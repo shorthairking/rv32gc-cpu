@@ -718,9 +718,23 @@ arch-test 与 hello/memtest 无影响，已复跑）。
   PMPZalrsc 1/1、PMPZca 12/15；1 例平台口径差异 + 3 例 ISA 不可达见 §6）；回归 18 组 124 例 + 单元测试 + hello/memtest + lrsc 全绿
 - ✅ **中断投递 + 核内 CLINT/PLIC（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`；
   `CLINT_PLIC_UNIT: PASS (184)`；回归 18 组 124 例 + PMP 6 组无回退
-- ⏭ 下一步（顺序即优先级）：① 平台口径收尾（`if_rsp_err` 取指总线错误通道 + 物理 0 口径）；
-  ③ 取指总线错误通道（`rv32_ifetch.if_rsp_err` 未使用）+ 平台把物理 0 的口径与真实映射对齐；
-  ④ 未接入组 `Zimop`(40)/`Zcmop`(8)；⑤ Sv32 MMU → L1I/L1D/L2 Cache（接 D16② 判定点）→ 2A-7b~d 上板
+- 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求本轮不做上板）**——顺序即优先级：
+  ① **平台口径收尾**：`rv32_ifetch.if_rsp_err` 目前**悬空未用**（取指总线错误会被当指令执行）⇒ 加
+     "取指总线错误 → cause 1" 通道；实现要点（已定，避免踩旧坑）：错误期间**不冻结流水线**（`fetch_stall`
+     若恒 1 会让 `advance_all` 恒 0 → 死锁），改为向前端**注入气泡**让更老的指令排空，排空后取陷阱
+     （epc=tval=出错 PC），flush 清零错误。**必须同时给 `sim_axi_slave.v` 加"错误区域"（如 `+ERR_ADDR=`）
+     并写定向测试**，否则该路径不可验证（不写测试就不合入）。同批处理物理 0 口径（`PMPSm_cfg_A_tor_zero`：
+     现平台把 0..16MiB 铺成 DDR 且复位桩在 0；方案见上板测试计划）。
+  ② **未接入组 `Zimop`(40)/`Zcmop`(8)**：按规范"未实现的 MOP 必须无副作用执行"，译码器映射即可（子 Agent 在办）。
+  ③ **Sv32 MMU（TLB+PTW）**：`satp` 生效、S/U 翻译、`sfence.vma`、`SUM/MXR/MPRV`、页错误 cause 12/13/15；
+     **PMP 必须作用在物理地址**；跑 `tests/priv` 的 `Svbare`/`Sv`/`SvPMP`/`ExceptionsSv` 等（不做
+     Svinval/Svnapot/Svpbmt/Svadu/Svade）。方案侦察已派子 Agent。
+  ④ **L1I/L1D/L2 Cache**（行 32B）：接 **D16② 的 XIP 绕 Cache 判定点**（`xip_bypass`/`line_xip_q`）；
+     CBO 真正生效后跑 `PMPZicbo`(4)。
+  ⑤ **2A-7b/7c（仿真可验部分）**：SPI 小引导 + DDR 主镜像 + 链接/打包脚本；DTS/OpenSBI 的平台映射声明。
+  ⑥ **交付：上板测试计划（2A-7d）书面稿交用户审阅** —— 涵盖 FPGA 工程/约束/时序目标、上板步骤、
+     B1~B3 判据、串口与数码管观测、失败回退与风险。**用户审阅通过前不做上板**。
+- 📄 本阶段任务的详细清单与判据即上方 🚧 列表（旧编号列表已并入其中）。
 - 📌 **平台适配结论（D15/D16）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；
   需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI
 - 📌 **待用户确认（2A-4 前）**：数据侧访问 SPI-XIP 窗口（`0x1C00_0000`）是否也要绕过 L1D（见 `spec/08-bus-axi.md` §2.1 待决项）
