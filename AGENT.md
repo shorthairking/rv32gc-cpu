@@ -762,6 +762,37 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 第 14 轮：阶段 2A-③ Sv32 MMU 核内集成（S2~S5）+ 两个集成缺陷修复
+
+**本项范围**：把上一轮的 `rv32_tlb`/`rv32_ptw` 接进核（取指侧 + 访存侧）、`sfence.vma`、取指页错误、
+`priv/Sv` 等验收组。**结果：`Svbare 3/3` + `Sv ^sv32_ 28/31`（其余 3 例参考模型自己 FAIL）**。
+
+| 项 | 结果 |
+|---|---|
+| 新增 `rtl/mmu/rv32mmu_top.v` | ITLB(8) + DTLB(16) + 单个 `rv32_ptw`；两个翻译口（取指组合口 / 访存请求口）；**D 优先**仲裁、只在 PTW 空闲时起遍历（保证 `req` 干净上升沿）；权限（U/SUM/MXR/R/W/X）与 **Svade** 的 A/D 在内部**逐次 live 判定**（TLB 只存 PTE 原值）；PA 拼装 4K=`{ppn[19:0],va[11:0]}`、4M=`{ppn[19:10],va[21:12],va[11:0]}` |
+| 访存侧集成（`rv32gc_core.v`） | `M_IDLE` 内联等翻译（`!mem_addr_ready` 分支：页错误→复用"免请求+M_DONE+记 cause 13/15"范式；就绪→`m_addr_q<=mmu_d_pa`、`m_xlated_q<=1`）；保留 `M_XLATE` 作兜底态（8 个状态码已用完 ⇒ `memst_q` 扩到 4 位）；`mem_chk_addr` 统一供 PMP/CLINT/PLIC/总线使用（**全按 PA**），`tval` 仍为 VA |
+| 数据总线通道与 PTW 复用 | MEM 优先、**同一时刻只允许一笔在途事务**（`d_busy_q` + `d_owner_ptw_q`），响应按归属分派（`ptw_bus_ack = d_rsp_valid && d_owner_ptw_q`）；FSM 推进改用 `d_req_take = d_req_valid && d_req_ready`（裸 `d_req_ready` 在 valid 被门控时会造成"不发请求也推进"） |
+| 取指侧集成（`rv32_ifetch.v`） | 新增 `pa_valid/pa/xlate_fault` 输入与 `fetch_pf` 输出；**`hit`/`line_valid`/发请求三处全部门控**，行标签改存 **PA**（同一 PA 可多 VA 映射）；跨行指令补 `cross_pa_q`/`id_pa_q`（取指 PMP 必须查 PA，`tval` 仍 VA） |
+| `sfence.vma` | WB 提交拍 `sfence_take` ⇒ TLB 全清 + PTW `abort` + **强制 `flush_front`**（按行号比对的 flush 覆盖不到同 PA 不同 VA）；S 模式且 `TVM=1` 时已在 ID 级报非法 |
+| 取指页错误 | 与总线错误共用"停止取指 + 流水线排空后取陷阱"通道；`fetch_fault_cause = fetch_pf ? 12 : 1`，epc/tval = 出错取指 VA |
+| CSR 补齐（验收必需） | `mcountinhibit`(0x320) 与 `mhpmevent3-31`(0x323-0x33F) 改为**存在**（WARL：读回所存位/0、写忽略）：参考模型认为它们合法，缺失会让 `sv32_mstatus_sbe_*` 多报 **31 个**非法指令陷阱；`mcountinhibit` 的 CY/IR 已真正停表（`mcycle`/`minstret`） |
+| **缺陷 1（集成期，实测定位）** | `i_walk_done` 归属判反（写成 `!ptw_owner_q`，而 owner=1 才是取指侧）⇒ 取指遍历永不收货、**无限重走 L1**：实测同一页表地址 `0x8000c300` 被反复读、pc 冻结 60k 拍无提交。靠 MMU 内部临时打印（`satp_mode/owner/start`）一屏定位 |
+| **缺陷 2（集成期，实测定位）** | 翻译完成后 `m_addr_q <= mem_addr_q` 把 **PA 覆盖回 VA** ⇒ 总线发 VA（实测 `0x30002280` 未翻译、AXI `err=1`、误报 cause 5）。修法：所有路径统一 `m_addr_q <= mem_chk_addr`，CLINT/PLIC 的 `.addr()` 同步改 PA |
+| **缺陷 3（子 Agent 定位，我复核依据）** | **陷阱进入时错误清零 `mstatus.MPRV`**（`csr/rv32_csr.v`）⇒ `sv32_upage_mprv_set_sum_unset_Smode` FAIL：ACT 陷阱处理器靠 MPRV 判断 xEPC 是否需要重定位，签名 word2 差 `0x1f0`（=epc−代码段基址）。规范 `machine.adoc:413 norm:mstatusmprvclrmretsretlesspriv`：**只有 xRET 到 <M 才清 MPRV**；Spike `processor.cc` 全文不写 `mprv`（我复核 ✓）。删除该清零后该例 PASS |
+| 验收（RV32 可跑子集，全部实测） | `Svbare 3/3`；**`Sv '^sv32_' 28/31**；`Svade '^sv32_Svade' 0/2`；`SvPMP '^sv32_pmp' 2/4`；`ExceptionsSv '^sv32_' 0/4`；`ExceptionsSvZaamo/Zalrsc '^sv32_' 0/3+0/3`；`SvZicbo '^sv32_' 2/6`；`SvPMPZicbo '^sv32_pmp' 0/8`（合计 35/64） |
+| **3 例判为参考模型自身失败（有证据）** | `sv32_VA_all_ones_Smode`、`sv32_mstatus_sbe_set_Smode`、`sv32_mstatus_sbe_and_sum_set_Smode`：`sim/arch_test/out/*.spike.log` 里 `*** FAILED *** (tohost = 1)`，签名只剩起始标记 + `0xdeadbeef` 填充。**312 个参考日志里只有这 3 个失败**（`grep -l FAILED sim/arch_test/out/*.spike.log`），故不可作为判据 |
+| 回归（不可退，全绿） | 非特权 **18 组 124 例全 PASS**；PMPS 11/11、PMPU 11/11、PMPZaamo/PMPZalrsc 1/1、PMPZca 12/15、PMPSm 37/38（例外同前）；`PMP_UNIT 443`、`CLINT_PLIC_UNIT 184`、**`TLB_PTW_UNIT 155`**、`AXI 79`、`EXEC 2461`、`DECODER PASS`、`PRIV_TRAP 46`、`FETCH_ERR 21`、`LRSC_DIRECTED PASS`、`SPI_BOOT PASS`、`hello`/`memtest` PASS |
+
+#### 关键经验（本轮）
+
+* **"冻结"类故障先看总线层**：实测"同一页表地址被反复读 + pc 冻结"直接指向遍历归属判定写反，比逐级打印流水线快一个数量级。
+* **总线口仲裁三件套**：单笔在途（`busy`）、归属寄存器（`owner`）、FSM 推进用 `valid && ready`。少任何一件都会在"两个主设备抢一个口"时出现丢响应/假推进。
+* **VA/PA 混用的代价是静默错**：`m_addr_q <= mem_addr_q` 这一行在 MMU off 时完全正确、on 时把 PA 覆盖回 VA；这类"同一寄存器两种语义"的写法必须**只有一个赋值点**（本轮统一成 `mem_chk_addr`）。
+* **改共享 TB 后必须立刻编译自检**：本轮清理调试代码时把 `tb_trace_mem.v` 改坏（漏删一个块尾），随后整组 I 报 28 例"iverilog 编译失败"，一度被误读为功能回退 —— 已 `git checkout` 恢复并重跑，回归全绿。
+* **参考模型失败必须先用证据排除**：`grep -l FAILED` 一次就能把 3 例"永远不可能通过"的用例识别出来，避免在错误目标上耗时间。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -783,8 +814,20 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 - 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求不做上板）**——进度：
   * ✅ ① 总线错误通道（取指 cause 1 + load/store 5/7，`FETCH_ERR: PASS (21)`）；物理 0 口径仍记为平台约定差异（详见上板计划）
   * ✅ ② `Zimop 40/40`、`Zcmop 8/8`
-  * ⏭ ③ Sv32 MMU（**S0 基线 + S1 模块层已完**：`TLB_PTW_UNIT: PASS (155)`、`sv_mstatus_tvm` 转 PASS；
-    **S2~S5 核内集成待做**，见下）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  * ⏭ ③ Sv32 MMU（**S0~S5 主体已完成**：`Svbare 3/3`、`Sv ^sv32_ 28/31`、`rv32mmu_top` 集成 +
+    `sfence.vma` + 取指页错误；**剩余 Sv 家族用例待修**）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  * 🔜 **③ 的剩余工作（下一轮优先级最高，按此顺序）**：
+    1. **`ExceptionsSv` 系列 10 例**（`ExceptionsSv 0/4`、`ExceptionsSvZaamo 0/3`、`ExceptionsSvZalrsc 0/3`）：
+       现在**不是签名不符而是"慢到超时"** —— 实测 `sv32_exceptions_Smode` 60k 拍只有 649 条提交
+       （≈92 拍/指令），且内核一直在取指；先用 `tb_trace_mem` + 计数（每次翻译/每次 PTW 读/每次 sfence）
+       确认是否"每拍重复翻译"或"每次陷阱后全清 TLB 导致反复重走"。**这是一条根因、10 例一起收**。
+    2. `Svade 0/2`：A/D 页错误语义（Svade 不改写 PTE）与参考的差异逐字段比对。
+    3. `SvPMP 2/4`：PMP 作用在 PA 之后的边界用例。
+    4. `SvZicbo 2/6` + `SvPMPZicbo 0/8`：**依赖 ④ 的 CBO 真正生效**（CBO 现在只是走 MEM FSM 的空操作），
+       与 ④ 同轮做。
+  * ✅ **③ 的 S2~S5 集成设计已落地**（见上一轮 §7 与本轮 §6）：`rv32mmu_top.v`（ITLB 8/DTLB 16/单 PTW、
+    D 优先、权限与 Svade live 判）、访存侧 `M_IDLE` 内联翻译 + `M_XLATE` 兜底、`mem_chk_addr` 全按 PA、
+    取指侧 `pa_valid` 门控三处 + 行标签存 PA + `cross_pa_q`/`id_pa_q`、数据总线与 PTW 复用单笔在途、`sfence.vma` 全清。
   * 🔜 **③ 的 S2~S5 集成设计（下一轮执行，已定稿）**：
     * 新增 `rtl/mmu/rv32mmu_top.v`（我实现）：例化 ITLB(8)/DTLB(16)/`rv32_ptw`，对外**两个翻译口**——
       取指 `if_va → if_pa/if_pa_valid/if_fault`，访存 `d_va/d_is_store/d_req → d_pa/d_pa_valid/d_fault`；

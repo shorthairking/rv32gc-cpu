@@ -388,6 +388,8 @@
 `define CSR_MIE       12'h304
 `define CSR_MTVEC     12'h305
 `define CSR_MCOUNTEREN 12'h306
+`define CSR_MHPMEVENT3  12'h323
+`define CSR_MHPMEVENT31 12'h33F
 `define CSR_MENVCFG   12'h30A
 `define CSR_MSTATUSH  12'h310
 `define CSR_MENVCFGH  12'h31A

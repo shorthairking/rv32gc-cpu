@@ -92,11 +92,12 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
-   b0. ✅ **已完成（第 13 轮）**：Sv32 MMU 的 **S0 基线 + S1 模块层** —— `rtl/mmu/rv32_tlb.v`（参数化 CAM）+
-       `rtl/mmu/rv32_ptw.v`（`IDLE→L1→L2→RES`，每次 4B 读）→ **`TLB_PTW_UNIT: PASS (155 checks)`**（变异 10/10 被捕获）；
-       顺带把 `mstatus.TVM/TSR` 与 `mret/sret` 特权级强制补上 ⇒ **`priv/Sv '^sv_mstatus_tvm' 1/1 PASS`**。
-       **下一步＝同一项的 S2~S5 核内集成**（`rv32mmu_top.v` + `M_IDLE/M_XLATE` + `rv32_ifetch.pa_valid` +
-       `sfence.vma` 全清 + 63 例验收），设计与坑位清单见 `AGENT.md` §7 的「③ 的 S2~S5 集成设计」。
+   b0. ✅ **已完成（第 14 轮）**：**Sv32 MMU 核内集成**（`rtl/mmu/rv32mmu_top.v` + 取指/访存两侧接入 + `sfence.vma`
+       + 取指页错误）—— `Svbare 3/3`、**`priv/Sv '^sv32_' 28/31`**、`TLB_PTW_UNIT 155`、全量回归无回退。
+       剩余 Sv 家族用例（`ExceptionsSv` 10 例"慢到超时"、`Svade` 2、`SvPMP` 2、`SvZicbo`/`SvPMPZicbo` 14）
+       的排查顺序见 `AGENT.md` §7 的「③ 的剩余工作」。
+   b1. ✅ **已完成（第 13 轮）**：MMU 模块层（`rtl/mmu/rv32_tlb.v`/`rv32_ptw.v` → `TLB_PTW_UNIT: PASS (155 checks)`）
+       + `mstatus.TVM/TSR` 与 `mret/sret` 特权级强制（`sv_mstatus_tvm` FAIL→PASS）。
    b0a. ✅ **已完成（第 12 轮）**：总线错误通道（`FETCH_ERR: PASS (21)`，修了 `rv32_axi_master.if_rsp_err` 恒 0 的生产者缺陷）+
        `Zimop 40/40`/`Zcmop 8/8`。
    b. ✅ **中断投递 + 核内 CLINT/PLIC 已完成（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`、

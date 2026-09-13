@@ -20,8 +20,14 @@ module rv32_ifetch (
 
   input  wire         flush,          // 重定向/异常：丢弃当前行
 
-  // ---- D16② SPI-XIP 取指判定（由 rv32gc_core.v 用 `IS_SPI_XIP(fetch_pc) 算好）----
-  input  wire         xip_bypass,     // 1 = 本次取指地址落在 SPI Flash XIP 窗口
+  // ---- MMU（Sv32）取指翻译结果（由 rv32mmu_top 组合给出）----
+  //   pa_valid=1 才允许比对行标签/发请求；总线地址与行标签一律用 **PA**（同一个 PA 可映射到多个 VA）
+  input  wire         pa_valid,       // 1 = pa 可用（无需翻译 / 翻译命中且权限+A/D 通过）
+  input  wire [31:0]  pa,             // pc 对应的物理地址
+  input  wire         xlate_fault,    // 取指页错误（cause 12）
+
+  // ---- D16② SPI-XIP 取指判定（由 rv32gc_core.v 用 `IS_SPI_XIP(pa) 算好）----
+  input  wire         xip_bypass,     // 1 = 本次取指地址（PA）落在 SPI Flash XIP 窗口
 
   // ---- AXI 取指客户端（rv32_axi_master） ----
   output reg          if_req_valid,
@@ -35,14 +41,17 @@ module rv32_ifetch (
   // ---- 取指总线错误（AXI 读响应 err）----
   // 出错的行**不填充**（line_vld_q 保持 0），错误保持到 flush（核取走陷阱后会 flush）。
   // 必须保持：否则核会在同一地址反复重试，或把没取到的行当指令执行。
-  output wire         fetch_err
+  output wire         fetch_err,
+  // ---- 取指页错误（MMU）：与总线错误共用"停止取指 + 等流水线排空"通道，但 cause=12 ----
+  output wire         fetch_pf
 );
 
   reg [255:0] line_q;
   reg [31:0]  line_tag_q;      // PC[31:5]
   reg         line_vld_q;
   reg         busy_q;          // 正在等待 AXI 返回
-  reg         err_q;           // 取指总线错误（sticky，flush 清除）
+  reg         err_q;           // 取指错误（sticky，flush 清除）
+  reg         err_pf_q;        // 上者的类型：1 = MMU 页错误（cause 12），0 = 总线错误（cause 1）
   /* verilator lint_off UNUSED */
   reg         line_xip_q;      // 本行来自 SPI-XIP 窗口？—— 2A-4 的 I-Cache 必须禁止其填充
   reg         req_xip_q;       // 在途请求行的窗口归属（请求发起拍采样，响应拍写入 line_xip_q）
@@ -64,10 +73,11 @@ module rv32_ifetch (
   // 否则 XIP 读被缓存且平台无一致性维护 → 取指错乱（D16「否决原因③」）。
   //-----------------------------------------------------------------------------
 
-  wire        hit = line_vld_q && (pc[31:5] == line_tag_q[31:5]);   // 比较行号（line_tag_q 存的是完整字节地址）
+  wire        hit = pa_valid && line_vld_q && (pa[31:5] == line_tag_q[31:5]);  // 比较**物理**行号
   assign line_valid = hit;
   assign if_rsp_ready = 1'b1;  // 收到即接收
   assign fetch_err    = err_q;
+  assign fetch_pf     = err_pf_q;
 
   // 行内选择：半字索引 = pc[4:1]，第 idx 个半字位于位偏移 idx*16
   wire [3:0]  idx = pc[4:1];
@@ -83,6 +93,7 @@ module rv32_ifetch (
       req_xip_q   <= 1'b0;
       busy_q      <= 1'b0;
       err_q       <= 1'b0;
+      err_pf_q    <= 1'b0;
       if_req_valid<= 1'b0;
       if_req_addr <= 32'd0;
     end else begin
@@ -94,19 +105,29 @@ module rv32_ifetch (
         busy_q     <= 1'b0;
         line_vld_q <= if_rsp_err ? 1'b0 : 1'b1;   // 总线错误 ⇒ 该行不可用
         err_q      <= if_rsp_err;                 // 并锁存错误直到 flush
+        err_pf_q   <= 1'b0;                       // 总线错误（cause 1）
+      end
+
+      // 1b) MMU 取指页错误：同一"错误粘性 + 停止取指"通道，类型记为页错误（cause 12）
+      if (xlate_fault) begin
+        err_q      <= 1'b1;
+        err_pf_q   <= 1'b1;
+        line_vld_q <= 1'b0;
       end
 
       // 2) 冲刷：使当前行失效（后赋值优先），但不清 busy_q
       if (flush) begin
         line_vld_q   <= 1'b0;
         err_q        <= 1'b0;
+        err_pf_q     <= 1'b0;
         if_req_valid <= 1'b0;
       end
 
-      // 3) 发起新取指（未命中、无在途请求、且本拍未冲刷）
-      if (!hit && !busy_q && !if_req_valid && !flush && !err_q) begin
+      // 3) 发起新取指（未命中、无在途请求、本拍未冲刷、PA 可用）
+      //    ⚠ 必须用 pa_valid 门控：翻译未完成时发请求会取到**错误行**（VA 当 PA 用）
+      if (!hit && !busy_q && !if_req_valid && !flush && !err_q && pa_valid) begin
         if_req_valid <= 1'b1;
-        if_req_addr  <= {pc[31:5], 5'b0};
+        if_req_addr  <= {pa[31:5], 5'b0};   // 总线地址 = PA（行标签也由此而来）
         req_xip_q    <= xip_bypass;   // 采样"本请求行是否属于 SPI-XIP 窗口"
         busy_q       <= 1'b1;
       end

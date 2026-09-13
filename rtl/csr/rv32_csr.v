@@ -55,6 +55,9 @@ module rv32_csr (
   output wire [1:0]  mstatus_mpp,
   output wire        mstatus_tvm,         // TVM：S 模式的 sfence.vma 非法（核内 ID 级检查用）
   output wire        mstatus_tsr,         // TSR：S 模式的 sret 非法（核内 ID 级检查用）
+  output wire        mstatus_sum,         // SUM：MMU 数据侧权限判定（live）
+  output wire        mstatus_mxr,         // MXR：MMU 数据侧权限判定（live）
+  output wire [31:0] satp_o,              // satp 原值（MODE/ASID/PPN，供 MMU 使用）
   output wire        timer_irq_pending,   // 预留：CLINT 比较器
   output wire        ext_irq_pending,     // 预留：PLIC
 
@@ -100,6 +103,7 @@ module rv32_csr (
 
   reg [31:0] stvec_q, sscratch_q, sepc_q, scause_q, stval_q;
   reg [31:0] sie_q, sip_q, scounteren_q, satp_q;
+  reg [2:0]  mcountinhibit_q;   // {IR,TM,CY}：bit0=CY 停 mcycle，bit2=IR 停 minstret（TM/HPM 恒 0）
   // menvcfg/senvcfg：本核只用到它们的 CBO（Zicbom/Zicboz）低特权级执行许可位。
   // 位域（RV32）：CBIE[5:4]、CBCFE[6]、CBZE[7]（machine.adoc menvcfg / supervisor.adoc senvcfg）。
   // 复位为 0 = 低特权级禁用 CBO，与规范默认一致。
@@ -268,6 +272,7 @@ module rv32_csr (
       `CSR_MCAUSE:  csr_rdata = mcause_q;
       `CSR_MTVAL:   csr_rdata = mtval_q;
       `CSR_MIP:     csr_rdata = mip_masked;
+      `CSR_MCOUNTINHIBIT: csr_rdata = {29'd0, mcountinhibit_q};
       `CSR_MCYCLE:  csr_rdata = mcycle_q[31:0];
       `CSR_MCYCLEH: csr_rdata = mcycle_q[63:32];
       `CSR_MINSTRET:csr_rdata = minstret_q[31:0];
@@ -349,6 +354,11 @@ module rv32_csr (
     // PMP：0x3A0-0x3A3（pmpcfg0-3）与 0x3B0-0x3BF（pmpaddr0-15）存在；
     // 0x3A4-0x3AF（RV32 无这些 pmpcfg）与 0x3C0 以上**不存在** → 报非法指令
     if (`IS_PMPCFG_ADDR(csr_raddr) || `IS_PMPADDR_ADDR(csr_raddr)) csr_exists = 1'b1;
+    // mcountinhibit(0x320) 与 mhpmevent3-31(0x323-0x33F) 必须**存在**：虽然本核不实现 HPM
+    // 计数器（`misa` 无 Zihpm），但参考模型 Spike 认为它们合法，测试前导码会 csrrw 这些地址
+    // （实测 sv32_mstatus_sbe_* 两例因"非法指令"多报 31 个陷阱）。写成 WARL：读回 0 / 写忽略。
+    if (csr_raddr == `CSR_MCOUNTINHIBIT) csr_exists = 1'b1;
+    if (csr_raddr >= `CSR_MHPMEVENT3 && csr_raddr <= `CSR_MHPMEVENT31) csr_exists = 1'b1;
   end
 
   // 特权级检查：机器级 CSR 只能 M 访问；监管级 CSR 需 S 或 M
@@ -379,6 +389,9 @@ module rv32_csr (
 
   assign mstatus_tvm = mstatus_tvm_q[0];
   assign mstatus_tsr = mstatus_tsr_q[0];
+  assign mstatus_sum = mstatus_sum_q[0];
+  assign mstatus_mxr = mstatus_mxr_q[0];
+  assign satp_o      = satp_q;
 
   // ---------------------------------------------------------------- 陷阱委托与向量
   wire [1:0]  cause_priv  = trap_is_int ? (mideleg_q[trap_cause] ? `PRV_S : `PRV_M)
@@ -434,12 +447,13 @@ module rv32_csr (
       pmpcfg_q        <= {`PMP_ENTRIES*8{1'b0}};    // PMP 复位全 0 = 全部 OFF（S/U 一律拒绝）
       pmpaddr_q       <= {`PMP_ENTRIES*32{1'b0}};
       satp_q          <= 32'd0;
+      mcountinhibit_q <= 3'd0;
       mcycle_q        <= 64'd0;
       minstret_q      <= 64'd0;
     end else begin
-      // 计数器
-      mcycle_q <= mcycle_q + 64'd1;
-      if (instret_en) minstret_q <= minstret_q + 64'd1;
+      // 计数器（mcountinhibit：bit0=CY 停 mcycle，bit2=IR 停 minstret；见 machine.adoc mcountinhibit）
+      if (!mcountinhibit_q[0]) mcycle_q <= mcycle_q + 64'd1;
+      if (instret_en && !mcountinhibit_q[2]) minstret_q <= minstret_q + 64'd1;
 
       // 陷阱进入（优先级高于 CSR 写；trap 与写不会同拍）
       if (trap_valid) begin
@@ -459,7 +473,14 @@ module rv32_csr (
           mstatus_mpp_q <= priv_q;
         end
         priv_q        <= cause_priv;
-        mstatus_mprv_q<= 1'b0;
+        // MPRV 不由陷阱进入修改：规范中唯一的清零点只有
+        // "An MRET or SRET instruction that changes the privilege mode to a mode
+        //  less privileged than M also sets mprv=0."
+        // (riscv-isa-manual machine.adoc, norm:mstatusmprvclrmretsretlesspriv；
+        //  下方 xret 分支已实现)。Spike 的 take_trap 只写 MPIE/MPP/MIE/MPV/GVA/MPELP，
+        // 从不碰 mstatus.MPRV(tools/spike/riscv/processor.cc:543-549)，故陷阱进入后
+        // MPRV 保持 1；ACT 陷阱处理器正是靠这一点判定 xEPC 是 VA(不改写)还是 PA(要重定位)
+        // (riscv-arch-test/tests/env/rvtest_trap_handler.h:2179-2202)。
       end
       // 陷阱返回
       else if (xret_valid) begin
@@ -542,6 +563,11 @@ module rv32_csr (
             senvcfg_q[6]   <= csr_wdata[6];
             senvcfg_q[5:4] <= (csr_wdata[5:4] == 2'b10) ? 2'b00 : csr_wdata[5:4];
           end
+          `CSR_MCOUNTINHIBIT: begin
+            mcountinhibit_q[2] <= csr_wdata[2];
+            mcountinhibit_q[0] <= csr_wdata[0];
+          end
+          // mhpmevent3-31：本核无 HPM 计数器（读 0），写入忽略 —— 落到 default 即可
           // ---- PMP：pmpcfg0-3 / pmpaddr0-15 ----
           // 写入值由上面的组合逻辑算好（保留位归一、R=0⇒W 丢弃、锁定项忽略）；
           // 写锁定项不报错（与 Spike 一致）。0x3A4-0x3AF 不在此列（不在 exists 表里）。

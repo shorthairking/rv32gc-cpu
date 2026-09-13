@@ -61,23 +61,35 @@ module rv32gc_core (
   wire [15:0] hw0, hw1;
   wire        line_valid;
   wire        flush_front;
-  wire        fetch_err;      // 取指总线错误（来自 rv32_ifetch）
+  wire        fetch_err;      // 取指总线错误（来自 rv32_ifetch，cause 1）
+  wire        fetch_pf;       // 取指页错误（来自 rv32_ifetch，cause 12）
+  // ---- MMU（Sv32，③ 里程碑）：取指口 + 访存口 ----
+  wire [31:0] mmu_if_pa;
+  wire        mmu_if_pa_valid;
+  wire        mmu_if_fault;
+  wire [31:0] mmu_d_pa;
+  wire        mmu_d_pa_valid;
+  wire        mmu_d_fault;
+  wire [3:0]  mmu_d_fault_cause;
+  reg  [31:0] id_pa_q;        // ID 级指令的**物理**起始地址（取指侧 PMP 必须按 PA 检查）
+  reg  [31:0] cross_pa_q;     // 跨行指令第一 parcel 的 PA（need_cross 拍锁存）
 
   // ---- D16② SPI-XIP 取指判定点：命中 SPI 窗口必须**绕过 I-Cache** ----
   // 平台复位取指窗口是 0x1C00_0000（SPI Flash XIP，无硬件 boot ROM；另有 0x1FE8_0000 别名），
   // 见 `rv32gc_defs.vh` 的 `IS_SPI_XIP 与 AGENT.md §2 D16。当前基线核无 I-Cache，该信号只
   // 接到取指单元并在填充时记录（rv32_ifetch 的 line_xip_q）；阶段 2A-4 上 I-Cache 后**必须**
   // 用它禁止 XIP 行的填充/命中，详见 rv32_ifetch.v 的说明。
-  wire        if_spi_xip = `IS_SPI_XIP(fetch_pc);
+  wire        if_spi_xip = `IS_SPI_XIP(mmu_if_pa);   // 窗口判定按 **PA**（MMU off 时 PA==VA）
 
   rv32_ifetch u_ifetch (
     .clk(clk), .rst_n(rst_n),
     .pc(fetch_pc), .hw0(hw0), .hw1(hw1), .line_valid(line_valid),
     .flush(flush_front), .xip_bypass(if_spi_xip),
+    .pa_valid(mmu_if_pa_valid), .pa(mmu_if_pa), .xlate_fault(mmu_if_fault),
     .if_req_valid(if_req_valid), .if_req_addr(if_req_addr), .if_req_ready(if_req_ready),
     .if_rsp_valid(if_rsp_valid), .if_rsp_data(if_rsp_data),
     .if_rsp_err(if_rsp_err), .if_rsp_ready(if_rsp_ready),
-    .fetch_err(fetch_err)
+    .fetch_err(fetch_err), .fetch_pf(fetch_pf)
   );
 
   wire        at_line_end = (pc_q[4:1] == 4'd15);
@@ -154,6 +166,9 @@ module rv32gc_core (
   wire [1:0]  priv_q;
   wire        mstatus_tvm_w;    // TVM：S 模式下 sfence.vma 非法
   wire        mstatus_tsr_w;    // TSR：S 模式下 sret 非法
+  wire        mstatus_sum_w;    // SUM（MMU 数据侧 live 权限判定）
+  wire        mstatus_mxr_w;    // MXR（同上）
+  wire [31:0] satp_w;           // satp {MODE, ASID, PPN}
   wire        trap_take, xret_take;
   wire [3:0]  trap_cause_wb;
   wire [31:0] trap_tval_wb;
@@ -170,7 +185,7 @@ module rv32gc_core (
     .csr_wen(wb_csr_wen), .csr_waddr(wb_csr_addr_q), .csr_wdata(wb_csr_wdata), .csr_is_fp(1'b0),
     .instret_en(wb_retire),
     .trap_valid(trap_take_all),
-    .trap_cause(if_err_take ? `EXC_INSTR_ACCESS : trap_cause_wb),
+    .trap_cause(if_err_take ? fetch_fault_cause : trap_cause_wb),
     .trap_tval (if_err_take ? pc_q : trap_tval_wb),
     .trap_is_int(trap_is_int), .trap_epc(if_err_take ? pc_q : trap_epc_w),
     .trap_vector(trap_vector), .trap_new_priv(trap_new_priv),
@@ -179,6 +194,7 @@ module rv32gc_core (
     .priv_o(priv_q),
     .mstatus_mie(), .mstatus_sie(), .mstatus_mprv(mstatus_mprv_w), .mstatus_mpp(mstatus_mpp_w),
     .mstatus_tvm(mstatus_tvm_w), .mstatus_tsr(mstatus_tsr_w),
+    .mstatus_sum(mstatus_sum_w), .mstatus_mxr(mstatus_mxr_w), .satp_o(satp_w),
     .timer_irq_pending(), .ext_irq_pending(),
     .menvcfg_cbcfe(menvcfg_cbcfe), .menvcfg_cbze(menvcfg_cbze), .menvcfg_cbie(menvcfg_cbie),
     .senvcfg_cbcfe(senvcfg_cbcfe), .senvcfg_cbze(senvcfg_cbze), .senvcfg_cbie(senvcfg_cbie),
@@ -234,22 +250,23 @@ module rv32gc_core (
   // 这样避免复制整条匹配树 —— 实测两个实例会让整核 iverilog 仿真慢 3 倍以上。
   rv32_pmp u_pmp_d (
     .pmpcfg(pmpcfg_all), .pmpaddr(pmpaddr_all),
-    .addr(mem_addr_q), .acc_size(mem_pmp_size), .eff_priv(pmp_eff_priv_d),
+    .addr(mem_chk_addr), .acc_size(mem_pmp_size), .eff_priv(pmp_eff_priv_d),
     .need_r(1'b1), .need_w(1'b0), .need_x(1'b0),
     .need_r2(1'b0), .need_w2(1'b1), .need_x2(1'b0),
     .permit(pmp_d_r_ok), .permit2(pmp_d_w_ok), .match_any(), .match_all()
   );
   // 取指侧：**按 2 字节 parcel 分别检查**（与参考模型 Spike 一致，见下）。
+  // ⚠ MMU 之后必须用**物理地址** `id_pa_q`（PMP 作用在 PA 上）；`tval` 仍取 VA（id_pc_q）。
   rv32_pmp u_pmp_if_a (
     .pmpcfg(pmpcfg_all), .pmpaddr(pmpaddr_all),
-    .addr(id_pc_q), .acc_size(2'd1), .eff_priv(priv_q),
+    .addr(id_pa_q), .acc_size(2'd1), .eff_priv(priv_q),
     .need_r(1'b0), .need_w(1'b0), .need_x(1'b1),
     .need_r2(1'b0), .need_w2(1'b0), .need_x2(1'b0),
     .permit(pmp_x_ok_a), .permit2(), .match_any(), .match_all()
   );
   rv32_pmp u_pmp_if_b (                 // 第二 parcel（仅 32 位指令用）
     .pmpcfg(pmpcfg_all), .pmpaddr(pmpaddr_all),
-    .addr(id_pc_q + 32'd2), .acc_size(2'd1), .eff_priv(priv_q),
+    .addr(id_pa_q + 32'd2), .acc_size(2'd1), .eff_priv(priv_q),
     .need_r(1'b0), .need_w(1'b0), .need_x(1'b1),
     .need_r2(1'b0), .need_w2(1'b0), .need_x2(1'b0),
     .permit(pmp_x_ok_b), .permit2(), .match_any(), .match_all()
@@ -266,17 +283,17 @@ module rv32gc_core (
   // 地址窗口：CLINT 0x1F00_0000（1 MiB）；PLIC 0x1F10_0000 起 —— SiFive PLIC 1.0.0 的
   // threshold/claim 位于偏移 0x20_0000/0x20_1000，1 MiB 窗口覆盖不到，故取 0x1F10_0000–
   // 0x1F3F_FFFF（addr[31:20] ∈ {1F1,1F2,1F3}）。见 `rv32gc_defs.vh` 与 spec/07 §8。
-  wire        mem_clint_hit = (mem_addr_q[31:20] == 12'h1F0);
-  wire        mem_plic_hit  = (mem_addr_q[31:20] == 12'h1F1) ||
-                              (mem_addr_q[31:20] == 12'h1F2) ||
-                              (mem_addr_q[31:20] == 12'h1F3);
+  wire        mem_clint_hit = (mem_chk_addr[31:20] == 12'h1F0);
+  wire        mem_plic_hit  = (mem_chk_addr[31:20] == 12'h1F1) ||
+                              (mem_chk_addr[31:20] == 12'h1F2) ||
+                              (mem_chk_addr[31:20] == 12'h1F3);
   wire        mem_io_hit    = mem_clint_hit | mem_plic_hit;
   wire        io_we    = (mem_mem_op_q == `MEM_STORE) || (mem_mem_op_q == `MEM_SC) ||
                          (mem_mem_op_q == `MEM_AMO);
   // 只在 M_IDLE 那一拍拉高（设备访问单拍完成；PLIC 的 claim 有"每拍都生效"的副作用，
   // 多拍保持会连续 claim —— 子 Agent 已提示）。
   wire        io_req   = (memst_q == M_IDLE) && mem_needs_fsm && mem_io_hit &&
-                         !mem_misaligned && !mem_pmp_deny;
+                         !mem_misaligned && !mem_pmp_deny && mem_addr_ready;
   wire [3:0]  io_wstrb = a1_wstrb;
   wire [31:0] io_wdata = a1_wdata;
   wire [31:0] clint_rdata, plic_rdata;
@@ -285,14 +302,14 @@ module rv32gc_core (
 
   rv32_clint u_clint (
     .clk(clk), .rst_n(rst_n), .tick(1'b1),          // 仿真里 mtime 直接按核时钟 +1
-    .req(io_req && mem_clint_hit), .we(io_we), .addr(mem_addr_q),
+    .req(io_req && mem_clint_hit), .we(io_we), .addr(mem_chk_addr),
     .wstrb(io_wstrb), .wdata(io_wdata), .rdata(clint_rdata),
     .msip(clint_msip_w), .mtip(clint_mtip_w)
   );
   rv32_plic #(.NSRC(8)) u_plic (
     .clk(clk), .rst_n(rst_n),
     .src({3'b000, intrpt[4:0]}),   // PLIC source 1..5 ← 平台 intrpt[0..4]（source 0 保留）
-    .req(io_req && mem_plic_hit), .we(io_we), .addr(mem_addr_q),
+    .req(io_req && mem_plic_hit), .we(io_we), .addr(mem_chk_addr),
     .wstrb(io_wstrb), .wdata(io_wdata), .rdata(plic_rdata),
     .meip(plic_meip_w), .seip(plic_seip_w)
   );
@@ -525,10 +542,16 @@ module rv32gc_core (
 
   // ============================================================ MEM 级访问 FSM
   // 访存 FSM：支持非对齐访问的"两次单拍"拆分（跨 4 字节边界时）
-  localparam [2:0] M_IDLE = 3'd0, M_REQ = 3'd1, M_WAIT = 3'd2, M_DONE = 3'd3,
-                   M_REQ2 = 3'd4, M_WAIT2 = 3'd5,
-                   M_REQ_W = 3'd6, M_WAIT_W = 3'd7;   // 原子指令/SC 的写回阶段
-  reg  [2:0]  memst_q;
+  // M_XLATE（③ 里程碑新增）：Sv32 生效时的**翻译过渡态**。原 8 个状态码已用完，故扩到 4 位。
+  // 语义：M_IDLE 发现"需要翻译且尚未翻译" ⇒ 进 M_XLATE 等 mmu_top 给 PA（或页错误），
+  //   - 拿到 PA：写回 `m_addr_q`（此后它就是**物理地址**）、置 `m_xlated_q`，回 M_IDLE 走原路径；
+  //   - 页错误：复用"不拉请求 + 直接进 M_DONE + 记 cause"的范式（尾随 VA 由 mem_addr_q 提供）；
+  //   - 未就绪：停在 M_XLATE（`mem_stall` 已为 1 ⇒ 核内全局冻结，PTW 自驱总线取 PTE，无死锁）。
+  localparam [3:0] M_IDLE = 4'd0, M_REQ = 4'd1, M_WAIT = 4'd2, M_DONE = 4'd3,
+                   M_REQ2 = 4'd4, M_WAIT2 = 4'd5,
+                   M_REQ_W = 4'd6, M_WAIT_W = 4'd7, M_XLATE = 4'd8;
+  reg  [3:0]  memst_q;
+  reg         m_xlated_q;      // m_addr_q 已由 MMU 翻译成 PA（仅对当前访问有效，M_DONE 时清）
   reg  [31:0] m_addr_q, m_wdata_q, m_rdata_q, m_rdata2_q, m_excp_tval_q;
   reg  [3:0]  m_wstrb_q, m_wstrb2_q;
   reg         m_we_q, m_err_q, m_split_q;
@@ -571,15 +594,62 @@ module rv32gc_core (
   // 请求有效须覆盖两次拆分访问：M_REQ（第一次）与 M_REQ2（第二次）。
   // 历史缺陷：只写了 M_REQ，非对齐拆分时第二次访问永不发请求、FSM 卡在 M_REQ2
   // （Zifencei / Zca 等用例里出现非对齐访问即整机停摆）。
-  assign d_req_valid = (memst_q == M_REQ) || (memst_q == M_REQ2) || (memst_q == M_REQ_W);
-  assign d_req_we    = (memst_q == M_REQ_W) ? 1'b1 : m_we_q;
-  assign d_req_addr  = m_addr_q;
+  //
+  // ============================ MMU：数据总线通道与 PTW 共用（③ 里程碑）============================
+  // PTW 的页表读**必须**有路可走，但**不得**经过本 FSM 的状态机（否则 M_IDLE 等翻译、
+  // 翻译又要 M_REQ 发请求 ⇒ 死锁）。做法：在**总线口**这一层做仲裁，MEM 优先、PTW 其次，
+  // 且**同一时刻只允许一笔在途事务**（`d_busy_q`）—— 这样响应归属明确、AXI master 的单槽
+  // 语义也不被破坏。
+  wire        mem_want   = (memst_q == M_REQ) || (memst_q == M_REQ2) || (memst_q == M_REQ_W);
+  wire        ptw_bus_req;     // rv32mmu_top 的页表读请求（见下方例化）
+  wire [31:0] ptw_bus_addr;
+  wire        ptw_want   = ptw_bus_req;
+  wire        d_req_valid_w = !d_busy_q && (mem_want || ptw_want);
+  wire        d_is_ptw     = ptw_want && !mem_want;
+  wire        d_req_take   = d_req_valid_w && d_req_ready;
+  reg         d_busy_q;        // 有在途事务（直到收到响应）
+  reg         d_owner_ptw_q;   // 在途事务归属：1 = PTW 页表读，0 = MEM 访存
+  assign d_req_valid = d_req_valid_w;
+  assign d_req_we    = mem_want ? ((memst_q == M_REQ_W) ? 1'b1 : m_we_q) : 1'b0;
+  assign d_req_addr  = mem_want ? m_addr_q : ptw_bus_addr;
   assign d_req_wdata = m_wdata_q;
   assign d_req_wstrb = m_wstrb_q;
   assign d_rsp_ready = 1'b1;
+  // PTW 的应答（4 字节读）：只有归属 PTW 的响应才回给它
+  wire [31:0] ptw_bus_rdata = d_rsp_rdata;
+  wire        ptw_bus_ack   = d_rsp_valid && d_owner_ptw_q;
+  wire        ptw_bus_err   = d_rsp_err && d_owner_ptw_q;
+  // MEM 侧只消费归属自己的响应（不变式：M_WAIT 时 owner 必为 0）
+  wire        mem_rsp_valid = d_rsp_valid && !d_owner_ptw_q;
 
   wire [4:0]  mem_ctrl_amo_op = mem_amo_op_q;
   wire        mem_needs_fsm = mem_valid_q && (mem_mem_op_q != `MEM_NONE);
+  // ---- MMU（③）：翻译启用/就绪/请求 ----
+  // 有效特权级 < M 且 satp.MODE=1 才翻译（MPRV/MPP 已并入 pmp_eff_priv_d，与 PMP 同口径）；
+  // 非对齐**先于**翻译判定（与 Spike 的 load_slow_path/store_slow_path 一致）。
+  wire        mem_trans_en   = satp_w[31] && (pmp_eff_priv_d != `PRV_M);
+  wire        mem_addr_ready = !mem_trans_en || m_xlated_q;
+  wire        mem_xlate_req  = (memst_q == M_IDLE) && mem_needs_fsm && mem_trans_en &&
+                               !m_xlated_q && !mem_misaligned;
+  // PMP 与核内设备窗口判定一律用**物理地址**：翻译完成后是 m_addr_q，否则就是 mem_addr_q
+  wire [31:0] mem_chk_addr   = m_xlated_q ? m_addr_q : mem_addr_q;
+
+  //============================================================ MMU（Sv32）
+  // 取指翻译：输入是**当前取指地址**（fetch_pc，含跨行时的 pc+2），输出 PA/页错误；
+  // 访存翻译：输入是 MEM 级地址（VA），`d_req` 只在 M_IDLE 确实有访存时拉高（避免陈旧地址空走）。
+  rv32mmu_top #(.ITLB_ENTRIES(8), .DTLB_ENTRIES(16)) u_mmu (
+    .clk(clk), .rst_n(rst_n),
+    .satp_mode(satp_w[31]), .satp_ppn(satp_w[21:0]), .satp_asid(satp_w[30:22]),
+    .priv(priv_q), .d_eff_priv(pmp_eff_priv_d),
+    .sum(mstatus_sum_w), .mxr(mstatus_mxr_w), .flush(sfence_take),
+    .if_va(fetch_pc),
+    .if_pa_valid(mmu_if_pa_valid), .if_pa(mmu_if_pa), .if_fault(mmu_if_fault),
+    .d_va(mem_addr_q), .d_is_store(pmp_mem_is_w || pmp_mem_is_amo), .d_req(mem_xlate_req),
+    .d_pa_valid(mmu_d_pa_valid), .d_pa(mmu_d_pa),
+    .d_fault(mmu_d_fault), .d_fault_cause(mmu_d_fault_cause),
+    .ptw_bus_req(ptw_bus_req), .ptw_bus_addr(ptw_bus_addr),
+    .ptw_bus_rdata(ptw_bus_rdata), .ptw_bus_ack(ptw_bus_ack), .ptw_bus_err(ptw_bus_err)
+  );
   wire        mem_done_now  = (memst_q == M_DONE);
   // 拆分判定（组合，基于 MEM 级寄存器）
   wire [2:0]  mem_nbytes = (mem_mem_size_q == `MSZ_BYTE) ? 3'd1 :
@@ -677,7 +747,10 @@ module rv32gc_core (
                              !xret_take && !mem_sideeff;
   assign      trap_is_int  = intr_take;
   assign      trap_take     = wb_valid_q && advance && (wb_excp_valid_q || intr_take);
-  // ---- 取指总线错误（cause 1）：等流水线排空后取，绝不丢弃更老的未提交指令 ----
+  // ---- 取指错误：总线错误（cause 1）或 MMU 页错误（cause 12）----
+  // 两者共用同一条"停止取指 + 等流水线排空后取陷阱"的通路（rv32_ifetch 内的粘性错误 + 类型位）；
+  // epc/tval 都是**出错取指地址**（pc_q，即当前 VA；页错误的 tval 正是该 VA）。
+  wire [3:0]  fetch_fault_cause = fetch_pf ? `EXC_INSTR_PAGE_FAULT : `EXC_INSTR_ACCESS;
   wire        front_empty   = !(wb_valid_q || mem_valid_q || ex_valid_q || id_valid_q);
   wire        if_err_take   = fetch_err_pending && front_empty;
   wire        trap_take_all = trap_take | if_err_take;
@@ -687,6 +760,11 @@ module rv32gc_core (
   assign xret_take     = wb_valid_q && advance &&
                          ((wb_sys_op_q == `SYS_MRET) || (wb_sys_op_q == `SYS_SRET));
   assign wb_is_sret    = (wb_sys_op_q == `SYS_SRET);
+  // ---- sfence.vma：提交拍执行（全清 TLBs + 丢弃在途 PTW + 强制冲刷前端）----
+  // 为什么必须强制 `flush_front`：前端按"行号"比对命中，同 PA 不同 VA 时行号可能相同；
+  // 且 sfence 之后按规范必须重新取指。S 模式且 TVM=1 时该指令已在 ID 级报非法（见 id_xret_ill 附近）。
+  wire        wb_is_sfence = (wb_sys_op_q == `SYS_SFENCE_VMA);
+  wire        sfence_take  = wb_valid_q && advance && wb_is_sfence && !wb_excp_valid_q;
 
   wire [31:0] csr_src   = wb_csr_imm_q ? wb_imm_q : wb_rs1_val_q;
   assign wb_csr_wdata   = (wb_csr_op_q == `CSR_RW) ? csr_src :
@@ -710,7 +788,8 @@ module rv32gc_core (
                                ex_br_redirect ? br_target : id_jal_target;
   // 取指错误必须在取走陷阱那一拍**强制 flush**：否则若 trap_vector 与出错 PC 落在同一个 32B 行内，
   // 上面的行号比较不成立 ⇒ ifetch 的 err_q 清不掉 ⇒ 反复取同一条错误。
-  assign flush_front = (redirect_valid && (redirect_pc[31:5] != pc_q[31:5])) || if_err_take;
+  assign flush_front = (redirect_valid && (redirect_pc[31:5] != pc_q[31:5])) ||
+                       if_err_take || sfence_take;
 
   wire sq_id  = redirect_valid;
   wire sq_ex  = trap_take_all | xret_take | ex_br_redirect;
@@ -747,6 +826,8 @@ module rv32gc_core (
       mem_excp_valid_q <= 1'b0; mem_excp_cause_q <= 4'd0; mem_excp_tval_q <= 32'd0;
 
       memst_q <= M_IDLE; m_addr_q <= 32'd0; m_wdata_q <= 32'd0; m_rdata_q <= 32'd0;
+      m_xlated_q <= 1'b0; d_busy_q <= 1'b0; d_owner_ptw_q <= 1'b0;
+      id_pa_q <= 32'd0; cross_pa_q <= 32'd0;
       m_rdata2_q <= 32'd0; m_wstrb2_q <= 4'd0; m_split_q <= 1'b0;
       m_is_lr_q <= 1'b0; m_is_sc_q <= 1'b0; m_is_amo_q <= 1'b0; m_amo_op_q <= 5'd0; m_rs2_q <= 32'd0;
       resv_valid_q <= 1'b0; resv_addr_q <= 32'd0;
@@ -764,6 +845,13 @@ module rv32gc_core (
       // fetch_pc 变为 pc_q+2，取指单元才会去取下一行；下一行就绪后 instr_raw 由
       // {hw0(下一行首半字), cross_hw0_q(本行末半字)} 拼成完整 32 位指令。
       if (trap_take) resv_valid_q <= 1'b0;   // 陷阱后保留集失效
+      // ---- MMU：总线通道归属跟踪（一笔在途事务，响应按归属分派）----
+      if (d_req_take) begin
+        d_busy_q      <= 1'b1;
+        d_owner_ptw_q <= d_is_ptw;
+      end else if (d_rsp_valid) begin
+        d_busy_q      <= 1'b0;
+      end
       if (redirect_valid) begin
         pc_q  <= redirect_pc;
         cross_q <= 1'b0;
@@ -771,6 +859,7 @@ module rv32gc_core (
         if (need_cross) begin
           cross_q     <= 1'b1;
           cross_hw0_q <= hw0;
+          cross_pa_q  <= mmu_if_pa;   // 记下第一 parcel 的 **PA**（此刻 fetch_pc = pc_q）
         end else begin
           if (cross_q) cross_q <= 1'b0;
           if (if_ready) pc_q <= pc_q + {29'd0, ilen_raw};
@@ -780,11 +869,40 @@ module rv32gc_core (
       // ---------------- 访存 FSM（与 stall 并行推进） ----------------
       case (memst_q)
         M_IDLE: if (mem_needs_fsm) begin
-            // ---- PMP 访存检查：必须在**发起任何总线请求之前**判定 ----
+            // ---- MMU 翻译阶段（只为 Sv32 生效且特权级 < M 的访问；非对齐在上面的分支已排除）----
+            if (!mem_addr_ready) begin
+              if (mmu_d_fault) begin
+                // 页错误（cause 13/15）：复用"免请求 + 直接进 M_DONE + 记 cause"范式。
+                // tval = **虚拟地址**（mem_addr_q 此刻仍是 VA）。
+                m_addr_q      <= mem_chk_addr;
+                m_we_q        <= 1'b0;
+                m_size_q      <= mem_mem_size_q;
+                m_uns_q       <= mem_mem_flags_q;
+                m_shift_q     <= mem_addr_q[1:0];
+                m_split_q     <= 1'b0;
+                m_wdata_q     <= mem_rs2_val_q;
+                m_wstrb_q     <= 4'h0;
+                m_wstrb2_q    <= 4'h0;
+                m_is_lr_q     <= 1'b0;      // 被拒的 LR/SC/AMO 不建立保留集
+                m_is_sc_q     <= 1'b0;
+                m_is_amo_q    <= 1'b0;
+                m_amo_op_q    <= 5'd0;
+                m_rs2_q       <= mem_rs2_val_q;
+                m_rdata_q     <= 32'd0;
+                m_excp_tval_q <= mem_addr_q;
+                m_excp_cause_q<= mmu_d_fault_cause;
+                if (mem_is_sc || mem_is_amo) resv_valid_q <= 1'b0;
+                memst_q       <= M_DONE;
+              end else if (mmu_d_pa_valid) begin
+                m_addr_q   <= mmu_d_pa;   // 从此 m_addr_q 就是**物理地址**
+                m_xlated_q <= 1'b1;       // 下一拍在 M_IDLE 走原有的 PMP/设备/发起路径
+              end
+              // else：翻译未就绪 —— 停在 M_IDLE 等（mem_stall 已为 1，PTW 自驱总线，不死锁）
+            end else if (mem_pmp_deny) begin
             // 拒绝路径完全复用 misaligned 的"免请求 + 直接进 M_DONE"写法：不拉 d_req_valid、
             // 不写任何字节，由 WB 级精确报 cause 5/7，tval = 出错地址。
-            if (mem_pmp_deny) begin
-              m_addr_q      <= mem_addr_q;
+            // （此时 mem_chk_addr 已是 **PA**：翻译完成才会走到这里）
+              m_addr_q      <= mem_chk_addr;
               m_we_q        <= 1'b0;
               m_size_q      <= mem_mem_size_q;
               m_uns_q       <= mem_mem_flags_q;
@@ -812,7 +930,7 @@ module rv32gc_core (
                                                             : `EXC_STORE_MISALIGN;
                 memst_q       <= M_DONE;
               end else begin
-                m_addr_q      <= mem_addr_q;
+                m_addr_q      <= mem_chk_addr;
                 m_we_q        <= 1'b0;
                 m_size_q      <= mem_mem_size_q;
                 m_uns_q       <= mem_mem_flags_q;
@@ -836,7 +954,7 @@ module rv32gc_core (
 `ifdef MISALIGNED_TRAP
             if (mem_misaligned) begin
               // 不做拆分访问：直接进入 M_DONE 并在 WB 级精确报地址非对齐异常
-              m_addr_q      <= mem_addr_q;
+              m_addr_q      <= mem_chk_addr;
               m_we_q        <= (mem_mem_op_q == `MEM_STORE);   // 只有普通 store 在本阶段写；LR/AMO 先读，SC/AMO 的写在 M_REQ_W
               m_size_q      <= mem_mem_size_q;
               m_uns_q       <= mem_mem_flags_q;
@@ -850,7 +968,7 @@ module rv32gc_core (
               memst_q       <= M_DONE;
             end else begin
 `endif
-            m_addr_q      <= mem_addr_q;
+            m_addr_q      <= mem_chk_addr;
             m_we_q        <= (mem_mem_op_q == `MEM_STORE);   // 只有普通 store 在本阶段写；LR/AMO 先读，SC/AMO 的写在 M_REQ_W
             m_size_q      <= mem_mem_size_q;
             m_uns_q       <= mem_mem_flags_q;
@@ -900,8 +1018,19 @@ module rv32gc_core (
 `endif
             end
           end
-        M_REQ:  if (d_req_ready) memst_q <= M_WAIT;
-        M_WAIT: if (d_rsp_valid) begin
+        // M_XLATE 理论上不会被用到（翻译等待就地在 M_IDLE 完成），保留作为兜底并把 PA 采纳进来
+        M_XLATE: begin
+          if (mmu_d_pa_valid) begin m_addr_q <= mmu_d_pa; m_xlated_q <= 1'b1; memst_q <= M_IDLE; end
+          else if (mmu_d_fault) begin
+            m_excp_tval_q  <= mem_addr_q;
+            m_excp_cause_q <= mmu_d_fault_cause;
+            m_we_q         <= 1'b0;
+            m_split_q      <= 1'b0;
+            memst_q        <= M_DONE;
+          end
+        end
+        M_REQ:  if (d_req_take) memst_q <= M_WAIT;
+        M_WAIT: if (mem_rsp_valid) begin
                   m_rdata_q <= d_rsp_rdata;
                   m_err_q   <= d_rsp_err;
                   if (d_rsp_err) begin
@@ -928,14 +1057,14 @@ module rv32gc_core (
                     memst_q   <= M_REQ2;
                   end else memst_q <= M_DONE;
                 end
-        M_REQ2: if (d_req_ready) memst_q <= M_WAIT2;
-        M_WAIT2: if (d_rsp_valid) begin
+        M_REQ2: if (d_req_take) memst_q <= M_WAIT2;
+        M_WAIT2: if (mem_rsp_valid) begin
                   m_rdata2_q <= d_rsp_rdata;
                   if (d_rsp_err) m_excp_cause_q <= m_we_q ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
                   memst_q <= M_DONE;
                 end
-        M_REQ_W:  if (d_req_ready) memst_q <= M_WAIT_W;
-        M_WAIT_W: if (d_rsp_valid) begin
+        M_REQ_W:  if (d_req_take) memst_q <= M_WAIT_W;
+        M_WAIT_W: if (mem_rsp_valid) begin
                     // 写响应：出错按 store 访问错误记账（rd 数据对 SC 成功为 0，对齐已保证）
                     if (d_rsp_err) m_excp_cause_q <= `EXC_STORE_ACCESS;
                     // SC 的写完成 → 保留集已被消费；AMO 的写完成 → 同样使保留集失效
@@ -947,8 +1076,11 @@ module rv32gc_core (
         // M_IDLE，FSM 会**再次执行同一条指令**——对 SC 是致命的：第一次已把保留集消费掉，
         // 第二次重入即见到 resv=0 → 走失败分支把 rd 改成 1（甚至再发一次写）。
         // 历史缺陷（本会话定位）：Zalrsc 的 SC 在 fetch 停顿下必然 rd=1，且同一地址被写两次。
-        M_DONE: if (!mem_valid_q || advance_all) memst_q <= M_IDLE;
-        default: memst_q <= M_IDLE;
+        M_DONE: if (!mem_valid_q || advance_all) begin
+                  memst_q    <= M_IDLE;
+                  m_xlated_q <= 1'b0;      // 翻译结果只对本次访问有效
+                end
+        default: begin memst_q <= M_IDLE; m_xlated_q <= 1'b0; end
       endcase
 
       // ---------------- 流水线推进 ----------------
@@ -1040,6 +1172,7 @@ module rv32gc_core (
         else if (front_hold) begin end
         else begin
           id_pc_q    <= pc_q;
+          id_pa_q    <= cross_q ? cross_pa_q : mmu_if_pa;   // 指令起始的物理地址（取指 PMP 用）
           id_instr_q <= instr_raw;
           id_ilen_q  <= ilen_raw;
           id_valid_q <= if_ready;
