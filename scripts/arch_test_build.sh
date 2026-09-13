@@ -25,9 +25,48 @@ CC="${CC:-riscv32-unknown-linux-gnu-gcc}"
 
 TEST_SRC="$1"
 OUT="${2:-$ROOT/sim/arch_test/out}"
-MARCH="${3:-rv32imac_zicsr_zifencei_zicntr}"
+# ---------------------------------------------------------------------------
+# ISA 串合成：DUT 支持的"基座"扩展 ∪ 用例头部声明的扩展
+# ---------------------------------------------------------------------------
+# ACT4 每个生成用例都在 START_TEST_CONFIG 头里声明自己需要的 ISA 串，例如：
+#   I/Zicsr/Zifencei → rv32i_zicsr_zifencei        （注意：**不含** zicntr）
+#   Zicbom           → rv32i_zicbom_zicsr_zifencei
+#   Zalrsc           → rv32i_zicsr_zifencei_zalrsc
+# 若直接拿头部串去汇编，Zicsr 组会因 `csrrs instret`（属于 Zicntr）被判非法、
+# Zicntr 相关 CSR 也取不到 → 参考签名与 DUT 不一致而整组失败（实测 4/6 FAIL）。
+# 因此这里做**并集**：基座（DUT 实际实现）rv32imac + zicsr + zifencei + zicntr
+# ∪ 头部声明中出现的其它扩展（zicbom/zihintpause/zalrsc/zaamo/...）。
+BASE_EXT="imac_zicsr_zifencei_zicntr"
+HEADER_MARCH="$(sed -n '/START_TEST_CONFIG/,/END_TEST_CONFIG/p' "$TEST_SRC" \
+                | sed -n 's/^[[:space:]]*#[[:space:]]*MARCH:[[:space:]]*\([A-Za-z0-9_.]*\).*/\1/p' \
+                | head -1)"
+# 从头部串里抽出 rv32 之后的扩展名（去掉 rv32i/rv32im 之类的基础部分）
+HEADER_EXT=""
+if [ -n "$HEADER_MARCH" ]; then
+  HEADER_EXT="$(printf '%s' "$HEADER_MARCH" | sed 's/^rv32[eim]*//')"
+fi
+MERGED_EXT="$BASE_EXT"
+if [ -n "$HEADER_EXT" ]; then
+  # 逐个 _ext 追加（去重）
+  IFS='_' read -r -a exts <<< "${HEADER_EXT#_}"
+  for e in "${exts[@]}"; do
+    [ -n "$e" ] || continue
+    case "_${MERGED_EXT}_" in
+      *"_${e}_"*) ;;                       # 已有，跳过
+      *) MERGED_EXT="${MERGED_EXT}_${e}" ;;
+    esac
+  done
+fi
+if [ -n "${3:-}" ]; then
+  MARCH="$3"
+elif [ -n "${MARCH:-}" ]; then
+  MARCH="$MARCH"
+else
+  MARCH="rv32${MERGED_EXT}"
+fi
 MABI="${4:-ilp32}"
 NAME="$(basename "$TEST_SRC" .S)"
+echo "[build] $NAME: MARCH=$MARCH (头部=${HEADER_MARCH:-无})"
 
 mkdir -p "$OUT"
 

@@ -26,7 +26,9 @@ AT_SRC="${AT_SRC:-$WS_ROOT/riscv-arch-test}"
 GROUP="${1:?用法: $0 <组名> [用例名过滤正则]}"
 FILTER="${2:-.}"
 TMO="${RV32GC_TIMEOUT:-300000}"
-MARCH="${MARCH:-rv32imac_zicsr_zifencei_zicntr}"
+# MARCH 默认留空 → 每个用例由 arch_test_build.sh 从自己的 `# MARCH:` 头部解析（Zicbom 等
+# 需要专属 ISA 串）。显式设置 MARCH=... 则强制覆盖全部用例。
+MARCH="${MARCH:-}"
 MABI="${MABI:-ilp32}"
 JOBS="${JOBS:-1}"
 

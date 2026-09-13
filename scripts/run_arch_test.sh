@@ -19,7 +19,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AT_SRC="${AT_SRC:-$(cd "$ROOT/.." && pwd)/riscv-arch-test}"
 REL="$1"                                   # 例: I/I-add-00
-MARCH="${2:-rv32imac_zicsr_zifencei_zicntr}"
+# MARCH：显式第 2 参数 > 环境变量 MARCH > 留空（由 arch_test_build.sh 从用例头部的
+# `# MARCH:` 自动解析，例如 Zicbom 需要 rv32i_zicbom_zicsr_zifencei）。留空可避免用错 ISA
+# 串导致 "unrecognized opcode ... extension required"。
+MARCH="${2:-${MARCH:-}}"
+MABI="${3:-ilp32}"
 MABI="${3:-ilp32}"
 NAME="$(basename "$REL")"
 SRC="$AT_SRC/tests/rv32i/$REL.S"
@@ -30,7 +34,11 @@ OBJCOPY=riscv32-unknown-linux-gnu-objcopy
 [ -f "$SRC" ] || { echo "ERROR: 找不到测试源 $SRC"; exit 2; }
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  bash "$ROOT/scripts/arch_test_build.sh" "$SRC" "$OUT" "$MARCH" "$MABI" >/dev/null
+  if [ -n "$MARCH" ]; then
+    bash "$ROOT/scripts/arch_test_build.sh" "$SRC" "$OUT" "$MARCH" "$MABI" >/dev/null
+  else
+    bash "$ROOT/scripts/arch_test_build.sh" "$SRC" "$OUT" "" "$MABI" >/dev/null
+  fi
   echo "[arch-test] 构建完成: $OUT/$NAME.elf"
 fi
 
