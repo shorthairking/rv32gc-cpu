@@ -216,12 +216,20 @@ module rv32gc_core (
   wire        e_is_load  = e_is_lsu && (e_mem_op == `MEM_LOAD);
 
   // ---- 旁路（转发）网络 ----
-  // MEM 级（EX/MEM 寄存器）：仅 ALU 类结果可转发（load 数据要等 WB）
-  wire        mem_fwd_en  = mem_valid_q && mem_rd_wen_q && (mem_rd_q != 5'd0) &&
-                            (mem_mem_op_q == `MEM_NONE);
+  // MEM 级（EX/MEM 寄存器）：ALU 类结果随时可转发；访存类（LOAD/LR/SC/AMO）的结果在
+  // FSM 到达 M_DONE 的那一拍就已经在 mem_load_data 上（提前于 WB 级整整一拍），也必须转发。
+  // 历史缺陷（本会话定位，见 AGENTS/AGENT.md 第 7 轮）：
+  //   `mem_fwd_en` 曾要求 `mem_mem_op_q == MEM_NONE`，即访存结果在 MEM 级一律不转发，只能等
+  //   WB。于是 "load/LR/SC → 紧跟依赖它的分支或运算" 会读到旧值一拍：
+  //     sc.w a1,a1,(s0) / bnez a1,fail      → bnez 用错的 a1 判方向（sc.w 成功 rd=0 却当作非零）
+  //     lw   t1,0(s0)   / bne t1,t2,fail    → bne 用旧 t1
+  //   Lup 等被 load_use 停顿掩盖（EX 级 load 的消费者会被冻结），但 MEM 级访存结果的消费者
+  //   不在 load_use 覆盖范围内，故必错。
+  wire        mem_fwd_ready = mem_needs_fsm ? mem_done_now : 1'b1;
+  wire        mem_fwd_en  = mem_valid_q && mem_rd_wen_q && (mem_rd_q != 5'd0) && mem_fwd_ready;
   wire [31:0] mem_fwd_val = (mem_wb_sel_q == `WB_PC4) ? (mem_pc_q + {29'd0, mem_ilen_q}) :
                             (mem_wb_sel_q == `WB_CSR) ? mem_csr_rdata_q :
-                            mem_alu_q;   // WB_MEM（load）不在 MEM 级转发，见 mem_fwd_en
+                            (mem_wb_sel_q == `WB_MEM) ? mem_load_data : mem_alu_q;
   // WB 级：只要求"WB 携带有效写回值"，**不要求本拍真的退休**。
   // 关键：流水线冻结拍（mem_stall / mdu_hold / fetch_stall）里 wb_retire=0，但 WB 的值
   // 已经确定；此时若禁止转发，正在 EX 的消费者（如 MDU 在 start 拍锁存操作数）会采到旧值。
@@ -569,6 +577,7 @@ module rv32gc_core (
             // 原子操作不可拆分：地址非自然对齐一律报 cause=6（与 MISALIGNED_TRAP 无关）
             if (mem_is_atomic && mem_misaligned) begin
               m_excp_cause_q <= `EXC_STORE_MISALIGN;
+              if (mem_is_sc) resv_valid_q <= 1'b0;   // 失败的 SC 也消费保留集
               memst_q        <= M_DONE;
             end else if (mem_is_sc) begin
               // SC：保留集有效且地址一致才写；成功 rd=0，失败 rd=1；两种都清保留集
@@ -578,10 +587,19 @@ module rv32gc_core (
                 m_rdata_q <= 32'd0;
                 memst_q   <= M_REQ_W;
               end else begin
-                m_rdata_q <= 32'd1;
-                memst_q   <= M_DONE;
+                m_rdata_q     <= 32'd1;
+                resv_valid_q  <= 1'b0;                // 失败：消费保留集
+                memst_q       <= M_DONE;
               end
             end else begin
+              // 普通 store / LOAD / AMO 进入 MEM：按 RISC-V 规范（unpriv "Load-Reserved/
+              // Store-Conditional"）"the reservation is ... invalidated by any store"，
+              // 这里对**发起** store 的拍清保留集。
+              // 注意：AMO 的写发生在读之后的 M_REQ_W，故这里只处理 MEM_STORE；
+              // AMO/LR 在各自命中路径上处理（见 M_WAIT 分支）。
+              // 历史缺陷（本会话定位）：保留集只在 trap / WB 写响应出错时清，普通 store
+              // 不清 → LR → sw → SC 会错误地成功（arch-test Zalrsc 的 sc_after_store 类用例）。
+              if (mem_mem_op_q == `MEM_STORE) resv_valid_q <= 1'b0;
               memst_q <= M_REQ;          // load/store/LR/AMO：发起访问（LR/AMO 为读）
             end
 `ifdef MISALIGNED_TRAP
@@ -626,9 +644,16 @@ module rv32gc_core (
         M_WAIT_W: if (d_rsp_valid) begin
                     // 写响应：出错按 store 访问错误记账（rd 数据对 SC 成功为 0，对齐已保证）
                     if (d_rsp_err) m_excp_cause_q <= `EXC_STORE_ACCESS;
+                    // SC 的写完成 → 保留集已被消费；AMO 的写完成 → 同样使保留集失效
+                    if (m_is_sc_q || m_is_amo_q) resv_valid_q <= 1'b0;
                     memst_q <= M_DONE;
                   end
-        M_DONE: memst_q <= M_IDLE;
+        // M_DONE 必须"linger"到该指令真正离开 MEM：本核允许 MEM 指令在 FSM 完成后仍被前端
+        // 停顿（fetch_stall/front_hold 时 advance_all=0）继续占住 MEM 级若干拍。若此时直接回
+        // M_IDLE，FSM 会**再次执行同一条指令**——对 SC 是致命的：第一次已把保留集消费掉，
+        // 第二次重入即见到 resv=0 → 走失败分支把 rd 改成 1（甚至再发一次写）。
+        // 历史缺陷（本会话定位）：Zalrsc 的 SC 在 fetch 停顿下必然 rd=1，且同一地址被写两次。
+        M_DONE: if (!mem_valid_q || advance_all) memst_q <= M_IDLE;
         default: memst_q <= M_IDLE;
       endcase
 

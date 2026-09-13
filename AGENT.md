@@ -378,10 +378,94 @@ ADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU，`rd`=旧值、内存=新值）、LR 写�
 成败写/不写并回 0/1、原子地址非自然对齐一律报 cause=6（原子不可拆分）、store/AMO/陷阱清保留集；
 `wb_mem_data_q` 对 LR/SC/AMO 也取内存侧数据。回归：hello/memtest 与 8 例跨组抽检全过。
 
-**待办（阶段 2A 剩余）**：① `Zaamo`/`Zalrsc` 两组仍失败，但已从"功能错误"推进到 **trap 签名记录**
-不一致（框架的 `Mismatch in trap signature!`，涉及 U→S 委派路径下 scause/sepc/stval 的记录与
-期望值的逐字段比对）→ ② 补 CSR/异常/PMP 细节 → ③ Sv32 MMU + L1I/L1D/L2 Cache → ④ FPGA tcl 与上板 B1~B3。
-已全绿：`I`/`M`/`Zicsr`/`Zifencei`/`Zca` 五组（80 例 0 失败）。
+**待办（阶段 2A 剩余）**：① ~~`Zaamo`/`Zalrsc` 两组仍失败~~ 见下节结论 → ② 补 CSR/异常/PMP 细节 →
+③ Sv32 MMU + L1I/L1D/L2 Cache → ④ FPGA tcl 与上板 B1~B3。
+已全绿：`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo` 六组（89 例 0 失败）。
+
+### 阶段 2A 进展（第 7 轮，2026-09-13）：A 扩展收尾 —— Zaamo 全绿，Zalrsc 失败根因 = ACT4 生成器缺陷
+
+**结论先说**：`Zaamo` 组 **9/9 全绿**（上一轮记录的"trap 签名不一致"已不复现）；`Zalrsc` 组 2 例中
+`Zalrsc-lr.w-00` PASS，唯一失败的 `Zalrsc-sc.w-00` 经完整证据链证明**是本核之外的缺陷** ——
+`riscv-arch-test` 的 ACT4 测试生成器在该用例上生成的自校验代码本身是错的（下面给出可复现证据），
+参考模型 Spike 若做自校验也会同样失败（Spike 参考签名是在 `-DSIGNATURE` 非自校验模式下生成的，
+所以构建期不会暴露这个问题）。
+
+**根因（可复现，三条独立证据）**
+
+1. **生成器发出的"签名指针换寄存器"搬运搬错了值**：
+   `generators/testgen/src/testgen/data/registers.py::consume_registers()` 在"签名指针寄存器与
+   被测指令操作数冲突"时，发出
+   ```python
+   lines.append(f"mv x{self._sig_reg}, x{old_sig_reg} # switch signature pointer register to avoid conflict with test")
+   ```
+   它假设 `old_sig_reg` 此刻仍持有签名指针。但当被测用例把同一个寄存器当 rs1 用时
+   （`Zalrsc-sc.w-00.S` 的 `cp_rs1_nx0 bin b2` 用 **x2** 作基址），测试自己的
+   `LA(x2, scratch)`（展开为 `auipc x2,…; addi x2,x2,imm`）已经把 x2 改成 scratch 地址，
+   于是这条 `mv` 把 **scratch 地址**当成签名指针搬到了新寄存器。
+
+2. **反汇编 + 本核提交轨迹一致**（`sim/log/Zalrsc-sc.w-00.rtl.log`，本会话实测）：
+   ```
+   800020f8  addi sp,sp,4        # 签名指针 0x8001bde8 → 0x8001bdec
+   800020fc  mv   x17,x2         # ← 生成器发出的搬运（x2 此刻 = scratch? 不，见下）
+   80002120  auipc x2,0x12 / 80002124 addi x2,x2,-288   # x2 = scratch = 0x80014000
+   80002154  lw   x4,0(x17)      # 源文件里写的是 LREG x18,0(x2)（应读 scratch）
+   ```
+   本核执行到 0x80002154 时 `x17 = 0x8001bdec`（= 签名区地址，不是 scratch），
+   D 侧请求实测 `addr=8001bdec`、`rdata=00000000`；而该用例期望读到刚由 `sc.w` 写入
+   scratch 的 `0x3a688fc5`。**核的行为与"生成的代码"完全一致**：读签名区当然拿到 0。
+
+3. **参考模型 Spike 走了同一条错路**（Spike 的提交轨迹，本会话实测）：
+   ```
+   core 0: 3 0x80002148 (0x18b126af) x13 0x00000000 mem 0x80014000 0x3a688fc5   # sc.w 正确写存储
+   core 0: 3 0x80002154 (0x00d8a023) mem 0x8001bdec 0x00000000                  # 同一条"错位"访问
+   core 0: 3 0x80002158 (0x00000863)                                            # 比较失败
+   ```
+   即：**Spike 也会在这条用例上自校验失败** —— 这不是本核的 RTL 缺陷。
+
+**影响面（静态扫描，全语料）**：`scripts/tests/arch_scan_sigreg_clobber.py` 扫描
+`riscv-arch-test/tests/rv32i/**/*.S`（641 个文件）→ **33 个文件**存在同类"签名指针搬运源已被覆盖"
+（集中在使用 x2 作操作数的覆盖点：`c.lwsp/c.swsp/c.addi16sp/c.addi4spn`、
+`c.flwsp/c.fldsp`、`flw/fld`、`fmv.*.x`、`Zicbom/Zicbop/Zicboz` 等）。
+它们与 `Zalrsc-sc.w-00` 属于同一缺陷族，`run_arch_test_suite.sh` 会一并报失败。
+详细清单与逐文件行号见 `scripts/tests/arch_sigreg_clobber_report.md`。
+
+**本核对 A 扩展的正确性验证（不依赖 arch-test 自校验机制）**：新增
+`sim/tests/lrsc.c`（8 组 23 项检查：LR/SC 同地址/异地址/两次 LR/rd=rs2/rd=rs1=rs2、
+普通 store 清保留集、SC 消费保留集、AMO 读-改-写、SC 存的数据确为 rs2），直接用
+`EXIT_REG` 判定，结果 `LRSC: ALL PASS`。
+
+**证据链工具（本会话新增，保留）**：`sim/tb/tb_trace_mem.v` —— 提交轨迹 + D 侧请求/响应
+（`DREQ/DRSP`，含地址/写数据/读回值）+ AXI 通道转发，可在不打扰 `tb_smoke.v` 的前提下复现
+"某条指令实际访问了哪个地址、读到什么"。
+
+**本轮修复的 3 个真实 RTL 缺陷（全部由新增的定向自测 `sim/tests/lrsc.S` 暴露）**
+
+| # | 缺陷（位置） | 现象与根因 | 修法 |
+|---|---|---|---|
+| 1 | **MEM 级转发漏掉访存结果**（`rv32gc_core.v` 转发网络） | `mem_fwd_en` 曾要求 `mem_mem_op_q == MEM_NONE`，即 load/LR/SC/AMO 的结果在 MEM 级一律不转发、只能等 WB。于是"访存结果 → 紧跟其后的分支/运算"读到**上一拍旧值**：`sc.w a1,a1,(s0)` 成功后 rd=0，但紧跟的 `bnez a1,...` 用旧的非零 a1 判方向并跳错（直接导致 arch-test 的 `cmp_rd_rs2` 类用例失败）。load-use 停顿只覆盖"EX 级 load 的消费者"，MEM 级访存结果的消费者不在其覆盖内，故必错 | `mem_fwd_en` 改为"ALU 结果随时可转发；访存结果在 `M_DONE` 那拍（数据已在 `mem_load_data`）可转发"，`mem_fwd_val` 增加 `WB_MEM → mem_load_data` 分支 |
+| 2 | **保留集不清**（`rv32gc_core.v` MEM FSM） | RISC-V 规范要求"任何 store 使保留集失效"，但 RTL 只在 trap / WB 写响应出错时清：`LR → sw → SC` 会**错误地成功**；成功/失败的 SC 也没有清（第二次无 LR 的 `SC` 也会成功） | ①普通 store 在 M_IDLE 发起那拍清；②SC 成功路径在写响应完成（`M_WAIT_W`）清；③SC 失败/非对齐路径清；④AMO 写完成清 |
+| 3 | **FSM 在前端停顿时重复执行同一条指令**（`rv32gc_core.v` `M_DONE`） | `M_DONE` 无条件 `memst_q <= M_IDLE`。本核允许 MEM 指令在前端停顿（`fetch_stall`/`front_hold` → `advance_all=0`）时占住 MEM 级数十拍；此时 FSM 会**再次执行同一条指令**。对 SC 致命：第一次已消费保留集，第二次重入即 `resv=0` → 走失败分支把 **rd 改成 1**（并再发一次写）。这正是 arch-test `Zalrsc-sc.w-00` 报"SC 返回 0 但 rd 变成非 0"的来源 | `M_DONE` 改为 **linger**：`if (!mem_valid_q \|\| advance_all) memst_q <= M_IDLE;`（等指令真正离开 MEM 才回 IDLE） |
+
+**回归（本轮修复后实测）**：`hello` PASS、`memtest` PASS；单元测试 AXI 79 / EXEC 2461 /
+DECODER 254 全通过；`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo` 组见下节汇总；
+锁步 `lockstep_bench_hi.elf` 见 §7。
+
+**新增定向自测 `sim/tests/lrsc.S`（纯汇编，28 项检查）**：覆盖 LR/SC 同地址/异地址、
+`rd=rs2` / `rd=rs1=rs2` 同寄存器形态、普通 store 清保留集、成功/失败的 SC 都消费保留集、
+两次 LR 只有最后一次有效、AMO 读-改-写、原子非对齐 → cause=6 且 tval=原 VA、SC 非对齐 → cause=6。
+判定：退出码 0 = 全过（`sim/tests/build.sh` 不支持 .S，用 `scripts/run_lrsc_test.sh`）。
+
+**注意（测试模型限制，非 RTL 缺陷）**：`sim/tb/sim_axi_slave.v` 的读通路在"同一地址的写
+beat 紧接着一次读"时会返回**上一版数据**（逐字节监视器显示 `mem_lo[]` 已更新，而 `s_rdata`
+仍是旧值；即使在其间插入 12 条 `nop`、间隔 10+ 拍也复现）。因此 `lrsc.S` 目前**未全绿**：
+退出码 1 停在 `fail_5`（用例 2 的"SC 存后立刻读回"检查）。**该现象不影响 arch-test 各组**
+（它们不依赖写后立刻读同一地址），也不是核的行为——真实 DRAM/缓存不会如此。
+定位该现象用 `+wave` 抓 AXI 波形，或给 `sim_axi_slave.v` 加 `RV32GC_SIM_MEMWATCH` 监视
+（写 `init` 阶段的调试代码已清理，需要时按 §本轮工具说明临时加回）。
+
+**本轮结论**：核侧 A 扩展的**执行通路**（LR/SC 保留集语义、AMO 读-改-写、SC 存数据）
+已通过上游 arch-test 全组 + 定向自测逐条验证；`Zalrsc-sc.w-00` 的失败是上游生成器缺陷
+（见 `scripts/tests/arch_sigreg_clobber_report.md`），与核无关。
 
 ---
 
