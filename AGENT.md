@@ -903,6 +903,28 @@ arch-test 与 hello/memtest 无影响，已复跑）。
       验收：全量回归不回退 + `SvZicbo`/`SvPMPZicbo` 保持 PASS + `fence.i` 语义；性能类特性
       （MSHR 关键 half、预取、多路替换）可分批做，**正确性优先**。
 
+  * 🔜 **④ Cache 的最小可用实施方案（第 17 轮执行；规格裁剪，理由写清楚）**：
+    规格原文在 `docs/design/03-cache.md`（L1I 16 KB/4 路/32 B VIPT、L1D 32 KB/8 路 写回+写分配、
+    L2 256 KB、MSHR/Store Buffer/DMA 一致性）。**全量照做超出本阶段可验证的余量**，故按"正确性优先、
+    性能够 B3 起步"裁剪为：
+    * **L1I（必做）**：16 KB = 128 组 × 4 路 × 32 B，**VIPT（VA[11:5] 索引、PA 全地址标记）**，
+      只读，**轮转（RR）替换**（不做伪 LRU，效果差距有限、验证成本低），单未完成缺失（不建 MSHR 阵列、
+      不做预取）。插入点：`rv32_ifetch` 现成的"整行 32 B 取指"（`if_req_addr` = PA 行地址 → 直接接入）。
+      **必须接 D16② 的 XIP 绕 Cache 判定**：`xip_bypass=1` 时既不命中、也不填充（`line_xip_q` 已预留）；
+      `fence.i` / 提交级 `sfence.vma` 触发整表失效（**注意**：本设计 VIPT 且索引位全在页内、
+      PA 标记，故**不需要**在 `sfence.vma` 上失效 Cache，只需 `fence.i`）。
+    * **L1D（次做，可选）**：若时间不够就**不做**，并在 §6 记录"数据侧暂不缓存 + D16② 数据侧待决项已确认"。
+      要做就做**最小正确版**：32 KB/8 路，**写直达 + 不写分配**（store 直接落总线，命中则更新行；
+      没有脏行 ⇒ 不需要写回、Store Buffer、以及 CBO 的 clean/flush 语义都退化为空操作，风险最低），
+      读分配 + RR 替换；数据侧访问 SPI-XIP 窗口**同样绕 Cache**（与取指口径一致，见 §7 待用户确认项）。
+    * **L2（本阶段不做）**：DDR 侧靠 AXI 往返，B3 起步够用；在 §6 记为已知性能项。
+    * **验证（缺一不可）**：① 全量回归不回退（非特权 18 组 + PMP 6 组 + 单元 + 定向 + hello/memtest）；
+      ② `SPI_BOOT` / `BOOT_CHAIN` 仍 PASS（证明 XIP 取指在开 Cache 后仍正确）；③ **性能对比**：
+      `memtest` 与 `hello` 的 cycles 前后对比，必须显著下降（否则 Cache 没起作用，等于白做）；
+      ④ **XIP 不分配的结构断言**：TB 观测 `xip_bypass` 期间 Cache 的 allocate/写使能**恒为 0**；
+      ⑤ `fence.i` 定向：改代码后 `fence.i` 能取到新指令（可用 `sim/tests/` 里现成自修改代码风格新增）。
+    * **安全阀**：模块加参数 `ENABLE`，便于 A/B 对比与"万一回归挂了立刻切回已验证基线"。
+
   * ✅ **③ 的 S2~S5 集成设计已落地**（见上一轮 §7 与本轮 §6）：`rv32mmu_top.v`（ITLB 8/DTLB 16/单 PTW、
     D 优先、权限与 Svade live 判）、访存侧 `M_IDLE` 内联翻译 + `M_XLATE` 兜底、`mem_chk_addr` 全按 PA、
     取指侧 `pa_valid` 门控三处 + 行标签存 PA + `cross_pa_q`/`id_pa_q`、数据总线与 PTW 复用单笔在途、`sfence.vma` 全清。
