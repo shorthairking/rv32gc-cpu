@@ -444,6 +444,8 @@ trap 签名 / 存储未落盘"**全部由本轮修复的核内缺陷解释**，�
   `docs/design/spec/03-pipeline-regs.md`（两处表）；RTL 里原先**硬编码的 `[72:0]` / `73'd0`
   已全部改为 `` `UOP_CTRL_W `` 宏**（否则 `dec_ctrl[73]` 读出 X，会污染 PC/CSR 通路，实测表现为
   仿真卡死在取指 X 地址）。
+* **Zicboz/Zicbop 顺带全绿**：`Zicboz` 1/1、`Zicbop` 3/3。CBO.ZERO 的 CBZE 许可位与 menvcfg/
+  senvcfg 一起在本轮实现，`prefetch.{i,r,w}` 本核按提示指令（NOP）处理，两边一致即通过。
 * **用例 ISA 串自动合成**：`scripts/arch_test_build.sh` 改为「DUT 基座 rv32imac_zicsr_zifencei_zicntr
   ∪ 用例 `START_TEST_CONFIG` 头声明的扩展」。写死基座会让 Zicbom/Zihintpause 因缺扩展而整组 0/N；
   直接用头部串又缺 `_zicntr`（Zicsr 组把 `csrrs instret` 当非法，实测 4/6 FAIL）。故取并集。
@@ -452,7 +454,7 @@ trap 签名 / 存储未落盘"**全部由本轮修复的核内缺陷解释**，�
 
 | 项 | 结果 |
 |---|---|
-| arch-test **12 组**：`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo`/`Zalrsc`/`Misalign`/`MisalignZca`/`Zicntr`/`Zicbom`/`Zihintpause` | **39/8/6/1/26/9/2/5/4/2/3/1 全 PASS**（共 **106 例 0 失败**） |
+| arch-test **14 组**：`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo`/`Zalrsc`/`Misalign`/`MisalignZca`/`Zicntr`/`Zicbom`/`Zicboz`/`Zicbop`/`Zihintpause` | **39/8/6/1/26/9/2/5/4/2/3/1/3/1 全 PASS**（共 **110 例 0 失败**） |
 | 端到端 | `SIM: PASS hello`、`SIM: PASS memtest` |
 | 单元测试 | AXI 79 / EXEC 2461 / DECODER 254 全通过 |
 | A 扩展定向自测 | `sim/tests/lrsc.S`（28 项检查）→ `LRSC_DIRECTED: PASS` |

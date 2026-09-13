@@ -54,9 +54,9 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ## 4. 当前状态与卡点（第 7 轮结束时的事实，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
-2. **arch-test 12 组全绿（106 例 0 失败）**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、
+2. **arch-test 14 组全绿（110 例 0 失败）**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、
    `Zca` 26/26、`Zaamo` 9/9、`Zalrsc` 2/2、`Misalign` 5/5、`MisalignZca` 4/4、`Zicntr` 2/2、
-   **`Zicbom` 3/3**、**`Zihintpause` 1/1**。
+   **`Zicbom` 3/3**、**`Zicboz` 1/1**、**`Zicbop` 3/3**、**`Zihintpause` 1/1**。
    批量：`bash scripts/run_arch_test_suite.sh <组名>`（JOBS=4 并行更快）。
    注意：`run_arch_test.sh` 默认加 `-DMISALIGNED_TRAP`；**MARCH 已改为自动合成**（基座
    rv32imac_zicsr_zifencei_zicntr ∪ 用例头部声明的扩展），不要再写死 MARCH，否则会整组失败。
