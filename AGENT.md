@@ -306,15 +306,40 @@
 **arch-test 接入进展（本轮用锁步连续定位并修复 3 个缺陷）**：
 - `sim/tests/arch_stub.S`（0x0 → `lui t0,0x80002; jr t0`）+ 镜像重定位已完成；arch-test 的 CLINT/UART 地址在阶段 2A 指向已映射 scratch（避免引入未实现的 CLINT）。
 - 锁步发现并修复：① **CSR 写地址错位**（`wb_csr_addr_q` 误接 MEM 级信号 → CSR 写落到错误地址）；② **CSR RAW 冒险**（`csrr` 在 ID 组合读，早于前一条 `csrw` 的 WB 写 → 读到旧值；已按 `ctrl.is_serial` 对 CSR/系统指令做"等流水线排空"的顺序化停顿）；③ **转发网络遗漏 CSR 写回**（MEM 级转发用 `mem_alu_q` 而非 `mem_csr_rdata_q`，导致 `csrr` 的消费者拿到垃圾值）。
-- 修复后：`I-add-00` 的**前 378 条提交（PC/rd/wdata）与 Spike 完全一致**；完整用例在 5M 拍超时前未跑完（本核无 Cache，arch-test 规模下周期数偏大）→ 下一轮：提高仿真周期上限并把锁步轨迹拉长，定位后续分歧；同时把 `+timeout` 用于长测试。
+- 修复后：`I-add-00` 的**前 378 条提交（≥0x8000_0000，PC/rd/wdata）与 Spike 完全一致**。
 
-**待办（阶段 2A 剩余）**：memtest 通过 → arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通 → CSR/异常/PMP 完善 → Sv32 MMU + L1 Cache → FPGA tcl 与上板 B1~B3。
+**第 4 轮（goal round 4）结论 —— I-add-00 仍未跑完，已定位到两个具体现象（下一步的入口）**：
+
+1. **周期数远超预期**：把 TB 超时提到 **3000 万拍**仍在 25 分钟内未完成（`RV32GC_TIMEOUT=30000000 bash scripts/run_sim.sh I-add-00` → `TB: TIMEOUT`）。本核无 Cache，arch-test 全量签名比较规模大，但 30M 拍仍不够说明还有停滞。
+2. **仿真在特定阶段极慢 + 出现陷阱**：用增强的调试 TB（`sim/tb/tb_debug_min.v`，本次新增每 500 拍 STATE 打印与 `CSRID`/`CSRW` 观测）得到：
+   - `STATE cyc=1000/1500: pc=8000652c | IDpc=80006528 | EXpc=80006524 | MEMpc=80006520 memst=2(M_WAIT) | WBpc=8000651c`，`front_hold=1`
+     → **PC 落在 0x8000_65xx（rvtest 陷阱处理程序区），说明测试确实在反复进陷阱**；MEM 处于 `M_WAIT` 等 AXI 响应；同时 `front_hold=1`（CSR/系统指令顺序化停顿）持续多拍。
+   - `STATE cyc=2000: pc=80046840` → 已回到测试主体，说明陷阱能正确返回。
+   - 240 秒挂钟只推进到约 2000 拍（≈20 拍/秒），远慢于 `hello`（353 拍秒级完成）与 `memtest`（约 10^5~10^6 拍数分钟）→ **强烈怀疑存在组合环/零时间振荡**（在 `front_hold` 或 `M_WAIT` 期间每拍产生大量 delta 周期），或某个访问路径反复重试。
+   - 提交轨迹最后停在 `C1991 pc=80046824 / C1993 pc=8004682c`（0x8004_682x 附近的签名计算循环）。
+
+**下一轮的第一步（已备好工具与命令）**：
+```bash
+# 1) 先确认是否组合环：把 STATE 打印改为每 1 拍（临时），看 cyc 是否推进
+#    或对 cyc=1990~2010 区间 dump VCD 观察；同时用 verilator --lint-only 检查组合环告警
+# 2) 拉长锁步：debug TB 的周期上限已放宽，用
+bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_0000 布局的 ELF
+#    或直接用现有 mem_hi 镜像跑 tb_debug_min 并把 RTL 轨迹扩大到 ≥5000 条提交
+# 3) 定位到具体指令后用 Spike 的 --log-commits 对照该 PC 附近的期望行为
+```
+
+**待办（阶段 2A 剩余）**：① 查清 I-add-00 的停滞/极慢根因（疑组合环或 CSR 顺序化停顿与 M_WAIT 的交互）→ ② arch-test 子集（I/M/Zicsr/Zifencei/Zca）全绿 → ③ 补 CSR/异常/PMP → ④ Sv32 MMU + L1I/L1D/L2 Cache → ⑤ FPGA tcl 与上板 B1~B3。
 
 ---
 
 ## 7. 当前状态与下一阶段计划
 
-**当前状态**：阶段一已完成，**等待用户审阅与"开始阶段二"的明确指令**。
+**当前状态（2026-09-13，阶段 2A 进行中）**：按"开始阶段 2A"指令已执行 4 个 goal round。
+- ✅ 仿真/回归环境（iverilog + Verilator + Spike 参考模型 + 自研 TB + 锁步工具链）已建成
+- ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 257）
+- ⏳ arch-test `I-add-00`：前 378 条提交与 Spike 锁步一致，但完整用例未跑完（停滞/极慢，疑组合环）
+- 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）
+
 
 > **阶段 2A 的实施依据**：`docs/design/spec/`（实现级规格书）已全部就绪，RTL 开发按 `spec/00-conventions.md` §8 的顺序自底向上推进；每写一个模块，先按 `spec/09-verification-interface.md` §4 建对应单元测试。
 

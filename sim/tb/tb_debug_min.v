@@ -77,6 +77,14 @@ module tb_debug_min;
     if (dut.u_core.id_valid_q && dut.u_core.c_csr_op != 2'd0)
       $display("CSRID cyc=%0d pc=%h op=%0d addr=%h rs1=%0d", cyc, dut.u_core.id_pc_q,
                dut.u_core.c_csr_op, dut.u_core.dec_csr_addr, dut.u_core.dec_rs1);
+    // PERIODIC：每 50000 拍打印一次流水线状态（用于定位停滞）
+    if ((cyc % 500) == 0 && cyc > 0)
+      $display("STATE cyc=%0d pc=%h stall=%b front_hold=%b | IDv=%b IDpc=%h | EXv=%b EXpc=%h | MEMv=%b MEMpc=%h memst=%0d | WBv=%b WBpc=%h",
+        cyc, dut.u_core.pc_q, dut.u_core.stall, dut.u_core.front_hold,
+        dut.u_core.id_valid_q, dut.u_core.id_pc_q,
+        dut.u_core.ex_valid_q, dut.u_core.ex_pc_q,
+        dut.u_core.mem_valid_q, dut.u_core.mem_pc_q, dut.u_core.memst_q,
+        dut.u_core.wb_valid_q, dut.u_core.wb_pc_q);
     if (dut.u_core.wb_retire) begin
       $display("C%0d pc=%h instr=%h rd=%0d wd=%h wen=%b", cyc, dut.u_core.wb_pc_q,
                dut.u_core.wb_instr_q, dut.u_core.wb_rd_q, dut.u_core.wb_wdata, dut.u_core.wb_wen);
