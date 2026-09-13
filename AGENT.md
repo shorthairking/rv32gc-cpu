@@ -63,6 +63,7 @@
 | D12 | 参考模型用 **Spike**（自行编译） | arch-test 需要参考签名；Spike 可输出提交级轨迹用于锁步比对 | Sail：OCaml 依赖重；NEMU：仅 LA32R |
 | D13 | 乘法器用 DSP48E1（`*` 推断），除法器/浮点自研 | 避免 `div_gen`/`floating_point` IP 的仿真依赖（Verilator 无法编译 .xci）；面积与延迟可控 | 直接例化 IP：仿真环境受限 |
 | D14 | 分区统一定义为 `256K(env),50M(kernel)ro,1M(dtb),-(rootfs)` | 解决参考实现/DTS/文档三处冲突，且避免环境变量与内核镜像冲突 | 沿用 50M@0：env 无处安放 |
+| D15 | **平台适配（不做 AXI 编址改造）**：核**不改**平台 AXI 地址映射；RISC-V 侧靠"三处约定"适配：① 上板复位向量取平台启动窗口 `0x1C00_0000`（SPI-XIP/SRAM，`RESET_PC` 为编译期宏）；② 镜像/软件按平台 DDR `0x0000_0000` 链接加载（RISC-V 习惯的 `0x8000_0000` 不适用；`0x8000_0000` 仅仿真里给 arch-test 用）；③ RISC-V 期望的 CLINT/PLIC `0x0200_0000/0x0C00_0000` 平台没有 → 用 D5 的**核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）**，并在 DTS/OpenSBI 参数与文档中显式声明 | 依据平台硬事实：DDR3 是 **AXI 默认从设备，位于 `0x0–0x07FF_FFFF`**；`0x1C00_0000` 只是 1 MiB 启动窗口；CONFREG/UART/NAND 是 SoC 设备窗口（`docs/kb/01-chiplab-platform.md` §3、`docs/design/00-overview.md` §2.2）。**AXI 编址与指令集无关**，ISA 也不规定物理地址映射，故"为符合 RV32 而改 AXI 编址"既不必要也不正确 | 直接改平台 RTL/约束：改 SoC 顶层与工程、失去平台复用，且与 LA32R 参考实现冲突 |
 
 ---
 
@@ -393,6 +394,7 @@ ADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU，`rd`=旧值、内存=新值）、LR 写�
 - ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
 - ✅ A 扩展（LR/SC/AMO）执行通路已实现（写回阶段 + 读-改-写 + 保留集 + 原子对齐检查）
 - ⏭ 下一步：Zaamo/Zalrsc 的 trap 签名记录一致性 → CSR/异常/PMP 完善 → Sv32 MMU + Cache → FPGA 上板
+- 📌 **平台适配结论（D15）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、以及把核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI —— 已作为任务 2A-7 列入
 - 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）
 
 
@@ -408,6 +410,7 @@ ADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU，`rd`=旧值、内存=新值）、LR 写�
 | 2A-4 | MMU（Sv32 TLB+PTW）与 L1I/L1D、L2 | `rtl/mmu/`、`rtl/mem/` | Cache/TLB 单元测试通过 |
 | 2A-5 | arch-test 接入（Spike 生成签名）+ 自研裸机测试框架 | `sw/tests/`、`sim/log` | I/M/A/F/D/C/Zicsr/Zifencei 子集全绿 |
 | 2A-6 | FPGA 工程脚本与上板 | `fpga/build_chiplab.tcl`、bit 流 | 串口输出 + 数码管正确 + 60 MHz 收敛 |
+| 2A-7 | **平台适配（复位向量/镜像布局/RISC-V 内存映射）**：`RESET_PC=0x1C00_0000` 上板取值、平台 DDR `0x0` 链接脚本、DTS/OpenSBI 的 DRAM 基址与核内 CLINT/PLIC 地址声明、地址映射自检 | `docs/porting/00-overview.md` §平台适配、`sim/tests/link.ld`（0x0 已就绪）、`platform_override`/DTS 片段 | 上板从 `0x1C00_0000` 启动→跳 DDR；软件（OpenSBI/U-Boot/内核）按 `0x0` DRAM 与 `0x1F00_0000/0x1F10_0000` 的 CLINT/PLIC 跑通 |
 
 **阶段二开工前需要用户确认/配合的事项**
 1. ~~在沙箱外执行 `sudo apt install verilator iverilog gtkwave`~~ → **已完成**（Verilator 5.020 / Icarus Verilog 12.0 已就绪，`xvlog/xelab/xsim` 亦可用）；
