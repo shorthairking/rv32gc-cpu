@@ -591,6 +591,67 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 阶段 2A 进展（第 10 轮，2026-09-13）：PMP 落地（2A-3 收尾，P1-b）
+
+**结论**：实现 PMP（16 项，G=0 / 4 字节粒度，TOR/NA4/NAPOT + 锁定语义 + S/U 访问检查），
+`tests/priv` 的 PMP 组由「0 通过」提升到 **69 / 73 可达用例通过**。详见下表与失败清单。
+
+#### 交付物
+
+| 文件 | 说明 |
+|---|---|
+| `rtl/csr/rv32_pmp.v`（新增，197 行） | **纯组合**检查器：16 项匹配（TOR/NA4/NAPOT，无循环 NAPOT 掩码）+ **最低编号匹配项决定** + 全字节匹配要求 + `L=0&&M` 通过 / 无匹配 M 通过、S/U 拒绝；一个匹配引擎带**两组权限需求**（`permit` 读 / `permit2` 写） |
+| `sim/tests/unit/tb_unit_pmp.v` + `scripts/run_unit_pmp.sh`（新增） | **`PMP_UNIT: PASS (443 checks)`**（定向 + A 模式/L/RWX 暴扫 + 随机对照），模块可独立编译零告警 |
+| `rtl/csr/rv32_csr.v` | `pmpcfg0-3`@0x3A0-0x3A3 / `pmpaddr0-15`@0x3B0-0x3BF（`0x3A4-0x3AF` 不存在⇒非法指令）；**逐项锁定合并**（L=1⇒整字节忽略；L=1&&A=TOR⇒`pmpaddr[i-1]` 也忽略）；**写归一**（保留位 [6:5] 忽略、`R=0⇒W 丢弃`，对齐 Spike）；**WB→ID 读旁通返回合并后的有效值**；输出 `pmpcfg_o/pmpaddr_o` |
+| `rtl/pkg/rv32gc_defs.vh` | `CSR_PMPADDR1-15`、`` `IS_PMPCFG_ADDR ``/`` `IS_PMPADDR_ADDR `` |
+| `rtl/top/rv32gc_core.v` | PMP 接入：取指侧**按 2 字节 parcel 分别查**（`u_pmp_if_a/b`，tval=被拒 parcel 地址）；访存侧在 MEM `M_IDLE` **发起请求前**检查（不通过⇒不拉请求、直接 `M_DONE`，WB 报 cause 5/7）；`mstatus.MPRV` 接出并只作用于数据访问；**非对齐优先于 PMP** |
+| `docs/design/spec/07-priv-csr-mmu.md` §7 | 按实际实现重写（结构/端口/性能约束） |
+| `docs/design/spec/09-verification-interface.md` §3.4 | MMU-10..15 指向新实现；订正"G=0 时 `pmpaddr` 低 2 位恒 0"的旧表述；记录判定规则/检查点/性能约束 |
+| `sim/arch_test/config/rvtest_config.h` 等 | （第 9 轮已提交）特权组运行支持 + PMP 宏 |
+
+#### 本轮修复的 4 个真实缺陷（全部有 Spike 侧依据 + 对照实验）
+
+| # | 缺陷 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | **访存 PMP 拒绝会死锁**（设计风险，实现时已规避） | M_IDLE 不拉请求又不回 `M_DONE` ⇒ `mem_stall` 恒 1 ⇒ `advance_all` 恒 0 | 复用 misaligned 的"免请求 + 直接进 `M_DONE`"写法，由 WB 级精确报 trap |
+| 2 | **非法指令 `mtval` 用了 RVC 展开值** | `id_excp_tval` 用 `dec_instr`；保留编码 `c.addi4spn`(nzuimm=0) 被展开成 `addi x8,x2,0`=0x00010413，而 Spike 记 `insn.bits()`=0x0000 | 改用**原始指令位**（16 位指令取低 16 位、高半字补 0）⇒ 修复 9 例 TOR + 3 例 NA4 |
+| 3 | **取指 PMP 检查粒度过粗** | 本核按"整条指令"一次查并要求同一项覆盖全部扇区；Spike `fetch_slow_path` 按 **2 字节 parcel** 各查一次（`translate(…,sizeof(insn_parcel_t))`），parcel 只折到其所在 4 字节扇区 | 改为 `u_pmp_if_a`(pc) + `u_pmp_if_b`(pc+2) 两次 `acc_size=1` 检查，tval=被拒 parcel 地址 ⇒ 修复 6 例 XWR_all/杂项 + 3 例 misaligned |
+| 4 | **AMO 的 PMP 违例报错 cause 错** | 按"读相位先判"报 cause 5；Spike 的 `amo()` 走 store 检查且被 `convert_load_traps_to_store_traps` 包住 ⇒ **AMO 被拒恒 cause 7** | `mem_pmp_cause = (amo || store/sc) ? 7 : 5` ⇒ 修复 `PMPZaamo_cfg_wr-00` |
+
+另修：**非对齐优先于 PMP**（Spike `load_slow_path` 先抛 cause 4/6，PMP 在 `translate()` 内）——
+`mem_pmp_deny = !mem_pmp_ok && !mem_misaligned`（仅 `-DMISALIGNED_TRAP`）⇒ 修复 `PMPSm_cfg_tor_all-00`。
+
+#### 验证（本轮实测；主 Agent 复跑）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 单元测试（PMP） | `bash scripts/run_unit_pmp.sh` | **`PMP_UNIT: PASS (443 checks)`** |
+| 特权组（PMP） | `bash scripts/run_arch_test_suite.sh <组>` | PMPSm **37/38**、PMPS **9/11**、PMPU **9/11**、PMPZaamo **1/1**、PMPZalrsc **1/1**、PMPZca **12/15**（3 例为本核无 Zcb/F/D 的 ISA 不可达）⇒ **69 / 73 可达** |
+| **回归（P1-c 不可退）** | 18 组 `run_arch_test_suite.sh` ×（JOBS=4） | **18 组 124 例全 PASS**（39/8/6/1/26/9/2/5/4/2/3/1/3/1/4/4/4/2） |
+| 其它回归 | `hello` / `memtest` / `run_unit_axi|exec|decoder` / `run_lrsc_test.sh` | 全 PASS（memtest 2,026,669 拍与基线一致；EXEC 2461 / DECODER 254 / AXI 79；`LRSC_DIRECTED: PASS`） |
+| **性能** | 50k 拍 `tb_debug_min` | PMP 接入后 **1.07s**（含 PMP 前的基线 2.85s）—— 关键：NAPOT 掩码**无循环**、访存侧**只实例化一个匹配引擎**（复制匹配树会慢 3 倍以上） |
+
+#### 仍失败 / 不可达（**未完成项，下一轮继续**）
+
+| 用例 | 状态 | 说明 |
+|---|---|---|
+| `PMPS/PMPS_csr_access-00`、`PMPU/PMPU_csr_access-00` | **FAIL（在查）** | DUT **一个陷阱都没记录**（参考期望 ~640 字陷阱签名）：S 模式下读写 PMP CSR 应报非法指令，实际没走到 trap。疑与 T-SBI 模式切换或该用例的恢复路径有关 |
+| `PMPS/PMPS_mprv_check-01-00`、`PMPU/PMPU_mprv_check-01-00` | **FAIL（在查）** | MPRV 相关，诊断进行中（`mprv_check-02` 已 PASS） |
+| `PMPSm/PMPSm_cfg_A_tor_zero-00` | **平台口径差异** | 探针地址=**物理 0**：Spike 默认内存映射在 0 无存储 ⇒ 参考记 3 个 access fault；本仿真平台把 0..16 MiB 铺成 DDR（与真实平台一致：DDR3 在 `0x0`）且复位桩在 0 ⇒ 访问成功。另发现 `rv32_ifetch.v` 的 `if_rsp_err` **从未使用**（取指总线错误无法转 cause 1），属真实缺口，随 2A-7 平台收尾一起做 |
+| `PMPF`(1)、`PMPZca` 的 zcb/zcf/zcd(3) | **ISA 不可达** | 需要 F/D 或 Zcb/Zcf/Zcd；已与用户确认按 74/78 口径验收 |
+
+#### 旁证：`priv_trap.S` 定向自测（本轮新增，未提交缺陷修复）
+
+`sim/tests/priv_trap.S`（718 行，46 检查点）+ `scripts/run_priv_trap_test.sh` 首次系统性地覆盖了
+**M/S/U 三态 + 陷阱进出**这条 arch-test 非特权组从未走过的路径：40 项通过、1 项失败、5 项 SKIP。
+失败项是**核的真实缺陷**：**中断永不投递** —— `rv32gc_core.v` 的 `.trap_is_int(1'b0)` 恒 0、陷阱决策链
+没有任何 `mip/mie` 项，而 `rv32_csr.v` 的 `mip` 软件可写并可读回（`mip_q <= csr_wdata & 32'h0888`），
+`core_top.v` 的 `intrpt[7:0]` 只接进 dummy。即"能置挂起位但硬件永不响应"，两头都不合规范
+（`machine.adoc norm:intrmipmie_op` / `norm:intrmipmieboundedtime`）。**对 PMP 组不阻塞**（PMP 用例
+不依赖中断），但 CLINT/PLIC/Linux 之前必须补 —— 已列入 §7。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -604,8 +665,13 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 - ✅ **SPI-XIP 启动链路（2A-7a，第 9 轮）**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**
   （`RESET_PC=0x1C00_0000` → SPI 窗口取首条指令 → 跨 ~448 MiB 跳 DDR `0x0` → 退出码 0）；D16② 的
   "取指命中 SPI 窗口绕过 I-Cache"判定点已落地（当前无 Cache，行为中性）
-- ⏭ 下一步（顺序即优先级）：**PMP（2A-3 收尾）** → 未接入组（`Zimop` 40/`Zcmop` 8）→ Sv32 MMU → L1I/L1D/L2 Cache
-  → 平台适配收尾（2A-7b~d：启动镜像三件套/DTS+OpenSBI 声明/FPGA tcl 与上板 B1~B3）
+- ✅ **PMP（2A-3 收尾，第 10 轮）**：16 项 + 锁定语义 + S/U 访问检查；`run_unit_pmp.sh` → `PMP_UNIT: PASS (443)`；
+  `tests/priv` PMP 组 **69 / 73 可达用例通过**（PMPSm 37/38、PMPS 9/11、PMPU 9/11、PMPZaamo 1/1、
+  PMPZalrsc 1/1、PMPZca 12/15）；回归 18 组 124 例 + 单元测试 + hello/memtest + lrsc 全绿
+- ⏭ 下一步（顺序即优先级）：① 收尾 4 例 PMP 失败（`PMPS/PMPU_csr_access`、`PMPS/PMPU_mprv_check-01`）；
+  ② **实现中断投递**（`mip/mie` 评审 + `trap_is_int` + CLINT/PLIC；`priv_trap.S` 已给出最小复现）；
+  ③ 取指总线错误通道（`rv32_ifetch.if_rsp_err` 未使用）+ 平台把物理 0 的口径与真实映射对齐；
+  ④ 未接入组 `Zimop`(40)/`Zcmop`(8)；⑤ Sv32 MMU → L1I/L1D/L2 Cache（接 D16② 判定点）→ 2A-7b~d 上板
 - 📌 **平台适配结论（D15/D16）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；
   需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI
 - 📌 **待用户确认（2A-4 前）**：数据侧访问 SPI-XIP 窗口（`0x1C00_0000`）是否也要绕过 L1D（见 `spec/08-bus-axi.md` §2.1 待决项）

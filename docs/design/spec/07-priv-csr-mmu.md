@@ -337,12 +337,34 @@ VA 匹配实现（一次比较覆盖 4 K/4 M）：`va_hit(e,rs1) = e.IS_4M ? (e.
 | `TVM=1 && S` | 非法指令 | `machine.adoc:732-742` |
 | PMP 改写后 / `satp` 写入 | PMP 改写后软件须执行 `sfence.vma x0,x0` 同步；写 `satp` **不隐含失效**，软件须自行 `sfence.vma` | `machine.adoc:3631-3636`、`supervisor.adoc:1131-1137` |
 
-## 7. `pmp.v`：物理内存保护
+## 7. PMP：物理内存保护（`csr/rv32_pmp.v` + `csr/rv32_csr.v`）
 
-### 7.1 端口与规模
+### 7.1 结构与规模（**阶段 2A 已落地，取代本节原先的"单状态模块"方案**）
 
-`module pmp(input clk, rst_n, input [11:0] csr_addr, input [31:0] csr_wdata, input csr_wen, input [3:0] csr_wstrb, output [31:0] csr_rdata, input [33:0] chk_addr, input [1:0] chk_size, input [1:0] chk_priv, input [2:0] chk_type /*0=R 1=W 2=X*/, output chk_ok, output cfg_changed);`
-`PMP_ENTRIES=16`；`pmpcfg0-3`@0x3A0-0x3A3；`pmpaddr0-15`@0x3B0-0x3BF（`machine.adoc:3353-3357,3379-3381`）。
+| 部分 | 位置 | 职责 |
+|---|---|---|
+| PMP CSR 状态与写路径 | `rtl/csr/rv32_csr.v` | `pmpcfg0-3`@0x3A0-0x3A3、`pmpaddr0-15`@0x3B0-0x3BF（`0x3A4-0x3AF` **不存在** ⇒ 非法指令）；锁定合并、写归一、WB→ID 读旁通；输出 `pmpcfg_o[127:0]` / `pmpaddr_o[511:0]` |
+| 匹配与权限判定 | `rtl/csr/rv32_pmp.v` | **纯组合、无状态**：`pmpcfg/pmpaddr + addr + acc_size + eff_priv + need_r/w/x`（两组）→ `permit`/`permit2`/`match_any`/`match_all` |
+
+**为什么不用原方案的单状态模块**：PMP CSR 必须与其它 CSR 共用同一条读写与**旁通**路径（"写锁定项之后
+紧跟的那条读"必须返回**锁定/归一后的有效值**，是 arch-test 最容易挂的点），状态放在 `rv32_csr.v` 才能复用
+既有结构；检查器保持纯组合则便于独立单测（`sim/tests/unit/tb_unit_pmp.v`，443 checks）。
+
+```verilog
+module rv32_pmp #(parameter integer PMP_ENTRIES = 16) (
+  input  wire [PMP_ENTRIES*8-1:0]  pmpcfg,   input wire [PMP_ENTRIES*32-1:0] pmpaddr,
+  input  wire [31:0] addr,  input wire [1:0] acc_size,  input wire [1:0] eff_priv,
+  input  wire need_r, need_w, need_x,        // 第一组权限需求（取指：need_x）
+  input  wire need_r2, need_w2, need_x2,     // 第二组（与第一组**共享同一次匹配**）
+  output wire permit, permit2,  output wire [PMP_ENTRIES-1:0] match_any, match_all
+);
+```
+
+* `addr` 为 32 位：基线核 VA=PA，Sv32 的 34 位物理地址在 2A-4 接入 MMU 时加宽。
+* **访存侧只实例化一个匹配引擎**：`permit` 供读相位、`permit2` 供写相位（AMO 先读后写 ⇒ 缺 R 报
+  cause 5、缺 W 报 cause 7，与 Spike 的 mmu 调用顺序一致）。实测复制匹配树会让 iverilog 仿真慢 3 倍以上，
+  且 NAPOT 掩码必须**无循环**实现（原 for 循环版本同样拖慢 10 倍）。
+* `cfg_changed` **不再需要**：本核不缓存 PMP 判定（取指每拍、访存每次都在组合逻辑上现算）。
 
 ### 7.2 匹配算法伪代码（`machine.adoc:3427-3540`）
 

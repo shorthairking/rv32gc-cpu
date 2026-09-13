@@ -171,16 +171,93 @@ module rv32gc_core (
     .xret_valid(xret_take), .xret_is_sret(wb_is_sret),
     .xret_pc(xret_pc), .xret_new_priv(xret_new_priv),
     .priv_o(priv_q),
-    .mstatus_mie(), .mstatus_sie(), .mstatus_mprv(), .mstatus_mpp(),
+    .mstatus_mie(), .mstatus_sie(), .mstatus_mprv(mstatus_mprv_w), .mstatus_mpp(mstatus_mpp_w),
     .timer_irq_pending(), .ext_irq_pending(),
     .menvcfg_cbcfe(menvcfg_cbcfe), .menvcfg_cbze(menvcfg_cbze), .menvcfg_cbie(menvcfg_cbie),
-    .senvcfg_cbcfe(senvcfg_cbcfe), .senvcfg_cbze(senvcfg_cbze), .senvcfg_cbie(senvcfg_cbie)
+    .senvcfg_cbcfe(senvcfg_cbcfe), .senvcfg_cbze(senvcfg_cbze), .senvcfg_cbie(senvcfg_cbie),
+    .pmpcfg_o(pmpcfg_all), .pmpaddr_o(pmpaddr_all)
   );
   // Zicbom/Zicboz 低特权级执行许可（menvcfg/senvcfg 的 CBCFE/CBIE/CBZE）
   wire menvcfg_cbcfe, menvcfg_cbze;
   wire [1:0] menvcfg_cbie;
   wire senvcfg_cbcfe, senvcfg_cbze;
   wire [1:0] senvcfg_cbie;
+
+  // ============================================================ PMP（阶段 2A：16 项，G=0）
+  // 配置来自 `rv32_csr`（pmpcfg0-3 / pmpaddr0-15），匹配与权限由**纯组合**检查器
+  // `rv32_pmp` 完成（规范要点见该文件头）。两个检查点：
+  //   ① 取指：**ID 级**按指令地址检查 → cause 1，tval = 该指令地址；
+  //   ② 访存：**MEM 的 M_IDLE**，在发起任何总线请求**之前**检查；不通过则不拉请求、直接进
+  //      M_DONE，由 WB 级精确报 cause 5/7（与 misaligned 同一写法）。
+  // ⚠ 关键（本项目已踩过的坑）：**不能用"闸掉总线请求"实现拒绝** —— M_IDLE 不发请求又不回
+  //   M_DONE 会让 mem_stall 恒 1 ⇒ advance_all 恒 0 ⇒ 死锁且永不进 trap；取指侧若只是不拉
+  //   if_req_valid，则 line_valid 永不置 ⇒ 前端死锁、ID 永远拿不到指令去报错。故取指违例在
+  //   ID 报（指令虽已取回但**不执行**：rd/store/CSR 全部无副作用）。
+  wire        mstatus_mprv_w;
+  wire [1:0]  mstatus_mpp_w;
+  wire [`PMP_ENTRIES*8-1:0]  pmpcfg_all;
+  wire [`PMP_ENTRIES*32-1:0] pmpaddr_all;
+  // 数据侧有效特权级：`mstatus.MPRV=1` 且当前为 M 时用 MPP（machine.adoc MPRV 语义）；
+  // 取指**不受 MPRV 影响**（恒用当前特权级）。
+  wire [1:0]  pmp_eff_priv_d = ((priv_q == `PRV_M) && mstatus_mprv_w) ? mstatus_mpp_w : priv_q;
+
+  // 访存侧：读相位与写相位各一个检查结果（AMO 先读后写 ⇒ 缺 R 报 cause 5、缺 W 报 cause 7，
+  // 与 Spike 的 mmu 调用顺序一致；SC 与普通 store 一样按写检查）
+  wire [1:0]  mem_pmp_size = (mem_mem_size_q == `MSZ_BYTE) ? 2'd0 :
+                             (mem_mem_size_q == `MSZ_HALF) ? 2'd1 : 2'd2;
+  wire        pmp_d_r_ok, pmp_d_w_ok, pmp_x_ok_if;
+  // 数据侧只实例化**一个**匹配引擎：permit 供读相位、permit2 供写相位
+  // （AMO 先读后写 ⇒ 缺 R 报 cause 5、缺 W 报 cause 7，与 Spike 一致）。
+  // 这样避免复制整条匹配树 —— 实测两个实例会让整核 iverilog 仿真慢 3 倍以上。
+  rv32_pmp u_pmp_d (
+    .pmpcfg(pmpcfg_all), .pmpaddr(pmpaddr_all),
+    .addr(mem_addr_q), .acc_size(mem_pmp_size), .eff_priv(pmp_eff_priv_d),
+    .need_r(1'b1), .need_w(1'b0), .need_x(1'b0),
+    .need_r2(1'b0), .need_w2(1'b1), .need_x2(1'b0),
+    .permit(pmp_d_r_ok), .permit2(pmp_d_w_ok), .match_any(), .match_all()
+  );
+  // 取指侧：**按 2 字节 parcel 分别检查**（与参考模型 Spike 一致，见下）。
+  rv32_pmp u_pmp_if_a (
+    .pmpcfg(pmpcfg_all), .pmpaddr(pmpaddr_all),
+    .addr(id_pc_q), .acc_size(2'd1), .eff_priv(priv_q),
+    .need_r(1'b0), .need_w(1'b0), .need_x(1'b1),
+    .need_r2(1'b0), .need_w2(1'b0), .need_x2(1'b0),
+    .permit(pmp_x_ok_a), .permit2(), .match_any(), .match_all()
+  );
+  rv32_pmp u_pmp_if_b (                 // 第二 parcel（仅 32 位指令用）
+    .pmpcfg(pmpcfg_all), .pmpaddr(pmpaddr_all),
+    .addr(id_pc_q + 32'd2), .acc_size(2'd1), .eff_priv(priv_q),
+    .need_r(1'b0), .need_w(1'b0), .need_x(1'b1),
+    .need_r2(1'b0), .need_w2(1'b0), .need_x2(1'b0),
+    .permit(pmp_x_ok_b), .permit2(), .match_any(), .match_all()
+  );
+  // 为什么按 parcel 而不是"整条指令一次查"：`tools/spike/riscv/mmu.cc` 的 `fetch_slow_path`
+  // 调 `translate(access_info, sizeof(insn_parcel_t))`，即 **len = 2 字节**；一条 32 位指令分
+  // 两个 parcel 各查一次，而 `pmp_lookup` 把访问折算到 **4 字节扇区**（`addr & -gran`、gran=4）。
+  // 若改成"整条指令必须被同一项覆盖全部扇区"，就比 Spike 更严 —— 实测在跨扇区/跨区域边界的
+  // 指令上多报 cause 1（例：0x…0e 处的 32 位 nop，两个扇区分别由不同项允许时）。
+  // `acc_size=1`（2 字节）恰好等价于"只查本 parcel 所在的 4 字节扇区"。
+
+  wire        pmp_mem_is_amo = (mem_mem_op_q == `MEM_AMO);
+  wire        pmp_mem_is_w   = (mem_mem_op_q == `MEM_STORE) || (mem_mem_op_q == `MEM_SC);
+  wire        mem_pmp_ok     = pmp_mem_is_amo ? (pmp_d_r_ok && pmp_d_w_ok)
+                             : pmp_mem_is_w   ? pmp_d_w_ok
+                                              : pmp_d_r_ok;
+  // AMO 被 PMP 拒绝时**一律**报 cause 7（store/AMO access fault）：Spike 的 `amo()`
+  // （tools/spike/riscv/mmu.h:198-212）先走 store 检查，且整体被 convert_load_traps_to_store_traps
+  // 包住 —— AMO 内部的 load fault 也会被转成 store fault。实测 PMPZaamo_cfg_wr-00 需要此口径。
+  wire [3:0]  mem_pmp_cause  = (pmp_mem_is_amo || pmp_mem_is_w) ? `EXC_STORE_ACCESS
+                                                                : `EXC_LOAD_ACCESS;
+  // 访存侧拒绝信号：**非对齐优先于 PMP**（与 Spike 一致）。
+  // 依据 `tools/spike/riscv/mmu.cc:265-300`（load_slow_path / store_slow_path）：
+  //   access_fault 判定 → 非对齐判定（cause 4/6）→ 才轮到（对齐/已拆分的）真正访存里的 PMP 检查
+  //   （`pmp_ok` 在 `translate()` 内）。若把 PMP 放在最前面，对"既非对齐又被拒绝"的访问会报 5/7，
+  //   而参考期望 4/6（实测 PMPZca_misaligned_{na4,napot,tor} 三例）。
+`ifdef MISALIGNED_TRAP
+  wire        mem_pmp_deny   = !mem_pmp_ok && !mem_misaligned;
+`else
+  wire        mem_pmp_deny   = !mem_pmp_ok;
+`endif
 
   // ID 级异常
   wire        id_is_sys = (c_op_class == `OP_SYS);
@@ -209,10 +286,25 @@ module rv32gc_core (
                               (id_cbo_op == `CBO_ZERO)  ? !cbo_zero_ok  :
                               (id_cbo_op == `CBO_INVAL) ? !cbo_inval_ok  : 1'b0);
 
-  wire        id_excp_valid = id_valid_q && (!dec_legal || id_ecall || id_ebreak || id_cbo_denied);
-  wire [3:0]  id_excp_cause = (!dec_legal || id_cbo_denied) ? `DEXC_ILLEGAL
-                                                           : id_ebreak ? `DEXC_BREAK : ecall_cause;
-  wire [31:0] id_excp_tval  = (!dec_legal || id_cbo_denied) ? dec_instr : 32'd0;
+  // ---- PMP 取指违例（cause 1）：与"非法指令"同层，在 ID 精确报出 ----
+  // 优先级高于非法指令（取指就被拒时 Spike 也是先报取指访问错误）。
+  // tval 与 Spike 对齐：**被拒的那个 parcel 的地址**（第一 parcel 被拒 → pc；仅第二 parcel 被拒 → pc+2）。
+  wire        id_pmp_x_fail_a = id_valid_q && !pmp_x_ok_a;
+  wire        id_pmp_x_fail_b = id_valid_q && (id_ilen_q == 3'd4) && !pmp_x_ok_b;
+  wire        id_pmp_x_fail   = id_pmp_x_fail_a || id_pmp_x_fail_b;
+  wire [31:0] id_pmp_x_tval   = id_pmp_x_fail_a ? id_pc_q : (id_pc_q + 32'd2);
+  // 非法指令的 mtval = **原始指令位**（不是译码器的展开形式）：
+  //   Spike 的 `illegal_instruction()` 抛 `trap_illegal_instruction(insn.bits())`，对 16 位指令就是
+  //   那 16 位本身（高半字为 0）。此前用 `dec_instr`（c.addi4spn 之类保留编码会被展开成 32 位
+  //   `addi`）⇒ mtval 出现 0x00010413 这类"展开值"，与参考签名不符（实测 Tor/Na4 组多例）。
+  wire [31:0] id_instr_raw    = (id_ilen_q == 3'd2) ? {16'd0, id_instr_q[15:0]} : id_instr_q;
+  wire        id_excp_valid = id_valid_q && (!dec_legal || id_ecall || id_ebreak || id_cbo_denied ||
+                                             id_pmp_x_fail);
+  wire [3:0]  id_excp_cause = id_pmp_x_fail                 ? `EXC_INSTR_ACCESS :
+                              (!dec_legal || id_cbo_denied) ? `DEXC_ILLEGAL :
+                              id_ebreak ? `DEXC_BREAK : ecall_cause;
+  wire [31:0] id_excp_tval  = id_pmp_x_fail                 ? id_pmp_x_tval :
+                              (!dec_legal || id_cbo_denied) ? id_instr_raw : 32'd0;
 
   // ID 级 JAL
   wire        id_jal_taken  = id_valid_q && dec_legal && c_is_jal;
@@ -576,6 +668,30 @@ module rv32gc_core (
       // ---------------- 访存 FSM（与 stall 并行推进） ----------------
       case (memst_q)
         M_IDLE: if (mem_needs_fsm) begin
+            // ---- PMP 访存检查：必须在**发起任何总线请求之前**判定 ----
+            // 拒绝路径完全复用 misaligned 的"免请求 + 直接进 M_DONE"写法：不拉 d_req_valid、
+            // 不写任何字节，由 WB 级精确报 cause 5/7，tval = 出错地址。
+            if (mem_pmp_deny) begin
+              m_addr_q      <= mem_addr_q;
+              m_we_q        <= 1'b0;
+              m_size_q      <= mem_mem_size_q;
+              m_uns_q       <= mem_mem_flags_q;
+              m_shift_q     <= mem_addr_q[1:0];
+              m_split_q     <= 1'b0;
+              m_wdata_q     <= mem_rs2_val_q;
+              m_wstrb_q     <= 4'h0;
+              m_wstrb2_q    <= 4'h0;
+              m_is_lr_q     <= 1'b0;      // 被拒的 LR/SC/AMO 不建立保留集
+              m_is_sc_q     <= 1'b0;
+              m_is_amo_q    <= 1'b0;
+              m_amo_op_q    <= 5'd0;
+              m_rs2_q       <= mem_rs2_val_q;
+              m_excp_tval_q <= mem_addr_q;
+              m_excp_cause_q<= mem_pmp_cause;
+              // 被拒的 SC/AMO 消费保留集（规范：SC 失败 / 任何写访问都使保留集失效）
+              if (mem_is_sc || mem_is_amo) resv_valid_q <= 1'b0;
+              memst_q       <= M_DONE;
+            end else begin
 `ifdef MISALIGNED_TRAP
             if (mem_misaligned) begin
               // 不做拆分访问：直接进入 M_DONE 并在 WB 级精确报地址非对齐异常
@@ -641,6 +757,7 @@ module rv32gc_core (
 `ifdef MISALIGNED_TRAP
             end
 `endif
+            end
           end
         M_REQ:  if (d_req_ready) memst_q <= M_WAIT;
         M_WAIT: if (d_rsp_valid) begin

@@ -400,6 +400,27 @@
 `define CSR_PMPCFG2   12'h3A2
 `define CSR_PMPCFG3   12'h3A3
 `define CSR_PMPADDR0  12'h3B0
+`define CSR_PMPADDR1  12'h3B1
+`define CSR_PMPADDR2  12'h3B2
+`define CSR_PMPADDR3  12'h3B3
+`define CSR_PMPADDR4  12'h3B4
+`define CSR_PMPADDR5  12'h3B5
+`define CSR_PMPADDR6  12'h3B6
+`define CSR_PMPADDR7  12'h3B7
+`define CSR_PMPADDR8  12'h3B8
+`define CSR_PMPADDR9  12'h3B9
+`define CSR_PMPADDR10 12'h3BA
+`define CSR_PMPADDR11 12'h3BB
+`define CSR_PMPADDR12 12'h3BC
+`define CSR_PMPADDR13 12'h3BD
+`define CSR_PMPADDR14 12'h3BE
+`define CSR_PMPADDR15 12'h3BF
+// PMP 窗口的"整段"判定（rv32_csr 与核内检查共用；RV32：cfg 4 个字 × 每字 4 项 = 16 项）
+//   0x3A0-0x3A3 → pmpcfg0-3；0x3A4-0x3AF 不存在（访问须报非法指令）
+//   0x3B0-0x3BF → pmpaddr0-15
+// 用法：实参必须是**裸标识符**（Verilog 不允许对带括号的表达式做 part-select）
+`define IS_PMPCFG_ADDR(a)  (a[11:2] == 10'h0E8)
+`define IS_PMPADDR_ADDR(a) (a[11:4] == 8'h3B)
 `define CSR_MCYCLE    12'hB00
 `define CSR_MINSTRET  12'hB02
 `define CSR_MCYCLEH   12'hB80

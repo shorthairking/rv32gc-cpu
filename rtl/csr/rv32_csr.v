@@ -64,7 +64,13 @@ module rv32_csr (
   output wire [1:0]  menvcfg_cbie,        // CBO.INVAL 在 <M 模式的使能（0b00=禁用）
   output wire        senvcfg_cbcfe,       // U 模式额外条件
   output wire        senvcfg_cbze,        // U 模式额外条件
-  output wire [1:0]  senvcfg_cbie         // U 模式额外条件
+  output wire [1:0]  senvcfg_cbie,        // U 模式额外条件
+
+  // ---- PMP 配置输出（供核内 rv32_pmp 检查器使用）----
+  //   cfg[i]  = pmpcfg_o[8*i +: 8]（{L,[6:5]保留=0,A[4:3],X,W,R}）
+  //   addr[i] = pmpaddr_o[32*i +: 32]（= 物理地址 >> 2；G=0 → 32 位全可写）
+  output wire [`PMP_ENTRIES*8-1:0]  pmpcfg_o,
+  output wire [`PMP_ENTRIES*32-1:0] pmpaddr_o
 );
 
   // ---------------------------------------------------------------- 状态寄存器
@@ -85,6 +91,12 @@ module rv32_csr (
   // 位域（RV32）：CBIE[5:4]、CBCFE[6]、CBZE[7]（machine.adoc menvcfg / supervisor.adoc senvcfg）。
   // 复位为 0 = 低特权级禁用 CBO，与规范默认一致。
   reg [31:0] menvcfg_q, senvcfg_q;
+
+  // PMP：16 项。pmpcfg0-3（每字 4 项，共 16 个 8 位 cfg 字节）+ pmpaddr0-15。
+  // G=0（4 字节粒度）：pmpaddr 32 位全可写、NA4 可选，与 Spike 默认
+  // （tools/spike/riscv/cfg.cc:42-43：pmpregions=16、pmpgranularity=4）一致。
+  reg [`PMP_ENTRIES*8-1:0]  pmpcfg_q;
+  reg [`PMP_ENTRIES*32-1:0] pmpaddr_q;
 
   reg [63:0] mcycle_q, minstret_q;
 
@@ -108,6 +120,53 @@ module rv32_csr (
   assign senvcfg_cbcfe  = senvcfg_q[6];
   assign senvcfg_cbie   = senvcfg_q[5:4];
 
+  assign pmpcfg_o  = pmpcfg_q;
+  assign pmpaddr_o = pmpaddr_q;
+
+  // ---------------------------------------------------------------- PMP 写合并（组合）
+  // 语义与**参考模型 Spike** 对齐（本工程的 arch-test 参考签名由它生成）：
+  //   · cfg 字节：只保留 R|W|X|A|L（掩码 8'h9F）——保留位 [6:5] 写忽略、读恒 0；
+  //     无 Smepmp（mseccfg.MML=0）时**丢弃 R=0,W=1 组合的 W**
+  //     （tools/spike/riscv/csrs.cc:276-279：cfg &= ~PMP_W | ((cfg & PMP_R) ? PMP_W : 0)）；
+  //     G=0 ⇒ 粒度就是 4 字节，NA4 不需要归一成 NAPOT（csrs.cc:281 的条件不成立）。
+  //   · 锁定（machine.adoc:3542-3563 norm:pmplbit_function / norm:pmplbitwriteprotection）：
+  //     项 i 的 L=1 ⇒ 写 cfg[i] 与 pmpaddr[i] 都被**忽略**（不报错）；
+  //     此外若项 i+1 的 L=1 且 A=TOR ⇒ 写 pmpaddr[i] 也被忽略。
+  reg  [`PMP_ENTRIES-1:0] pmpcfg_byte_locked;     // cfg 字节锁定
+  reg  [`PMP_ENTRIES-1:0] pmpaddr_entry_locked;   // pmpaddr 项锁定（含 TOR 前驱规则）
+  reg  [`PMP_ENTRIES*8-1:0]  pmpcfg_new;          // 本次写之后的完整值（未写/锁定项保持旧值）
+  reg  [`PMP_ENTRIES*32-1:0] pmpaddr_new;
+
+  function [7:0] pmpcfg_byte_norm;               // 一个 cfg 字节的写入归一
+    input [7:0] b;
+    begin
+      pmpcfg_byte_norm = b & 8'h9F;              // [6:5] 保留位写忽略
+      if (!pmpcfg_byte_norm[0])
+        pmpcfg_byte_norm = pmpcfg_byte_norm & 8'hFD;   // R=0 ⇒ W 丢弃
+    end
+  endfunction
+
+  integer pi;
+  always @(*) begin
+    pmpcfg_new  = pmpcfg_q;
+    pmpaddr_new = pmpaddr_q;
+    for (pi = 0; pi < `PMP_ENTRIES; pi = pi + 1) begin
+      // 锁定掩码（用**当前**值判定，写被忽略不改状态）
+      pmpcfg_byte_locked[pi]   = pmpcfg_q[8*pi + 7];
+      pmpaddr_entry_locked[pi] = pmpcfg_q[8*pi + 7];       // 自身 L
+      if (pi < `PMP_ENTRIES-1)                              // 后继项 L=1 且 A=TOR
+        pmpaddr_entry_locked[pi] = pmpaddr_entry_locked[pi] ||
+                                   (pmpcfg_q[8*pi + 15] && (pmpcfg_q[8*pi + 12 -: 2] == 2'b01));
+      // 新值：只有"被写的那一项"会变（pmpcfg 按 32 位字 → 4 项一组）
+      if ((pi / 4) == csr_waddr[1:0]) begin
+        if (`IS_PMPCFG_ADDR(csr_waddr) && !pmpcfg_byte_locked[pi])
+          pmpcfg_new[8*pi +: 8] = pmpcfg_byte_norm(csr_wdata[8*(pi%4) +: 8]);
+      end
+      if ((pi == csr_waddr[3:0]) && `IS_PMPADDR_ADDR(csr_waddr) && !pmpaddr_entry_locked[pi])
+        pmpaddr_new[32*pi +: 32] = csr_wdata;
+    end
+  end
+
   // ---------------------------------------------------------------- 特权级判定
   // CSR 地址的 [9:8] 位给出最低可访问特权级：00=U 01=S 11=M
   wire [1:0] csr_priv = csr_raddr[9:8];
@@ -116,6 +175,11 @@ module rv32_csr (
   // ---------------------------------------------------------------- 读端口
   always @(*) begin
     csr_rdata = 32'd0;
+    if (`IS_PMPADDR_ADDR(csr_raddr))            // pmpaddr0-15（G=0：32 位全可读回）
+      csr_rdata = pmpaddr_q[32*csr_raddr[3:0] +: 32];
+    else if (`IS_PMPCFG_ADDR(csr_raddr))        // pmpcfg0-3（每字 4 项）
+      csr_rdata = pmpcfg_q[32*csr_raddr[1:0] +: 32];
+    else begin
     case (csr_raddr)
       // ---- 浮点（基线阶段：只读 0 / 可写 fcsr 影子）----
       `CSR_FFLAGS:  csr_rdata = 32'd0;
@@ -206,10 +270,19 @@ module rv32_csr (
 
       default:      csr_rdata = 32'd0;
     endcase
+    end
     // WB→ID 旁路：前一条指令在同拍提交级写同一 CSR 时，读端口返回新值
     // （与寄存器堆的写优先问题同类：写发生在 posedge，而 ID 为组合读）
-    if (csr_wen && !csr_is_fp && (csr_waddr == csr_raddr))
-      csr_rdata = csr_wdata;
+    // PMP 例外：锁定/保留位归一之后的有效值与 csr_wdata 不同，必须返回**合并后的值**
+    // （否则 `csrw pmpcfg0,…; csrr t0,pmpcfg0` 会读到未归一的原始值，与 Spike 不符）
+    if (csr_wen && !csr_is_fp && (csr_waddr == csr_raddr)) begin
+      if (`IS_PMPCFG_ADDR(csr_raddr))
+        csr_rdata = pmpcfg_new[32*csr_raddr[1:0] +: 32];
+      else if (`IS_PMPADDR_ADDR(csr_raddr))
+        csr_rdata = pmpaddr_new[32*csr_raddr[3:0] +: 32];
+      else
+        csr_rdata = csr_wdata;
+    end
   end
 
   // 合法性：地址存在 + 特权级足够 + 读不涉及只写
@@ -228,6 +301,9 @@ module rv32_csr (
         csr_exists = 1'b1;
       default: csr_exists = 1'b0;
     endcase
+    // PMP：0x3A0-0x3A3（pmpcfg0-3）与 0x3B0-0x3BF（pmpaddr0-15）存在；
+    // 0x3A4-0x3AF（RV32 无这些 pmpcfg）与 0x3C0 以上**不存在** → 报非法指令
+    if (`IS_PMPCFG_ADDR(csr_raddr) || `IS_PMPADDR_ADDR(csr_raddr)) csr_exists = 1'b1;
   end
 
   // 特权级检查：机器级 CSR 只能 M 访问；监管级 CSR 需 S 或 M
@@ -301,6 +377,8 @@ module rv32_csr (
       scounteren_q    <= 32'd0;
       menvcfg_q       <= 32'd0;
       senvcfg_q       <= 32'd0;
+      pmpcfg_q        <= {`PMP_ENTRIES*8{1'b0}};    // PMP 复位全 0 = 全部 OFF（S/U 一律拒绝）
+      pmpaddr_q       <= {`PMP_ENTRIES*32{1'b0}};
       satp_q          <= 32'd0;
       mcycle_q        <= 64'd0;
       minstret_q      <= 64'd0;
@@ -407,7 +485,13 @@ module rv32_csr (
             senvcfg_q[6]   <= csr_wdata[6];
             senvcfg_q[5:4] <= (csr_wdata[5:4] == 2'b10) ? 2'b00 : csr_wdata[5:4];
           end
-          default: ;
+          // ---- PMP：pmpcfg0-3 / pmpaddr0-15 ----
+          // 写入值由上面的组合逻辑算好（保留位归一、R=0⇒W 丢弃、锁定项忽略）；
+          // 写锁定项不报错（与 Spike 一致）。0x3A4-0x3AF 不在此列（不在 exists 表里）。
+          default: begin
+            if (`IS_PMPCFG_ADDR(csr_waddr))  pmpcfg_q  <= pmpcfg_new;
+            if (`IS_PMPADDR_ADDR(csr_waddr)) pmpaddr_q <= pmpaddr_new;
+          end
         endcase
       end
     end

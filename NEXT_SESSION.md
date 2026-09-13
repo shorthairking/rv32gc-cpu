@@ -84,38 +84,23 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
    而是本核的 MEM 转发缺陷（#4 之①）。`scripts/tests/arch_sigreg_clobber_report.md` 顶部有更正
    横幅；`arch_scan_sigreg_clobber.py` 的值模型作废，**不要据此判定生成器缺陷**。
 6. **下一步（阶段 2A 剩余，按 `AGENT.md` §7 任务表；顺序即优先级）**：
-   a. **[P0/P1] 2A-3 收尾：PMP** —— 实现 `pmpcfg0-3`(0x3A0-0x3A3) / `pmpaddr0-15`(0x3B0-0x3BF)
-      （**16 项，G=0 = 4 字节粒度，pmpaddr 32 位全可写**），TOR/NA4/NAPOT + 锁定语义 +
-      S/U 访问检查 + `mstatus.MPRV` 对数据访问的特权级替换（**当前核把 `.mstatus_mprv/.mstatus_mpp`
-      空接**，必须接出）。查明的关键前提（**已实测，勿重复推导**）：
-      · `sim/arch_test/config/rvtest_config.h` 的 PMP 宏必须 = `UDB_NUM_PMP_ENTRIES`/`UDB_NUM_PMP_ENTIRES`
-        （上游拼写错，两个都要定义）/`UDB_NUM_USABLE_PMP_ENTRIES` = **16**、`UDB_PMP_GRANULARITY` = **2**
-        （UDB 语义 = G+2，即 G=0；写 4 会得到签名不符的假失败）、`UDB_PMP_NAPOT_SUPPORTED` +
-        `UDB_PMP_TOR_SUPPORTED` 都要打开（框架铺 U 模式背景区要求至少一个）——**已改好**。
-      · `scripts/run_arch_test*.sh` 已支持 `tests/priv/<组>`（`run_arch_test_suite.sh PMPS` 自动回退，
-        也接受 `priv/PMPS` 写法）；`scripts/arch_test_build.sh` 已修特权组头部的 `rv${XLEN}` 解析 ——
-        **已改好并实测**（`run_arch_test.sh I/I-add-00` 仍 PASS，`run_arch_test_suite.sh PMPS 'PMPS_csr_access'`
-        能定位/构建/运行并正确判 FAIL）。
-      · **必须先对齐配置再动 RTL**，否则用例编不过/期望值错。
-      · **不能靠"闸掉总线请求"实现拒绝**：M_IDLE 不发请求又不回 `M_DONE` → `mem_stall` 恒 1 → 死锁且
-        永不进 trap；ifetch 不发 `if_req_valid` → `line_valid` 永不置 → 前端死锁。正确做法是复用
-        **misaligned 的免请求写法**（`memst_q<=M_DONE` + 直接置 cause 5/7 与 tval）与 **ID 级异常注入**
-        （cause 1，tval = `id_pc_q`，32 位指令要覆盖 pc 与 pc+2）。
-      · 参考实现落点：状态放 `rtl/csr/rv32_csr.v`（读 case / 存在性表 / 写 case，注意 `pmpcfg` 的 **L=1
-        整字节忽略**、`L=1 && A=TOR` 时 `pmpaddr[i-1]` 也忽略、**WB→ID 读旁通（`rv32_csr.v:209-212`）必须
-        返回"锁定合并后"的有效值**）；匹配逻辑用独立组合模块 `rtl/csr/rv32_pmp.v`（**规则：最低编号匹配项
-        决定**，不是"所有匹配项都要允许"；匹配项必须覆盖访问的**全部字节**；`L=0 && M 模式 ⇒ 通过`；
-        无匹配 ⇒ M 通过、S/U 拒绝）。
-      · **范围（需用户确认）**：本核无 F/D、无 Zcb，故 `PMPF`(1) 与 `PMPZca` 里依赖 Zcb/Zcf/Zcd 的 3 例
-        **不可达**，现实目标是 **74/78**（PMPS 11 + PMPSm 38 + PMPU 11 + PMPZaamo 1 + PMPZalrsc 1 + PMPZca 12）。
-      · `PMPZicbo`(4) 需要 CBO 指令真正走一趟 MEM FSM（现在 `rv32_decoder.v` 只置 `is_cbo/use_rs1`、不置
-        `mem_op`），本里程碑不做。
-   b. **[P2] Sv32 MMU（TLB+PTW）** → 跑 `tests/priv/ExceptionsSv`(8) 等；**L1I/L1D/L2 Cache**（2A-4）——
-      有 Cache 后 CBO 才需要真正实现 clean/flush/inval/zero 语义，并且 **D16② 的 XIP 绕 Cache 判定点
-      （`xip_bypass`/`line_xip_q`，已连好）必须在 I-Cache 落地时接上**；另需定"数据侧是否也绕 L1D"。
-   c. **[P2] 未接入组**：`Zimop` 0/40、`Zcmop` 0/8（MOP 预留编码，规范要求"未实现的 MOP 应执行
-      而不产生副作用"，需给译码加 MOP 处理）；`PMPZicbo`(4) 随 Cache 一起做。
-   d. **[P3] 2A-7b~d**：启动镜像三件套 → DTS/OpenSBI 声明 → FPGA tcl 与上板 B1~B3。
+   a. **[P1] 收尾 PMP 剩余 4 例失败** —— `PMPS/PMPS_csr_access-00`、`PMPU/PMPU_csr_access-00`
+      （DUT **一个陷阱都没记录**：S 模式读写 PMP CSR 应报非法指令；优先查 T-SBI 模式切换与用例恢复路径）
+      与 `PMPS/PMPS_mprv_check-01-00`、`PMPU/PMPU_mprv_check-01-00`。
+      已知口径（**本轮实测，勿重复推导**）：① 非法指令 `mtval` = **原始指令位**（不能用译码器展开值）；
+      ② 取指 PMP 检查**按 2 字节 parcel**（Spike `fetch_slow_path` 的 `sizeof(insn_parcel_t)`），
+      tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
+      （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
+      "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b. **[P1] 实现中断投递**（核的真实缺陷，`sim/tests/priv_trap.S` 已给最小复现）：`mip/mie` 评审 →
+      `trap_is_int`/`trap_vector` 支持中断（`mip_q <= csr_wdata & 32'h0888` 现在软件能置挂起位但
+      硬件永不响应；`core_top.v` 的 `intrpt[7:0]` 只接进 dummy）→ CLINT/PLIC。
+   c. **[P2] 平台口径收尾**：`rv32_ifetch.v` 的 `if_rsp_err` 从未使用（取指总线错误无法转 cause 1）；
+      `PMPSm_cfg_A_tor_zero-00` 需要参考模型在物理地址 0 无存储，而本平台把 0..16 MiB 铺成 DDR
+      （与真实平台一致：DDR3 在 `0x0`）且复位桩在 0 —— 记为平台口径差异，随 2A-7 一起处理。
+   d. **[P2] 未接入组**：`Zimop` 0/40、`Zcmop` 0/8（MOP 预留编码，规范要求"未实现的 MOP 应执行
+      而不产生副作用"）；`PMPZicbo`(4) 需 CBO 真正走一趟 MEM FSM。
+   e. **[P3] Sv32 MMU（TLB+PTW）→ L1I/L1D/L2 Cache**（接 D16② 判定点）**→ 2A-7b~d**：启动镜像三件套
 7. **本轮新增工具/资产**：`sim/tb/tb_trace_mem.v`（提交轨迹 + D 侧请求/响应 + AXI 通道追踪，
    定位本轮三个缺陷的关键工具）、`sim/tb/tb_axi_slave_rw.v`（从设备写后读可见性独立复现台）、
    `sim/tests/lrsc.S` + `scripts/run_lrsc_test.sh`（A 扩展定向自测）、`scripts/tests/`
