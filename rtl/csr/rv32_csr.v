@@ -53,6 +53,8 @@ module rv32_csr (
   output wire        mstatus_sie,
   output wire        mstatus_mprv,
   output wire [1:0]  mstatus_mpp,
+  output wire        mstatus_tvm,         // TVM：S 模式的 sfence.vma 非法（核内 ID 级检查用）
+  output wire        mstatus_tsr,         // TSR：S 模式的 sret 非法（核内 ID 级检查用）
   output wire        timer_irq_pending,   // 预留：CLINT 比较器
   output wire        ext_irq_pending,     // 预留：PLIC
 
@@ -365,9 +367,18 @@ module rv32_csr (
                     ((priv == `PRV_S) && mcounteren_q[counter_idx]) ||
                     ((priv == `PRV_U) && mcounteren_q[counter_idx] && scounteren_q[counter_idx]);
 
+  // mstatus.TVM：TVM=1 时 **S 模式**的 satp 读写触发非法指令异常（M 模式不受限）。
+  // 依据 machine.adoc "Trap-Virtual-Machine（TVM）"：TVM=1 时 S 模式访问 satp 或执行 sfence.vma
+  // 均抛非法指令。对 CSRRS/CSRRC/CSRRW 而言读口地址即目标 CSR，故用 `csr_raddr` 判定即可覆盖读写
+  // （sfence.vma 不走 CSR 通道，其在核内 ID 级检查）。
+  wire tvm_satp_ill = (priv == `PRV_S) && mstatus_tvm_q[0] && (csr_raddr == `CSR_SATP);
+
   always @(*) begin
-    csr_legal = csr_exists && priv_ok && counter_ok;
+    csr_legal = csr_exists && priv_ok && counter_ok && !tvm_satp_ill;
   end
+
+  assign mstatus_tvm = mstatus_tvm_q[0];
+  assign mstatus_tsr = mstatus_tsr_q[0];
 
   // ---------------------------------------------------------------- 陷阱委托与向量
   wire [1:0]  cause_priv  = trap_is_int ? (mideleg_q[trap_cause] ? `PRV_S : `PRV_M)

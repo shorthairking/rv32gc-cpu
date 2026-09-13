@@ -152,6 +152,8 @@ module rv32gc_core (
   wire [31:0] xret_pc;
   wire [1:0]  xret_new_priv;
   wire [1:0]  priv_q;
+  wire        mstatus_tvm_w;    // TVM：S 模式下 sfence.vma 非法
+  wire        mstatus_tsr_w;    // TSR：S 模式下 sret 非法
   wire        trap_take, xret_take;
   wire [3:0]  trap_cause_wb;
   wire [31:0] trap_tval_wb;
@@ -176,6 +178,7 @@ module rv32gc_core (
     .xret_pc(xret_pc), .xret_new_priv(xret_new_priv),
     .priv_o(priv_q),
     .mstatus_mie(), .mstatus_sie(), .mstatus_mprv(mstatus_mprv_w), .mstatus_mpp(mstatus_mpp_w),
+    .mstatus_tvm(mstatus_tvm_w), .mstatus_tsr(mstatus_tsr_w),
     .timer_irq_pending(), .ext_irq_pending(),
     .menvcfg_cbcfe(menvcfg_cbcfe), .menvcfg_cbze(menvcfg_cbze), .menvcfg_cbie(menvcfg_cbie),
     .senvcfg_cbcfe(senvcfg_cbcfe), .senvcfg_cbze(senvcfg_cbze), .senvcfg_cbie(senvcfg_cbie),
@@ -357,7 +360,26 @@ module rv32gc_core (
   // CSR 访问合法性：`rv32_csr` 的 `csr_legal`（地址不存在 / 特权级不足 / 写只读 CSR）此前**从未被核使用**
   // ⇒ S 模式读写 pmpcfg/pmpaddr 会静默提交而不报非法指令（实测 PMPS/PMPU_csr_access 零陷阱）。
   wire        id_csr_ill   = (c_csr_op != `CSR_NONE) && !csr_legal;
-  wire        id_illegal   = !dec_legal || id_cbo_denied || id_csr_ill;
+  // sfence.vma 的特权级/TVM 检查（machine.adoc "TVM" + supervisor.adoc "SFENCE.VMA"）：
+  //   · U 模式执行 sfence.vma **恒**为非法指令（该指令仅 S/M 可执行）；
+  //   · S 模式且 mstatus.TVM=1 时非法（TVM 置位时 S 模式不得执行 SFENCE.VMA / 访问 satp）；
+  //   · M 模式恒可执行。
+  // 本核 sfence.vma 目前只做流水线串行化（无 TLB 可清），真正的失效在 ③ 里程碑接入 MMU 后补。
+  wire        id_is_sfence = dec_ctrl[`CTRL_IS_SFENCE_H];
+  wire        id_sfence_ill = id_is_sfence &&
+                              ((priv_q == `PRV_U) || ((priv_q == `PRV_S) && mstatus_tvm_w));
+  // MRET/SRET 的特权级检查（machine.adoc「Trap-Return Instructions」，norm:xretinhigher_mode）：
+  //   · xRET 只能在其对应特权级**或更高**特权级执行 —— MRET 仅 M 可执行（S/U 非法）；
+  //     SRET 在 U 模式非法，S/M 合法；
+  //   · norm:mstatustsrop：TSR=1 时 S 模式执行 SRET 非法（WARL，本核 TVM 同批实现）。
+  // 注：WFI 无需检查 —— norm:mstatustwumode_op 允许"在实现特定的有界时间内完成"的实现，
+  //     本核 WFI 是立即完成的空操作，因此在 S/U 模式（含 TW=1）均为合法。
+  wire        id_is_mret  = id_is_sys && (c_sys_op == `SYS_MRET) && dec_legal;
+  wire        id_is_sret  = id_is_sys && (c_sys_op == `SYS_SRET) && dec_legal;
+  wire        id_xret_ill = (id_is_mret && (priv_q != `PRV_M)) ||
+                            (id_is_sret && ((priv_q == `PRV_U) ||
+                                            ((priv_q == `PRV_S) && mstatus_tsr_w)));
+  wire        id_illegal   = !dec_legal || id_cbo_denied || id_csr_ill || id_sfence_ill || id_xret_ill;
   wire        id_excp_valid = id_valid_q && (id_illegal || id_ecall || id_ebreak || id_pmp_x_fail);
   wire [3:0]  id_excp_cause = id_pmp_x_fail ? `EXC_INSTR_ACCESS :
                               id_illegal   ? `DEXC_ILLEGAL :

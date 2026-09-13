@@ -322,7 +322,7 @@ DIFF at seq=832
 | MMU-05 | `tlb.v`+`ptw.v` | 命中且 `A=0` 或（store 且 `D=0`） | 触发 A/D 更新：**先写回 PTE 成功，再完成访问**；PTE 写回失败/异常时按规范报页错误且不完成访问 | F |
 | MMU-06 | `tlb.v` | A/D 更新写回 | 写回**不得**改变 PTE 其它位；写回是原子的（读-改-写，且期间该 PTE 不被其它请求观察为中间态） | F |
 | MMU-07 | `ptw.v` | 一次遍历 | 同一缺失恰好填一个 TLB 项；非叶 PTE 的 `A/D/U` 合法性按规范检查（叶子/非叶规则不同） | F |
-| MMU-08 | `ptw.v` | 非法 PTE（`V=0` 或保留位非零） | 报页错误（12/13/15）且**不填充 TLB** | F |
+| MMU-08 | `ptw.v` | 非法 PTE（`V=0`、`R=0&&W=1`、非叶带 `D/A/U`、4M 未对齐、第二级仍非叶） | 报页错误（12/13/15）且**不填充 TLB**；Sv32 **无保留位**（`pte[31:10]` 全为 PPN） | F |
 | MMU-09 | `tlb.v` | 权限判定 | U 页在 S 模式访问且 `SUM=0` → 页错误；`MXR=1` 时 `X` 页可读；`MPRV=1` 时用 `MPP` 权限与特权级 | F |
 | MMU-10 | `csr/rv32_pmp.v` | 任一 S/U 模式访问且无匹配项 | 拒绝（cause 1/5/7 访问错误，`tval`=地址） | F |
 | MMU-11 | `csr/rv32_pmp.v` | 匹配 `A=TOR` | 用 `pmpaddr[i-1]` 作下界；项 0 的 TOR 下界为 0；上下界相等 → 空区间 | F |
@@ -418,8 +418,8 @@ DIFF at seq=832
 | `l2_cache` | `l2_rand` | L1I/L1D/写回/非缓存 4 源并发随机 | REF-B | 4 源都不丢事务；PIPT 无别名问题 |
 | `tlb` | `tlb_sv32_basic` | 4 KB/4 MB 页手工页表，全部权限组合 | 手工构造页表 + REF-T | 命中/缺失/权限结果逐项符合预期 |
 | `tlb` | `tlb_sfence` | `sfence.vma` 8 种变体（`rs1`/`rs2` 零与非零 × ASID 匹配与否） | 逻辑断言 | 仅预期项被失效（MMU-01~04） |
-| `tlb` | `tlb_ad` | A=0/D=0 组合 × load/store × 命中 | REF-B（页表内存模型） | PTE 被正确置位写回；访问在置位后完成 |
-| `ptw` | `ptw_illegal_pte` | 12 种非法 PTE（`V=0`、非叶带 `A/D/U` 越权、保留位非零） | REF-T | 报正确 cause，且 TLB 未被污染 |
+| `tlb` | `tlb_ad` | A=0/D=0 组合 × load/store × 命中 | REF-B（页表内存模型） | **Svade**：A=0（load）/ D=0（store）⇒ 页错误 13/15，且 **PTE 不被改写**（本设计不做硬件 A/D 置位，见 07 §5.2） |
+| `ptw` | `ptw_illegal_pte` | 12 种非法 PTE（`V=0`、非叶带 `A/D/U`、`R=0&&W=1`、4M 未对齐、二级仍非叶；Sv32 无保留位） | REF-T | 报正确 cause，且 TLB 未被污染 |
 | `ptw` | `ptw_walk2` | 两级遍历 × 中途 PMP 拒绝 | REF-B | 中间级失败即报错，不继续遍历 |
 | `pmp` | `pmp_match` | 16 项 × A={OFF,TOR,NA4,NAPOT} × XWR 组合 | REF-T | 匹配结果逐项一致；无匹配时 M 放行、S/U 拒绝 |
 | `pmp` | `pmp_lock` | `L=1` 后尝试改 cfg/addr | REF-T | 写入被忽略且不产生异常 |

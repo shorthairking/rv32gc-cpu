@@ -733,6 +733,35 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 第 13 轮：阶段 2A-③ Sv32 MMU（S0 基线 + S1 模块层 + TVM/TSR 强制）
+
+**本项范围**：`🧭 Sv32 MMU 实施计划` 的 **S0（基线）与 S1（TLB/PTW 模块层）**，以及 MMU 前置的
+`mstatus.TVM/TSR` 与 `mret/sret` 特权级强制（`sv_mstatus_tvm` 是 S0 实测的 FAIL 项）。核内集成
+（S2 数据侧 / S3 取指侧 / S4 sfence.vma / S5 63 例验收）留待下一轮。
+
+| 项 | 结果 |
+|---|---|
+| **S0 基线（MMU 前，实测）** | `priv/Svbare` **3/3 PASS**；`priv/Sv '^sv32_satp_access'` **1/1 PASS**；`priv/Sv '^sv_mstatus_tvm'` **FAIL**（`Trap count mismatch`：期望 4 个陷阱签名，实测 **0**）⇒ 证实 TVM 只存不判、`sfence.vma` 是空操作 |
+| **TVM/TSR 强制（新增）** | `rtl/csr/rv32_csr.v`：新增输出 `mstatus_tvm`/`mstatus_tsr`；`csr_legal` 加 `tvm_satp_ill`（`priv==S && TVM && csr_raddr==SATP` ⇒ 非法，读-改-写全覆盖）。`rtl/top/rv32gc_core.v`：`id_sfence_ill`（U 模式**恒**非法；S 模式且 `TVM=1` 非法；M 模式恒合法）、`id_xret_ill`（`MRET` 仅 M 可执行；`SRET` 在 U 非法、在 S 且 `TSR=1` 非法）。`WFI` **故意不检查**：`norm:mstatustwumode_op` 允许"在实现特定的有界时间内完成"的实现，本核 WFI 立即完成 ⇒ S/U（含 `TW=1`）均合法 |
+| **TVM 实测** | **`priv/Sv '^sv_mstatus_tvm' 1/1 PASS`**（修复前 FAIL）；`^sv32_satp_access` 1/1 PASS 无回退 |
+| **MMU 模块层（S1，子 Agent 实现 + 主 Agent 复跑核实）** | `rtl/mmu/rv32_tlb.v`（150 行，参数化全相联 CAM，`hit=VALID&(G\|ASID==satp_asid)&(IS_4M?tag[19:10]==va[31:22]:tag[19:0]==va[31:12])`，多命中取最小项，rr 替换，`flush_all` 同拍优先）、`rtl/mmu/rv32_ptw.v`（252 行，`IDLE→L1→L2→RES`，每次 4B 读、`bus_req` hold-until-ack、`req` **上升沿**有效、`abort` 立即丢弃）、`sim/tests/unit/tb_unit_tlb_ptw.v`（767 行）、`scripts/run_unit_tlb_ptw.sh` |
+| **S1 实测** | **`TLB_PTW_UNIT: PASS (155 checks)`**（主 Agent 独立复跑一致）；两个模块各自 `iverilog -g2005 -Wall -s <模块>` **零告警**；全量 RTL 编译告警无新增 |
+| **S1 变异测试（子 Agent）** | **10/10 被捕获**：非叶 `D\|A\|U`、4M `ppn[0]!=0`、TLB ASID 匹配、基址 `ppn<<10`（任务书原文错误）、L2 非叶当叶子、4M 标签比整 20 位、`V=0`、`R=0&&W=1`、`is_4m` 漏报、结果态忽略 `req` 边沿；首轮 M1/M8 曾**假阴性**（漏判时另一条规则照样 fault 掩盖缺陷），已改成"漏判即 `done=1`"的构造 |
+| **⚠ 任务书公式订正（重要）** | 我给子 Agent 的 PTW 基址公式 `{ppn,10'b0}`（= `ppn<<10`）**错 4 倍**；正确为 `ppn<<12`：`tools/spike/riscv/mmu.cc:732,787` `pte_paddr = base + idx*ptesize`（`base = ppn<<PGSHIFT`，`ptesize=4`，`PGSHIFT=12`）、`supervisor.adoc:1727-1730`。子 Agent 按规范实现并在 `rv32_ptw.v` 文件头留证；本核已按 `ppn<<12` 落地 |
+| **规格文档订正（Sv39+ 口径泄漏）** | `07-priv-csr-mmu.md` §5.1 步骤 3「`pte[31:10]` 保留位非零 ⇒ 页错误」**错**（Sv32 的 `pte[31:10]` 全是 PPN；Spike `PTE_RSVD=0x07C0_0000_0000_0000` 是 64 位专用，`encoding.h:521`）；步骤 4「非叶不检查 A/D/U」**反了**（Spike `mmu.cc:751-753`：非叶带 `D\|A\|U` ⇒ 页错误，`G` 不非法）。两处已按 Sv32/Spike 更正，并同步 §5.2 表、勘误表第 11 条、`09-verification-interface.md` 的 MMU-08 / `ptw_illegal_pte` / `tlb_ad`（后者改为 **Svade** 口径：A/D=0 ⇒ 页错误且不改写 PTE） |
+| **回归（不可退，全绿）** | 非特权 **18 组 124 例**（39/8/6/1/26/9/2/5/4/2/3/1/3/1/4/4/4/2）；`Svbare 3/3`；PMPS 11/11、PMPU 11/11、PMPZaamo 1/1、PMPZalrsc 1/1、PMPZca 12/15（3 例 ISA 不可达）、PMPSm 37/38（1 例平台口径）；`PMP_UNIT 443`、`CLINT_PLIC_UNIT 184`、`AXI_SLAVE_UNIT 79`、`EXEC_UNIT 2461`、`DECODER_UNIT_TESTS PASS`、`PRIV_TRAP 46`、`FETCH_ERR 21`、`LRSC_DIRECTED PASS`、`SPI_BOOT PASS`、`SIM: PASS hello`、`SIM: PASS memtest` |
+
+#### 关键经验（本轮）
+
+* **任务书里的公式也要按参考模型核**：`{ppn,10'b0}` 与 `ppn<<12` 差 2 位，若照抄会让所有页表基址落在错误地址；
+  子 Agent 因读 Spike 源码而纠偏 —— **"以 Spike 为准"这条纪律对主 Agent 的指令同样适用**。
+* **测试用例必须"漏判即失败"**：变异测试首轮 2 个假阴性说明，若用例在缺陷下仍因**另一条规则**报同样的错，
+  就等于没测该规则。非法 PTE 的每条规则都要构造"去掉该规则后必然成功翻译"的场景。
+* **回归期间不得改 RTL**：本轮中途改 RTL（TVM→TSR/MRET/SRET）导致上一轮回归不可归因，只能杀掉重跑；
+  改完 RTL 再跑一次干净全量是唯一正确的做法。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -754,7 +783,25 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 - 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求不做上板）**——进度：
   * ✅ ① 总线错误通道（取指 cause 1 + load/store 5/7，`FETCH_ERR: PASS (21)`）；物理 0 口径仍记为平台约定差异（详见上板计划）
   * ✅ ② `Zimop 40/40`、`Zcmop 8/8`
-  * ⏭ ③ Sv32 MMU（方案已侦察定稿，见下）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  * ⏭ ③ Sv32 MMU（**S0 基线 + S1 模块层已完**：`TLB_PTW_UNIT: PASS (155)`、`sv_mstatus_tvm` 转 PASS；
+    **S2~S5 核内集成待做**，见下）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  * 🔜 **③ 的 S2~S5 集成设计（下一轮执行，已定稿）**：
+    * 新增 `rtl/mmu/rv32mmu_top.v`（我实现）：例化 ITLB(8)/DTLB(16)/`rv32_ptw`，对外**两个翻译口**——
+      取指 `if_va → if_pa/if_pa_valid/if_fault`，访存 `d_va/d_is_store/d_req → d_pa/d_pa_valid/d_fault`；
+      **权限（U/SUM/MXR/RWX）与 Svade 的 A/D 判定在 mmu_top 内 live 做**（TLB 只存 `{R,W,X,U,G,A,D}`，
+      不缓存权限结论），页错误 cause 由口上的访问类型决定（取指 12 / load 13 / store·AMO·SC 15）。
+    * 访存侧在 `rv32gc_core` 的 **`M_IDLE` 加一个 `M_XLATE` 中间态**：非对齐（cause 4/6）判定**先于**翻译；
+      `M_XLATE` 等 `d_pa_valid` ⇒ 把 PA 写回 `m_addr_q`（另存 `m_va_q` 供 tval）+ 置 `m_xlated_q` 回 `M_IDLE`；
+      `d_fault` ⇒ 复用"不拉请求 + 进 `M_DONE` + 记 cause"范式（**严禁**留在 `M_IDLE` 死等）。
+      `m_xlated_q` 之后 PMP 检查与 `d_req_addr` 全部用 **PA**，`tval` 仍用 VA。
+    * 取指侧给 `rv32_ifetch` 加 `pa_valid` 输入，门控 **`hit`/`line_valid`/发请求**三处（缺一即取错行的老坑），
+      `line_tag_q` 改存 **PA**；`xip_bypass` 改按 **PA** 判（复位后 MMU off 时两者相同）。
+    * PTW 自驱 `d_req_*`（**不经 LSU 的 `M_REQ`/不被 `advance_all`、`fetch_stall`、`mem_stall` 门控**）；
+      PTE 读的 PMP/PMA 检查把 `bus_err` 反馈给 PTW（页表读访问错误 ⇒ cause 1/5/7 口径待 Spike 对齐）。
+    * `sfence.vma` 接入：任意 `sfence.vma` 先做**全清**（`flush_all` + `abort` 在途 PTW + 强制 `flush_front`，
+      因为按行号比对的 `flush_front` 覆盖不到同 PA 不同 VA 的场景）。
+    * 验收：63 例（Sv 30 + Svbare 3 + SvPMP 4 + Svade 2 + ExceptionsSv 4 + ExceptionsSvZaamo/Zalrsc 3+3 +
+      SvZicbo 6 + SvPMPZicbo 8），组内用正则过滤（`Sv` 有 134 个文件但仅约 30 个 RV32 可跑）。
   原顺序与判据：
   ① **平台口径收尾**：`rv32_ifetch.if_rsp_err` 目前**悬空未用**（取指总线错误会被当指令执行）⇒ 加
      "取指总线错误 → cause 1" 通道；实现要点（已定，避免踩旧坑）：错误期间**不冻结流水线**（`fetch_stall`

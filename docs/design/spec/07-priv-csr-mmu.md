@@ -277,10 +277,13 @@ trap_vector = (vec_mode==2'b01 && is_intr) ? vec_base + {22'b0,cause[3:0],2'b00}
 3  pte = mem_read32(pte_addr);
    if (pte.v == 0)                              -> PAGE_FAULT(req_type, va)
    if (pte.r == 0 && pte.w == 1)                -> PAGE_FAULT(req_type, va)
-   if (pte[31:10] 保留位非零)                    -> PAGE_FAULT(req_type, va)   // 仅 pte[9:8](RSW) 可自由使用
+   // Sv32 **没有保留位**：pte[31:10] 全部是 PPN（Spike 的 `PTE_RSVD=0x07C0_0000_0000_0000`
+   // 只对 64 位 PTE 有意义，见 tools/spike/riscv/encoding.h:521；Svnapot 的 PTE_N 需扩展使能，
+   // 本设计不实现）。② 原文档此处照抄了 Sv39+ 的"pte[31:10] 保留位"口径，已按 Sv32 更正。
 4  if (pte.r || pte.x) goto 5;                                  // 叶子
+   if (pte.d || pte.a || pte.u)                 -> PAGE_FAULT(req_type, va)   // 非叶带 D/A/U 非法
    if (i == 0)                                  -> PAGE_FAULT(req_type, va)   // 第二级仍非叶
-   i = 0; a = pte.ppn << 12; goto 2;                            // 非叶: 不检查 A/D/U 组合
+   i = 0; a = pte.ppn << 12; goto 2;                            // 非叶: G 位合法（Spike mmu.cc:751-753）
 5  if (i > 0 && pte.ppn[i-1:0] != 0)             -> PAGE_FAULT(req_type, va)   // 超级页未对齐(4M 要求 ppn[9:0]=0)
 6  if (!perm_u_ok(pte.u, mode, sum))             -> PAGE_FAULT(req_type, va)
 7  if (!perm_rwx_ok(pte, req_type, mxr))         -> PAGE_FAULT(req_type, va)
@@ -297,7 +300,7 @@ trap_vector = (vec_mode==2'b01 && is_intr) ? vec_base + {22'b0,cause[3:0],2'b00}
 
 | 判定项 | 规则 | 出处 |
 |---|---|---|
-| `V=0`、`R=0&&W=1`、保留位/编码非零 | 页错误 | `supervisor.adoc:1732-1734` |
+| `V=0`、`R=0&&W=1`、非叶带 `D/A/U` | 页错误 | `supervisor.adoc:1704-1706,1732-1734`、`tools/spike/riscv/mmu.cc:751-758` |
 | 非叶 PTE | `R=0&&W=0&&X=0`，`i←i-1` 继续；`i<0` 则页错误 | `supervisor.adoc:1736-1740` |
 | 超级页对齐 | `i>0 && pte.ppn[i-1:0]!=0`→页错误 | `supervisor.adoc:1742-1744` |
 | `U` 位 | `mode==U` 需 `U=1`；`mode==S&&SUM=0` 需 `U=0`；`SUM=1` 允许 `U=1` | `supervisor.adoc:1746-1747`、`machine.adoc:2813-2820` |
@@ -305,7 +308,7 @@ trap_vector = (vec_mode==2'b01 && is_intr) ? vec_base + {22'b0,cause[3:0],2'b00}
 | A/D 更新 / A/D 缓存 | `Svade`→页错误；否则原子 CAS 写回，**PTE 整体原子更新**，CAS 失败回步骤 2；**地址翻译缓存不得用于 A/D 更新**，只能直接改内存 | `supervisor.adoc:1754-1766,1849-1854` |
 | 页表访问权限 / `MPRV` | 隐式页表访问的有效特权级为 **S**（PMP 检查同）；`MPRV=1` 时用 `MPP` 作为有效特权级 | `machine.adoc:3331-3333,3627-3629,586-635` |
 | 推测翻译 | 允许推测；推测时不得置 D、不得报异常、不得建立会被已执行 `sfence.vma` 作废的表项 | `supervisor.adoc:1800-1807` |
-| 异常优先级 | 页表读访问错误 > `V`/`R=0,W=1`/保留位页错误 > 超级页对齐 > `U` 位 > `R/W/X` > A/D 页错误；A/D 写回 PMP 违例报**访问错误** | `supervisor.adoc:1732-1766` |
+| 异常优先级 | 页表读访问错误 > `V`/`R=0,W=1`/非叶 `D/A/U` 页错误 > 超级页对齐 > `U` 位 > `R/W/X` > A/D 页错误；A/D 写回 PMP 违例报**访问错误** | `supervisor.adoc:1732-1766` |
 
 ### 6.3 PTW 状态机（逐拍动作）
 
@@ -514,7 +517,7 @@ best[ctx] = argmax_{N: pending[N] && enable[ctx][N] && priority[N] > threshold[c
 | 8 | §4.4 写 `mret/sret` 恢复 `MPRV←0` | `MPRV` **仅在返回目标≠M 时清 0**；返回 M 时保持不变 | `machine.adoc:3405-3412` |
 | 9 | §5.2 写"A/D 写回通过 D-Cache 保证原子性；若写回期间异常按规范先置位再报错" | 规范要求 A/D 更新是**对 PTE 的原子读改写（CAS）**且**不得使用地址翻译缓存**；A/D 写回若违反 PMP/PMA 报**访问错误** | `supervisor.adoc:1754-1766,1849-1854` |
 | 10 | §5.2/§5.3 只写"TLB 表项携带 PMP 通过标记" | 还须规定：写 `pmpcfg`/`pmpaddr` 必须失效全部 TLB（规范要求软件执行 `sfence.vma x0,x0`） | `machine.adoc:3631-3636` |
-| 11 | §5.1 写"非法 PTE（V=0 或保留位非零）" | 非法组合还包括 **`R=0&&W=1`**，以及第二级仍非叶（`i<0`） | `supervisor.adoc:1732-1740` |
+| 11 | §5.1 写"非法 PTE（V=0 或保留位非零）" | 非法组合还包括 **`R=0&&W=1`**、**非叶带 `D/A/U`**，以及第二级仍非叶（`i<0`）；Sv32 **无保留位**（`pte[31:10]` 全为 PPN，见 §5.1 代码块注释） | `supervisor.adoc:1704-1740`、`tools/spike/riscv/mmu.cc:751-766` |
 | 12 | §3 未定义 `mtimecmp` 写高半的抑制判据 | 写高半后若 `{new_hi,lo} < mtime` 则抑制 MTIP 至写低半，配合规范的 `-1/高/低` 序列 | `machine.adoc:2598-2612` |
 | 13 | §6 写"清空 ROB 中更年轻表项" | 还须**丢弃在途 PTW 结果**（epoch 计数），并作废本次翻译建立的 TLB 表项 | `supervisor.adoc:1811-1828` |
 | 14 | §2.1 `mstatus` 复位"MPP 写 10 归一到 11"未给复位值 | 本设计 `mstatus` 复位 `32'h0000_1800`（MPP=11、MIE=0），与 `00-conventions.md:30` 一致 | `machine.adoc:3371-3385` |

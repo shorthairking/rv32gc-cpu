@@ -51,7 +51,7 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ```
 注意：Spike 的 `--log-commits` 输出在 **stderr**（用 `2>&1 1>/dev/null`）；Spike 的内存映射用 `-m0x80000000:0x10000000,...`（0x0 布局会与设备区冲突）；本核复位 PC=0，跑 0x8000_0000 布局的镜像需要 **`-DRESET_PC=32'h8000_0000`** 重编或用 `arch_stub.S` 跳转桩。
 
-## 4. 当前状态与卡点（第 9 轮结束时的事实，请从这里接手）
+## 4. 当前状态与卡点（**滚动更新**：下表事实截至第 13 轮结束，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
    **新增（第 9 轮）**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**（441 拍）——
@@ -92,8 +92,13 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
-   b0. ✅ **已完成（第 12 轮）**：总线错误通道（`FETCH_ERR: PASS (21)`，修了 `rv32_axi_master.if_rsp_err` 恒 0 的生产者缺陷）+
-       `Zimop 40/40`/`Zcmop 8/8`；下一步入口见 `AGENT.md` §7 的「Sv32 MMU 实施计划」（侦察已定稿）。
+   b0. ✅ **已完成（第 13 轮）**：Sv32 MMU 的 **S0 基线 + S1 模块层** —— `rtl/mmu/rv32_tlb.v`（参数化 CAM）+
+       `rtl/mmu/rv32_ptw.v`（`IDLE→L1→L2→RES`，每次 4B 读）→ **`TLB_PTW_UNIT: PASS (155 checks)`**（变异 10/10 被捕获）；
+       顺带把 `mstatus.TVM/TSR` 与 `mret/sret` 特权级强制补上 ⇒ **`priv/Sv '^sv_mstatus_tvm' 1/1 PASS`**。
+       **下一步＝同一项的 S2~S5 核内集成**（`rv32mmu_top.v` + `M_IDLE/M_XLATE` + `rv32_ifetch.pa_valid` +
+       `sfence.vma` 全清 + 63 例验收），设计与坑位清单见 `AGENT.md` §7 的「③ 的 S2~S5 集成设计」。
+   b0a. ✅ **已完成（第 12 轮）**：总线错误通道（`FETCH_ERR: PASS (21)`，修了 `rv32_axi_master.if_rsp_err` 恒 0 的生产者缺陷）+
+       `Zimop 40/40`/`Zcmop 8/8`。
    b. ✅ **中断投递 + 核内 CLINT/PLIC 已完成（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`、
       `CLINT_PLIC_UNIT: PASS (184)`、回归无回退。口径：`mip.MSIP/MTIP/MEIP/SEIP` 只读（走 CLINT/PLIC）、
       中断在 **WB 提交之后**的边界取且避开"副作用已落地"的 MEM 指令、`trap_take` 必须用门控后的 `intr_take`。
