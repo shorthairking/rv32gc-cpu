@@ -925,6 +925,25 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 21 轮：④ L1D Cache 落地（阶段 2A 的 ④ 项完成）+ 回归脚本"假 PASS"缺陷修复
+
+| 项 | 结果 |
+|---|---|
+| **L1D 结构** | 新增 `rtl/mem/rv32_dcache.v`（424 行）：**32 KB = 128 组 × 8 路 × 32 B**；**VIPT**（组索引 `pa[11:5]` 页内位、标记 `pa[31:12]` 物理地址 ⇒ 无别名、`sfence.vma` 无需失效）；**写直达 + 不写分配**（无脏行 ⇒ 无写回/Victim/Store Buffer，CBO clean/flush 退化为失效）；读分配（整行 32 B 突发填充）；RR 替换；单未完成缺失；**`parameter ENABLE`**（0 = 直通，实测与基线**逐拍一致**：hello 347 / memtest 1,116,795） |
+| **关键实现决定** | **只有"可缓存 load"走 FSM**（命中次拍应答 / 缺失填充）；**store 与全部旁路访问（PTW / SPI-XIP / 设备 / LR·SC·AMO / CBO 探针）组合转发**，仅在总线响应拍用"延迟副作用"更新或失效行。理由（实测）：若把 store 也塞进 FSM，每笔 store +2 拍，正好吃光 load 命中的全部收益（hello 347→371 退化；改回后 308） |
+| **XIP 绕 Cache（数据侧）** | 双窗 `IS_SPI_XIP`（`0x1C00_0000` / 别名 `0x1FE8_0000`）+ 非 DDR 窗口一律旁路：**不命中、不分配**；TB 新增 `XIP_NOALLOC_D` 断言（SPI_BOOT 142 / BOOT_CHAIN 5059 拍检查，违例 0） |
+| **原子/CBO 交互** | LR/SC/AMO **整体旁路**，SC/AMO 写成功且 `wstrb≠0` ⇒ 失效被写行；`CBO.INVAL/CLEAN/FLUSH` 探针读成功后失效该行；`CBO.ZERO` **不旁路**（8 个普通写 ⇒ 命中更新、缺失只落总线）；`fence.i`/`sfence.vma` 不动 L1D |
+| **性能（硬判据，实测）** | **`memtest` 1,116,795 → 1,021,800 拍（再 −8.5%；相对无 Cache 的 2,026,669 共 −49.6%）**；**`hello` 347 → 308 拍（−11.2%）**。L1D 统计：memtest `access=57527 hit=27222 miss=1544 bypass=54`（可缓存 load 命中率 94.6%）、hello `access=27 hit=12 miss=1` |
+| **新增验证（我逐项复核）** | `DCACHE_UNIT: PASS (59 checks)` + `DWRITE_THRU: PASS (14 checks)`（store 缺失 allocate 恒 0、总线确有写、store 命中行被更新且后续 load 读到新值；**3 组反证实验**：关"命中更新行"→FAIL(2/59)、让 store 缺失走读分配→FAIL(5/59)、关"AMO/CBO 失效"→FAIL(4/59)）；`DCACHE_DIRECTED: PASS (28 checks)`（写后立刻读、store→load 交替×4、跨行非对齐+哨兵、AMO/LR/SC 在命中行、自改码+fence.i、CBO 命中行含 cbo.zero 后 load 读到 0；**2 组反证**）；`XIP_NOALLOC_D: PASS` |
+| **⚠ 回归脚本缺陷（子 Agent 发现，已修）** | `scripts/run_full_regression.sh` 的 `cmd` 判定正则**括号不配平**（grep 报 `Unmatched ( or \(`），且未捕获时的兜底文案里含 "PASS" ⇒ **单元/定向项会"假 PASS"**。**第 19 轮台账里那几行单元 PASS 因此不可信**（本次已修正并重跑：正则配平 + 兜底文案不含 PASS ⇒ 捕获失败会判 FAIL；并新增 L1D/L1D 定向两项）。**教训**：回归脚本必须"未捕获即失败"，且脚本自身要能自证（本轮即靠子 Agent 的反向审查发现） |
+| **终版回归（主 Agent 亲跑，脚本修复后）** | **`FULL_REGRESSION: PASS （PASS 计数=281 / FAIL 计数=7）`，偏离基线清单为空**；7 个 FAIL 全是已知基线例外（PMPZca 3 ISA 不可达、PMPSm_cfg_A_tor_zero-00 平台 PA-0、Sv 3 例参考模型自失败）。非特权 18 组 124/0；PMP 6 组同基线；MMU 验收 61/64；单元全 PASS；定向全 PASS；`CHECK_DTS/PACK_BOOT` PASS；`hello` 308 拍、`memtest` 1,021,800 拍（`time run_sim.sh hello` 0.99 s，无变慢） |
+| 与规格的裁剪（已记录） | 写回+写分配→写直达+不写分配；伪 LRU+Victim→RR；MSHR 阵列/关键字优先/预取→单未完成缺失+整行突发；Store Buffer→无（无脏行）；L2 不做；`03-cache.md` §5 把 SRAM(`0x1C00_0000`) 列为可缓存，本轮按 **D16②** 数据侧口径改为**旁路**（XIP 只读） |
+| 遗留（写入 §7） | memtest 只降 8.5% 属结构上限（写直达 store 与基线同价、命中 load 仅省总线往返 ~5 拍，估算上限 ≈11.6%）；L1D 命中率 94.6%（规格目标 ≥95%，RR+单未完成缺失所致）；"失效后读回内存值"在软件层不可观测（写直达 ⇒ Cache 恒等于内存），由单元 TB 的 poke-内存模拟 DMA 覆盖；多笔在途总线事务时"延迟副作用"假设已在 RTL 头注释标注待重审 |
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -952,9 +971,10 @@ arch-test 与 hello/memtest 无影响，已复跑）。
   * ✅ **④ 的 L1I 部分已完成（第 18 轮）**：`rtl/frontend/rv32_icache.v`（16 KB/4 路/32 B、VIPT、RR、
     单未完成缺失、XIP 双判、`fence.i` 整表失效、`ENABLE` 安全阀）⇒ **`memtest` 2,026,669 → 1,116,795 拍
     （−45.0%）**、AXI 取指 82005 → 29 笔；新增 `ICACHE_UNIT 36`、`FENCEI_SMC 9`、`XIP_NOALLOC 142/5059`。
-  * ⏭ **④ 剩余部分＝L1D（+ 可选 L2）**：按 §7 的最小正确版（**写直达 + 不写分配**、读分配、RR、
-    SPI-XIP 窗口同样绕 Cache）+ 五条验证（回归不回退 / SPI_BOOT·BOOT_CHAIN / cycles 下降 /
-    XIP 不分配断言 / fence.i）。**用户已拍板"先把 Cache 做出来再上板"**，故 L1D 是上板前的最后一项 RTL 工作。
+  * ✅ **④ 已完成（第 21 轮）**：CBO（第 17 轮）+ **L1I**（第 18 轮，16 KB/4 路/32 B、VIPT、XIP 双判、
+    `fence.i` 整表失效）+ **L1D**（第 21 轮，32 KB/8 路/32 B、写直达+不写分配、读分配、XIP 旁路、原子/CBO 失效）。
+    性能：`memtest` 2,026,669 → **1,021,800** 拍（**−49.6%**）、`hello` 352 → **308** 拍。
+    **L2 暂缓**（规格 256 KB/8 路；当前 DDR 往返够用，记为性能项）。
   * 📌 **待用户审阅后统一修（来自 `docs/porting/08-upstream-repos-knowledge.md` 的 4 条冲突）**：
     ① DTS 加 `chiplab,` 前缀（`sifive,clint0`/`sifive,plic-1.0.0`/CPU 节点 `riscv` 均为 deprecated 或
     simulator-only）；② SPI flash 节点改 `cfi-flash` + `fixed-partitions`（`jedec,spi-nor` 直挂 soc 不符模型）；

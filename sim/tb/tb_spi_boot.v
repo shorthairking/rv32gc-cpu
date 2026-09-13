@@ -216,10 +216,21 @@ module tb_spi_boot;
   wire [31:0] ic_alloc_addr = u_dut.u_core.u_icache.dbg_alloc_addr;
   wire        ic_alloc_wen  = u_dut.u_core.u_icache.dbg_alloc_wen;
   wire        ic_xip_bypass = u_dut.u_core.if_spi_xip;
+  // L1D（数据侧，第 20 轮新增）：D16② 的数据侧口径 = SPI-XIP 窗口**既不命中也不分配**
+  wire [31:0] dc_alloc_addr = u_dut.u_core.u_dcache.dbg_alloc_addr;
+  wire        dc_alloc_wen  = u_dut.u_core.u_dcache.dbg_alloc_wen;
+  wire        dc_req_valid  = u_dut.u_core.dc_up_req_valid;
+  wire        dc_req_ready  = u_dut.u_core.dc_up_req_ready;
+  wire [31:0] dc_req_addr   = u_dut.u_core.dc_up_req_addr;
 `else
   wire [31:0] ic_alloc_addr = 32'd0;
   wire        ic_alloc_wen  = 1'b0;
   wire        ic_xip_bypass = 1'b0;
+  wire [31:0] dc_alloc_addr = 32'd0;
+  wire        dc_alloc_wen  = 1'b0;
+  wire        dc_req_valid  = 1'b0;
+  wire        dc_req_ready  = 1'b0;
+  wire [31:0] dc_req_addr   = 32'd0;
 `endif
 
   // SPI-XIP 别名窗口（`IS_SPI_XIP` 的第二段）：0x1FE8_0000 起 64 KiB
@@ -254,9 +265,33 @@ module tb_spi_boot;
     end
   end
 
+  // L1D 侧同类断言（第 20 轮新增）：数据地址落在 SPI-XIP 窗口时**不得分配行**
+  integer n_d_alloc = 0;      // D 侧分配笔数（不要求 >0：无数据访存的镜像可以一次都没有）
+  integer n_d_xip   = 0;      // D 侧被接受的 XIP 窗口访问笔数（BOOT_CHAIN 可能为 0）
+  integer n_d_bad   = 0;      // D 侧违例次数
+  always @(posedge clk) if (rst_n) begin
+    if (dc_alloc_wen) begin
+      n_d_alloc <= n_d_alloc + 1;
+      if (in_xip(dc_alloc_addr)) begin
+        n_d_bad <= n_d_bad + 1;
+        $display("[SPI-BOOT] XIP_NOALLOC_D VIOLATION: L1D alloc @0x%08x 落在 SPI-XIP 窗口 (t=%0t)",
+                 dc_alloc_addr, $time);
+      end
+    end
+    if (dc_req_valid && dc_req_ready && in_xip(dc_req_addr)) begin
+      n_d_xip <= n_d_xip + 1;
+      if (dc_alloc_wen) begin
+        n_d_bad <= n_d_bad + 1;
+        $display("[SPI-BOOT] XIP_NOALLOC_D VIOLATION: XIP 数据访问同拍仍 alloc @0x%08x (t=%0t)",
+                 dc_alloc_addr, $time);
+      end
+    end
+  end
+
   // 判定条件（iverilog 要求 function 至少有一个入端口，故这里用 wire 表达式）：
   //   无违例 ∧ 确实发生过分配 ∧ 确实走过 XIP 直通（后两条防"断言空转"）
-  wire xip_noalloc_pass = (n_xip_bad == 0) && (n_alloc > 0) && (n_xip_cyc > 0);
+  wire xip_noalloc_pass = (n_xip_bad == 0) && (n_alloc > 0) && (n_xip_cyc > 0)
+                          && (n_d_bad == 0);
 
 
   // 提交级：debug0_wb_* 只在"提交一条**写寄存器**指令"时有效（core_top 的 ws_valid），
@@ -361,6 +396,9 @@ module tb_spi_boot;
         $display("XIP_NOALLOC: PASS (%0d checks)", n_xip_chk);
       else
         $display("XIP_NOALLOC: FAIL (%0d checks, %0d violations)", n_xip_chk, n_xip_bad);
+      // L1D 侧：只要没有违例即 PASS（分配数/XIP 数据访问数打印出来防止误读）
+      $display("XIP_NOALLOC_D: %s (L1D alloc=%0d 笔, XIP 数据访问=%0d 笔, 违例=%0d)",
+               (n_d_bad == 0) ? "PASS" : "FAIL", n_d_alloc, n_d_xip, n_d_bad);
 
       $display("[SPI-BOOT] 首个提交 PC = 0x%08x，cycles=%0d", first_commit_pc, cyc);
       if (ok) begin

@@ -305,6 +305,12 @@ module tb_smoke;
     begin
       do_sig_dump(sig_dump_file);
       $display("TB: cycles=%0d", cyc);
+`ifdef CORE_PRESENT
+      // L1D 统计（阶段 2A-④）：access/hit/miss/bypass —— 便于性能与命中率报告
+      $display("TB: L1D access=%0d hit=%0d miss=%0d bypass=%0d",
+               u_core.u_core.u_dcache.perf_access, u_core.u_core.u_dcache.perf_hit,
+               u_core.u_core.u_dcache.perf_miss,  u_core.u_core.u_dcache.perf_bypass);
+`endif
       if (code == 0) begin
         $display("TB: TEST PASS");
         $finish;

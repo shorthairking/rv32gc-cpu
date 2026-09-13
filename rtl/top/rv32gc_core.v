@@ -37,6 +37,15 @@ module rv32gc_core (
   input  wire         d_rsp_err,
   output wire         d_rsp_ready,
 
+  // ---- AXI4 数据行填充通道（L1D refill：8 beat 突发 → 256 bit 整行）----
+  output wire         dl_req_valid,
+  output wire [31:0]  dl_req_addr,
+  input  wire         dl_req_ready,
+  input  wire         dl_rsp_valid,
+  input  wire [255:0] dl_rsp_data,
+  input  wire         dl_rsp_err,
+  output wire         dl_rsp_ready,
+
   input  wire [7:0]   intrpt,
 
   output wire [31:0]  dbg_commit_pc,
@@ -674,7 +683,7 @@ module rv32gc_core (
   reg  [31:0] amo_wdata;
   // 读响应当拍要用"即将锁存的 d_rsp_rdata"参与运算：m_rdata_q 与本组合逻辑在同一时钟沿更新，
   // 若直接用 m_rdata_q，M_WAIT 拍算出的新值会退化成 0+rs2（首次 AMO 必错）。
-  wire [31:0] amo_base = d_rsp_valid ? d_rsp_rdata : m_rdata_q;
+  wire [31:0] amo_base = dc_up_rsp_valid ? dc_up_rsp_rdata : m_rdata_q;
   always @(*) begin
     case (m_amo_op_q)
       `AMO_ADD:  amo_wdata = amo_base + m_rs2_q;
@@ -707,23 +716,61 @@ module rv32gc_core (
   //   · 被拒绝时不发请求，由 ptw_pmp_deny 让 PTW 直接进"访问错误"结果态。
   // 请求"保持到 ack"的语义不受影响：没被总线接收就等下一拍再试（不会丢响应）。
   wire        ptw_want   = ptw_bus_req && !mem_pmp_chk && ptw_pmp_ok;
-  wire        d_req_valid_w = !d_busy_q && (mem_want || ptw_want);
   wire        d_is_ptw     = ptw_want && !mem_want;
-  wire        d_req_take   = d_req_valid_w && d_req_ready;
   reg         d_busy_q;        // 有在途事务（直到收到响应）
   reg         d_owner_ptw_q;   // 在途事务归属：1 = PTW 页表读，0 = MEM 访存
-  assign d_req_valid = d_req_valid_w;
-  assign d_req_we    = mem_want ? ((memst_q == M_REQ_W) ? 1'b1 : m_we_q) : 1'b0;
-  assign d_req_addr  = mem_want ? m_addr_q : ptw_bus_addr;
-  assign d_req_wdata = m_wdata_q;
-  assign d_req_wstrb = m_wstrb_q;
-  assign d_rsp_ready = 1'b1;
+  wire        d_req_valid_w = !d_busy_q && (mem_want || ptw_want);
+
+  // ============================ L1D 数据 Cache（阶段 2A-④，第 20 轮新增）============================
+  // 插入点：本仲裁点（MEM 优先、PTW 其次、单笔在途）与 rv32_axi_master 的 d 客户端之间。
+  // 上游契约与原来的 d 端口逐位一致；`d_busy_q` 保证"接受一笔后在响应交付前不再发新请求"，
+  // 因此 rv32_dcache 只需 1 个在途槽。模块内的策略（写直达+不写分配、读分配、VIPT、
+  // XIP/PTW/原子/CBO 旁路）与出处见 `rtl/mem/rv32_dcache.v` 头部。
+  // 三类旁路判定就在这个仲裁点上取信号，避免在模块里重新猜"这笔请求是谁发的"：
+  //   · `dc_up_bypass`：PTW 页表读（页表项会被软件改写 ⇒ 必须每次看内存；且 PTW 读不可缓存的
+  //     老坑：缓存的 PTE 在 sfence.vma 后会是陈旧的）；
+  //   · `dc_up_atomic`：LR/SC/AMO 整体绕 Cache（保留集/原子性语义不走 Cache）；
+  //   · `dc_up_cbo`   ：CBO CLEAN/FLUSH/INVAL 的"探针读"（保持第 17 轮的平台裁决语义不变，
+  //     只额外在成功返回时失效该行；CBO.ZERO 不是探针读，它走 8 个普通写 ⇒ 不在此列）。
+  wire        dc_up_req_ready;
+  wire        dc_up_rsp_valid, dc_up_rsp_err;
+  wire [31:0] dc_up_rsp_rdata;
+  wire        dc_up_req_valid = d_req_valid_w;
+  wire        dc_up_req_we    = mem_want ? ((memst_q == M_REQ_W) ? 1'b1 : m_we_q) : 1'b0;
+  wire [31:0] dc_up_req_addr  = mem_want ? m_addr_q : ptw_bus_addr;
+  wire [31:0] dc_up_req_wdata = m_wdata_q;
+  wire [3:0]  dc_up_req_wstrb = m_wstrb_q;
+  wire        dc_up_bypass    = d_is_ptw;
+  wire        dc_up_atomic    = mem_want && (m_is_lr_q || m_is_sc_q || m_is_amo_q);
+  wire        dc_up_cbo       = mem_want && m_is_cbo_q && !m_cbo_zero_q;
+
+  rv32_dcache #(.ENABLE(1)) u_dcache (
+    .clk(clk), .rst_n(rst_n),
+    .up_req_valid(dc_up_req_valid), .up_req_we(dc_up_req_we), .up_req_addr(dc_up_req_addr),
+    .up_req_wdata(dc_up_req_wdata), .up_req_wstrb(dc_up_req_wstrb),
+    .up_req_ready(dc_up_req_ready),
+    .up_rsp_valid(dc_up_rsp_valid), .up_rsp_rdata(dc_up_rsp_rdata), .up_rsp_err(dc_up_rsp_err),
+    .up_rsp_ready(1'b1),                       // 原 `assign d_rsp_ready = 1'b1;`
+    .up_bypass(dc_up_bypass), .up_atomic(dc_up_atomic), .up_cbo(dc_up_cbo),
+    .dn_req_valid(d_req_valid), .dn_req_we(d_req_we), .dn_req_addr(d_req_addr),
+    .dn_req_wdata(d_req_wdata), .dn_req_wstrb(d_req_wstrb), .dn_req_ready(d_req_ready),
+    .dn_rsp_valid(d_rsp_valid), .dn_rsp_rdata(d_rsp_rdata), .dn_rsp_err(d_rsp_err),
+    .dn_rsp_ready(d_rsp_ready),
+    .dl_req_valid(dl_req_valid), .dl_req_addr(dl_req_addr), .dl_req_ready(dl_req_ready),
+    .dl_rsp_valid(dl_rsp_valid), .dl_rsp_data(dl_rsp_data), .dl_rsp_err(dl_rsp_err),
+    .dl_rsp_ready(dl_rsp_ready),
+    .dbg_hit(), .dbg_hit_way(), .dbg_set(), .dbg_alloc_wen(), .dbg_alloc_addr(),
+    .dbg_fill_busy(), .dbg_alloc_store(),
+    .perf_access(), .perf_hit(), .perf_miss(), .perf_bypass()
+  );
+
+  wire        d_req_take   = dc_up_req_valid && dc_up_req_ready;
   // PTW 的应答（4 字节读）：只有归属 PTW 的响应才回给它
-  wire [31:0] ptw_bus_rdata = d_rsp_rdata;
-  wire        ptw_bus_ack   = d_rsp_valid && d_owner_ptw_q;
-  wire        ptw_bus_err   = d_rsp_err && d_owner_ptw_q;
+  wire [31:0] ptw_bus_rdata = dc_up_rsp_rdata;
+  wire        ptw_bus_ack   = dc_up_rsp_valid && d_owner_ptw_q;
+  wire        ptw_bus_err   = dc_up_rsp_err && d_owner_ptw_q;
   // MEM 侧只消费归属自己的响应（不变式：M_WAIT 时 owner 必为 0）
-  wire        mem_rsp_valid = d_rsp_valid && !d_owner_ptw_q;
+  wire        mem_rsp_valid = dc_up_rsp_valid && !d_owner_ptw_q;
 
   wire [4:0]  mem_ctrl_amo_op = mem_amo_op_q;
   // ⚠ **已带精确异常（ID 级判定）的指令不得产生访存副作用**：`mem_excp_valid_q` 是非法指令 /
@@ -990,7 +1037,7 @@ module rv32gc_core (
       if (d_req_take) begin
         d_busy_q      <= 1'b1;
         d_owner_ptw_q <= d_is_ptw;
-      end else if (d_rsp_valid) begin
+      end else if (dc_up_rsp_valid) begin
         d_busy_q      <= 1'b0;
       end
       if (redirect_valid) begin
@@ -1247,9 +1294,9 @@ module rv32gc_core (
         end
         M_REQ:  if (d_req_take) memst_q <= M_WAIT;
         M_WAIT: if (mem_rsp_valid) begin
-                  m_rdata_q <= d_rsp_rdata;
-                  m_err_q   <= d_rsp_err;
-                  if (d_rsp_err) begin
+                  m_rdata_q <= dc_up_rsp_rdata;
+                  m_err_q   <= dc_up_rsp_err;
+                  if (dc_up_rsp_err) begin
                     m_excp_cause_q <= (m_we_q || m_is_amo_q || m_is_sc_q || m_is_cbo_q)
                                       ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
                     if (m_is_amo_q || m_is_sc_q) resv_valid_q <= 1'b0;
@@ -1276,21 +1323,21 @@ module rv32gc_core (
                 end
         M_REQ2: if (d_req_take) memst_q <= M_WAIT2;
         M_WAIT2: if (mem_rsp_valid) begin
-                  m_rdata2_q <= d_rsp_rdata;
-                  if (d_rsp_err) m_excp_cause_q <= m_we_q ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
+                  m_rdata2_q <= dc_up_rsp_rdata;
+                  if (dc_up_rsp_err) m_excp_cause_q <= m_we_q ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
                   memst_q <= M_DONE;
                 end
         M_REQ_W:  if (d_req_take) memst_q <= M_WAIT_W;
         M_WAIT_W: if (mem_rsp_valid) begin
                     // 写响应：出错按 store 访问错误记账（rd 数据对 SC 成功为 0，对齐已保证）
-                    if (d_rsp_err) m_excp_cause_q <= `EXC_STORE_ACCESS;
+                    if (dc_up_rsp_err) m_excp_cause_q <= `EXC_STORE_ACCESS;
                     // SC 的写完成 → 保留集已被消费；AMO 的写完成 → 同样使保留集失效
                     if (m_is_sc_q || m_is_amo_q) resv_valid_q <= 1'b0;
                     // ---- CBO.ZERO：块内 8 个 4 字节写，写响应后续写下一个字 ----
                     // （Spike 是一次 memset 32 字节；本核按 4 字节总线上限拆成 8 笔，
                     //   任何一笔出错即记 store 访问错误 7 并停止 —— 与 Spike 在
                     //   `sim->addr_to_mem(paddr)==nullptr` 时直接 trap 同类。）
-                    if (m_cbo_zero_q && !d_rsp_err && (m_cbo_cnt_q != 3'd7)) begin
+                    if (m_cbo_zero_q && !dc_up_rsp_err && (m_cbo_cnt_q != 3'd7)) begin
                       m_cbo_cnt_q <= m_cbo_cnt_q + 3'd1;
                       m_addr_q    <= m_addr_q + 32'd4;
                       m_wdata_q   <= 32'd0;

@@ -11,7 +11,7 @@
 #       bash scripts/run_full_regression.sh mmu        # 只跑 MMU 验收组
 #       bash scripts/run_full_regression.sh units      # 只跑单元+定向+程序
 #
-# 基线（2026-09-13，第 18 轮 L1I 之后）：非特权 18 组 124 例 0 失败；PMP 6 组同基线；
+# 基线（2026-09-13，第 20 轮 L1D 之后）：非特权 18 组 124 例 0 失败；PMP 6 组同基线；
 # MMU 61/64（3 例为参考模型 Spike 自身 FAIL）；单元/定向/程序全绿。
 #==============================================================================
 set -u
@@ -52,8 +52,11 @@ group() {   # group <显示名> <组参数> [用例过滤正则]
 cmd() { # cmd <显示名> <命令...>
   local label="$1"; shift
   local out
-  out=$("$@" 2>&1 | grep -aoE "(SIM: PASS [A-Za-z0-9_-]+|TB: TEST PASS|(PMP_UNIT|CLINT_PLIC_UNIT|TLB_PTW_UNIT|ICACHE_UNIT|AXI_SLAVE_UNIT|EXEC_UNIT_TESTS|DECODER_UNIT_TESTS|PRIV_TRAP|FETCH_ERR|LRSC_DIRECTED|FENCEI_SMC|XIP_NOALLOC|SPI_BOOT|BOOT_CHAIN|CHECK_DTS|PACK_BOOT): PASS( \([0-9]+ checks\))?" | tail -1)
-  [ -n "$out" ] || out="（未捕获 PASS 行）"
+  # ⚠ 第 20 轮修复：原正则少一个右括号（`grep -E` 直接报 "Unmatched ( or \("），
+  #   且兜底文案里带 "PASS" ⇒ 所有单元/定向项都会**假 PASS**。现在两边都修好：
+  #   正则括号配平；未捕获到判定行时文案不含 PASS（会被 case 判为 FAIL）。
+  out=$("$@" 2>&1 | grep -aoE "SIM: PASS [A-Za-z0-9_-]+|TB: TEST PASS|(PMP_UNIT|CLINT_PLIC_UNIT|TLB_PTW_UNIT|ICACHE_UNIT|DCACHE_UNIT|DWRITE_THRU|AXI_SLAVE_UNIT|EXEC_UNIT_TESTS|DECODER_UNIT_TESTS|PRIV_TRAP|FETCH_ERR|LRSC_DIRECTED|FENCEI_SMC|DCACHE_DIRECTED|XIP_NOALLOC|SPI_BOOT|BOOT_CHAIN|CHECK_DTS|PACK_BOOT): (PASS|FAIL)" | tail -1)
+  [ -n "$out" ] || out="（未捕获到判定行）"
   printf '%-26s %s\n' "$label" "$out" | tee -a "$SUMMARY"
   case "$out" in *PASS*) PASS_N=$((PASS_N+1));; *) FAIL_N=$((FAIL_N+1)); DEVIATION+=("$label 未 PASS: $out");; esac
 }
@@ -108,6 +111,7 @@ if [ "$ONLY" = all ] || [ "$ONLY" = units ]; then
   cmd "CLINT/PLIC 单元" bash scripts/run_unit_clint_plic.sh
   cmd "TLB/PTW 单元"    bash scripts/run_unit_tlb_ptw.sh
   cmd "L1I 单元"        bash scripts/run_unit_icache.sh
+  cmd "L1D 单元（含写直达结构断言）" bash scripts/run_unit_dcache.sh
   cmd "AXI 单元"        bash scripts/run_unit_axi.sh
   cmd "EXEC 单元"       bash scripts/run_unit_exec.sh
   cmd "译码器单元"      bash scripts/run_unit_decoder.sh
@@ -116,6 +120,7 @@ if [ "$ONLY" = all ] || [ "$ONLY" = units ]; then
   cmd "取指总线错误"    bash scripts/run_fetch_err_test.sh
   cmd "LR/SC 定向"      bash scripts/run_lrsc_test.sh
   cmd "fence.i 自改码"  bash scripts/run_fencei_smc_test.sh
+  cmd "L1D 定向功能"    bash scripts/run_dcache_test.sh
   cmd "SPI-XIP 启动"    bash scripts/run_spi_boot_test.sh
   cmd "启动链（真产物）" bash scripts/run_boot_chain_test.sh
   echo "########## DTS / 打包" | tee -a "$SUMMARY"

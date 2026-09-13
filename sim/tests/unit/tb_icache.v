@@ -99,6 +99,9 @@ module tb_icache;
     .d_req_valid(1'b0), .d_req_we(1'b0), .d_req_addr(32'd0), .d_req_wdata(32'd0),
     .d_req_wstrb(4'd0), .d_req_ready(),
     .d_rsp_valid(), .d_rsp_rdata(), .d_rsp_err(), .d_rsp_ready(1'b1),
+    // L1D 行填充客户端：本 TB 不测 L1D，恒空置（未连接会让 take_if 变成 x）
+    .dl_req_valid(1'b0), .dl_req_addr(32'd0), .dl_req_ready(),
+    .dl_rsp_valid(), .dl_rsp_data(), .dl_rsp_err(), .dl_rsp_ready(1'b1),
     .arid(arid), .araddr(araddr), .arlen(arlen), .arsize(arsize), .arburst(arburst),
     .arlock(arlock), .arcache(arcache), .arprot(arprot), .arvalid(arvalid), .arready(arready),
     .rid(rid), .rdata(rdata), .rresp(rresp), .rlast(rlast), .rvalid(rvalid), .rready(rready),

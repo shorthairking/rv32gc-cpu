@@ -92,6 +92,15 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0k. ✅ **已完成（第 21 轮）**：**④ 的 L1D 落地，④ 项完成** —— `rtl/mem/rv32_dcache.v`（32 KB = 128 组 × 8 路 ×
+       32 B、VIPT、**写直达+不写分配**、读分配整行填充、RR、XIP 旁路、原子/CBO 失效失效、`ENABLE` 安全阀）；
+       **`memtest` 1,116,795 → 1,021,800 拍（−8.5%，相对无 Cache 共 −49.6%）、`hello` 347 → 308 拍**；
+       新增 `DCACHE_UNIT(59)+DWRITE_THRU(14)`、`DCACHE_DIRECTED(28)`、`XIP_NOALLOC_D`；
+       终版回归（脚本修复后主 Agent 亲跑）**FULL_REGRESSION: PASS（281/7，偏离基线为空）**。
+       **另修掉回归脚本"假 PASS"缺陷**（`cmd` 正则括号不配平 + 兜底文案含 PASS ⇒ 未捕获也会判 PASS）——
+       第 19 轮台账里那几行单元 PASS 不可信，已重跑确认。
+       **下一步**：① 步骤④＝定稿 `docs/porting/07-board-bringup-plan.md`（33 MHz、B1/B2 以"CPU 稳定执行指令"
+       为主线、NAND 标可选）交用户审阅；② 用户放行后才上板（2A-7d）。
    b0i. ✅ **已完成（第 18 轮）**：④ 的 **L1I Cache 落地**（`rtl/frontend/rv32_icache.v`：16 KB/4 路/32 B、
        VIPT、RR、XIP 双判绕 Cache、`fence.i` 整表失效）⇒ **`memtest` −45.0%（2026669→1116795 拍）**、
        AXI 取指 82005→29 笔；新增 `ICACHE_UNIT(36)`/`FENCEI_SMC(9)`/`XIP_NOALLOC(142,5059)`。

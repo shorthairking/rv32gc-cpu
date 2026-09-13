@@ -94,6 +94,11 @@ module core_top (
   wire [31:0] d_req_addr, d_req_wdata, d_rsp_rdata;
   wire [3:0]  d_req_wstrb;
 
+  // L1D 行填充（8 beat 突发）通道：rv32gc_core 内的 rv32_dcache ↔ rv32_axi_master
+  wire        dl_req_valid, dl_req_ready, dl_rsp_valid, dl_rsp_err, dl_rsp_ready;
+  wire [31:0] dl_req_addr;
+  wire [255:0] dl_rsp_data;
+
   rv32_axi_master u_axi (
     .clk(aclk), .rst_n(rst_n),
     .if_req_valid(if_req_valid), .if_req_addr(if_req_addr), .if_req_ready(if_req_ready),
@@ -103,6 +108,9 @@ module core_top (
     .d_req_wdata(d_req_wdata), .d_req_wstrb(d_req_wstrb), .d_req_ready(d_req_ready),
     .d_rsp_valid(d_rsp_valid), .d_rsp_rdata(d_rsp_rdata), .d_rsp_err(d_rsp_err),
     .d_rsp_ready(d_rsp_ready),
+    .dl_req_valid(dl_req_valid), .dl_req_addr(dl_req_addr), .dl_req_ready(dl_req_ready),
+    .dl_rsp_valid(dl_rsp_valid), .dl_rsp_data(dl_rsp_data), .dl_rsp_err(dl_rsp_err),
+    .dl_rsp_ready(dl_rsp_ready),
     .arid(arid), .araddr(araddr), .arlen(arlen), .arsize(arsize), .arburst(arburst),
     .arlock(arlock), .arcache(arcache), .arprot(arprot), .arvalid(arvalid), .arready(arready),
     .rid(rid), .rdata(rdata), .rresp(rresp), .rlast(rlast), .rvalid(rvalid), .rready(rready),
@@ -129,6 +137,9 @@ module core_top (
     .d_req_wdata(d_req_wdata), .d_req_wstrb(d_req_wstrb), .d_req_ready(d_req_ready),
     .d_rsp_valid(d_rsp_valid), .d_rsp_rdata(d_rsp_rdata), .d_rsp_err(d_rsp_err),
     .d_rsp_ready(d_rsp_ready),
+    .dl_req_valid(dl_req_valid), .dl_req_addr(dl_req_addr), .dl_req_ready(dl_req_ready),
+    .dl_rsp_valid(dl_rsp_valid), .dl_rsp_data(dl_rsp_data), .dl_rsp_err(dl_rsp_err),
+    .dl_rsp_ready(dl_rsp_ready),
     .intrpt(intrpt),
     .dbg_commit_pc(dbg_pc), .dbg_commit_valid(dbg_valid), .dbg_commit_wen(dbg_wen),
     .dbg_commit_rd(dbg_rd), .dbg_commit_wdata(dbg_wdata), .dbg_priv(dbg_priv),
