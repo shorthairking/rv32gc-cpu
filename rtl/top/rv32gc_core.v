@@ -199,13 +199,22 @@ module rv32gc_core (
   wire [`PMP_ENTRIES*32-1:0] pmpaddr_all;
   // 数据侧有效特权级：`mstatus.MPRV=1` 且当前为 M 时用 MPP（machine.adoc MPRV 语义）；
   // 取指**不受 MPRV 影响**（恒用当前特权级）。
-  wire [1:0]  pmp_eff_priv_d = ((priv_q == `PRV_M) && mstatus_mprv_w) ? mstatus_mpp_w : priv_q;
+  // MPRV/MPP 的**同拍旁路**：`csrs mstatus,(MPRV|MPP=S)` 紧跟 `sw/lw` 时，前一条 csrs 还停在 WB
+  // 且因 mem_stall 未提交（此时 wb_csr_wen 为 0！），若直接用寄存器输出会把 M 模式当有效特权级
+  // ⇒ 漏报 SMPU 违例（实测 PMPS/PMPU_mprv_check-01）。这里按"WB 待提交的 mstatus 写"取有效值。
+  // 注意：**不能用 wb_csr_wen 门控**（停摆拍它是 0），要用 wb_csr_op_q 判"这是 CSR 写"。
+  wire        mstat_pend = wb_valid_q && !wb_excp_valid_q && (wb_csr_op_q != `CSR_NONE) &&
+                           (wb_csr_addr_q == `CSR_MSTATUS);
+  wire        mprv_eff   = mstat_pend ? wb_csr_wdata[17] : mstatus_mprv_w;
+  wire [1:0]  mpp_eff    = mstat_pend ? ((wb_csr_wdata[12:11] == 2'b10) ? `PRV_M : wb_csr_wdata[12:11])
+                                      : mstatus_mpp_w;
+  wire [1:0]  pmp_eff_priv_d = (((priv_q == `PRV_M) && mprv_eff) ? mpp_eff : priv_q);
 
   // 访存侧：读相位与写相位各一个检查结果（AMO 先读后写 ⇒ 缺 R 报 cause 5、缺 W 报 cause 7，
   // 与 Spike 的 mmu 调用顺序一致；SC 与普通 store 一样按写检查）
   wire [1:0]  mem_pmp_size = (mem_mem_size_q == `MSZ_BYTE) ? 2'd0 :
                              (mem_mem_size_q == `MSZ_HALF) ? 2'd1 : 2'd2;
-  wire        pmp_d_r_ok, pmp_d_w_ok, pmp_x_ok_if;
+  wire        pmp_d_r_ok, pmp_d_w_ok;
   // 数据侧只实例化**一个**匹配引擎：permit 供读相位、permit2 供写相位
   // （AMO 先读后写 ⇒ 缺 R 报 cause 5、缺 W 报 cause 7，与 Spike 一致）。
   // 这样避免复制整条匹配树 —— 实测两个实例会让整核 iverilog 仿真慢 3 倍以上。
@@ -298,13 +307,16 @@ module rv32gc_core (
   //   那 16 位本身（高半字为 0）。此前用 `dec_instr`（c.addi4spn 之类保留编码会被展开成 32 位
   //   `addi`）⇒ mtval 出现 0x00010413 这类"展开值"，与参考签名不符（实测 Tor/Na4 组多例）。
   wire [31:0] id_instr_raw    = (id_ilen_q == 3'd2) ? {16'd0, id_instr_q[15:0]} : id_instr_q;
-  wire        id_excp_valid = id_valid_q && (!dec_legal || id_ecall || id_ebreak || id_cbo_denied ||
-                                             id_pmp_x_fail);
-  wire [3:0]  id_excp_cause = id_pmp_x_fail                 ? `EXC_INSTR_ACCESS :
-                              (!dec_legal || id_cbo_denied) ? `DEXC_ILLEGAL :
-                              id_ebreak ? `DEXC_BREAK : ecall_cause;
-  wire [31:0] id_excp_tval  = id_pmp_x_fail                 ? id_pmp_x_tval :
-                              (!dec_legal || id_cbo_denied) ? id_instr_raw : 32'd0;
+  // CSR 访问合法性：`rv32_csr` 的 `csr_legal`（地址不存在 / 特权级不足 / 写只读 CSR）此前**从未被核使用**
+  // ⇒ S 模式读写 pmpcfg/pmpaddr 会静默提交而不报非法指令（实测 PMPS/PMPU_csr_access 零陷阱）。
+  wire        id_csr_ill   = (c_csr_op != `CSR_NONE) && !csr_legal;
+  wire        id_illegal   = !dec_legal || id_cbo_denied || id_csr_ill;
+  wire        id_excp_valid = id_valid_q && (id_illegal || id_ecall || id_ebreak || id_pmp_x_fail);
+  wire [3:0]  id_excp_cause = id_pmp_x_fail ? `EXC_INSTR_ACCESS :
+                              id_illegal   ? `DEXC_ILLEGAL :
+                              id_ebreak    ? `DEXC_BREAK : ecall_cause;
+  wire [31:0] id_excp_tval  = id_pmp_x_fail ? id_pmp_x_tval :
+                              id_illegal   ? id_instr_raw : 32'd0;
 
   // ID 级 JAL
   wire        id_jal_taken  = id_valid_q && dec_legal && c_is_jal;
