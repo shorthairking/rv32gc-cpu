@@ -936,9 +936,15 @@ arch-test 与 hello/memtest 无影响，已复跑）。
      Svinval/Svnapot/Svpbmt/Svadu/Svade）。方案侦察已派子 Agent。
   ④ **L1I/L1D/L2 Cache**（行 32B）：接 **D16② 的 XIP 绕 Cache 判定点**（`xip_bypass`/`line_xip_q`）；
      CBO 真正生效后跑 `PMPZicbo`(4)。
-  ⑤ **2A-7b/7c（仿真可验部分）**：SPI 小引导 + DDR 主镜像 + 链接/打包脚本；DTS/OpenSBI 的平台映射声明。
-  ⑥ **交付：上板测试计划（2A-7d）书面稿交用户审阅** —— 涵盖 FPGA 工程/约束/时序目标、上板步骤、
-     B1~B3 判据、串口与数码管观测、失败回退与风险。**用户审阅通过前不做上板**。
+  ⑤ **2A-7b/7c（仿真可验部分）**：✅ **第 16 轮已交付** —— `sw/board/{spi_stub.S,ddr_main.S,spi_stub.ld,ddr_main.ld}`
+     + `scripts/{pack_boot_image.sh,run_boot_chain_test.sh}`（`PACK_BOOT: PASS`、`BOOT_CHAIN: PASS`）；
+     `sw/board/rv32gc-chiplab.dts` + `scripts/check_dts.sh`（**`CHECK_DTS: PASS (17 ok)`**，DTS 与 RTL 常量交叉校验）
+     + `docs/porting/00-overview.md` §8（内存映射与 OpenSBI 适配）。
+     **剩余**：真机 OpenSBI/U-Boot 链接（把目标文件追加到 `sw/board/ddr_main.ld`）、dtb 编译产物入 NAND 分区。
+  ⑥ **交付：上板测试计划（2A-7d）书面稿交用户审阅** —— ✅ 草案已写：`docs/porting/07-board-bringup-plan.md`
+     （v0.9 草案：B1/B2/B3 判据、已核实的板级事实（100 MHz 时钟 AC19/复位 Y3/50-33 MHz/引脚）、集成步骤、
+     观测手段、8 条风险（R1 时序/R4 无 Cache 性能…）、时间预算、**5 个待用户拍板的决策点**）。
+     **待 ④ 落定后定稿提交审阅；用户审阅通过前不做上板（2A-7d）**。
 - 📄 本阶段任务的详细清单与判据即上方 🚧 列表（旧编号列表已并入其中）。
 - 🧭 **Sv32 MMU 实施计划（第 12 轮侦察定稿，下一轮执行；裁剪版：不实现 Svinval/Svnapot/Svpbmt/Svadu/Svade→按 Svade 即"不改写 PTE"）**：
   结构 `rtl/mmu/rv32_tlb.v`（ITLB 8/DTLB 16，全相联 CAM，项存 `{valid,G,IS_4M,ASID,VPN_TAG,PPN,PERM,AD}`）+
