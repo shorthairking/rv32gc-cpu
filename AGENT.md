@@ -891,9 +891,11 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 - 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求不做上板）**——进度：
   * ✅ ① 总线错误通道（取指 cause 1 + load/store 5/7，`FETCH_ERR: PASS (21)`）；物理 0 口径仍记为平台约定差异（详见上板计划）
   * ✅ ② `Zimop 40/40`、`Zcmop 8/8`
-  * ⏭ ③ Sv32 MMU（**验收 47/64**：`Svbare 3/3`、`Sv '^sv32_' 28/31`、`Svade 2/2`、`ExceptionsSv 4/4`、
-    `ExceptionsSvZaamo 3/3`、`ExceptionsSvZalrsc 3/3`、`SvPMP 2/4`、`SvZicbo 2/6`、`SvPMPZicbo 0/8`；
-    **剩 `SvPMP on_pte` 2 例 + 依赖 ④ 的 CBO 14 例**）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  * ✅ **③ Sv32 MMU 已完成（第 17 轮，验收 61/64 —— 可判定项全过）**：`Svbare 3/3`、`Sv '^sv32_' 28/31`
+    （余 3 例为**参考模型自身 FAIL**）、`Svade 2/2`、`SvPMP 4/4`、`ExceptionsSv 4/4`、`ExceptionsSvZaamo 3/3`、
+    `ExceptionsSvZalrsc 3/3`、`SvZicbo 6/6`、`SvPMPZicbo 8/8`（另非 Sv 的 `PMPZicbo 4/4`）。
+  * ⏭ **④ 剩余部分＝L1I/L1D/L2 Cache**（CBO 已于第 17 轮完成）：最小可用方案见下（L1I 必做、L1D 可选、L2 暂缓），
+    目标是接上 **D16② 的 XIP 绕 Cache 判定点**并显著降低 `hello`/`memtest` 的 cycles。
   * 🔜 **③ 的剩余工作（下一轮优先级最高，按此顺序）**：
     1. **`ExceptionsSv` 系列 10 例**（`ExceptionsSv 0/4`、`ExceptionsSvZaamo 0/3`、`ExceptionsSvZalrsc 0/3`）：
        现在**不是签名不符而是"慢到超时"** —— 实测 `sv32_exceptions_Smode` 60k 拍只有 649 条提交

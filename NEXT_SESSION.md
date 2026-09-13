@@ -92,6 +92,12 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0g. ✅ **已完成（第 17 轮）**：③ **Sv32 MMU 收尾完成**（验收 **61/64**，可判定项全过）——
+       CBO 真正走内存通路（`MEM_CBO`，照 Spike `mmu.h:237-266`：ZERO=store 语意+真清零 32B、
+       CLEAN/FLUSH/INVAL=load 语意但 cause 取 store 变体）⇒ `SvZicbo 6/6`、`SvPMPZicbo 8/8`、`PMPZicbo 4/4`；
+       PTW 页表读补 PMP 检查（`pmp_ok(pte_paddr,4,LOAD,PRV_S)`，拒绝⇒访问错误）⇒ `SvPMP 4/4`。
+       **下一步＝④ 剩余部分：L1I/L1D/L2 Cache**（最小可用方案 + 五条验证见 `AGENT.md` §7），
+       然后把 ⑥ 上板计划定稿交用户审阅。
    b0e. ✅ **已完成（第 16 轮）**：⑤ 的仿真可验部分 —— `sw/board/{spi_stub.S,ddr_main.S,*.ld}`
        + `scripts/{pack_boot_image.sh,run_boot_chain_test.sh}`（`PACK_BOOT: PASS (SPI 333B/1MiB, 重定位 0,
        DDR entry 0x0)`、**`BOOT_CHAIN: PASS`** —— 用要烧写的真产物跑出 SPI 桩→DDR 镜像→退出 0）；
