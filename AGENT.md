@@ -284,6 +284,25 @@
 
 **未决/待验证事项（带入阶段二，均不阻塞开工）**：`PARAM`/硬件 ECC/坏址标记/`TIMING` 取值（上板实测）；FPGA 工程 tcl 与 Vivado 2025.2 许可；100 MHz 时序收敛（4 项降级措施，降为双发射需用户批准）。
 
+### 阶段 2A 进展（2026-09-13，进行中）
+
+**已完成**
+| 项 | 内容 | 证据 |
+|---|---|---|
+| 仿真环境 | `sim/tb/sim_axi_slave.v`（单从设备 AXI 模型：mem_lo/mem_hi/CONFREG 双窗口/UART/tohost）+ `tb_smoke.v` + `run_sim.sh` | `AXI_SLAVE_UNIT: PASS (79 checks)`；`RV32GC_NO_CORE=1` 通路自测 PASS |
+| 参考模型 | Spike 1.1.1-dev 源码编译（`tools/spike-install`） | `spike --isa=rv32imac` 可运行 RV32 ELF |
+| 译码器 | `rtl/decode/rv32_decoder.v` + `rv32_imm_gen.v`（RV32IM+A+Zicsr+SYS+Zicbom+全部 Zca） | `DECODER_UNIT_TESTS: PASS (257 vectors)` |
+| 执行单元 | `rtl/exec/rv32_alu.v`、`rv32_bru.v`、`rv32_mul_div.v` | `EXEC_UNIT_TESTS: PASS (2461 checks)`（含 26 个注入缺陷全部被捕获） |
+| 核骨架 | `rtl/top/core_top.v`（平台端口契约）+ `rv32gc_core.v`（IF/ID/EX/MEM/WB）+ `rv32_axi_master.v` + `rv32_ifetch.v` + `rv32_regfile.v` + `rv32_csr.v` | **`SIM: PASS hello`**：真实编译的 C 程序经完整 AXI 通路打印 `Hello RV32GC` 并正常退出（353 拍） |
+| arch-test 通路 | `scripts/arch_test_build.sh` + `sim/arch_test/config/*`（link.ld 固定 tohost@0x8000_1000、UART/CLINT 地址改本平台） | 真实参考签名由 Spike 生成并编译进自校验 ELF：`I-add-00.elf` 构建成功 |
+| 非对齐访存 | MEM FSM 两次单拍拆分（跨 4B 边界自动拆分 + 字节级合并） | hello 仍 PASS；memtest 已能跑过打印阶段 |
+
+**本阶段修复的关键缺陷（均经仿真定位）**：I-Cache 行内半字位偏移错（idx*2 当成位索引）、行标签比较用完整地址比行号、flush 与 AXI 响应同拍导致 busy 永久卡死、JAL 在 EX 被误清导致 ra 未写、ecall/ebreak 未按 op_class 门控、AXI 读响应握手自取消（d_rsp_valid 永不为 1）、load-use 停顿冻结整条流水导致死锁（改为只冻结前端 + EX 插气泡）、mstatus/sstatus 拼接位宽错（41/33 位截断）。
+
+**进行中**：`memtest`（64 KiB 字节/半字/字/走位/非对齐混合测试）尚未通过 → 正在定位（疑似 VUART 输出与内存校验交织或某类访问的拆分/转发边界问题）。
+
+**待办（阶段 2A 剩余）**：memtest 通过 → arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通 → CSR/异常/PMP 完善 → Sv32 MMU + L1 Cache → FPGA tcl 与上板 B1~B3。
+
 ---
 
 ## 7. 当前状态与下一阶段计划

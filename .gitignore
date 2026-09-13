@@ -21,6 +21,7 @@ work/
 
 # 工具链与第三方源码（由脚本按需拉取）
 tools/
+spike-install/
 third_party/
 
 # Vivado 用户目录（沙箱内需把 HOME 指到工作区）
@@ -32,3 +33,10 @@ third_party/
 *~
 .DS_Store
 *.swp
+
+# 仿真/单元测试产物
+sim/log/
+sim/tests/out/
+*.vvp
+*.vcd
+*.fst

@@ -43,6 +43,19 @@ spike --isa=rv32imafdc_zicsr_zifencei --log-commits -l pk payload.elf
 - Spike 支持 `+signature=<file>` 生成签名（arch-test 需要 `--signature-granularity 4`）；
 - `--log-commits` 输出提交级轨迹（pc / 指令 / rd / 写数据），用于与本 RTL 的 `debug0_wb_*` 轨迹逐条比对。
 
+### 3.1 本项目已完成的 Spike 构建（2026-09-13）
+
+```bash
+# 已执行并验证：
+cd rv32gc-cpu/tools
+git clone --depth 1 https://github.com/riscv-software-src/riscv-isa-sim.git spike
+cd spike && mkdir build && cd build
+../configure --prefix=$PWD/../../spike-install && make -j16 && make install
+# 产出：tools/spike-install/bin/spike（版本 1.1.1-dev，支持 --isa=rv32i、--log-commits）
+```
+用途：① 生成 riscv-arch-test 的参考签名；② 生成提交级黄金轨迹（`--log-commits`）与 RTL 轨迹比对。
+`tools/` 已在 `.gitignore` 中（不入库）。
+
 ## 4. OpenSBI（RV32，M 模式固件）
 
 ```bash
