@@ -52,6 +52,9 @@ module rv32_alu (
       `ALU_SRA:  result = $signed(op_a) >>> op_b[4:0];
       `ALU_OR:   result = op_a | op_b;
       `ALU_AND:  result = op_a & op_b;
+      // Zicond（Zicond ci：rd = (rs2 == 0) ? 0 : rs1 / rd = (rs2 != 0) ? 0 : rs1）
+      `ALU_CZERO_EQZ: result = (op_b == 32'd0) ? 32'd0 : op_a;
+      `ALU_CZERO_NEZ: result = (op_b != 32'd0) ? 32'd0 : op_a;
       default:   result = 32'd0;                      // 保留编码
     endcase
   end

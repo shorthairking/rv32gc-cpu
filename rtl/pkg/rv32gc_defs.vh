@@ -164,6 +164,9 @@
 `define ALU_SRA   5'd7
 `define ALU_OR    5'd8
 `define ALU_AND   5'd9
+// Zicond：条件置零（rd = (rs2 条件) ? 0 : rs1）
+`define ALU_CZERO_EQZ 5'd10
+`define ALU_CZERO_NEZ 5'd11
 
 `define ALU_A_RS1  2'd0
 `define ALU_A_PC   2'd1

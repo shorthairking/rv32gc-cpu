@@ -574,12 +574,18 @@ module rv32_decoder (
           3'b010: if (funct7 == 7'b0000000) begin legal32=1'b1; alu_op_d=`ALU_SLT;  end // SLT
           3'b011: if (funct7 == 7'b0000000) begin legal32=1'b1; alu_op_d=`ALU_SLTU; end // SLTU
           3'b100: if (funct7 == 7'b0000000) begin legal32=1'b1; alu_op_d=`ALU_XOR;  end // XOR
-          3'b101: begin  // SRL / SRA
+          3'b101: begin  // SRL / SRA / CZERO.EQZ
             if (funct7 == 7'b0000000)      begin legal32=1'b1; alu_op_d=`ALU_SRL; end
             else if (funct7 == 7'b0100000) begin legal32=1'b1; alu_op_d=`ALU_SRA; end
+            // Zicond czero.eqz（funct7=0000111, funct3=101）：rd = (rs2 == 0) ? 0 : rs1
+            else if (funct7 == 7'b0000111) begin legal32=1'b1; alu_op_d=`ALU_CZERO_EQZ; end
           end
           3'b110: if (funct7 == 7'b0000000) begin legal32=1'b1; alu_op_d=`ALU_OR;   end // OR
-          3'b111: if (funct7 == 7'b0000000) begin legal32=1'b1; alu_op_d=`ALU_AND;  end // AND
+          3'b111: begin
+            if (funct7 == 7'b0000000)      begin legal32=1'b1; alu_op_d=`ALU_AND;  end // AND
+            // Zicond czero.nez（funct7=0000111, funct3=111）：rd = (rs2 != 0) ? 0 : rs1
+            else if (funct7 == 7'b0000111) begin legal32=1'b1; alu_op_d=`ALU_CZERO_NEZ; end
+          end
           default: legal32 = 1'b0;
         endcase
       end
