@@ -328,16 +328,57 @@ bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_
 # 3) 定位到具体指令后用 Spike 的 --log-commits 对照该 PC 附近的期望行为
 ```
 
-**待办（阶段 2A 剩余）**：① 查清 I-add-00 的停滞/极慢根因（疑组合环或 CSR 顺序化停顿与 M_WAIT 的交互）→ ② arch-test 子集（I/M/Zicsr/Zifencei/Zca）全绿 → ③ 补 CSR/异常/PMP → ④ Sv32 MMU + L1I/L1D/L2 Cache → ⑤ FPGA tcl 与上板 B1~B3。
+### 阶段 2A 进展（第 5 轮，2026-09-13）：arch-test 打通 79/80，锁步 5994 条
+
+**本轮结论（推翻上一轮的"组合环"猜测）**：`verilator --lint-only` 无组合环告警；实测 iverilog 仿真
+速度正常（约 10⁴ 拍/秒，I-add-00 全程 28206 拍）。上一轮"20 拍/秒"的观测不可复现（那是调试 TB 的
+硬编码 2000 拍出口 + Spike 执行时间被计入）。真实原因是 6 个具体 RTL 缺陷，全部用"提交轨迹 + 参考
+模型/失败用例定位"逐一查清并修复：
+
+| # | 缺陷（位置） | 现象与根因 | 证据 |
+|---|---|---|---|
+| 1 | 前端跨行 32 位取指（`rv32gc_core.v`） | 32 位指令落在 32 B 行末半字时 `need_cross=1` → `if_ready=0` → `advance_all=0`，而 `cross_q` 置位又被 `advance_all` 门控 → 永久死锁（I-add-00 在 `pc=0x8000207e` 冻结，100 万拍零推进）。修：`fetch_stall=!line_valid`；PC 推进与 cross 状态拆分门控 | `tb_prof` 现场：`need_cross=1 if_ready=0 cross=0` |
+| 2 | JALR 非对齐误判 | 用 `ex_addr[1]`（4 B 对齐）报 cause=0；实现 Zca 后 IALIGN=16，规范 `zca.adoc` norm:Zcanomisaligned 明确"任何指令都不会产生该异常" | 旧 TRAP 行 `cause=0 tval=80005132` |
+| 3 | 分支重定向未门控（`ex_br_redirect`） | WB→EX 旁路挂在 `wb_retire`(含 `advance`) 上，流水线冻结拍旁路失效，EX 中分支却仍用**过期操作数**判定并重定向（`c.lw/c.lw/bne` 序列跳错方向） | 对照 Spike 的 x23（签名指针）写入序列定位 |
+| 4 | 状态机漏发请求（`d_req_valid`） | 非对齐拆分第二次访问（`M_REQ2`）未拉高 `d_req_valid` → 等不到 `d_req_ready`，FSM 卡死（Zifencei/Zca 用例停摆） | `tb_prof`：`memst=4`（M_REQ2）长期不动 |
+| 5 | MDU 集成（`mdu_hold`）+ WB 旁路 | `mdu_hold` 在 start 拍不保持 → 结果未算出就流出 EX（M 组 8/8 全错）；且 start 拍锁存操作数时流水线被冻结、`wb_fwd_en` 被 `wb_wen`(含 advance) 门控 → 采到 load 旧值。修：`mdu_hold = … && !mdu_done`；转发只看"WB 有有效值" | M-mul-00 首用例 `mul` 结果 0 → 0x59012226 → 正确 |
+| 6 | 压缩跳转链接值 + FENCE.I 保留字段 | 链接值恒 `pc+4`，压缩 `c.jal/c.jalr` 应为 `pc+2`（新增 ilen 流水寄存器）；译码器把 `fence.i` 的 rs1/rd 非零判非法，规范 `zifencei.adoc` 要求"shall ignore these fields" | Zca-c.jal-00（x1=0x8000302c 应为 0x8000302a）、trap `cause=2 tval=0001100f` |
+
+**同时修正的验证环境问题（非 RTL）**：① 桩 `arch_stub.S` 未铺满一整条 32 B 取指行，镜像空洞读到 `x`
+会经 `ilen` 把 PC 污染成 `x`（真实内存不会）；② 仿真内存模型把未初始化字节按 0 读出；
+③ `scripts/arch_test_build.sh` 生成参考签名时错误地把 `_zicntr/_zifencei` 从 Spike 的 ISA 串剥掉，
+使参考把 `csrrs instret`/`fence.i` 当非法指令（Zicsr 组曾 4/6 FAIL、Zifencei 陷阱计数不符）。
+
+**本轮验收证据（全部实测）**
+
+| 项 | 结果 |
+|---|---|
+| arch-test `I` / `M` / `Zicsr` / `Zca` | **39/39、8/8、6/6、26/26 PASS**（共 79 例，0 失败） |
+| arch-test `Zifencei` | 0/1：`fence.i` 已可正确执行，剩余"Trap count mismatch"（ACT4 框架 trap 签名计数语义） |
+| 单元测试 | AXI 79 / EXEC 2461 / DECODER 255（向量随 fence.i 语义修正更新）全通过 |
+| 端到端 | `SIM: PASS hello`、`SIM: PASS memtest` |
+| 锁步 | `scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000` → **5994 条提交与 Spike 完全一致**（新增纯计算基准 `sim/tests/lockstep_bench.c`，避免 MMIO 让 Spike 提前退出） |
+
+**新增工具**：`sim/tb/tb_prof.v`（停滞直方图 + 窗口 PC 哈希 + 死锁现场 dump）、
+`scripts/run_arch_test_suite.sh`（整组批量跑+汇总）、`scripts/arch_fail_locate.py`（从提交轨迹定位
+首个失败用例及其 instptr/描述串）、`sim/tests/lockstep_bench.c`；`scripts/lockstep.sh` 修好三处工具
+缺陷（`32'h…` 未加引号、Spike 提交日志在 stderr、RESET_PC 改取 ELF 入口）。
+
+**待办（阶段 2A 剩余）**：① Zifencei 单例（"Trap count mismatch"，对齐 ACT4 trap 签名计数语义）
+→ ② Zaamo/Zalrsc（A 扩展执行通路尚未实现，AMO/LR/SC 目前会走成普通读写）→ ③ 补 CSR/异常/PMP
+→ ④ Sv32 MMU + L1I/L1D/L2 Cache → ⑤ FPGA tcl 与上板 B1~B3。上一轮的"组合环"假设已排除。
 
 ---
 
 ## 7. 当前状态与下一阶段计划
 
-**当前状态（2026-09-13，阶段 2A 进行中）**：按"开始阶段 2A"指令已执行 4 个 goal round。
+**当前状态（2026-09-13，阶段 2A 进行中）**：已执行 5 个 goal round。
 - ✅ 仿真/回归环境（iverilog + Verilator + Spike 参考模型 + 自研 TB + 锁步工具链）已建成
-- ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 257）
-- ⏳ arch-test `I-add-00`：前 378 条提交与 Spike 锁步一致，但完整用例未跑完（停滞/极慢，疑组合环）
+- ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）
+- ✅ **arch-test 4 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zca` 26/26（共 79 例 0 失败）；
+  `Zifencei` 1 例待办（fence.i 已可执行，剩 ACT4 trap 签名计数语义）
+- ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
+- ⏭ 下一步：Zaamo/Zalrsc（A 扩展执行通路）→ CSR/异常/PMP 完善 → Sv32 MMU + Cache → FPGA 上板
 - 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）
 
 

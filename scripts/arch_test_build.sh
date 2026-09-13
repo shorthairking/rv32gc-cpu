@@ -36,8 +36,12 @@ if [ ! -x "$SPIKE" ]; then
   exit 1
 fi
 
-# Spike 的 --isa= 不接受全部扩展名，做一次映射
-SPIKE_ISA="$(echo "$MARCH" | sed -e 's/_zicsr//' -e 's/_zifencei//' -e 's/_zicntr//' -e 's/_zmmul//' -e 's/_zca//' -e 's/_zcd//' -e 's/_zcf//')"
+# Spike 的 --isa= 只接受它认识的扩展名；这里只剥离"Spike 不认识/由基 ISA 隐含"的：
+#   _zmmul / _zca / _zcd / _zcf  —— Spike 不认识（C 已覆盖 Zca/Zcd/Zcf）
+# **保留** _zicsr / _zifencei / _zicntr —— 它们决定参考模型是否实现 CSR/指令栅栏/计数器：
+#   * 剥掉 _zicntr  → Spike 把 `csrrs instret` 当非法指令 → Zicsr 组误判失败
+#   * 剥掉 _zifencei → Spike 把 `fence.i` 当非法指令 → Zifencei 组陷阱计数不符而失败
+SPIKE_ISA="$(echo "$MARCH" | sed -e 's/_zmmul//' -e 's/_zca//' -e 's/_zcd//' -e 's/_zcf//')"
 ISA_STR="rv32${SPIKE_ISA#rv32}"
 
 COMMON=(-Wl,--no-warn-rwx-segments

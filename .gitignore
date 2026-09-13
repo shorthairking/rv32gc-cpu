@@ -40,3 +40,8 @@ sim/tests/out/
 *.vvp
 *.vcd
 *.fst
+
+# arch-test 生成产物（参考签名/结果/ELF 均由脚本重建）
+sim/arch_test/out/
+sim/tests/out/
+sim/log/

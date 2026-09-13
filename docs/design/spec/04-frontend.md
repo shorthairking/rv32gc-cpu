@@ -130,7 +130,7 @@ assign pc_if0_valid = rst_n && !if_freeze && !wfi_hold && !fencei_hold;
 - **顺序推进固定 `+16`**：前端以 16 B 块为单位，`pc_q[3:0]==0` 恒成立；RVC 只改变块内指令条数。
 - **块内对齐由 `valid_hw[7:0]` 掩码表达**：重定向可落在块内任意偶地址，首块 `valid_hw = 8'hFF << pc[4:1]`（截到行尾）；ID 只让掩码内的半字参与拼接。
 - **`+2` 只出现两处**：① ID 拼接 32 bit 指令 `instr32 = {hw_hi, hw_lo}`，`hw_hi` 属于 `PC+2`（可能在下一次取指块）；② 16 bit 指令的 `pc_next = pc+2` 由 ID 的 RVC 对齐逻辑维护，**不进 `pc_gen`**。
-- **不做取指地址非对齐检查**：本设计支持 C 扩展，`IALIGN=16`，规范明确"IALIGN=16 时不可能产生取指地址非对齐异常"（`riscv-isa-manual/src/unpriv/rv32.adoc`，jal/jalr 一节 NOTE）。分支/JAL/JALR 目标非对齐在 BRU/EX 级按 `../04-csr-mmu.md` §4.1 报 cause=0。
+- **不做取指地址非对齐检查**：本设计支持 Zca（C 扩展），`IALIGN=16`，规范明确"With the addition of the Zca extension, no instructions can raise instruction-address-misaligned exceptions"（`riscv-isa-manual/src/unpriv/zca.adoc`，norm:Zcanomisaligned；`rv32.adoc` jal/jalr 一节 NOTE 同义）。因此 **BRU/EX 级也不报 cause=0**：JALR 目标由 BRU 清零 `bit0`，分支/JAL 的立即数最低位恒 0，任何取指地址都是合法的 2 字节对齐地址。
 - **`misa.C=0` 时**：`pc_if0[1]` 仍允许为 1（目标由软件对齐）；若取到半字边界上的 32 bit 指令，由 ID 报 `illegal_instr`（cause=2），前端不报地址非对齐。
 
 ---

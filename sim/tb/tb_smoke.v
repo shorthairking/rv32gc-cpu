@@ -56,6 +56,9 @@ module tb_smoke;
   reg              trace_en = 1'b0;
   reg              wave_en  = 1'b0;
   reg              sig_en   = 1'b0;
+  // 签名 dump 范围（mem_hi 字节偏移/字数）；默认沿用 0x1000..0x2000 的 1024 字
+  integer          sig_base  = 32'h1000;
+  integer          sig_words = 1024;
 
   initial begin
     wave_file = "";
@@ -65,6 +68,8 @@ module tb_smoke;
 
     sig_dump_file = "";
     sig_en = $value$plusargs("sig_dump=%s", sig_dump_file);
+    if (!$value$plusargs("sig_base=%h", sig_base))  sig_base  = 32'h1000;
+    if (!$value$plusargs("sig_words=%d", sig_words)) sig_words = 1024;
 
     lo_init_file = "";
     hi_init_file = "";
@@ -280,12 +285,12 @@ module tb_smoke;
         if (fd == 0) begin
           $display("TB: ERROR cannot open sig_dump file %0s", fname);
         end else begin
-          for (i = 0; i < 1024; i = i + 1)
+          for (i = 0; i < sig_words; i = i + 1)
             $fdisplay(fd, "%08x",
-                      {u_slave.mem_hi[32'h1003 + 4*i], u_slave.mem_hi[32'h1002 + 4*i],
-                       u_slave.mem_hi[32'h1001 + 4*i], u_slave.mem_hi[32'h1000 + 4*i]});
+                      {u_slave.mem_hi[sig_base + 3 + 4*i], u_slave.mem_hi[sig_base + 2 + 4*i],
+                       u_slave.mem_hi[sig_base + 1 + 4*i], u_slave.mem_hi[sig_base + 0 + 4*i]});
           $fclose(fd);
-          $display("TB: sig_dump -> %0s (mem_hi[0x1000..0x2000], 1024 words)", fname);
+          $display("TB: sig_dump -> %0s (mem_hi[0x%0h + %0d words])", fname, sig_base, sig_words);
         end
 `endif
       end

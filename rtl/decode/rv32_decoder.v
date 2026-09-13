@@ -39,7 +39,7 @@
 //   * JALR 的 funct3!=000、BRANCH 的 funct3=010/011；
 //   * MISC-MEM 的 funct3 非 000/001/010（010 为 Zicbom）；SYSTEM 的 funct3=100；
 //   * SYSTEM：funct12 非 ECALL/EBREAK/MRET/SRET/WFI/SFENCE.VMA、
-//     SFENCE.VMA 的 rd!=0、FENCE.I 的 rd!=0 或 rs1!=0（FENCE.I 保留编码）；
+//     SFENCE.VMA 的 rd!=0（FENCE.I 的 rs1/rd/funct12 是"必须忽略"的保留字段，不报非法）；
 //   * Zicbom（MISC-MEM 操作码 funct3=010）：funct12 非 000/001/002/004 或 rd!=0（保留编码）；
 //   * A 扩展：funct3!=010；funct5 非 LR/SC/9 种 AMO；LR.W 的 rs2!=0、SC.W 的 rs2=0（保留编码）；
 //   * Zicsr：funct3=100（保留）；SYSTEM 的 funct3=000 仅在 funct7/funct12 精确匹配
@@ -594,15 +594,18 @@ module rv32_decoder (
             is_serial_d= 1'b1;
             imm_type_d = IMM_NONE;
           end
-          3'b001: begin  // FENCE.I（rd/rs1 必须为 0，否则保留）
-            if ((rd_i == 5'd0) && (rs1_i == 5'd0)) begin
-              legal32    = 1'b1;
-              op_class_d = `OP_SYS;
-              sys_op_d   = `SYS_FENCE_I;
-              is_fencei_d= 1'b1;
-              is_serial_d= 1'b1;
-              imm_type_d = IMM_NONE;
-            end
+          3'b001: begin  // FENCE.I：rs1/rd/funct12 是保留字段，实现必须**忽略**，不得报非法
+            // riscv-isa-manual/src/unpriv/zifencei.adoc："…funct12, rs1, and rd, are reserved
+            // for finer-grain fences in future extensions. For forward compatibility, base
+            // implementations shall ignore these fields".
+            // 历史缺陷：曾要求 rd==0 && rs1==0，导致 `fence.i` 带非零 rs1（arch-test 用例
+            // 0x0001100f）被判非法指令（cause=2），Zifencei 用例失败。
+            legal32    = 1'b1;
+            op_class_d = `OP_SYS;
+            sys_op_d   = `SYS_FENCE_I;
+            is_fencei_d= 1'b1;
+            is_serial_d= 1'b1;
+            imm_type_d = IMM_NONE;
           end
           3'b010: begin  // Zicbom：cbo.inval/clean/flush/zero（编码固定 rd=0）
             if (rd_i == 5'd0) begin

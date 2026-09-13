@@ -165,12 +165,17 @@ module sim_axi_slave #(
   endfunction
 
   // 内存字节读（非内存区返回 0，由 device_word 接管）
+  // 未初始化字节（$readmemh 未覆盖的位置）按 0 读出：真实 DRAM/BRAM 不会返回 x，
+  // 若让 x 传出，取指行里未定义的那些字节会把指令长度/PC 污染成 x（仿真假死锁）。
   function [7:0] mem_byte_read;
     input [31:0] a;
     begin
-      if (a <= MEM_LO_LAST)                       mem_byte_read = mem_lo[a];
-      else if (a >= MEM_HI_BASE && a <= MEM_HI_LAST) mem_byte_read = mem_hi[a - MEM_HI_BASE];
-      else                                        mem_byte_read = 8'h00;
+      if (a <= MEM_LO_LAST)
+        mem_byte_read = (mem_lo[a] !== 8'hxx) ? mem_lo[a] : 8'h00;
+      else if (a >= MEM_HI_BASE && a <= MEM_HI_LAST)
+        mem_byte_read = (mem_hi[a - MEM_HI_BASE] !== 8'hxx) ? mem_hi[a - MEM_HI_BASE] : 8'h00;
+      else
+        mem_byte_read = 8'h00;
     end
   endfunction
 

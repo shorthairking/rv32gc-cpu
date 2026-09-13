@@ -49,21 +49,26 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ```
 注意：Spike 的 `--log-commits` 输出在 **stderr**（用 `2>&1 1>/dev/null`）；Spike 的内存映射用 `-m0x80000000:0x10000000,...`（0x0 布局会与设备区冲突）；本核复位 PC=0，跑 0x8000_0000 布局的镜像需要 **`-DRESET_PC=32'h8000_0000`** 重编或用 `arch_stub.S` 跳转桩。
 
-## 4. 当前卡点（第 4 轮结束时的事实，请从这里接手）
+## 4. 当前状态与卡点（第 5 轮结束时的事实，请从这里接手）
 
-1. **`hello`、`memtest` 全绿**；单元测试全绿。
-2. **arch-test `I-add-00` 未跑完**：
-   - 与 Spike 的提交级锁步：**前 378 条（≥0x8000_0000 的提交，PC/rd/wdata）完全一致**；
-   - 用 `RV32GC_TIMEOUT=30000000` 仍 `TB: TIMEOUT`（30M 拍未完成）；
-   - 增强调试 TB 观测：`cyc≈1000~1500` 时 PC 在 `0x8000_65xx`（**rvtest 陷阱处理程序**）、`front_hold=1`、MEM 处于 `M_WAIT`（等 AXI）；`cyc≈2000` 回到 `0x80046840`（测试主体）→ 陷阱能返回；
-   - **挂钟 240 秒只推进约 2000 拍（≈20 拍/秒）**，远慢于 `hello`/`memtest`（数千~数万拍/秒）→ 强烈怀疑**组合环/零时间振荡**（在 `front_hold` 或 `M_WAIT` 期间），或某访问路径反复重试；
-   - 提交轨迹最后停在 `pc≈0x8004_682x` 的签名计算循环。
-3. **下一步建议顺序**：
-   a. 用 `verilator --lint-only` 全 RTL 扫组合环告警；把调试 TB 的 STATE 打印改为每 1 拍，看 `cyc` 是否推进（判断是否零时间振荡）；必要时 dump `cyc=1985~2010` 的 VCD；
-   b. 若确认振荡/死锁 → 定位到具体信号组合并修复（重点看 `front_hold`（CSR 顺序化停顿）、`mem_stall`、`advance_all`、`wb_retire` 的相互依赖）；
-   c. 修好后把锁步轨迹拉长到 ≥5000 条提交，确保与 Spike 一致，再跑 arch-test 全量；
-   d. 跑通后按 `I → M → Zicsr → Zifencei → Zca → Zaamo/Zalrsc` 顺序批量跑 arch-test 子集（`scripts/run_arch_test.sh <组>/<用例>`）。
-4. **阶段 2A 剩余**（在 arch-test 之后）：CSR/异常/PMP 完善 → Sv32 MMU → L1I/L1D/L2 Cache → FPGA tcl（`fpga/tcl/build_chiplab.tcl`，时钟 IP 已备好 `fpga/tcl/create_clk_wiz_cpu.tcl`）与上板 B1~B3。
+1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）。
+2. **arch-test**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zca` 26/26 **全绿**；`Zifencei/Zifencei-fence.i-00` 仍失败。
+   批量跑法：`bash scripts/run_arch_test_suite.sh <组名>`（默认超时 300000 拍）。
+3. **锁步已达标**：`bash scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000`
+   → 5994 条提交与 Spike 完全一致（新增 `sim/tests/lockstep_bench.c` 纯计算基准，避免 MMIO 让 Spike 提前退出）。
+   `lockstep.sh` 已修好三处工具缺陷（`32'h…` 加引号、Spike 提交日志取 stderr、RESET_PC 取 ELF 入口）。
+4. **剩余卡点（Zifencei 单例）**：`fence.i` 已能正确执行；失败在 ACT4 框架 `check_trap_sig_offset`
+   → "Trap count mismatch"：参考 `.results` 的 `trap_sigptr` 期望两条 **store 访问错误**记录
+   （mcause=6~7、mepc≈0x8000208e/0x800020ee、mtval=0x46/0xa6），本核只发生 4 次 ecall 陷阱、没有这两条。
+   下一步：对比 Spike 在 sig 版镜像上的 trap 记录与本核的 trap/`mtval`/优先级语义
+   （本核非对齐访存走硬件拆分，可能报 access fault 而非 misaligned）。
+5. **下一步顺序建议**：
+   a. 查清 Zifencei 的 trap 签名计数语义；
+   b. 实现 A 扩展执行通路（LR/SC/AMO 目前会走成普通读写）→ 跑 `Zaamo`/`Zalrsc` 组；
+   c. 按 2A-3/2A-4 补 CSR/异常/PMP → Sv32 MMU + L1I/L1D/L2 Cache；
+   d. FPGA tcl 与上板 B1~B3（`fpga/tcl/build_chiplab.tcl`，时钟 IP 已备好 `create_clk_wiz_cpu.tcl`）。
+6. **本轮修复的 6 个 RTL 缺陷与 3 个验证环境问题**：见 `AGENT.md` §6「阶段 2A 进展（第 5 轮）」表格；
+   上一轮的"组合环/极慢"是误判，已排除（lint 无环、仿真约 10⁴ 拍/秒）。
 
 ## 5. 工作方式要求（必须遵守）
 

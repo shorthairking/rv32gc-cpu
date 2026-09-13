@@ -197,7 +197,7 @@ RVC 在 ID 级由 `rvc_expand.v` 展开为等价的 32 位指令后进入同一�
 | 非法指令 | 无匹配译码项；RVC 展开非法（nzuimm=0、rd=x0 的 c.lwsp 等） | 2（illegal_instr），`tval = instr` |
 | 非法 CSR 访问 | CSR 地址不存在，或特权级不足，或只读 CSR 被写 | 2（按规范非法指令） |
 | ECALL/EBREAK | 直接译码产生 | 8/9/11、3（按特权级） |
-| 跳转目标非对齐 | JAL/JALR/Branch（在 EX 级检测，不在译码期） | 0/3（EX 级产生） |
+| 跳转目标非对齐 | **不实现**：本设计实现 Zca，IALIGN=16，规范明确任何指令都不会产生指令地址非对齐异常（`zca.adoc` norm:Zcanomisaligned）；JALR 目标由 BRU 清零 bit0 | —（cause 0 不产生） |
 | `mstatus.FS=Off` 执行浮点 | 译码期检查 `fs_off` | 2 |
 
 > 译码期异常**不阻塞** uop 流动：uop 带 `excp_valid` 进入后端，在 RT 级（ROB 头部）精确触发。

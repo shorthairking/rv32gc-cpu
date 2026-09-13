@@ -320,7 +320,7 @@ def decode32(w):
             d["legal"] = 1
             setf(d, op_class="OP_SYS", sys_op="SYS_FENCE", is_fence=1, is_serial=1)
             d["imm_type"] = "NONE"
-        elif f3 == 1 and rd == 0 and rs1 == 0:         # FENCE.I
+        elif f3 == 1:                                  # FENCE.I（rs1/rd/funct12 为保留字段，忽略）
             d["legal"] = 1
             setf(d, op_class="OP_SYS", sys_op="SYS_FENCE_I", is_fencei=1, is_serial=1)
             d["imm_type"] = "NONE"
@@ -903,8 +903,8 @@ ILLEGAL32 = [
     (ENC_I(0x102, 10, 0, 0, 0x73), "SRET rd!=0（保留）"),
     (ENC_I(0x105, 10, 0, 0, 0x73), "WFI rd!=0（保留）"),
     ((0x09 << 25) | (11 << 20) | (10 << 15) | (1 << 7) | 0x73, "SFENCE.VMA rd!=0"),
-    (ENC_I(0, 0, 10, 1, 0x0F), "FENCE.I rs1!=0（保留）"),
-    (ENC_I(0, 10, 0, 1, 0x0F), "FENCE.I rd!=0（保留）"),
+    # 注：FENCE.I 的 rs1/rd/funct12 是"实现必须忽略"的保留字段（zifencei.adoc），
+    #     不是非法编码，故不作为 ILLEGAL32 条目（对应 arch-test 用例 0x0001100f）。
     (ENC_I(0x000, 10, 10, 2, 0x0F), "CBO rd!=0（保留）"),
     (ENC_I(0x002, 0, 10, 3, 0x0F), "MISC-MEM funct3=011 保留"),
     (ENC_I(0, 10, 11, 3, 0x03), "LOAD funct3=011（RV64 LD）"),

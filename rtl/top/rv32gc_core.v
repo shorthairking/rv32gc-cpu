@@ -186,6 +186,7 @@ module rv32gc_core (
   reg  [31:0] ex_pc_q, ex_instr_q, ex_imm_q;
   reg  [31:0] ex_rs1_val_q, ex_rs2_val_q;
   reg  [4:0]  ex_rs1_q, ex_rs2_q, ex_rd_q;
+  reg  [2:0]  ex_ilen_q;
   reg  [11:0] ex_csr_addr_q;
   reg  [31:0] ex_csr_rdata_q;
   reg  [72:0] ex_ctrl_q;
@@ -218,11 +219,14 @@ module rv32gc_core (
   // MEM 级（EX/MEM 寄存器）：仅 ALU 类结果可转发（load 数据要等 WB）
   wire        mem_fwd_en  = mem_valid_q && mem_rd_wen_q && (mem_rd_q != 5'd0) &&
                             (mem_mem_op_q == `MEM_NONE);
-  wire [31:0] mem_fwd_val = (mem_wb_sel_q == `WB_PC4) ? (mem_pc_q + 32'd4) :
+  wire [31:0] mem_fwd_val = (mem_wb_sel_q == `WB_PC4) ? (mem_pc_q + {29'd0, mem_ilen_q}) :
                             (mem_wb_sel_q == `WB_CSR) ? mem_csr_rdata_q :
                             mem_alu_q;   // WB_MEM（load）不在 MEM 级转发，见 mem_fwd_en
-  // WB 级：wb_wen 已含 rd!=0 与无异常
-  wire        wb_fwd_en   = wb_wen;
+  // WB 级：只要求"WB 携带有效写回值"，**不要求本拍真的退休**。
+  // 关键：流水线冻结拍（mem_stall / mdu_hold / fetch_stall）里 wb_retire=0，但 WB 的值
+  // 已经确定；此时若禁止转发，正在 EX 的消费者（如 MDU 在 start 拍锁存操作数）会采到旧值。
+  // 历史缺陷：wb_fwd_en = wb_wen（含 advance）导致 M 扩展整组失败（MUL/... 得到旧操作数）。
+  wire        wb_fwd_en   = wb_valid_q && !wb_excp_valid_q && wb_rd_wen_q && (wb_rd_q != 5'd0);
   wire [31:0] wb_fwd_val  = wb_wdata;
 
   wire [31:0] ex_rs1_fwd = (mem_fwd_en && (mem_rd_q == ex_rs1_q)) ? mem_fwd_val :
@@ -253,9 +257,13 @@ module rv32gc_core (
 
   wire        mdu_busy, mdu_done;
   wire [31:0] mdu_result;
-  reg         mdu_started_q;
-  wire        mdu_start = ex_valid_q && e_is_mdu && !mdu_started_q && !mdu_busy && !mdu_done;
-  wire        mdu_hold  = ex_valid_q && e_is_mdu && !mdu_done && !mdu_start;
+  // MDU 握手（见 rv32_mul_div.v：start 被接收后下一拍 busy=1；乘法第 3 拍、除法第 33 拍
+  // done=1 单拍脉冲，且 done 与 result 同拍）。
+  // start 条件用 busy/done 即可保证单拍：busy 拍不会再发 start，done 拍已 !done。
+  wire        mdu_start = ex_valid_q && e_is_mdu && !mdu_busy && !mdu_done;
+  // 占用：从 start 拍起一直保持到 done 拍（含 start 拍），done 拍才放行并采走同拍结果。
+  // 历史缺陷：曾在 start 拍不保持（… && !mdu_start），结果尚未算出就流出 EX → M 扩展全错。
+  wire        mdu_hold  = ex_valid_q && e_is_mdu && !mdu_done;
 
   rv32_mul_div u_mdu (
     .clk(clk), .rst_n(rst_n),
@@ -266,9 +274,18 @@ module rv32gc_core (
 
   wire [31:0] ex_result  = e_is_mdu ? mdu_result : alu_result;
   wire [31:0] ex_addr    = ex_rs1_fwd + ex_imm_q;         // LSU 地址
-  wire        ex_br_redirect = ex_valid_q && (e_is_br || e_is_jalr) && br_taken;
-  // jalr 目标非 2 字节对齐 → 指令地址非对齐异常
-  wire        ex_jalr_bad = ex_valid_q && e_is_jalr && (ex_addr[1] == 1'b1);
+  // EX 级分支/JALR 退出条件（原始）。注意：实际重定向必须再用 advance_all 门控，
+  // 见下方 ex_br_redirect —— WB→EX 旁路挂在 wb_retire(=…&&advance…) 上，流水线冻结
+  // 的那一拍旁路不生效，若此时就用（可能过期的）操作数做决定并重定向，会跳错方向。
+  wire        ex_br_exit = ex_valid_q && (e_is_br || e_is_jalr) && br_taken;
+  // JALR/分支的指令地址非对齐异常：
+  //   本核实现 Zca（C 扩展）→ IALIGN=16。规范明确 "With the addition of the Zca
+  //   extension, no instructions can raise instruction-address-misaligned exceptions"
+  //   （riscv-isa-manual/src/unpriv/zca.adoc, norm:Zcanomisaligned）。
+  //   且 rv32_bru 已按规范把 JALR 目标 bit0 清零。故该项恒不成立。
+  //   历史缺陷：曾用 ex_addr[1]（4 字节对齐）判定，导致返回地址为 2 mod 4 时
+  //   误报 cause=0 陷阱（arch-test 大量用例因此失败）。
+  wire        ex_jalr_bad = 1'b0;
 
   // EX 级异常合并（ID 级异常随 ex_excp_* 传入）
   wire        ex_excp_valid_final = ex_excp_valid_q || ex_jalr_bad;
@@ -279,6 +296,7 @@ module rv32gc_core (
   reg  [31:0] mem_pc_q, mem_instr_q, mem_alu_q, mem_addr_q, mem_imm_q, mem_rs1_val_q, mem_rs2_val_q;
   reg  [31:0] mem_csr_rdata_q;
   reg  [4:0]  mem_rd_q;
+  reg  [2:0]  mem_ilen_q;
   reg  [11:0] mem_csr_addr_q;
   reg  [2:0]  mem_wb_sel_q, mem_mem_op_q, mem_sys_op_q;
   reg  [1:0]  mem_mem_size_q, mem_mem_flags_q, mem_csr_op_q;
@@ -298,7 +316,10 @@ module rv32gc_core (
   reg  [1:0]  m_size_q, m_uns_q, m_shift_q;
   reg  [3:0]  m_excp_cause_q;
 
-  assign d_req_valid = (memst_q == M_REQ);
+  // 请求有效须覆盖两次拆分访问：M_REQ（第一次）与 M_REQ2（第二次）。
+  // 历史缺陷：只写了 M_REQ，非对齐拆分时第二次访问永不发请求、FSM 卡在 M_REQ2
+  // （Zifencei / Zca 等用例里出现非对齐访问即整机停摆）。
+  assign d_req_valid = (memst_q == M_REQ) || (memst_q == M_REQ2);
   assign d_req_we    = m_we_q;
   assign d_req_addr  = m_addr_q;
   assign d_req_wdata = m_wdata_q;
@@ -331,6 +352,7 @@ module rv32gc_core (
   // ============================================================ MEM/WB 寄存器
   reg  [31:0] wb_pc_q, wb_instr_q, wb_alu_q, wb_imm_q, wb_rs1_val_q, wb_csr_rdata_q, wb_mem_data_q;
   reg  [4:0]  wb_rd_q;
+  reg  [2:0]  wb_ilen_q;
   reg  [2:0]  wb_wb_sel_q, wb_sys_op_q;
   reg  [1:0]  wb_csr_op_q;
   reg         wb_rd_wen_q, wb_valid_q, wb_csr_imm_q;
@@ -339,13 +361,22 @@ module rv32gc_core (
   reg  [31:0] wb_excp_tval_q;
 
   // ============================================================ 停顿/清空
-  wire fetch_stall = !if_ready;
+  // 注意 fetch_stall 用 line_valid 而非 if_ready：当 pc 处的 32 位指令跨越 32B 行边界
+  // （need_cross=1，见上文）时 if_ready=0，但这不是"无法取指"，而是需要进入跨行拼装
+  // 状态（cross_q=1）再去取下一行。若此处用 !if_ready，advance_all 会恒为 0，而 cross_q
+  // 的置位又被 advance_all 门控 → 前端永久死锁（arch-test 在行末 32 位指令处必现）。
+  wire fetch_stall = !line_valid;
   wire load_use    = ex_valid_q && e_is_load && ex_rd_wen_q && (ex_rd_q != 5'd0) && id_valid_q &&
                      ((c_use_rs1 && (dec_rs1 == ex_rd_q)) ||
                       (c_use_rs2 && (dec_rs2 == ex_rd_q)));
   wire mem_stall   = mem_needs_fsm && !mem_done_now;
   // advance_all：EX/MEM/WB 三级推进（访存未完成 / MDU 忙 / 取指未就绪时冻结）
   wire advance_all = !(fetch_stall || mem_stall || mdu_hold);
+  // 分支/JALR 只在流水线真正推进的那一拍才允许重定向：此时 WB 旁路（wb_retire 含 advance）
+  // 必然有效，EX 拿到的操作数一定是最新的；冻结拍不重定向，等停摆解除后再判定。
+  // 历史缺陷：未门控时会在取指停顿拍用过期操作数判定（load 结果尚未写回），
+  // arch-test 的 `c.lw/c.lw/bne` 序列因此跳错方向（I-bne-00 / I-blt-00 失败）。
+  wire ex_br_redirect = ex_br_exit && advance_all;
   // CSR/系统指令的顺序性：CSR 写只在 WB 生效，而 CSR 读发生在 ID（组合）。
   // 若更老的指令仍在流水线中，ID 可能读到尚未提交的旧值 → 让该指令等流水线排空后再前进。
   wire id_serial        = id_valid_q && c_is_serial;
@@ -359,7 +390,7 @@ module rv32gc_core (
   assign wb_wen    = wb_retire && wb_rd_wen_q && (wb_rd_q != 5'd0);
   assign wb_rd     = wb_rd_q;
   assign wb_wdata  = (wb_wb_sel_q == `WB_MEM) ? wb_mem_data_q :
-                     (wb_wb_sel_q == `WB_PC4) ? (wb_pc_q + 32'd4) :
+                     (wb_wb_sel_q == `WB_PC4) ? (wb_pc_q + {29'd0, wb_ilen_q}) :
                      (wb_wb_sel_q == `WB_CSR) ? wb_csr_rdata_q : wb_alu_q;
   assign wb_pc     = wb_pc_q;
 
@@ -399,8 +430,9 @@ module rv32gc_core (
   // ============================================================ WB→ID 旁路
   // 关键：寄存器堆在 posedge 写入、ID 为组合读，若生产者处于 WB 而消费者同拍处于 ID，
   // 消费者会读到旧值（经典的"写优先寄存器堆"漏洞）。此处显式旁路 WB 的写数据。
-  wire        id_byp_a = wb_wen && (wb_rd_q == dec_rs1) && (dec_rs1 != 5'd0);
-  wire        id_byp_b = wb_wen && (wb_rd_q == dec_rs2) && (dec_rs2 != 5'd0);
+  // 转发条件同样用 wb_fwd_en（不看是否本拍退休），理由见上
+  wire        id_byp_a = wb_fwd_en && (wb_rd_q == dec_rs1) && (dec_rs1 != 5'd0);
+  wire        id_byp_b = wb_fwd_en && (wb_rd_q == dec_rs2) && (dec_rs2 != 5'd0);
   wire [31:0] id_rdata_a = id_byp_a ? wb_wdata : rf_rdata_a;
   wire [31:0] id_rdata_b = id_byp_b ? wb_wdata : rf_rdata_b;
 
@@ -412,15 +444,14 @@ module rv32gc_core (
 
       ex_pc_q <= 32'd0; ex_instr_q <= 32'd0; ex_imm_q <= 32'd0;
       ex_rs1_val_q <= 32'd0; ex_rs2_val_q <= 32'd0;
-      ex_rs1_q <= 5'd0; ex_rs2_q <= 5'd0; ex_rd_q <= 5'd0;
+      ex_rs1_q <= 5'd0; ex_rs2_q <= 5'd0; ex_rd_q <= 5'd0; ex_ilen_q <= 3'd4;
       ex_csr_addr_q <= 12'd0; ex_csr_rdata_q <= 32'd0;
       ex_ctrl_q <= 73'd0; ex_valid_q <= 1'b0; ex_rd_wen_q <= 1'b0;
       ex_excp_valid_q <= 1'b0; ex_excp_cause_q <= 4'd0; ex_excp_tval_q <= 32'd0;
-      mdu_started_q <= 1'b0;
 
       mem_pc_q <= 32'd0; mem_instr_q <= 32'd0; mem_alu_q <= 32'd0; mem_addr_q <= 32'd0;
       mem_imm_q <= 32'd0; mem_rs1_val_q <= 32'd0; mem_rs2_val_q <= 32'd0; mem_csr_rdata_q <= 32'd0;
-      mem_rd_q <= 5'd0; mem_csr_addr_q <= 12'd0;
+      mem_rd_q <= 5'd0; mem_ilen_q <= 3'd4; mem_csr_addr_q <= 12'd0;
       mem_wb_sel_q <= `WB_ALU; mem_mem_op_q <= `MEM_NONE; mem_sys_op_q <= 3'd0;
       mem_mem_size_q <= 2'd0; mem_mem_flags_q <= 2'd0; mem_csr_op_q <= `CSR_NONE;
       mem_rd_wen_q <= 1'b0; mem_valid_q <= 1'b0; mem_csr_imm_q <= 1'b0;
@@ -432,18 +463,25 @@ module rv32gc_core (
 
       wb_pc_q <= 32'd0; wb_instr_q <= 32'd0; wb_alu_q <= 32'd0; wb_imm_q <= 32'd0;
       wb_rs1_val_q <= 32'd0; wb_csr_rdata_q <= 32'd0; wb_mem_data_q <= 32'd0;
-      wb_rd_q <= 5'd0; wb_csr_addr_q <= 12'd0; wb_wb_sel_q <= `WB_ALU; wb_sys_op_q <= 3'd0; wb_csr_op_q <= `CSR_NONE;
+      wb_rd_q <= 5'd0; wb_ilen_q <= 3'd4; wb_csr_addr_q <= 12'd0; wb_wb_sel_q <= `WB_ALU; wb_sys_op_q <= 3'd0; wb_csr_op_q <= `CSR_NONE;
       wb_rd_wen_q <= 1'b0; wb_valid_q <= 1'b0; wb_csr_imm_q <= 1'b0;
       wb_excp_valid_q <= 1'b0; wb_excp_cause_q <= 4'd0; wb_excp_tval_q <= 32'd0;
     end else begin
-      // ---------------- PC ----------------
-      if (redirect_valid) pc_q <= redirect_pc;
-      else if (advance_all && if_ready && !front_hold) pc_q <= pc_q + {29'd0, ilen_raw};
-
-      if (redirect_valid) cross_q <= 1'b0;
-      else if (advance_all && if_ready && !front_hold) begin
-        if (need_cross) begin cross_q <= 1'b1; cross_hw0_q <= hw0; end
-        else if (cross_q) cross_q <= 1'b0;
+      // ---------------- PC / 跨行拼装 ----------------
+      // 跨行拼装必须在"本行有效"时就允许进入（不能要求 if_ready）：进入 cross_q=1 后
+      // fetch_pc 变为 pc_q+2，取指单元才会去取下一行；下一行就绪后 instr_raw 由
+      // {hw0(下一行首半字), cross_hw0_q(本行末半字)} 拼成完整 32 位指令。
+      if (redirect_valid) begin
+        pc_q  <= redirect_pc;
+        cross_q <= 1'b0;
+      end else if (advance_all && !front_hold && line_valid) begin
+        if (need_cross) begin
+          cross_q     <= 1'b1;
+          cross_hw0_q <= hw0;
+        end else begin
+          if (cross_q) cross_q <= 1'b0;
+          if (if_ready) pc_q <= pc_q + {29'd0, ilen_raw};
+        end
       end
 
       // ---------------- 访存 FSM（与 stall 并行推进） ----------------
@@ -500,6 +538,7 @@ module rv32gc_core (
         wb_csr_addr_q  <= mem_csr_addr_q;
         wb_mem_data_q  <= (mem_mem_op_q == `MEM_LOAD) ? mem_load_data : mem_alu_q;
         wb_rd_q        <= mem_rd_q;
+        wb_ilen_q      <= mem_ilen_q;
         wb_wb_sel_q    <= mem_wb_sel_q;
         wb_sys_op_q    <= mem_sys_op_q;
         wb_csr_op_q    <= mem_csr_op_q;
@@ -529,6 +568,7 @@ module rv32gc_core (
           mem_rs2_val_q   <= ex_rs2_fwd;
           mem_csr_rdata_q <= ex_csr_rdata_q;
           mem_rd_q        <= ex_rd_q;
+          mem_ilen_q      <= ex_ilen_q;
           mem_csr_addr_q  <= ex_csr_addr_q;
           mem_wb_sel_q    <= e_wb_sel;
           mem_mem_op_q    <= e_mem_op;
@@ -556,6 +596,7 @@ module rv32gc_core (
           ex_rs1_q       <= dec_rs1;
           ex_rs2_q       <= dec_rs2;
           ex_rd_q        <= dec_rd;
+          ex_ilen_q      <= id_ilen_q;   // 指令字节长度（2/4），供 WB 算链接值 pc+ilen
           ex_csr_addr_q  <= dec_csr_addr;
           ex_csr_rdata_q <= csr_rdata;
           ex_ctrl_q      <= dec_ctrl;

@@ -57,8 +57,10 @@ module tb_debug_min;
   );
 
   integer cyc = 0;
+  integer maxcyc = 2000;              // +maxcyc=N 提高上限（锁步取 ≥5000 条提交需更大值）
   reg [1023:0] mem_path;
   initial begin
+    if (!$value$plusargs("maxcyc=%d", maxcyc)) maxcyc = 2000;
     if (!$value$plusargs("MEM_LO_INIT=%s", mem_path)) mem_path = "sim/tests/out/hello.hex";
     $readmemh(mem_path, u_slave.mem_lo);
     $display("[dbg] mem_lo <- %s", mem_path);
@@ -77,6 +79,9 @@ module tb_debug_min;
     if (dut.u_core.id_valid_q && dut.u_core.c_csr_op != 2'd0)
       $display("CSRID cyc=%0d pc=%h op=%0d addr=%h rs1=%0d", cyc, dut.u_core.id_pc_q,
                dut.u_core.c_csr_op, dut.u_core.dec_csr_addr, dut.u_core.dec_rs1);
+    if (dut.u_core.trap_take)
+      $display("TRAP cyc=%0d pc=%h cause=%h tval=%h priv=%0d instr=%h", cyc, dut.u_core.wb_pc_q,
+               dut.u_core.wb_excp_cause_q, dut.u_core.wb_excp_tval_q, dut.u_core.priv_q, dut.u_core.wb_instr_q);
     // PERIODIC：每 50000 拍打印一次流水线状态（用于定位停滞）
     if ((cyc % 500) == 0 && cyc > 0)
       $display("STATE cyc=%0d pc=%h stall=%b front_hold=%b | IDv=%b IDpc=%h | EXv=%b EXpc=%h | MEMv=%b MEMpc=%h memst=%0d | WBv=%b WBpc=%h",
@@ -89,21 +94,14 @@ module tb_debug_min;
       $display("C%0d pc=%h instr=%h rd=%0d wd=%h wen=%b", cyc, dut.u_core.wb_pc_q,
                dut.u_core.wb_instr_q, dut.u_core.wb_rd_q, dut.u_core.wb_wdata, dut.u_core.wb_wen);
     end
-    if (cyc > 4000000) begin $display("[dbg] 结束"); $finish; end
-    if (cyc > 100000000) begin
-      $display("cyc=%0d pc=%h ifrdy=%b line=%b | f:busy=%b reqv=%b reqa=%h tag=%h | axird=%0d | stall=%b memstall=%b memst=%0d memop=%0d memaddr=%h | commit=%b wbv=%b memv=%b redir=%b",
-        cyc, dut.u_core.pc_q, dut.u_core.if_ready, dut.u_core.line_valid,
-        dut.u_core.u_ifetch.busy_q, dut.u_core.u_ifetch.if_req_valid,
-        dut.u_core.u_ifetch.if_req_addr, dut.u_core.u_ifetch.line_tag_q,
-        dut.u_axi.rd_state,
-        dut.u_core.stall, dut.u_core.mem_stall, dut.u_core.memst_q,
-        dut.u_core.mem_mem_op_q, dut.u_core.mem_addr_q,
-        dut.u_core.wb_retire, dut.u_core.wb_valid_q, dut.u_core.mem_valid_q, dut.u_core.redirect_valid);
+    if (tohost_we) begin
+      $display("[dbg] TOHOST=%0d @cyc=%0d", tohost_wdata, cyc);
+      $finish;
     end
-    if (cyc > 2000) begin $display("[dbg] 2000 拍结束"); $finish; end
+    if (cyc > maxcyc) begin $display("[dbg] 达到 maxcyc=%0d 结束 pc=%h", maxcyc, dut.u_core.pc_q); $finish; end
   end
 
   initial begin
-    #20_000_000; $display("[dbg] 超时"); $finish;
+    #200_000_000; $display("[dbg] 超时"); $finish;
   end
 endmodule
