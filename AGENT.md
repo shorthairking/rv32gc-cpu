@@ -568,6 +568,7 @@ rd=rs2/rd=rs1=rs2、store 清保留集、SC 消费保留集、AMO 读-改-写、
 | **负对照 1**（SPI 镜像缺失） | `vvp … +SPI_INIT=/tmp/不存在.hex` | **FAIL**（CHECK-2/5 FAIL，退出码 `0x21`，rc=1） |
 | **负对照 2**（破坏 XIP 魔数 `0x0D→0x0E`） | `vvp … +SPI_INIT=/tmp/bad.spi.hex` | **FAIL**（CHECK-3/4/5 FAIL，退出码 **`0x13`=E_SPI_LOAD**，rc=1）——证明 XIP **数据读**真的在读 SPI 内存 |
 | 无回归（本项） | `run_sim.sh hello` / `memtest`、`run_unit_axi.sh` | PASS（hello 352 拍、AXI 79 checks；主 Agent 独立复跑 hello 亦 PASS） |
+| **全量回归（P1-c 证据）** | `scripts/run_arch_test_suite.sh <组>` × **18 组**（JOBS=4，串行跑完） | **39/8/6/1/26/9/2/5/4/2/3/1/3/1/4/4/4/2 全 PASS = 124 例 0 失败**；`run_arch_test.sh I/I-add-00` 亦 PASS（脚本改动向后兼容） |
 
 #### D16② 落实情况（"命中 SPI 窗口时绕过 I-Cache"）
 
@@ -595,8 +596,9 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
 - ✅ 仿真/回归环境（iverilog + Verilator + Spike 参考模型 + 自研 TB + 锁步工具链）已建成
 - ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）
-- ✅ **arch-test 17 组 123 例 0 失败**（I 39/M 8/Zicsr 6/Zifencei 1/Zca 26/Zaamo 9/Zalrsc 2/Misalign 5/
-  MisalignZca 4/Zicntr 2/Zicbom 3/Zicboz 1/Zicbop 3/Zihintpause 1/Zihintntl 4/ZihintntlZca 4/Zmmul 4/Zicond 2）
+- ✅ **arch-test 18 组 124 例 0 失败**（I 39/M 8/Zicsr 6/Zifencei 1/Zca 26/Zaamo 9/Zalrsc 2/Misalign 5/
+  MisalignZca 4/Zicntr 2/Zicbom 3/Zicboz 1/Zicbop 3/Zihintpause 1/Zihintntl 4/ZihintntlZca 4/Zmmul 4/Zicond 2；
+  第 9 轮**全量复跑实测**——此前文档写的"17 组 123 例"是漏计一组/一例，以本行为准）
 - ✅ **A 扩展定向自测**（`bash scripts/run_lrsc_test.sh` → `LRSC_DIRECTED: PASS`）
 - ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
 - ✅ **SPI-XIP 启动链路（2A-7a，第 9 轮）**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**

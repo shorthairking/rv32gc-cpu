@@ -58,7 +58,8 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
    `RESET_PC=0x1C00_0000` 复位 → 在 **SPI Flash XIP 窗口**取到并执行首条指令 → SPI 段 ALU + XIP 数据读
    自检 → `auipc+addi+jalr` **跨约 448 MiB** 跳到 DDR `0x0` → DDR 段 ALU/写读回 → 退出码 0；两条负对照
    （SPI 镜像缺失 / 破坏 XIP 魔数）都按预期 `SPI_BOOT: FAIL`（退出码 0x21 / 0x13）。**2A-7a 已完成**。
-2. **arch-test 17 组全绿（123 例 0 失败）**：`I` 39、`M` 8、`Zicsr` 6、`Zifencei` 1、`Zca` 26、
+2. **arch-test 18 组 124 例 0 失败**（第 9 轮全量复跑实测；此前文档写的"17 组 123 例"是漏计一组/一例）：
+   `I` 39、`M` 8、`Zicsr` 6、`Zifencei` 1、`Zca` 26、
    `Zaamo` 9、`Zalrsc` 2、`Misalign` 5、`MisalignZca` 4、`Zicntr` 2、`Zicbom` 3、`Zicboz` 1、
    `Zicbop` 3、`Zihintpause` 1、`Zihintntl` 4、`ZihintntlZca` 4、`Zmmul` 4、`Zicond` 2。
    批量：`bash scripts/run_arch_test_suite.sh <组名>`（JOBS=4 更快）。
