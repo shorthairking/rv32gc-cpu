@@ -2,6 +2,7 @@
 
 > 上游文档：`00-overview.md`。规范依据：RISC-V Privileged Architecture v1.12（工作区 `riscv-isa-manual/src/priv/machine.adoc`、`supervisor.adoc`，可通过常驻知识库 `kb_search` 检索原文）。
 > 目标：支持 OpenSBI（M 模式固件）+ S 模式 Linux（Sv32），并满足 xv6/裸机测试等场景。
+> **实现级详细规格**：`spec/07-priv-csr-mmu.md`（逐 CSR 字段表、异常优先级、PTW 状态机、PMP 匹配算法、CLINT/PLIC 寄存器实现，含 179 处规范原文引用）；本文档若与其冲突，**以实现级规格为准**。
 
 ![特权级、CSR 与地址转换](diagrams/priv-csr.svg)
 
@@ -40,7 +41,7 @@
 | `0x342` | `mcause` | RW | 见 §4.1 |
 | `0x343` | `mtval` | RW | 见 §4.1 |
 | `0x344` | `mip` | RW | `MSIP/MTIP/MEIP` + `SSIP/STIP/SEIP`；S 级位是 M 级位的只读影子 |
-| `0x3A0`–`0x3AF` | `pmpcfg0`–`pmpcfg15` | RW | 本设计实现 16 项 → `pmpcfg0`–`pmpcfg3`（RV32 下每 32 位 4 项） |
+| `0x3A0`–`0x3A3` | `pmpcfg0`–`pmpcfg3` | RW | RV32 下 **仅这 4 个存在**（每 32 位 4 项 × 8 bit）；`0x3A4`–`0x3AF` 未分配，访问须报非法指令 |
 | `0x3B0`–`0x3BF` | `pmpaddr0`–`pmpaddr15` | RW | 16 项 |
 | `0xB00`/`0xB02` | `mcycle`/`minstret` | RW | 真实计数（64 位，RV32 分高低） |
 | `0xB80`/`0xB82` | `mcycleh`/`minstreth` | RW | RV32 高 32 位 |
@@ -67,19 +68,25 @@
 
 ### 2.3 `mstatus`/`mstatush` 字段（RV32）
 
+> 依据规范 `riscv-isa-manual/src/priv/machine.adoc`（Machine Status 一节，经 `kb_search "mstatus MPP MPRV SUM MXR"` 查证）。**准确位图如下**（RV32）：
+>
+> `SD=31`, `TSR=22`, `TW=21`, `TVM=20`, `MXR=19`, `SUM=18`, `MPRV=17`, `XS=16:15`, `FS=14:13`, `MPP=12:11`, `VS=10:9`, `SPP=8`, `MPIE=7`, `UBE=6`, `SPIE=5`, `MIE=3`, `SIE=1`
+
 | 字段 | 位 | 实现 |
 |---|---|---|
-| `SIE`/`MIE` | 1/3 | RW |
-| `SPIE`/`MPIE` | 5/7 | RW |
-| `SPP`/`MPP` | 8/12:11 | RW（MPP 支持 00/01/11，写 10 保留 → 归一到 11） |
-| `MPRV` | 17 | RW（影响 load/store 的权限检查与地址转换，见规范 `machine.adoc` §"Memory Privilege in mstatus Register"） |
-| `SUM` | 18 | RW（S 模式访问 U 页面） |
-| `MXR` | 19 | RW（可执行页可读） |
-| `FS` | 14:13 | RW（Off/Initial/Clean/Dirty；`mstatus.FS` 为 Off 时执行浮点指令触发非法指令异常） |
-| `SD` | 31 | 由 `FS`/`XS` 推导 |
-| `UXL`/`SXL` | 33/35（在 `mstatush`？） | RV32 下 `mstatush` 只有 `MBE/SBE`，UXL/SXL 在 `mstatus` 高位不可用；读 0 |
+| `SIE`/`MIE` | 1/3 | RW（中断使能，S/M） |
+| `SPIE`/`MPIE` | 5/7 | RW（trap 时保存旧 `xIE`） |
+| `SPP`/`MPP` | 8 / 12:11 | RW；`MPP` 仅支持 `00/01/11`，写 `10` 为保留值（WARL，归一到 `11`） |
+| `FS` | 14:13 | RW（0=Off 1=Initial 2=Clean 3=Dirty）；`FS=Off` 时执行浮点指令触发非法指令异常 |
+| `XS`/`VS` | 16:15 / 10:9 | 本设计无额外用户扩展状态 → 只读 0 |
+| `MPRV` | 17 | RW：置 1 时 load/store 的**权限检查与地址转换**改用 `MPP` 指定的特权级（取指不受影响） |
+| `SUM` | 18 | RW：S 模式可访问 U 页面（仅 load/store） |
+| `MXR` | 19 | RW：可执行页可读 |
+| `TVM`/`TW`/`TSR` | 20/21/22 | RW：分别使 S 模式执行 `sfence.vma`/`wfi`/`sret` 触发非法指令异常 |
+| `SD` | 31 | 只读，由 `FS`/`XS` 推导（`FS=3` 或 `XS=3` 时置 1） |
+| `MBE`/`SBE`（`mstatush`） | `mstatush[5]`/`[4]` | 只读 0（本设计仅支持小端） |
 
-> 说明：RV32 的 `mstatus` 为 32 位，`UXL/SXL` 等字段只存在于 RV64，故本设计在 `mstatus` 中不实现它们；`mstatush` 仅实现 `MBE/SBE`（恒 0）。
+> 说明：RV32 无 `UXL/SXL`（仅 RV64 存在）；`mstatush` 仅含 `MBE/SBE`，其余位读 0、写忽略。
 
 ## 3. 计数器与定时器
 
@@ -150,7 +157,7 @@
 ### 4.4 `WFI`、`MRET/SRET`、`SFENCE.VMA`
 
 - `wfi`：暂停取指，直到任一"使能且挂起"的中断出现（TW=1 时在 S 模式执行 `wfi` 触发非法指令异常）。
-- `mret/sret`：按规范恢复 `xIE←xPIE`、`xPIE←1`、特权级 ← `xPP`、`MPRV←0`（`mret`），跳到 `xepc`。
+- `mret/sret`：按规范恢复 `xIE←xPIE`、`xPIE←1`、特权级 ← `xPP`、`xPP←U`，跳到 `xepc`；**`MPRV` 仅在返回目标特权级 ≠ M 时清 0**（即 `xPP=M` 时 `MPRV` 保持不变），`mret` 另将 `MPRV` 语义与 `MPP` 解耦的细节见规范（`machine.adoc` 的 MRET 一节）。
 - `sfence.vma`：按 `rs1`（vaddr）/`rs2`（ASID）失效 ITLB/DTLB/L2TLB；`rs2=0` 时失效所有 ASID，`rs1=0` 时失效所有地址。TVM=1 时 S 模式执行触发非法指令异常。
 
 ## 5. MMU（Sv32）
@@ -171,7 +178,7 @@
 | PTW | 1~2 个 | — | 缺失时填充 L2TLB |
 
 - 表项内容：`{VA 高位, ASID, 权限(R/W/X/U/G), 级别(4K/4M 大页), PPN, 有效位}`；支持 4 MB 大页。
-- **A/D 位**：命中且未置位时由硬件置位并写回页表（写回通过 D-Cache 保证原子性；若写回期间发生异常，按规范先置位再报错）。
+- **A/D 位**：命中且未置位时由硬件置位并写回页表。按规范要求（`supervisor.adoc` 的 Sv32 虚拟地址转换流程一节）：① 对 PTE 的更新必须是**对内存中 PTE 的原子读-改-写（比较交换语义）**；② **翻译缓存（TLB）中缓存的 PTE 不得用于 A/D 更新**，必须重新读取内存中的 PTE；③ 若 A/D 写回因 PMP 等保护而失败，按**访问错误（access fault）**而非页错误处理。详细实现见 `spec/07-priv-csr-mmu.md`。
 - **权限检查**：结合当前特权级、`SUM`、`MXR`、`MPRV`、`mstatus.MPP`（MPRV 生效时用 MPP 权限）与页表 `R/W/X/U` 位。
 
 ### 5.3 PMP（物理内存保护）

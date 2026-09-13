@@ -238,11 +238,45 @@
 - FPGA 工程 tcl 生成与 Vivado 2025.2 许可/工程升级；
 - 100 MHz 时序收敛风险（保留 4 项降级措施，其中降为双发射需用户批准）。
 
+### 阶段一补充之二：设计细化（微架构规格书，2026-09-13）
+
+用户选择"先细化设计再开工"，因此把方案级设计细化为**可直接照着写 RTL 的规格书**。
+
+**交付物（`docs/design/spec/`，共 10 篇，约 4700 行）**
+
+| 文件 | 内容 | 规模 |
+|---|---|---|
+| `spec/README.md` | 阅读顺序、唯一真源、一致性规则、RTL 开发顺序 | 39 行 |
+| `spec/00-conventions.md` | 编码风格、时钟复位、握手/清空协议、参数、目录规划、调试接口 | 244 行 |
+| `spec/02-uop-and-decode.md` | **uop 控制位 73 位定义**、RV32IMAFDC+Zicsr/Zicbom 译码表、RVC 展开、立即数、译码期异常 | ~200 行 |
+| `spec/03-pipeline-regs.md` | 流水级寄存器、跨模块 bundle、IQ/ROB/LSQ 表项、重命名结构、`core_top` 端口 | 250 行 |
+| `spec/04-frontend.md` | PC 生成、锦标赛 BPU（表项/更新伪码/恢复）、I-Cache（MSHR/FSM）、取指队列、RVC 对齐 | 570 行 |
+| `spec/05-ooo-core.md` | 重命名/ROB/IQ/唤醒选择/PRF/旁路、4 宽提交、精确异常与恢复（含 ROB 反走伪码） | 561 行 |
+| `spec/06-lsu-mem.md` | AGU/LSU/LSQ/转发/重放/D-Cache（8 MSHR）/L2/预取/原子/`cbo.*` | 577 行 |
+| `spec/07-priv-csr-mmu.md` | 逐 CSR 字段表、异常优先级、trap/`mret`/`sret`、TLB/PTW/PMP、CLINT/PLIC（179 处规范原文引用） | 500 行 |
+| `spec/08-bus-axi.md` | AXI 读/写引擎 FSM、非缓存通道、地址解码、错误处理、平台集成清单 | 572 行 |
+| `spec/09-verification-interface.md` | 仿真环境、**提交级 trace 格式（与 Spike 对齐）**、81 条断言、41 项单元测试、覆盖点 | 698 行 |
+
+**配套实现产物**：`rtl/pkg/rv32gc_defs.vh`（宏与位域的唯一真源，已通过 `iverilog -g2005` 编译与 `verilator --lint-only` 检查，并用测试程序验证 `CTRL_GET`/`IS_YOUNGER`/`AXI_BEATS_PER_LINE` 展开正确）。
+
+**本轮裁定并已同步到各文档的跨文档冲突（4 条）**
+
+1. **BPU 读延迟**：BTB/PHT/LHT 用 BRAM 同步读（IF0 送址、IF1 出结果），预测在 **IF2 用于取指块截断**，稳态无气泡 → 不需要把 BTB 改成分布式 RAM（已改 `01-pipeline.md` §7 并加结论说明）。
+2. **LSU 违例 replay 语义**：清空范围 = **该 load 自身及其全部更年轻指令**（`flush_rob_idx = load.rob_idx - 1`），复用分支误预测的恢复硬件，不保留 load（已改 `05-ooo.md` §6，与 `spec/06` 一致）。
+3. **PRF 写口冲突**：改为"压制重试 + 唤醒照常广播"，不插入流水线停顿（已改 `01-pipeline.md` §2.4）。
+4. **FMA 第三源**：`uop_ctrl_t` 由 72 位扩为 **73 位**，新增 `use_rs3`，并补 `rs3_arch[4:0]`/`ps3[6:0]`（已同步 `rv32gc_defs.vh`、`spec/02`、`spec/03`）。
+
+**同时修正的 ISA 准确性问题**（由 `spec/07` 的规范比对发现，已改 `04-csr-mmu.md`）：`pmpcfg` 在 RV32 只有 `0x3A0–0x3A3`（4 个寄存器 / 16 项）；`mstatus` 位图按规范补全（含 `TVM/TW/TSR`、`XS/VS`、`SD`）；`mret/sret` 的 `MPRV` **仅在返回目标 ≠ M 时清 0**；A/D 位更新必须对 PTE **原子 CAS 且不得使用翻译缓存**，写回违例报**访问错误**。
+
+**未决/待验证事项（带入阶段二，均不阻塞开工）**：`PARAM`/硬件 ECC/坏址标记/`TIMING` 取值（上板实测）；FPGA 工程 tcl 与 Vivado 2025.2 许可；100 MHz 时序收敛（4 项降级措施，降为双发射需用户批准）。
+
 ---
 
 ## 7. 当前状态与下一阶段计划
 
 **当前状态**：阶段一已完成，**等待用户审阅与"开始阶段二"的明确指令**。
+
+> **阶段 2A 的实施依据**：`docs/design/spec/`（实现级规格书）已全部就绪，RTL 开发按 `spec/00-conventions.md` §8 的顺序自底向上推进；每写一个模块，先按 `spec/09-verification-interface.md` §4 建对应单元测试。
 
 **下一阶段（阶段 2A）任务与计划**
 

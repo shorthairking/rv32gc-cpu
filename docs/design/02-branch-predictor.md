@@ -43,7 +43,7 @@
 | LHT（局部历史表） | 1024 项 | 8 bit 历史 | `PC[9:0]` | 提交时（实际方向移入） |
 | LPHT（局部模式表） | 4096 项 | 2 bit 饱和计数器 | `{LHT[PC[9:0]], PC[9:0]}`（拼接后哈希到 12 bit） | 提交时 |
 | CPHT（选择器表） | 4096 项 | 2 bit 饱和计数器 | `PC[11:0] ^ fold(GHR)` | 提交时：全局对→+1，局部对→−1 |
-| BTB | 512 项 4 路组相联 | tag 22 bit + target 30 bit + 类型 2 bit + 置信度 2 bit | `PC[10:2]`（组索引） | 分支提交时分配/替换（LRU 或置信度替换） |
+| BTB | 512 项 4 路组相联（128 组） | **74 bit/路**：tag 22 bit（`{PC[31:11],PC[1]}`，含 RVC 半字对齐位）+ target 31 bit + 类型 2 bit + 置信度 2 bit + **块内分支偏移 3 bit + 第二个分支偏移 3 bit + 块属性 2 bit**（支撑「每取指块最多 2 个分支」） | `PC[10:2]`（组索引） | 分支提交时分配/替换（LRU 或置信度替换） |
 | RAS | 32 项 × 30 bit | — | 栈顶指针 | `jal/jalr`（rd=ra 且非 ret 语义）push；`jalr`（rs1=ra）pop |
 
 **计数器语义**：`00/01` = 不跳转倾向，`10/11` = 跳转倾向（高位为方向）。CPHT 高位选择全局/局部。
@@ -83,7 +83,7 @@
 | `checkpoint_idx` | RN → BPU | 分支分配 checkpoint 后回写 |
 | `resolve_valid`, `resolve_actual`, `resolve_target`, `resolve_rob_idx` | BRU(EX) → BPU/前端 | 分支解析与重定向 |
 | `commit_valid`, `commit_actual`, `commit_pc`, `commit_type` | RT → BPU | 架构更新 |
-| `flush` | 重定向 | 清空推测更新（RAS 恢复、GHR 回滚） |
+| `flush_all` / `flush_valid+flush_rob_idx` | 重定向 | 清空推测更新（RAS 恢复、GHR 回滚）；命名与 `spec/03-pipeline-regs.md` §2.5 统一 |
 
 ## 6. 资源估算
 

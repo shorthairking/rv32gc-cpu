@@ -160,6 +160,8 @@ module core_top(
 
 详细模块划分与接口会在阶段二实现时以 `rtl/README.md` + 各模块头注释固化。
 
+**实现级规格**：`docs/design/spec/`（00 全局约定、02 uop 与译码表、03 流水级与接口 bundle、04 前端、05 乱序后端、06 访存子系统、07 CSR/MMU/特权、08 总线、09 验证接口）+ `rtl/pkg/rv32gc_defs.vh`（宏与位域的唯一真源）。写 RTL 前必须先读 `spec/00`、`spec/02`、`spec/03`。
+
 ---
 
 ## 6. 验证与交付路线（概览）
