@@ -354,7 +354,7 @@ bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_
 | 项 | 结果 |
 |---|---|
 | arch-test `I` / `M` / `Zicsr` / `Zca` | **39/39、8/8、6/6、26/26 PASS**（共 79 例，0 失败） |
-| arch-test `Zifencei` | 0/1：`fence.i` 已可正确执行，剩余"Trap count mismatch"（ACT4 框架 trap 签名计数语义） |
+| arch-test `Zifencei` | **1/1 PASS**（需 `-DMISALIGNED_TRAP`，见下） |
 | 单元测试 | AXI 79 / EXEC 2461 / DECODER 255（向量随 fence.i 语义修正更新）全通过 |
 | 端到端 | `SIM: PASS hello`、`SIM: PASS memtest` |
 | 锁步 | `scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000` → **5994 条提交与 Spike 完全一致**（新增纯计算基准 `sim/tests/lockstep_bench.c`，避免 MMIO 让 Spike 提前退出） |
@@ -364,9 +364,16 @@ bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_
 首个失败用例及其 instptr/描述串）、`sim/tests/lockstep_bench.c`；`scripts/lockstep.sh` 修好三处工具
 缺陷（`32'h…` 未加引号、Spike 提交日志在 stderr、RESET_PC 改取 ELF 入口）。
 
-**待办（阶段 2A 剩余）**：① Zifencei 单例（"Trap count mismatch"，对齐 ACT4 trap 签名计数语义）
-→ ② Zaamo/Zalrsc（A 扩展执行通路尚未实现，AMO/LR/SC 目前会走成普通读写）→ ③ 补 CSR/异常/PMP
-→ ④ Sv32 MMU + L1I/L1D/L2 Cache → ⑤ FPGA tcl 与上板 B1~B3。上一轮的"组合环"假设已排除。
+**Zifencei 的收尾（已解决）**：失败点是 ACT4 框架的 trap 签名比对——参考模型 Spike（本版本无
+`--misaligned`）对非自然对齐访存一律报 cause 4/6，而本核按规格默认"硬件拆分"（Linux/uboot 需要），
+于是框架特意制造的两条 misaligned store 陷阱在核上根本没发生。解法：实现规格里本就预留的
+`` `MISALIGNED_TRAP ``（`rtl/top/rv32gc_core.v`：非对齐访问不拆分、直接报 cause 4/6 且 `tval`=原始 VA），
+并在 `run_arch_test.sh` 里默认加 `-DMISALIGNED_TRAP`（可用 `RV32GC_NO_MISALIGNED_TRAP=1` 关掉）；
+`run_sim.sh` 新增 `RV32GC_DEFS` 传额外宏。默认（拆分）配置下 hello/memtest 不受影响，仍 PASS。
+
+**待办（阶段 2A 剩余）**：① Zaamo/Zalrsc（A 扩展执行通路尚未实现：LR/SC/AMO 目前会走成普通读写）
+→ ② 补 CSR/异常/PMP → ③ Sv32 MMU + L1I/L1D/L2 Cache → ④ FPGA tcl 与上板 B1~B3。
+上一轮的"组合环"假设已排除；arch-test 受支持的 5 组（I/M/Zicsr/Zifencei/Zca）已全绿。
 
 ---
 
@@ -375,8 +382,7 @@ bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_
 **当前状态（2026-09-13，阶段 2A 进行中）**：已执行 5 个 goal round。
 - ✅ 仿真/回归环境（iverilog + Verilator + Spike 参考模型 + 自研 TB + 锁步工具链）已建成
 - ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）
-- ✅ **arch-test 4 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zca` 26/26（共 79 例 0 失败）；
-  `Zifencei` 1 例待办（fence.i 已可执行，剩 ACT4 trap 签名计数语义）
+- ✅ **arch-test 5 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26（共 80 例 0 失败）
 - ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
 - ⏭ 下一步：Zaamo/Zalrsc（A 扩展执行通路）→ CSR/异常/PMP 完善 → Sv32 MMU + Cache → FPGA 上板
 - 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）

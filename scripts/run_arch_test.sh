@@ -45,5 +45,12 @@ fi
            "$OUT/$NAME.elf" "$ROOT/sim/tests/out/$NAME.hi.hex"
 
 # 4) 运行
+#    参考模型 Spike（本版本）对非自然对齐访存一律报 cause 4/6，本核默认是"硬件拆分"（Linux/uboot
+#    需要）。arch-test 的 trap 签名比对要求两边一致，故这里默认加 -DMISALIGNED_TRAP
+#    （规格 00-conventions 定义的 bring-up/arch-test 模式）；要跑默认拆分行为设
+#    RV32GC_NO_MISALIGNED_TRAP=1。
 cd "$ROOT"
-RV32GC_TIMEOUT="${RV32GC_TIMEOUT:-30000000}" bash scripts/run_sim.sh "$NAME"
+if [ "${RV32GC_NO_MISALIGNED_TRAP:-0}" != "1" ]; then
+  RV32GC_DEFS="${RV32GC_DEFS:--DMISALIGNED_TRAP}"
+fi
+RV32GC_TIMEOUT="${RV32GC_TIMEOUT:-30000000}" RV32GC_DEFS="${RV32GC_DEFS:-}" bash scripts/run_sim.sh "$NAME"

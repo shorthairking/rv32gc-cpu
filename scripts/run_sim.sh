@@ -88,6 +88,13 @@ else
     echo "[run_sim] 注意: rtl/top/core_top.v 不存在 → 无核模式（仅编译/elaboration + 从设备自检）"
 fi
 
+# 额外编译期宏：RV32GC_DEFS="-DMISALIGNED_TRAP"（arch-test 需与 Spike 参考一致时用）
+if [ -n "${RV32GC_DEFS:-}" ]; then
+    read -r -a EXTRA_DEFS <<< "$RV32GC_DEFS"
+    DEFS+=("${EXTRA_DEFS[@]}")
+    echo "[run_sim] 额外宏: ${RV32GC_DEFS}"
+fi
+
 echo "[run_sim] test=$TEST tool=$TOOL rtl=${#RTL_SRCS[@]} 个文件 tb=${#TB_SRCS[@]} 个文件"
 echo "[run_sim] plusargs: ${PLUSARGS[*]:-<无>}"
 

@@ -52,16 +52,17 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ## 4. 当前状态与卡点（第 5 轮结束时的事实，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）。
-2. **arch-test**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zca` 26/26 **全绿**；`Zifencei/Zifencei-fence.i-00` 仍失败。
+2. **arch-test 5 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26（共 80 例 0 失败）。
    批量跑法：`bash scripts/run_arch_test_suite.sh <组名>`（默认超时 300000 拍）。
+   注意：`run_arch_test.sh` 现在**默认加 `-DMISALIGNED_TRAP`**（参考模型 Spike 对非对齐访存一律报
+   cause 4/6，而本核默认是硬件拆分；arch-test 的 trap 签名比对必须两边一致）。要验证默认拆分行为设
+   `RV32GC_NO_MISALIGNED_TRAP=1`；`run_sim.sh` 新增 `RV32GC_DEFS` 传额外宏。
 3. **锁步已达标**：`bash scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000`
    → 5994 条提交与 Spike 完全一致（新增 `sim/tests/lockstep_bench.c` 纯计算基准，避免 MMIO 让 Spike 提前退出）。
    `lockstep.sh` 已修好三处工具缺陷（`32'h…` 加引号、Spike 提交日志取 stderr、RESET_PC 取 ELF 入口）。
-4. **剩余卡点（Zifencei 单例）**：`fence.i` 已能正确执行；失败在 ACT4 框架 `check_trap_sig_offset`
-   → "Trap count mismatch"：参考 `.results` 的 `trap_sigptr` 期望两条 **store 访问错误**记录
-   （mcause=6~7、mepc≈0x8000208e/0x800020ee、mtval=0x46/0xa6），本核只发生 4 次 ecall 陷阱、没有这两条。
-   下一步：对比 Spike 在 sig 版镜像上的 trap 记录与本核的 trap/`mtval`/优先级语义
-   （本核非对齐访存走硬件拆分，可能报 access fault 而非 misaligned）。
+4. **剩余卡点：A 扩展执行通路**。`Zaamo`/`Zalrsc` 尚未实现——`mem_op=LR/SC/AMO` 目前会落到普通
+   读/写路径（AMO 不会做读-改-写、LR/SC 无保留集），需要按 `docs/design/spec/06-lsu-mem.md` 在
+   MEM FSM 里加 AMO 的读-改-写与 LR/SC 保留集语义（这是阶段 2A 收尾的最后一块 ISA 缺口）。
 5. **下一步顺序建议**：
    a. 查清 Zifencei 的 trap 签名计数语义；
    b. 实现 A 扩展执行通路（LR/SC/AMO 目前会走成普通读写）→ 跑 `Zaamo`/`Zalrsc` 组；

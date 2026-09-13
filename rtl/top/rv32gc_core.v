@@ -333,6 +333,11 @@ module rv32gc_core (
                            (mem_mem_size_q == `MSZ_HALF) ? 3'd2 : 3'd4;
   wire [2:0]  mem_shift  = {1'b0, mem_addr_q[1:0]};
   wire        mem_split  = ((mem_shift + mem_nbytes) > 3'd4);
+  // 自然对齐检查（按访问宽度）：BYTE 恒对齐；HALF 要求 addr[0]==0；WORD 要求 addr[1:0]==0。
+  // 默认（未定义 MISALIGNED_TRAP）非对齐访问由硬件拆成两次单拍完成；
+  // 定义 MISALIGNED_TRAP 时改为报 cause 4/6（bring-up / arch-test：参考模型 Spike 默认如此）。
+  wire        mem_misaligned = (mem_mem_size_q == `MSZ_WORD) ? (mem_addr_q[1:0] != 2'b00) :
+                               (mem_mem_size_q == `MSZ_HALF) ? (mem_addr_q[0]   != 1'b0)  : 1'b0;
   // 第一次访问的字节数与使能
   wire [2:0]  a1_bytes = mem_split ? (3'd4 - mem_shift) : mem_nbytes;
   wire [3:0]  a1_wstrb = (4'hF >> (4 - a1_bytes)) << mem_addr_q[1:0];
@@ -487,6 +492,23 @@ module rv32gc_core (
       // ---------------- 访存 FSM（与 stall 并行推进） ----------------
       case (memst_q)
         M_IDLE: if (mem_needs_fsm) begin
+`ifdef MISALIGNED_TRAP
+            if (mem_misaligned) begin
+              // 不做拆分访问：直接进入 M_DONE 并在 WB 级精确报地址非对齐异常
+              m_addr_q      <= mem_addr_q;
+              m_we_q        <= (mem_mem_op_q != `MEM_LOAD);
+              m_size_q      <= mem_mem_size_q;
+              m_uns_q       <= mem_mem_flags_q;
+              m_shift_q     <= mem_addr_q[1:0];
+              m_split_q     <= 1'b0;
+              m_wdata_q     <= mem_rs2_val_q;
+              m_wstrb_q     <= 4'h0;
+              m_wstrb2_q    <= 4'h0;
+              m_excp_tval_q <= mem_addr_q;
+              m_excp_cause_q<= (mem_mem_op_q == `MEM_LOAD) ? `EXC_LOAD_MISALIGN : `EXC_STORE_MISALIGN;
+              memst_q       <= M_DONE;
+            end else begin
+`endif
             m_addr_q      <= mem_addr_q;
             m_we_q        <= (mem_mem_op_q != `MEM_LOAD);
             m_size_q      <= mem_mem_size_q;
@@ -499,6 +521,9 @@ module rv32gc_core (
             m_excp_tval_q <= mem_addr_q;
             m_excp_cause_q<= `EXC_NONE;
             memst_q       <= M_REQ;
+`ifdef MISALIGNED_TRAP
+            end
+`endif
           end
         M_REQ:  if (d_req_ready) memst_q <= M_WAIT;
         M_WAIT: if (d_rsp_valid) begin
