@@ -45,18 +45,39 @@ HEADER_EXT=""
 if [ -n "$HEADER_MARCH" ]; then
   HEADER_EXT="$(printf '%s' "$HEADER_MARCH" | sed 's/^rv32[eim]*//')"
 fi
-MERGED_EXT="$BASE_EXT"
-if [ -n "$HEADER_EXT" ]; then
-  # 逐个 _ext 追加（去重）
-  IFS='_' read -r -a exts <<< "${HEADER_EXT#_}"
-  for e in "${exts[@]}"; do
-    [ -n "$e" ] || continue
-    case "_${MERGED_EXT}_" in
-      *"_${e}_"*) ;;                       # 已有，跳过
-      *) MERGED_EXT="${MERGED_EXT}_${e}" ;;
-    esac
-  done
-fi
+# 扩展名规范化 + 去重（含别名归一），避免出现 `_c_..._zca` 这类重复与非法组合：
+#   · `c` → `zca`（GCC 不允许 c 与 zca 同时出现，也不允许重复）
+#   · `m`/`a` 隐含在基座 rv32imac 里，不再单列；`i`/`e`/`g` 等基础字母同理
+#   · `zmmul` 已被 rv32im（M）覆盖
+# 实现：用 python3 做集合运算（bash 字符串处理在这里容易出错，且本脚本已有 python 依赖）
+MERGED_EXT="$(python3 - "$BASE_EXT" "$HEADER_EXT" <<'PYEOF'
+import sys
+base = sys.argv[1] if len(sys.argv) > 1 else ""
+hdr  = sys.argv[2] if len(sys.argv) > 2 else ""
+
+ALIAS = {"c": "zca", "m": "m", "a": "a", "f": "f", "d": "d",
+         "zmmul": "zmmul", "zaamo": "zaamo", "zalrsc": "zalrsc"}
+DROP = {"i", "e", "g", "m", "a", "c", "zmmul"}   # 基础字母/别名：由基座承担或不单列
+
+def toks(s):
+    s = s.strip().lstrip("_")
+    return [t for t in s.split("_") if t]
+
+ordered = []
+seen = set()
+for t in toks(base):
+    t = ALIAS.get(t, t)
+    if t in DROP or t in seen:
+        continue
+    seen.add(t); ordered.append(t)
+for t in toks(hdr):
+    t = ALIAS.get(t, t)
+    if t in DROP or t in seen:
+        continue
+    seen.add(t); ordered.append(t)
+print("_".join(ordered))
+PYEOF
+)"
 if [ -n "${3:-}" ]; then
   MARCH="$3"
 elif [ -n "${MARCH:-}" ]; then
