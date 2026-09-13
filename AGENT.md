@@ -454,7 +454,7 @@ trap 签名 / 存储未落盘"**全部由本轮修复的核内缺陷解释**，�
 
 | 项 | 结果 |
 |---|---|
-| arch-test **14 组**：`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo`/`Zalrsc`/`Misalign`/`MisalignZca`/`Zicntr`/`Zicbom`/`Zicboz`/`Zicbop`/`Zihintpause` | **39/8/6/1/26/9/2/5/4/2/3/1/3/1 全 PASS**（共 **110 例 0 失败**） |
+| arch-test **16 组**：`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo`/`Zalrsc`/`Misalign`/`MisalignZca`/`Zicntr`/`Zicbom`/`Zicboz`/`Zicbop`/`Zihintpause`/`Zihintntl`/`ZihintntlZca`/`Zmmul` | **39/8/6/1/26/9/2/5/4/2/3/1/3/1/4/4/4 全 PASS**（共 **121 例 0 失败**） |
 | 端到端 | `SIM: PASS hello`、`SIM: PASS memtest` |
 | 单元测试 | AXI 79 / EXEC 2461 / DECODER 254 全通过 |
 | A 扩展定向自测 | `sim/tests/lrsc.S`（28 项检查）→ `LRSC_DIRECTED: PASS` |

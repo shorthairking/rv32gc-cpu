@@ -54,12 +54,11 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ## 4. 当前状态与卡点（第 7 轮结束时的事实，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
-2. **arch-test 14 组全绿（110 例 0 失败）**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、
-   `Zca` 26/26、`Zaamo` 9/9、`Zalrsc` 2/2、`Misalign` 5/5、`MisalignZca` 4/4、`Zicntr` 2/2、
-   **`Zicbom` 3/3**、**`Zicboz` 1/1**、**`Zicbop` 3/3**、**`Zihintpause` 1/1**。
-   批量：`bash scripts/run_arch_test_suite.sh <组名>`（JOBS=4 并行更快）。
-   注意：`run_arch_test.sh` 默认加 `-DMISALIGNED_TRAP`；**MARCH 已改为自动合成**（基座
-   rv32imac_zicsr_zifencei_zicntr ∪ 用例头部声明的扩展），不要再写死 MARCH，否则会整组失败。
+2. **arch-test 16 组全绿（121 例 0 失败）**：`I` 39、`M` 8、`Zicsr` 6、`Zifencei` 1、`Zca` 26、
+   `Zaamo` 9、`Zalrsc` 2、`Misalign` 5、`MisalignZca` 4、`Zicntr` 2、`Zicbom` 3、`Zicboz` 1、
+   `Zicbop` 3、`Zihintpause` 1、`Zihintntl` 4、`ZihintntlZca` 4、**`Zmmul` 4**（各组均 0 失败）。
+   批量：`bash scripts/run_arch_test_suite.sh <组名>`。**MARCH 已自动合成**（基座
+   rv32imac_zicsr_zifencei_zicntr ∪ 用例头部扩展，含 `c`→`zca` 别名归一与去重），不要写死 MARCH。
 3. **A 扩展定向自测全绿**：`bash scripts/run_lrsc_test.sh` → `LRSC_DIRECTED: PASS`
    （`sim/tests/lrsc.S`，28 项检查）。
 4. **本轮（第 7 轮）修复 3 个真实 RTL 缺陷 + 1 处测试模型加固 + Zicbom 落地**，详见 `AGENT.md`
