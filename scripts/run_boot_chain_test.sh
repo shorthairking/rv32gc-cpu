@@ -71,7 +71,9 @@ grep -a -q "CHECK-1 OK"      "$LOG" || fail "TB CHECK-1 失败：首笔取指不
 grep -a -q "CHECK-2 OK"      "$LOG" || fail "TB CHECK-2 失败：没有指令在 SPI-XIP 窗口提交"
 grep -a -q "CHECK-3 OK"      "$LOG" || fail "TB CHECK-3 失败：没有指令在 DDR 窗口提交"
 grep -a -q "CHECK-4 OK"      "$LOG" || fail "TB CHECK-4 失败：跨窗口取指通路没打通"
+grep -a -q "CHECK-6 OK"      "$LOG" || fail "TB CHECK-6 失败：XIP 期间 L1I 发生了分配"
+grep -a -q "XIP_NOALLOC: PASS" "$LOG" || fail "TB CHECK-6：日志中没有 XIP_NOALLOC: PASS"
 grep -a -q "EXIT code=0"     "$LOG" || fail "没有观测到退出码 0（IO_SIMU）"
 
-echo "BOOT_CHAIN: PASS (SPI 桩 0x1C00_0000 → DDR 0x0 → exit 0；横幅与窗口提交均观测到)"
+echo "BOOT_CHAIN: PASS (SPI 桩 0x1C00_0000 → DDR 0x0 → exit 0；横幅/窗口提交/XIP 不分配断言均观测到)"
 echo "  日志: $LOG"

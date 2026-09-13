@@ -14,7 +14,10 @@
 //     CHECK-2 提交级 PC 必须**出现过**在 SPI XIP 窗口内；
 //     CHECK-3 提交级 PC 必须**出现过**在 DDR 窗口内（0x0 起）——即确实跨了窗口；
 //     CHECK-4 **取指请求**必须到达过 DDR 窗口（跨窗口的取指通路真的通了）；
-//     CHECK-5 退出码 == 0。
+//     CHECK-5 退出码 == 0；
+//     CHECK-6 **结构断言（第 18 轮新增）**：L1 指令 Cache 在 XIP 窗口期间**永不分配**
+//             （`rv32_icache.dbg_alloc_wen` 与写入地址逐拍检查），并统计"确实分配过/确实
+//             走过 XIP 直通"防止断言空转；通过时打印 `XIP_NOALLOC: PASS (n checks)`。
 //   任一不成立都不算通过：这防止"核根本没从 SPI 启动 / 没跳到 DDR"却被当成通过。
 //
 // 运行期加号参数：
@@ -23,10 +26,11 @@
 //   +wave=<file.vcd>         波形
 //   +timeout=<n>             超时时钟数（默认 200000）
 //
-// 约束标注：本核当前**没有 I-Cache**（rtl/frontend/rv32_ifetch.v = 单行缓冲 +
-//   AXI 整行读），所以本 TB 不需要任何 cache 维护动作；取指命中 SPI-XIP 必须绕过
-//   I-Cache 这一约束的 RTL 判定点（`IS_SPI_XIP()` → rv32_ifetch.xip_bypass）由主
-//   Agent 维护，本 TB 只做观测，不改 RTL。
+// 结构约束（第 18 轮更新）：本核取指行请求的下游是 L1 指令 Cache
+//   （`rtl/frontend/rv32_icache.v`，16 KB/128 组/4 路/32 B、VIPT、RR 替换，`rv32_ifetch`
+//   与 `rv32_axi_master` 之间）。取指命中 SPI-XIP 必须绕过 I-Cache 这一约束的 RTL 判定点
+//   （`IS_SPI_XIP()` → `rv32_ifetch.xip_bypass`/`req_xip_q` → `rv32_icache` 的命中禁令与
+//   填充禁令）由 RTL 侧维护；本 TB 只做观测，并以 CHECK-6 给出可判定的结构断言。
 //=============================================================================
 `timescale 1ns/1ps
 
@@ -198,6 +202,63 @@ module tb_spi_boot;
   wire ar_hs = arvalid & arready;
   wire if_ar_hs = ar_hs & (arid == AXI_ID_IF);
 
+  //--------------------------------------------------------------------------
+  // CHECK-6（结构性断言，第 18 轮新增）：XIP 窗口期间 L1I **不得分配**
+  //   D16② 要求"命中 SPI-XIP 窗口时绕过 I-Cache"：既不命中、也不填充。功能上由
+  //   `run_spi_boot/run_boot_chain` 的启动链路正确性间接反映，这里给一条**直接的结构断言**：
+  //     · 每拍观测 `rv32_icache.dbg_alloc_wen`（= 正在写 Cache 阵列/置 valid）；
+  //     · ① 只要 alloc_wen=1，被写入的行地址就**不得**落在 SPI-XIP 窗口；
+  //       ② `xip_bypass=1`（本拍取指 PA 落在 XIP 窗口）期间 alloc_wen 必须恒 0。
+  //   同时统计"确实分配过"与"确实走过 XIP 直通"的次数，防止断言空转（vacuous pass）。
+  //   层次路径：tb → core_top(u_dut) → rv32gc_core(u_core) → rv32_icache(u_icache)。
+  //--------------------------------------------------------------------------
+`ifdef CORE_PRESENT
+  wire [31:0] ic_alloc_addr = u_dut.u_core.u_icache.dbg_alloc_addr;
+  wire        ic_alloc_wen  = u_dut.u_core.u_icache.dbg_alloc_wen;
+  wire        ic_xip_bypass = u_dut.u_core.if_spi_xip;
+`else
+  wire [31:0] ic_alloc_addr = 32'd0;
+  wire        ic_alloc_wen  = 1'b0;
+  wire        ic_xip_bypass = 1'b0;
+`endif
+
+  // SPI-XIP 别名窗口（`IS_SPI_XIP` 的第二段）：0x1FE8_0000 起 64 KiB
+  localparam [31:0] SPI_ALIAS_BASE = 32'h1FE8_0000;
+  localparam [31:0] SPI_ALIAS_LAST = 32'h1FE8_FFFF;
+
+  function in_xip;
+    input [31:0] a;
+    begin in_xip = ((a >= SPI_BASE) && (a <= SPI_LAST)) ||
+                   ((a >= SPI_ALIAS_BASE) && (a <= SPI_ALIAS_LAST)); end
+  endfunction
+
+  integer n_xip_chk   = 0;    // 有效观测拍数（alloc 拍 或 xip 拍）
+  integer n_alloc     = 0;    // 观测到的分配笔数（必须 >0，否则断言空转）
+  integer n_xip_cyc   = 0;    // xip_bypass=1 的拍数（必须 >0，否则没走到 XIP 直通）
+  integer n_xip_bad   = 0;    // 违例次数
+  always @(posedge clk) if (rst_n) begin
+    if (ic_alloc_wen) n_alloc <= n_alloc + 1;
+    if (ic_xip_bypass) n_xip_cyc <= n_xip_cyc + 1;
+    if (ic_alloc_wen || ic_xip_bypass) n_xip_chk <= n_xip_chk + 1;
+    // ① 分配的行地址不得在 XIP 窗口
+    if (ic_alloc_wen && in_xip(ic_alloc_addr)) begin
+      n_xip_bad <= n_xip_bad + 1;
+      $display("[SPI-BOOT] XIP_NOALLOC VIOLATION: alloc @0x%08x 落在 SPI-XIP 窗口 (t=%0t)",
+               ic_alloc_addr, $time);
+    end
+    // ② xip_bypass 期间不得分配
+    if (ic_xip_bypass && ic_alloc_wen) begin
+      n_xip_bad <= n_xip_bad + 1;
+      $display("[SPI-BOOT] XIP_NOALLOC VIOLATION: xip_bypass=1 同拍仍 alloc @0x%08x (t=%0t)",
+               ic_alloc_addr, $time);
+    end
+  end
+
+  // 判定条件（iverilog 要求 function 至少有一个入端口，故这里用 wire 表达式）：
+  //   无违例 ∧ 确实发生过分配 ∧ 确实走过 XIP 直通（后两条防"断言空转"）
+  wire xip_noalloc_pass = (n_xip_bad == 0) && (n_alloc > 0) && (n_xip_cyc > 0);
+
+
   // 提交级：debug0_wb_* 只在"提交一条**写寄存器**指令"时有效（core_top 的 ws_valid），
   // 用它作为"该 PC 确实退休执行过"的判据，避免把未提交/被冲刷的 PC 当成执行过。
   wire cmt_v = ws_valid & debug0_wb_rf_wen[0];
@@ -282,6 +343,24 @@ module tb_spi_boot;
         $display("[SPI-BOOT] CHECK-5 FAIL: 退出码 = %0d (0x%08x)", code, code);
         ok = 1'b0;
       end
+
+      // CHECK-6：XIP 期间 L1I 不分配（结构断言；见本文件上方 n_xip_bad 统计）
+      if (xip_noalloc_pass)
+        $display("[SPI-BOOT] CHECK-6 OK  : XIP 期间 L1I 无分配（alloc=%0d 笔，xip_bypass=%0d 拍）",
+                 n_alloc, n_xip_cyc);
+      else begin
+        if (n_xip_bad != 0)
+          $display("[SPI-BOOT] CHECK-6 FAIL: L1I 在 XIP 窗口分配了 %0d 次", n_xip_bad);
+        else if (n_xip_cyc == 0)
+          $display("[SPI-BOOT] CHECK-6 FAIL: 从未观测到 xip_bypass=1（XIP 直通未被覆盖，断言空转）");
+        else
+          $display("[SPI-BOOT] CHECK-6 FAIL: 从未观测到任何 Cache 分配（断言空转，alloc=0）");
+        ok = 1'b0;
+      end
+      if (xip_noalloc_pass)
+        $display("XIP_NOALLOC: PASS (%0d checks)", n_xip_chk);
+      else
+        $display("XIP_NOALLOC: FAIL (%0d checks, %0d violations)", n_xip_chk, n_xip_bad);
 
       $display("[SPI-BOOT] 首个提交 PC = 0x%08x，cycles=%0d", first_commit_pc, cyc);
       if (ok) begin

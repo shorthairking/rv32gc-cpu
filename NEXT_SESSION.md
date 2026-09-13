@@ -92,6 +92,13 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0i. ✅ **已完成（第 18 轮）**：④ 的 **L1I Cache 落地**（`rtl/frontend/rv32_icache.v`：16 KB/4 路/32 B、
+       VIPT、RR、XIP 双判绕 Cache、`fence.i` 整表失效）⇒ **`memtest` −45.0%（2026669→1116795 拍）**、
+       AXI 取指 82005→29 笔；新增 `ICACHE_UNIT(36)`/`FENCEI_SMC(9)`/`XIP_NOALLOC(142,5059)`。
+       另把三个上游仓库接入知识库（`.dsh-kb/sources.json` 12 源，索引 433→3736 文档）并产出
+       `docs/porting/08-upstream-repos-knowledge.md`（291 行，含 4 条与本设计的冲突）。
+       **下一步**：L1D（写直达+不写分配）→ 修 DTS 4 处 → 上板计划定稿交审。
+       **全量回归单一入口**：`bash scripts/run_full_regression.sh`（输出 `sim/log/full_regression_summary.txt`）。
    b0g. ✅ **已完成（第 17 轮）**：③ **Sv32 MMU 收尾完成**（验收 **61/64**，可判定项全过）——
        CBO 真正走内存通路（`MEM_CBO`，照 Spike `mmu.h:237-266`：ZERO=store 语意+真清零 32B、
        CLEAN/FLUSH/INVAL=load 语意但 cause 取 store 变体）⇒ `SvZicbo 6/6`、`SvPMPZicbo 8/8`、`PMPZicbo 4/4`；

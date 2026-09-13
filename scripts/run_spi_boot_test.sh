@@ -222,6 +222,16 @@ if ! grep -q 'SPI_BOOT: PASS' "$LOG"; then
     echo "SPI_BOOT: FAIL (日志中没有 'SPI_BOOT: PASS', log=$LOG)"
     exit 1
 fi
+# CHECK-6 / XIP 不分配结构断言（第 18 轮新增）：必须**明确出现 PASS**。
+# TB 内已判"空转"（要求同时观测到 alloc>0 与 xip_bypass>0），见 tb_spi_boot.v。
+if ! grep -q 'CHECK-6 OK' "$LOG"; then
+    echo "SPI_BOOT: FAIL (TB CHECK-6 失败：XIP 期间 L1I 发生了分配, log=$LOG)"
+    exit 1
+fi
+if ! grep -q 'XIP_NOALLOC: PASS' "$LOG"; then
+    echo "SPI_BOOT: FAIL (日志中没有 'XIP_NOALLOC: PASS', log=$LOG)"
+    exit 1
+fi
 
 echo "SPI_BOOT: PASS"
 echo "[spi-boot] 日志: $LOG  反汇编: $DUMP"

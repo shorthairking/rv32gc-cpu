@@ -78,21 +78,52 @@ module rv32gc_core (
 
   // ---- D16② SPI-XIP 取指判定点：命中 SPI 窗口必须**绕过 I-Cache** ----
   // 平台复位取指窗口是 0x1C00_0000（SPI Flash XIP，无硬件 boot ROM；另有 0x1FE8_0000 别名），
-  // 见 `rv32gc_defs.vh` 的 `IS_SPI_XIP 与 AGENT.md §2 D16。当前基线核无 I-Cache，该信号只
-  // 接到取指单元并在填充时记录（rv32_ifetch 的 line_xip_q）；阶段 2A-4 上 I-Cache 后**必须**
-  // 用它禁止 XIP 行的填充/命中，详见 rv32_ifetch.v 的说明。
-  wire        if_spi_xip = `IS_SPI_XIP(mmu_if_pa);   // 窗口判定按 **PA**（MMU off 时 PA==VA）
+  // 见 `rv32gc_defs.vh` 的 `IS_SPI_XIP 与 AGENT.md §2 D16。
+  // 第 18 轮起取指行请求的下游是 **L1 指令 Cache**（`rtl/frontend/rv32_icache.v`，见下）：
+  // 判定点由 `xip_bypass`（本信号，按 **PA** 组合判定，采样进 ifetch.req_xip_q）+
+  // `rv32_icache` 内按**在途请求地址**的二次判定共同保证"XIP 行既不命中也不填充"。
+  // MMU off（复位后、satp=0）时 PA==VA，两者等价；MMU on 时按 PA 判（窗口是物理属性）。
+  wire        if_spi_xip = `IS_SPI_XIP(mmu_if_pa);   // 窗口判定按 **PA**
+
+  // ---- L1 指令 Cache（阶段 2A-④）：插在 rv32_ifetch 与 rv32_axi_master 之间 ----
+  // 16 KB = 128 组 × 4 路 × 32 B、VIPT（pa[11:5] 索引 / pa[31:12] 标记）、RR 替换、
+  // 单未完成缺失。`fence.i` 提交拍 `fencei_take` 给 invalidate 一个脉冲（整表 1 拍全清）；
+  // `sfence.vma` **不**失效它（物理标记 + 页内索引，见 spec/04-frontend.md §4.6）。
+  // ENABLE=0 可整体关掉（直通基线），作为回归兜底安全阀。
+  wire         ic_req_valid, ic_req_ready, ic_req_xip;
+  wire [31:0]  ic_req_addr;
+  wire         ic_rsp_valid, ic_rsp_err, ic_rsp_ready;
+  wire [255:0] ic_rsp_data;
+  wire         ic_alloc_wen;
+  wire [31:0]  ic_alloc_addr;
 
   rv32_ifetch u_ifetch (
     .clk(clk), .rst_n(rst_n),
     .pc(fetch_pc), .hw0(hw0), .hw1(hw1), .line_valid(line_valid),
-    .flush(flush_front), .xip_bypass(if_spi_xip),
+    .flush(flush_front), .xip_bypass(if_spi_xip), .req_xip(ic_req_xip),
     .pa_valid(mmu_if_pa_valid), .pa(mmu_if_pa), .xlate_fault(mmu_if_fault),
     .xlate_fault_pf(!mmu_if_fault_is_access),
-    .if_req_valid(if_req_valid), .if_req_addr(if_req_addr), .if_req_ready(if_req_ready),
-    .if_rsp_valid(if_rsp_valid), .if_rsp_data(if_rsp_data),
-    .if_rsp_err(if_rsp_err), .if_rsp_ready(if_rsp_ready),
+    .if_req_valid(ic_req_valid), .if_req_addr(ic_req_addr), .if_req_ready(ic_req_ready),
+    .if_rsp_valid(ic_rsp_valid), .if_rsp_data(ic_rsp_data),
+    .if_rsp_err(ic_rsp_err), .if_rsp_ready(ic_rsp_ready),
     .fetch_err(fetch_err), .fetch_pf(fetch_pf)
+  );
+
+  wire         fencei_take;    // fence.i 提交拍（见下「sfence.vma / fence.i」段）
+
+  rv32_icache #(.ENABLE(1)) u_icache (
+    .clk(clk), .rst_n(rst_n),
+    .invalidate(fencei_take),
+    .req_valid(ic_req_valid), .req_addr(ic_req_addr), .req_xip(ic_req_xip),
+    .req_ready(ic_req_ready),
+    .rsp_valid(ic_rsp_valid), .rsp_data(ic_rsp_data), .rsp_err(ic_rsp_err),
+    .rsp_ready(ic_rsp_ready),
+    .axi_req_valid(if_req_valid), .axi_req_addr(if_req_addr), .axi_req_ready(if_req_ready),
+    .axi_rsp_valid(if_rsp_valid), .axi_rsp_data(if_rsp_data), .axi_rsp_err(if_rsp_err),
+    .axi_rsp_ready(if_rsp_ready),
+    .dbg_alloc_wen(ic_alloc_wen), .dbg_alloc_addr(ic_alloc_addr),
+    .dbg_hit(), .dbg_hit_way(), .dbg_set(),
+    .perf_access(), .perf_hit(), .perf_miss()
   );
 
   wire        at_line_end = (pc_q[4:1] == 4'd15);
@@ -861,6 +892,17 @@ module rv32gc_core (
   wire        wb_is_sfence = (wb_sys_op_q == `SYS_SFENCE_VMA);
   wire        sfence_take  = wb_valid_q && advance && wb_is_sfence && !wb_excp_valid_q;
 
+  // ---- fence.i：提交拍（WB，is_serial ⇒ 更老的 store 已提交落盘）----
+  // 动作：① L1I 整表失效（`u_icache.invalidate`，1 拍全清 512 个 valid 位）；
+  //       ② 强制冲刷前端行缓冲（否则同一 32B 行内的自修改代码会继续用缓冲里的旧指令）。
+  // 为什么用 `wb_retire`（= 提交拍）而不是 ID 级：fence.i 之前的 store 必须在它之前提交，
+  //   本核 `is_serial` 的 `csr_order_stall` 保证 fence.i 离开 ID 时更老的指令已排空。
+  // 为什么不在 fence.i 上失效 TLB / 重定向 PC：本设计 VIPT + 页内索引 + **物理**标记，
+  //   地址空间切换不改变组号与标记 ⇒ 无需失效（`docs/design/spec/04-frontend.md` §4.6 第 2 行）。
+  // 在途填充（AXI 读已发出、响应未回）由 u_icache 自行丢弃并重发，见 rv32_icache.v。
+  wire        wb_is_fencei = (wb_sys_op_q == `SYS_FENCE_I);
+  assign      fencei_take  = wb_retire && wb_is_fencei;   // 声明见 u_icache 例化处
+
   wire [31:0] csr_src   = wb_csr_imm_q ? wb_imm_q : wb_rs1_val_q;
   assign wb_csr_wdata   = (wb_csr_op_q == `CSR_RW) ? csr_src :
                           (wb_csr_op_q == `CSR_RS) ? (wb_csr_rdata_q | csr_src) :
@@ -883,8 +925,10 @@ module rv32gc_core (
                                ex_br_redirect ? br_target : id_jal_target;
   // 取指错误必须在取走陷阱那一拍**强制 flush**：否则若 trap_vector 与出错 PC 落在同一个 32B 行内，
   // 上面的行号比较不成立 ⇒ ifetch 的 err_q 清不掉 ⇒ 反复取同一条错误。
+  // `fencei_take` 同样必须**无条件**冲刷（不看行号是否变化）：自修改代码可能就落在当前行缓冲
+  // 所覆盖的同一 32B 行内，靠"行号不同"判定不会冲刷 ⇒ 仍会执行旧指令。
   assign flush_front = (redirect_valid && (redirect_pc[31:5] != pc_q[31:5])) ||
-                       if_err_take || sfence_take;
+                       if_err_take || sfence_take || fencei_take;
 
   wire sq_id  = redirect_valid;
   wire sq_ex  = trap_take_all | xret_take | ex_br_redirect;

@@ -4,8 +4,10 @@
 // 功能：缓存当前 PC 所在的 32 B 行（16 个半字），向流水线提供 pc 处的两个半字：
 //   hw0 = 半字[pc]，hw1 = 半字[pc+2]；若 hw0[1:0] != 2'b11 则为 16 位压缩指令，
 //   否则由上层拼成 32 位指令（见 rv32gc_core.v）。
-// 时序：line_valid=0 时发起 AXI 8-beat 读；数据返回后同拍/次拍可用。
-// 说明：阶段 2A 后续会用带 TLB 的 I-Cache 替换本模块（接口保持不变）。
+// 时序：line_valid=0 时发起整行请求；数据返回后同拍/次拍可用。
+// 说明：行请求的下游从第 18 轮起是 **L1 指令 Cache**（`rtl/frontend/rv32_icache.v`，
+//   16 KB/128 组/4 路/32 B、VIPT、RR 替换），命中 1 拍返回、缺失才发 AXI 读并填充；
+//   本模块的请求/响应握手与直连 AXI 时完全一致（接口保持不变）。
 //=============================================================================
 `include "rv32gc_defs.vh"
 
@@ -31,6 +33,7 @@ module rv32_ifetch (
 
   // ---- D16② SPI-XIP 取指判定（由 rv32gc_core.v 用 `IS_SPI_XIP(pa) 算好）----
   input  wire         xip_bypass,     // 1 = 本次取指地址（PA）落在 SPI Flash XIP 窗口
+  output wire         req_xip,        // 在途请求行的窗口归属（= req_xip_q）→ rv32_icache 判定点
 
   // ---- AXI 取指客户端（rv32_axi_master） ----
   output reg          if_req_valid,
@@ -56,23 +59,27 @@ module rv32_ifetch (
   reg         err_q;           // 取指错误（sticky，flush 清除）
   reg         err_pf_q;        // 上者的类型：1 = MMU 页错误（cause 12），0 = 总线错误（cause 1）
   /* verilator lint_off UNUSED */
-  reg         line_xip_q;      // 本行来自 SPI-XIP 窗口？—— 2A-4 的 I-Cache 必须禁止其填充
-  reg         req_xip_q;       // 在途请求行的窗口归属（请求发起拍采样，响应拍写入 line_xip_q）
+  reg         line_xip_q;      // 本行来自 SPI-XIP 窗口？—— I-Cache 必须禁止其填充（本模块只缓冲，
+                               //   真正的 Cache 填充判定在 rv32_icache 内按**请求地址**做）
   /* verilator lint_on UNUSED */
+  reg         req_xip_q;       // 在途请求行的窗口归属（请求发起拍采样，响应拍写入 line_xip_q）
+                               //   ⇒ 输出给 rv32_icache（D16② 请求侧判定点）
+
+  assign req_xip = req_xip_q;
 
   //-----------------------------------------------------------------------------
-  // D16② 「命中 SPI 窗口绕过 I-Cache」的判定点（本阶段无 Cache，行为不变）
+  // D16② 「命中 SPI-XIP 窗口绕过 I-Cache」的判定点（第 18 轮：Cache 已上线）
   //
-  // 本模块当前只有**单行取指缓冲** `line_q`：它是取指的功能性缓冲，去掉就取不到指令，
-  // 不是 Cache，所以"绕过"在此阶段无行为差异。为使该约束**不可遗忘**，判定点在这里落地为
-  // 两个信号：
-  //   · xip_bypass —— 组合判定，本拍取指地址落在 SPI-XIP 窗口（`0x1C00_0000` 1 MiB 或
-  //                   别名 `0x1FE8_0000` 64 KiB，见 `rv32gc_defs.vh` 的 `IS_SPI_XIP`）；
-  //   · line_xip_q —— 填充时记录：当前缓冲行来自 XIP 窗口。
-  // 阶段 2A-4 引入真正的 I-Cache 时**必须**用它们禁止 XIP 行被缓存：
-  //   ① 填充侧：`line_xip_q=1` 的行不得写入 Cache 阵列 —— 不能只看请求侧的 xip_bypass，
-  //      因为 Cache 命中的是**之前取过的行**；
-  //   ② 请求侧：`xip_bypass=1` 时不得从 Cache 阵列命中，每拍都走总线 XIP 读。
+  // 本模块只有**单行取指缓冲** `line_q`（功能性缓冲，不是 Cache）。真正的 L1I 是
+  // `rtl/frontend/rv32_icache.v`，插在本模块与 `rv32_axi_master` 之间并共用同一握手。
+  // 判定点在这里落地为两个信号，接线见 `rv32gc_core.v`：
+  //   · xip_bypass —— 组合判定，本拍取指地址（PA）落在 SPI-XIP 窗口（`0x1C00_0000` 1 MiB 或
+  //                   别名 `0x1FE8_0000`，见 `rv32gc_defs.vh` 的 `IS_SPI_XIP`）；
+  //   · req_xip_q  —— 在途请求行的窗口归属，输出 `req_xip` 给 `rv32_icache`：
+  //                   ① 请求侧：XIP 请求**禁止命中**，每拍都走总线 XIP 读；
+  //   · line_xip_q —— 响应到达时记录"本缓冲行来自 XIP 窗口"（本模块用，供调试观察）。
+  // 填充侧禁令由 `rv32_icache` 按**在途请求地址**自行再判一次（填充发生在若干拍之后，
+  // 必须看那一笔请求自己的窗口归属，不能只看请求侧的瞬态判定）。
   // 否则 XIP 读被缓存且平台无一致性维护 → 取指错乱（D16「否决原因③」）。
   //-----------------------------------------------------------------------------
 

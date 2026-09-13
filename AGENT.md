@@ -870,6 +870,30 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 18 轮：④ L1I Cache 落地 + 上游仓库知识库（用户拍板后的第一批）
+
+| 项 | 结果 |
+|---|---|
+| **L1I Cache（子 Agent 实现 + 主 Agent 复核）** | 新增 `rtl/frontend/rv32_icache.v`：**16 KB = 128 组 × 4 路 × 32 B**；**VIPT**（组索引 `pa[11:5]`（=页内位，无别名）、标记 `pa[31:12]` 物理地址）；轮转 RR 替换；单未完成缺失；插入点在 `rv32_ifetch` 与 `rv32_axi_master` 之间（前端本来就按 32 B 整行请求）。`parameter ENABLE`（0=直通基线） |
+| **D16② XIP 绕 Cache（硬要求）** | 请求侧 `req_xip`（`rv32_ifetch.req_xip_q` 新输出）+ 模块内 `` `IS_SPI_XIP `` **双判** ⇒ 禁止命中；填充侧按**在途请求地址**再判 ⇒ 不写阵列、不置 valid；XIP 请求照常走总线 |
+| **`fence.i`** | 提交拍 `fencei_take` ⇒ L1I 整表失效（1 拍清 512 valid 位）**并入 `flush_front`**；在途填充被打断则丢弃+同址重发。`sfence.vma` 不需失效 Cache（PA 标记 + 页内索引） |
+| **性能（硬判据）** | **`memtest` 2,026,669 → 1,116,795 拍（−45.0%）**；L1I 访问 82005 / 命中 81976（99.96%）/ 缺失 29 ⇒ **AXI 取指 82005 → 29 笔**。`hello` 352 → 347（全程仅 4 次 Cache 访问，347 拍由数据通路 27 笔未缓存 AXI 事务主导，已用数据说明不属 L1I 可改善范围） |
+| **新增验证** | `ICACHE_UNIT: PASS (36 checks)`（命中/缺失、XIP 别名窗口、`req_xip` 漏接凭地址也拦住、RR 顺序、**fence.i 打断在途填充**、ENABLE=0 直通）；`FENCEI_SMC: PASS (9 checks)`（自改码定向，附**反证实验**：把 `.invalidate(fencei_take)` 改 0 后该测试立即 FAIL ⇒ 测试确实有效）；`XIP_NOALLOC: PASS (142 checks)`（SPI_BOOT）/ `PASS (5059 checks)`（BOOT_CHAIN）——TB 逐拍断言 XIP 期间填充写使能与地址 |
+| **回归（子 Agent 冻结版跑两次 + 主 Agent 独立复核 4 项）** | 非特权 **18 组 124 例 0 FAIL**；PMP `PMPS 11/11 PMPU 11/11 PMPZaamo/PMPZalrsc 1/1 PMPZca 12/15 PMPSm 37/38`；MMU `Svbare 3/3 Sv 28/31 Svade 2/2 SvPMP 4/4 ExceptionsSv 4/4 Zaamo 3/3 Zalrsc 3/3 SvZicbo 6/6 SvPMPZicbo 8/8`；单元 `PMP 443 / TLB_PTW 155 / EXEC 2461 / DECODER 255 / AXI 79`；定向 `PRIV_TRAP 46 / FETCH_ERR 21 / LRSC PASS / SPI_BOOT PASS / BOOT_CHAIN PASS / hello PASS / memtest PASS` |
+| **与规格的裁剪（已记录）** | 未做 `03-cache.md` 的 IF0/IF1/IF2 流水前端、fetch_queue、16 B 块、MSHR 阵列、next-line 预取、伪 LRU（本核前端是"单行缓冲 + 整行请求"，按 `AGENT.md` §7 ④ 的最小可用裁剪）；`fence.i` 存在"提交拍前已进 ID 的至多 1 条更年轻指令不丢弃"的理论窗口（全部回归 + SMC 定向未暴露） |
+| **知识库（用户拉取的上游仓库）** | `.dsh-kb/sources.json` 新增 5 条源：`upstream-linux`（7.3-rc2；`Documentation/arch/riscv`、DT bindings、`arch/riscv/configs`）、`upstream-uboot`、`upstream-opensbi`（含 `include/sbi/**` 接口头）、`chiplab-la32r-{uboot,linux}`（参考移植）。**reindex 实测 433→3736 文档、5158→15640 片段**（204 s）；检索验证命中 `u-boot/doc/board/emulation/qemu-riscv.rst`、`linux/.../sifive,plic-1.0.0.yaml` 等 |
+| **知识提炼（子 Agent）** | `docs/porting/08-upstream-repos-knowledge.md`（291 行，每条事实带仓库内路径）。**它指出 4 处与本设计的冲突**：① DTS 的 `sifive,clint0/plic-1.0.0` 被 binding 标为 deprecated/QEMU 专用、CPU 节点 `compatible="riscv"` 属 simulator-only ⇒ 建议加 `chiplab,` 前缀；② `jedec,spi-nor` 直挂 soc 不符 SPI 外设模型 ⇒ 改 `cfi-flash`+`fixed-partitions`；③ OpenSBI RV32 默认 `FW_PAYLOAD_ALIGN=0x400000` ⇒ 与 07 文档 `TEXT_BASE=0x0020_0000` 冲突，需 `FW_PAYLOAD_OFFSET` 或改 TEXT_BASE；④ `timebase-frequency` 应为 33 MHz（用户已定）、UART `reg-io-width` 必须与 RTL 窗口位宽一致。**这些待用户审阅后统一修**（已列入 §7） |
+
+#### 关键经验（本轮）
+
+* **XIP 绕 Cache 需要"请求侧 + 填充侧"双判**：只看请求侧会漏掉"命中已被缓存过的 XIP 行"；填充侧必须按**在途请求地址**判，不能按当前请求判。
+* **性能判据要选对基准程序**：`hello` 是数据通路/串口主导（−1.4% 无意义），`memtest` 才反映取指局部性（−45%）——报告里必须解释清楚，否则会被误读为"Cache 没生效"。
+* **定向测试要配反证实验**：`fence.i` 测试通过后，把失效信号强制为 0 再跑一次能 FAIL，才证明测试真的在测这件事（本轮已做）。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -894,8 +918,18 @@ arch-test 与 hello/memtest 无影响，已复跑）。
   * ✅ **③ Sv32 MMU 已完成（第 17 轮，验收 61/64 —— 可判定项全过）**：`Svbare 3/3`、`Sv '^sv32_' 28/31`
     （余 3 例为**参考模型自身 FAIL**）、`Svade 2/2`、`SvPMP 4/4`、`ExceptionsSv 4/4`、`ExceptionsSvZaamo 3/3`、
     `ExceptionsSvZalrsc 3/3`、`SvZicbo 6/6`、`SvPMPZicbo 8/8`（另非 Sv 的 `PMPZicbo 4/4`）。
-  * ⏭ **④ 剩余部分＝L1I/L1D/L2 Cache**（CBO 已于第 17 轮完成）：最小可用方案见下（L1I 必做、L1D 可选、L2 暂缓），
-    目标是接上 **D16② 的 XIP 绕 Cache 判定点**并显著降低 `hello`/`memtest` 的 cycles。
+  * ✅ **④ 的 L1I 部分已完成（第 18 轮）**：`rtl/frontend/rv32_icache.v`（16 KB/4 路/32 B、VIPT、RR、
+    单未完成缺失、XIP 双判、`fence.i` 整表失效、`ENABLE` 安全阀）⇒ **`memtest` 2,026,669 → 1,116,795 拍
+    （−45.0%）**、AXI 取指 82005 → 29 笔；新增 `ICACHE_UNIT 36`、`FENCEI_SMC 9`、`XIP_NOALLOC 142/5059`。
+  * ⏭ **④ 剩余部分＝L1D（+ 可选 L2）**：按 §7 的最小正确版（**写直达 + 不写分配**、读分配、RR、
+    SPI-XIP 窗口同样绕 Cache）+ 五条验证（回归不回退 / SPI_BOOT·BOOT_CHAIN / cycles 下降 /
+    XIP 不分配断言 / fence.i）。**用户已拍板"先把 Cache 做出来再上板"**，故 L1D 是上板前的最后一项 RTL 工作。
+  * 📌 **待用户审阅后统一修（来自 `docs/porting/08-upstream-repos-knowledge.md` 的 4 条冲突）**：
+    ① DTS 加 `chiplab,` 前缀（`sifive,clint0`/`sifive,plic-1.0.0`/CPU 节点 `riscv` 均为 deprecated 或
+    simulator-only）；② SPI flash 节点改 `cfi-flash` + `fixed-partitions`（`jedec,spi-nor` 直挂 soc 不符模型）；
+    ③ OpenSBI RV32 `FW_PAYLOAD_ALIGN=0x400000` 与文档里的 U-Boot `TEXT_BASE=0x0020_0000` 冲突 ⇒ 定
+    `FW_PAYLOAD_OFFSET`/`TEXT_BASE`；④ `timebase-frequency` 改 **33 MHz**（用户第 8 轮定）、UART
+    `reg-io-width` 与 RTL 窗口位宽对齐。
   * 🔜 **③ 的剩余工作（下一轮优先级最高，按此顺序）**：
     1. **`ExceptionsSv` 系列 10 例**（`ExceptionsSv 0/4`、`ExceptionsSvZaamo 0/3`、`ExceptionsSvZalrsc 0/3`）：
        现在**不是签名不符而是"慢到超时"** —— 实测 `sv32_exceptions_Smode` 60k 拍只有 649 条提交
