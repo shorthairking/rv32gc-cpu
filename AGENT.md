@@ -303,7 +303,7 @@
 
 **当前状态**：`SIM: PASS hello` / `SIM: PASS memtest` / `AXI_SLAVE_UNIT: PASS (79)` / `EXEC_UNIT_TESTS: PASS (2461)` / `DECODER_UNIT_TESTS: PASS (257)`。
 
-**进行中**：arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通——需要 0x0 处放跳转桩（本核复位 PC=0）把控制权交给 `0x8000_2000` 的 `rvtest_entry_point`，签名由 TB 的 `+sig_dump` 导出。
+**arch-test 接入进展**：跳转桩 `sim/tests/arch_stub.S`（0x0 → `lui t0,0x80002; jr t0`）+ 镜像重定位脚本已完成；`I-add-00` 在本核上已能启动并执行到 `rvmodel` 的 UART 初始化（0x8004_62D0，正确设置 `0x1FE0_01E3` = UART LCR），RBTL 轨迹显示 377 条提交后进入停滞 → **下一轮用锁步工具（Spike 侧同样跑该 ELF）定位停滞点**；签名比对通路（`+sig_dump` 导出 `mem_hi[0x1000..0x2000]`）已就绪。
 
 **待办（阶段 2A 剩余）**：memtest 通过 → arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通 → CSR/异常/PMP 完善 → Sv32 MMU + L1 Cache → FPGA tcl 与上板 B1~B3。
 
