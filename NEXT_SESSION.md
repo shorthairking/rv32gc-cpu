@@ -1,6 +1,6 @@
 # NEXT_SESSION.md —— 下一会话的启动提示词（复制下面整段发给 AI）
 
-> 用途：本会话（阶段 2A 执行到第 4 个 goal round）结束后，用户切换会话时把下面 `====` 之间的内容整段发给新会话的 AI。
+> 用途：本会话（阶段 2A 执行到第 7 个 goal round）结束后，用户切换会话时把下面 `====` 之间的内容整段发给新会话的 AI。
 > 维护规则：每轮结束时更新"当前卡点"与"下一步"，并保持自包含（新会话没有本会话的上下文）。
 
 ================================================================================
@@ -41,51 +41,54 @@ bash scripts/run_sim.sh hello                 # 端到端 C 程序 → 期望 SI
 bash scripts/run_sim.sh memtest               # 64KiB 字节/半字/字/走位/非对齐 → 期望 PASS
 bash scripts/run_unit_exec.sh                 # EXEC_UNIT_TESTS: PASS (2461)
 bash scripts/run_unit_axi.sh                  # AXI_SLAVE_UNIT: PASS (79)
-bash scripts/run_unit_decoder.sh              # DECODER_UNIT_TESTS: PASS (257 vectors)
-RV32GC_TIMEOUT=30000000 bash scripts/run_arch_test.sh I/I-add-00   # arch-test（见第 4 节卡点）
+bash scripts/run_unit_decoder.sh              # DECODER_UNIT_TESTS: PASS (254 vectors)
+bash scripts/run_arch_test_suite.sh I         # 整组批量（默认超时 300000 拍，JOBS=4 并行）
+bash scripts/run_arch_test.sh I/I-add-00      # 单个用例
+bash scripts/run_lrsc_test.sh                 # A 扩展定向自测（LR/SC/AMO/非对齐，见第 4.5 节）
 # 锁步（Spike 提交轨迹 vs 本核轨迹，自动报首个分歧）
 bash scripts/lockstep.sh <0x80000000布局的.elf> 3000    # 或直接跑 tb_debug_min + lockstep_diff.py
 python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ```
 注意：Spike 的 `--log-commits` 输出在 **stderr**（用 `2>&1 1>/dev/null`）；Spike 的内存映射用 `-m0x80000000:0x10000000,...`（0x0 布局会与设备区冲突）；本核复位 PC=0，跑 0x8000_0000 布局的镜像需要 **`-DRESET_PC=32'h8000_0000`** 重编或用 `arch_stub.S` 跳转桩。
 
-## 4. 当前状态与卡点（第 5 轮结束时的事实，请从这里接手）
+## 4. 当前状态与卡点（第 7 轮结束时的事实，请从这里接手）
 
-1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）。
-2. **arch-test 5 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26（共 80 例 0 失败）。
-   批量跑法：`bash scripts/run_arch_test_suite.sh <组名>`（默认超时 300000 拍）。
-   注意：`run_arch_test.sh` 现在**默认加 `-DMISALIGNED_TRAP`**（参考模型 Spike 对非对齐访存一律报
-   cause 4/6，而本核默认是硬件拆分；arch-test 的 trap 签名比对必须两边一致）。要验证默认拆分行为设
-   `RV32GC_NO_MISALIGNED_TRAP=1`；`run_sim.sh` 新增 `RV32GC_DEFS` 传额外宏。
-3. **锁步已达标**：`bash scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000`
-   → 5994 条提交与 Spike 完全一致（新增 `sim/tests/lockstep_bench.c` 纯计算基准，避免 MMIO 让 Spike 提前退出）。
-   `lockstep.sh` 已修好三处工具缺陷（`32'h…` 加引号、Spike 提交日志取 stderr、RESET_PC 取 ELF 入口）。
-4. **剩余卡点：`Zalrsc-sc.w-00` 第 171 例 `cp: cmp_rd_rs2 / bin b1`（rd = rs2 = x1）**
-   - 该例代码（自校验镜像 0x80009dd8~0x80009e50）：
-     `lr.w x0,(x27); sc.w x1,x1,(x27); beqz x1,success; ...`
-     `success: lw tp,0(sp); beq tp,ra`（比较 **rd=x1**）→ 通过；
-     随后 `auipc/addi s3,scratch; lw t3,0(s3); lw tp,0(sp); beq tp,t3`（比较 **内存**）→ **失败**。
-   - 现场：`pc=0x80009e40 lw t3,0(s3)` 读回 **0**，期望 `0x72926d9b`（= 本用例注入 rs2/x1 的数据值）。
-     即：**`sc.w` 的 rd 结果正确（比较通过），但它的"存"没有把 rs2 数据写进 scratch**（要么没写、
-     要么写的是 0）。
-   - 下一步定位：在 `tb_debug_min` 里对 `pc=0x80009de8(或最近的 sc.w)` 前后打印
-     `mem_rs2_val_q / m_wdata_q / d_req_addr / d_req_wdata / d_req_wstrb / memst_q`，
-     确认 `SC→M_REQ_W` 阶段是否发出写、写数据是否等于 rs2；并核对 `M_IDLE` 里
-     `m_wdata_q <= mem_rs2_val_q` 的采样时刻（若 rs2 在 MEM 级尚未转发到位则会采到 0）。
-   - 提示：`Zaamo` 9/9 已全绿，说明 AMO 的读-改-写路径（`amo_base`）正确；差异只在 SC 的"写数据/写发出"。
-5. **（历史）trap 签名记录问题**：LR/SC/AMO 执行通路**已实现**（MEM FSM 的
-   `M_REQ_W/M_WAIT_W` 写回阶段、AMO 读-改-写、LR/SC 保留集、原子非对齐报 cause=6），但
-   `Zaamo`/`Zalrsc` 两组仍报框架的 `Mismatch in trap signature!`：用例在 U 模式下对非对齐地址发
-   AMO，陷阱经 `medeleg` 委派进 S 模式，需逐字段核对 S 侧 `scause/sepc/stval` 的记录值与参考
-   `.results` 中 `trap_sigptr` 的期望序列（下一步入口：`python3 scripts/arch_fail_locate.py
-   sim/arch_test/out/Zaamo-amoadd.w-00.elf sim/log/Zaamo-amoadd.w-00.rtl.log --hex ...`）。
-5. **下一步顺序建议**：
-   a. 查清 Zifencei 的 trap 签名计数语义；
-   b. 实现 A 扩展执行通路（LR/SC/AMO 目前会走成普通读写）→ 跑 `Zaamo`/`Zalrsc` 组；
-   c. 按 2A-3/2A-4 补 CSR/异常/PMP → Sv32 MMU + L1I/L1D/L2 Cache；
-   d. FPGA tcl 与上板 B1~B3（`fpga/tcl/build_chiplab.tcl`，时钟 IP 已备好 `create_clk_wiz_cpu.tcl`）。
-6. **本轮修复的 6 个 RTL 缺陷与 3 个验证环境问题**：见 `AGENT.md` §6「阶段 2A 进展（第 5 轮）」表格；
-   上一轮的"组合环/极慢"是误判，已排除（lint 无环、仿真约 10⁴ 拍/秒）。
+1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
+2. **arch-test 6 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26、**`Zaamo` 9/9**
+   （共 **89 例 0 失败**）。批量跑法：`bash scripts/run_arch_test_suite.sh <组名>`。
+   注意：`run_arch_test.sh` 默认加 `-DMISALIGNED_TRAP`（参考模型 Spike 对非对齐访存一律报 cause 4/6）；
+   要验证默认拆分行为设 `RV32GC_NO_MISALIGNED_TRAP=1`。
+3. **第 7 轮修复了 3 个真实 RTL 缺陷**（都在 `rtl/top/rv32gc_core.v`，详见 `AGENT.md` §6「第 7 轮」）：
+   ① **MEM 级转发漏掉访存结果**：`mem_fwd_en` 曾要求 `mem_mem_op_q == MEM_NONE`，于是
+      `load/LR/SC/AMO → 紧跟其后的分支/运算` 读到**上一拍旧值**（`sc.w` 成功后 `bnez` 用旧值判方向）。
+      改为「访存结果在 `M_DONE` 那拍可转发」，`mem_fwd_val` 增加 `WB_MEM → mem_load_data`。
+   ② **保留集不清**：普通 store 发起时、SC 成功写完成时、SC 失败/非对齐时、AMO 写完成时都必须清
+      （规范："reservation is invalidated by any store"）。此前只在 trap/WB 出错时清。
+   ③ **`M_DONE` 无条件回 `M_IDLE` 导致 FSM 在前端停顿时重放同一条指令**；对 SC 致命
+      （第一次已消费保留集，重入即 `resv=0` → rd 被改成 1，并再发一次写）。改为
+      `if (!mem_valid_q || advance_all) memst_q <= M_IDLE;`（linger 到指令真正离开 MEM）。
+4. **`Zalrsc-sc.w-00` 的失败根因已查明：是 upstream ACT4 生成器缺陷，不是核的问题**
+   （证据链与全语料影响面见 `scripts/tests/arch_sigreg_clobber_report.md`，扫描工具
+   `scripts/tests/arch_sigreg_clobber.py`：641 个 `.S` 中 33 个同族）。
+   要点：生成器发 `mv xNew,xOld # switch signature pointer register` 时，`xOld` 已被测试自身的
+   `LA(xOld,scratch)` 改写成 scratch 地址 → 签名指针搬到 scratch → 自校验必失败。
+   三条独立证据：①反汇编（`80002154: lw tp,0(a7)` 即源码的 `LREG x18,0(x2)`）；②本核提交轨迹+
+   D 侧请求（`addr=8001bdec` 即签名区）；③Spike 提交轨迹同样走到 `mem 0x8001bdec 0x00000000`。
+   下一步（可选）：给 upstream 提 issue/PR（改 `registers.py::consume_registers`），或在下游把
+   这 33 个文件标记为"框架已知缺陷"。
+5. **剩余小卡点（第 7 轮发现，核外）**：`sim/tb/sim_axi_slave.v` 的读通路在"同一地址写 beat 之后
+   的读"会返回**上一版数据**（逐字节监视器确认 `mem_lo[]` 已更新而 `s_rdata` 仍旧；间隔 10+ 拍也复现）。
+   影响：定向自测 `sim/tests/lrsc.S`（`bash scripts/run_lrsc_test.sh`）停在 `fail_5`（"SC 存后立刻
+   读回"）。**不影响 arch-test 各组**（它们不做写后立刻读同址）。下一步：给 `sim_axi_slave.v` 的
+   读写通道加显式排序/延迟（或加 `RV32GC_SIM_MEMWATCH` 监视开关重新定位）。
+6. **下一步顺序建议**：
+   a. （可选）修 `sim_axi_slave.v` 的写-读可见性 → 让 `lrsc.S` 全绿；
+   b. 按 2A-3/2A-4 补 CSR/异常/PMP → Sv32 MMU + L1I/L1D/L2 Cache；
+   c. FPGA tcl 与上板 B1~B3（`fpga/tcl/build_chiplab.tcl`，时钟 IP 已备好 `create_clk_wiz_cpu.tcl`）。
+7. **本轮新增工具/资产**：`sim/tb/tb_trace_mem.v`（提交轨迹 + D 侧请求/响应 + AXI 通道，
+   定位"某条指令实际访问哪个地址、读到什么"）、`scripts/tests/`（扫描脚本+报告）、
+   `sim/tests/lrsc.S` + `scripts/run_lrsc_test.sh`（A 扩展定向自测，含 LR/SC 保留集 8 组、
+   AMO、非对齐陷阱共 28 项检查）。
 
 ## 5. 工作方式要求（必须遵守）
 
