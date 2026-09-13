@@ -894,6 +894,22 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 19 轮：全量回归入口固化 + 终版回归证据（审阅用）
+
+| 项 | 结果 |
+|---|---|
+| **固化单一回归入口** | 新增 `scripts/run_full_regression.sh`（支持 `nonpriv`/`pmp`/`mmu`/`units`/`progs` 子集），逐项打印 `PASS=x FAIL=y / 共 z`，并与**内置基线表**比对，末尾输出"偏离基线"清单；汇总写入 `sim/log/full_regression_summary.txt`。程序段按 **TB 日志**判定（`TB: TEST PASS`）并在汇总里带上 cycles |
+| **终版回归（审阅证据）** | **`FULL_REGRESSION: PASS （PASS 计数=279 / FAIL 计数=7）`，偏离基线清单为空**（7 个 FAIL 全部是基线已知例外：`PMPZca` 3 例 ISA 不可达、`PMPSm_cfg_A_tor_zero-00` 平台 PA-0 口径、`Sv` 3 例参考模型自身 FAIL）。含 `hello` **347 拍**、`memtest` **1,116,795 拍**（L1I −45.0%） |
+| 明细（同一份汇总） | 非特权 18 组 = `I 39 / M 8 / Zicsr 6 / Zifencei 1 / Zca 26 / Zaamo 9 / Zalrsc 2 / Misalign 5 / MisalignZca 4 / Zicntr 2 / Zicbom 3 / Zicboz 1 / Zicbop 3 / Zihintpause 1 / Zihintntl 4 / ZihintntlZca 4 / Zmmul 4 / Zicond 2` = **124 例 0 失败**；PMP `PMPS 11 / PMPU 11 / PMPZaamo 1 / PMPZalrsc 1 / PMPZca 12(3) / PMPSm 37(1)`；MMU `Svbare 3 / Sv 28(3) / Svade 2 / SvPMP 4 / ExceptionsSv 4 / Zaamo 3 / Zalrsc 3 / SvZicbo 6 / SvPMPZicbo 8 / PMPZicbo 4`；单元 `PMP 443 / CLINT_PLIC 184 / TLB_PTW 155 / ICACHE 36 / AXI 79 / EXEC 2461 / DECODER`；定向 `PRIV_TRAP 46 / FETCH_ERR 21 / LRSC / FENCEI_SMC / SPI_BOOT / BOOT_CHAIN`；DTS `CHECK_DTS 17`、打包 `PACK_BOOT` |
+
+**状态小结（供用户审阅）**：① ② ③ ⑤ 完成；④ 的 CBO 与 **L1I** 完成、**L1D（+可选 L2）待做**（方案见 §7 ④）；
+⑥ 计划草案已按用户 5 项拍板更新，另有 4 处 DTS/计划修正待用户审阅后统一处理（见 §7 📌）。
+**上板（2A-7d）未开始**，等用户审阅。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。

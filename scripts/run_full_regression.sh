@@ -52,10 +52,23 @@ group() {   # group <显示名> <组参数> [用例过滤正则]
 cmd() { # cmd <显示名> <命令...>
   local label="$1"; shift
   local out
-  out=$("$@" 2>&1 | grep -aoE "(PMP_UNIT|CLINT_PLIC_UNIT|TLB_PTW_UNIT|ICACHE_UNIT|AXI_SLAVE_UNIT|EXEC_UNIT_TESTS|DECODER_UNIT_TESTS|PRIV_TRAP|FETCH_ERR|LRSC_DIRECTED|FENCEI_SMC|XIP_NOALLOC|SPI_BOOT|BOOT_CHAIN|CHECK_DTS|PACK_BOOT): PASS( \([0-9]+ checks\))?" | tail -1)
+  out=$("$@" 2>&1 | grep -aoE "(SIM: PASS [A-Za-z0-9_-]+|TB: TEST PASS|(PMP_UNIT|CLINT_PLIC_UNIT|TLB_PTW_UNIT|ICACHE_UNIT|AXI_SLAVE_UNIT|EXEC_UNIT_TESTS|DECODER_UNIT_TESTS|PRIV_TRAP|FETCH_ERR|LRSC_DIRECTED|FENCEI_SMC|XIP_NOALLOC|SPI_BOOT|BOOT_CHAIN|CHECK_DTS|PACK_BOOT): PASS( \([0-9]+ checks\))?" | tail -1)
   [ -n "$out" ] || out="（未捕获 PASS 行）"
   printf '%-26s %s\n' "$label" "$out" | tee -a "$SUMMARY"
   case "$out" in *PASS*) PASS_N=$((PASS_N+1));; *) FAIL_N=$((FAIL_N+1)); DEVIATION+=("$label 未 PASS: $out");; esac
+}
+
+prog() {  # prog <显示名> <测试名>：跑 run_sim.sh 并以 TB 日志判定（比抓命令行输出稳健）
+  local name="$1" test="$2" cyc
+  timeout 2400 bash scripts/run_sim.sh "$test" >/dev/null 2>&1
+  if grep -qa "TB: TEST PASS" "sim/log/$test.log"; then
+    cyc=$(grep -aoE "TB: cycles=[0-9]+" "sim/log/$test.log" | tail -1)
+    printf '%-26s SIM: PASS %s (%s)\n' "$name" "$test" "$cyc" | tee -a "$SUMMARY"
+    PASS_N=$((PASS_N+1))
+  else
+    printf '%-26s SIM: FAIL %s\n' "$name" "$test" | tee -a "$SUMMARY"
+    FAIL_N=$((FAIL_N+1)); DEVIATION+=("$name 未 PASS")
+  fi
 }
 
 if [ "$ONLY" = all ] || [ "$ONLY" = nonpriv ]; then
@@ -83,6 +96,12 @@ if [ "$ONLY" = all ] || [ "$ONLY" = mmu ]; then
   group PMPZicbo    priv/PMPZicbo
 fi
 
+if [ "$ONLY" = progs ]; then
+  echo "########## 程序（progs 模式）" | tee -a "$SUMMARY"
+  prog "hello（取指局部性）" hello
+  prog "memtest（长跑）"     memtest
+fi
+
 if [ "$ONLY" = all ] || [ "$ONLY" = units ]; then
   echo "########## 单元测试" | tee -a "$SUMMARY"
   cmd "PMP 单元"        bash scripts/run_unit_pmp.sh
@@ -103,8 +122,8 @@ if [ "$ONLY" = all ] || [ "$ONLY" = units ]; then
   cmd "DTS 交叉校验"    bash scripts/check_dts.sh
   cmd "启动镜像打包"    bash scripts/pack_boot_image.sh
   echo "########## 程序" | tee -a "$SUMMARY"
-  cmd "hello"           bash scripts/run_sim.sh hello
-  cmd "memtest"         bash scripts/run_sim.sh memtest
+  prog "hello（取指局部性）"   hello
+  prog "memtest（长跑）"      memtest
 fi
 
 {
