@@ -86,14 +86,17 @@
 | `READID` | — | — | 无 | 向 `0x00` 写 `0x21` | `udelay(1)` 后读 `IDH/IDL` |
 | `STATUS` | — | — | 无 | 软件合成（`status \| 0x80`） | — |
 
-## 5. ECC 策略（必须显式决定）
+## 5. ECC 策略（已按实际芯片确定）
 
+- **实际芯片**：**K9F1G08U0C-PCB0**（Samsung 1 Gbit SLC，128 MiB，页 2048+64 B，块 128 KiB）——由原理图确认（U8）。
+- **芯片的 ECC 要求**：**1 bit / 512 Byte**（片内 Copy-Back EDC 为 1 bit/528 B）。即：一个 2048 B 页 = 4 个 512 B 扇区，每扇区纠正 1 bit 即满足器件规范。
 - 现状：参考驱动把 ECC **完全关闭**（`NAND_ECC_ENGINE_TYPE_NONE`，`ecc_rd/ecc_wr=0`），仅有的线索是未启用的布局：**24 字节 ECC 位于 spare 偏移 40..63，`oobfree = {2, 38}`**。
-- 控制器**支持**硬件 ECC（`CMD[11]/[12]/[24]`），但语义无文档。
+- 控制器**支持**硬件 ECC（`CMD[11]/[12]/[24]`），但寄存器语义无文档。
 - **本项目策略**（分两步）：
-  1. **第一阶段：软件 BCH ECC**（内核 `CONFIG_MTD_NAND_ECC_SW_BCH=y`，U-Boot `CONFIG_NAND_ECC_SOFT_BCH`），保证数据可靠；代价是 CPU 开销（NAND 写入慢，但内核/uboot 场景可接受）；
-  2. **第二阶段（可选）**：实测硬件 ECC：写入已知数据 → 读回并对比 `CMD[11]` 置位时的 ECC 字节位置与纠错行为 → 若与 24B@40..63 布局一致则启用硬件 ECC 提升性能，并把 ECC 布局写入设备树（`nand-ecc-*` 属性）。
-- **注意**：ECC 布局必须与 U-Boot 一致（否则 U-Boot 写的镜像内核读不出来）。两处共用同一个 `#define`（例如放在 `include/linux/mtd/nand-ecc-layout.h` 与 U-Boot 的对应头文件中，或都从设备树读取）。
+  1. **第一阶段：软件 ECC**——推荐 **软件 BCH-4**（内核 `CONFIG_MTD_NAND_ECC_SW_BCH`，U-Boot `CONFIG_NAND_ECC_SOFT_BCH`），每 512 B 用 7 B ECC，一页 28 B，64 B spare 足够（满足并超出 1 bit/512 B 的要求）；若想最小开销，软件 Hamming（3 B/512 B，共 12 B）也已满足器件规范。
+  2. **第二阶段（可选）**：实测硬件 ECC —— 写入已知数据、置 `CMD[11]`/`CMD[12]` 观察 spare 中 ECC 字节位置与纠错行为；若与 24 B@40..63 布局一致则启用硬件 ECC 提速，并把 ECC 布局写入设备树（`nand-ecc-*` 属性）。
+- **布局由我们的两份驱动共同定义**（控制器硬件 ECC 语义未知，不作为依赖）：ECC 算法、strength、step size、`oobfree` 必须在内核与 U-Boot 两侧**完全一致**（建议共享同一组 `#define` 或都由设备树读取），否则镜像互不可读。
+- **坏块标记**：Samsung 大页 SLC 惯例为"每个块第 1 页 spare 区首字节非 `0xFF` 即坏块"，MTD 的 `badblockpos` 对大页默认 0，与之一致；上板用"擦除后读 spare 首字节"实测确认。
 
 ## 6. 分区（统一定义）
 
@@ -113,7 +116,7 @@
 1. **结构**：以参考驱动的命令序列为蓝本，但改用 **`->exec_op()`（`nand_op_parser`）** 接口（5.14 支持），把 `CMD/ADDR/DATA_IN/DATA_OUT` 映射到寄存器 + DMA；保留 `->legacy.*` 作为后备。
 2. **地址**：全部通过 `platform_get_resource(pdev, IORESOURCE_MEM, 0/1)` 获取（控制器 + 门铃），`devm_ioremap_resource`；**杜绝硬编码**。
 3. **DMA**：`dma_alloc_coherent()` 分配描述符与数据缓冲；`dma_sync_single_for_cpu/device()` 做 cache 维护；使用 `readl_poll_timeout` 轮询门铃与 DONE（带超时与错误恢复，参考实现的 `write_z_cmd` 恢复路径可借鉴）。
-4. **几何校验**：参考驱动要求 128 KiB 块 / 2048 字节页 / 64 字节 OOB，否则 probe 失败；本项目**放宽为警告**，让 `nand_scan` 自行识别（并记录实测几何）。
+4. **几何校验**：参考驱动要求 128 KiB 块 / 2048 字节页 / 64 字节 OOB —— **与实际芯片 K9F1G08U0C 完全一致，无需放宽**；仍建议在 probe 时打印实测几何与器件 ID（`0xEC`/`0xF1`）以便上板核对。
 5. **中断**：先实现**轮询**（参考实现即轮询），DTS 中保留中断属性备用。
 6. **`CACHEPRG`**：确认控制器是否支持 `NAND_CMD_CACHEDPROG`，不支持则去掉 `NAND_CACHEPRG` 选项。
 
@@ -143,9 +146,10 @@
 
 | 风险 | 说明 | 处理 |
 |---|---|---|
-| 硬件 ECC 语义未知 | 唯一线索是 24B@40..63 布局 | 先软件 ECC；硬件 ECC 作为优化项 |
-| `PARAM`（`0x18`）语义未知 | 参考实现 RMW 时会清除 `0x0800_0000` 位 | 实测确定；驱动中固定写入实测可行的值 |
-| NAND 芯片型号/几何未知 | probe 的几何 gate 可能不匹配 | 放宽 gate + 实测记录 |
+| ~~硬件 ECC 语义未知~~ | 已确认芯片只需 **1 bit/512 B**，软件 BCH-4/Hamming 即满足 | 先软件 ECC；硬件 ECC 仅作为提速优化项 |
+| 控制器 `PARAM`（`0x18`）语义未知 | 参考实现 RMW 时会清除 `0x0800_0000` 位 | 实测确定；驱动中固定写入实测可行的值 |
+| ~~NAND 芯片型号/几何未知~~ | **已确认**：K9F1G08U0C-PCB0，2048+64 B 页 / 128 KiB 块 / 1024 块，与参考驱动 gate 吻合 | 无需放宽 gate |
 | `IDH[31:16]` 作为状态字节的语义 | 参考实现的 `waitfunc` 依赖它 | 用 `done` 位 + `IDH` 双路判断 |
 | DMA 与 Cache 一致性 | 平台无硬件一致性 | CPU 实现 Zicbom；驱动全程 `dma_sync_*` |
 | 分区冲突 | 驱动/DTS/文档三处不一致 | 以本文 §6 为准，两侧共用同一 `mtdparts` |
+| 时序寄存器（`TIMING=0x205`）取值 | 参考实现未给出推导依据，与 APB 33 MHz、器件 25 ns 串行访问时间的匹配需实测 | 上板抓 NAND 时序波形核对，必要时调整 |

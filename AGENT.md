@@ -223,13 +223,20 @@
 
 **已确认的需求澄清**
 - "4 个标量及以上" → **4 发射超标量**（用户确认）；
-- 仿真工具 → **用户在沙箱外 `apt install verilator iverilog`**（用户确认）。
+- 仿真工具 → **用户在沙箱外 `apt install verilator iverilog`**（用户确认，**已安装完成**：Verilator 5.020 + Icarus Verilog 12.0 已验证可用）；
+- 设计方案参数 → **用户已审阅通过**（4 发射、Cache 容量、乱序结构、软件栈）。
+
+**阶段一补充更新（2026-09-13，依据 `实验箱A7-原理图.pdf`）**
+- **NAND 芯片确认**：位号 U8 = **K9F1G08U0C-PCB0**（Samsung 1 Gbit SLC，3.3 V，x8）——容量 **128 MiB**，页 **2048 + 64 B**，块 **128 KiB（64 页）**，共 1024 块，**ECC 要求 1 bit / 512 Byte**（片内 Copy-Back EDC 1 bit/528 B），tR 25 µs(max)、tPROG 200 µs(typ)、tBERS 1.5 ms(typ)，器件 ID `0xEC`/`0xF1`（与 Linux `nand_ids.c:107` 的 "NAND 128MiB 3,3V 8-bit" 一致）。
+  → **与平台 RTL `nand_type=2'h2`、参考驱动几何 gate（128 KiB/2048/64）完全吻合，无需放宽**；ECC 用软件 BCH-4（或 Hamming）即可满足器件规范。
+- **其他板级确认**：DDR3 = K4B1G1646G-BCK0（1 Gbit = **128 MiB**，与内核 DTS `/memory` 一致）；SPI NOR = S25FL128SAGMFI001（128 Mbit = 16 MiB，DIP 插座，存放 PMON/u-boot）；板级输入时钟 100 MHz。
+- 已更新文档：`docs/kb/01-chiplab-platform.md`（新增板级硬件清单）、`docs/kb/03-nand-controller.md`（新增芯片身份与 ECC 结论）、`docs/porting/04-nand.md`（ECC 策略与几何校验落定）、`docs/porting/00-overview.md` 与 `03-drivers.md`。
 
 **未决/待验证事项（带入阶段二）**
 - CONFREG 仿真/FPGA 两套地址的最终取舍（仿真 TB 采用 FPGA 地址 + 仿真便捷寄存器）；
-- NAND 硬件 ECC 语义、`PARAM` 寄存器语义、芯片实际几何；
+- NAND 控制器 `PARAM` 寄存器语义、硬件 ECC 寄存器语义、坏块标记位置、`TIMING=0x205` 取值依据（均已降级为"实测确认"项，不再阻塞设计）；
 - FPGA 工程 tcl 生成与 Vivado 2025.2 许可/工程升级；
-- 100 MHz 时序收敛风险（保留 4 项降级措施）。
+- 100 MHz 时序收敛风险（保留 4 项降级措施，其中降为双发射需用户批准）。
 
 ---
 
@@ -249,6 +256,7 @@
 | 2A-6 | FPGA 工程脚本与上板 | `fpga/build_chiplab.tcl`、bit 流 | 串口输出 + 数码管正确 + 60 MHz 收敛 |
 
 **阶段二开工前需要用户确认/配合的事项**
-1. 在沙箱外执行：`sudo apt install verilator iverilog gtkwave`（若希望我改用源码编译或 XSim，请告知）；
-2. 确认阶段一设计参数（发射宽度 4、Cache 容量、乱序结构）后即可开工；
-3. 如手头有实验箱的 NAND 芯片型号/丝印信息，请提供（可提前消除 ECC 与几何的不确定性）。
+1. ~~在沙箱外执行 `sudo apt install verilator iverilog gtkwave`~~ → **已完成**（Verilator 5.020 / Icarus Verilog 12.0 已就绪，`xvlog/xelab/xsim` 亦可用）；
+2. ~~确认阶段一设计参数~~ → **已审阅通过**；
+3. ~~提供实验箱 NAND 芯片型号/丝印~~ → **已由原理图确认**（K9F1G08U0C-PCB0，见阶段一补充更新）；
+4. 仅剩一项待用户指令：**"开始阶段 2A"**。收到后按 §7 的 2A-1 → 2A-6 顺序执行。

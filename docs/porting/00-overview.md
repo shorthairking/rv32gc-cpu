@@ -11,7 +11,7 @@
 | `la32r-Linux`（Linux 5.14.0-rc2）中 **`arch/riscv` 是基本上游代码且已支持 RV32/Sv32**（`ARCH_RV32I` → `select MMU`、`arch/riscv/configs/rv32_defconfig` 现成） | Linux 侧**不需要**做架构移植，只需新增 SoC（`SOC_CHIPLAB`）、设备树、defconfig 和平台驱动 |
 | `la32r-uboot`（自称 2019.07，实为混合快照）中 **`arch/riscv` 同样完整支持 RV32**（`qemu-riscv32(_smode)_defconfig` 可作种子） | U-Boot 侧同样只新增 board/defconfig/DTS/驱动 |
 | `arch/loongarch`/`arch/la32r` 与 RISC-V 的 CSR/异常/MMU 模型完全不同 | **明确不移植**这两套架构代码，只把其中的**平台驱动**当作参考实现 |
-| 平台已有 RTL 级 NAND 控制器（`chiplab/IP/APB_DEV/NAND/`，基址 `0x1FE7_8000`），内核侧有参考驱动 `ls1a_nand.c`（1173 行） | NAND 驱动是**唯一必须新写**的驱动（内核 + U-Boot 两份） |
+| 平台已有 RTL 级 NAND 控制器（`chiplab/IP/APB_DEV/NAND/`，基址 `0x1FE7_8000`），内核侧有参考驱动 `ls1a_nand.c`（1173 行）；板上 NAND 为 **K9F1G08U0C-PCB0**（Samsung 1 Gbit SLC，128 MiB，页 2048+64 B，块 128 KiB，ECC 要求 1 bit/512 B，原理图确认） | NAND 驱动是**唯一必须新写**的驱动（内核 + U-Boot 两份），但几何与参考驱动完全吻合，ECC 用软件 BCH-4/Hamming 即满足 |
 | U-Boot 当前**完全没有 NAND/MTD 支持**（`# CONFIG_NAND is not set` 等） | 需要新增驱动 + 使能 `CONFIG_NAND/CMD_NAND/CMD_MTDPARTS/ENV_IS_IN_NAND` + 改写 `bootcmd` |
 | 内核 `RISCV_M_MODE` 是隐藏符号且 `default !MMU` → RV32+MMU 必须走 **S 模式 + SBI** | 软件栈采用 **OpenSBI（M 模式） + U-Boot（S 模式） + Linux（S 模式）** 的标准三段式 |
 
@@ -99,7 +99,7 @@ rv32gc-cpu/sw/
 
 | 风险 | 说明 | 对策 |
 |---|---|---|
-| NAND 硬件 ECC 语义未知 | 参考驱动把 ECC 全关，页/OOB 布局只有 24 B @ spare 40..63 一种线索 | 先用软件 BCH ECC（内核已支持）；ECC 布局用实测确定 |
+| NAND 硬件 ECC 寄存器语义未知（**芯片要求已知：1 bit/512 B**） | 参考驱动把 ECC 全关 | 先用软件 BCH-4（超出器件要求）；硬件 ECC 作为提速优化项 |
 | NAND 数据必须走平台 DMA 引擎 | CPU 有 Cache，DMA 不具一致性 | CPU 实现 Zicbom；驱动统一用 `dma_sync_*`；U-Boot 侧实现 dcache flush/inval |
 | 分区定义三处冲突（驱动 21M/35M、DTS 20M、文档 50M） | 影响启动与工具链 | 统一定义为本方案 §7 的布局，全部通过 `mtdparts`/DT 传递 |
 | CONFREG 地址在仿真与 FPGA 不同 | 软硬件地址不一致 | 用设备树区分（FPGA/仿真两份 DTS），驱动不硬编码 |

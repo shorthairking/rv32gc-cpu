@@ -74,6 +74,8 @@
 - `la32r-Linux` 与 `la32r-uboot` 里**都有现成可用的 `arch/riscv`（RV32）**：移植 = 新增 SoC/board + 设备树 + defconfig + 驱动；**不要**尝试把 `arch/loongarch`/`arch/la32r` 改造成 RISC-V。
 - Linux 必须走 **S 模式 + SBI**（该内核树 `RISCV_M_MODE` 隐藏且 `default !MMU`）→ 软件栈 = **OpenSBI(M) + U-Boot(S) + Linux(S)**。
 - **NAND 驱动是唯一必须新写的驱动**（U-Boot 现在完全没有 NAND/MTD 支持）；参考实现 `la32r-Linux/drivers/mtd/nand/raw/ls1a_nand.c` 的**命令序列可用**，但地址/cache/DMA 部分必须重写；数据搬运必须走平台 DMA 引擎（门铃 `0x1FD0_1160`）。
+- **板上 NAND 已确认**（原理图 `实验箱A7-原理图.pdf`，位号 U8）：**K9F1G08U0C-PCB0**（Samsung 1 Gbit SLC，3.3 V）——128 MiB / 页 2048+64 B / 块 128 KiB / 1024 块 / **ECC 要求 1 bit/512 B** / tR 25 µs、tPROG 200 µs、tBERS 1.5 ms / ID `EC F1`。与平台 RTL `nand_type=2'h2`、参考驱动几何 gate **完全吻合**；ECC 用软件 BCH-4（或 Hamming）即可，U-Boot 与内核必须使用相同 ECC 布局。
+- 其他板级事实：DDR3 = K4B1G1646G-BCK0（128 MiB，与 DTS 一致）；SPI NOR = S25FL128SAGMFI001（16 MiB，DIP 插座，存放 PMON/u-boot）；板级时钟 100 MHz。
 - 分区统一定义：`nand-flash:256K(env),50M(kernel)ro,1M(dtb),-(rootfs)`。
 - 上游源码树不复制进本项目：用"新增文件 + 补丁序列 + 构建脚本"管理，版本号记录在 `sw/*/UPSTREAM.md`。
 
@@ -129,6 +131,7 @@
 
 ## 五、当前状态快照（随阶段更新）
 
-- **阶段一已完成**：设计文档 9 篇、移植方案 6 篇、知识库 7 篇、结构图/数据通路图 5 张、`AGENT.md`、本提示词；已提交 git。
-- **等待用户**：审阅设计参数（4 发射、Cache 容量、乱序结构、软件栈）；在沙箱外执行 `sudo apt install verilator iverilog gtkwave`。
-- **下一阶段（2A）首三件事**：① 仿真环境（iverilog+verilator+Spike）落地；② `core_top` 平台壳 + AXI 内存/设备模型跑通；③ 5 级顺序流水 + CSR + 上板最小系统。
+- **阶段一已完成并获用户审阅通过**：设计文档 9 篇、移植方案 6 篇、知识库 7 篇、结构图/数据通路图 5 张、`AGENT.md`、本提示词；已提交 git。
+- **环境就绪**：Verilator 5.020 + Icarus Verilog 12.0 已安装（用户完成）；Vivado 2025.2 可用；`/opt/riscv` GCC 16.1.0 可用；网络可用。
+- **硬件事实已确认**（原理图）：NAND = K9F1G08U0C-PCB0（128 MiB / 2048+64 B 页 / 128 KiB 块 / ECC 1 bit/512 B）、DDR3 = 128 MiB、SPI NOR = S25FL128SAGMFI001（16 MiB）、板级时钟 100 MHz。
+- **下一阶段（2A）首三件事**：① 仿真环境落地（iverilog + verilator 回归脚本 + 编译 Spike 作参考模型）；② `core_top` 平台壳 + AXI/内存/CONFREG 仿真环境跑通；③ 5 级顺序流水 + CSR/特权 + 最小系统上板（B1~B3）。

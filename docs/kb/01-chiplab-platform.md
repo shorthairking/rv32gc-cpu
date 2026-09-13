@@ -1,5 +1,17 @@
 # KB-01 平台硬事实（chiplab / 龙芯实验箱）
 
+## 0. 板级硬件清单（由 `实验箱A7-原理图.pdf` 确认，2026-09-13 更新）
+
+| 位号 | 器件 | 型号 | 说明 |
+|---|---|---|---|
+| — | FPGA | **XC7A200T-FBG676**（`xc7a200tfbg676-2`，Artix-7） | 板级输入时钟 **100 MHz** |
+| U8 | **NAND Flash** | **K9F1G08U0C-PCB0**（Samsung 1 Gbit SLC，3.3 V，x8） | 页 2048+64 B、块 128 KiB、1024 块 = **128 MiB**；单 CE#；R/B# → `FPGA_NAND_RDY`；4.7 K 上拉；详见 `03-nand-controller.md` §0 |
+| U14 | **SPI NOR Flash** | **S25FL128SAGMFI001**（128 Mbit = 16 MiB，DIP 插座） | 信号 `FPGA_SPI_{SCK,CS#,SDI,SDO,WP#,HOLD#}`；平台 PMON/u-boot 的存放介质 |
+| — | DDR3 | **K4B1G1646G-BCK0**（Samsung 1 Gbit x16 DDR3） | **128 MiB**，与内核 DTS `/memory` 的 `0x0800_0000` 一致 |
+| — | 其他 | MAC PHY ×2、USB PHY、UART、LCD/VGA、SRAM、数码管/键盘/开关、AD/DA | 与平台 SoC 顶层一一对应 |
+
+> 结论：**NAND 与 DDR3 的容量、页/块几何都与平台 RTL 和 LA32R 内核 DTS 完全一致**（128 MiB / 2048+64 B 页 / 128 KiB 块），无需修改参考驱动的几何 gate。
+
 ## 1. CPU 接口契约（不可更改）
 
 - 顶层模块名必须是 **`core_top`**，源文件放入 `$CHIPLAB_HOME/IP/myCPU/`（该目录当前是**未初始化的空子模块**，指向 `gitee.com/loongson-edu/open-la500`）。

@@ -11,7 +11,7 @@
 | UART 16550 | `IP/APB_DEV/URT`，`0x1FE0_01E0`，33 MHz，中断线 UART | `8250_of`（标准驱动）+ DTS 节点 | `CONFIG_SYS_NS16550`（标准驱动） | **零代码**（仅 DTS/配置） |
 | CLINT（mtime/mtimecmp/msip） | **核内实现**（`0x1F00_0000`） | `riscv,timer` / `CLINT_TIMER`（标准） | `CONFIG_RISCV_TIMER`（标准，SBI `TIME` 调用） | **零代码**（仅 DTS/配置） |
 | PLIC（外部中断） | **核内实现**（`0x1F10_0000`），源 = `intrpt[7:0]` | `sifive,plic-1.0.0`（标准 `irq-sifive-plic`） | 不需要（U-Boot 轮询） | **零代码**（仅 DTS） |
-| NAND 控制器 + DMA | `IP/APB_DEV/NAND` + `IP/DMA`，`0x1FE7_8000` / 门铃 `0x1FD0_1160` | 新驱动 `chiplab_nand.c` | 新驱动 `chiplab_nand.c` | **主要工作量** → 见 `04-nand.md` |
+| NAND 控制器 + DMA | `IP/APB_DEV/NAND` + `IP/DMA`，`0x1FE7_8000` / 门铃 `0x1FD0_1160`；板上芯片 **K9F1G08U0C-PCB0**（128 MiB / 2048+64 B 页 / 128 KiB 块，ECC 1 bit/512 B） | 新驱动 `chiplab_nand.c`（软件 BCH-4 ECC） | 新驱动 `chiplab_nand.c` | **主要工作量** → 见 `04-nand.md` |
 | CONFREG | `IP/CONFREG/confreg_syn.v` @ `0x1FD0_0000`（仿真 `confreg_sim.v` @ `0x1FAF_0000`） | 可选：reboot/poweroff、LED | 可选：启动指示 | 小（约 100 行） |
 | 网络 MAC (dmfe) | `IP/MAC`，`0x1FF0_0000` | 第二阶段：可参考 `dmfe` 驱动（LA32R 树中有） | 可选 | 中（可延后） |
 | SPI Flash | `IP/SPI/godson_sbridge_spi.v`，`0x1FE8_0000` + XIP `0x1C00_0000` | 可作为 MTD SPI-NOR（可选） | 已有 SPI flash 框架 | 可延后 |
