@@ -68,10 +68,10 @@
 #define RVMODEL_MAX_CYCLES_PER_TIMER_TICK 1
 
 // CLINT (mtime/mtimecmp/msip) - required if any interrupt/mtime test is built
-#define CLINT_BASE_ADDRESS 0x1F000000   /* 核内 CLINT（阶段 2A 后续实现） */
+#define CLINT_BASE_ADDRESS 0x800F0000   /* 阶段 2A：CLINT 未实现，指向已映射 scratch（Linux 阶段改回 0x1F000000） */
 #define RVMODEL_MSIP_ADDRESS (CLINT_BASE_ADDRESS + 0x0)
-#define RVMODEL_MTIMECMP_ADDRESS 0x1F004000
-#define RVMODEL_MTIME_ADDRESS 0x1F00BFF8
+#define RVMODEL_MTIMECMP_ADDRESS 0x800F4000
+#define RVMODEL_MTIME_ADDRESS 0x800FBFF8
 
 // External interrupts: required by check_defines.h when S_SUPPORTED is set.
 // Point these at your interrupt controller if you have one.

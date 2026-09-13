@@ -116,6 +116,7 @@ module rv32gc_core (
   wire        c_rd_wen    = dec_ctrl[`CTRL_RD_WEN_H];
   wire        c_use_rs1   = dec_ctrl[`CTRL_USE_RS1_H];
   wire        c_use_rs2   = dec_ctrl[`CTRL_USE_RS2_H];
+  wire        c_is_serial = dec_ctrl[`CTRL_IS_SERIAL_H];
   wire        c_is_jal    = c_br_flags[`BRF_JAL];
   wire        c_is_jalr   = c_br_flags[`BRF_JALR];
   wire        c_is_br     = (c_br_type != `BR_NONE);
@@ -147,7 +148,7 @@ module rv32gc_core (
   wire [31:0] trap_tval_wb;
   wire [31:0] wb_pc;
   wire        wb_csr_wen;
-  wire [11:0] wb_csr_addr_q;
+  reg  [11:0] wb_csr_addr_q;   // WB 级 CSR 地址（独立流水寄存器）
   wire [31:0] wb_csr_wdata;
   wire        wb_retire;
   wire        wb_is_sret;
@@ -217,7 +218,9 @@ module rv32gc_core (
   // MEM 级（EX/MEM 寄存器）：仅 ALU 类结果可转发（load 数据要等 WB）
   wire        mem_fwd_en  = mem_valid_q && mem_rd_wen_q && (mem_rd_q != 5'd0) &&
                             (mem_mem_op_q == `MEM_NONE);
-  wire [31:0] mem_fwd_val = (mem_wb_sel_q == `WB_PC4) ? (mem_pc_q + 32'd4) : mem_alu_q;
+  wire [31:0] mem_fwd_val = (mem_wb_sel_q == `WB_PC4) ? (mem_pc_q + 32'd4) :
+                            (mem_wb_sel_q == `WB_CSR) ? mem_csr_rdata_q :
+                            mem_alu_q;   // WB_MEM（load）不在 MEM 级转发，见 mem_fwd_en
   // WB 级：wb_wen 已含 rd!=0 与无异常
   wire        wb_fwd_en   = wb_wen;
   wire [31:0] wb_fwd_val  = wb_wdata;
@@ -343,8 +346,12 @@ module rv32gc_core (
   wire mem_stall   = mem_needs_fsm && !mem_done_now;
   // advance_all：EX/MEM/WB 三级推进（访存未完成 / MDU 忙 / 取指未就绪时冻结）
   wire advance_all = !(fetch_stall || mem_stall || mdu_hold);
+  // CSR/系统指令的顺序性：CSR 写只在 WB 生效，而 CSR 读发生在 ID（组合）。
+  // 若更老的指令仍在流水线中，ID 可能读到尚未提交的旧值 → 让该指令等流水线排空后再前进。
+  wire id_serial        = id_valid_q && c_is_serial;
+  wire csr_order_stall  = id_serial && (ex_valid_q || mem_valid_q || wb_valid_q);
   // load_use：只冻结前端并给 EX 注入气泡，EX 中的 load 仍继续流入 MEM
-  wire front_hold  = load_use;
+  wire front_hold  = load_use || csr_order_stall;
   wire advance     = advance_all;                       // 兼容旧名（供提交/CSR 使用）
   wire stall       = !advance_all || front_hold;        // 供调试观察
 
@@ -369,7 +376,6 @@ module rv32gc_core (
                           (wb_csr_op_q == `CSR_RC) ? (wb_csr_rdata_q & ~csr_src) :
                           wb_csr_rdata_q;
   assign wb_csr_wen     = wb_retire && (wb_csr_op_q != `CSR_NONE);
-  assign wb_csr_addr_q  = mem_csr_addr_q;
 
   assign dbg_commit_valid = wb_retire;
   assign dbg_commit_pc    = wb_pc_q;
@@ -426,7 +432,7 @@ module rv32gc_core (
 
       wb_pc_q <= 32'd0; wb_instr_q <= 32'd0; wb_alu_q <= 32'd0; wb_imm_q <= 32'd0;
       wb_rs1_val_q <= 32'd0; wb_csr_rdata_q <= 32'd0; wb_mem_data_q <= 32'd0;
-      wb_rd_q <= 5'd0; wb_wb_sel_q <= `WB_ALU; wb_sys_op_q <= 3'd0; wb_csr_op_q <= `CSR_NONE;
+      wb_rd_q <= 5'd0; wb_csr_addr_q <= 12'd0; wb_wb_sel_q <= `WB_ALU; wb_sys_op_q <= 3'd0; wb_csr_op_q <= `CSR_NONE;
       wb_rd_wen_q <= 1'b0; wb_valid_q <= 1'b0; wb_csr_imm_q <= 1'b0;
       wb_excp_valid_q <= 1'b0; wb_excp_cause_q <= 4'd0; wb_excp_tval_q <= 32'd0;
     end else begin
@@ -491,6 +497,7 @@ module rv32gc_core (
         wb_imm_q       <= mem_imm_q;
         wb_rs1_val_q   <= mem_rs1_val_q;
         wb_csr_rdata_q <= mem_csr_rdata_q;
+        wb_csr_addr_q  <= mem_csr_addr_q;
         wb_mem_data_q  <= (mem_mem_op_q == `MEM_LOAD) ? mem_load_data : mem_alu_q;
         wb_rd_q        <= mem_rd_q;
         wb_wb_sel_q    <= mem_wb_sel_q;

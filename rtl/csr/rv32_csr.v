@@ -180,6 +180,10 @@ module rv32_csr (
 
       default:      csr_rdata = 32'd0;
     endcase
+    // WB→ID 旁路：前一条指令在同拍提交级写同一 CSR 时，读端口返回新值
+    // （与寄存器堆的写优先问题同类：写发生在 posedge，而 ID 为组合读）
+    if (csr_wen && !csr_is_fp && (csr_waddr == csr_raddr))
+      csr_rdata = csr_wdata;
   end
 
   // 合法性：地址存在 + 特权级足够 + 读不涉及只写

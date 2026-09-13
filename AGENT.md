@@ -303,7 +303,10 @@
 
 **当前状态**：`SIM: PASS hello` / `SIM: PASS memtest` / `AXI_SLAVE_UNIT: PASS (79)` / `EXEC_UNIT_TESTS: PASS (2461)` / `DECODER_UNIT_TESTS: PASS (257)`。
 
-**arch-test 接入进展**：跳转桩 `sim/tests/arch_stub.S`（0x0 → `lui t0,0x80002; jr t0`）+ 镜像重定位脚本已完成；`I-add-00` 在本核上已能启动并执行到 `rvmodel` 的 UART 初始化（0x8004_62D0，正确设置 `0x1FE0_01E3` = UART LCR），RBTL 轨迹显示 377 条提交后进入停滞 → **下一轮用锁步工具（Spike 侧同样跑该 ELF）定位停滞点**；签名比对通路（`+sig_dump` 导出 `mem_hi[0x1000..0x2000]`）已就绪。
+**arch-test 接入进展（本轮用锁步连续定位并修复 3 个缺陷）**：
+- `sim/tests/arch_stub.S`（0x0 → `lui t0,0x80002; jr t0`）+ 镜像重定位已完成；arch-test 的 CLINT/UART 地址在阶段 2A 指向已映射 scratch（避免引入未实现的 CLINT）。
+- 锁步发现并修复：① **CSR 写地址错位**（`wb_csr_addr_q` 误接 MEM 级信号 → CSR 写落到错误地址）；② **CSR RAW 冒险**（`csrr` 在 ID 组合读，早于前一条 `csrw` 的 WB 写 → 读到旧值；已按 `ctrl.is_serial` 对 CSR/系统指令做"等流水线排空"的顺序化停顿）；③ **转发网络遗漏 CSR 写回**（MEM 级转发用 `mem_alu_q` 而非 `mem_csr_rdata_q`，导致 `csrr` 的消费者拿到垃圾值）。
+- 修复后：`I-add-00` 的**前 378 条提交（PC/rd/wdata）与 Spike 完全一致**；完整用例在 5M 拍超时前未跑完（本核无 Cache，arch-test 规模下周期数偏大）→ 下一轮：提高仿真周期上限并把锁步轨迹拉长，定位后续分歧；同时把 `+timeout` 用于长测试。
 
 **待办（阶段 2A 剩余）**：memtest 通过 → arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通 → CSR/异常/PMP 完善 → Sv32 MMU + L1 Cache → FPGA tcl 与上板 B1~B3。
 

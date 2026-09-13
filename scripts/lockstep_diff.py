@@ -37,6 +37,8 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     sp, rtl = parse_spike(args[0]), parse_rtl(args[1])
     # 对齐：跳过 Spike 自身的启动跳板（RTL 从 ELF 入口直接开始）
+    # 丢弃 RTL 侧的低地址跳转桩（<0x8000_0000），以 arch-test 入口为对齐点
+    rtl = [r for r in rtl if r[0] >= 0x80000000]
     if sp and rtl:
         target = rtl[0][0]
         k = 0
