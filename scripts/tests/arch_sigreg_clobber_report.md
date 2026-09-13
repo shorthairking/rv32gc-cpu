@@ -1,3 +1,16 @@
+> ## ⚠️ 更正（2026-09-13 第 7 轮）
+>
+> **本报告的结论已被推翻。** `Zalrsc-sc.w-00` 的失败实际是本核 `rtl/top/rv32gc_core.v` 的
+> **MEM 级转发缺陷**（访存结果在 MEM 级不转发，紧跟 `LA(x2,scratch)` 的消费者读到旧值，
+> 导致签名指针寄存器被搬到 scratch 地址）。核修复后，**同一份生成的汇编、同一个参考签名**
+> 即可通过；生成器并无缺陷。
+>
+> 归因证据：`4f0ad1e`（旧 RTL）+ 旧 slave → FAIL；`7040098`（含修复 RTL）+ 旧 slave → PASS。
+>
+> 本文下方内容保留作为**排查过程记录**，其中"框架缺陷"的判断以及"33 个同族文件"的结论
+> **不再成立**（`arch_scan_sigreg_clobber.py` 的值模型基于"LA 之后寄存器即被覆盖"的错误假设）。
+> 请勿据此报告向 upstream 提 issue。
+
 # ACT4 生成器缺陷：签名指针寄存器被测试自身覆盖（`mv x<new>,x<old> # switch signature pointer`）
 
 > 发现于 RV32GC 核 bring-up 阶段（2026-09-13），定位对象：`riscv-arch-test`（ACT4 框架）。

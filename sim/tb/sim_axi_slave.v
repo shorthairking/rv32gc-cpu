@@ -440,7 +440,13 @@ module sim_axi_slave #(
   assign s_rid     = arid_q;
   assign s_rlast   = (rbeat_q == arlen_q);
   assign s_rresp   = rerr_q ? 2'b10 : 2'b00;
-  assign s_rdata   = beat_read_data(r_beat_addr, arsize_q);
+  // 读数据：**寄存一拍**后保持到 beat 被接收。
+  // 为什么不用组合读：本模型的行为级内存数组用非阻塞赋值更新，而 `s_rdata` 若直接组合
+  // 读数组，仿真器在"写 beat 与读 beat 紧邻"的时序下会返回**上一版**数据（实测：数组已是
+  // 新值、函数单独求值也是新值，但该组合赋值输出的仍是旧值），会让"store 后立刻读回同址"
+  // 的定向测试假失败。改为在 AR 握手拍锁存、R 拍保持，既消除该竞态又不改变 AXI 握手时序。
+  reg [31:0] rdata_q;
+  assign s_rdata = rdata_q;
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -457,13 +463,17 @@ module sim_axi_slave #(
             arsize_q <= s_arsize;
             rbeat_q  <= 4'd0;
             rerr_q   <= (region_of(s_araddr) == R_NONE);
+            rdata_q  <= beat_read_data(s_araddr, s_arsize);   // 地址握手拍锁存 beat 0
             rstate   <= R_DATA;
           end
         end
         R_DATA: begin
           if (r_hs) begin
             if (rbeat_q == arlen_q) rstate <= R_IDLE;
-            else                    rbeat_q <= rbeat_q + 4'd1;
+            else begin
+              rbeat_q <= rbeat_q + 4'd1;
+              rdata_q <= beat_read_data(r_beat_addr + (32'd1 << arsize_q), arsize_q);
+            end
           end
         end
         default: rstate <= R_IDLE;
