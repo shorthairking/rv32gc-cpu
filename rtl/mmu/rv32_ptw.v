@@ -52,9 +52,12 @@
 // 总线协议约定（valid-until-ready，调用方接总线时须满足）：
 //   * 每级访问：本模块置 bus_req=1 并保持，同时给出稳定 bus_addr；等到 bus_ack 或
 //     bus_err 有效的那一拍采数/采错，随后 bus_req 拉低。
-//   * bus_rdata 与 bus_ack 同拍有效；bus_err=1 表示该次读失败（如 PMA/PMP 违例、
-//     AXI DECERR/SLVERR），本模块报 fault（**不做重试**；cause 归类由调用方决定：
-//     页表读总线错误 → 访问错误，见 supervisor.adoc:1730）。
+//   * bus_rdata 与 bus_ack 同拍有效；bus_err=1 表示该次读失败（如 PMA 违例、
+//     AXI DECERR/SLVERR），本模块报 fault（**不做重试**）。bus_err 与 bus_deny（PMP 拒绝）
+//     都归为 **访问错误**（fault_is_access=1），cause 由调用方按原访问类型取
+//     （取指 1 / load 5 / store·AMO·CBO 7）；结构性非法 PTE 才是页错误
+//     （fault_is_access=0，cause 12/13/15）。依据 tools/spike/riscv/mmu.h:486-497
+//     `pte_load()`（PMP 失败与 mmio_load 失败都 `throw_access_exception`）。
 //   * 允许 bus_ack 为组合（0 延迟）或任意拍延迟（≥1）；两种都能工作。
 //   * 同一时刻只允许一次未完成请求：本模块在等 ack 期间不会改 bus_addr。
 //
@@ -77,10 +80,18 @@ module rv32_ptw (
   input  wire [31:0] bus_rdata,
   input  wire        bus_ack,
   input  wire        bus_err,
+  // PMP 拒绝本次页表读（核内由共享的 PMP 匹配引擎给出；只在本模块 bus_req=1 且引擎
+  // 确实分配给本模块的那一拍有效）。语义与 reference 一致：
+  // tools/spike/riscv/mmu.h:486-497 `pte_load()` 在真正读 PTE 之前做
+  //   `pmp_ok(pte_paddr, ptesize, LOAD, PRV_S, false)`，失败即 `throw_access_exception`
+  //   ⇒ **访问错误**（cause 取原访问类型：取指 1 / load 5 / store·AMO·CBO 7），不是页错误。
+  input  wire        bus_deny,
   //---------------------------------------------------------------- 结果
   output reg         busy,           // 遍历中（IDLE/DONE/FAULT 态为 0）
   output reg         done,           // 翻译成功：ppn/is_4m/perm 有效（与 fault 互斥）
   output reg         fault,          // 结构性非法或总线错误
+  output reg         fault_is_access,// fault 的分类：1 = 访问错误（总线错误 / PMP 拒绝），
+                                     //                0 = 页错误（PTE 结构非法等）
   output reg  [21:0] ppn,
   output reg         is_4m,
   output reg  [7:0]  perm,
@@ -133,6 +144,20 @@ module rv32_ptw (
       busy     <= 1'b0;
       done     <= 1'b0;
       fault    <= 1'b1;
+      fault_is_access <= 1'b0;      // 默认：结构性页错误
+      fault_va <= va_r;
+      state    <= ST_RES;
+    end
+  endtask
+
+  // 访问错误（总线错误 / PMP 拒绝页表读）：cause 由调用方按**原访问类型**取（1/5/7）
+  task enter_fault_access;
+    begin
+      bus_req  <= 1'b0;
+      busy     <= 1'b0;
+      done     <= 1'b0;
+      fault    <= 1'b1;
+      fault_is_access <= 1'b1;
       fault_va <= va_r;
       state    <= ST_RES;
     end
@@ -145,6 +170,7 @@ module rv32_ptw (
       busy     <= 1'b0;
       done     <= 1'b1;
       fault    <= 1'b0;
+      fault_is_access <= 1'b0;
       ppn      <= pte_ppn;
       is_4m    <= is4;
       perm     <= bus_rdata[7:0];       // 原始叶子 PTE 低 8 位（含 V/G/A/D）
@@ -167,6 +193,7 @@ module rv32_ptw (
       is_4m    <= 1'b0;
       perm     <= 8'd0;
       fault_va <= 32'd0;
+      fault_is_access <= 1'b0;
       va_r     <= 32'd0;
       req_prev <= 1'b0;
     end else if (abort) begin
@@ -194,8 +221,10 @@ module rv32_ptw (
         end
         //------------------------------------------------ 第 1 级（根表）读
         ST_L1: begin
-          if (bus_err) begin
-            enter_fault;                                          // 页表读总线错误
+          if (bus_deny) begin
+            enter_fault_access;                                   // PMP 拒绝页表读
+          end else if (bus_err) begin
+            enter_fault_access;                                   // 页表读总线错误
           end else if (bus_ack) begin
             if (pte_bad) begin
               enter_fault;                                        // V=0 / R=0&&W=1
@@ -219,8 +248,10 @@ module rv32_ptw (
         end
         //------------------------------------------------------ 第 2 级读
         ST_L2: begin
-          if (bus_err) begin
-            enter_fault;
+          if (bus_deny) begin
+            enter_fault_access;                                   // PMP 拒绝页表读
+          end else if (bus_err) begin
+            enter_fault_access;
           end else if (bus_ack) begin
             if (pte_bad) begin
               enter_fault;                                        // V=0 / R=0&&W=1

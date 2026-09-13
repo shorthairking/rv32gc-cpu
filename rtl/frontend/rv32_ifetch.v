@@ -25,6 +25,9 @@ module rv32_ifetch (
   input  wire         pa_valid,       // 1 = pa 可用（无需翻译 / 翻译命中且权限+A/D 通过）
   input  wire [31:0]  pa,             // pc 对应的物理地址
   input  wire         xlate_fault,    // 取指页错误（cause 12）
+  input  wire         xlate_fault_pf, // xlate_fault 的分类：1 = 页错误（cause 12）；
+                                      // 0 = 访问错误（cause 1）—— 页表读被 PMP 拒绝或
+                                      // 页表读总线错误，见 rv32mmu_top.if_fault_is_access
 
   // ---- D16② SPI-XIP 取指判定（由 rv32gc_core.v 用 `IS_SPI_XIP(pa) 算好）----
   input  wire         xip_bypass,     // 1 = 本次取指地址（PA）落在 SPI Flash XIP 窗口
@@ -108,10 +111,11 @@ module rv32_ifetch (
         err_pf_q   <= 1'b0;                       // 总线错误（cause 1）
       end
 
-      // 1b) MMU 取指页错误：同一"错误粘性 + 停止取指"通道，类型记为页错误（cause 12）
+      // 1b) MMU 取指页错误：同一"错误粘性 + 停止取指"通道，类型按 xlate_fault_pf 取
+      //     （1 ⇒ cause 12 页错误；0 ⇒ cause 1 访问错误，见上游 if_fault_is_access）
       if (xlate_fault) begin
         err_q      <= 1'b1;
-        err_pf_q   <= 1'b1;
+        err_pf_q   <= xlate_fault_pf;
         line_vld_q <= 1'b0;
       end
 

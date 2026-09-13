@@ -88,7 +88,7 @@ FIELDS = [
     ("mdu_op", 3, {"MDU_MUL": 0, "MDU_MULH": 1, "MDU_MULHSU": 2, "MDU_MULHU": 3,
                    "MDU_DIV": 4, "MDU_DIVU": 5, "MDU_REM": 6, "MDU_REMU": 7}),
     ("mem_op", 3, {"MEM_NONE": 0, "MEM_LOAD": 1, "MEM_STORE": 2,
-                   "MEM_LR": 3, "MEM_SC": 4, "MEM_AMO": 5}),
+                   "MEM_LR": 3, "MEM_SC": 4, "MEM_AMO": 5, "MEM_CBO": 6}),
     ("mem_size", 2, {"MSZ_BYTE": 0, "MSZ_HALF": 1, "MSZ_WORD": 2}),
     ("mem_flags", 2, {"MF_FP": 1, "MF_UNSIGNED": 0}),
     ("amo_flags", 2, {"AMOF_RL": 1, "AMOF_AQ": 0}),
@@ -329,7 +329,10 @@ def decode32(w):
                   0x002: "CBO_FLUSH", 0x004: "CBO_ZERO"}
             if rd == 0 and f12 in cb:
                 d["legal"] = 1
-                setf(d, op_class="OP_SYS", cbo_op=cb[f12], is_serial=1, use_rs1=1)
+                # CBO 不是 SYSTEM 指令：op_class=LSU + mem_op=MEM_CBO（曾译成 OP_SYS 且
+                # sys_op 缺省 0 ⇒ 被核当成 ecall）。见 rv32_decoder.v 的同处说明。
+                setf(d, op_class="OP_LSU", mem_op="MEM_CBO", cbo_op=cb[f12],
+                     is_serial=1, use_rs1=1)
                 d.update(rs1=rs1, imm_type="NONE")
     elif op == 0x73:                                   # SYSTEM / Zicsr / Zicbom
         if f3 == 0:
@@ -662,11 +665,14 @@ HAND = {
                                   rd_wen=1, use_rs1=1, use_rs2=1),
     "amomaxu.w.aqrl a0, a1, (a2)": dict(op_class="OP_LSU", mem_op="MEM_AMO",
                                         amo_op="AMO_MAXU", amo_flags=0b11),
-    "cbo.inval (a0)": dict(op_class="OP_SYS", cbo_op="CBO_INVAL", is_serial=1,
-                           use_rs1=1, rd_wen=0, rs1=10),
-    "cbo.clean (a0)": dict(op_class="OP_SYS", cbo_op="CBO_CLEAN", is_serial=1, use_rs1=1),
-    "cbo.flush (a0)": dict(op_class="OP_SYS", cbo_op="CBO_FLUSH", is_serial=1, use_rs1=1),
-    "cbo.zero (a0)": dict(op_class="OP_SYS", cbo_op="CBO_ZERO", is_serial=1, use_rs1=1),
+    "cbo.inval (a0)": dict(op_class="OP_LSU", mem_op="MEM_CBO", cbo_op="CBO_INVAL",
+                           is_serial=1, use_rs1=1, rd_wen=0, rs1=10),
+    "cbo.clean (a0)": dict(op_class="OP_LSU", mem_op="MEM_CBO", cbo_op="CBO_CLEAN",
+                           is_serial=1, use_rs1=1),
+    "cbo.flush (a0)": dict(op_class="OP_LSU", mem_op="MEM_CBO", cbo_op="CBO_FLUSH",
+                           is_serial=1, use_rs1=1),
+    "cbo.zero (a0)": dict(op_class="OP_LSU", mem_op="MEM_CBO", cbo_op="CBO_ZERO",
+                          is_serial=1, use_rs1=1),
     "fadd.s fa0, fa1, fa2": dict(legal=0, excp_cause="DEXC_ILLEGAL", excp_valid=1,
                                  op_class="OP_NOP", rd_wen=0, use_rs1=0, use_rs2=0),
     "flw fa0, 0(a1)": dict(legal=0, excp_cause="DEXC_ILLEGAL", excp_valid=1),

@@ -105,8 +105,9 @@
 //   * ecall 的 excp_cause：本模块无特权级输入，按 M 模式取 DEXC_ECALL_M(11)；
 //     trap_ctrl 在提交级按当前特权级改写为 8/9/11（见总结中的偏差说明）。
 //   * pc 端口本阶段不参与译码（保留给后续取指边界/地址非对齐检查），显式引用避免悬空。
-//   * cbo.* 的 op_class=SYS（spec/02 §4.5），地址来自 rs1，is_serial=1，
-//     cbo_op 指示 cache 操作类型；后端的「走 LSU」路由由 ctrl 的 cbo_op/is_serial 决定。
+//   * cbo.* 的 op_class=LSU + mem_op=MEM_CBO（**不是** OP_SYS：见 MISC-MEM 段内说明，
+//     曾因 sys_op 缺省 0 被核当成 ecall），地址来自 rs1，is_serial=1，
+//     cbo_op 指示 cache 操作类型；后端由 MEM 级 FSM 按 MEM_CBO 走翻译/PMP/总线通路。
 //   * ilen 端口为 2 位，无法直接表示 4，故定义为 log2(字节长度)：
 //     2'd1 = 2 字节（RVC）、2'd2 = 4 字节（非压缩）；下游 (1<<ilen) 得字节数。
 //   * 纯组合逻辑，Verilog-2001 可综合子集，无 `initial`/`$display`。
@@ -634,7 +635,15 @@ module rv32_decoder (
                 default: legal32 = 1'b0;   // 其余 funct12 保留
               endcase
               if (legal32) begin
-                op_class_d = `OP_SYS;
+                // ⚠ 历史缺陷（本会话定位）：CBO 原先译成 `op_class=OP_SYS 且 sys_op 缺省 0`
+                //   ⇒ 核内 `id_ecall = id_is_sys && (c_sys_op == SYS_ECALL)` 把 cbo.* 当成
+                //   **ECALL**（S 模式报 cause 9、M 模式报 cause 11），arch-test 的 T-SBI
+                //   框架随即把这条 ecall 当作 SBI 调用、报
+                //   "T-SBI ERROR: requested instruction not found in tsbi_instr_table"。
+                //   CBO 不是 SYSTEM 指令（它在 MISC-MEM 操作码里），必须有自己的访存类：
+                //   译成 LSU 的 MEM_CBO，由 MEM 级 FSM 走「MMU 翻译 → PMP → 总线」通路。
+                op_class_d = `OP_LSU;
+                mem_op_d   = `MEM_CBO;
                 is_serial_d= 1'b1;
                 is_cbo_d   = 1'b1;
                 imm_type_d = IMM_NONE;

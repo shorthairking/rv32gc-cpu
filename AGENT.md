@@ -845,6 +845,31 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 17 轮：阶段 2A-④ 第一步（CBO 真正生效）+ ③ 收尾（页表读 PMP）—— **③ 完成**
+
+**结果：MMU 验收 47/64 → 61/64（可判定项 61/61 全过；余 3 例为参考模型自身 FAIL）；CBO 相关 18 例全绿。**
+
+| 项 | 结果 |
+|---|---|
+| **根因 A：CBO 被当成 ECALL** | CBO 原译码 `op_class=OP_SYS` 且 `sys_op` 缺省 0 ⇒ 核内 `id_ecall` 把它当 **ECALL**（S=9/M=11），T-SBI 框架打印 `tsbi_instr_table` 查不到 ⇒ `SvZicbo` 全挂的直接原因 |
+| **根因 B：CBO 没有访存通路** | 不翻译、不查 PMP、无副作用。改为 `OP_LSU + mem_op=MEM_CBO`（新宏 `MEM_CBO 3'd6`），在 `M_IDLE` 复用既有 `翻译→PMP→总线` 通路 |
+| CBO 语义（照 Spike `mmu.h:237-266`） | ZERO：`d_is_store=1`（W 权限）、PMP 只查**操作数 1 字节**、对 `PA & ~31` **真写 8 个 4 字节 0**；CLEAN/FLUSH/INVAL：`d_is_store=0`（LOAD 权限）、不写内存、只发一笔块基址读做可访问性判定；两类 cause 一律 **store 变体 15/7**（`convert_load_traps_to_store_traps`，与 AMO 同机制）；CBO 无对齐要求；`menvcfg/senvcfg` 许可检查保持原样 |
+| **③ 收尾：页表读的 PMP 检查** | PTW 的每次 PTE 读按 Spike `pmp_ok(pte_paddr,4,LOAD,**PRV_S**)`（`mmu.h:490`）检查：拒绝/总线错误 ⇒ **访问错误**（cause 按原访问类型 1/5/7，tval=原 VA，`mmu.cc:596`）；结构性非法 PTE 才是页错误。**PMP 引擎未新增实例**（与 MEM 分时复用 `u_pmp_d`，仿真无变慢）⇒ 一并修好 `SvPMP on_pte_{S,U}mode` |
+| 回归中发现并修掉的两个真问题 | ① `mem_needs_fsm` 加 `&& !mem_excp_valid_q`：带 ID 级精确异常（非法指令）的指令**不得有访存副作用**，否则 `cbo.zero` 在许可不足判非法后仍会写 32 字节（非特权 `Zicboz-cbo.zero-00` 由 PASS 变 FAIL）；② CBO 块内写循环标志残留会让紧随 `cbo.clean` 的 SC/AMO 误续写 7 个 0 |
+| **验收（RV32 可跑子集，我本轮亲自复核全量回归）** | **`Svbare 3/3`、`Sv '^sv32_' 28/31`（3 例参考自失败）、`Svade 2/2`、`SvPMP 4/4`、`ExceptionsSv 4/4`、`ExceptionsSvZaamo 3/3`、`ExceptionsSvZalrsc 3/3`、`SvZicbo 6/6`、`SvPMPZicbo 8/8` = 61/64**；另非 Sv 的 `PMPZicbo 4/4`（此前 0/4） |
+| 回归（不可退，全绿） | 非特权 **18 组 124 例**；PMPS 11/11、PMPU 11/11、PMPZaamo/PMPZalrsc 1/1、PMPZca 12/15、PMPSm 37/38（例外同前）；`PMP_UNIT 443`、`CLINT_PLIC_UNIT 184`、`TLB_PTW_UNIT 155`、`AXI 79`、`EXEC 2461`、`DECODER PASS`、`PRIV_TRAP 46`、`FETCH_ERR 21`、`LRSC_DIRECTED PASS`、`SPI_BOOT PASS`、`hello`/`memtest` PASS（墙钟无显著变慢） |
+| 测试侧同步 | `sim/tests/unit/gen_decoder_vectors.py` + `decoder_vectors.vh`（CBO 译码期望改 OP_LSU/MEM_CBO，否则 DECODER 单测挂）、`tb_unit_tlb_ptw.v`（PTW 新端口接线，仍 155 checks）、新增 `sim/tests/cbo_directed.S`（定向验证真清零/clean 无副作用/AMO 不被污染） |
+
+#### 已知遗留（写入 §7，不隐瞒）
+
+* CBO 落到**平台真实设备窗口**（UART/NAND…）会真的读写该设备（本核无静态 PMA）；若 B2/B3 有 MMIO 上的 CBO 语义要求，需加窗口白名单。
+* `cbo.clean` 用"一笔块基址 4 字节读"代替 Spike 的 PMA `reservable` 检查：纯内存语义等价，MMIO 有细微差别。
+* CBO 清零是无 Cache 下的 8 拍串行写：语义正确、性能非最优（④ Cache 完成后可自然改善）。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。

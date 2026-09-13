@@ -48,20 +48,26 @@ module rv32mmu_top #(
   output wire        if_pa_valid,     // 1 = if_pa 可用（无需翻译 / 命中且权限+AD 通过）
   output wire [31:0] if_pa,
   output wire        if_fault,        // 取指页错误（cause 12）
+  output wire        if_fault_is_access,  // 上者的分类：1 = 访问错误（cause 1）：页表读
+                                          // 被 PMP 拒绝或总线错误，见 rv32_ptw.v
   //------------------------------------------------ 访存翻译口（组合 + 请求）
   input  wire [31:0] d_va,
-  input  wire        d_is_store,      // AMO/SC 亦为 1
+  input  wire        d_is_store,      // AMO/SC/CBO.ZERO 亦为 1
   input  wire        d_req,           // 本拍有访存需要翻译（核内：M_IDLE && mem_needs_fsm）
   output wire        d_pa_valid,
   output wire [31:0] d_pa,
   output wire        d_fault,
-  output wire [3:0]  d_fault_cause,   // 13 = load 页错误，15 = store/AMO 页错误
+  output wire [3:0]  d_fault_cause,   // 13 = load 页错误，15 = store/AMO/CBO 页错误
+  output wire        d_fault_is_access,   // 1 = 该故障其实是访问错误（页表读 PMP 拒绝/总线
+                                          // 错误）⇒ 核内改用 cause 5/7（见 tools/spike/riscv/
+                                          // mmu.h:486-497 的 throw_access_exception）
   //------------------------------------------------ 页表读（4 字节）
   output wire        ptw_bus_req,
   output wire [31:0] ptw_bus_addr,
   input  wire [31:0] ptw_bus_rdata,
   input  wire        ptw_bus_ack,
-  input  wire        ptw_bus_err
+  input  wire        ptw_bus_err,
+  input  wire        ptw_bus_deny     // 核内共享 PMP 引擎对本次页表读的结论（1 = 拒绝）
 );
 
   localparam [1:0] PRV_U_ = `PRV_U;
@@ -72,6 +78,7 @@ module rv32mmu_top #(
   wire        ptw_req;         // 由下方 assign 驱动（上升沿启动）
   wire [31:0] ptw_va;
   wire        ptw_busy, ptw_done, ptw_fault, ptw_is_4m;
+  wire        ptw_fault_is_access;
   wire [21:0] ptw_ppn;
   wire [7:0]  ptw_perm;
   wire [31:0] ptw_fault_va;
@@ -111,7 +118,8 @@ module rv32mmu_top #(
     .req(ptw_req), .va(ptw_va), .satp_ppn(satp_ppn),
     .bus_req(ptw_bus_req), .bus_addr(ptw_bus_addr),
     .bus_rdata(ptw_bus_rdata), .bus_ack(ptw_bus_ack), .bus_err(ptw_bus_err),
-    .busy(ptw_busy), .done(ptw_done), .fault(ptw_fault),
+    .bus_deny(ptw_bus_deny),
+    .busy(ptw_busy), .done(ptw_done), .fault(ptw_fault), .fault_is_access(ptw_fault_is_access),
     .ppn(ptw_ppn), .is_4m(ptw_is_4m), .perm(ptw_perm), .fault_va(ptw_fault_va),
     .abort(flush)
   );
@@ -137,12 +145,17 @@ module rv32mmu_top #(
   reg [31:0] i_va_q;     // 本次遍历的 VA（供 TLB fill 用）
   reg        i_fault_q;  // 结构性页错误已判定（粘住到 VA 变化/flush）
   reg [31:0] i_fault_va_q;
+  reg        i_fault_acc_q;   // 粘性故障的分类：1 = 访问错误（页表读 PMP/总线）
 
   // ⚠ 归属判定：ptw_owner_q=1 ⇒ 取指侧（见下方 ptw_owner_q <= i_start）
   wire i_walk_done  = i_wait_q && ptw_owner_q && ptw_done;
   wire i_walk_fault = i_wait_q && ptw_owner_q && ptw_fault;
   wire i_fault_sticky = i_fault_q && (i_fault_va_q == if_va);
   assign if_fault    = i_trans_en && ((i_hit && !i_perm_ok) || i_walk_fault || i_fault_sticky);
+  // 访问错误只可能来自页表读（PMP 拒绝 / 总线错误）；权限/A-D 失败是页错误
+  assign if_fault_is_access = i_trans_en && !(i_hit && !i_perm_ok) &&
+                              ((i_walk_fault && ptw_fault_is_access) ||
+                               (i_fault_sticky && i_fault_acc_q));
   assign if_pa_valid = !i_trans_en || ((i_hit || i_walk_done) && i_perm_ok);
   assign if_pa       = !i_trans_en ? if_va :
                        make_pa(i_hit ? i_ppn : ptw_ppn, i_hit ? i_is_4m : ptw_is_4m, if_va);
@@ -152,12 +165,16 @@ module rv32mmu_top #(
   reg [31:0] d_va_q;
   reg        d_fault_q;
   reg [31:0] d_fault_va_q;
+  reg        d_fault_acc_q;
 
   wire d_walk_done  = d_wait_q && ptw_owner_q == 1'b0 && ptw_done;
   wire d_walk_fault = d_wait_q && ptw_owner_q == 1'b0 && ptw_fault;
   wire d_fault_sticky = d_fault_q && (d_fault_va_q == d_va);
   assign d_fault     = d_trans_en && ((d_hit && !d_perm_ok) || d_walk_fault || d_fault_sticky);
   assign d_fault_cause = d_is_store ? (`EXC_STORE_PAGE_FAULT) : (`EXC_LOAD_PAGE_FAULT);
+  assign d_fault_is_access = d_trans_en && !(d_hit && !d_perm_ok) &&
+                             ((d_walk_fault && ptw_fault_is_access) ||
+                              (d_fault_sticky && d_fault_acc_q));
   assign d_pa_valid  = !d_trans_en || ((d_hit || d_walk_done) && d_perm_ok);
   assign d_pa        = !d_trans_en ? d_va :
                        make_pa(d_hit ? d_ppn : ptw_ppn, d_hit ? d_is_4m : ptw_is_4m, d_va);
@@ -201,6 +218,8 @@ module rv32mmu_top #(
       d_fault_va_q  <= 32'd0;
       i_va_q        <= 32'd0;
       d_va_q        <= 32'd0;
+      i_fault_acc_q <= 1'b0;
+      d_fault_acc_q <= 1'b0;
       ptw_owner_q   <= 1'b0;
     end else if (flush) begin
       // sfence.vma：TLB 已被 flush_all 清空；这里复位两个 FSM 并丢弃在途结果与粘性页错误
@@ -225,12 +244,14 @@ module rv32mmu_top #(
       if (i_walk_done || i_walk_fault) i_wait_q <= 1'b0;
       if (d_walk_done || d_walk_fault) d_wait_q <= 1'b0;
       if (i_walk_fault) begin
-        i_fault_q    <= 1'b1;
-        i_fault_va_q <= i_va_q;
+        i_fault_q     <= 1'b1;
+        i_fault_va_q  <= i_va_q;
+        i_fault_acc_q <= ptw_fault_is_access;
       end
       if (d_walk_fault) begin
-        d_fault_q    <= 1'b1;
-        d_fault_va_q <= d_va_q;
+        d_fault_q     <= 1'b1;
+        d_fault_va_q  <= d_va_q;
+        d_fault_acc_q <= ptw_fault_is_access;
       end
       // 粘性页错误只对"同一个 VA"有效；VA 变化即自动失效（无需外部清除）
       if (i_fault_q && (i_fault_va_q != if_va)) i_fault_q <= 1'b0;

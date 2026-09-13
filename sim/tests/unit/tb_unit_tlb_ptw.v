@@ -55,6 +55,7 @@ module tb_unit_tlb_ptw;
   wire        p_is_4m;
   wire [7:0]  p_perm;
   wire [31:0] p_fault_va;
+  wire        p_fault_acc;      // fault 的分类：1 = 访问错误（总线错误 / PMP 拒绝页表读）
 
   rv32_ptw dut_ptw (
     .clk      (clk),
@@ -67,9 +68,11 @@ module tb_unit_tlb_ptw;
     .bus_rdata(bus_rdata),
     .bus_ack  (bus_ack),
     .bus_err  (bus_err),
+    .bus_deny (1'b0),           // 本 TB 不模拟 PMP 拒绝（PMP 检查在核内，arch-test 覆盖）
     .busy     (p_busy),
     .done     (p_done),
     .fault    (p_fault),
+    .fault_is_access(p_fault_acc),
     .ppn      (p_ppn),
     .is_4m    (p_is_4m),
     .perm     (p_perm),

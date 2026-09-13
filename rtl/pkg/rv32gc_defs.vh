@@ -228,6 +228,16 @@
 `define MEM_LR     3'd3
 `define MEM_SC     3'd4
 `define MEM_AMO    3'd5
+// Zicbom/Zicboz 的 cache block 操作（cbo.clean/flush/inval/zero）：
+// 走 **MEM 级访存通路**（M_IDLE → MMU 翻译 → PMP → 总线），语义见 core 的 MEM FSM。
+// 操作数地址 = rs1；**无对齐要求**（CBO 的块对齐由软件保证，Spike 也不检查）。
+// 访问类型（决定权限与陷阱 cause）由 cbo_op 区分：
+//   · CBO_ZERO            —— 按 STORE（要 W），有内存副作用（写 32 字节 0）
+//   · CLEAN/FLUSH/INVAL   —— 按 LOAD（要 R 或 MXR&&X），无内存副作用（本核无 Cache）
+// 两者陷阱 cause 一律取 **store 变体**（15 页错误 / 7 访问错误），依据
+// tools/spike/riscv/mmu.h:237-266（cbo_zero）与 :254-266（clean_inval 被
+// convert_load_traps_to_store_traps 包住，mmu.h:181-194）。
+`define MEM_CBO    3'd6
 
 `define MSZ_BYTE   2'd0
 `define MSZ_HALF   2'd1
