@@ -910,6 +910,21 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 20 轮：用户审阅通过后的 ① 步 —— DTS/计划 4 处修正（33 MHz 上板口径）
+
+| 项 | 结果 |
+|---|---|
+| DTS compatible 厂商前缀 | CPU `chiplab,rv32gc", "riscv"`；CLINT `"chiplab,clint", "sifive,clint0"`；PLIC `"chiplab,plic", "sifive,plic-1.0.0"` —— 去掉 binding 标 deprecated 的 `riscv,clint0`/`riscv,plic0`，CPU 节点不再只有 simulator-only 的 `riscv` |
+| SPI flash 节点口径 | 改**内存映射 flash**（`cfi-flash` + `fixed-partitions`），并注明"本阶段只做 XIP 读、SPI 控制器寄存器接口未建模"；不再用直挂 soc 的 `jedec,spi-nor` |
+| UART 口径 | 去掉 `reg-io-width = <4>`：参考 `la32r-Linux/arch/loongarch/boot/dts/loongson/loongson32_ls.dts` 的 UART 节点只给 `reg = <0x1fe001e0 0x10>` + `clock-frequency = <33000000>`（**字节步进**）；`bootargs` 的 earlycon 相应改 `uart8250,mmio,0x1fe001e0`（不是 `mmio32`） |
+| 时钟 33 MHz 落实 | DTS `timebase-frequency` 与 CPU `clock-frequency` 均 `33000000`；计划 §8 D-1 明确 **cpu_clk 取 `clk_pll_33` 的 `clk_out2`(33 MHz)**、`config.h` 的 `FREQ` 同步改、时序目标 33 MHz |
+| OpenSBI/U-Boot 链接决策（计划 §10.1 新增） | OpenSBI `FW_TEXT_START=0x0`；**U-Boot `CONFIG_TEXT_BASE=0x0040_0000`**（与 OpenSBI RV32 默认 `FW_PAYLOAD_ALIGN=0x400000` 一致；备选 `FW_PAYLOAD_OFFSET=0x200000` + `TEXT_BASE=0x0020_0000`，二者必须一致）；内核建议 `0x0200_0000` 起；附构建命令口径（`qemu-riscv32smodedefconfig`、`PLATFORM=generic PLATFORM_RISCV_XLEN=32 FW_PAYLOAD_PATH=…`、`make ARCH=riscv rv32_defconfig` —— **主线没有 rv32_defconfig 文件**，只有同名 make 目标 ≡ defconfig + 32-bit.config 片段） |
+| 验证 | `bash scripts/check_dts.sh` → **`CHECK_DTS: PASS (17 ok / 0 fail)`**（timebase 断言已改 33 MHz）；DTS 仍通过 `dtc` 编译/反编译 |
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
