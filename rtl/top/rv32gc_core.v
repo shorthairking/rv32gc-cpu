@@ -533,7 +533,7 @@ module rv32gc_core (
             if (mem_misaligned) begin
               // 不做拆分访问：直接进入 M_DONE 并在 WB 级精确报地址非对齐异常
               m_addr_q      <= mem_addr_q;
-              m_we_q        <= (mem_mem_op_q != `MEM_LOAD);
+              m_we_q        <= (mem_mem_op_q == `MEM_STORE);   // 只有普通 store 在本阶段写；LR/AMO 先读，SC/AMO 的写在 M_REQ_W
               m_size_q      <= mem_mem_size_q;
               m_uns_q       <= mem_mem_flags_q;
               m_shift_q     <= mem_addr_q[1:0];
@@ -547,7 +547,7 @@ module rv32gc_core (
             end else begin
 `endif
             m_addr_q      <= mem_addr_q;
-            m_we_q        <= (mem_mem_op_q != `MEM_LOAD);
+            m_we_q        <= (mem_mem_op_q == `MEM_STORE);   // 只有普通 store 在本阶段写；LR/AMO 先读，SC/AMO 的写在 M_REQ_W
             m_size_q      <= mem_mem_size_q;
             m_uns_q       <= mem_mem_flags_q;
             m_shift_q     <= mem_is_atomic ? 2'b00 : mem_addr_q[1:0];
