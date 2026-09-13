@@ -333,17 +333,20 @@ module rv32gc_core (
 
   // AMO 读-改-写的结果值（组合；用已读回的字 m_rdata_q 与 rs2 锁存值 m_rs2_q）
   reg  [31:0] amo_wdata;
+  // 读响应当拍要用"即将锁存的 d_rsp_rdata"参与运算：m_rdata_q 与本组合逻辑在同一时钟沿更新，
+  // 若直接用 m_rdata_q，M_WAIT 拍算出的新值会退化成 0+rs2（首次 AMO 必错）。
+  wire [31:0] amo_base = d_rsp_valid ? d_rsp_rdata : m_rdata_q;
   always @(*) begin
     case (m_amo_op_q)
-      `AMO_ADD:  amo_wdata = m_rdata_q + m_rs2_q;
+      `AMO_ADD:  amo_wdata = amo_base + m_rs2_q;
       `AMO_SWAP: amo_wdata = m_rs2_q;
-      `AMO_XOR:  amo_wdata = m_rdata_q ^ m_rs2_q;
-      `AMO_OR:   amo_wdata = m_rdata_q | m_rs2_q;
-      `AMO_AND:  amo_wdata = m_rdata_q & m_rs2_q;
-      `AMO_MIN:  amo_wdata = ($signed(m_rdata_q) < $signed(m_rs2_q)) ? m_rdata_q : m_rs2_q;
-      `AMO_MAX:  amo_wdata = ($signed(m_rdata_q) > $signed(m_rs2_q)) ? m_rdata_q : m_rs2_q;
-      `AMO_MINU: amo_wdata = (m_rdata_q < m_rs2_q) ? m_rdata_q : m_rs2_q;
-      `AMO_MAXU: amo_wdata = (m_rdata_q > m_rs2_q) ? m_rdata_q : m_rs2_q;
+      `AMO_XOR:  amo_wdata = amo_base ^ m_rs2_q;
+      `AMO_OR:   amo_wdata = amo_base | m_rs2_q;
+      `AMO_AND:  amo_wdata = amo_base & m_rs2_q;
+      `AMO_MIN:  amo_wdata = ($signed(amo_base) < $signed(m_rs2_q)) ? amo_base : m_rs2_q;
+      `AMO_MAX:  amo_wdata = ($signed(amo_base) > $signed(m_rs2_q)) ? amo_base : m_rs2_q;
+      `AMO_MINU: amo_wdata = (amo_base < m_rs2_q) ? amo_base : m_rs2_q;
+      `AMO_MAXU: amo_wdata = (amo_base > m_rs2_q) ? amo_base : m_rs2_q;
       default:   amo_wdata = m_rs2_q;
     endcase
   end
