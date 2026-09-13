@@ -61,6 +61,7 @@ module rv32gc_core (
   wire [15:0] hw0, hw1;
   wire        line_valid;
   wire        flush_front;
+  wire        fetch_err;      // 取指总线错误（来自 rv32_ifetch）
 
   // ---- D16② SPI-XIP 取指判定点：命中 SPI 窗口必须**绕过 I-Cache** ----
   // 平台复位取指窗口是 0x1C00_0000（SPI Flash XIP，无硬件 boot ROM；另有 0x1FE8_0000 别名），
@@ -75,7 +76,8 @@ module rv32gc_core (
     .flush(flush_front), .xip_bypass(if_spi_xip),
     .if_req_valid(if_req_valid), .if_req_addr(if_req_addr), .if_req_ready(if_req_ready),
     .if_rsp_valid(if_rsp_valid), .if_rsp_data(if_rsp_data),
-    .if_rsp_err(if_rsp_err), .if_rsp_ready(if_rsp_ready)
+    .if_rsp_err(if_rsp_err), .if_rsp_ready(if_rsp_ready),
+    .fetch_err(fetch_err)
   );
 
   wire        at_line_end = (pc_q[4:1] == 4'd15);
@@ -165,8 +167,10 @@ module rv32gc_core (
     .csr_raddr(dec_csr_addr), .priv(priv_q), .csr_rdata(csr_rdata), .csr_legal(csr_legal),
     .csr_wen(wb_csr_wen), .csr_waddr(wb_csr_addr_q), .csr_wdata(wb_csr_wdata), .csr_is_fp(1'b0),
     .instret_en(wb_retire),
-    .trap_valid(trap_take), .trap_cause(trap_cause_wb), .trap_tval(trap_tval_wb),
-    .trap_is_int(trap_is_int), .trap_epc(trap_epc_w),
+    .trap_valid(trap_take_all),
+    .trap_cause(if_err_take ? `EXC_INSTR_ACCESS : trap_cause_wb),
+    .trap_tval (if_err_take ? pc_q : trap_tval_wb),
+    .trap_is_int(trap_is_int), .trap_epc(if_err_take ? pc_q : trap_epc_w),
     .trap_vector(trap_vector), .trap_new_priv(trap_new_priv),
     .xret_valid(xret_take), .xret_is_sret(wb_is_sret),
     .xret_pc(xret_pc), .xret_new_priv(xret_new_priv),
@@ -597,7 +601,11 @@ module rv32gc_core (
   // （need_cross=1，见上文）时 if_ready=0，但这不是"无法取指"，而是需要进入跨行拼装
   // 状态（cross_q=1）再去取下一行。若此处用 !if_ready，advance_all 会恒为 0，而 cross_q
   // 的置位又被 advance_all 门控 → 前端永久死锁（arch-test 在行末 32 位指令处必现）。
-  wire fetch_stall = !line_valid;
+  // 取指总线错误期间**不冻结流水线**（否则 fetch_stall 恒 1 ⇒ advance_all 恒 0 ⇒ 死锁，错误也永远
+  // 取不走）：改为让 advance 继续、IF/ID 自动注入气泡（line_valid=0 ⇒ id_valid_q <= if_ready = 0），
+  // 更老的指令照常排空；排空后取陷阱（epc=tval=出错 PC，pc_q 因 line_valid=0 不推进），flush 清错误。
+  wire        fetch_err_pending = fetch_err;
+  wire        fetch_stall = !line_valid && !fetch_err_pending;
   wire load_use    = ex_valid_q && e_is_load && ex_rd_wen_q && (ex_rd_q != 5'd0) && id_valid_q &&
                      ((c_use_rs1 && (dec_rs1 == ex_rd_q)) ||
                       (c_use_rs2 && (dec_rs2 == ex_rd_q)));
@@ -647,6 +655,10 @@ module rv32gc_core (
                              !xret_take && !mem_sideeff;
   assign      trap_is_int  = intr_take;
   assign      trap_take     = wb_valid_q && advance && (wb_excp_valid_q || intr_take);
+  // ---- 取指总线错误（cause 1）：等流水线排空后取，绝不丢弃更老的未提交指令 ----
+  wire        front_empty   = !(wb_valid_q || mem_valid_q || ex_valid_q || id_valid_q);
+  wire        if_err_take   = fetch_err_pending && front_empty;
+  wire        trap_take_all = trap_take | if_err_take;
   assign      trap_cause_wb = wb_excp_valid_q ? wb_excp_cause_q : intr_cause;
   assign      trap_tval_wb  = wb_excp_valid_q ? wb_excp_tval_q  : 32'd0;
   wire [31:0] trap_epc_w   = trap_is_int ? intr_epc : wb_pc;
@@ -667,18 +679,20 @@ module rv32gc_core (
   assign dbg_commit_rd    = wb_rd_q;
   assign dbg_commit_wdata = wb_wdata;
   assign dbg_priv         = priv_q;
-  assign dbg_trap         = trap_take;
+  assign dbg_trap         = trap_take_all;
   assign dbg_trap_cause   = wb_excp_cause_q;
 
-  wire        redirect_valid = trap_take | xret_take | ex_br_redirect | id_jal_taken;
-  wire [31:0] redirect_pc    = trap_take      ? trap_vector :
+  wire        redirect_valid = trap_take_all | xret_take | ex_br_redirect | id_jal_taken;
+  wire [31:0] redirect_pc    = trap_take_all  ? trap_vector :
                                xret_take      ? xret_pc :
                                ex_br_redirect ? br_target : id_jal_target;
-  assign flush_front = redirect_valid && (redirect_pc[31:5] != pc_q[31:5]);
+  // 取指错误必须在取走陷阱那一拍**强制 flush**：否则若 trap_vector 与出错 PC 落在同一个 32B 行内，
+  // 上面的行号比较不成立 ⇒ ifetch 的 err_q 清不掉 ⇒ 反复取同一条错误。
+  assign flush_front = (redirect_valid && (redirect_pc[31:5] != pc_q[31:5])) || if_err_take;
 
   wire sq_id  = redirect_valid;
-  wire sq_ex  = trap_take | xret_take | ex_br_redirect;
-  wire sq_mem = trap_take | xret_take;
+  wire sq_ex  = trap_take_all | xret_take | ex_br_redirect;
+  wire sq_mem = trap_take_all | xret_take;
 
   // ============================================================ WB→ID 旁路
   // 关键：寄存器堆在 posedge 写入、ID 为组合读，若生产者处于 WB 而消费者同拍处于 ID，

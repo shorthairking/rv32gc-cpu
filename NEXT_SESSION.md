@@ -92,6 +92,8 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0. ✅ **已完成（第 12 轮）**：总线错误通道（`FETCH_ERR: PASS (21)`，修了 `rv32_axi_master.if_rsp_err` 恒 0 的生产者缺陷）+
+       `Zimop 40/40`/`Zcmop 8/8`；下一步入口见 `AGENT.md` §7 的「Sv32 MMU 实施计划」（侦察已定稿）。
    b. ✅ **中断投递 + 核内 CLINT/PLIC 已完成（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`、
       `CLINT_PLIC_UNIT: PASS (184)`、回归无回退。口径：`mip.MSIP/MTIP/MEIP/SEIP` 只读（走 CLINT/PLIC）、
       中断在 **WB 提交之后**的边界取且避开"副作用已落地"的 MEM 指令、`trap_take` 必须用门控后的 `intr_take`。

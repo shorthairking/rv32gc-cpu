@@ -700,6 +700,39 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 阶段 2A 进展（第 12 轮，2026-09-13）：平台收尾①（总线错误通道）+ 未接入组 Zimop/Zcmop
+
+**结论**：① 取指/访存**总线错误通道**打通（此前未映射地址的读会返回全 0 并被当指令执行）；
+② `Zimop`(40) 与 `Zcmop`(8) 两组**全绿**。全量回归无回退。
+
+#### 交付物
+
+| 文件 | 说明 |
+|---|---|
+| `rtl/bus/rv32_axi_master.v` | **缺陷修复（生产者侧）**：`if_rsp_err` 原先有两处硬写 0（复位 + `RD_FILL`），取指分支从不看 `rresp` ⇒ 核内新通道是死代码。改为逐 beat 锁存 `rd_err <= (rresp != 2'b00)`、新事务清零、`RD_FILL: if_rsp_err <= rd_err` |
+| `rtl/frontend/rv32_ifetch.v` | 新增 `fetch_err`：出错行**不填充**、错误 sticky 保持到 `flush`、错误期间不再发请求 |
+| `rtl/top/rv32gc_core.v` | **排空后取陷阱**：`fetch_stall = !line_valid && !fetch_err_pending`（错误期间不冻结流水线，靠 IF/ID 自动注入气泡让更老指令排空）；`if_err_take = fetch_err_pending && front_empty` → cause 1、`mepc=mtval=pc_q`；并强制 `flush` 清错误（否则 trap_vector 与出错 PC 同行时清不掉） |
+| `sim/tests/fetch_err.S` + `scripts/run_fetch_err_test.sh`（新增） | **`FETCH_ERR: PASS (21 checks)`**：取指 0x9000_0000 / 0x8010_0000 → cause 1 + mepc=mtval=该地址；load→5、store→7 且 tval=VA；三处陷阱后恢复继续执行、故障点后指令**未提交**、MEM_HI 边界内侧访存对照 |
+| `rtl/decode/rv32_decoder.v` | Zimop/Zcmop：`MOP.R.N`/`MOP.RR.N`（SYSTEM funct3=100）→ 合法 OP_ALU(ADD, A=ZERO/B=ZERO)、`rd_wen=(rd!=0)` ⇒ **写 0 到 x[rd]**（`zimop.adoc:26-41`）；`c.mop.N`（`c.lui` rd 奇且 nzimm=0 空间）→ 展开 NOP（不写寄存器，`zcmop.adoc:32-49`）；其余保留编码仍非法 |
+| `sim/tests/unit/gen_decoder_vectors.py` + `decoder_vectors.vh` | 向量 254→**255**（合法 167/非法 88）：`0x6581` 由"非法 c.lui imm=0"更正为合法 **C.MOP.11**（`zcmop.adoc:44`），另补 `0x6601`（rd 偶，真保留）作非法向量；其余 252 条逐位不变 |
+
+#### 验证（本轮实测；主 Agent 复跑）
+
+| 项 | 结果 |
+|---|---|
+| 总线错误定向自测 | **`FETCH_ERR: PASS (21 checks)`**（24099 拍；修复前 21 项中取指 4 项失败：mcause=2、mtval=0 —— 证实"全 0 行被当指令执行"） |
+| 未接入组 | **`Zimop 40/40`**、**`Zcmop 8/8`** |
+| 译码器单元 | **`DECODER_UNIT_TESTS: PASS (255 vectors)`**（155→167 合法、88 非法） |
+| 全量回归 | 非特权 **18 组 124 例** + PMPS 11/11 + PMPU 11/11 + PMPZaamo/Zalrsc 1/1 + PMPZca 12/15 + PMPSm 37/38（例外同前）+ `PRIV_TRAP: PASS (46)` + `LRSC_DIRECTED: PASS` + `hello`/`memtest` 全绿 |
+
+#### 关键经验（写入工作方式）
+
+* **"通道实现了"不等于"通路接通了"**：本次核内 drain-then-trap 写得再对，生产者（`rv32_axi_master`）不置错误位就全是死代码。判据必须来自**端到端定向测试**（本测试修复前 21 项中恰好只有取指 4 项失败）。
+* **改 RTL 时实例端口连接也要核对**：本轮曾因一处 `.fetch_err()` 连接漏加，导致核内 `fetch_err` 悬空为 X → `advance_all` 变 X → 全核冻结（`hello` 超时）。批量改 RTL 后必须 `grep` 核对新增端口两端都存在。
+* **规范定义的保留编码会随扩展实现变合法**：`0x6581` 在 Zcmop 未实现时非法、实现后就是 C.MOP.11；向量表属于**生成器产物**，应改生成器再重生成（本轮已按此处理并逐条比对未受影响项）。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -718,7 +751,11 @@ arch-test 与 hello/memtest 无影响，已复跑）。
   PMPZalrsc 1/1、PMPZca 12/15；1 例平台口径差异 + 3 例 ISA 不可达见 §6）；回归 18 组 124 例 + 单元测试 + hello/memtest + lrsc 全绿
 - ✅ **中断投递 + 核内 CLINT/PLIC（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`；
   `CLINT_PLIC_UNIT: PASS (184)`；回归 18 组 124 例 + PMP 6 组无回退
-- 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求本轮不做上板）**——顺序即优先级：
+- 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求不做上板）**——进度：
+  * ✅ ① 总线错误通道（取指 cause 1 + load/store 5/7，`FETCH_ERR: PASS (21)`）；物理 0 口径仍记为平台约定差异（详见上板计划）
+  * ✅ ② `Zimop 40/40`、`Zcmop 8/8`
+  * ⏭ ③ Sv32 MMU（方案已侦察定稿，见下）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  原顺序与判据：
   ① **平台口径收尾**：`rv32_ifetch.if_rsp_err` 目前**悬空未用**（取指总线错误会被当指令执行）⇒ 加
      "取指总线错误 → cause 1" 通道；实现要点（已定，避免踩旧坑）：错误期间**不冻结流水线**（`fetch_stall`
      若恒 1 会让 `advance_all` 恒 0 → 死锁），改为向前端**注入气泡**让更老的指令排空，排空后取陷阱
@@ -735,6 +772,14 @@ arch-test 与 hello/memtest 无影响，已复跑）。
   ⑥ **交付：上板测试计划（2A-7d）书面稿交用户审阅** —— 涵盖 FPGA 工程/约束/时序目标、上板步骤、
      B1~B3 判据、串口与数码管观测、失败回退与风险。**用户审阅通过前不做上板**。
 - 📄 本阶段任务的详细清单与判据即上方 🚧 列表（旧编号列表已并入其中）。
+- 🧭 **Sv32 MMU 实施计划（第 12 轮侦察定稿，下一轮执行；裁剪版：不实现 Svinval/Svnapot/Svpbmt/Svadu/Svade→按 Svade 即"不改写 PTE"）**：
+  结构 `rtl/mmu/rv32_tlb.v`（ITLB 8/DTLB 16，全相联 CAM，项存 `{valid,G,IS_4M,ASID,VPN_TAG,PPN,PERM,AD}`）+
+  `rtl/mmu/rv32_ptw.v`（IDLE→L1→L2→FAULT，**无 UPDATE_AD**）+ `rv32mmu_top.v` 内聚；取指翻译在 **IF**（须给
+  `rv32_ifetch` 加 `pa_valid` 并门控 `hit/line_valid/发请求` 三处），访存翻译在 **MEM 的 M_IDLE**（复用"拒绝→
+  M_DONE+记 cause"范式）；**PMP/CLINT-PLUI 窗口全部改按 PA**、`tval` 仍为 VA；非对齐判定必须先于翻译；
+  PTW 自驱 `d_req_*`（**不得经 LSU M_REQ、不得被 stall 门控**）；页错误 12/13/15；SUM/MXR/priv **不缓存进 TLB**；
+  PTE 合法性照抄 Spike（非叶 D/A/U、`V=0`、`R=0&&W=1`、4M 的 `ppn[9:0]!=0`）。验收 63 例（Sv 30 + Svbare 3 +
+  SvPMP 4 + Svade 2 + ExceptionsSv 4 + ExceptionsSvZaamo/Zalrsc 3+3 + SvZicbo 6 + SvPMPZicbo 8），组内须用正则过滤。
 - 📌 **平台适配结论（D15/D16）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；
   需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI
 - 📌 **待用户确认（2A-4 前）**：数据侧访问 SPI-XIP 窗口（`0x1C00_0000`）是否也要绕过 L1D（见 `spec/08-bus-axi.md` §2.1 待决项）

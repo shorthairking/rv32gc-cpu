@@ -16,6 +16,8 @@
 //   * Zicsr 全部：CSRRW/CSRRS/CSRRC/CSRRWI/CSRRSI/CSRRCI；
 //   * SYS：ECALL/EBREAK/MRET/SRET/WFI/FENCE/FENCE.I/SFENCE.VMA；
 //   * Zicbom：CBO.INVAL/CBO.CLEAN/CBO.FLUSH/CBO.ZERO；
+//   * Zimop：MOP.R.n(32)/MOP.RR.n(8)（写 0 到 x[rd]，无副作用）；
+//   * Zcmop：C.MOP.1/3/../15（不写任何寄存器，展开为 NOP）；
 //   * Zca/RVC：RV32 全部 29 条压缩指令（整数 25 条 + 压缩浮点访存 4 条，
 //     后者展开为 FLD/FSD/FLW/FSW/FLWSP/FSWSP 后按「F/D 未实现」判非法）。
 //
@@ -37,7 +39,8 @@
 //   * 未定义操作码 / 保留 funct3 / 保留 funct7（含 OP 的 SUB 型 funct7 配 SLL 等）；
 //   * LOAD/STORE 的 funct3=011/110/111（RV64 的 LD/SD/LWU 等）；OP-32 全部；
 //   * JALR 的 funct3!=000、BRANCH 的 funct3=010/011；
-//   * MISC-MEM 的 funct3 非 000/001/010（010 为 Zicbom）；SYSTEM 的 funct3=100；
+//   * MISC-MEM 的 funct3 非 000/001/010（010 为 Zicbom）；SYSTEM 的 funct3=100 仅
+//     Zimop 的 40 条 MOP 编码合法，其余组合保留；
 //   * SYSTEM：funct12 非 ECALL/EBREAK/MRET/SRET/WFI/SFENCE.VMA、
 //     SFENCE.VMA 的 rd!=0（FENCE.I 的 rs1/rd/funct12 是"必须忽略"的保留字段，不报非法）；
 //   * Zicbom（MISC-MEM 操作码 funct3=010）：funct12 非 000/001/002/004 或 rd!=0（保留编码）；
@@ -45,7 +48,8 @@
 //   * Zicsr：funct3=100（保留）；SYSTEM 的 funct3=000 仅在 funct7/funct12 精确匹配
 //     ECALL/EBREAK/MRET/SRET/WFI/SFENCE.VMA 时合法（rd/rs1 必须为 0，funct7 为 0000000/
 //     0011000/0001000/0001001），其余组合保留；
-//   * RVC（保留/非法形式）：c.addi4spn nzuimm=0；c.lui imm=0；c.addi16sp nzimm=0；
+//   * RVC（保留/非法形式）：c.addi4spn nzuimm=0；c.lui imm=0（Zcmop 的 c.mop.N
+//     编码除外，见下）；c.addi16sp nzimm=0；
 //     c.lwsp rd=0；c.jr rs1=0；
 //     c.srli/c.srai/c.slli 的 shamt[5]=1（XLEN=32 时 designated for custom，本核未实现 → 非法）；
 //     C0 象限保留槽位 op=00/funct3=100（CL 保留）；
@@ -71,6 +75,7 @@
 //   c.li       rd,imm      → addi   rd,x0,imm
 //   c.addi16sp nzimm       → addi   x2,x2,nzimm        (nzimm=0 非法)
 //   c.lui      rd,nzimm    → lui    rd,nzimm           (nzimm=0 非法；rd=0 是 HINT；rd=2 即 c.addi16sp)
+//   c.mop.N    （N 奇，1..15）→ nop  (addi x0,x0,0)      (nzimm=0 且 rd 为奇且 <16；不写寄存器)
 //   c.srli/c.srai rd',sh   → srli/srai rd',rd',sh      (shamt[5]=1 非法)
 //   c.andi     rd',imm     → andi   rd',rd',imm
 //   c.sub/c.xor/c.or/c.and → sub/xor/or/and rd',rd',rs2'
@@ -222,6 +227,10 @@ module rv32_decoder (
             ex_instr = {{2{c[12]}}, c[12], c[4], c[3], c[5], c[2], c[6], 4'b0000,
                         5'd2, 3'b000, 5'd2, 7'b0010011};
             if (c_imm6 == 6'd0) ex_ill = 1'b1;       // nzimm=0 保留
+          end else if ((c_imm6 == 6'd0) && (c_rd[4] == 1'b0) && (c_rd[0] == 1'b1)) begin
+            // Zcmop c.mop.N（N=1,3,..,15，奇且 <16）：占据 c.lui[xN,0] 的保留空间
+            // 规范：不写任何寄存器、无副作用 → 展开为 NOP（addi x0,x0,0）
+            ex_instr = {12'b0, 5'd0, 3'b000, 5'd0, 7'b0010011};
           end else begin
             ex_instr = {{14{c[12]}}, c[12], c[6:2], c_rd, 7'b0110111};
             // imm=0 保留；rd=x0 且 imm!=0 是 HINT（合法，展开为 lui x0,imm）
@@ -732,7 +741,26 @@ module rv32_decoder (
               use_rs1_d  = 1'b1;
             end
           end
-          3'b100: legal32 = 1'b0;   // 保留
+          3'b100: begin  // Zimop：MOP.R.n(32 条) / MOP.RR.n(8 条)，其余编码保留
+            // 规范：未被其它扩展重定义时，这些指令「简单地写 0 到 x[rd]」且无副作用。
+            // MOP.R.n  （n=0..31）：funct7 = {1'b1, n[4], 2'b00, n[3:2], 1'b0}，
+            //                        rs2 域 = {3'b111, n[1:0]}（即 bit24:22=111）
+            // MOP.RR.n （n=0..7） ：funct7 = {1'b1, n[2], 2'b00, n[1:0], 1'b1}，
+            //                        rs2 域为真 rs2（任意 x 寄存器）
+            if ((funct7[6] == 1'b1) && (funct7[4] == 1'b0) && (funct7[3] == 1'b0) &&
+                ((funct7[0] == 1'b1) || (rs2_i[4:2] == 3'b111))) begin
+              legal32     = 1'b1;
+              op_class_d  = `OP_ALU;
+              alu_op_d    = `ALU_ADD;
+              alu_a_sel_d = `ALU_A_ZERO;   // A = 0
+              alu_b_sel_d = `ALU_B_ZERO;   // B = 0 → rd = 0
+              imm_type_d  = IMM_NONE;      // 无立即数（imm 保持 0）
+              wb_sel_d    = `WB_ALU;
+              rd_d        = rd_i;
+              rd_wen_d    = (rd_i != 5'd0);
+              // MOP 不建立 rs1/rs2 → rd 的语法依赖：use_rs1/use_rs2 保持 0（不读寄存器）
+            end
+          end
           default: legal32 = 1'b0;
         endcase
       end

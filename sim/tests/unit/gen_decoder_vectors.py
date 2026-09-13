@@ -29,7 +29,7 @@ import tempfile
 TOOL_PREFIX = "/opt/riscv/bin/riscv32-unknown-linux-gnu-"
 AS = TOOL_PREFIX + "as"
 OBJDUMP = TOOL_PREFIX + "objdump"
-MARCH = "rv32gc_zicsr_zifencei_zicbom_zicboz"
+MARCH = "rv32gc_zicsr_zifencei_zicbom_zicboz_zcmop"
 MABI = "ilp32d"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -473,6 +473,11 @@ def rvc_expand(c):
                     (b(2) << 5) | (b(6) << 4)
                 w = I12(sext(o, 10), 2, 0, 2, 0x13)
                 ill = (o == 0)
+            elif (imm6 == 0) and (rd & 1) and (rd < 16):
+                # Zcmop C.MOP.N（N=1,3,..,15）：占据 c.lui[xN,0] 的保留空间；
+                # 规范：不写任何寄存器 → 展开为 NOP（addi x0,x0,0）
+                w = I12(0, 0, 0, 0, 0x13)
+                ill = False
             else:                                      # C.LUI
                 nzimm20 = (b(12) << 5) | ((c >> 2) & 0x1F)      # nzimm[17:12]
                 val32 = sext(nzimm20 << 12, 18) & 0xFFFFFFFF     # 32 位立即数值
@@ -795,13 +800,15 @@ RVC = [
     ("c.lui x0, 1",               0x6005, "lui x0, 0x1"),
     ("c.mv x0, a1",               0x802E, "add x0, x0, a1"),
     ("c.addi a0, 0",              0x0501, "addi a0, a0, 0"),
+    # Zcmop：c.mop.N 占 c.lui[xN,0] 的保留空间，不写寄存器（zcmop.adoc 编码表）
+    ("c.mop.11",                  0x6581, "addi x0, x0, 0"),
 ]
 
 RVC_ILLEGAL = [
     ("c.addi4spn nzuimm=0（保留）",        0x0000),
     ("c.lwsp rd=x0（保留）",               0x4042),
     ("c.jr rs1=x0（保留）",                0x8002),
-    ("c.lui imm=0（保留）",                0x6581),
+    ("c.lui imm=0（保留，rd 非 c.mop.N）",  0x6601),
     ("c.addi16sp nzimm=0（保留）",         0x6101),
     ("c.srli shamt[5]=1（XLEN=32 保留）",  0x9101),
     ("c.srai shamt[5]=1（XLEN=32 保留）",  0x9501),
@@ -823,6 +830,8 @@ def canon(mn):
     """助记符归一为可接受集合（objdump 伪指令别名在不同形式下可能不同）"""
     if mn.startswith("c."):
         mn = mn[2:]
+    if mn.startswith("mop."):     # Zcmop：等价展开是 NOP（写 x0）
+        return {"addi"}
     return CANON_MN.get(mn, {mn})
 
 

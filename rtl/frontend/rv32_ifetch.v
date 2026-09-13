@@ -30,13 +30,19 @@ module rv32_ifetch (
   input  wire         if_rsp_valid,
   input  wire [255:0] if_rsp_data,
   input  wire         if_rsp_err,
-  output wire         if_rsp_ready
+  output wire         if_rsp_ready,
+
+  // ---- 取指总线错误（AXI 读响应 err）----
+  // 出错的行**不填充**（line_vld_q 保持 0），错误保持到 flush（核取走陷阱后会 flush）。
+  // 必须保持：否则核会在同一地址反复重试，或把没取到的行当指令执行。
+  output wire         fetch_err
 );
 
   reg [255:0] line_q;
   reg [31:0]  line_tag_q;      // PC[31:5]
   reg         line_vld_q;
   reg         busy_q;          // 正在等待 AXI 返回
+  reg         err_q;           // 取指总线错误（sticky，flush 清除）
   /* verilator lint_off UNUSED */
   reg         line_xip_q;      // 本行来自 SPI-XIP 窗口？—— 2A-4 的 I-Cache 必须禁止其填充
   reg         req_xip_q;       // 在途请求行的窗口归属（请求发起拍采样，响应拍写入 line_xip_q）
@@ -61,6 +67,7 @@ module rv32_ifetch (
   wire        hit = line_vld_q && (pc[31:5] == line_tag_q[31:5]);   // 比较行号（line_tag_q 存的是完整字节地址）
   assign line_valid = hit;
   assign if_rsp_ready = 1'b1;  // 收到即接收
+  assign fetch_err    = err_q;
 
   // 行内选择：半字索引 = pc[4:1]，第 idx 个半字位于位偏移 idx*16
   wire [3:0]  idx = pc[4:1];
@@ -75,6 +82,7 @@ module rv32_ifetch (
       line_xip_q  <= 1'b0;
       req_xip_q   <= 1'b0;
       busy_q      <= 1'b0;
+      err_q       <= 1'b0;
       if_req_valid<= 1'b0;
       if_req_addr <= 32'd0;
     end else begin
@@ -82,19 +90,21 @@ module rv32_ifetch (
       if (if_rsp_valid) begin
         line_q     <= if_rsp_data;
         line_tag_q <= if_req_addr;
-        line_vld_q <= 1'b1;
         line_xip_q <= req_xip_q;   // D16②：记录本行是否来自 XIP 窗口（2A-4 禁止其入 Cache）
         busy_q     <= 1'b0;
+        line_vld_q <= if_rsp_err ? 1'b0 : 1'b1;   // 总线错误 ⇒ 该行不可用
+        err_q      <= if_rsp_err;                 // 并锁存错误直到 flush
       end
 
       // 2) 冲刷：使当前行失效（后赋值优先），但不清 busy_q
       if (flush) begin
         line_vld_q   <= 1'b0;
+        err_q        <= 1'b0;
         if_req_valid <= 1'b0;
       end
 
       // 3) 发起新取指（未命中、无在途请求、且本拍未冲刷）
-      if (!hit && !busy_q && !if_req_valid && !flush) begin
+      if (!hit && !busy_q && !if_req_valid && !flush && !err_q) begin
         if_req_valid <= 1'b1;
         if_req_addr  <= {pc[31:5], 5'b0};
         req_xip_q    <= xip_bypass;   // 采样"本请求行是否属于 SPI-XIP 窗口"

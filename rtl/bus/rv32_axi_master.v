@@ -105,6 +105,7 @@ module rv32_axi_master (
   reg [31:0] rd_addr;
   reg [255:0] rd_line;
   reg [31:0] rd_data_word;
+  reg        rd_err;           // 本笔取指读取收到的 rresp != OKAY（SLVERR/DECERR）
 
   // 仲裁：数据优先
   wire take_data  = d_req_valid && (rd_state == RD_IDLE) && (wr_state == WR_IDLE);
@@ -147,6 +148,7 @@ module rv32_axi_master (
       if_rsp_valid <= 1'b0;
       if_rsp_data  <= 256'd0;
       if_rsp_err   <= 1'b0;
+      rd_err       <= 1'b0;
       d_rsp_valid  <= 1'b0;
       d_rsp_rdata  <= 32'd0;
       d_rsp_err    <= 1'b0;
@@ -164,6 +166,7 @@ module rv32_axi_master (
             rd_addr   <= {if_req_addr[31:5], 5'b0};
             rd_beat   <= 4'd0;
             rd_line   <= 256'd0;
+            rd_err    <= 1'b0;   // 新事务：清总线错误（取指）
             rd_state  <= RD_AR;
           end
         end
@@ -179,6 +182,7 @@ module rv32_axi_master (
 
         RD_R: begin
           if (rvalid) begin
+            if (rresp != 2'b00) rd_err <= 1'b1;   // 取指行读取：记录总线错误（数据侧另有 d_rsp_err 路径）
             if (rd_client == 2'd0) begin
               case (rd_beat[2:0])
                 3'd0: rd_line[31:0]    <= rdata;
@@ -205,7 +209,7 @@ module rv32_axi_master (
         RD_FILL: begin
           if_rsp_valid <= 1'b1;
           if_rsp_data  <= rd_line;
-          if_rsp_err   <= 1'b0;
+          if_rsp_err   <= rd_err;   // 取指行：把该笔读的 rresp 结果交给 rv32_ifetch
           rd_state     <= RD_RSP;
         end
 
