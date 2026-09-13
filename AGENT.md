@@ -272,7 +272,13 @@
 8. **性能计数器**：`mhpmcounter3..7` 实现为真实计数器（分支数/误预测/L1D 缺失/L1I 缺失/L2 缺失，事件硬连线，`mhpmevent3..7` 只读 0），`mhpmcounter8..31` 读 0（已更新 `04-csr-mmu.md`）。
 9. **`cbo.clean/flush` 语义**：必须把数据**推过 L2 直达 DDR** 并在完成前阻塞提交，否则非一致性 DMA 会读到旧数据（已写入 `03-cache.md`）；同时记录"平台无 snoop"的已知限制（DMA 对 LR/SC 保留集不可观测、AMO 与 DMA 无原子性保证，需软件回避）。
 
-**FPGA 升频方案修正（依实际 `.xci` 参数）**：`clk_pll_33` 是 **PLLE2_ADV**，实测 `PRIM_IN_FREQ=100`、`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33` → **VCO=1650 MHz**，`CLKOUT0_DIVIDE_F=33` → `cpu_clk`=50 MHz、`CLKOUT1_DIVIDE=50` → `uncore_clk`=33 MHz。因此原"CLKOUT2..7 已是 100 MHz"的说法**不成立**；推荐方案是**直接用板级 100 MHz 作为 `cpu_clk`**（零 IP 风险），备选为 `CLKOUT0_DIVIDE_F` 改 16.5 或用 tcl 重新生成 IP；并注意 VCO=1650 MHz 可能超出 Artix-7 -2 的 PLLE2 上限（平台既有疑点，重新生成 IP 时用 DRC 校验）。
+**FPGA 时钟方案（2026-09-13 依用户要求定稿）**
+
+- **实测平台时钟**：`clk_pll_33` 为 **PLLE2_ADV**（`PRIM_IN_FREQ=100 MHz`、`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33` → **VCO=1650 MHz**；`CLKOUT0_DIVIDE_F=33` → `cpu_clk`=50 MHz；`CLKOUT1_DIVIDE=50` → `uncore_clk`=33 MHz）。原文档"CLKOUT2..7 已是 100 MHz"的说法**不成立**（那是未用输出的默认请求值）。VCO=1650 MHz 可能超过 Artix-7 **-2** 的 PLLE2 上限（约 1600 MHz），属**平台既有疑点**，阶段五首次综合时用 DRC/`report_clocks` 核实。
+- **用户要求**：`cpu_clk` **不得**直接使用晶振输入，必须经 Vivado **Clocking Wizard（MMCM/PLL）**产生，以获得稳定、可控、带锁定指示的时钟。
+- **采用方案**：新增 Clocking Wizard IP **`clk_wiz_cpu`（MMCM）**，输入板级 100 MHz，`DIVCLK_DIVIDE=1` + `CLKFBOUT_MULT_F=12.0` → **VCO=1200 MHz**（-2 器件 MMCM 范围 600~1440 MHz，余量充足），`CLKOUT0_DIVIDE_F=12.0` → **100 MHz**；`locked` 与外部 `resetn` 相与做复位门控；频率可用 `CPU_CLK_MHZ` 配为 **50/60/75/100** 以支持降级。平台 `clk_pll_33` **不改动**（仅继续用其 `clk_out2` 提供 uncore 33 MHz，`clk_out1` 弃用）。
+- **SoC 顶层**：平台 `soc_top.v` 把 `cpu_clk` 硬连到 `clk_pll_33/clk_out1`，故本项目保留**最小差异副本** `fpga/rtl/soc_top_rv32gc.v`（仅时钟块 + CPU 例化不同，其余逐行一致），并在 `fpga/README.md` 给出与平台文件的 diff 说明以便复核/同步。
+- **零 RTL 改动备选**：把平台 `clk_pll_33.xci` 复制到本项目并改为 MMCM 同时输出 100 MHz 与 uncore 时钟，模块名/端口名不变 → `soc_top.v` 无需修改；代价是 33 MHz 只能取 `1200/36.375 = 32.99 MHz`（偏差 0.03%，无功能影响）。
 
 **同时修正的 ISA 准确性问题**（由 `spec/07` 的规范比对发现，已改 `04-csr-mmu.md`）：`pmpcfg` 在 RV32 只有 `0x3A0–0x3A3`（4 个寄存器 / 16 项）；`mstatus` 位图按规范补全（含 `TVM/TW/TSR`、`XS/VS`、`SD`）；`mret/sret` 的 `MPRV` **仅在返回目标 ≠ M 时清 0**；A/D 位更新必须对 PTE **原子 CAS 且不得使用翻译缓存**，写回违例报**访问错误**。
 

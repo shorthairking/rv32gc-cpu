@@ -23,6 +23,9 @@ work/
 tools/
 third_party/
 
+# Vivado 用户目录（沙箱内需把 HOME 指到工作区）
+.vivado_home/
+
 # 编辑器/系统
 .vscode/
 .idea/

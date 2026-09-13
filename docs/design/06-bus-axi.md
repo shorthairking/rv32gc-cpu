@@ -94,16 +94,14 @@
 ## 4. 时钟与复位
 
 - **时钟**：CPU 与 CPU 侧 AXI 使用 `cpu_clk`；平台 uncore（DDR/UART/NAND/MAC/CONFREG）使用 33 MHz `aclk`。两者之间已有平台 `axi_clock_converter_0` 完成异步跨时钟域，**本核不需要额外处理 CDC**。
-- **升频方法（2026-09-13 依实际 `.xci` 参数修正）**：
-  `clk_pll_33` 实为 **PLLE2_ADV**，实测参数为 `PRIM_IN_FREQ=100 MHz`、`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33`（→ **VCO = 1650 MHz**）、`CLKOUT0_DIVIDE_F=33`（→ `cpu_clk` = **50 MHz**）、`CLKOUT1_DIVIDE=50`（→ `uncore_clk` = 33 MHz）。因此"CLKOUT2..7 已是 100 MHz"的说法**不成立**（那是未使用输出的默认请求值）。
-  可选方案（按推荐度排序）：
-  1. **直接用板级 100 MHz 作为 `cpu_clk`**（`clk` 引脚，`soc_up.xdc` 的 `create_clock -period 10.000`）：无需改动时钟 IP，零 IP 风险；代价是 SoC 顶层一行改动（本项目在自有工程中保留该改动，或在本项目副本中实现）；
-  2. 把 `CLKOUT0_DIVIDE_F` 由 33 改为 **16.5** → 100 MHz（VCO 不变），需确认 PLLE2 的分数分频被 Vivado 接受；
-  3. 用 tcl 重新生成 `clk_pll_33`（`CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {100.000}` + `generate_target`），由向导重算分频比；
-  4. 新建一个 `clk_wiz` IP（tcl `create_ip`）专门产生 100 MHz。
-  **注意（平台既有风险）**：VCO = 1650 MHz 可能超过 Artix-7 **-2** 的 PLLE2 VCO 上限（约 1600 MHz）；重新生成/校验 IP 时若报 DRC，需按方案 3/4 重算 VCO。
-  同时必须把 `chip/soc_demo/loongson/config.h` 的 `` `define FREQ 32'd33000000 `` 与 SoC 中 `CORE_CLOCKS_PER_SEC` 改为**实际频率**（当前值 33 MHz 与 50 MHz 的 `cpu_clk` 已不一致，属平台遗留问题）。
-- **复位**：`aresetn` 在 SoC 中由 Xilinx 互连的 `S00_AXI_ARESET_OUT_N` 驱动；核内做 2 级同步后作为内部同步复位。
+- **升频方法（2026-09-13 依用户要求与实测 `.xci` 参数确定）**：
+  `clk_pll_33` 实为 **PLLE2_ADV**（`PRIM_IN_FREQ=100 MHz`、`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33` → **VCO = 1650 MHz**；`CLKOUT0_DIVIDE_F=33` → `cpu_clk` = 50 MHz；`CLKOUT1_DIVIDE=50` → `uncore_clk` = 33 MHz）。
+  **CPU 时钟改为由新增的 Clocking Wizard IP `clk_wiz_cpu`（MMCM）产生**——不使用晶振直连：
+  - 输入：板级 `clk` = 100 MHz（`soc_up.xdc` 已约束）；MMCM：`DIVCLK_DIVIDE=1`、`CLKFBOUT_MULT_F=12.0` → **VCO=1200 MHz**（-2 器件 MMCM 范围 600~1440 MHz）、`CLKOUT0_DIVIDE_F=12.0` → **100 MHz**；
+  - `locked` 参与复位门控（锁定后才释放复位）；`CPU_CLK_MHZ` 可配 50/60/75/100 以支持降级；
+  - `uncore_clk`（33 MHz）继续由平台 `clk_pll_33/clk_out2` 提供，平台 IP **不改动**；
+  - SoC 顶层使用本项目的最小差异副本 `fpga/rtl/soc_top_rv32gc.v`（仅时钟块与 CPU 例化不同），详见 `07-fpga-timing.md` §1.1。
+  同时必须把 `chip/soc_demo/loongson/config.h` 的 `` `define FREQ 32'd33000000 `` 与 SoC 中 `CORE_CLOCKS_PER_SEC` 改为**实际 CPU 频率**（当前值与 50 MHz 的 `cpu_clk` 已不一致，属平台遗留问题）。
 
 ## 5. 平台集成步骤（Vivado CLI）
 

@@ -26,12 +26,15 @@
 | 时钟 | 来源 | 频率 | 域内设备 |
 |---|---|---|---|
 | 板级 `clk` | 晶振（AC19） | 100 MHz | PLL/MIG 参考 |
-| `cpu_clk` | `clk_pll_33/clk_out1` | **50 MHz**（本项目目标 100 MHz） | CPU + CPU 侧 AXI |
+| `cpu_clk` | `clk_pll_33/clk_out1`（平台现状） | **50 MHz**；本项目改为由新增 `clk_wiz_cpu`（MMCM，VCO=1200 MHz）产生 **100 MHz**（可配 50/60/75/100），**不使用晶振直连** | CPU + CPU 侧 AXI |
 | `uncore_clk` = `aclk` | `clk_pll_33/clk_out2` | 33 MHz | DDR/UART/NAND/SPI/MAC/CONFREG |
 | `clk_wiz_0/clk_out1` | PLL | 200 MHz | DDR MIG 参考 |
 | MIG `ui_clk` | MIG | 100 MHz | DDR 控制器 |
 
 - CPU 侧与 uncore 侧的跨时钟域由平台 `axi_clock_converter_0` 完成，**核内不需要处理**。`[RTL]`
+- `clk_pll_33` 实测为 **PLLE2_ADV**：`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33` → **VCO=1650 MHz**，`CLKOUT0_DIVIDE_F=33` → 50 MHz、`CLKOUT1_DIVIDE=50` → 33 MHz。`[RTL]`
+  - VCO=1650 MHz 可能超过 Artix-7 **-2** 的 PLLE2 VCO 上限（约 1600 MHz）——**平台既有疑点**，阶段五首次综合时用 DRC/`report_clocks` 核实。
+  - 本项目**不修改**该 IP（仅继续用其 33 MHz 的 `clk_out2` 作为 uncore 时钟），CPU 时钟另用 Clocking Wizard（MMCM）产生，方案见 `../design/07-fpga-timing.md` §1.1。
 - `` `define FREQ 32'd33000000 ``（`chip/soc_demo/loongson/config.h`）与实际 `cpu_clk`（50 MHz）**不一致**，属平台遗留；升频时必须一并修正。`[RTL]`
 - `soc_up.xdc` 的 `create_clock -period 10.000` 约束的是板级 100 MHz 输入，不是 CPU 时钟。`[RTL]`
 

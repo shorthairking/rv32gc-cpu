@@ -18,7 +18,7 @@
 | cache 大小不做要求 | L1I 16 KB 4 路、L1D 32 KB 8 路、L2 统一 256 KB 8 路 | `03-cache.md` |
 | 流水级至少五级 | 前端 IF0/IF1/IF2/ID/RN/DP + 后端 IS/EX/MEM/WB/RT，共 11 级（浮点更深） | `01-pipeline.md` |
 | 完整的特权级 CSR | 机器级/监管级/用户级 CSR 全集 + PMP + 计数器 | `04-csr-mmu.md` |
-| 主频 ≥60 MHz，目标 100 MHz | 时钟取自 `clk_pll_33` 的 `clk_out1`（改为 100 MHz）；微架构按 10 ns 关键路径设计 | `07-fpga-timing.md` |
+| 主频 ≥60 MHz，目标 100 MHz | **`cpu_clk` 由新增的 Clocking Wizard IP `clk_wiz_cpu`（MMCM，VCO=1200 MHz）从板级 100 MHz 产生**，默认 100 MHz、可配 50/60/75/100（不使用晶振直连）；微架构按 10 ns 关键路径设计 | `07-fpga-timing.md` §1.1 |
 | 采用乱序执行技术 | 128 项 ROB + 物理寄存器重命名 + 分布式发射队列 + LSQ，顺序提交、精确异常 | `05-ooo.md` |
 | 尽量复用平台 IP（AXI 及以上） | 只需实现 `core_top` 的 AXI4 主设备接口，DDR/UART/NAND/MAC/CONFREG 全部复用 | `06-bus-axi.md` |
 | 乘法器等使用 FPGA 原语/IP | 乘法器由 `*` 推断映射到 DSP48E1；除法器为自研基 4 迭代（理由见 §7） | `01-pipeline.md` §5 |
@@ -35,7 +35,7 @@ chiplab 平台要求处理器核以固定模块名 `core_top` 接入，接口为
 
 ```
 module core_top(
-    input         aclk,             // CPU 时钟（来自 clk_pll_33 clk_out1）
+    input         aclk,             // CPU 时钟（来自本项目 clk_wiz_cpu/MMCM 的输出）
     input         aresetn,          // 低有效异步复位
     input  [7:0]  intrpt,           // 外部中断（SoC 中断线）
     // AXI4 主设备（32bit 数据 / 4bit ID / 4bit len）

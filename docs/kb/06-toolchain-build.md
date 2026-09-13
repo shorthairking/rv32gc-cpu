@@ -84,7 +84,27 @@ git clone https://github.com/sigma-star/mtd-utils  # 或 https://git.infradead.o
 
 **注意**：GCC 16 默认把 C 扩展拆成 `Zca/Zcd/Zcf`；为避免歧义，构建脚本中**显式写出**完整 `-march`。
 
-## 7. 常见构建问题
+## 7. 在沙箱内运行 Vivado CLI 的要点（实测）
+
+| 问题 | 现象 | 解决 |
+|---|---|---|
+| Vivado 无法写 `$HOME/.Xilinx` | `Failed to create directory to save app.xml at '/home/<user>/.Xilinx/...'` → `ERROR: [Common 17-1219]`、`catalog_2025.2.xml: cannot open file`，随后 `Exiting Vivado` | 把 `HOME` 指向**工作区内**目录再运行：`HOME=/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/.vivado_home vivado -mode batch …`（该目录已加入 `.gitignore`） |
+| 批处理模式无 GUI | 需要 `-mode batch -nojournal -nolog -source <tcl>` | 所有工程生成/综合/实现/下载都用 tcl，符合任务"用 CLI 而非 GUI"的要求 |
+| 生成 IP | `create_ip -name clk_wiz -vendor xilinx.com -library ip -version 6.0 -module_name <name>` + `set_property -dict [...]` + `generate_target {…} [get_ips <name>]` | 参考 `fpga/tcl/create_clk_wiz_cpu.tcl`（已实测通过） |
+| 同名 IP 重复创建 | `ERROR: IP name 'x' is already in use in this project` | 换 module_name，或先 `delete_ip_run`/`remove_files` 清理 |
+
+**实测：CPU 时钟 Clocking Wizard（MMCM）解**（`xc7a200tfbg676-2`，Vivado 2025.2）
+
+| 请求 | VCO | 实际输出 |
+|---|---|---|
+| 100 MHz | 1000.0 MHz（DIVCLK=1, MULT=10.0, CLKOUT0=10.0） | 100.0000 MHz |
+| 75 MHz | 1003.1 MHz（DIVCLK=4, MULT=40.125, CLKOUT0=13.375） | 75.0000 MHz |
+| 60 MHz | 997.5 MHz（DIVCLK=5, MULT=49.875, CLKOUT0=16.625） | 60.0000 MHz |
+| 50 MHz | 1000.0 MHz（DIVCLK=1, MULT=10.0, CLKOUT0=20.0） | 50.0000 MHz |
+
+> 自动求解模式下 `MMCM_CLKFBOUT_MULT_F`/`MMCM_CLKOUT0_DIVIDE_F` 为 disabled 参数，**不要显式写入**（会被忽略）；给出输入/输出频率后读回实际解即可。平台现有时钟 `clk_pll_33` 为 PLLE2_ADV（`DIVCLK_DIVIDE=2`、`MULT=33` → VCO=1650 MHz，可能超 -2 的 PLLE2 上限），本项目不改动它，只用其 33 MHz 输出。
+
+## 8. 常见构建问题
 
 | 问题 | 处理 |
 |---|---|

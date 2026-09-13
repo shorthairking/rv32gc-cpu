@@ -531,7 +531,7 @@ synth_design -top soc_top -part xc7a200tfbg676-2 -flatten_hierarchy rebuilt -ret
 
 ### 9.4 升频到 100 MHz 的步骤（**平台侧改动，本节只描述，不在本次交付中执行**）
 
-1. `clk_pll_33`：把 `IP/xilinx_ip/<ver>/clk_pll_33/clk_pll_33.xci` 的 `CLKOUT1_REQUESTED_OUT_FREQ` 由 `50.000` 改为 `100.000`，重新生成 IP。派生值：`MMCM_DIVCLK_DIVIDE=2`、`MMCM_CLKFBOUT_MULT_F=33` → **VCO=1650 MHz**；`MMCM_CLKOUT0_DIVIDE_F` 由 `33` 改为 **`16.5`** 即得 100 MHz。`CLKOUT2`（`MMCM_CLKOUT1_DIVIDE=50`）**保持 33 MHz 不动**（uncore 必须维持 33 MHz）。
+1. **时钟（2026-09-13 依用户要求定稿）**：`cpu_clk` 由**新增的 Clocking Wizard IP `clk_wiz_cpu`（MMCM）**产生——输入板级 `clk` 100 MHz，`DIVCLK_DIVIDE=1`、`CLKFBOUT_MULT_F=12.0` → **VCO=1200 MHz**，`CLKOUT0_DIVIDE_F=12.0` → **100 MHz**；`locked` 参与复位门控；频率可由 `CPU_CLK_MHZ` 配为 50/60/75/100。**不使用晶振直连**，也**不改动**平台 `clk_pll_33`（其 `clk_out2` 继续提供 uncore 33 MHz，`clk_out1` 弃用）。SoC 顶层用本项目最小差异副本 `fpga/rtl/soc_top_rv32gc.v`（仅时钟块与 CPU 例化不同），详见 `../07-fpga-timing.md` §1.1。
 2. `chip/soc_demo/loongson/config.h:33`：`` `define FREQ 32'd33000000 `` → `32'd100000000`（否则 CONFREG `FREQ_ADDR` 与软件计时错误）；`software/bsp/drivers/confreg_time.c` 的 `CORE_CLOCKS_PER_SEC`（weak，33 MHz）与内核 `timebase-frequency` 同步改 100 MHz。
 3. XDC：`set_clock_groups -asynchronous -group [get_clocks cpu_clk] -group [get_clocks uncore_clk]`（`soc_up.xdc` 只约束板级 100 MHz 输入，不能替代 `cpu_clk` 约束）。
 4. `axi_clock_converter_0` 无需改配置（频率无关，内部 FIFO 自动反压）；但 100→33 MHz 带宽比约 3:1，DDR 侧成为瓶颈，`03-cache.md` §9 的命中率目标更重要。
