@@ -54,33 +54,40 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ## 4. 当前状态与卡点（第 7 轮结束时的事实，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
-2. **arch-test 7 组全绿（91 例 0 失败）**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、
-   `Zca` 26/26、**`Zaamo` 9/9**、**`Zalrsc` 2/2**。批量：`bash scripts/run_arch_test_suite.sh <组名>`。
-   注意：`run_arch_test.sh` 默认加 `-DMISALIGNED_TRAP`（参考模型 Spike 对非对齐访存一律报 cause 4/6）；
-   要验证默认拆分行为设 `RV32GC_NO_MISALIGNED_TRAP=1`。
+2. **arch-test 12 组全绿（106 例 0 失败）**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、
+   `Zca` 26/26、`Zaamo` 9/9、`Zalrsc` 2/2、`Misalign` 5/5、`MisalignZca` 4/4、`Zicntr` 2/2、
+   **`Zicbom` 3/3**、**`Zihintpause` 1/1**。
+   批量：`bash scripts/run_arch_test_suite.sh <组名>`（JOBS=4 并行更快）。
+   注意：`run_arch_test.sh` 默认加 `-DMISALIGNED_TRAP`；**MARCH 已改为自动合成**（基座
+   rv32imac_zicsr_zifencei_zicntr ∪ 用例头部声明的扩展），不要再写死 MARCH，否则会整组失败。
 3. **A 扩展定向自测全绿**：`bash scripts/run_lrsc_test.sh` → `LRSC_DIRECTED: PASS`
-   （`sim/tests/lrsc.S`，28 项：LR/SC 同址/异址/二次 LR/rd=rs2/rd=rs1=rs2、store 清保留集、
-   SC 消费保留集、AMO 读-改-写、原子与 SC 非对齐陷阱）。
-4. **第 7 轮修了 4 处缺陷 + 1 处测试模型加固**（详见 `AGENT.md` §6「第 7 轮」，含逐项必要性验证表）：
-   * RTL `rtl/top/rv32gc_core.v`：① **MEM 级转发漏掉访存结果**（`mem_fwd_en` 曾要求
-     `mem_mem_op_q == MEM_NONE` → LR/SC/LOAD 结果只能等 WB，紧跟其后的消费者读到旧值；
-     **这是 Zalrsc/Zaamo 组转绿的直接原因**）；② **保留集不清**（普通 store、SC 成功/失败、
-     AMO 写完成都要清）；③ **`M_DONE` 无条件回 `M_IDLE` 会在前端停顿时重放同一条指令**
-     （对 SC 致命：rd 被改成 1 并重复写内存）→ 改为 linger。
-   * 测试模型 `sim/tb/sim_axi_slave.v`：④ 读数据由组合读改为**寄存一拍**（AR 握手拍锁存），
-     消除"写后读同一地址返回上一版数据"的仿真竞态。**这不是 Zalrsc 通过的原因**（已验证：
-     旧 slave + 新 RTL 也能通过），但没有它 `lrsc.S` 会假失败。
+   （`sim/tests/lrsc.S`，28 项检查）。
+4. **本轮（第 7 轮）修复 3 个真实 RTL 缺陷 + 1 处测试模型加固 + Zicbom 落地**，详见 `AGENT.md`
+   §6「第 7 轮」（含逐项必要性验证表）：
+   * RTL `rv32gc_core.v`：① **MEM 级转发漏掉访存结果**（LL/SC/LOAD 结果只能等 WB，紧跟的
+     消费者读到旧值 → Zalrsc/Zaamo 组失败的真正原因）；② **保留集不清**（普通 store、SC
+     成功/失败、AMO 写完成都要清）；③ **`M_DONE` 无条件回 `M_IDLE` 在前端停顿时重放同一条
+     指令**（对 SC 致命）→ 改为 linger。
+   * 测试模型 `sim/tb/sim_axi_slave.v`：④ 读数据改为**寄存一拍**（AR 握手拍锁存），消除
+     "写后读同一地址返回上一版数据"的仿真竞态（不是 Zalrsc 通过的原因，但 `lrsc.S` 需要它）。
+   * Zicbom：`rv32_csr.v` 新增 **menvcfg(0x30A)/senvcfg(0x10A)** 的 CBCFE[6]/CBZE[7]/CBIE[5:4]；
+     `rv32gc_core.v` ID 级做 CBO 低特权级许可检查；**`uop_ctrl_t` 73→74 bit 新增 `is_cbo`**
+     （`cbo_op` 的 0 值与 ECALL 冲突，必须单独一位）；`rtl/pkg/rv32gc_defs.vh` 与
+     `docs/design/spec/{02,03}` 已同步；RTL 中硬编码的 `[72:0]`/`73'd0` 全部改用
+     `` `UOP_CTRL_W ``（否则 `dec_ctrl[73]` 读出 X，仿真会卡死在取指 X 地址）。
 5. **⚠️ 上一轮的结论已更正**：`Zalrsc-sc.w-00` 的失败**不是** upstream ACT4 生成器缺陷，
-   而是本核的 MEM 转发缺陷（上表 #1）。`scripts/tests/arch_sigreg_clobber_report.md` 顶部已加
-   更正说明，`arch_scan_sigreg_clobber.py` 的值模型作废、**不要再据此判定生成器缺陷**。
-6. **下一步（阶段 2A 剩余）**：
-   a. 按 2A-3/2A-4 补 CSR/异常/PMP → Sv32 MMU + L1I/L1D/L2 Cache（`AGENT.md` §7 任务表）；
-   b. 关注 `Misalign*` / `Zicbom/Zicbop/Zicboz` 等尚未接入的组（本核已实现 Zicbom 译码，
-      可先跑 `bash scripts/run_arch_test_suite.sh Zicbom` 看现状）；
-   c. FPGA tcl 与上板 B1~B3（`fpga/tcl/build_chiplab.tcl`，时钟 IP 已备好 `create_clk_wiz_cpu.tcl`）。
+   而是本核的 MEM 转发缺陷（见 #4 之①）。`scripts/tests/arch_sigreg_clobber_report.md` 顶部
+   已加更正横幅；`arch_scan_sigreg_clobber.py` 的值模型作废，**不要据此判定生成器缺陷**。
+6. **下一步（阶段 2A 剩余，按 `AGENT.md` §7 任务表）**：
+   a. **PMP**（`UDB_NUM_PMP_ENTRIES` 目前为 0；内核/SBI 需要）→ 打开对应 arch-test 组；
+   b. **Sv32 MMU（TLB+PTW）+ L1I/L1D/L2 Cache**（2A-4；CBO 现在是"走 LSU 的空操作"，
+      有 Cache 后要真正实现 clean/flush/inval/zero 语义）；
+   c. 其余未接入组可继续试跑（`Zicsr` 已过；`Zicboz` 需 CBZE，已实现 CSR 位，可直接试
+      `bash scripts/run_arch_test_suite.sh Zicboz`）；
+   d. FPGA tcl 与上板 B1~B3（`fpga/tcl/build_chiplab.tcl`，时钟 IP 已备好）。
 7. **本轮新增工具/资产**：`sim/tb/tb_trace_mem.v`（提交轨迹 + D 侧请求/响应 + AXI 通道追踪）、
-   `sim/tb/tb_axi_slave_rw.v`（从设备写后读可见性的独立复现台，不接核）、
-   `sim/tests/lrsc.S` + `scripts/run_lrsc_test.sh`、`scripts/tests/`（扫描脚本与报告，含更正）。
+   `sim/tb/tb_axi_slave_rw.v`（从设备写后读可见性独立复现台）、`sim/tests/lrsc.S` +
+   `scripts/run_lrsc_test.sh`、`scripts/tests/`（扫描脚本与报告，含更正）。
 
 ## 5. 工作方式要求（必须遵守）
 

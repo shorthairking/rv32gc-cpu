@@ -5,7 +5,9 @@
 //   · M/S/U 三特权级，机器级与监管级 CSR（见 docs/design/spec/07-priv-csr-mmu.md）
 //   · 同步异常与中断的进入/返回（mret/sret）、委托 medeleg/mideleg
 //   · 计数器 mcycle/minstret（64 位，RV32 高低半）
-// 暂未实现（后续里程碑）：PMP、TLB/satp 生效、CLINT/PLIC 外部中断、menvcfg 等。
+// 暂未实现（后续里程碑）：PMP、TLB/satp 生效、CLINT/PLIC 外部中断、menvcfg/senvcfg 的
+//   CBO 之外字段（FIOM/PMM/DTE 等一律读 0）。menvcfg/senvcfg 目前只实现 Zicbom/Zicboz 的
+//   CBCFE/CBIE/CBZE 位（核内 CBO 低特权级许可检查用）。
 //
 // 读端口：组合；写端口：提交级单拍（csr_wdata 已由核内按 CSR_RW/RS/RC 语义算好）
 //=============================================================================
@@ -52,7 +54,17 @@ module rv32_csr (
   output wire        mstatus_mprv,
   output wire [1:0]  mstatus_mpp,
   output wire        timer_irq_pending,   // 预留：CLINT 比较器
-  output wire        ext_irq_pending      // 预留：PLIC
+  output wire        ext_irq_pending,     // 预留：PLIC
+
+  // ---- Zicbom/Zicboz 低特权级执行许可（供核内 CBO 模式检查）----
+  // 语义：machine.adoc norm:menvcfgcbcfeop / norm:menvcfgcbiecbo-invaloplead-in；
+  //       supervisor.adoc「senvcfg 的 CBCFE/CBIE 控制 U 模式」。
+  output wire        menvcfg_cbcfe,       // CBO.CLEAN/CBO.FLUSH 在 <M 模式允许执行
+  output wire        menvcfg_cbze,        // CBO.ZERO 在 <M 模式允许执行
+  output wire [1:0]  menvcfg_cbie,        // CBO.INVAL 在 <M 模式的使能（0b00=禁用）
+  output wire        senvcfg_cbcfe,       // U 模式额外条件
+  output wire        senvcfg_cbze,        // U 模式额外条件
+  output wire [1:0]  senvcfg_cbie         // U 模式额外条件
 );
 
   // ---------------------------------------------------------------- 状态寄存器
@@ -69,6 +81,10 @@ module rv32_csr (
 
   reg [31:0] stvec_q, sscratch_q, sepc_q, scause_q, stval_q;
   reg [31:0] sie_q, sip_q, scounteren_q, satp_q;
+  // menvcfg/senvcfg：本核只用到它们的 CBO（Zicbom/Zicboz）低特权级执行许可位。
+  // 位域（RV32）：CBIE[5:4]、CBCFE[6]、CBZE[7]（machine.adoc menvcfg / supervisor.adoc senvcfg）。
+  // 复位为 0 = 低特权级禁用 CBO，与规范默认一致。
+  reg [31:0] menvcfg_q, senvcfg_q;
 
   reg [63:0] mcycle_q, minstret_q;
 
@@ -83,6 +99,14 @@ module rv32_csr (
   assign mstatus_mpp   = mstatus_mpp_q;
   assign timer_irq_pending = 1'b0;    // 预留
   assign ext_irq_pending   = 1'b0;    // 预留
+
+  // Zicbom/Zicboz 许可位：RV32 位域 CBIE[5:4] / CBCFE[6] / CBZE[7]
+  assign menvcfg_cbze   = menvcfg_q[7];
+  assign menvcfg_cbcfe  = menvcfg_q[6];
+  assign menvcfg_cbie   = menvcfg_q[5:4];
+  assign senvcfg_cbze   = senvcfg_q[7];
+  assign senvcfg_cbcfe  = senvcfg_q[6];
+  assign senvcfg_cbie   = senvcfg_q[5:4];
 
   // ---------------------------------------------------------------- 特权级判定
   // CSR 地址的 [9:8] 位给出最低可访问特权级：00=U 01=S 11=M
@@ -144,6 +168,7 @@ module rv32_csr (
       `CSR_MIMPID:  csr_rdata = 32'h0000_2A01;   // 阶段 2A 版本
       `CSR_MHARTID: csr_rdata = 32'd0;
       `CSR_MCONFIGPTR: csr_rdata = 32'd0;
+      `CSR_MENVCFG: csr_rdata = menvcfg_q;
 
       // ---- 监管级 ----
       // sstatus 是 mstatus 的受限视图（19=MXR 18=SUM 16:15=XS 14:13=FS 8=SPP 5=SPIE 1=SIE）
@@ -169,6 +194,7 @@ module rv32_csr (
       `CSR_STVAL:   csr_rdata = stval_q;
       `CSR_SIP:     csr_rdata = sip_q & mideleg_q;
       `CSR_SATP:    csr_rdata = satp_q;
+      `CSR_SENVCFG: csr_rdata = senvcfg_q;
 
       // ---- 计数器 ----
       `CSR_CYCLE:   csr_rdata = mcycle_q[31:0];
@@ -197,6 +223,7 @@ module rv32_csr (
       `CSR_MVENDORID, `CSR_MARCHID, `CSR_MIMPID, `CSR_MHARTID, `CSR_MCONFIGPTR,
       `CSR_SSTATUS, `CSR_SIE, `CSR_STVEC, `CSR_SCOUNTEREN, `CSR_SSCRATCH, `CSR_SEPC,
       `CSR_SCAUSE, `CSR_STVAL, `CSR_SIP, `CSR_SATP,
+      `CSR_MENVCFG, `CSR_SENVCFG,
       `CSR_CYCLE, `CSR_CYCLEH, `CSR_TIME, `CSR_TIMEH, `CSR_INSTRET, `CSR_INSTRETH:
         csr_exists = 1'b1;
       default: csr_exists = 1'b0;
@@ -272,6 +299,8 @@ module rv32_csr (
       sie_q           <= 32'd0;
       sip_q           <= 32'd0;
       scounteren_q    <= 32'd0;
+      menvcfg_q       <= 32'd0;
+      senvcfg_q       <= 32'd0;
       satp_q          <= 32'd0;
       mcycle_q        <= 64'd0;
       minstret_q      <= 64'd0;
@@ -367,6 +396,17 @@ module rv32_csr (
           `CSR_STVAL:   stval_q   <= csr_wdata;
           `CSR_SIP:     sip_q     <= csr_wdata & 32'h0000_0222;
           `CSR_SATP:    satp_q    <= csr_wdata;   // 阶段 2A 暂不生效（MMU 后续里程碑）
+          // menvcfg/senvcfg：只保留 CBO 相关位（CBIE[5:4] 的 0b10 保留编码按 WARL 归 0）
+          `CSR_MENVCFG: begin
+            menvcfg_q[7]   <= csr_wdata[7];
+            menvcfg_q[6]   <= csr_wdata[6];
+            menvcfg_q[5:4] <= (csr_wdata[5:4] == 2'b10) ? 2'b00 : csr_wdata[5:4];
+          end
+          `CSR_SENVCFG: begin
+            senvcfg_q[7]   <= csr_wdata[7];
+            senvcfg_q[6]   <= csr_wdata[6];
+            senvcfg_q[5:4] <= (csr_wdata[5:4] == 2'b10) ? 2'b00 : csr_wdata[5:4];
+          end
           default: ;
         endcase
       end

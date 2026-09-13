@@ -14,7 +14,7 @@
 
 ---
 
-## 2. 控制位定义（`uop_ctrl_t`，共 73 bit）
+## 2. 控制位定义（`uop_ctrl_t`，共 74 bit）
 
 > 所有位在 ID 级一次译出，随 uop 流动；`reserved` 位写 0。
 > 常量定义放在 `rtl/pkg/rv32gc_defs.vh`，RTL 中只使用宏名，不写字面量。
@@ -55,6 +55,7 @@
 | `[70]` | `is_sfence` | 1 | SFENCE.VMA（提交时清 TLB） |
 | `[71]` | `is_serial` | 1 | 串行化指令（CSR/SYS/FENCE 类，RT 级单条提交） |
 | `[72]` | `use_rs3` | 1 | 需要读第三源（仅 FMA 类，`rs3_arch = instr[31:27]`） |
+| `[73]` | `is_cbo` | 1 | Zicbom：该指令是 `cbo.inval/clean/flush/zero`（`cbo_op` 的 0 值与 ECALL 冲突，必须单独一位；供核内做 menvcfg/senvcfg 低特权级许可检查） |
 
 ### 2.1 `fp_op` 编码
 

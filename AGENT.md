@@ -428,11 +428,31 @@ trap 签名 / 存储未落盘"**全部由本轮修复的核内缺陷解释**，�
 
 即 4 项修复**各自都不可省**，且 #1 是 `Zalrsc`/`Zaamo` 组转绿的直接原因。
 
+#### Zicbom 落地（本轮追加，含 CSR 与陷阱语义）
+
+* **menvcfg/senvcfg**：`rtl/csr/rv32_csr.v` 新增两个 CSR（0x30A/0x10A），实现 Zicbom/Zicboz
+  的许可位 CBCFE[6]/CBZE[7]/CBIE[5:4]（CBIE=0b10 为保留编码，按 WARL 归 0），其余字段读 0；
+  复位为 0。位域依据：machine.adoc menvcfg、supervisor.adoc senvcfg 的 wavedrom 定义。
+* **CBO 低特权级许可检查**（`rv32gc_core.v` ID 级）：priv<M 时 CBO.CLEAN/CBO.FLUSH 需
+  `menvcfg.CBCFE=1`、CBO.ZERO 需 `menvcfg.CBZE=1`、CBO.INVAL 需 `menvcfg.CBIE∈{01,11}`；
+  priv=U 还需 `senvcfg` 同名位为 1，否则报非法指令（cause=2）。
+  规范条文：machine.adoc `norm:menvcfgcbcfeop`、`norm:menvcfgcbiecbo-invaloplead-in`；
+  supervisor.adoc「senvcfg 的 CBCFE/CBIE 控制 U 模式」。
+* **`uop_ctrl_t` 73 → 74 bit**：新增 `is_cbo`（位 73）。原因：`cbo_op` 的 0 值与 ECALL 的
+  `sys_op` 无法区分（两者都是 `op_class=SYS` + `is_serial=1`），模式检查必须能判别"这是不是
+  CBO 指令"。同步更新 `rtl/pkg/rv32gc_defs.vh`、`docs/design/spec/02-uop-and-decode.md` §2、
+  `docs/design/spec/03-pipeline-regs.md`（两处表）；RTL 里原先**硬编码的 `[72:0]` / `73'd0`
+  已全部改为 `` `UOP_CTRL_W `` 宏**（否则 `dec_ctrl[73]` 读出 X，会污染 PC/CSR 通路，实测表现为
+  仿真卡死在取指 X 地址）。
+* **用例 ISA 串自动合成**：`scripts/arch_test_build.sh` 改为「DUT 基座 rv32imac_zicsr_zifencei_zicntr
+  ∪ 用例 `START_TEST_CONFIG` 头声明的扩展」。写死基座会让 Zicbom/Zihintpause 因缺扩展而整组 0/N；
+  直接用头部串又缺 `_zicntr`（Zicsr 组把 `csrrs instret` 当非法，实测 4/6 FAIL）。故取并集。
+
 #### 验证（本轮实测）
 
 | 项 | 结果 |
 |---|---|
-| arch-test `I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo`/`Zalrsc` | **39/8/6/1/26/9/2 全 PASS**（共 **91 例 0 失败**） |
+| arch-test **12 组**：`I`/`M`/`Zicsr`/`Zifencei`/`Zca`/`Zaamo`/`Zalrsc`/`Misalign`/`MisalignZca`/`Zicntr`/`Zicbom`/`Zihintpause` | **39/8/6/1/26/9/2/5/4/2/3/1 全 PASS**（共 **106 例 0 失败**） |
 | 端到端 | `SIM: PASS hello`、`SIM: PASS memtest` |
 | 单元测试 | AXI 79 / EXEC 2461 / DECODER 254 全通过 |
 | A 扩展定向自测 | `sim/tests/lrsc.S`（28 项检查）→ `LRSC_DIRECTED: PASS` |

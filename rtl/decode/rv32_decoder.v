@@ -120,7 +120,7 @@ module rv32_decoder (
   output wire [4:0]  rd_arch,
   output wire [31:0] imm,
   output wire [11:0] csr_addr,
-  output wire [72:0] ctrl         // 按 spec/02 §2 打包（含 use_rs3 位 [72]）
+  output wire [`UOP_CTRL_W-1:0] ctrl   // 按 spec/02 §2 打包（含 use_rs3[72]、is_cbo[73]）
 );
 
   //---------------------------------------------------------------------------
@@ -370,6 +370,7 @@ module rv32_decoder (
   reg        rd_wen_d;
   reg        rd_is_fp_d;
   reg        use_rs1_d, use_rs2_d, use_rs3_d;
+  reg        is_cbo_d;       // Zicbom：cbo.* 专用标志（cbo_op==0 与 ECALL 无法区分，必须单独一位）
   reg        excp_valid_d;
   reg [3:0]  excp_cause_d;
   reg        is_fence_d, is_fencei_d, is_sfence_d, is_serial_d;
@@ -408,6 +409,7 @@ module rv32_decoder (
     use_rs1_d    = 1'b0;
     use_rs2_d    = 1'b0;
     use_rs3_d    = 1'b0;
+    is_cbo_d = 1'b0;
     excp_valid_d = 1'b0;
     excp_cause_d = `DEXC_NONE;
     is_fence_d   = 1'b0;
@@ -619,6 +621,7 @@ module rv32_decoder (
               if (legal32) begin
                 op_class_d = `OP_SYS;
                 is_serial_d= 1'b1;
+                is_cbo_d   = 1'b1;
                 imm_type_d = IMM_NONE;
                 rs1_d      = rs1_i;
                 use_rs1_d  = 1'b1;
@@ -878,6 +881,7 @@ module rv32_decoder (
   assign ctrl[`CTRL_IS_SFENCE_H   -: `CTRL_IS_SFENCE_W]   = is_sfence_d;
   assign ctrl[`CTRL_IS_SERIAL_H   -: `CTRL_IS_SERIAL_W]   = is_serial_d;
   assign ctrl[`CTRL_USE_RS3_H     -: `CTRL_USE_RS3_W]     = use_rs3_d;
+  assign ctrl[`CTRL_IS_CBO_H      -: `CTRL_IS_CBO_W]      = is_cbo_d;
 
   //---------------------------------------------------------------------------
   // 5. 其余输出

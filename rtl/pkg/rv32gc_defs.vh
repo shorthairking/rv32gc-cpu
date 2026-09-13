@@ -410,9 +410,9 @@
 //                   fp_fmt[1:0], fp_op[5:0], amo_op[4:0], amo_flags[1:0],
 //                   mem_flags[1:0], mem_size[1:0], mem_op[2:0], mdu_op[2:0],
 //                   br_flags[3:0], br_type[2:0], alu_b_sel[2:0], alu_a_sel[1:0],
-//                   alu_op[4:0], op_class[2:0], use_rs3}
+//                   alu_op[4:0], op_class[2:0], use_rs3, is_cbo}
 //-----------------------------------------------------------------------------
-`define UOP_CTRL_W   73   // [72]=use_rs3（FMA 第三源）
+`define UOP_CTRL_W   74   // [72]=use_rs3（FMA 第三源）, [73]=is_cbo（Zicbom 用途判别）
 // 各字段在 ctrl 中的高位下标（低位 = 下标 - 宽度 + 1）
 `define CTRL_OP_CLASS_H    2
 `define CTRL_ALU_OP_H      7
@@ -445,6 +445,7 @@
 `define CTRL_IS_SFENCE_H   70
 `define CTRL_IS_SERIAL_H   71
 `define CTRL_USE_RS3_H     72
+`define CTRL_IS_CBO_H      73
 
 // 字段抽取宏：CTRL_GET(ctrl, FIELD)
 `define CTRL_GET(ctrl, name)  (ctrl[`CTRL_``name``_H -: `CTRL_``name``_W])
@@ -480,6 +481,7 @@
 `define CTRL_IS_SFENCE_W   1
 `define CTRL_IS_SERIAL_W   1
 `define CTRL_USE_RS3_W     1
+`define CTRL_IS_CBO_W      1
 
 //-----------------------------------------------------------------------------
 // 13. 物理寄存器约定

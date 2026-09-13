@@ -40,7 +40,7 @@
 | 字段 | 宽度 | 说明 |
 |---|---|---|
 | `valid` | 1 | — |
-| `ctrl` | 73 | 控制位（`uop_ctrl_t`，含 `use_rs3`） |
+| `ctrl` | 74 | 控制位（`uop_ctrl_t`，含 `use_rs3`、`is_cbo`） |
 | `pc` | 32 | — |
 | `imm` | 32 | — |
 | `ps1`, `ps2`, `ps3` | 7×3 | 源物理寄存器号（`use_rsX=0` 时仍填 P0）；`ps3` 仅 FMA 使用（`use_rs3`，架构源 `instr[31:27]`） |
@@ -135,7 +135,7 @@
 | `rob_idx` | 7 | ROB 索引（用于清空与提交排序） |
 | `lsq_idx` | 5 | 访存类专用 |
 | `age` | 5 | 老化计数（用于最老优先选择；与 ROB 索引二选一，见 `05-ooo-core.md`） |
-| `ctrl` | 73 | 控制位（`uop_ctrl_t`，含 `use_rs3`） |
+| `ctrl` | 74 | 控制位（`uop_ctrl_t`，含 `use_rs3`、`is_cbo`） |
 | `imm`, `pc` | 32+32 | 立即数与 PC |
 
 **深度**：整型 32（IQ_INT_DEPTH）、访存 24（IQ_MEM_DEPTH）、浮点 16（IQ_FP_DEPTH）。

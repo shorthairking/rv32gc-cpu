@@ -90,7 +90,7 @@ module rv32gc_core (
   wire [4:0]  dec_rs1, dec_rs2, dec_rs3, dec_rd;
   wire [31:0] dec_imm;
   wire [11:0] dec_csr_addr;
-  wire [72:0] dec_ctrl;
+  wire [`UOP_CTRL_W-1:0] dec_ctrl;
 
   rv32_decoder u_decoder (
     .instr_raw(id_instr_q), .pc(id_pc_q),
@@ -165,8 +165,15 @@ module rv32gc_core (
     .xret_pc(xret_pc), .xret_new_priv(xret_new_priv),
     .priv_o(priv_q),
     .mstatus_mie(), .mstatus_sie(), .mstatus_mprv(), .mstatus_mpp(),
-    .timer_irq_pending(), .ext_irq_pending()
+    .timer_irq_pending(), .ext_irq_pending(),
+    .menvcfg_cbcfe(menvcfg_cbcfe), .menvcfg_cbze(menvcfg_cbze), .menvcfg_cbie(menvcfg_cbie),
+    .senvcfg_cbcfe(senvcfg_cbcfe), .senvcfg_cbze(senvcfg_cbze), .senvcfg_cbie(senvcfg_cbie)
   );
+  // Zicbom/Zicboz 低特权级执行许可（menvcfg/senvcfg 的 CBCFE/CBIE/CBZE）
+  wire menvcfg_cbcfe, menvcfg_cbze;
+  wire [1:0] menvcfg_cbie;
+  wire senvcfg_cbcfe, senvcfg_cbze;
+  wire [1:0] senvcfg_cbie;
 
   // ID 级异常
   wire        id_is_sys = (c_op_class == `OP_SYS);
@@ -174,9 +181,31 @@ module rv32gc_core (
   wire        id_ebreak = id_is_sys && (c_sys_op == `SYS_EBREAK) && dec_legal;
   wire [3:0]  ecall_cause = (priv_q == `PRV_U) ? `DEXC_ECALL_U :
                             (priv_q == `PRV_S) ? `DEXC_ECALL_S : `DEXC_ECALL_M;
-  wire        id_excp_valid = id_valid_q && (!dec_legal || id_ecall || id_ebreak);
-  wire [3:0]  id_excp_cause = !dec_legal ? `DEXC_ILLEGAL : id_ebreak ? `DEXC_BREAK : ecall_cause;
-  wire [31:0] id_excp_tval  = !dec_legal ? dec_instr : 32'd0;
+  // ---- Zicbom/Zicboz：低特权级执行许可检查（ID 级，产生非法指令异常）----
+  // 规范（machine.adoc / supervisor.adoc）：
+  //   · CBO.CLEAN/CBO.FLUSH：priv<M 时要求 menvcfg.CBCFE=1；priv=U 还要求 senvcfg.CBCFE=1；
+  //   · CBO.ZERO          ：priv<M 时要求 menvcfg.CBZE=1； priv=U 还要求 senvcfg.CBZE=1；
+  //   · CBO.INVAL         ：priv<M 时要求 menvcfg.CBIE∈{01,11}；priv=U 还要求 senvcfg.CBIE∈{01,11}。
+  //   M 模式恒可执行。
+  // 本核暂无 Cache（CBO 目前只是"走 LSU 的串行空操作"），因此这里只实现**许可与陷阱**语义。
+  wire [1:0] id_cbo_op   = dec_ctrl[`CTRL_CBO_OP_H -: `CTRL_CBO_OP_W];
+  wire       id_is_cbo   = id_valid_q && dec_legal && dec_ctrl[`CTRL_IS_CBO_H];
+  wire       id_cbo_is_m = (priv_q == `PRV_M);
+  wire       id_cbo_is_u = (priv_q == `PRV_U);
+  // 各级许可（M 恒可执行）
+  wire       cbo_clean_flush_ok = menvcfg_cbcfe && (!id_cbo_is_u || senvcfg_cbcfe);
+  wire       cbo_zero_ok        = menvcfg_cbze  && (!id_cbo_is_u || senvcfg_cbze);
+  wire       cbo_inval_ok       = (menvcfg_cbie == 2'b01 || menvcfg_cbie == 2'b11) &&
+                                  (!id_cbo_is_u || (senvcfg_cbie == 2'b01 || senvcfg_cbie == 2'b11));
+  wire       id_cbo_denied = id_is_cbo && !id_cbo_is_m &&
+                             ((id_cbo_op == `CBO_CLEAN || id_cbo_op == `CBO_FLUSH) ? !cbo_clean_flush_ok :
+                              (id_cbo_op == `CBO_ZERO)  ? !cbo_zero_ok  :
+                              (id_cbo_op == `CBO_INVAL) ? !cbo_inval_ok  : 1'b0);
+
+  wire        id_excp_valid = id_valid_q && (!dec_legal || id_ecall || id_ebreak || id_cbo_denied);
+  wire [3:0]  id_excp_cause = (!dec_legal || id_cbo_denied) ? `DEXC_ILLEGAL
+                                                           : id_ebreak ? `DEXC_BREAK : ecall_cause;
+  wire [31:0] id_excp_tval  = (!dec_legal || id_cbo_denied) ? dec_instr : 32'd0;
 
   // ID 级 JAL
   wire        id_jal_taken  = id_valid_q && dec_legal && c_is_jal;
@@ -189,7 +218,7 @@ module rv32gc_core (
   reg  [2:0]  ex_ilen_q;
   reg  [11:0] ex_csr_addr_q;
   reg  [31:0] ex_csr_rdata_q;
-  reg  [72:0] ex_ctrl_q;
+  reg  [`UOP_CTRL_W-1:0] ex_ctrl_q;
   reg         ex_valid_q, ex_rd_wen_q, ex_excp_valid_q;
   reg  [3:0]  ex_excp_cause_q;
   reg  [31:0] ex_excp_tval_q;
@@ -495,7 +524,7 @@ module rv32gc_core (
       ex_rs1_val_q <= 32'd0; ex_rs2_val_q <= 32'd0;
       ex_rs1_q <= 5'd0; ex_rs2_q <= 5'd0; ex_rd_q <= 5'd0; ex_ilen_q <= 3'd4;
       ex_csr_addr_q <= 12'd0; ex_csr_rdata_q <= 32'd0;
-      ex_ctrl_q <= 73'd0; ex_valid_q <= 1'b0; ex_rd_wen_q <= 1'b0;
+      ex_ctrl_q <= {`UOP_CTRL_W{1'b0}}; ex_valid_q <= 1'b0; ex_rd_wen_q <= 1'b0;
       ex_excp_valid_q <= 1'b0; ex_excp_cause_q <= 4'd0; ex_excp_tval_q <= 32'd0;
 
       mem_pc_q <= 32'd0; mem_instr_q <= 32'd0; mem_alu_q <= 32'd0; mem_addr_q <= 32'd0;
