@@ -370,6 +370,7 @@ def decode32(w):
                  rd_wen=1 if rd else 0, is_serial=1, use_rs1=0 if cimm else 1)
             d.update(rs1=rs1, rd=rd, csr=f12, imm_type="CSR" if cimm else "I")
     elif op == 0x2F and f3 == 2:                       # AMO
+        d["imm_type"] = "NONE"    # A 类指令无立即数（RTL 用 imm_gen 保留输入 -> imm=0）
         aq, rl = (w >> 26) & 1, (w >> 25) & 1
         aflags = (rl << M("AMOF_RL")) | (aq << M("AMOF_AQ"))
         amos = {0x01: "AMO_SWAP", 0x00: "AMO_ADD", 0x04: "AMO_XOR", 0x08: "AMO_OR",
