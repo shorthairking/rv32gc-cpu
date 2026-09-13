@@ -115,6 +115,17 @@
 `define DDR_SIZE            32'h0800_0000   // 128 MiB
 `define SRAM_BASE           32'h1C00_0000
 `define SRAM_SIZE           32'h0010_0000   // 1 MiB
+
+// ---- SPI Flash XIP 启动窗口（决策 D16；与 SRAM 窗口同址）----
+// 平台把 paddr[31:20]==12'h1C0 接到 SPI 控制器（chiplab `IP/AMBA/axi_mux_syn.v:946`），
+// **没有硬件 boot ROM**，复位后的第一条指令就从这个窗口 XIP 执行；另有 0x1FE8_0000 别名窗口。
+`define SPI_XIP_BASE        32'h1C00_0000   // 复位取指窗口（= SRAM_BASE，1 MiB，只读 XIP）
+`define SPI_XIP_MASK        32'hFFF0_0000   // 1 MiB 窗口判定掩码
+`define SPI_XIP_ALIAS_BASE  32'h1FE8_0000   // 同一 SPI 控制器的别名窗口（= SPI_BASE）
+`define SPI_XIP_ALIAS_MASK  32'hFFFF_0000   // 64 KiB 窗口判定掩码
+// D16② 判定：地址是否落在 SPI-XIP 窗口 —— 取指命中时必须**绕过 I-Cache**
+`define IS_SPI_XIP(a)   ((((a) & `SPI_XIP_MASK) == `SPI_XIP_BASE) || \
+                         (((a) & `SPI_XIP_ALIAS_MASK) == `SPI_XIP_ALIAS_BASE))
 `define CLINT_BASE          32'h1F00_0000   // 核内截获
 `define PLIC_BASE           32'h1F10_0000   // 核内截获（1 MiB 窗口）
 `define CONFREG_FPGA_BASE   32'h1FD0_0000   // confreg_syn.v

@@ -62,10 +62,17 @@ module rv32gc_core (
   wire        line_valid;
   wire        flush_front;
 
+  // ---- D16② SPI-XIP 取指判定点：命中 SPI 窗口必须**绕过 I-Cache** ----
+  // 平台复位取指窗口是 0x1C00_0000（SPI Flash XIP，无硬件 boot ROM；另有 0x1FE8_0000 别名），
+  // 见 `rv32gc_defs.vh` 的 `IS_SPI_XIP 与 AGENT.md §2 D16。当前基线核无 I-Cache，该信号只
+  // 接到取指单元并在填充时记录（rv32_ifetch 的 line_xip_q）；阶段 2A-4 上 I-Cache 后**必须**
+  // 用它禁止 XIP 行的填充/命中，详见 rv32_ifetch.v 的说明。
+  wire        if_spi_xip = `IS_SPI_XIP(fetch_pc);
+
   rv32_ifetch u_ifetch (
     .clk(clk), .rst_n(rst_n),
     .pc(fetch_pc), .hw0(hw0), .hw1(hw1), .line_valid(line_valid),
-    .flush(flush_front),
+    .flush(flush_front), .xip_bypass(if_spi_xip),
     .if_req_valid(if_req_valid), .if_req_addr(if_req_addr), .if_req_ready(if_req_ready),
     .if_rsp_valid(if_rsp_valid), .if_rsp_data(if_rsp_data),
     .if_rsp_err(if_rsp_err), .if_rsp_ready(if_rsp_ready)

@@ -531,16 +531,82 @@ rd=rs2/rd=rs1=rs2、store 清保留集、SC 消费保留集、AMO 读-改-写、
 
 ---
 
+### 阶段 2A 进展（第 9 轮，2026-09-13）：SPI-XIP 启动链路打通（2A-7a）
+
+**结论**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**（441 拍，rc=0）。核能在平台的真实
+复位取指窗口 **`0x1C00_0000`（SPI Flash XIP，平台没有硬件 boot ROM）** 取到并执行首条指令，在 SPI
+窗口内完成自检后以 `auipc+addi+jalr` **跨约 448 MiB** 跳到 DDR `0x0` 继续执行，最终写退出码 0。
+
+#### 交付物
+
+| 文件 | 说明 |
+|---|---|
+| `scripts/run_spi_boot_test.sh`（新增，229 行） | 编译测试 → 切双镜像 → 用 `-DRESET_PC=32'h1C000000` 重编全部 RTL（top=`tb_spi_boot`）→ 跑 → 判定 `SPI_BOOT: PASS` |
+| `sim/tb/tb_spi_boot.v`（新增，335 行） | 专用 TB：复用 `sim_axi_slave` 与同一退出约定，新增 5 条启动链路断言 |
+| `sim/tests/spi_link.ld`（新增） | `.text.spi`→`0x1C00_0000`、`.text.ddr`→`0x0` 两个地址区 |
+| `sim/tests/spi_boot.S`（改写，245 行） | 入口 PC 落窗自检 + SPI 段 ALU 自检 + **XIP 数据读**（`lw` 读回魔数 `0xC0DEF00D`）+ 跨窗口 `jalr` + DDR 段 ALU/写读回（含窄写与同址连续换值回读） |
+| `rtl/pkg/rv32gc_defs.vh`、`rtl/frontend/rv32_ifetch.v`、`rtl/top/rv32gc_core.v` | **D16② 判定点**（见下）：`SPI_XIP_BASE/MASK` + `` `IS_SPI_XIP `` → `if_spi_xip` → `rv32_ifetch.xip_bypass`（请求侧组合判定）/`line_xip_q`（填充侧记录本行窗口归属） |
+| `docs/design/spec/08-bus-axi.md` | §2.1 订正"SRAM/SPI-XIP 可缓存"的一刀切说法 + 写明 D16② 的判定点与 2A-4 必须做的两件事；留下"数据侧是否也绕 L1D"的待决项 |
+
+**镜像切分（关键设计）**：一个 ELF 两个地址区（跨区 `%pcrel_hi/lo` 必须由链接器在同一 ELF 内解析），再用
+`objcopy -O verilog --verilog-data-width=1` 切两份字节宽度 hex：SPI 段用 `--only-section=.text.spi
+--change-section-address .text.spi=0` 重定位到 0 基（`$readmemh` 的目标 `mem_spi[]` 是 1 MiB 0 基数组，
+带 `@1C000000` 的记录会越界），DDR 段保持 `@0`；分别经 `+SPI_INIT=` 与 `+MEM_LO_INIT=` 载入。
+踩坑：objcopy 的 verilog 输出按 **LMA** 写地址（只改 `--change-section-vma` 无效）；输出为 CRLF。
+
+**"退出码 0 = PASS" 的确定性判定**：程序把退出码写 `0x1FAF_FF00`（CONFREG 仿真 IO_SIMU）；`sim_axi_slave`
+在写 beat 落地那拍置 1 拍 `exit_we` 并锁存 `exit_wdata`；`tb_spi_boot.v` **在 `exit_we` 那一拍按退出值
+本身**判定（0 → `$finish`/PASS，非 0 → FAIL/`$fatal`），因此"写 0"不会被误当成"没结束"而判超时。
+
+#### 验证（本轮实测；主 Agent 全部复跑）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 启动链路（主 Agent 复跑） | `bash scripts/run_spi_boot_test.sh` | **`SPI_BOOT: PASS`**，rc=0，5 条 TB 断言全 OK，441 拍 |
+| 日志观测量 | 同上日志 | 首笔取指 `@0x1c000000`；SPI 窗口提交 PC `0x1c000000`；DDR 提交 PC `0x00000000`；取指请求 15 笔；退出码 0 |
+| 反汇编核对 | `sim/tests/out/spi_boot.dump` | 跨窗口跳转为原样三连 `auipc t0,0xe4000; addi t0,t0,-140; jalr t0`（`0x1C00008C + 0xE4000000(sign) − 0x8C = 0x0`） |
+| **负对照 1**（SPI 镜像缺失） | `vvp … +SPI_INIT=/tmp/不存在.hex` | **FAIL**（CHECK-2/5 FAIL，退出码 `0x21`，rc=1） |
+| **负对照 2**（破坏 XIP 魔数 `0x0D→0x0E`） | `vvp … +SPI_INIT=/tmp/bad.spi.hex` | **FAIL**（CHECK-3/4/5 FAIL，退出码 **`0x13`=E_SPI_LOAD**，rc=1）——证明 XIP **数据读**真的在读 SPI 内存 |
+| 无回归（本项） | `run_sim.sh hello` / `memtest`、`run_unit_axi.sh` | PASS（hello 352 拍、AXI 79 checks；主 Agent 独立复跑 hello 亦 PASS） |
+
+#### D16② 落实情况（"命中 SPI 窗口时绕过 I-Cache"）
+
+当前基线核**无 I-Cache**（`rv32_ifetch` 是单行取指缓冲：去掉就取不到指令，不是 Cache），所以"绕过"在本阶段
+**没有行为差异**。为避免该约束在 2A-4 被遗忘，判定点已**物理连好**：`` `IS_SPI_XIP(fetch_pc) `` →
+`xip_bypass`（请求侧）+ `line_xip_q`/`req_xip_q`（填充侧记录该行的窗口归属）。`rv32_ifetch.v` 顶部与
+`docs/design/spec/08-bus-axi.md` §2.1 写明 2A-4 必须两处都用上：① 填充侧禁止 `line_xip_q=1` 的行进入
+Cache 阵列（不能只看请求侧判定——命中的是*之前取过的行*）；② 请求侧 `xip_bypass=1` 时不得从阵列命中。
+否则 XIP 读被缓存且平台无一致性维护 → 取指错乱（D16 否决原因③）。本项改动**行为中性**（对现有 123 例
+arch-test 与 hello/memtest 无影响，已复跑）。
+
+#### 已知限制（不要当成已验过）
+
+* 真实 SPI 控制器的**读写命令序列**（`0x03` 读 / `0x02` 页编程 / WREN / WIP 轮询、上电延迟、时钟分频）不在
+  仿真模型内：`sim_axi_slave.v` 的 `mem_spi[]` 是行为级 XIP 窗口（命中即按字节返回，**写忽略**）。本测试
+  **不对 SPI 写做任何断言**，程序也从不写 SPI 窗口。
+* 只验证"取指与数据读经 AXI 命中 `0x1C00_0000` 窗口"这条链路；平台实机首次访问前是否需要命令播种未覆盖。
+* 取指命中但 X 权限被 PMP 拒绝时"不发未检查地址"（`spec/09-verification-interface.md` AXI-15）在当前取指单元
+  上尚未做请求抑制；随 P1-b 的 PMP 一并评估（见 §7）。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
-**当前状态（2026-09-13，阶段 2A 进行中）**：已执行 5 个 goal round。
+**当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
 - ✅ 仿真/回归环境（iverilog + Verilator + Spike 参考模型 + 自研 TB + 锁步工具链）已建成
-- ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）
-- ✅ **arch-test 5 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26（共 80 例 0 失败）
+- ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）
+- ✅ **arch-test 17 组 123 例 0 失败**（I 39/M 8/Zicsr 6/Zifencei 1/Zca 26/Zaamo 9/Zalrsc 2/Misalign 5/
+  MisalignZca 4/Zicntr 2/Zicbom 3/Zicboz 1/Zicbop 3/Zihintpause 1/Zihintntl 4/ZihintntlZca 4/Zmmul 4/Zicond 2）
+- ✅ **A 扩展定向自测**（`bash scripts/run_lrsc_test.sh` → `LRSC_DIRECTED: PASS`）
 - ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
-- ✅ A 扩展（LR/SC/AMO）执行通路已实现（写回阶段 + 读-改-写 + 保留集 + 原子对齐检查）
-- ⏭ 下一步：**SPI-XIP 启动链路（2A-7a，见 §2 D16）** → PMP → Sv32 MMU + Cache → 上板 B1~B3
-- 📌 **平台适配结论（D15）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、以及把核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI —— 已作为任务 2A-7 列入
+- ✅ **SPI-XIP 启动链路（2A-7a，第 9 轮）**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**
+  （`RESET_PC=0x1C00_0000` → SPI 窗口取首条指令 → 跨 ~448 MiB 跳 DDR `0x0` → 退出码 0）；D16② 的
+  "取指命中 SPI 窗口绕过 I-Cache"判定点已落地（当前无 Cache，行为中性）
+- ⏭ 下一步（顺序即优先级）：**PMP（2A-3 收尾）** → 未接入组（`Zimop` 40/`Zcmop` 8）→ Sv32 MMU → L1I/L1D/L2 Cache
+  → 平台适配收尾（2A-7b~d：启动镜像三件套/DTS+OpenSBI 声明/FPGA tcl 与上板 B1~B3）
+- 📌 **平台适配结论（D15/D16）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；
+  需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI
+- 📌 **待用户确认（2A-4 前）**：数据侧访问 SPI-XIP 窗口（`0x1C00_0000`）是否也要绕过 L1D（见 `spec/08-bus-axi.md` §2.1 待决项）
 - 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）
 
 
@@ -572,7 +638,7 @@ bash scripts/run_spi_boot_test.sh        # SPI_BOOT: PASS（RESET_PC=0x1C00_0000
 | 2A-4 | MMU（Sv32 TLB+PTW）与 L1I/L1D、L2 | `rtl/mmu/`、`rtl/mem/` | Cache/TLB 单元测试通过 |
 | 2A-5 | arch-test 接入（Spike 生成签名）+ 自研裸机测试框架 | `sw/tests/`、`sim/log` | I/M/A/F/D/C/Zicsr/Zifencei 子集全绿 |
 | 2A-6 | FPGA 工程脚本与上板 | `fpga/build_chiplab.tcl`、bit 流 | 串口输出 + 数码管正确 + 60 MHz 收敛 |
-| 2A-7a | **SPI-XIP 启动链路（仿真可验）**：`sim_axi_slave.v` 增加 SPI 窗口（`0x1C00_0000`+`0x1FE8_0000` 别名，只读，`+SPI_INIT=` 载镜像）；`sim/tests/spi_boot.S` + 专用链接脚本（`.text.spi`→`0x1C00_0000`、`.text.ddr`→`0x0`）；`scripts/run_spi_boot_test.sh` 以 `-DRESET_PC=32'h1C000000` 编译 RTL 并断言 `SPI_BOOT: PASS`；取指命中 SPI 窗口时绕过 I-Cache | 见 §2 D16 的源码级依据；`sim/log/dbg/spi_link.ld` 雏形已写 | **无 Cache 的基线核**：`RESET_PC=0x1C000000` → SPI 窗口取首条指令 → 算术自检 → `auipc+jalr` **跨 ~448 MiB** 跳 DDR `0x0` → DDR 内算术/写读回 → 退出码 0；且 arch-test 17 组回归不受影响 |
+| 2A-7a | ✅ **已完成（第 9 轮）** SPI-XIP 启动链路：`run_spi_boot_test.sh` → `SPI_BOOT: PASS`；`spi_boot.S`+`spi_link.ld`+`tb_spi_boot.v`；D16② 的取指绕 I-Cache 判定点已落地 | `scripts/run_spi_boot_test.sh`、`sim/tb/tb_spi_boot.v`、`sim/tests/spi_link.{ld,S}`、`rtl` 三处判定点 | **已达成**：`RESET_PC=0x1C000000` → SPI 窗口取首条指令（`@0x1c000000`）→ SPI 段 ALU+XIP 数据读自检 → `auipc+addi+jalr` 跨 ~448 MiB → DDR `0x0` 段 ALU/写读回 → 退出码 0；两条负对照均正确 FAIL；arch-test 17 组/hello/memtest/单元测试无回归 |
 | 2A-7b | **启动镜像三件套**：SPI 小引导（0x1C00_0000，PC 相对，能初始化 UART 并跳 DDR）→ DDR 主镜像（`0x0` 起，OpenSBI+U-Boot）→ NAND 分区（D14）；产出烧写/打包脚本 | `sw/` 下的 board 目录 + `scripts/` 打包脚本 | SPI 镜像 ≤1 MiB 且全部 PC 相对；DDR 镜像按 `0x0` 链接；三者能串起来跑到 U-Boot 提示符（先仿真后上板） |
 | 2A-7c | **DTS/OpenSBI 内存映射声明**：DRAM 基址 `0x0`+128 MiB、核内 CLINT/PLIC `0x1F00_0000/0x1F10_0000`、UART `0x1FE0_01E0`、SPI `0x1C00_0000`、NAND 分区 | `docs/porting/00-overview.md` §平台适配、DTS/`platform_override` 片段 | `dtc` 编译通过；OpenSBI 启动打印的内存/中断信息与 DTS 一致 |
 | 2A-7d | **FPGA tcl 与上板 B1~B3**：`fpga/tcl/build_chiplab.tcl`（工程内生成，不改 chiplab 源树）→ 约束复用 `soc_up.xdc` → 综合实现 → 60 MHz 收敛 → 上板串口输出 + 从 `0x1C00_0000` 启动 | `fpga/`、Vivado 报告 | 上板从 SPI 启动打印串口信息；时序报告 WNS≥0 @60 MHz；B1~B3 通过 |

@@ -20,6 +20,9 @@ module rv32_ifetch (
 
   input  wire         flush,          // 重定向/异常：丢弃当前行
 
+  // ---- D16② SPI-XIP 取指判定（由 rv32gc_core.v 用 `IS_SPI_XIP(fetch_pc) 算好）----
+  input  wire         xip_bypass,     // 1 = 本次取指地址落在 SPI Flash XIP 窗口
+
   // ---- AXI 取指客户端（rv32_axi_master） ----
   output reg          if_req_valid,
   output reg  [31:0]  if_req_addr,
@@ -34,6 +37,26 @@ module rv32_ifetch (
   reg [31:0]  line_tag_q;      // PC[31:5]
   reg         line_vld_q;
   reg         busy_q;          // 正在等待 AXI 返回
+  /* verilator lint_off UNUSED */
+  reg         line_xip_q;      // 本行来自 SPI-XIP 窗口？—— 2A-4 的 I-Cache 必须禁止其填充
+  reg         req_xip_q;       // 在途请求行的窗口归属（请求发起拍采样，响应拍写入 line_xip_q）
+  /* verilator lint_on UNUSED */
+
+  //-----------------------------------------------------------------------------
+  // D16② 「命中 SPI 窗口绕过 I-Cache」的判定点（本阶段无 Cache，行为不变）
+  //
+  // 本模块当前只有**单行取指缓冲** `line_q`：它是取指的功能性缓冲，去掉就取不到指令，
+  // 不是 Cache，所以"绕过"在此阶段无行为差异。为使该约束**不可遗忘**，判定点在这里落地为
+  // 两个信号：
+  //   · xip_bypass —— 组合判定，本拍取指地址落在 SPI-XIP 窗口（`0x1C00_0000` 1 MiB 或
+  //                   别名 `0x1FE8_0000` 64 KiB，见 `rv32gc_defs.vh` 的 `IS_SPI_XIP`）；
+  //   · line_xip_q —— 填充时记录：当前缓冲行来自 XIP 窗口。
+  // 阶段 2A-4 引入真正的 I-Cache 时**必须**用它们禁止 XIP 行被缓存：
+  //   ① 填充侧：`line_xip_q=1` 的行不得写入 Cache 阵列 —— 不能只看请求侧的 xip_bypass，
+  //      因为 Cache 命中的是**之前取过的行**；
+  //   ② 请求侧：`xip_bypass=1` 时不得从 Cache 阵列命中，每拍都走总线 XIP 读。
+  // 否则 XIP 读被缓存且平台无一致性维护 → 取指错乱（D16「否决原因③」）。
+  //-----------------------------------------------------------------------------
 
   wire        hit = line_vld_q && (pc[31:5] == line_tag_q[31:5]);   // 比较行号（line_tag_q 存的是完整字节地址）
   assign line_valid = hit;
@@ -49,6 +72,8 @@ module rv32_ifetch (
       line_q      <= 256'd0;
       line_tag_q  <= 32'hFFFF_FFFF;
       line_vld_q  <= 1'b0;
+      line_xip_q  <= 1'b0;
+      req_xip_q   <= 1'b0;
       busy_q      <= 1'b0;
       if_req_valid<= 1'b0;
       if_req_addr <= 32'd0;
@@ -58,6 +83,7 @@ module rv32_ifetch (
         line_q     <= if_rsp_data;
         line_tag_q <= if_req_addr;
         line_vld_q <= 1'b1;
+        line_xip_q <= req_xip_q;   // D16②：记录本行是否来自 XIP 窗口（2A-4 禁止其入 Cache）
         busy_q     <= 1'b0;
       end
 
@@ -71,6 +97,7 @@ module rv32_ifetch (
       if (!hit && !busy_q && !if_req_valid && !flush) begin
         if_req_valid <= 1'b1;
         if_req_addr  <= {pc[31:5], 5'b0};
+        req_xip_q    <= xip_bypass;   // 采样"本请求行是否属于 SPI-XIP 窗口"
         busy_q       <= 1'b1;
       end
 

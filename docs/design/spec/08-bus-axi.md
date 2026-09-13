@@ -78,7 +78,7 @@ core_top ──AR/R──► axi_2x1_mux ──m1_*──┐ （S01 = debug_sram
 | 窗口 | 区间 | 属性 | 取指 | load/store | 去向 |
 |---|---|---|---|---|---|
 | DDR3 | `0x0000_0000`–`0x07FF_FFFF`（128 MiB） | **可缓存**（写回+写分配） | ✅ | ✅（含 AMO/LR/SC） | L2→AXI，ID 0/1/2 |
-| SRAM / SPI-XIP | `0x1C00_0000`–`0x1C0F_FFFF`（1 MiB） | **可缓存** | ✅ | ✅ | L2→AXI，ID 0/1/2 |
+| SRAM / SPI-XIP | `0x1C00_0000`–`0x1C0F_FFFF`（1 MiB；= 平台 SPI Flash XIP **复位取指窗口**，另有 `0x1FE8_0000` 64 KiB 别名） | 数据侧**可缓存**；**取指侧绕过 I-Cache**（D16②） | ✅（XIP，**不进 I-Cache**） | ✅ | L2→AXI，ID 0/1/2 |
 | CONFREG（FPGA / 仿真） | `0x1FD0_0000`–`0x1FD0_FFFF` / `0x1FAF_0000`–`0x1FAF_FFFF`（各 64 KiB） | **非缓存/强序** | ❌ cause 1 | ✅ | uncached，ID 3 |
 | UART0 / NAND | `0x1FE0_0000`–`0x1FE0_3FFF`（16 KiB，寄存器 `+0x1E0`）/ `0x1FE7_8000`–`0x1FE7_BFFF`（16 KiB，数据口 `+0x40`） | **非缓存/强序** | ❌ cause 1 | ✅ | uncached，ID 3 |
 | SPI / MAC | `0x1FE8_0000`–`0x1FE8_FFFF`（64 KiB）/ `0x1FF0_0000`–`0x1FF0_FFFF`（64 KiB） | **非缓存/强序** | ❌ cause 1 | ✅ | uncached，ID 3 |
@@ -89,6 +89,8 @@ core_top ──AR/R──► axi_2x1_mux ──m1_*──┐ （S01 = debug_sram
 - AMO/LR/SC 只允许落在**可缓存**窗口；设备窗口上的 `lr.w/sc.w/amo*.w` 由 PMA 检查判为访问错误（LR→cause 5，SC/AMO→cause 7），不发起 AXI（本平台无总线锁定能力，A 扩展要求可原子访问的 PMA）。
 - 设备窗口**不允许取指**（读设备寄存器有副作用：16550 RBR/IIR 读清、NAND 数据口、MAC 描述符、仿真 `VIRTUAL_UART`）→ IF2 直接报 cause 1，`mtval`=取指 PC。
 - 核内解码比平台**更窄**：平台按 `addr[31:16]` 粗译码（`0x1fe0/0x1fe7/0x1fd0` 整块）且 `default→DDR`；本核用上表精确窗口（`0x1FE0_4000-0x1FE0_FFFF` 在平台上也会落到 APB，本核**不承认**该别名）。
+- **D16② SPI-XIP 取指必须绕过 I-Cache（已落地的判定点）**：平台没有硬件 boot ROM，**复位后的第一条指令就在上表这个 1 MiB 窗口里**（`chiplab/IP/AMBA/axi_mux_syn.v:946`；详见 `AGENT.md` §2 D16）。判定点已按"不依赖 Cache 存在"的方式落地：`rv32gc_defs.vh` 的 `` `IS_SPI_XIP(addr) `` → `rv32gc_core.v` 的 `if_spi_xip` → `rv32_ifetch.xip_bypass`（组合判定）与 `line_xip_q`（填充时记录该行的窗口归属）。当前基线核无 I-Cache，二者行为等价；**2A-4 引入 I-Cache 时必须两处都用上**：① **填充侧**禁止 `line_xip_q=1` 的行进入 Cache 阵列（不能只看请求侧的组合判定 —— Cache 命中的是*之前取过的行*）；② **请求侧** `xip_bypass=1` 时不得从 Cache 阵列命中，每拍都走总线 XIP 读。否则 XIP 读被缓存且平台无一致性维护 → 取指错乱（D16 否决原因③）。
+- **待决（2A-4 落地 I-Cache/L1D 前必须确认）**：**数据侧**访问该窗口（`lw` 读 SPI Flash）是否也要绕过 L1D/Cache？本表暂按"数据侧可缓存"（XIP 内容在启动期不变，缓存不引入一致性问题），但若引导/运行期软件会对 SPI 控制器发擦写命令（flash 编程），则 D 侧同样必须按**非缓存/强序**处理。届时需在 `addr_decode.v` 的 region 属性里区分"取指"与"数据"两条路径（`is_fetch` 已在端口列表中预留）。
 
 ### 2.2 端口与伪代码
 

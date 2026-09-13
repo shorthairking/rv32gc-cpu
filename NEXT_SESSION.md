@@ -51,9 +51,13 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ```
 注意：Spike 的 `--log-commits` 输出在 **stderr**（用 `2>&1 1>/dev/null`）；Spike 的内存映射用 `-m0x80000000:0x10000000,...`（0x0 布局会与设备区冲突）；本核复位 PC=0，跑 0x8000_0000 布局的镜像需要 **`-DRESET_PC=32'h8000_0000`** 重编或用 `arch_stub.S` 跳转桩。
 
-## 4. 当前状态与卡点（第 8 轮结束时的事实，请从这里接手）
+## 4. 当前状态与卡点（第 9 轮结束时的事实，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
+   **新增（第 9 轮）**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**（441 拍）——
+   `RESET_PC=0x1C00_0000` 复位 → 在 **SPI Flash XIP 窗口**取到并执行首条指令 → SPI 段 ALU + XIP 数据读
+   自检 → `auipc+addi+jalr` **跨约 448 MiB** 跳到 DDR `0x0` → DDR 段 ALU/写读回 → 退出码 0；两条负对照
+   （SPI 镜像缺失 / 破坏 XIP 魔数）都按预期 `SPI_BOOT: FAIL`（退出码 0x21 / 0x13）。**2A-7a 已完成**。
 2. **arch-test 17 组全绿（123 例 0 失败）**：`I` 39、`M` 8、`Zicsr` 6、`Zifencei` 1、`Zca` 26、
    `Zaamo` 9、`Zalrsc` 2、`Misalign` 5、`MisalignZca` 4、`Zicntr` 2、`Zicbom` 3、`Zicboz` 1、
    `Zicbop` 3、`Zihintpause` 1、`Zihintntl` 4、`ZihintntlZca` 4、`Zmmul` 4、`Zicond` 2。
@@ -79,24 +83,45 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
    而是本核的 MEM 转发缺陷（#4 之①）。`scripts/tests/arch_sigreg_clobber_report.md` 顶部有更正
    横幅；`arch_scan_sigreg_clobber.py` 的值模型作废，**不要据此判定生成器缺陷**。
 6. **下一步（阶段 2A 剩余，按 `AGENT.md` §7 任务表；顺序即优先级）**：
-   a. **[P1] 2A-7a SPI-XIP 启动链路（仿真可验）** —— 见 `AGENT.md` §2 **D16**：chiplab 复位取指
-      地址是 **`0x1C00_0000`**（SPI Flash XIP，`IP/AMBA/axi_mux_syn.v` 的 `[31:20]==0x1c0` 判决），
-      DDR3 在 `0x0`，**没有硬件 boot ROM**。要做：`sim_axi_slave.v` 的 SPI 窗口（已改，未提交）+
-      `sim/tests/spi_boot.S`（`.text.spi`→`0x1C00_0000`、`.text.ddr`→`0x0`，用 `auipc+jalr` 跨
-      ~448 MiB 跳转）+ `scripts/run_spi_boot_test.sh`（`-DRESET_PC=32'h1C000000`，断言
-      `SPI_BOOT: PASS`）；取指命中 SPI 窗口须绕过 I-Cache。
-   b. **[P1] PMP**（`UDB_NUM_PMP_ENTRIES` 仍为 0；内核/SBI 需要）—— 实现 pmpcfg0-3/pmpaddr0-15 +
-      S/U 访问检查（L/X/W/R + TOR/NA4/NAPOT），再跑 `tests/priv` 的 `PMPS`(11)/`PMPSm`(38)/`PMPU`(11)/
-      `PMPZaamo`(1)/`PMPZalrsc`(1)/`PMPZca`(15)/`PMPF`(1)；
-   c. **[P2] Sv32 MMU（TLB+PTW）** → 跑 `tests/priv/ExceptionsSv`(8) 等；**L1I/L1D/L2 Cache**（2A-4）——
-      有 Cache 后 CBO 才需要真正实现 clean/flush/inval/zero 语义（目前是"走 LSU 的空操作"）；
-   d. **[P2] 未接入组**：`Zimop` 0/40、`Zcmop` 0/8（MOP 预留编码，规范要求"未实现的 MOP 应执行
-      而不产生副作用"，需给译码加 MOP 处理）；
-   e. **[P3] 2A-7b~d**：启动镜像三件套 → DTS/OpenSBI 声明 → FPGA tcl 与上板 B1~B3。
+   a. **[P0/P1] 2A-3 收尾：PMP** —— 实现 `pmpcfg0-3`(0x3A0-0x3A3) / `pmpaddr0-15`(0x3B0-0x3BF)
+      （**16 项，G=0 = 4 字节粒度，pmpaddr 32 位全可写**），TOR/NA4/NAPOT + 锁定语义 +
+      S/U 访问检查 + `mstatus.MPRV` 对数据访问的特权级替换（**当前核把 `.mstatus_mprv/.mstatus_mpp`
+      空接**，必须接出）。查明的关键前提（**已实测，勿重复推导**）：
+      · `sim/arch_test/config/rvtest_config.h` 的 PMP 宏必须 = `UDB_NUM_PMP_ENTRIES`/`UDB_NUM_PMP_ENTIRES`
+        （上游拼写错，两个都要定义）/`UDB_NUM_USABLE_PMP_ENTRIES` = **16**、`UDB_PMP_GRANULARITY` = **2**
+        （UDB 语义 = G+2，即 G=0；写 4 会得到签名不符的假失败）、`UDB_PMP_NAPOT_SUPPORTED` +
+        `UDB_PMP_TOR_SUPPORTED` 都要打开（框架铺 U 模式背景区要求至少一个）——**已改好**。
+      · `scripts/run_arch_test*.sh` 已支持 `tests/priv/<组>`（`run_arch_test_suite.sh PMPS` 自动回退，
+        也接受 `priv/PMPS` 写法）；`scripts/arch_test_build.sh` 已修特权组头部的 `rv${XLEN}` 解析 ——
+        **已改好并实测**（`run_arch_test.sh I/I-add-00` 仍 PASS，`run_arch_test_suite.sh PMPS 'PMPS_csr_access'`
+        能定位/构建/运行并正确判 FAIL）。
+      · **必须先对齐配置再动 RTL**，否则用例编不过/期望值错。
+      · **不能靠"闸掉总线请求"实现拒绝**：M_IDLE 不发请求又不回 `M_DONE` → `mem_stall` 恒 1 → 死锁且
+        永不进 trap；ifetch 不发 `if_req_valid` → `line_valid` 永不置 → 前端死锁。正确做法是复用
+        **misaligned 的免请求写法**（`memst_q<=M_DONE` + 直接置 cause 5/7 与 tval）与 **ID 级异常注入**
+        （cause 1，tval = `id_pc_q`，32 位指令要覆盖 pc 与 pc+2）。
+      · 参考实现落点：状态放 `rtl/csr/rv32_csr.v`（读 case / 存在性表 / 写 case，注意 `pmpcfg` 的 **L=1
+        整字节忽略**、`L=1 && A=TOR` 时 `pmpaddr[i-1]` 也忽略、**WB→ID 读旁通（`rv32_csr.v:209-212`）必须
+        返回"锁定合并后"的有效值**）；匹配逻辑用独立组合模块 `rtl/csr/rv32_pmp.v`（**规则：最低编号匹配项
+        决定**，不是"所有匹配项都要允许"；匹配项必须覆盖访问的**全部字节**；`L=0 && M 模式 ⇒ 通过`；
+        无匹配 ⇒ M 通过、S/U 拒绝）。
+      · **范围（需用户确认）**：本核无 F/D、无 Zcb，故 `PMPF`(1) 与 `PMPZca` 里依赖 Zcb/Zcf/Zcd 的 3 例
+        **不可达**，现实目标是 **74/78**（PMPS 11 + PMPSm 38 + PMPU 11 + PMPZaamo 1 + PMPZalrsc 1 + PMPZca 12）。
+      · `PMPZicbo`(4) 需要 CBO 指令真正走一趟 MEM FSM（现在 `rv32_decoder.v` 只置 `is_cbo/use_rs1`、不置
+        `mem_op`），本里程碑不做。
+   b. **[P2] Sv32 MMU（TLB+PTW）** → 跑 `tests/priv/ExceptionsSv`(8) 等；**L1I/L1D/L2 Cache**（2A-4）——
+      有 Cache 后 CBO 才需要真正实现 clean/flush/inval/zero 语义，并且 **D16② 的 XIP 绕 Cache 判定点
+      （`xip_bypass`/`line_xip_q`，已连好）必须在 I-Cache 落地时接上**；另需定"数据侧是否也绕 L1D"。
+   c. **[P2] 未接入组**：`Zimop` 0/40、`Zcmop` 0/8（MOP 预留编码，规范要求"未实现的 MOP 应执行
+      而不产生副作用"，需给译码加 MOP 处理）；`PMPZicbo`(4) 随 Cache 一起做。
+   d. **[P3] 2A-7b~d**：启动镜像三件套 → DTS/OpenSBI 声明 → FPGA tcl 与上板 B1~B3。
 7. **本轮新增工具/资产**：`sim/tb/tb_trace_mem.v`（提交轨迹 + D 侧请求/响应 + AXI 通道追踪，
    定位本轮三个缺陷的关键工具）、`sim/tb/tb_axi_slave_rw.v`（从设备写后读可见性独立复现台）、
    `sim/tests/lrsc.S` + `scripts/run_lrsc_test.sh`（A 扩展定向自测）、`scripts/tests/`
    （生成器缺陷扫描脚本与报告，含更正）。
+   **第 9 轮新增**：`scripts/run_spi_boot_test.sh` + `sim/tb/tb_spi_boot.v` + `sim/tests/spi_link.ld`
+   （SPI-XIP 启动链路：双镜像切分、5 条启动链路断言、"退出码 0 = PASS"的确定性判定）；
+   `rtl` 三处 D16② 判定点（`SPI_XIP_*`/`` `IS_SPI_XIP ``/`xip_bypass`/`line_xip_q`）。
 
 ## 5. 工作方式要求（必须遵守）
 
