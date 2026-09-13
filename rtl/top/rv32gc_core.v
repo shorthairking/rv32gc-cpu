@@ -299,6 +299,7 @@ module rv32gc_core (
   reg  [2:0]  mem_ilen_q;
   reg  [11:0] mem_csr_addr_q;
   reg  [2:0]  mem_wb_sel_q, mem_mem_op_q, mem_sys_op_q;
+  reg  [4:0]  mem_amo_op_q;
   reg  [1:0]  mem_mem_size_q, mem_mem_flags_q, mem_csr_op_q;
   reg         mem_rd_wen_q, mem_valid_q, mem_csr_imm_q;
   reg         mem_excp_valid_q;
@@ -308,24 +309,56 @@ module rv32gc_core (
   // ============================================================ MEM 级访问 FSM
   // 访存 FSM：支持非对齐访问的"两次单拍"拆分（跨 4 字节边界时）
   localparam [2:0] M_IDLE = 3'd0, M_REQ = 3'd1, M_WAIT = 3'd2, M_DONE = 3'd3,
-                   M_REQ2 = 3'd4, M_WAIT2 = 3'd5;
+                   M_REQ2 = 3'd4, M_WAIT2 = 3'd5,
+                   M_REQ_W = 3'd6, M_WAIT_W = 3'd7;   // 原子指令/SC 的写回阶段
   reg  [2:0]  memst_q;
   reg  [31:0] m_addr_q, m_wdata_q, m_rdata_q, m_rdata2_q, m_excp_tval_q;
   reg  [3:0]  m_wstrb_q, m_wstrb2_q;
   reg         m_we_q, m_err_q, m_split_q;
   reg  [1:0]  m_size_q, m_uns_q, m_shift_q;
   reg  [3:0]  m_excp_cause_q;
+  // A 扩展：原子访问类型、amo 操作码、写数据、以及单 hart 保留集（LR/SC）
+  reg         m_is_lr_q, m_is_sc_q, m_is_amo_q;
+  reg  [4:0]  m_amo_op_q;
+  reg  [31:0] m_rs2_q;
+  reg         resv_valid_q;
+  reg  [31:0] resv_addr_q;
+
+  // MEM 级原子属性（用于 M_IDLE 判断，来自当前 MEM 寄存器而非锁存值）
+  wire        mem_is_lr   = (mem_mem_op_q == `MEM_LR);
+  wire        mem_is_sc   = (mem_mem_op_q == `MEM_SC);
+  wire        mem_is_amo  = (mem_mem_op_q == `MEM_AMO);
+  wire        mem_is_atomic = mem_is_lr | mem_is_sc | mem_is_amo;
+  wire [4:0]  mem_amo_op  = mem_ctrl_amo_op;
+
+  // AMO 读-改-写的结果值（组合；用已读回的字 m_rdata_q 与 rs2 锁存值 m_rs2_q）
+  reg  [31:0] amo_wdata;
+  always @(*) begin
+    case (m_amo_op_q)
+      `AMO_ADD:  amo_wdata = m_rdata_q + m_rs2_q;
+      `AMO_SWAP: amo_wdata = m_rs2_q;
+      `AMO_XOR:  amo_wdata = m_rdata_q ^ m_rs2_q;
+      `AMO_OR:   amo_wdata = m_rdata_q | m_rs2_q;
+      `AMO_AND:  amo_wdata = m_rdata_q & m_rs2_q;
+      `AMO_MIN:  amo_wdata = ($signed(m_rdata_q) < $signed(m_rs2_q)) ? m_rdata_q : m_rs2_q;
+      `AMO_MAX:  amo_wdata = ($signed(m_rdata_q) > $signed(m_rs2_q)) ? m_rdata_q : m_rs2_q;
+      `AMO_MINU: amo_wdata = (m_rdata_q < m_rs2_q) ? m_rdata_q : m_rs2_q;
+      `AMO_MAXU: amo_wdata = (m_rdata_q > m_rs2_q) ? m_rdata_q : m_rs2_q;
+      default:   amo_wdata = m_rs2_q;
+    endcase
+  end
 
   // 请求有效须覆盖两次拆分访问：M_REQ（第一次）与 M_REQ2（第二次）。
   // 历史缺陷：只写了 M_REQ，非对齐拆分时第二次访问永不发请求、FSM 卡在 M_REQ2
   // （Zifencei / Zca 等用例里出现非对齐访问即整机停摆）。
-  assign d_req_valid = (memst_q == M_REQ) || (memst_q == M_REQ2);
-  assign d_req_we    = m_we_q;
+  assign d_req_valid = (memst_q == M_REQ) || (memst_q == M_REQ2) || (memst_q == M_REQ_W);
+  assign d_req_we    = (memst_q == M_REQ_W) ? 1'b1 : m_we_q;
   assign d_req_addr  = m_addr_q;
   assign d_req_wdata = m_wdata_q;
   assign d_req_wstrb = m_wstrb_q;
   assign d_rsp_ready = 1'b1;
 
+  wire [4:0]  mem_ctrl_amo_op = mem_amo_op_q;
   wire        mem_needs_fsm = mem_valid_q && (mem_mem_op_q != `MEM_NONE);
   wire        mem_done_now  = (memst_q == M_DONE);
   // 拆分判定（组合，基于 MEM 级寄存器）
@@ -457,12 +490,15 @@ module rv32gc_core (
       mem_pc_q <= 32'd0; mem_instr_q <= 32'd0; mem_alu_q <= 32'd0; mem_addr_q <= 32'd0;
       mem_imm_q <= 32'd0; mem_rs1_val_q <= 32'd0; mem_rs2_val_q <= 32'd0; mem_csr_rdata_q <= 32'd0;
       mem_rd_q <= 5'd0; mem_ilen_q <= 3'd4; mem_csr_addr_q <= 12'd0;
-      mem_wb_sel_q <= `WB_ALU; mem_mem_op_q <= `MEM_NONE; mem_sys_op_q <= 3'd0;
+      mem_wb_sel_q <= `WB_ALU; mem_mem_op_q <= `MEM_NONE; mem_sys_op_q <= 3'd0; mem_amo_op_q <= 5'd0;
       mem_mem_size_q <= 2'd0; mem_mem_flags_q <= 2'd0; mem_csr_op_q <= `CSR_NONE;
       mem_rd_wen_q <= 1'b0; mem_valid_q <= 1'b0; mem_csr_imm_q <= 1'b0;
       mem_excp_valid_q <= 1'b0; mem_excp_cause_q <= 4'd0; mem_excp_tval_q <= 32'd0;
 
       memst_q <= M_IDLE; m_addr_q <= 32'd0; m_wdata_q <= 32'd0; m_rdata_q <= 32'd0;
+      m_rdata2_q <= 32'd0; m_wstrb2_q <= 4'd0; m_split_q <= 1'b0;
+      m_is_lr_q <= 1'b0; m_is_sc_q <= 1'b0; m_is_amo_q <= 1'b0; m_amo_op_q <= 5'd0; m_rs2_q <= 32'd0;
+      resv_valid_q <= 1'b0; resv_addr_q <= 32'd0;
       m_wstrb_q <= 4'd0; m_we_q <= 1'b0; m_err_q <= 1'b0;
       m_size_q <= 2'd0; m_uns_q <= 2'd0; m_excp_cause_q <= 4'd0; m_excp_tval_q <= 32'd0;
 
@@ -476,6 +512,7 @@ module rv32gc_core (
       // 跨行拼装必须在"本行有效"时就允许进入（不能要求 if_ready）：进入 cross_q=1 后
       // fetch_pc 变为 pc_q+2，取指单元才会去取下一行；下一行就绪后 instr_raw 由
       // {hw0(下一行首半字), cross_hw0_q(本行末半字)} 拼成完整 32 位指令。
+      if (trap_take) resv_valid_q <= 1'b0;   // 陷阱后保留集失效
       if (redirect_valid) begin
         pc_q  <= redirect_pc;
         cross_q <= 1'b0;
@@ -513,14 +550,37 @@ module rv32gc_core (
             m_we_q        <= (mem_mem_op_q != `MEM_LOAD);
             m_size_q      <= mem_mem_size_q;
             m_uns_q       <= mem_mem_flags_q;
-            m_shift_q     <= mem_addr_q[1:0];
-            m_split_q     <= mem_split;
+            m_shift_q     <= mem_is_atomic ? 2'b00 : mem_addr_q[1:0];
+            m_split_q     <= mem_is_atomic ? 1'b0  : mem_split;
             m_wdata_q     <= a1_wdata;
             m_wstrb_q     <= a1_wstrb;
             m_wstrb2_q    <= 4'hF >> (4 - (mem_nbytes - a1_bytes));
+            m_is_lr_q     <= mem_is_lr;
+            m_is_sc_q     <= mem_is_sc;
+            m_is_amo_q    <= mem_is_amo;
+            m_amo_op_q    <= mem_amo_op;
+            m_rs2_q       <= mem_rs2_val_q;
             m_excp_tval_q <= mem_addr_q;
             m_excp_cause_q<= `EXC_NONE;
-            memst_q       <= M_REQ;
+            // ---- A 扩展：原子指令（LR/SC/AMO）----
+            // 原子操作不可拆分：地址非自然对齐一律报 cause=6（与 MISALIGNED_TRAP 无关）
+            if (mem_is_atomic && mem_misaligned) begin
+              m_excp_cause_q <= `EXC_STORE_MISALIGN;
+              memst_q        <= M_DONE;
+            end else if (mem_is_sc) begin
+              // SC：保留集有效且地址一致才写；成功 rd=0，失败 rd=1；两种都清保留集
+              if (resv_valid_q && (resv_addr_q == mem_addr_q)) begin
+                m_wdata_q <= mem_rs2_val_q;
+                m_wstrb_q <= 4'hF;
+                m_rdata_q <= 32'd0;
+                memst_q   <= M_REQ_W;
+              end else begin
+                m_rdata_q <= 32'd1;
+                memst_q   <= M_DONE;
+              end
+            end else begin
+              memst_q <= M_REQ;          // load/store/LR/AMO：发起访问（LR/AMO 为读）
+            end
 `ifdef MISALIGNED_TRAP
             end
 `endif
@@ -530,8 +590,20 @@ module rv32gc_core (
                   m_rdata_q <= d_rsp_rdata;
                   m_err_q   <= d_rsp_err;
                   if (d_rsp_err) begin
-                    m_excp_cause_q <= m_we_q ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
+                    m_excp_cause_q <= (m_we_q || m_is_amo_q || m_is_sc_q) ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
+                    if (m_is_amo_q || m_is_sc_q) resv_valid_q <= 1'b0;
                     memst_q <= M_DONE;
+                  end else if (m_is_lr_q) begin
+                    // LR：写保留集，rd = 读回值（已在 m_rdata_q）
+                    resv_valid_q <= 1'b1;
+                    resv_addr_q  <= m_addr_q;
+                    memst_q      <= M_DONE;
+                  end else if (m_is_amo_q) begin
+                    // AMO：算好新值写回，rd = 旧值（m_rdata_q）；写操作使保留集失效
+                    m_wdata_q    <= amo_wdata;
+                    m_wstrb_q    <= 4'hF;
+                    resv_valid_q <= 1'b0;
+                    memst_q      <= M_REQ_W;
                   end else if (m_split_q) begin
                     // 第二次访问：地址 +4（4 字节对齐），字节使能/数据按剩余部分
                     m_addr_q  <= {m_addr_q[31:2], 2'b00} + 32'd4;
@@ -547,6 +619,12 @@ module rv32gc_core (
                   if (d_rsp_err) m_excp_cause_q <= m_we_q ? `EXC_STORE_ACCESS : `EXC_LOAD_ACCESS;
                   memst_q <= M_DONE;
                 end
+        M_REQ_W:  if (d_req_ready) memst_q <= M_WAIT_W;
+        M_WAIT_W: if (d_rsp_valid) begin
+                    // 写响应：出错按 store 访问错误记账（rd 数据对 SC 成功为 0，对齐已保证）
+                    if (d_rsp_err) m_excp_cause_q <= `EXC_STORE_ACCESS;
+                    memst_q <= M_DONE;
+                  end
         M_DONE: memst_q <= M_IDLE;
         default: memst_q <= M_IDLE;
       endcase
@@ -561,7 +639,9 @@ module rv32gc_core (
         wb_rs1_val_q   <= mem_rs1_val_q;
         wb_csr_rdata_q <= mem_csr_rdata_q;
         wb_csr_addr_q  <= mem_csr_addr_q;
-        wb_mem_data_q  <= (mem_mem_op_q == `MEM_LOAD) ? mem_load_data : mem_alu_q;
+        wb_mem_data_q  <= ((mem_mem_op_q == `MEM_LOAD) || (mem_mem_op_q == `MEM_LR) ||
+                           (mem_mem_op_q == `MEM_SC)   || (mem_mem_op_q == `MEM_AMO))
+                          ? mem_load_data : mem_alu_q;
         wb_rd_q        <= mem_rd_q;
         wb_ilen_q      <= mem_ilen_q;
         wb_wb_sel_q    <= mem_wb_sel_q;
@@ -597,6 +677,7 @@ module rv32gc_core (
           mem_csr_addr_q  <= ex_csr_addr_q;
           mem_wb_sel_q    <= e_wb_sel;
           mem_mem_op_q    <= e_mem_op;
+          mem_amo_op_q    <= ex_ctrl_q[`CTRL_AMO_OP_H -: `CTRL_AMO_OP_W];
           mem_mem_size_q  <= e_mem_size;
           mem_mem_flags_q <= e_mem_flags;
           mem_sys_op_q    <= e_sys_op;

@@ -371,9 +371,16 @@ bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_
 并在 `run_arch_test.sh` 里默认加 `-DMISALIGNED_TRAP`（可用 `RV32GC_NO_MISALIGNED_TRAP=1` 关掉）；
 `run_sim.sh` 新增 `RV32GC_DEFS` 传额外宏。默认（拆分）配置下 hello/memtest 不受影响，仍 PASS。
 
-**待办（阶段 2A 剩余）**：① Zaamo/Zalrsc（A 扩展执行通路尚未实现：LR/SC/AMO 目前会走成普通读写）
-→ ② 补 CSR/异常/PMP → ③ Sv32 MMU + L1I/L1D/L2 Cache → ④ FPGA tcl 与上板 B1~B3。
-上一轮的"组合环"假设已排除；arch-test 受支持的 5 组（I/M/Zicsr/Zifencei/Zca）已全绿。
+**A 扩展执行通路（本轮新增）**：在 `rtl/top/rv32gc_core.v` 的 MEM FSM 中实现：
+`M_REQ_W/M_WAIT_W` 写回阶段（`d_req_valid/d_req_we` 覆盖该阶段）、AMO 读-改-写（9 种 funct5：
+ADD/SWAP/XOR/OR/AND/MIN/MAX/MINU/MAXU，`rd`=旧值、内存=新值）、LR 写保留集、SC 按保留集
+成败写/不写并回 0/1、原子地址非自然对齐一律报 cause=6（原子不可拆分）、store/AMO/陷阱清保留集；
+`wb_mem_data_q` 对 LR/SC/AMO 也取内存侧数据。回归：hello/memtest 与 8 例跨组抽检全过。
+
+**待办（阶段 2A 剩余）**：① `Zaamo`/`Zalrsc` 两组仍失败，但已从"功能错误"推进到 **trap 签名记录**
+不一致（框架的 `Mismatch in trap signature!`，涉及 U→S 委派路径下 scause/sepc/stval 的记录与
+期望值的逐字段比对）→ ② 补 CSR/异常/PMP 细节 → ③ Sv32 MMU + L1I/L1D/L2 Cache → ④ FPGA tcl 与上板 B1~B3。
+已全绿：`I`/`M`/`Zicsr`/`Zifencei`/`Zca` 五组（80 例 0 失败）。
 
 ---
 
@@ -384,7 +391,8 @@ bash scripts/lockstep.sh sim/arch_test/out/I-add-00.elf 20000   # 需要 0x8000_
 - ✅ 顺序 5 级基线核跑通 `hello`、`memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 255）
 - ✅ **arch-test 5 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26（共 80 例 0 失败）
 - ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
-- ⏭ 下一步：Zaamo/Zalrsc（A 扩展执行通路）→ CSR/异常/PMP 完善 → Sv32 MMU + Cache → FPGA 上板
+- ✅ A 扩展（LR/SC/AMO）执行通路已实现（写回阶段 + 读-改-写 + 保留集 + 原子对齐检查）
+- ⏭ 下一步：Zaamo/Zalrsc 的 trap 签名记录一致性 → CSR/异常/PMP 完善 → Sv32 MMU + Cache → FPGA 上板
 - 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）
 
 

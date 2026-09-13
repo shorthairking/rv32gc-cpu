@@ -60,9 +60,12 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 3. **锁步已达标**：`bash scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000`
    → 5994 条提交与 Spike 完全一致（新增 `sim/tests/lockstep_bench.c` 纯计算基准，避免 MMIO 让 Spike 提前退出）。
    `lockstep.sh` 已修好三处工具缺陷（`32'h…` 加引号、Spike 提交日志取 stderr、RESET_PC 取 ELF 入口）。
-4. **剩余卡点：A 扩展执行通路**。`Zaamo`/`Zalrsc` 尚未实现——`mem_op=LR/SC/AMO` 目前会落到普通
-   读/写路径（AMO 不会做读-改-写、LR/SC 无保留集），需要按 `docs/design/spec/06-lsu-mem.md` 在
-   MEM FSM 里加 AMO 的读-改-写与 LR/SC 保留集语义（这是阶段 2A 收尾的最后一块 ISA 缺口）。
+4. **剩余卡点：A 扩展的 arch-test（trap 签名记录）**。LR/SC/AMO 执行通路**已实现**（MEM FSM 的
+   `M_REQ_W/M_WAIT_W` 写回阶段、AMO 读-改-写、LR/SC 保留集、原子非对齐报 cause=6），但
+   `Zaamo`/`Zalrsc` 两组仍报框架的 `Mismatch in trap signature!`：用例在 U 模式下对非对齐地址发
+   AMO，陷阱经 `medeleg` 委派进 S 模式，需逐字段核对 S 侧 `scause/sepc/stval` 的记录值与参考
+   `.results` 中 `trap_sigptr` 的期望序列（下一步入口：`python3 scripts/arch_fail_locate.py
+   sim/arch_test/out/Zaamo-amoadd.w-00.elf sim/log/Zaamo-amoadd.w-00.rtl.log --hex ...`）。
 5. **下一步顺序建议**：
    a. 查清 Zifencei 的 trap 签名计数语义；
    b. 实现 A 扩展执行通路（LR/SC/AMO 目前会走成普通读写）→ 跑 `Zaamo`/`Zalrsc` 组；
