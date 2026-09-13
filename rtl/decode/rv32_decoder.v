@@ -765,6 +765,7 @@ module rv32_decoder (
       rd_d       = rd_i;
       rd_wen_d   = (rd_i != 5'd0);
       use_rs1_d  = 1'b1;
+      imm_type_d = IMM_NONE;           // A 类指令无立即数：必须用保留输入，否则地址被加上 [31:20]
       if (funct3 == 3'b010) begin       // 仅 .W（RV32）
         case (funct5)
           5'b00010: begin               // LR.W（rs2 必须为 0）
