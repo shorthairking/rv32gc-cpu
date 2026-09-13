@@ -92,6 +92,14 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0e. ✅ **已完成（第 16 轮）**：⑤ 的仿真可验部分 —— `sw/board/{spi_stub.S,ddr_main.S,*.ld}`
+       + `scripts/{pack_boot_image.sh,run_boot_chain_test.sh}`（`PACK_BOOT: PASS (SPI 333B/1MiB, 重定位 0,
+       DDR entry 0x0)`、**`BOOT_CHAIN: PASS`** —— 用要烧写的真产物跑出 SPI 桩→DDR 镜像→退出 0）；
+       `sw/board/rv32gc-chiplab.dts` + `scripts/check_dts.sh`（**`CHECK_DTS: PASS (17 ok)`**：
+       DTS 与 `rtl/pkg/rv32gc_defs.vh` 常量交叉校验）；`docs/porting/00-overview.md` §8（OpenSBI 适配五条）。
+       **⑥ 上板计划草案**已写：`docs/porting/07-board-bringup-plan.md`（B1~B3 判据 + 8 条风险 + 5 个待用户拍板项）。
+       **下一步**：④ CBO 走内存通路（收 `SvZicbo`/`SvPMPZicbo`）→ ④ L1I Cache（最小可用方案见 AGENT.md §7）
+       → ⑥ 定稿交用户审阅。
    b0c. ✅ **已完成（第 15 轮）**：③ 收尾（一）—— 修掉**翻译+非对齐死锁**（`mem_addr_ready` 补
        `|| mem_misaligned`）、补 `menvcfgh/senvcfgh` 存在性（`Svade 2/2`）、子 Agent 修 M 模式委托语义 /
        `RVMODEL_ACCESS_FAULT_ADDRESS` 改成平台上真会 fault 的地址 / LR·SC 用 PA 比保留集+失败 SC 也上总线 /
