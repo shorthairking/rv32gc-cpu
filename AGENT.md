@@ -299,7 +299,9 @@
 
 **本阶段修复的关键缺陷（均经仿真定位）**：I-Cache 行内半字位偏移错（idx*2 当成位索引）、行标签比较用完整地址比行号、flush 与 AXI 响应同拍导致 busy 永久卡死、JAL 在 EX 被误清导致 ra 未写、ecall/ebreak 未按 op_class 门控、AXI 读响应握手自取消（d_rsp_valid 永不为 1）、load-use 停顿冻结整条流水导致死锁（改为只冻结前端 + EX 插气泡）、mstatus/sstatus 拼接位宽错（41/33 位截断）。
 
-**进行中**：`memtest`（64 KiB 字节/半字/字/走位/非对齐混合测试）尚未通过 → 正在定位（疑似 VUART 输出与内存校验交织或某类访问的拆分/转发边界问题）。
+**进行中**：
+1. `memtest`（64 KiB 字节/半字/字/走位/非对齐混合测试）尚未通过。已建立**锁步定位工具链**：`scripts/lockstep.sh` + `scripts/lockstep_diff.py`（Spike 提交轨迹 vs 本核提交轨迹，自动报首个分歧点）；已解决 Spike 侧三个环境问题（提交日志在 stderr 且块缓冲、`0x0` 布局与设备区冲突 → 统一 `0x8000_0000`、测试访问的平台地址需映射或改指 scratch），下一步用该工具定位首个分歧指令。
+2. `hello` 稳定 PASS（回归基线），`AXI_SLAVE_UNIT` / `EXEC_UNIT_TESTS` / `DECODER_UNIT_TESTS` 全绿。
 
 **待办（阶段 2A 剩余）**：memtest 通过 → arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通 → CSR/异常/PMP 完善 → Sv32 MMU + L1 Cache → FPGA tcl 与上板 B1~B3。
 

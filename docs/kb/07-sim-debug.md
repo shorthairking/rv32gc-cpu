@@ -47,6 +47,17 @@ sim/tb/
 | 上板调试 | 平台 UART 调试单元（`break_point/reg_num/rf_rdata/ws_valid`）+ CONFREG 数码管 + ILA |
 | 串口烧写 | 平台 `programmer_by_uart.bit` + xmodem（230400 波特率），见 `chiplab/docs/FPGA_run_linux/flash.md` |
 
+## 3.1 Spike 锁步（提交级比对）实测要点
+
+用法：`scripts/lockstep.sh <elf> [max_commits]` + `scripts/lockstep_diff.py`（本仓库已实现）。
+
+| 要点 | 说明 |
+|---|---|
+| 提交日志在 **stderr** | `spike --log-commits` 把提交行写到 **stderr**：必须 `2>&1 1>/dev/null`；重定向到文件时还会**块缓冲**，需 `stdbuf -oL -eL` 或让其自然结束 |
+| 内存映射 | `-m<a:m,b:n,...>`（**字节**为单位、基址 4 KiB 对齐）。裸机测试若链接在 `0x0000_0000`，Spike 会因设备区 `[0,0x1000)` 冲突而拒绝：`devices at [0, 1000) and [0, 10000000) overlap` → **锁步统一用 `0x8000_0000` 布局**（`sim/tests/link_hi.ld`） |
+| 设备地址 | 测试若访问 `0x1FAF_FF10`（仿真 VIRTUAL_UART）等平台地址，必须在 Spike 里映射该区域（`-m0x1FAF0000:0x1000`）；多区域映射在本机 Spike 1.1.1-dev 上对第三个区域**未生效**（表现为写入即触发 trap → 死在 `mtvec`），因此锁步版本建议把 VUART 指向已映射的 scratch RAM，并**只比对 PC+指令**（`.py` 已支持按需放宽） |
+| 参考轨迹的终止 | 裸机程序的退出是写 `IO_SIMU`（Spike 不认识）→ Spike 不会退出，需 `timeout` + `head` 截取前 N 条提交 |
+
 ## 4. 波形/日志文件的组织
 
 ```

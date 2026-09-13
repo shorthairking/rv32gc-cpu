@@ -61,7 +61,11 @@ module tb_debug_min;
   initial begin
     if (!$value$plusargs("MEM_LO_INIT=%s", mem_path)) mem_path = "sim/tests/out/hello.hex";
     $readmemh(mem_path, u_slave.mem_lo);
-    $display("[dbg] 已载入 %s", mem_path);
+    $display("[dbg] mem_lo <- %s", mem_path);
+    if ($value$plusargs("MEM_HI_INIT=%s", mem_path)) begin
+      $readmemh(mem_path, u_slave.mem_hi);
+      $display("[dbg] mem_hi <- %s", mem_path);
+    end
   end
 
   always @(posedge clk) begin
@@ -72,7 +76,7 @@ module tb_debug_min;
                dut.u_core.wb_instr_q, dut.u_core.wb_rd_q, dut.u_core.wb_wdata, dut.u_core.wb_wen);
     end
     if (cyc > 10000) begin $display("[dbg] 结束"); $finish; end
-    if (cyc > 78 && cyc < 100) begin
+    if (cyc > 100000000) begin
       $display("cyc=%0d pc=%h ifrdy=%b line=%b | f:busy=%b reqv=%b reqa=%h tag=%h | axird=%0d | stall=%b memstall=%b memst=%0d memop=%0d memaddr=%h | commit=%b wbv=%b memv=%b redir=%b",
         cyc, dut.u_core.pc_q, dut.u_core.if_ready, dut.u_core.line_valid,
         dut.u_core.u_ifetch.busy_q, dut.u_core.u_ifetch.if_req_valid,
