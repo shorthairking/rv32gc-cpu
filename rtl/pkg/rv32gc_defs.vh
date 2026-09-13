@@ -127,7 +127,9 @@
 `define IS_SPI_XIP(a)   ((((a) & `SPI_XIP_MASK) == `SPI_XIP_BASE) || \
                          (((a) & `SPI_XIP_ALIAS_MASK) == `SPI_XIP_ALIAS_BASE))
 `define CLINT_BASE          32'h1F00_0000   // 核内截获
-`define PLIC_BASE           32'h1F10_0000   // 核内截获（1 MiB 窗口）
+`define PLIC_BASE           32'h1F10_0000   // 核内截获；实际截获范围 0x1F10_0000–0x1F3F_FFFF
+                                        // （SiFive PLIC 1.0.0 的 threshold/claim 在偏移
+                                        //  0x20_0000/0x20_1000，1 MiB 窗口覆盖不到）
 `define CONFREG_FPGA_BASE   32'h1FD0_0000   // confreg_syn.v
 `define CONFREG_SIM_BASE    32'h1FAF_0000   // confreg_sim.v
 `define UART_BASE           32'h1FE0_0000   // 寄存器 0x1FE0_01E0

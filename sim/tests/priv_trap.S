@@ -101,6 +101,16 @@ _start:
     li      t6, 0                   /* 已执行检查数 */
     csrw    mstatus, zero           /* MIE/MPIE/MPP/SIE/SPIE/SPP 全清，状态确定 */
 
+/* PMP 背景项（entry 15 = L=1 / NAPOT / 全空间 / RWX）-------------------------
+ * 为什么要它：PMP 已实现 —— 所有项 A=OFF 时 **S/U 模式的任何访问都会被拒绝**（规范要求），
+ * 而本测试后面要切到 S/U 执行代码。arch-test 框架同样用 RVTEST_PMP_SET_BACKGROUND 做这件事。
+ * pmpaddr15 全 1 ⇒ 覆盖整个地址空间；L=1 同时约束 M 模式，但不改变 M 的既有行为。
+ *---------------------------------------------------------------------------*/
+    li      t0, -1
+    csrw    pmpaddr15, t0
+    li      t0, 0x9F000000          /* entry15 = L|NAPOT|X|W|R */
+    csrw    pmpcfg3, t0
+
 /*-----------------------------------------------------------------------------
  * 阶段 A：mtvec 写/读回（direct / vectored，MODE 保留）
  *---------------------------------------------------------------------------*/
@@ -328,11 +338,14 @@ f_done:
     CKI     t1, 0, 38               /* F: 返回 M 后 MPP 回 U */
 
 /*-----------------------------------------------------------------------------
- * 阶段 I：M 模式软件中断进入（mip.MSIP + mie.MSIE + mstatus.MIE）
+ * 阶段 I：M 模式软件中断进入（CLINT.msip → mip.MSIP + mie.MSIE + mstatus.MIE）
+ *   注意：mip.MSIP 是**只读**位（machine.adoc norm:mipmsiprdonly），软件置挂起必须写
+ *   核内 CLINT 的 memory-mapped msip 寄存器（0x1F00_0000，字地址 +0）
  *   取指点 = i_marker（让中断在 mip 写提交后的第一条指令处被取）
  *---------------------------------------------------------------------------*/
-    li      t0, 8                   /* MSIP = MIE.MSIE = mstatus.MIE = bit3 */
-    csrc    mip, t0
+    li      t0, 8                   /* MIE.MSIE = mstatus.MIE = bit3 */
+    li      t2, 0x1F000000          /* 核内 CLINT 基址：msip @+0 */
+    sw      zero, 0(t2)             /* 清挂起（经 CLINT，mip.MSIP 只读） */
     csrw    mie, t0                 /* mie.MSIE = 1 */
     csrs    mstatus, t0             /* mstatus.MIE = 1 */
     li      s5, 0
@@ -345,8 +358,9 @@ f_done:
     ori     t1, t1, 1
     csrw    mtvec, t1
     la      s6, i_marker
-    li      t0, 8
-    csrw    mip, t0                 /* 置 MSIP=1（挂起）；下一条指令即打断点 */
+    li      t0, 1
+    li      t2, 0x1F000000
+    sw      t0, 0(t2)               /* CLINT.msip=1 → mip.MSIP 挂起；下一条指令即打断点 */
 i_marker:
     li      s5, 0x1D                /* 被打断的指令：mret 后重新执行 */
 
@@ -389,8 +403,9 @@ i_ok:
     CKI     s5, 0x1D, 44            /* I: mret 后重跑被打断指令并继续 */
 
 i_cleanup:
+    li      t2, 0x1F000000
+    sw      zero, 0(t2)             /* CLINT.msip=0：清挂起，保证后续阶段状态确定 */
     li      t0, 8
-    csrc    mip, t0                 /* 清挂起，保证后续阶段状态确定 */
     csrc    mstatus, t0             /* MIE = 0 */
 
 /*-----------------------------------------------------------------------------
@@ -555,8 +570,8 @@ vec_common:
     csrr    s10, mepc
     csrr    s11, mtval
     csrr    a4, mstatus
-    li      t1, 8
-    csrc    mip, t1                 /* 清 MSIP，避免重复进入 */
+    li      t1, 0x1F000000
+    sw      zero, 0(t1)             /* CLINT.msip=0：清挂起，避免重复进入 */
     mret
 
 /*=============================================================================

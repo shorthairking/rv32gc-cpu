@@ -83,7 +83,7 @@ core_top ──AR/R──► axi_2x1_mux ──m1_*──┐ （S01 = debug_sram
 | UART0 / NAND | `0x1FE0_0000`–`0x1FE0_3FFF`（16 KiB，寄存器 `+0x1E0`）/ `0x1FE7_8000`–`0x1FE7_BFFF`（16 KiB，数据口 `+0x40`） | **非缓存/强序** | ❌ cause 1 | ✅ | uncached，ID 3 |
 | SPI / MAC | `0x1FE8_0000`–`0x1FE8_FFFF`（64 KiB）/ `0x1FF0_0000`–`0x1FF0_FFFF`（64 KiB） | **非缓存/强序** | ❌ cause 1 | ✅ | uncached，ID 3 |
 | **CLINT（核内）** | `0x1F00_0000`–`0x1F00_FFFF`（64 KiB） | 核内截获 | ❌ | 核内 CSR 通路 | **不下 AXI** |
-| **PLIC（核内）** | `0x1F10_0000`–`0x1F1F_FFFF`（1 MiB） | 核内截获 | ❌ | 核内寄存器 | **不下 AXI** |
+| **PLIC（核内）** | `0x1F10_0000`–`0x1F3F_FFFF`（3 MiB；SiFive PLIC 1.0.0 的 threshold/claim 在 +0x20_0000/+0x20_1000，1 MiB 覆盖不到） | 核内截获 | ❌ | 核内寄存器 | **不下 AXI** |
 | 其它（未映射） | 全部剩余空间 | **不可访问** | ❌ cause 1 | ❌ cause 5/7 | **不下 AXI** |
 
 - AMO/LR/SC 只允许落在**可缓存**窗口；设备窗口上的 `lr.w/sc.w/amo*.w` 由 PMA 检查判为访问错误（LR→cause 5，SC/AMO→cause 7），不发起 AXI（本平台无总线锁定能力，A 扩展要求可原子访问的 PMA）。

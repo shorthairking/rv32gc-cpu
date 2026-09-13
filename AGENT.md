@@ -654,6 +654,52 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 阶段 2A 进展（第 11 轮，2026-09-13）：中断投递 + 核内 CLINT/PLIC（D5 落地）
+
+**结论**：核从「`mip` 可写但无人消费、中断永不投递」变为**完整可投递**：`sim/tests/priv_trap.S`
+由 `passed=40/41 + 5 SKIP` 变为 **`PRIV_TRAP: PASS (46 checks)`**（含中断向量入口、`mcause=0x80000003`、
+`mepc`=被打断指令、`mstatus.MIE→MPIE`、`mret` 后重执行）。全量回归无回退。
+
+#### 交付物
+
+| 文件 | 说明 |
+|---|---|
+| `rtl/csr/rv32_clint.v`（新增） | 核内 CLINT：`msip`@+0（只 bit0）、`mtimecmp`@+0x4000 低/高、`mtime`@+0xBFF8 低/高；`mtip=(mtime>=mtimecmp)&~suppress`（64 位无符号）；wstrb 逐字节合并；**mtime 按核时钟每拍 +1**（仿真近似，FPGA 上需分频驱动 `tick`） |
+| `rtl/csr/rv32_plic.v`（新增） | 核内 PLIC（NSRC=8，SiFive PLIC 1.0.0 布局）：priority / pending / enable / threshold / claim-complete，**M 与 S 两个 context**；gateway（pending+in-service）、claim=返回最高优先级并置 in-service、complete 后源仍高则重挂；同级取最小编号；`priority>threshold` 严格大于 |
+| `rtl/csr/rv32_csr.v` | **中断评审**：`mip` 组合（MSIP/MTIP/MEIP/SEIP 只读、由 CLINT/PLIC 驱动；SSIP/STIP 软件可写、`sip` 写只作用于 SSIP）；取中断资格按 `norm:intrmipmie_op`（M 级需 `mstatus.MIE` / S 级需 `SIE`、`mideleg` 委托、priv=M 不取 S 级）；优先级 MEI>MSI>MTI>SEI>SSI>STI；输出 `intr_valid`/`intr_cause` |
+| `rtl/top/rv32gc_core.v` | 核内设备**访存截获**（CLINT `0x1F00_0000`、PLIC `0x1F10_0000–0x1F3F_FFFF`，单拍完成、**不产生 AXI 请求**；设备访问要求自然对齐，非对齐报 cause 4/6）；`intrpt[7:0]` 接入 PLIC（source 1..5）；**中断在"WB 提交之后"的边界取**：`mepc`=最老的未提交指令，且**不在 MEM 级副作用已落地的指令上取**（否则 mret 后重放、副作用翻倍） |
+| `sim/tests/unit/tb_clint_plic.v` + `scripts/run_unit_clint_plic.sh`（新增） | **`CLINT_PLIC_UNIT: PASS (184 checks)`**（CLINT 56 / PLIC 128；5 个 RTL 变异体全部被捕获，防假 PASS） |
+| `sim/tests/priv_trap.S` | 中断阶段改用 **CLINT.msip**（`mip.MSIP` 已按规范做成只读）；开头铺 **PMP 背景项**（entry15 = L=1/NAPOT/全空间/RWX）——PMP 生效后 S/U 阶段必须有背景项才可执行 |
+
+#### 实现中定的 3 条口径（都有规范/参考依据，勿再踩）
+
+1. **`mip.MSIP/MTIP/MEIP/SEIP` 只读**（`machine.adoc norm:mipmsiprdonly`：MSIP 由 memory-mapped 寄存器写）；
+   软件置挂起必须写 CLINT/PLIC，`mip` 只留 SSIP/STIP 可写（`norm:mipbitswr_op` 允许的另一种做法）。
+2. **中断在指令边界取、且不在"副作用已落地"的指令上取**：本核 store 在 MEM 即发出写（MMIO 写更是在
+   MEM 拍生效），若把该 store 当作 `mepc` 指向的被打断指令，`mret` 后重放会翻倍副作用 ⇒ 用
+   `mem_sideeff` 抑制一拍，等它进 WB 后取（`mepc` 精确指向下一条待执行指令）。
+3. **`trap_take` 必须用门控后的 `intr_take`**（不能直接用 `intr_valid`）——否则在"被抑制但挂起"的拍会
+   产生一条 `trap_is_int=0` 的伪同步陷阱（实测表现为 `mcause=3`、向量走 base 而非 base+4*3）。
+
+#### 验证（本轮实测）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 特权/陷阱定向自测 | `bash scripts/run_priv_trap_test.sh` | **`PRIV_TRAP: PASS (46 checks)`**（此前 40/41 + 5 SKIP） |
+| CLINT/PLIC 单元 | `bash scripts/run_unit_clint_plic.sh` | **`CLINT_PLIC_UNIT: PASS (184 checks)`** |
+| PMP 单元 | `bash scripts/run_unit_pmp.sh` | `PMP_UNIT: PASS (443 checks)` |
+| 回归 | 18 组 + PMP 6 组 + hello/memtest + lrsc | **18 组 124 例全 PASS**；PMPS 11/11、PMPU 11/11、PMPZaamo 1/1、PMPZalrsc 1/1、PMPZca 12/15、PMPSm 37/38（例外见上轮）；`LRSC_DIRECTED: PASS`、`SIM: PASS hello/memtest` |
+
+#### 已知限制（下一轮处理）
+
+* **复位即 `mtip=1`**（`mtime=mtimecmp=0`，与真实 CLINT 一致）⇒ 软件启用 MTIE 前必须先写 `mtimecmp`；
+  当前 arch-test 用例不启用 MTIE，故不受影响（已在 `rv32_clint.v` 头注明）。
+* PLIC 只有 8 源、2 context（够当前平台 `intrpt[4:0]` 与 Linux 基本驱动）；**未经端到端 Linux 驱动验证**。
+* 设备上的 LR/SC/AMO 未实现原子语义（按普通访问处理，已在 core 注释说明）。
+* `PLIC` 文档窗口（spec/07 §8.2 与 spec/08）已按实际截获范围更正为 `0x1F10_0000–0x1F3F_FFFF`。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -670,8 +716,9 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 - ✅ **PMP（2A-3 收尾，第 10 轮）**：16 项 + 锁定语义 + S/U 访问检查；`run_unit_pmp.sh` → `PMP_UNIT: PASS (443)`；
   `tests/priv` PMP 组 **73 / 73 可达用例通过**（PMPSm 37/38、PMPS 11/11、PMPU 11/11、PMPZaamo 1/1、
   PMPZalrsc 1/1、PMPZca 12/15；1 例平台口径差异 + 3 例 ISA 不可达见 §6）；回归 18 组 124 例 + 单元测试 + hello/memtest + lrsc 全绿
-- ⏭ 下一步（顺序即优先级）：① PMP 已收尾（73/73 可达，见 §6 第 10 轮）；
-  ② **实现中断投递**（`mip/mie` 评审 + `trap_is_int` + CLINT/PLIC；`priv_trap.S` 已给出最小复现）；
+- ✅ **中断投递 + 核内 CLINT/PLIC（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`；
+  `CLINT_PLIC_UNIT: PASS (184)`；回归 18 组 124 例 + PMP 6 组无回退
+- ⏭ 下一步（顺序即优先级）：① 平台口径收尾（`if_rsp_err` 取指总线错误通道 + 物理 0 口径）；
   ③ 取指总线错误通道（`rv32_ifetch.if_rsp_err` 未使用）+ 平台把物理 0 的口径与真实映射对齐；
   ④ 未接入组 `Zimop`(40)/`Zcmop`(8)；⑤ Sv32 MMU → L1I/L1D/L2 Cache（接 D16② 判定点）→ 2A-7b~d 上板
 - 📌 **平台适配结论（D15/D16）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；

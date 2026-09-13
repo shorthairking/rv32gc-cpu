@@ -92,9 +92,9 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
-   b. **[P1] 实现中断投递**（核的真实缺陷，`sim/tests/priv_trap.S` 已给最小复现）：`mip/mie` 评审 →
-      `trap_is_int`/`trap_vector` 支持中断（`mip_q <= csr_wdata & 32'h0888` 现在软件能置挂起位但
-      硬件永不响应；`core_top.v` 的 `intrpt[7:0]` 只接进 dummy）→ CLINT/PLIC。
+   b. ✅ **中断投递 + 核内 CLINT/PLIC 已完成（第 11 轮）**：`priv_trap.S` → `PRIV_TRAP: PASS (46 checks)`、
+      `CLINT_PLIC_UNIT: PASS (184)`、回归无回退。口径：`mip.MSIP/MTIP/MEIP/SEIP` 只读（走 CLINT/PLIC）、
+      中断在 **WB 提交之后**的边界取且避开"副作用已落地"的 MEM 指令、`trap_take` 必须用门控后的 `intr_take`。
    c. **[P2] 平台口径收尾**：`rv32_ifetch.v` 的 `if_rsp_err` 从未使用（取指总线错误无法转 cause 1）；
       `PMPSm_cfg_A_tor_zero-00` 需要参考模型在物理地址 0 无存储，而本平台把 0..16 MiB 铺成 DDR
       （与真实平台一致：DDR3 在 `0x0`）且复位桩在 0 —— 记为平台口径差异，随 2A-7 一起处理。

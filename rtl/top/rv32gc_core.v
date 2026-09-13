@@ -166,7 +166,7 @@ module rv32gc_core (
     .csr_wen(wb_csr_wen), .csr_waddr(wb_csr_addr_q), .csr_wdata(wb_csr_wdata), .csr_is_fp(1'b0),
     .instret_en(wb_retire),
     .trap_valid(trap_take), .trap_cause(trap_cause_wb), .trap_tval(trap_tval_wb),
-    .trap_is_int(1'b0), .trap_epc(wb_pc),
+    .trap_is_int(trap_is_int), .trap_epc(trap_epc_w),
     .trap_vector(trap_vector), .trap_new_priv(trap_new_priv),
     .xret_valid(xret_take), .xret_is_sret(wb_is_sret),
     .xret_pc(xret_pc), .xret_new_priv(xret_new_priv),
@@ -175,8 +175,15 @@ module rv32gc_core (
     .timer_irq_pending(), .ext_irq_pending(),
     .menvcfg_cbcfe(menvcfg_cbcfe), .menvcfg_cbze(menvcfg_cbze), .menvcfg_cbie(menvcfg_cbie),
     .senvcfg_cbcfe(senvcfg_cbcfe), .senvcfg_cbze(senvcfg_cbze), .senvcfg_cbie(senvcfg_cbie),
-    .pmpcfg_o(pmpcfg_all), .pmpaddr_o(pmpaddr_all)
+    .pmpcfg_o(pmpcfg_all), .pmpaddr_o(pmpaddr_all),
+    // 中断源：CLINT/PLIC 接入前先置 0（保持行为不变；下一轮换成真实源）
+    .clint_msip(clint_msip_w), .clint_mtip(clint_mtip_w),
+    .plic_meip(plic_meip_w),   .plic_seip(plic_seip_w),
+    .intr_valid(intr_valid), .intr_cause(intr_cause)
   );
+  wire        intr_valid;
+  wire [3:0]  intr_cause;
+  wire        trap_is_int;
   // Zicbom/Zicboz 低特权级执行许可（menvcfg/senvcfg 的 CBCFE/CBIE/CBZE）
   wire menvcfg_cbcfe, menvcfg_cbze;
   wire [1:0] menvcfg_cbie;
@@ -246,6 +253,42 @@ module rv32gc_core (
   // 若改成"整条指令必须被同一项覆盖全部扇区"，就比 Spike 更严 —— 实测在跨扇区/跨区域边界的
   // 指令上多报 cause 1（例：0x…0e 处的 32 位 nop，两个扇区分别由不同项允许时）。
   // `acc_size=1`（2 字节）恰好等价于"只查本 parcel 所在的 4 字节扇区"。
+
+  // ============================================================ 核内 CLINT / PLIC（决策 D5）
+  // 平台没有这两个设备窗口 ⇒ 核内实现，并在访存路径**截获**（不产生 AXI 请求）。
+  // 地址窗口：CLINT 0x1F00_0000（1 MiB）；PLIC 0x1F10_0000 起 —— SiFive PLIC 1.0.0 的
+  // threshold/claim 位于偏移 0x20_0000/0x20_1000，1 MiB 窗口覆盖不到，故取 0x1F10_0000–
+  // 0x1F3F_FFFF（addr[31:20] ∈ {1F1,1F2,1F3}）。见 `rv32gc_defs.vh` 与 spec/07 §8。
+  wire        mem_clint_hit = (mem_addr_q[31:20] == 12'h1F0);
+  wire        mem_plic_hit  = (mem_addr_q[31:20] == 12'h1F1) ||
+                              (mem_addr_q[31:20] == 12'h1F2) ||
+                              (mem_addr_q[31:20] == 12'h1F3);
+  wire        mem_io_hit    = mem_clint_hit | mem_plic_hit;
+  wire        io_we    = (mem_mem_op_q == `MEM_STORE) || (mem_mem_op_q == `MEM_SC) ||
+                         (mem_mem_op_q == `MEM_AMO);
+  // 只在 M_IDLE 那一拍拉高（设备访问单拍完成；PLIC 的 claim 有"每拍都生效"的副作用，
+  // 多拍保持会连续 claim —— 子 Agent 已提示）。
+  wire        io_req   = (memst_q == M_IDLE) && mem_needs_fsm && mem_io_hit &&
+                         !mem_misaligned && !mem_pmp_deny;
+  wire [3:0]  io_wstrb = a1_wstrb;
+  wire [31:0] io_wdata = a1_wdata;
+  wire [31:0] clint_rdata, plic_rdata;
+  wire        clint_msip_w, clint_mtip_w, plic_meip_w, plic_seip_w;
+  wire [31:0] io_rdata  = mem_clint_hit ? clint_rdata : plic_rdata;
+
+  rv32_clint u_clint (
+    .clk(clk), .rst_n(rst_n), .tick(1'b1),          // 仿真里 mtime 直接按核时钟 +1
+    .req(io_req && mem_clint_hit), .we(io_we), .addr(mem_addr_q),
+    .wstrb(io_wstrb), .wdata(io_wdata), .rdata(clint_rdata),
+    .msip(clint_msip_w), .mtip(clint_mtip_w)
+  );
+  rv32_plic #(.NSRC(8)) u_plic (
+    .clk(clk), .rst_n(rst_n),
+    .src({3'b000, intrpt[4:0]}),   // PLIC source 1..5 ← 平台 intrpt[0..4]（source 0 保留）
+    .req(io_req && mem_plic_hit), .we(io_we), .addr(mem_addr_q),
+    .wstrb(io_wstrb), .wdata(io_wdata), .rdata(plic_rdata),
+    .meip(plic_meip_w), .seip(plic_seip_w)
+  );
 
   wire        pmp_mem_is_amo = (mem_mem_op_q == `MEM_AMO);
   wire        pmp_mem_is_w   = (mem_mem_op_q == `MEM_STORE) || (mem_mem_op_q == `MEM_SC);
@@ -583,9 +626,30 @@ module rv32gc_core (
                      (wb_wb_sel_q == `WB_CSR) ? wb_csr_rdata_q : wb_alu_q;
   assign wb_pc     = wb_pc_q;
 
-  assign trap_take     = wb_valid_q && advance && wb_excp_valid_q;
-  assign trap_cause_wb = wb_excp_cause_q;
-  assign trap_tval_wb  = wb_excp_tval_q;
+  // ---- 陷阱注入：同步异常优先；无同步异常时在指令边界取中断 ----
+  // 中断在「WB 级有有效指令、且该指令没有同步异常」的那一拍取出：该指令被 sq_mem 压制、
+  // 不提交，mepc = 它的 PC ⇒ mret 后重新执行它 —— 即「在这条指令之前取中断」的经典边界。
+  // 规范依据：machine.adoc norm:intrmipmie_op（mip&mie 同位 + mstatus.MIE/SIE + mideleg）。
+  // 中断在 **WB 这条指令提交之后** 的边界取：mepc 指向"最老的未提交指令"（MEM→EX→ID→IF），
+  // 这些年轻指令被 sq_mem/sq_ex 压制、mret 后重新执行；WB 那条照常提交。
+  // 为什么不"在 WB 之前取"：MMIO 写（如 CLINT.msip）在 MEM 级就已落地，若把该 store 压制并让
+  // mepc 指向它，mret 后它会重放——不但语义不精确，还可能造成"置位→重放置位"的循环。
+  wire [31:0] intr_epc     = mem_valid_q ? mem_pc_q :
+                             ex_valid_q  ? ex_pc_q  :
+                             id_valid_q  ? id_pc_q  : pc_q;
+  // 不要在「MEM 级副作用已落地」的指令上取中断：MEM 阶段的 store/SC/AMO 已把写发出（MMIO 写更是在
+  // MEM 拍就生效），若把它当作 mepc 指向的"被打断指令"，mret 后重放会翻倍副作用。等它进入 WB 之后
+  // 再取，此时 MEM 里是更年轻的指令（无副作用）⇒ mepc 精确指向下一条待执行指令。
+  wire        mem_sideeff  = mem_valid_q && mem_needs_fsm &&
+                             ((mem_mem_op_q == `MEM_STORE) || (mem_mem_op_q == `MEM_SC) ||
+                              (mem_mem_op_q == `MEM_AMO)   || mem_io_hit);
+  wire        intr_take    = intr_valid && wb_valid_q && advance && !wb_excp_valid_q &&
+                             !xret_take && !mem_sideeff;
+  assign      trap_is_int  = intr_take;
+  assign      trap_take     = wb_valid_q && advance && (wb_excp_valid_q || intr_take);
+  assign      trap_cause_wb = wb_excp_valid_q ? wb_excp_cause_q : intr_cause;
+  assign      trap_tval_wb  = wb_excp_valid_q ? wb_excp_tval_q  : 32'd0;
+  wire [31:0] trap_epc_w   = trap_is_int ? intr_epc : wb_pc;
   assign xret_take     = wb_valid_q && advance &&
                          ((wb_sys_op_q == `SYS_MRET) || (wb_sys_op_q == `SYS_SRET));
   assign wb_is_sret    = (wb_sys_op_q == `SYS_SRET);
@@ -703,6 +767,35 @@ module rv32gc_core (
               // 被拒的 SC/AMO 消费保留集（规范：SC 失败 / 任何写访问都使保留集失效）
               if (mem_is_sc || mem_is_amo) resv_valid_q <= 1'b0;
               memst_q       <= M_DONE;
+            end else if (mem_io_hit) begin
+              // ---- 核内设备（CLINT/PLIC）：单拍完成，不产生 AXI 请求 ----
+              if (mem_misaligned) begin
+                // 设备寄存器一律要求自然对齐（规范：misaligned access to I/O 必报 misaligned）
+                m_excp_tval_q <= mem_addr_q;
+                m_excp_cause_q<= (mem_mem_op_q == `MEM_LOAD) ? `EXC_LOAD_MISALIGN
+                                                            : `EXC_STORE_MISALIGN;
+                memst_q       <= M_DONE;
+              end else begin
+                m_addr_q      <= mem_addr_q;
+                m_we_q        <= 1'b0;
+                m_size_q      <= mem_mem_size_q;
+                m_uns_q       <= mem_mem_flags_q;
+                m_shift_q     <= mem_addr_q[1:0];
+                m_split_q     <= 1'b0;
+                m_wdata_q     <= a1_wdata;
+                m_wstrb_q     <= a1_wstrb;
+                m_wstrb2_q    <= 4'h0;
+                m_is_lr_q     <= 1'b0;      // 设备不支持原子访问（LR/SC/AMO 当作普通访问）
+                m_is_sc_q     <= 1'b0;
+                m_is_amo_q    <= 1'b0;
+                m_amo_op_q    <= 5'd0;
+                m_rs2_q       <= mem_rs2_val_q;
+                m_rdata_q     <= io_rdata;  // 读数据同拍锁存（沿用既有的拆分/扩展逻辑）
+                m_rdata2_q    <= 32'd0;
+                m_excp_tval_q <= mem_addr_q;
+                m_excp_cause_q<= `EXC_NONE;
+                memst_q       <= M_DONE;
+              end
             end else begin
 `ifdef MISALIGNED_TRAP
             if (mem_misaligned) begin

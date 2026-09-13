@@ -70,7 +70,18 @@ module rv32_csr (
   //   cfg[i]  = pmpcfg_o[8*i +: 8]（{L,[6:5]保留=0,A[4:3],X,W,R}）
   //   addr[i] = pmpaddr_o[32*i +: 32]（= 物理地址 >> 2；G=0 → 32 位全可写）
   output wire [`PMP_ENTRIES*8-1:0]  pmpcfg_o,
-  output wire [`PMP_ENTRIES*32-1:0] pmpaddr_o
+  output wire [`PMP_ENTRIES*32-1:0] pmpaddr_o,
+
+  // ---- 中断源（核内 CLINT/PLIC 驱动；对应的 mip 位是**只读**的）----
+  // 规范：mip.MSIP 只读、由 memory-mapped msip 写（machine.adoc norm:mipmsiprdonly）；
+  // 能置起的位若在 mip 里只读，实现须提供别的清除途径（norm:mipbitsrdonly_op）——
+  // 本设计：MSIP/MTIP/MEIP/SEIP 只读（由 CLINT/PLIC 清），SSIP/STIP 软件可写。
+  input  wire        clint_msip,      // CLINT msip            → mip.MSIP (3)
+  input  wire        clint_mtip,      // CLINT mtime>=mtimecmp → mip.MTIP (7)
+  input  wire        plic_meip,       // PLIC context 0        → mip.MEIP (11)
+  input  wire        plic_seip,       // PLIC context 1        → mip.SEIP (9)
+  output wire        intr_valid,      // 本拍存在「已使能且可投递」的中断
+  output wire [3:0]  intr_cause       // 其中优先级最高者的 cause（11/3/7/9/1/5）
 );
 
   // ---------------------------------------------------------------- 状态寄存器
@@ -109,8 +120,40 @@ module rv32_csr (
   assign mstatus_sie   = mstatus_sie_q[0];
   assign mstatus_mprv  = mstatus_mprv_q[0];
   assign mstatus_mpp   = mstatus_mpp_q;
-  assign timer_irq_pending = 1'b0;    // 预留
-  assign ext_irq_pending   = 1'b0;    // 预留
+  assign timer_irq_pending = clint_mtip;
+  assign ext_irq_pending   = plic_meip | plic_seip;
+
+  // ---------------------------------------------------------------- 中断评审
+  // mip 组合：只读位来自硬件（CLINT/PLIC），可写位（SSIP/STIP）来自 mip_q。
+  wire [31:0] mip_masked = { 20'd0,
+                             plic_meip,      // 11 MEIP
+                             1'b0,           // 10
+                             plic_seip,      // 9  SEIP
+                             1'b0,           // 8
+                             clint_mtip,     // 7  MTIP
+                             1'b0,           // 6
+                             mip_q[5],       // 5  STIP（软件可写）
+                             1'b0,           // 4
+                             clint_msip,     // 3  MSIP
+                             1'b0,           // 2
+                             mip_q[1],       // 1  SSIP（软件可写）
+                             1'b0 };         // 0
+  // 取中断资格（machine.adoc norm:intrmipmie_op）：
+  //  · 未委托（mideleg=0）→ M 级：priv=M 需 mstatus.MIE=1；priv<S 恒使能；
+  //  · 已委托（mideleg=1）→ S 级：priv=S 需 mstatus.SIE=1；priv=U 恒使能；priv=M **不取**；
+  //  · 同时要求 mip 与 mie 对应位都为 1；
+  //  · 多中断同时挂起按惯例优先级 MEI > MSI > MTI > SEI > SSI > STI。
+  wire int_m_armed = (priv_q == `PRV_M) ? mstatus_mie_q[0] : 1'b1;
+  wire int_s_armed = (priv_q == `PRV_S) ? mstatus_sie_q[0] : (priv_q == `PRV_U);
+  wire t_mei = mip_masked[11] && mie_q[11] && !mideleg_q[11] && int_m_armed;
+  wire t_msi = mip_masked[3]  && mie_q[3]  && !mideleg_q[3]  && int_m_armed;
+  wire t_mti = mip_masked[7]  && mie_q[7]  && !mideleg_q[7]  && int_m_armed;
+  wire t_sei = mip_masked[9]  && mie_q[9]  &&  mideleg_q[9]  && int_s_armed;
+  wire t_ssi = mip_masked[1]  && mie_q[1]  &&  mideleg_q[1]  && int_s_armed;
+  wire t_sti = mip_masked[5]  && mie_q[5]  &&  mideleg_q[5]  && int_s_armed;
+  assign intr_valid = t_mei | t_msi | t_mti | t_sei | t_ssi | t_sti;
+  assign intr_cause = t_mei ? 4'd11 : t_msi ? 4'd3  : t_mti ? 4'd7 :
+                      t_sei ? 4'd9  : t_ssi ? 4'd1  : 4'd5;
 
   // Zicbom/Zicboz 许可位：RV32 位域 CBIE[5:4] / CBCFE[6] / CBZE[7]
   assign menvcfg_cbze   = menvcfg_q[7];
@@ -222,7 +265,7 @@ module rv32_csr (
       `CSR_MEPC:    csr_rdata = mepc_q;
       `CSR_MCAUSE:  csr_rdata = mcause_q;
       `CSR_MTVAL:   csr_rdata = mtval_q;
-      `CSR_MIP:     csr_rdata = mip_q;
+      `CSR_MIP:     csr_rdata = mip_masked;
       `CSR_MCYCLE:  csr_rdata = mcycle_q[31:0];
       `CSR_MCYCLEH: csr_rdata = mcycle_q[63:32];
       `CSR_MINSTRET:csr_rdata = minstret_q[31:0];
@@ -256,7 +299,7 @@ module rv32_csr (
       `CSR_SEPC:    csr_rdata = sepc_q;
       `CSR_SCAUSE:  csr_rdata = scause_q;
       `CSR_STVAL:   csr_rdata = stval_q;
-      `CSR_SIP:     csr_rdata = sip_q & mideleg_q;
+      `CSR_SIP:     csr_rdata = mip_masked & mideleg_q;  // S 视图（含硬件驱动的 STIP/SEIP）
       `CSR_SATP:    csr_rdata = satp_q;
       `CSR_SENVCFG: csr_rdata = senvcfg_q;
 
@@ -451,7 +494,10 @@ module rv32_csr (
           `CSR_MEPC:    mepc_q    <= {csr_wdata[31:1], 1'b0};
           `CSR_MCAUSE:  mcause_q  <= csr_wdata;
           `CSR_MTVAL:   mtval_q   <= csr_wdata;
-          `CSR_MIP:     mip_q     <= csr_wdata & 32'h0000_0888;
+          `CSR_MIP: begin   // 只有 SSIP(1)/STIP(5) 软件可写（MSIP/MTIP/MEIP/SEIP 只读）
+            mip_q[1] <= csr_wdata[1];
+            mip_q[5] <= csr_wdata[5];
+          end
           `CSR_MCYCLE:  mcycle_q[31:0]  <= csr_wdata;
           `CSR_MCYCLEH: mcycle_q[63:32] <= csr_wdata;
           `CSR_MINSTRET: minstret_q[31:0]  <= csr_wdata;
@@ -472,7 +518,7 @@ module rv32_csr (
           `CSR_SEPC:    sepc_q    <= {csr_wdata[31:1], 1'b0};
           `CSR_SCAUSE:  scause_q  <= csr_wdata;
           `CSR_STVAL:   stval_q   <= csr_wdata;
-          `CSR_SIP:     sip_q     <= csr_wdata & 32'h0000_0222;
+          `CSR_SIP:     sip_q[1]  <= csr_wdata[1];  // 仅 SSIP（委托给 S 后可写）
           `CSR_SATP:    satp_q    <= csr_wdata;   // 阶段 2A 暂不生效（MMU 后续里程碑）
           // menvcfg/senvcfg：只保留 CBO 相关位（CBIE[5:4] 的 0b10 保留编码按 WARL 归 0）
           `CSR_MENVCFG: begin
