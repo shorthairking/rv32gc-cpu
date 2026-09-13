@@ -117,3 +117,36 @@ rv32gc-cpu/sw/
 
 对应的 `mtdparts`：`nand-flash:256K(env),50M(kernel)ro,1M(dtb),-(rootfs)`
 （与 chiplab 文档的 `50M@0(kernel)ro,-(rootfs)` 相比，把 env 显式划出并增加 dtb 分区，避免与 U-Boot 环境变量冲突。）
+
+## 8. 平台内存映射声明（2A-7c）与 OpenSBI 适配
+
+**交付物**：`sw/board/rv32gc-chiplab.dts`（设备树源）+ `scripts/check_dts.sh`（可验证检查）。
+检查做两件事：① `dtc` 编译 + 反编译（语法/引用/分区合法性）；② **DTS ↔ RTL 常量交叉校验** ——
+`DDR_BASE/DDR_SIZE`、`SPI_XIP_BASE/SPI_XIP_ALIAS_BASE`、`CLINT_BASE`、`PLIC_BASE` 直接与
+`rtl/pkg/rv32gc_defs.vh` 比对（实测 **`CHECK_DTS: PASS (17 ok / 0 fail)`**）。两套地址漂移会立刻 FAIL。
+
+| 节点 | 地址 | 依据 |
+|---|---|---|
+| `/memory` | `0x0000_0000` + 128 MiB | 平台 DDR3，AXI **默认从设备**（D15：不改互连编址）；主镜像按 `0x0` 链接 |
+| `/soc/clint` | `0x1F00_0000` + 64 KiB | **核内** CLINT（D5），不在互连上；`interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>` |
+| `/soc/plic` | `0x1F10_0000` + 3 MiB | **核内** PLIC 1.0.0（D5）；`riscv,ndev = 8`（源号：1=UART0、2=SPI、3=NAND、4=MAC、5=DMA）；`<&cpu0_intc 11>, <&cpu0_intc 9>` |
+| `/soc/flash` | `0x1C00_0000`（1 MiB XIP 窗口）+ `0x1FE8_0000`（64 KiB 别名） | SPI NOR `S25FL128SAGMFI001`；**复位取指窗口**（D16），无片上 boot ROM |
+| `/soc/serial` | `0x1FE0_01E0` + 16 B | 平台 UART0 寄存器块（窗口 `0x1FE0_0000`–`0x1FE0_3FFF` 内的 `+0x1E0`） |
+| `/soc/nand` | `0x1FE7_8000`（数据口 `+0x40`） | NAND 控制器（K9F1G08U0C，128 MiB，分区见 §7） |
+
+**OpenSBI 适配要点**（平台通用驱动即可，无需新平台端口）：
+
+1. **`FW_TEXT_START`**：DDR 主镜像按 `0x0` 链接，故 OpenSBI 的 `FW_TEXT_START=0x0`；实际执行入口由
+   SPI 小引导在 DDR 内跳转到达（见 §2 启动链）。**早期启动不得开启 MMU**（D16）：SPI 窗口取指必须在
+   `satp.MODE=0`（Bare）下完成，否则取指要经过页表而镜像尚未按 VA 链接。
+2. **驱动选择**：CLINT → `sifive/clint`（核内实现与 SiFive 布局一致：`msip@+0`、`mtimecmp@+0x4000+8n`、
+   `mtime@+0xBFF8`）；PLIC → `sifive/plic`（1.0.0 布局：priority `+0`、pending `+0x1000`、
+   enable `+0x2000`、threshold/claim 依上下文）；串口 → `uart/uart8250`（`NS16550`，`+0x1E0`，
+   33 MHz 输入时钟，`115200n8`）。
+3. **`timebase-frequency` = 50 MHz**（`cpu_clk`，核内 CLINT 每拍递增）；写错会让 Linux 时钟快/慢若干倍。
+4. **`platform_override`**：不需要——本平台所有设备都是 RISC-V 通用/`sifive` 兼容布局，
+   用 `generic` 平台 + 上述 DTS 即可；**不要**照抄 LA32R 的 `cpuic`（LoongArch 中断编号与 RISC-V PLIC 源号无关）。
+5. **DTB 交付方式**：U-Boot 从 NAND 的 `dtb` 分区（`0x0324_0000`）读取；SPI 小引导不携带 DTB。
+
+**已知与平台文档的差异（本核决策）**：CLINT/PLIC 在核内（D5）而非既有 `apb_dev_top`；SPI-XIP 复位窗口取指
+必须**绕过指令缓存**（D16②，`rv32_ifetch` 的 `xip_bypass`/`line_xip_q` 已落地该判定点）。

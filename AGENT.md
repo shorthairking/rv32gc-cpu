@@ -823,6 +823,28 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 16 轮：阶段 2A-⑤（2A-7b 启动镜像三件套 + 2A-7c DTS/内存映射声明）
+
+| 项 | 结果 |
+|---|---|
+| **2A-7c DTS（交付物）** | 新增 `sw/board/rv32gc-chiplab.dts`（RV32-GC + chiplab SoC 设备树）。地址**逐项与 RTL 常量对齐**：DDR `0x0`+128 MiB、SPI-XIP `0x1C00_0000`（1 MiB）+ 别名 `0x1FE8_0000`、核内 CLINT `0x1F00_0000`、核内 PLIC `0x1F10_0000`（`riscv,ndev=8`）、UART0 寄存器块 `0x1FE0_01E0`、NAND `0x1FE7_8000`（数据口 `+0x40`）+ 四分区（env/kernel/dtb/rootfs = 128 MiB） |
+| **2A-7c 可验证检查（新增）** | `scripts/check_dts.sh`：① `dtc` 编译 + 反编译；② **DTS ↔ `rtl/pkg/rv32gc_defs.vh` 交叉校验**（DDR_BASE/SIZE、SPI_XIP_BASE/ALIAS、CLINT_BASE、PLIC_BASE 直接比对）；③ 平台事实与硬判据（UART/NAND 偏移、`mmu-type=sv32`、`ndev=8`、`interrupts-extended` 3/7 与 11/9、SPI boot 分区 ≤1 MiB、NAND 分区总长=128 MiB、env=256 KiB@0）。实测 **`CHECK_DTS: PASS (17 ok / 0 fail)`** |
+| **2A-7c 文档** | `docs/porting/00-overview.md` 新增 §8：内存映射表 + OpenSBI 适配五条（`FW_TEXT_START=0x0`、**早期启动不得开 MMU**（D16）、CLINT/PLIC/UART 驱动选择、`timebase-frequency=50 MHz`、无需 `platform_override`、DTB 从 NAND `dtb` 分区读） |
+| **2A-7b 启动镜像三件套** | 新增 `sw/board/spi_stub.S`（**真实引导桩**：全 PC 相对取址、UART0 初始化(8N1/115200)、打印横幅、跳 DDR `0x0`、panic 码）、`sw/board/ddr_main.S`（**DDR 主镜像入口桩**，按 `0x0` 链接，打印横幅后交棒 `__opensbi_entry`；仿真下写 IO_SIMU=0 正常退出）、`sw/board/spi_stub.ld`、`sw/board/ddr_main.ld`、`scripts/pack_boot_image.sh` |
+| **打包硬判据（全部实测）** | **`PACK_BOOT: PASS (SPI 333B/1MiB, 重定位 0, DDR entry 0x0)`**：SPI 镜像 ≤1 MiB（本桩仅 333 B）、SPI 桩**重定位表为空**（⇒ 全 PC 相对）、DDR 镜像 `_start=0x0`、`spi_flash.img` = 1 MiB（未用区 0xFF）、`boot_layout.txt` 输出 SPI/DDR/NAND 布局与 `mtdparts` |
+| **2A-7b 端到端仿真验收（新增）** | `scripts/run_boot_chain_test.sh`：用**真正要烧写的产物**（`spi_stub.sim.hex` + `ddr_main.sim.hex`）跑 `tb_spi_boot`，断言 ① 复位取指在 SPI-XIP 窗口；② SPI 桩横幅出现、且早于 DDR 横幅；③ TB 的 CHECK-1..4（SPI 提交/DDR 提交/跨窗口取指）；④ 退出码 0。实测 **`BOOT_CHAIN: PASS`**（cycles=9123） |
+| **本轮踩的坑（两条，写进经验）** | ① `iverilog -DRESET_PC=0x1C000000`（C 风格 `0x`）会**破坏 `rv32gc_core.v` 的解析**，报出一个和真实原因毫无关系的 `syntax error`（+ 满屏 "implicit definition" 警告）；必须写 Verilog 字面量 `32'h1C000000`（`run_spi_boot_test.sh` 一直是对的）。② 桩里第二处 `auipc t0,0` 取到的是**该指令**的 PC 而非桩首址 ⇒ 二次跳转落到 `0x5C`（DDR 镜像中间）；改为在入口处记录"实际基址偏移 s0"再抵消 |
+
+#### 关键经验（本轮）
+
+* **配置/声明的"可验证化"**：DTS 这种"写了不跑"的交付物，价值全在**交叉校验**——把 DTS 地址与 RTL 常量逐项比对后，"文档与实现漂移"这类隐性缺陷变成了一条命令的红/绿。
+* **引导链必须用"真产物"验**：单元级链路自测（`sim/tests/spi_boot.S`）证明通路存在；`sw/board/*` + 打包脚本 + `run_boot_chain_test.sh` 证明**要烧写的那两个镜像**能串起来。
+* **命令行长选项也会"看起来无关"地炸掉编译**：`-D` 的值必须与语言字面量一致（Verilog 用 `32'h…`），否则报错位置在别处、复现命令又恰好和回归不同 ⇒ 排查成本极高。看到"某文件语法错误 + 满屏 implicit definition"先怀疑**预处理宏**而不是文件内容。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -859,6 +881,28 @@ arch-test 与 hello/memtest 无影响，已复跑）。
     **第 15 轮已收掉 1~3 的大部分**：`ExceptionsSv 4/4`、`ExceptionsSvZaamo 3/3`、`ExceptionsSvZalrsc 3/3`、
     `Svade 2/2`（见 §6 第 15 轮）。**仍剩 `SvPMP on_pte_{S,U}mode` 2 例**（EPC 落在
     `failedtest_saveresults_common`，属二次效应；`on_pa` 两例已 PASS，差异集中在"PMP 作用在页表访问上"）。
+  * 🔜 **④ 的实现方案（第 16 轮执行；方案已按 Spike 逐条核对，可直接照做）**：
+    * **第一步：CBO 真正走内存通路**（收 `SvZicbo` 4 例 + `SvPMPZicbo` 8 例）。
+      Spike 语义（`tools/spike/riscv/mmu.h:237-266`，以它为准）：
+      - `cbo_zero`：按 **STORE** 类型生成访问（`generate_access_info(addr, STORE, {})`），
+        `translate(access_info, **1**)`（仅对操作数那 1 字节做 PMP 检查），
+        物理块基址 = `addr & ~(blocksz-1)`（blocksz=32），对整块 `memset(...,0,blocksz)`；
+        若翻译后的 PA 不落在内存 ⇒ `trap_store_access_fault`（**cause 7**）。
+      - `clean_inval`（cbo.clean/flush/inval 共用）：按 **LOAD** 类型生成访问
+        （`generate_access_info(addr, LOAD, {.clean_inval=true})`）⇒ 权限按**读**检查（`R` 或 `MXR&&X`）、
+        `U/SUM` 规则按 LOAD；但整个 translate 被 `convert_load_traps_to_store_traps` 包住 ⇒
+        **陷阱 cause 取 STORE 变体（页错误 15 / 访问错误 7）**（与 AMO 同机制，本项目已实现 AMO 口径）。
+      - 两者都只查**操作数那 1 字节**的 PMP（`len=1`），块对齐只影响内存副作用，不影响权限检查地址。
+      本核实现要点：给 MEM FSM 增加 `MEM_CBO` 操作（`mem_mem_op_q` 加一个取值即可），
+      ZERO 走"M_REQ_W ×8 个 4 字节写零"（块内 8 个字），INVAL/CLEAN/FLUSH 走"检查后空操作"；
+      `menvcfg/senvcfg` 的 CBCFE/CBZE/CBIE 门控**已实现**（ID 级非法指令），不要动。
+    * **第二步：L1I/L1D/L2（行 32 B）**：规格在 `docs/design/spec/04-frontend.md`（L1I 16 KB/4 路/32 B、
+      VIPT 无别名证明：128 组×32 B=4 KB=页大小、ITLB 与 Tag 并行）、`03-pipeline-regs.md`（L1D/L2 握手）、
+      `00-conventions.md`（`CACHE_LINE=32 B`）。**必须接上 D16② 的 XIP 绕 Cache 判定点**
+      （`rv32_ifetch` 已预留 `xip_bypass`/`line_xip_q`：XIP 行既不入 Cache 也不从 Cache 命中）。
+      验收：全量回归不回退 + `SvZicbo`/`SvPMPZicbo` 保持 PASS + `fence.i` 语义；性能类特性
+      （MSHR 关键 half、预取、多路替换）可分批做，**正确性优先**。
+
   * ✅ **③ 的 S2~S5 集成设计已落地**（见上一轮 §7 与本轮 §6）：`rv32mmu_top.v`（ITLB 8/DTLB 16/单 PTW、
     D 优先、权限与 Svade live 判）、访存侧 `M_IDLE` 内联翻译 + `M_XLATE` 兜底、`mem_chk_addr` 全按 PA、
     取指侧 `pa_valid` 门控三处 + 行标签存 PA + `cross_pa_q`/`id_pa_q`、数据总线与 PTW 复用单笔在途、`sfence.vma` 全清。
