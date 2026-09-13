@@ -60,7 +60,18 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 3. **锁步已达标**：`bash scripts/lockstep.sh sim/tests/out/lockstep_bench_hi.elf 6000`
    → 5994 条提交与 Spike 完全一致（新增 `sim/tests/lockstep_bench.c` 纯计算基准，避免 MMIO 让 Spike 提前退出）。
    `lockstep.sh` 已修好三处工具缺陷（`32'h…` 加引号、Spike 提交日志取 stderr、RESET_PC 取 ELF 入口）。
-4. **剩余卡点：A 扩展的 arch-test（trap 签名记录）**。LR/SC/AMO 执行通路**已实现**（MEM FSM 的
+4. **剩余卡点（本轮已大幅推进）**：`Zaamo` 9/9 全绿；`Zalrsc` 的 `lr.w` 通过，`sc.w` 仍在**第 171 例**
+   `cp: cmp_rd_rs2 / bin b1`（rd = rs2 = x1）失败：
+   - 已修并提交：① A 类指令 `imm_type`（地址被误加 imm[31:20]）；② AMO 首拍改读；③ AMO 写数据同沿取样
+     （`amo_base`）；④ **`sc.w` 的 rs2=x0 合法**（SC 的 rs2 是存储数据；只有 LR 的 rs2 必须为 0）——
+     该修复把用例从"第 1 例非法指令陷阱"推进到第 171 例。
+   - 第 171 例现场：参考签名该例的期望字 = `0x72926d9b`（正是本用例装入 rs2/x1 的数据值），
+     而按语义 `sc.w x1,x1,(x27)` 成功后 rd=x1 应被写成 `0`（失败为 1）。需判定：参考模型在
+     rd==rs2 别名时记录的是"SC 前的 rs2 值"（即该 SIGUPD 比较的是原 rs2，说明参考把该用例当作
+     *不* 覆盖 rd 的检查），还是本核的 rd 覆盖时序/`m_rdata_q` 写入有偏差。建议下一步：用
+     `tb_debug_min` 打印该例 `sc.w` 前后的 x1/内存与 `pc=0x80009e40/0x80009e44/0x80009e48` 三条提交，
+     并与 Spike 在 sig 版镜像上同地址的寄存器轨迹对照。
+5. **（历史）trap 签名记录问题**：LR/SC/AMO 执行通路**已实现**（MEM FSM 的
    `M_REQ_W/M_WAIT_W` 写回阶段、AMO 读-改-写、LR/SC 保留集、原子非对齐报 cause=6），但
    `Zaamo`/`Zalrsc` 两组仍报框架的 `Mismatch in trap signature!`：用例在 U 模式下对非对齐地址发
    AMO，陷阱经 `medeleg` 委派进 S 模式，需逐字段核对 S 侧 `scause/sepc/stval` 的记录值与参考

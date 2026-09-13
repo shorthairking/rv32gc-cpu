@@ -381,7 +381,7 @@ def decode32(w):
             setf(d, op_class="OP_LSU", mem_op="MEM_LR", mem_size="MSZ_WORD",
                  amo_flags=aflags, wb_sel="WB_MEM", rd_wen=1 if rd else 0, use_rs1=1)
             d.update(rs1=rs1, rd=rd)
-        elif f5 == 0x03 and rs2 != 0:                  # SC.W
+        elif f5 == 0x03:                               # SC.W（rs2=x0 合法：写入 0）
             d["legal"] = 1
             setf(d, op_class="OP_LSU", mem_op="MEM_SC", mem_size="MSZ_WORD",
                  amo_flags=aflags, wb_sel="WB_MEM", rd_wen=1 if rd else 0,
@@ -928,8 +928,6 @@ ILLEGAL32 = [
      "AMO funct5=00110 未定义"),
     ((0x02 << 27) | (12 << 20) | (11 << 15) | (2 << 12) | (10 << 7) | 0x2F,
      "LR.W rs2!=0（保留）"),
-    ((0x03 << 27) | (0 << 20) | (11 << 15) | (2 << 12) | (10 << 7) | 0x2F,
-     "SC.W rs2=0（保留）"),
     ((0x20 << 25) | (12 << 20) | (11 << 15) | (0 << 12) | (10 << 7) | 0x53,
      "OP-FP fsub.s（F 未实现）"),
     (ENC_I(0, 0, 11, 2, 0x07), "LOAD-FP（F 未实现）"),

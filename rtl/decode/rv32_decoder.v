@@ -776,8 +776,8 @@ module rv32_decoder (
               wb_sel_d  = `WB_MEM;
             end
           end
-          5'b00011: begin               // SC.W（rs2 为写入数据，不得为 0）
-            if (rs2_i != 5'd0) begin
+          5'b00011: begin               // SC.W（rs2 为写入数据；x0 合法 = 写 0，与 LR 的 rs2 必须为 0 不同）
+            begin
               legal32   = 1'b1;
               mem_op_d  = `MEM_SC;
               mem_size_d= `MSZ_WORD;
