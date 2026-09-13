@@ -1,6 +1,6 @@
-# RV32-GC 上板测试计划（B1~B3）—— 草案 v0.9（待用户审阅）
+# RV32-GC 上板测试计划（B1~B3）—— **v1.0（待用户审阅）**
 
-> 状态：**草案**。本文件是 AGENT.md §7 的 ⑥「上板测试计划（2A-7d）」交付物；
+> 状态：**v1.0 定稿待审**（④ Cache 已完成，L1I+L1D 实测见 §11）。本文件是 AGENT.md §7 的 ⑥「上板测试计划（2A-7d）」交付物；
 > **用户审阅通过前不做任何上板动作**。
 > 已核实的事实来源：`chiplab/fpga/loongson/soc_up.xdc`（引脚/时钟）、
 > `chiplab/chip/soc_demo/loongson/soc_top.v`（时钟 50/33 MHz、CPU 例化点）、
@@ -211,3 +211,45 @@ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j$(nproc)
 我在 `/home/shorthair/dsh/rv32-cpu/.dsh-kb/sources.json` 里加三条源，**root 精确到文档/配置子目录**
 （避免把整个源码树塞进索引，例如 `linux/Documentation`、`linux/arch/riscv`、`linux/arch/riscv/configs`、
 `u-boot/doc`、`u-boot/arch/riscv`、`u-boot/configs`、`opensbi/docs`），再 `kb_manage action=reindex`。
+
+
+---
+
+## 11. 定稿时的实测状态与复现入口（**审阅用**）
+
+### 11.1 一条命令复现全部验证
+```bash
+cd rv32gc-cpu && bash scripts/run_full_regression.sh     # 汇总写 sim/log/full_regression_summary.txt
+```
+**最近一次实测（主 Agent 亲跑，第 21 轮）**：
+```
+FULL_REGRESSION: PASS （PASS 计数=281  FAIL 计数=7）
+偏离基线清单：空（与基线逐项一致）
+```
+7 个 FAIL **全部是已知基线例外**：`PMPZca` 3 例（ISA 不可达：本核无 Zcb/F/D）、
+`PMPSm_cfg_A_tor_zero-00`（平台 PA-0 口径，与参考对物理地址 0 的假设不同）、
+`Sv` 3 例（**参考模型 Spike 自身 FAIL**，312 个参考日志里只有这 3 个）。
+
+| 类别 | 实测 |
+|---|---|
+| 非特权 arch-test | **18 组 124 例 0 失败**（I39/M8/Zicsr6/Zifencei1/Zca26/Zaamo9/Zalrsc2/Misalign5/MisalignZca4/Zicntr2/Zicbom3/Zicboz1/Zicbop3/Zihintpause1/Zihintntl4/ZihintntlZca4/Zmmul4/Zicond2） |
+| PMP 私权 | PMPS 11/11、PMPU 11/11、PMPZaamo 1/1、PMPZalrsc 1/1、PMPZca 12/15、PMPSm 37/38 |
+| MMU 验收（RV32 子集） | Svbare 3/3、**Sv 28/31**、Svade 2/2、SvPMP 4/4、ExceptionsSv 4/4、Zaamo 3/3、Zalrsc 3/3、SvZicbo 6/6、SvPMPZicbo 8/8、PMPZicbo 4/4 |
+| 单元 | PMP 443、CLINT_PLIC 184、TLB_PTW 155、**ICACHE 36**、**DCACHE 59 + DWRITE_THRU 14**、AXI 79、EXEC 2461、DECODER 255 |
+| 定向 | PRIV_TRAP 46、FETCH_ERR 21、LRSC、FENCEI_SMC 9、**DCACHE_DIRECTED 28**、SPI_BOOT(+XIP_NOALLOC 142)、BOOT_CHAIN(+XIP_NOALLOC 5059) |
+| DTS/打包 | CHECK_DTS 17/17、PACK_BOOT PASS |
+| **性能** | `hello` **308 拍**；`memtest` **1,021,800 拍**（相对无 Cache 的 2,026,669 拍 **−49.6%**；L1I 先降 45%、L1D 再降 8.5%） |
+
+### 11.2 上板前仍需在 Vivado 里确认的（软件仿真覆盖不到）
+1. **时序收敛**：目标 33 MHz（周期 30.303 ns），WNS ≥ 0；重点路径 = PMP 组合匹配树、MDU、AXI 仲裁、
+   **L1I/L1D 的 4 路/8 路标记比较与阵列读**（L1D 32 KB 需按 BRAM 推断复核）。
+2. **BRAM 推断**：L1I `4 路×128 组×32 B`、L1D `8 路×128 组×32 B` 的数据阵列能否正确推断成
+   Block RAM（若被推断成分布式 RAM，LUT 会爆）。必要时把阵列改成 `(* ram_style = "block" *)`。
+3. **复位/跨时钟**：`clk_pll_33` 的 `locked` 是否参与复位门控；100 MHz 板级时钟到 50/33 MHz 的 MMCM 配置沿用参考工程。
+4. **平台端口**：`core_top` 的 AXI 端口与 `chip/soc_demo/loongson/soc_top.v` 的 CPU 例化位置逐字段核对
+   （本核新增了 L1D 的 d 通道行填充客户端，但**对外端口形状未变**，`core_top.v` 已透传）。
+
+### 11.3 本阶段明确不做（避免误解）
+L2 Cache（规格 256 KB/8 路）、预取、多 MSHR、伪 LRU、Store Buffer、核心级乱序/超标量；
+NAND 与 rootfs 验证（用户拍板本阶段不验，B3 的 NAND 相关条目为可选）；
+千兆网/USB/PCIe 驱动；SMP；H 扩展。
