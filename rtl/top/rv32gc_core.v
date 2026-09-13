@@ -240,6 +240,19 @@ module rv32gc_core (
                                       : mstatus_mpp_w;
   wire [1:0]  pmp_eff_priv_d = (((priv_q == `PRV_M) && mprv_eff) ? mpp_eff : priv_q);
 
+  // mstatus.SUM/MXR 的**同拍旁路**（与上面 MPRV/MPP 同一类流水线冒险）：`csrs sstatus,(SUM|MXR)`
+  // 紧跟 `lhu/lw/...` 时，csrs 与这条 load 分别处在 WB/MEM（程序序相邻 ⇒ 同拍），CSR 寄存器要到
+  // 本拍时钟沿才更新，而 MMU 的权限判定是 MEM 级**组合**判定（rv32mmu_top.v:176-179 的
+  // d_perm_u_fail/d_perm_rwx_ok 直接用 sum/mxr）⇒ 不做旁路会用旧值判权限、误报页错误。
+  // 实测 sv32_exceptions_Zaamo_Umode（其余 Smode/Mmode 用例均通过）：S 模式陷阱处理器
+  // `csrr a5,sstatus; lui t2,0xC0000; csrs sstatus,t2; lhu t2,0(s0)` 里那条 `lhu` 读的是
+  // U 页（PTE_U=1），需要 SUM=1 才允许，DUT 报 cause 13，参考模型不报 ⇒ 后续陷阱序整段错位。
+  // sstatus 只暴露 SUM/MXR（第 18/19 位）且位序与 mstatus 相同，故直接用 wb_csr_wdata 取位。
+  wire        sxstat_pend = wb_valid_q && !wb_excp_valid_q && (wb_csr_op_q != `CSR_NONE) &&
+                            ((wb_csr_addr_q == `CSR_MSTATUS) || (wb_csr_addr_q == `CSR_SSTATUS));
+  wire        sum_eff = sxstat_pend ? wb_csr_wdata[18] : mstatus_sum_w;
+  wire        mxr_eff = sxstat_pend ? wb_csr_wdata[19] : mstatus_mxr_w;
+
   // 访存侧：读相位与写相位各一个检查结果（AMO 先读后写 ⇒ 缺 R 报 cause 5、缺 W 报 cause 7，
   // 与 Spike 的 mmu 调用顺序一致；SC 与普通 store 一样按写检查）
   wire [1:0]  mem_pmp_size = (mem_mem_size_q == `MSZ_BYTE) ? 2'd0 :
@@ -628,7 +641,12 @@ module rv32gc_core (
   // 有效特权级 < M 且 satp.MODE=1 才翻译（MPRV/MPP 已并入 pmp_eff_priv_d，与 PMP 同口径）；
   // 非对齐**先于**翻译判定（与 Spike 的 load_slow_path/store_slow_path 一致）。
   wire        mem_trans_en   = satp_w[31] && (pmp_eff_priv_d != `PRV_M);
-  wire        mem_addr_ready = !mem_trans_en || m_xlated_q;
+  // ⚠ 非对齐访问**不需要**翻译就绪：Spike 的 load_slow_path/store_slow_path 里"非对齐判定"先于
+  //   `translate()`（tools/spike/riscv/mmu.cc:293-294 在 translate 之前抛 misaligned），且
+  //   `mem_xlate_req` 本身也排除了非对齐 —— 若这里不把 misaligned 当作"就绪"，M_IDLE 会等一个
+  //   永远不会发出的翻译请求 ⇒ **整核冻结**（实测 sv32_exceptions_Smode：memst=IDLE、ptw 空闲、
+  //   零总线流量、pc 冻结在 0x300023a6，VA=0x9040d012 正是非对齐访存）。
+  wire        mem_addr_ready = !mem_trans_en || m_xlated_q || mem_misaligned;
   wire        mem_xlate_req  = (memst_q == M_IDLE) && mem_needs_fsm && mem_trans_en &&
                                !m_xlated_q && !mem_misaligned;
   // PMP 与核内设备窗口判定一律用**物理地址**：翻译完成后是 m_addr_q，否则就是 mem_addr_q
@@ -641,7 +659,7 @@ module rv32gc_core (
     .clk(clk), .rst_n(rst_n),
     .satp_mode(satp_w[31]), .satp_ppn(satp_w[21:0]), .satp_asid(satp_w[30:22]),
     .priv(priv_q), .d_eff_priv(pmp_eff_priv_d),
-    .sum(mstatus_sum_w), .mxr(mstatus_mxr_w), .flush(sfence_take),
+    .sum(sum_eff), .mxr(mxr_eff), .flush(sfence_take),
     .if_va(fetch_pc),
     .if_pa_valid(mmu_if_pa_valid), .if_pa(mmu_if_pa), .if_fault(mmu_if_fault),
     .d_va(mem_addr_q), .d_is_store(pmp_mem_is_w || pmp_mem_is_amo), .d_req(mem_xlate_req),
@@ -964,7 +982,13 @@ module rv32gc_core (
               m_wstrb_q     <= 4'h0;
               m_wstrb2_q    <= 4'h0;
               m_excp_tval_q <= mem_addr_q;
-              m_excp_cause_q<= (mem_mem_op_q == `MEM_LOAD) ? `EXC_LOAD_MISALIGN : `EXC_STORE_MISALIGN;
+              // cause 按指令自身的访问类型：LOAD/LR 是 load ⇒ 4；STORE/SC/AMO 是 store ⇒ 6。
+              // LR 走 Spike 的 `load_reserved`（mmu.h:124 → load 路径，require_alignment）
+              // ⇒ load address-misaligned；SC/AMO 走 store 侧（SC 由 `check_load_reservation`
+              //  的 store_slow_path、AMO 被 convert_load_traps_to_store_traps 包住）⇒ 6。
+              // 实测参考签名 sv32_exceptions_Zalrsc_Smode 前两条 = 4@lr.w + 6@sc.w。
+              m_excp_cause_q<= (mem_mem_op_q == `MEM_LOAD || mem_mem_op_q == `MEM_LR)
+                              ? `EXC_LOAD_MISALIGN : `EXC_STORE_MISALIGN;
               memst_q       <= M_DONE;
             end else begin
 `endif
@@ -985,23 +1009,38 @@ module rv32gc_core (
             m_excp_tval_q <= mem_addr_q;
             m_excp_cause_q<= `EXC_NONE;
             // ---- A 扩展：原子指令（LR/SC/AMO）----
-            // 原子操作不可拆分：地址非自然对齐一律报 cause=6（与 MISALIGNED_TRAP 无关）
+            // 原子操作不可拆分：地址非自然对齐一律报地址非对齐异常（与 MISALIGNED_TRAP 无关）。
+            // cause 按**指令自身的访问类型**取：LR 是 load ⇒ 4；SC/AMO 是 store ⇒ 6
+            // （依据 Spike：LR 走 `load_reserved`→`load(..., {.lr=true,.require_alignment=true})`
+            //  ⇒ trap_load_address_misaligned；SC 走 `check_load_reservation` 的
+            //  `store_slow_path(..., require_alignment=true)` ⇒ store 侧；AMO 被
+            //  convert_load_traps_to_store_traps 包住 ⇒ 6。实测参考签名
+            //  sv32_exceptions_Zalrsc_Smode 前两条正是 4@lr.w + 6@sc.w）。
             if (mem_is_atomic && mem_misaligned) begin
-              m_excp_cause_q <= `EXC_STORE_MISALIGN;
+              m_excp_cause_q <= mem_is_lr ? `EXC_LOAD_MISALIGN : `EXC_STORE_MISALIGN;
               if (mem_is_sc) resv_valid_q <= 1'b0;   // 失败的 SC 也消费保留集
               memst_q        <= M_DONE;
             end else if (mem_is_sc) begin
-              // SC：保留集有效且地址一致才写；成功 rd=0，失败 rd=1；两种都清保留集
-              if (resv_valid_q && (resv_addr_q == mem_addr_q)) begin
+              // SC：先按 Spike `mmu_t::check_load_reservation`（tools/spike/riscv/mmu.h:274-292）的顺序做
+              // "translate(store) + PMP + 平台 PMA 判定"，**然后**才比较保留集：
+              //   · 保留集比较必须用**物理地址**：Spike 的 LR 把 `paddr` 写进 `load_reservation_address`
+              //     （mmu.cc:259），SC 用 `paddr` 比较（mmu.h:285）——用 VA 比在开启翻译后必然失配。
+              //   · 保留集无效时**仍要把地址送到总线**（写使能被 wstrb=0 抑制）：Spike 在保留集比较之前
+              //     先做 `sim->reservable(paddr)`（mmu.h:285-288），未映射/设备区一律 store access fault；
+              //     本核没有静态 PMA 表，由平台互连给出同样的裁决（未映射 → SLVERR → cause 7）。
+              //     若在这里"直接 rd=1 收工"，sv32_exceptions_Zalrsc 的 Case 3（有效 PTE 指向
+              //     RVMODEL_ACCESS_FAULT_ADDRESS）就少了参考签名里的那条 cause 7 陷阱。
+              if (resv_valid_q && (resv_addr_q == mem_chk_addr)) begin
                 m_wdata_q <= mem_rs2_val_q;
                 m_wstrb_q <= 4'hF;
                 m_rdata_q <= 32'd0;
-                memst_q   <= M_REQ_W;
               end else begin
-                m_rdata_q     <= 32'd1;
-                resv_valid_q  <= 1'b0;                // 失败：消费保留集
-                memst_q       <= M_DONE;
+                m_wdata_q <= 32'd0;
+                m_wstrb_q <= 4'h0;               // 不写任何字节（SC 失败不得改写内存）
+                m_rdata_q <= 32'd1;
               end
+              resv_valid_q <= 1'b0;              // 成功/失败都消费保留集
+              memst_q      <= M_REQ_W;
             end else begin
               // 普通 store / LOAD / AMO 进入 MEM：按 RISC-V 规范（unpriv "Load-Reserved/
               // Store-Conditional"）"the reservation is ... invalidated by any store"，

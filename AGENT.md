@@ -793,6 +793,36 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 第 15 轮：阶段 2A-③ Sv32 MMU 收尾（一）：死锁 + 委托语义 + CSR 存在性 + LR/SC/SUM/MXR
+
+**本轮把 `Sv`/`Svade`/`ExceptionsSv` 三个家族的验收从 35/64 推到 47/64**，其中 10 例（ExceptionsSv 家族）
+由子 Agent 定位并修复、我已逐项复核。
+
+| 项 | 结果 |
+|---|---|
+| **死锁修复（我，含证据）** | `mem_addr_ready` 补 `|| mem_misaligned`：翻译模式下遇到非对齐访问时，`mem_xlate_req` 因 `!mem_misaligned` 不发遍历，而 `mem_addr_ready` 仍为 0 ⇒ `M_IDLE` 死等 ⇒ **整核冻结**（探针实测：`memst=IDLE`、PTW 空闲、零总线流量、PC 冻结在 `0x300023a6`，VA=`0x9040d012` 正是非对齐访存）。依据 Spike `load_slow_path/store_slow_path` 中"非对齐判定先于 `translate()`"（`tools/spike/riscv/mmu.cc:293-294`）。修前 `ExceptionsSv*` 10 例全是 300k 拍 TIMEOUT，修后 ~70k 拍出结果 |
+| **RV32 高半 CSR 存在性（我）** | 新增 `CSR_SENVCFGH 12'h11A`（defs）并把 `CSR_MENVCFGH(0x31A)`/`CSR_SENVCFGH(0x11A)` 加进 `csr_exists`（RO 0）。证据：`sv32_Svade_{S,U}mode` 的第一条陷阱是 **M 模式下 `csrc 0x31a`**（反汇编 `0x80002158: 31a2b073`），参考模型认为合法、我们报非法指令 ⇒ 整条陷阱序错位（表观症状"陷阱在 M 模式处理而参考在 S 模式"）。修后 **`Svade '^sv32_Svade' 2/2 PASS`** |
+| **委托语义（子 Agent，我复核）** | 陷阱**不得**从高特权级委托到低特权级：`cause_priv` 加 `deleg_en=(priv != PRV_M)`。依据 machine.adoc「Traps never transition from a more-privileged mode to a less-privileged mode」+ Spike `processor.cc:438-443`（`hsdeleg=(prv<=S)?medeleg:0`）。修复 `*_mprv_{S,U}_Mmode`/`Zaamo_Mmode` 的 M 模式陷阱被错误交给 S 模式 |
+| **`RVMODEL_ACCESS_FAULT_ADDRESS`（子 Agent，我复核）** | 本 DUT 声明从 `0x0` 改为 `0x4000_0000`：`0x0` 在本平台是 **DDR3 + 复位桩**（`docs/kb/01-chiplab-platform.md:45`），对 `0x0` 的 store/load/fetch **根本不 fault**（实测 Case 3 的 `jalr` 直接执行了 PA 0 的桩代码并跳回）。新地址在仿真从设备是 `R_NONE→SLVERR`、Spike 默认内存映射同样未映射 ⇒ 参考与 DUT 都必 fault。**注**：该宏变更会让相关用例的参考签名由 Spike 重新生成（`arch_test_build.sh` 自动做） |
+| **LR/SC 三处（子 Agent，我复核）** | ① 保留集比较改用 **PA**（`mem_chk_addr`，Spike 存/比 paddr，`mmu.cc:259`/`mmu.h:285`）——原来用 VA，开翻译后 `sc.w` 恒失败；② 保留集无效时失败 SC **也要上总线**（`wstrb=0` 抑制写），让互连给出 store access fault（`mmu.h:274-292`）；③ 非对齐 **LR 报 cause 4**（load 侧），SC/AMO 才是 6（`mmu.h:124`） |
+| **mstatus.SUM/MXR 同拍旁路（子 Agent，我复核）** | `csrs sstatus,(SUM\|MXR)` 后紧跟的访存同拍读到的还是旧值（CSR 要到时钟沿才更新），而 MMU 权限判定是 **MEM 级组合判定** ⇒ 3 个 `*_Umode` 用例误报页错误。新增 `sum_eff/mxr_eff` 旁路并接到 `rv32mmu_top` |
+| **验收（RV32 可跑子集，实测）** | `Svbare 3/3`、`Sv '^sv32_' 28/31`（3 例参考自失败）、**`Svade 2/2`**、`SvPMP 2/4`、**`ExceptionsSv 4/4`**、**`ExceptionsSvZaamo 3/3`**、**`ExceptionsSvZalrsc 3/3`**、`SvZicbo 2/6`、`SvPMPZicbo 0/8` ⇒ **47/64** |
+| 回归（不可退，全绿） | 非特权 **18 组 124 例全 PASS**；PMPS 11/11、PMPU 11/11、PMPZaamo/PMPZalrsc 1/1、PMPZca 12/15、PMPSm 37/38（例外同前）；`PMP_UNIT 443`、`CLINT_PLIC_UNIT 184`、`TLB_PTW_UNIT 155`、`AXI 79`、`EXEC 2461`、`DECODER PASS`、`PRIV_TRAP 46`、`FETCH_ERR 21`、`LRSC_DIRECTED PASS`、`SPI_BOOT PASS`、`hello`/`memtest` PASS。`run_sim.sh hello` 墙钟 **0.96 s**（未新增 PMP 实例，仿真未变慢） |
+| 剩余（下一轮） | ① `SvPMP on_pte_{S,U}mode` 2 例（EPC 落在 `failedtest_saveresults_common`，是二次效应，真因在前）；② `SvZicbo 4` + `SvPMPZicbo 8` 依赖 **④ CBO 真正生效**；③ `PMPSm_cfg_A_tor_zero-00`（PA 0 平台口径，已记录）；④ 3 例参考自失败（不可作为判据） |
+
+#### 关键经验（本轮）
+
+* **"陷阱在 M 模式处理、参考在 S 模式"这类表观症状几乎都源于"多了一条参考没有的陷阱"**：先用 `XEPC` **反汇编那条指令**（`/opt/riscv/bin/riscv32-unknown-linux-gnu-objdump -d --start-address=<epc> --stop-address=<epc+8>`），
+  本轮两例都是这样一眼定位（`csrc 0x31a` = menvcfgh 不存在、PA 0 桩代码不 fault）。
+* **CSR "存在性"是验收的隐形前提**：参考模型实现了而我们没实现的 CSR（menvcfgh、mhpmevent3-31）会让
+  M 模式前导码/清理代码报非法指令，症状却是"完全无关的用例失败"。补"存在但 RO/WARL"比补功能便宜得多。
+* **委托方向**：`medeleg` 只在"当前特权级 ≤ S"时才生效（`priv != M`）；忘了这条会让 M 模式下的陷阱
+  被错误交给 S 模式，整个陷阱序错位。
+* **平台地址属性属于 DUT 声明**：`RVMODEL_ACCESS_FAULT_ADDRESS` 必须指向**本平台真的会 fault** 的地址
+  （本项目 0x0 是 DDR+复位桩）；这是"把平台事实写对"，不是放宽用例。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
@@ -814,8 +844,9 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 - 🚧 **阶段 2A 上板前收尾（第 12 轮起；用户要求不做上板）**——进度：
   * ✅ ① 总线错误通道（取指 cause 1 + load/store 5/7，`FETCH_ERR: PASS (21)`）；物理 0 口径仍记为平台约定差异（详见上板计划）
   * ✅ ② `Zimop 40/40`、`Zcmop 8/8`
-  * ⏭ ③ Sv32 MMU（**S0~S5 主体已完成**：`Svbare 3/3`、`Sv ^sv32_ 28/31`、`rv32mmu_top` 集成 +
-    `sfence.vma` + 取指页错误；**剩余 Sv 家族用例待修**）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
+  * ⏭ ③ Sv32 MMU（**验收 47/64**：`Svbare 3/3`、`Sv '^sv32_' 28/31`、`Svade 2/2`、`ExceptionsSv 4/4`、
+    `ExceptionsSvZaamo 3/3`、`ExceptionsSvZalrsc 3/3`、`SvPMP 2/4`、`SvZicbo 2/6`、`SvPMPZicbo 0/8`；
+    **剩 `SvPMP on_pte` 2 例 + 依赖 ④ 的 CBO 14 例**）、④ L1I/L1D/L2 Cache、⑤ 镜像/DTS、⑥ 上板测试计划交审
   * 🔜 **③ 的剩余工作（下一轮优先级最高，按此顺序）**：
     1. **`ExceptionsSv` 系列 10 例**（`ExceptionsSv 0/4`、`ExceptionsSvZaamo 0/3`、`ExceptionsSvZalrsc 0/3`）：
        现在**不是签名不符而是"慢到超时"** —— 实测 `sv32_exceptions_Smode` 60k 拍只有 649 条提交
@@ -825,6 +856,9 @@ arch-test 与 hello/memtest 无影响，已复跑）。
     3. `SvPMP 2/4`：PMP 作用在 PA 之后的边界用例。
     4. `SvZicbo 2/6` + `SvPMPZicbo 0/8`：**依赖 ④ 的 CBO 真正生效**（CBO 现在只是走 MEM FSM 的空操作），
        与 ④ 同轮做。
+    **第 15 轮已收掉 1~3 的大部分**：`ExceptionsSv 4/4`、`ExceptionsSvZaamo 3/3`、`ExceptionsSvZalrsc 3/3`、
+    `Svade 2/2`（见 §6 第 15 轮）。**仍剩 `SvPMP on_pte_{S,U}mode` 2 例**（EPC 落在
+    `failedtest_saveresults_common`，属二次效应；`on_pa` 两例已 PASS，差异集中在"PMP 作用在页表访问上"）。
   * ✅ **③ 的 S2~S5 集成设计已落地**（见上一轮 §7 与本轮 §6）：`rv32mmu_top.v`（ITLB 8/DTLB 16/单 PTW、
     D 优先、权限与 Svade live 判）、访存侧 `M_IDLE` 内联翻译 + `M_XLATE` 兜底、`mem_chk_addr` 全按 PA、
     取指侧 `pa_valid` 门控三处 + 行标签存 PA + `cross_pa_q`/`id_pa_q`、数据总线与 PTW 复用单笔在途、`sfence.vma` 全清。

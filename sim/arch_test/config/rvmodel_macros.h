@@ -62,7 +62,16 @@
 3:
 
 // ---- Misc required macros ----
-#define RVMODEL_ACCESS_FAULT_ADDRESS 0x00000000
+// RVMODEL_ACCESS_FAULT_ADDRESS 必须选"本平台一定报访问错误"的 PA（ACT4 用它构造
+// store/load/fetch access fault 用例；见 riscv-arch-test/tests/env/check_defines.h:53）。
+// ⚠ 不能再用 0x0：本平台 `0x0000_0000–0x07FF_FFFF` 是 DDR/主存（docs/kb/01-chiplab-platform.md:45），
+//    仿真里 mem_lo 覆盖 0x0–0x00FF_FFFF，且 0x0 还铺着复位跳转桩（sim/tests/arch_stub.S，
+//    0x0–0x4B 全是 nop）——对 0x0+16 的 store/load/fetch 全部会"成功"（实测：sv32_exceptions_Smode
+//    的 Case 3 直接执行了桩代码并跳回 0x80002000，整条陷阱序错位）。
+// 选 0x4000_0000：落在低端主存窗口与 0x8000_0000 RAM 之间的空洞，仿真从设备 region_of()=R_NONE
+//    → SLVERR（sim/tb/sim_axi_slave.v:179,307,463），Spike 默认 `-m 2048`（0x8000_0000 起）同样未映射
+//    ⇒ 两侧都必然报 access fault（参考签名与 DUT 期望一致，不是"放宽"用例）。
+#define RVMODEL_ACCESS_FAULT_ADDRESS 0x40000000
 #define RVMODEL_INTERRUPT_LATENCY 10
 #define RVMODEL_TIMER_INT_SOON_DELAY 1000
 #define RVMODEL_MAX_CYCLES_PER_TIMER_TICK 1

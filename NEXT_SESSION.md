@@ -92,6 +92,11 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0c. ✅ **已完成（第 15 轮）**：③ 收尾（一）—— 修掉**翻译+非对齐死锁**（`mem_addr_ready` 补
+       `|| mem_misaligned`）、补 `menvcfgh/senvcfgh` 存在性（`Svade 2/2`）、子 Agent 修 M 模式委托语义 /
+       `RVMODEL_ACCESS_FAULT_ADDRESS` 改成平台上真会 fault 的地址 / LR·SC 用 PA 比保留集+失败 SC 也上总线 /
+       mstatus.SUM·MXR 同拍旁路 ⇒ **`ExceptionsSv 4/4`、`Zaamo 3/3`、`Zalrsc 3/3`**。验收 **35/64 → 47/64**，
+       全量回归全绿。**下一步**：`SvPMP on_pte_{S,U}mode` 2 例 + ④ Cache/CBO（收 `SvZicbo`/`SvPMPZicbo` 14 例）。
    b0. ✅ **已完成（第 14 轮）**：**Sv32 MMU 核内集成**（`rtl/mmu/rv32mmu_top.v` + 取指/访存两侧接入 + `sfence.vma`
        + 取指页错误）—— `Svbare 3/3`、**`priv/Sv '^sv32_' 28/31`**、`TLB_PTW_UNIT 155`、全量回归无回退。
        剩余 Sv 家族用例（`ExceptionsSv` 10 例"慢到超时"、`Svade` 2、`SvPMP` 2、`SvZicbo`/`SvPMPZicbo` 14）

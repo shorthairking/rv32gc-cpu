@@ -347,6 +347,11 @@ module rv32_csr (
       `CSR_SSTATUS, `CSR_SIE, `CSR_STVEC, `CSR_SCOUNTEREN, `CSR_SSCRATCH, `CSR_SEPC,
       `CSR_SCAUSE, `CSR_STVAL, `CSR_SIP, `CSR_SATP,
       `CSR_MENVCFG, `CSR_SENVCFG,
+      // RV32 的高半（menvcfgh/senvcfgh）在本设计里是 RO 0，但**必须存在**：
+      // 实测 sv32_Svade_{S,U}mode 的第一条陷阱就是 M 模式下 `csrc 0x31a` —— 参考模型
+      // 认为 menvcfgh 合法（无陷阱），我们若报非法指令会让整个陷阱序错位（表现为
+      // "陷阱在 M 模式处理而参考是 S 模式"）。
+      `CSR_MENVCFGH, `CSR_SENVCFGH,
       `CSR_CYCLE, `CSR_CYCLEH, `CSR_TIME, `CSR_TIMEH, `CSR_INSTRET, `CSR_INSTRETH:
         csr_exists = 1'b1;
       default: csr_exists = 1'b0;
@@ -394,8 +399,18 @@ module rv32_csr (
   assign satp_o      = satp_q;
 
   // ---------------------------------------------------------------- 陷阱委托与向量
-  wire [1:0]  cause_priv  = trap_is_int ? (mideleg_q[trap_cause] ? `PRV_S : `PRV_M)
-                                        : (medeleg_q[trap_cause] ? `PRV_S : `PRV_M);
+  // ⚠ 委托只在**当前特权级 ≤ S** 时生效：`machine.adoc`（medeleg/mideleg 一节）"Traps never
+  //   transition from a more-privileged mode to a less-privileged mode" —— M 模式里发生的陷阱
+  //   一律在 M 模式处理，即使 MPRV=1 让*访存*按 S 模式做（MPRV 影响的是地址翻译与 PMP/PMA，
+  //   不是陷阱的归属）。Spike 同口径：`processor.cc:438-443`
+  //   `hsdeleg = (state.prv <= PRV_S) ? medeleg/mideleg : 0`。
+  //   反例（本会话实测）：sv32_exceptions_Zaamo_Mmode 在 M 模式 + MPRV/MPP=S 下执行 store，
+  //   参考把这条 store page fault 记在 M 模式处理器（trap signature 的 mode 字段 = M），
+  //   我们却按 medeleg 委派给 S 模式 ⇒ 陷阱序从 test35 起整段错位（少一条 test36 的 cause 15，
+  //   多出 S 模式打印路径在 UART VA 上的两条 cause 13）。
+  wire        deleg_en   = (priv_q != `PRV_M);
+  wire [1:0]  cause_priv = (deleg_en && (trap_is_int ? mideleg_q[trap_cause] : medeleg_q[trap_cause]))
+                           ? `PRV_S : `PRV_M;
   wire [31:0] vec_base   = (cause_priv == `PRV_S) ? stvec_q : mtvec_q;
   assign trap_new_priv   = cause_priv;
   // MODE=0 直接模式；MODE=1 向量模式（中断时 base + 4*cause）
