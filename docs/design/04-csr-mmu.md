@@ -45,7 +45,8 @@
 | `0x3B0`–`0x3BF` | `pmpaddr0`–`pmpaddr15` | RW | 16 项 |
 | `0xB00`/`0xB02` | `mcycle`/`minstret` | RW | 真实计数（64 位，RV32 分高低） |
 | `0xB80`/`0xB82` | `mcycleh`/`minstreth` | RW | RV32 高 32 位 |
-| `0x320`+ | `mhpmcounter3..31` | RO 0 | 未实现的性能计数器读 0，写忽略（合法） |
+| `0xB03`–`0xB07` | `mhpmcounter3..7` | RW | **实现为真实性能计数器**（事件硬连线：3=分支数、4=分支误预测、5=L1D 缺失、6=L1I 缺失、7=L2 缺失；`mhpmevent3..7` 只读 0 = 事件硬连线，属合法 WARL 实现） |
+| `0xB08`–`0xB1F` | `mhpmcounter8..31` | RO 0 | 未实现，读 0、写忽略（合法） |
 | `0xF11`… | — | — | — |
 
 ### 2.2 监管级与用户级 CSR

@@ -80,6 +80,8 @@
 | `RAS_DEPTH` | 32 | 返回地址栈深度（指针 `ras_ptr[5:0]`，6 位以支持 32 项 + 空/满判定） |
 | `AXI_DATA_W` | 32（`` `AXI64 `` → 64、`` `AXI128 `` → 128） | AXI 数据宽度 |
 | `CACHE_LINE` | 32 B | 所有 Cache 的行大小（含 L2） |
+| `MISALIGNED_TRAP` | 未定义 | 定义则**非对齐访存触发地址非对齐异常**（用于调试）；默认未定义 = 硬件拆分处理（Linux/uboot 要求） |
+| `SIM_ASSERT` | 未定义 | 定义则打开仿真断言（见 `09-verification-interface.md` §3），综合时不得定义 |
 | `PADDR_W` | 32 | 物理地址宽度 |
 | `VADDR_W` | 32 | 虚拟地址宽度 |
 

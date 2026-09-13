@@ -266,6 +266,14 @@
 3. **PRF 写口冲突**：改为"压制重试 + 唤醒照常广播"，不插入流水线停顿（已改 `01-pipeline.md` §2.4）。
 4. **FMA 第三源**：`uop_ctrl_t` 由 72 位扩为 **73 位**，新增 `use_rs3`，并补 `rs3_arch[4:0]`/`ps3[6:0]`（已同步 `rv32gc_defs.vh`、`spec/02`、`spec/03`）。
 
+5. **非缓存（设备）访问时机**：采用 **ROB 头部门控**——非缓存 load/store 只在 `rob_idx == rob_head` 时发往 `uncached_unit`，发出后不重放；**不是**"提交后才发"（会死锁）。理由：平台设备有读副作用（UART RBR/IIR 读清、NAND 数据口、仿真 VIRTUAL_UART），头部门控既杜绝投机副作用，又保证该访问不会被更年轻指令的清空干掉（`spec/08-bus-axi.md` §9.4b D-1）。
+6. **AXI 端口归属**：`l2_cache.v` **不**直接暴露 AXI；L2 经 refill/victim 队列连 `axi_bridge`，**非缓存单元直接连桥**（不分配 L2 行）；设备访问 `awcache/arcache = 4'b0000`（D-2/D-3）。
+7. **RV32 的 Zcd**：RV32 下 Zcd 提供的是**压缩浮点双精度访存**（`c.fld/c.fsd/c.fldsp/c.fsdsp`），整数 `c.ld/c.sd` 属 RV64 专有（已修正 `spec/02` §4.6）。
+8. **性能计数器**：`mhpmcounter3..7` 实现为真实计数器（分支数/误预测/L1D 缺失/L1I 缺失/L2 缺失，事件硬连线，`mhpmevent3..7` 只读 0），`mhpmcounter8..31` 读 0（已更新 `04-csr-mmu.md`）。
+9. **`cbo.clean/flush` 语义**：必须把数据**推过 L2 直达 DDR** 并在完成前阻塞提交，否则非一致性 DMA 会读到旧数据（已写入 `03-cache.md`）；同时记录"平台无 snoop"的已知限制（DMA 对 LR/SC 保留集不可观测、AMO 与 DMA 无原子性保证，需软件回避）。
+
+**FPGA 升频方案修正（依实际 `.xci` 参数）**：`clk_pll_33` 是 **PLLE2_ADV**，实测 `PRIM_IN_FREQ=100`、`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33` → **VCO=1650 MHz**，`CLKOUT0_DIVIDE_F=33` → `cpu_clk`=50 MHz、`CLKOUT1_DIVIDE=50` → `uncore_clk`=33 MHz。因此原"CLKOUT2..7 已是 100 MHz"的说法**不成立**；推荐方案是**直接用板级 100 MHz 作为 `cpu_clk`**（零 IP 风险），备选为 `CLKOUT0_DIVIDE_F` 改 16.5 或用 tcl 重新生成 IP；并注意 VCO=1650 MHz 可能超出 Artix-7 -2 的 PLLE2 上限（平台既有疑点，重新生成 IP 时用 DRC 校验）。
+
 **同时修正的 ISA 准确性问题**（由 `spec/07` 的规范比对发现，已改 `04-csr-mmu.md`）：`pmpcfg` 在 RV32 只有 `0x3A0–0x3A3`（4 个寄存器 / 16 项）；`mstatus` 位图按规范补全（含 `TVM/TW/TSR`、`XS/VS`、`SD`）；`mret/sret` 的 `MPRV` **仅在返回目标 ≠ M 时清 0**；A/D 位更新必须对 PTE **原子 CAS 且不得使用翻译缓存**，写回违例报**访问错误**。
 
 **未决/待验证事项（带入阶段二，均不阻塞开工）**：`PARAM`/硬件 ECC/坏址标记/`TIMING` 取值（上板实测）；FPGA 工程 tcl 与 Vivado 2025.2 许可；100 MHz 时序收敛（4 项降级措施，降为双发射需用户批准）。

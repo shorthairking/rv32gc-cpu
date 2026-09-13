@@ -2,7 +2,7 @@
 
 > 上游：`00-conventions.md`（握手/命名/参数/时钟复位）、`03-pipeline-regs.md` §2.7/§2.8（CSR 与 LSU↔Cache/AXI 接口）、`../06-bus-axi.md`（平台契约）、`../03-cache.md`（L1/L2/MSHR/Victim/非缓存）、`../07-fpga-timing.md`（时序预算）。
 > 平台依据（**只读，不得修改 `chiplab/` 下任何文件**）：`chiplab/docs/Quick-Start.md:72-131`（`core_top` 端口）、`chip/soc_demo/loongson/soc_top.v:723-776`（CPU 例化）、`:779-989`（读 mux + 时钟桥）、`:992-1220`（`axi_slave_mux`）、`config.h`（`LID/Lawlen/Lwdata…`）、`IP/AMBA/axi_mux_syn.v:854-860,946-951`（平台译码）。
-> 范围：`rtl/bus/addr_decode.v`、`rtl/bus/axi_master.v`（读引擎+写引擎+L2↔AXI 桥）、`rtl/bus/uncached_unit.v`、`core_top` 端口绑定与平台集成清单。需其他已发布文件配合处（新增宏、`l2_req_ready`）不直接改动它们，登记在 §9.5。
+> 范围：`rtl/bus/addr_decode.v`、`rtl/bus/axi_master.v`（读引擎+写引擎+L2↔AXI 桥）、`rtl/bus/uncached_unit.v`、`core_top` 端口绑定与平台集成清单。需其他已发布文件配合处（新增宏、AXI 端口归属、非缓存策略）不直接改动它们，登记在 §9.5。
 
 ---
 
@@ -38,7 +38,7 @@
 | 32 B 行填充/写回（默认 AXI32 / `` `AXI64 `` / `` `AXI128 ``） | `4'd7` / `4'd3` / `4'd1` | `3'b010` / `3'b011` / `3'b100` | `2'b01` | 8×4 B / 4×8 B / 2×16 B |
 | 非缓存设备访问（单拍） | `4'd0` | `3'b010` | `2'b01` | 1 × 4 B |
 
-**硬约束**：① `arlen/awlen ≤ 4'd15`；② 突发不得跨 4 KB 边界——32 B 行天然 32 B 对齐、设备访问 4 B 对齐，均满足，仍按 §8.4 断言检查；③ 行访问 `len+1 == `AXI_BEATS_PER_LINE`。
+**硬约束**：① `arlen/awlen ≤ 4'd15`；② 突发不得跨 4 KB 边界——32 B 行天然 32 B 对齐、设备访问 4 B 对齐，均满足，仍按 §8.3 断言检查；③ 行访问 `len+1 == `AXI_BEATS_PER_LINE`。
 
 ### 1.3 平台侧拓扑与不变量（`soc_top.v:779-1220`）
 
@@ -131,11 +131,11 @@ else if (paddr[31:20]==12'h1F1)                               region=4; // PLIC 
 ```verilog
 module axi_rd_engine (
   input  wire clk, rst_n,
-  // 请求（来自 L2 miss 表 / uncached_unit，仲裁见 §6.4）
-  input  wire rd_req_valid, output wire rd_req_ready,          // ready = 读表有空项
+  // 请求（来自 L2 Refill Buffer / uncached_unit，仲裁见 §6.4）
+  input  wire rd_req_valid, output wire rd_req_rdy,            // rdy = 读表有空项
   input  wire [31:0] rd_req_addr, input wire [3:0] rd_req_id,  // ID: 0/1/3（§6.3）
   input  wire rd_req_len_mode,                                 // 0=行(8/4/2 beat) 1=单拍
-  input  wire [3:0] rd_req_tgt, input wire rd_req_tgt_is_uc,   // 目标 MSHR / UC 索引
+  input  wire [3:0] rd_req_tgt, input wire rd_req_tgt_is_uc,   // 目标 L2 Refill Buf / UC 索引
   // 回填（逐拍写 L2 行缓冲或 UC 数据寄存器）
   output wire fill_valid, output wire [3:0] fill_tgt, output wire fill_tgt_is_uc,
   output wire [4:0] fill_byte_off, output wire [`AXI_DATA_W-1:0] fill_data,
@@ -176,13 +176,13 @@ module axi_rd_engine (
 | `id` / `addr` / `len` / `size` | 4 / 32 / 4 / 3 | 已发出的 AR 参数（`1<<size` = 每拍字节数） |
 | `beat_cnt` | 4 | 已接收 beat 数（校验 `rlast`） |
 | `byte_off` | 5 | 行内字节偏移 = 回填写指针 / UC 车道选择（每拍 `+= 1<<size`） |
-| `tgt` / `tgt_is_uc` | 4 / 1 | 目标 MSHR（L2 miss 表）索引 / UC 队列索引 |
+| `tgt` / `tgt_is_uc` | 4 / 1 | 目标：L2 Refill Buffer 索引（4 项，`06-lsu-mem.md` §5.4）+ 源标记；或 UC 读队列索引（`tgt_is_uc=1`） |
 | `src` | 2 | 0=I-fetch 1=D-refill 3=device（错误归因，§8.1） |
 | `drop` / `err` / `resp` | 1 / 1 / 2 | flush·超时后丢弃（仍需吸收到 `rlast`）/ 错误 / AXI 响应码 |
 | `tmo_cnt` | 16 | 无进展超时计数（§3.5） |
 
 **ID FIFO**：每 ID 一个循环队列（8 项 × 3 bit 索引 + head/tail），入队序 = AR 发出序 → 保证同 ID 数据按序归属；只比较 4 个队头，不做全表搜索。
-**容量关系**：`AXI_RD_TBL_DEPTH(8)` 必须 ≥ L2 miss 表项数；若 L2 只实现 4 项 refill buffer，则读表降为 4、`tgt` 缩为 2 bit（§9.5 R2）。
+**容量关系**：`AXI_RD_TBL_DEPTH=8` 是**容量上限**（本规格要求"最多 8 个未完成突发"）。L2 侧已发布为 **Refill Buffer 4 项 + Victim Buffer 4 项**（`06-lsu-mem.md` §5.4），故稳态占用 ≤ 4（refill）+ 1（设备保留槽）+ 1（预取）= 6；8 项留作余量。若要把并发做满 8，L2 的 Refill Buffer 需扩到 8 并同步 `tgt` 位宽（§9.5 R2）。
 
 ### 3.4 按 `RID` 分发伪代码
 
@@ -229,7 +229,7 @@ end
 module axi_wr_engine (
   input  wire clk, rst_n,
   // 请求：victim 写回（数据在 L2 victim buffer）与设备写
-  input  wire wr_req_valid, output wire wr_req_ready,              // ready = 写表有空项
+  input  wire wr_req_valid, output wire wr_req_rdy,                // rdy = 写表有空项
   input  wire [31:0] wr_req_addr, input wire [3:0] wr_req_id,      // 2=writeback 3=device
   input  wire [1:0] wr_req_buf_idx,                                // victim buffer / UC 索引
   input  wire [3:0] wr_req_wstrb, input wire wr_req_last,          // 仅设备写用
@@ -304,12 +304,12 @@ wstrb = uc_wstrb << (lane*4);
 module uncached_unit (
   input  wire clk, rst_n,
   // ── 来自 LSU（提交门控后，§5.2）──
-  input  wire uc_req_valid, output wire uc_req_ready,
+  input  wire uc_req_valid, output wire uc_req_rdy,        // 命名与 `06-lsu-mem.md` §2 一致（*_rdy）
   input  wire uc_req_we, input wire [31:0] uc_req_addr, uc_req_wdata,
   input  wire [3:0] uc_req_wstrb, input wire [1:0] uc_req_size, input wire uc_req_unsigned,
   input  wire [4:0] uc_req_lsq_idx, input wire [6:0] uc_req_rob_idx,
   // ── 到 AXI 桥（单拍读写）──
-  output wire uc_axi_req_valid, input wire uc_axi_req_ready,
+  output wire uc_axi_req_valid, input wire uc_axi_req_rdy,
   output wire uc_axi_req_we, output wire [31:0] uc_axi_req_addr, uc_axi_req_wdata,
   output wire [3:0] uc_axi_req_wstrb,
   input  wire uc_axi_resp_valid, input wire [31:0] uc_axi_resp_rdata, input wire [1:0] uc_axi_resp_resp,
@@ -325,10 +325,11 @@ module uncached_unit (
 - **同地址保序**自动成立（不存在同一时刻的两个设备事务）；**读写之间的保序**也成立（younger write 不会越过 older read 到达设备）；
 - ID=3 最多 1 个未完成 → `RID/BID=3` 的分发只需 1 个寄存器，不需要 FIFO；
 - 深度 4 的用途：① 一条非对齐访问按 `mem_size` 拆成最多 2 个单拍请求；② 反压期间吸收 LSU 侧请求。因提交门控，**稳态占用 ≤2**。
+- **挂接点**：本文件按"UC 直接进 AXI 桥"给出 `uc_axi_*` 端口；若按 `06-lsu-mem.md` §5.3 把非缓存归入 L2 **源 3（非缓存/维护）**，则把该组端口换成 `l2_req_*` 的源 3 位（`l2_req_valid[3]`/`l2_req_rdy[3]`/`l2_rsp_*`），其余逻辑不变（见 §9.5 R11）。
 
 ### 5.2 "设备访问不投机"的明确定义（**提交门控**）
 
-> **定义**：设备窗口的 load/store 在到达 **ROB 头部**（`lsq_entry.rob_idx == rob_head_idx && rob_entry.done && !excp && !flush`）之前，**不产生任何 AXI 事务**；`uc_req_valid` 只在该条件下拉高。ROB 在该指令提交前等 `uc_resp_valid`：设备访问的**执行**就发生在提交点，提交与副作用之间没有窗口。
+> **定义**：设备窗口的 load/store 在到达 **ROB 头部**（`lsq_entry.rob_idx == rob_head_idx && rob_entry.done && !excp && !flush`）之前，**不产生任何 AXI 事务**；`uc_req_valid` 只在该条件下拉高。ROB 在该指令提交前等 `uc_resp_valid`：设备访问的**执行**就发生在提交点，提交与副作用之间没有窗口。（与 `06-lsu-mem.md` §7 的差异与取舍见 §9.5 R10。）
 
 | 理由 | 说明 |
 |---|---|
@@ -375,25 +376,25 @@ endcase
 ```
  L1I 缺失 ─┐                                ┌─ refill_q (4) ─┐
  L1D 缺失 ─┼─► L2 (256KB PIPT 8way) ─ miss ─┤                ├─► 读引擎(8 表项) ─► AR/R
- 设备访问 ─┘        │      ▲                └─ (miss 表 8 项) ┘
+ 设备访问 ─┘        │      ▲                └─ Refill Buf(4) ┘
                     │      └── 回填 fill_valid/tgt/byte_off/data
                     └─ victim ─► victim_q (4) ─► 写引擎(4 表项) ─► AW/W/B
                        （32 B 行 + 索引）        保留槽：读表项 7 / 写表项 3 归设备
 ```
 
-- **L2 miss 表**：8 项 `{valid, paddr[31:5], set[9:0], way[2:0], be[7:0], src, l1_req_id[3:0]}`；`tgt` = 该表索引。回填按 `byte_off`+`be` 把 4 B 片写进 L2 阵列 refill 端口，`fill_last` 时置 `be=8'hFF` 并唤醒等待的 L1I/L1D。
-- **victim 队列**：4 项 `{valid, paddr[31:5], vbuf_idx[1:0]}`，数据留在 L2 victim buffer（4 × 32 B），写引擎用 `wb_rd_*` 读走整行后才释放。
+- **Refill Buffer（L2 侧）**：4 项 `{tag, set, way, 源/ID, beat_cnt, data[255:0], err}`（`06-lsu-mem.md` §5.4）；`tgt` = 该缓冲索引 + 源标记。回填按 `byte_off` 把 4 B 片写入 `data`，`fill_last` 时整行写 L2 阵列并唤醒等待的 L1I/L1D。
+- **Victim 队列**：4 项 `{valid, paddr[31:5], vbuf_idx[1:0]}`，数据留在 L2 Victim Buffer（4 × 32 B），写引擎用 `wb_rd_*` 读走整行后才释放。
 
 ### 6.2 对 L2 的反压信号
 
 | 信号 | 方向 | 含义 |
 |---|---|---|
-| `l2_rf_valid/ready` | L2→桥 / 桥→L2 | refill 请求；`ready = !refill_q_full`（由读表空位驱动排空） |
-| `l2_wb_valid/ready` | L2→桥 / 桥→L2 | victim 写回；`ready = !victim_q_full` |
+| `l2_rf_valid/rdy` | L2→桥 / 桥→L2 | refill 请求；`rdy = !refill_q_full`（由读表空位驱动排空） |
+| `l2_wb_valid/rdy` | L2→桥 / 桥→L2 | victim 写回；`rdy = !victim_q_full` |
 | `l2_rf_full` / `l2_wb_full` | 桥→L2 | 队列将满告警（留 1 项余量），供 L2 提前反压 |
 | `l2_rf_stall` / `l2_wb_stall` | 桥→L2 | 第 1 级流水判满 → L2 停在当前请求（不回退指针） |
 
-**反压链**：读表满(8) → `refill_q` 满(4) → L2 miss 表满(8) → `l2_req_ready` 低 → L1I/L1D MSHR 分配失败 → 前端冻结/发射停顿；写表满(4) → `victim_q` 满(4) → victim buffer 无空位 → 替换停顿 → store 提交停顿。链上每级都有容量上界，反压**必然终止**（无活锁）。
+**反压链**：读表满(8) → `refill_q` 满(4) → L2 Refill Buffer 满(4) → `l2_req_rdy[3:0]` 拉低（`06-lsu-mem.md` §5.2）→ L1I/L1D MSHR 分配失败 → 前端冻结/发射停顿；写表满(4) → `victim_q` 满(4) → L2 Victim Buffer 无空位 → 替换停顿 → store 提交停顿。链上每级都有容量上界，反压**必然终止**（无活锁）。
 
 ### 6.3 ID 分配表
 
@@ -406,21 +407,21 @@ endcase
 
 - ID 在请求入队时由**源**决定；`wid = awid`。
 - 读表项 7 与写表项 3 为**设备保留槽**（refill/victim 最多用 7/3）：设备访问是**提交阻塞**的（§5.2），必须有界延迟；代价是 refill 并发降 1，实测无影响（32 B 行仅 8 beat）。
-- `4'd4`–`4'd15` 保留：若需提高 refill 并发（降低同 ID 头阻塞），可把 L2 miss 表项高位编入 ID（平台不合成 ID，安全），但会改变 ID FIFO 结构 → 列为后续优化。
+- `4'd4`–`4'd15` 保留：next-line 预取若按 `06-lsu-mem.md` §5.5 使用**独立 ID**，落在本保留区即可直接工作（读引擎按"每 ID 一个 FIFO"实现，不依赖 ID 取值）；也可把 Refill Buffer 索引高位编入 ID 以提高并发（平台不合成 ID，安全）。
 
 ### 6.4 读写并发仲裁与死锁避免
 
 **优先级**（同拍竞争表项时）：`设备(3) > victim(2) > refill(1)`——设备卡在 ROB 头（直接停提交），victim 满会卡 store 提交，refill 只影响性能。读/写通道物理独立，**可同时**发起（无需互斥）。
 
-**死锁避免**：① **无环依赖**——写数据只来自 L2 victim buffer 与 UC 写队列，**不来自任何读响应**，不存在"写等读"；② **设备路径解耦**——旁路 L2 阵列且持有保留槽，不会被 refill 流饿死；③ **每条已发事务必然终结**——正常由 `rlast`/`bvalid`，异常由 `AXI_TIMEOUT_CYCLES` 兜底，表项一定回收；④ **容量匹配**——`refill_q(4) ≤ 读表(8)`、`victim_q(4) ≤ 写表(4)`，队列不会无限积压；⑤ **不占总线锁定**——`lock=2'b00`，不与 `debug_sram`/DMA/MAC 主设备互锁；⑥ **核内截获**——CLINT/PLIC 不占 AXI 资源，总线卡住时仍能收中断并进 trap。
+**死锁避免**：① **无环依赖**——写数据只来自 L2 Victim Buffer 与 UC 写队列，**不来自任何读响应**，不存在"写等读"；② **设备路径解耦**——设备访问按 `06-lsu-mem.md` §5.3 走 L2 **源 3（非缓存/维护）**且不分配 Cache 行、持有保留槽，不会被 refill 流饿死；③ **每条已发事务必然终结**——正常由 `rlast`/`bvalid`，异常由 `AXI_TIMEOUT_CYCLES` 兜底，表项一定回收；④ **容量匹配**——`refill_q(4) ≤ 读表(8)`、`victim_q(4) ≤ 写表(4)`，队列不会无限积压；⑤ **不占总线锁定**——`lock=2'b00`，不与 `debug_sram`/DMA/MAC 主设备互锁；⑥ **核内截获**——CLINT/PLIC 不占 AXI 资源，总线卡住时仍能收中断并进 trap。
 
 > 已知降级：若平台对某地址既不响应也不回 `rlast`，看门狗只能让核内路径继续（发 trap）；**若该 ID 的 FIFO 头被永久占用，同 ID 后续请求会排队**——可接受的降级（可打印错误并停机），不是静默错误。
 
 ### 6.5 桥对 L2 的接口清单
 
 ```verilog
-// L2→桥：input l2_rf_valid, [31:0] l2_rf_addr, [2:0] l2_rf_idx, l2_rf_src;  output l2_rf_ready
-//        input l2_wb_valid, [31:0] l2_wb_addr, [1:0] l2_wb_idx;              output l2_wb_ready
+// L2→桥：input l2_rf_valid, [31:0] l2_rf_addr, [2:0] l2_rf_idx, l2_rf_src;  output l2_rf_rdy
+//        input l2_wb_valid, [31:0] l2_wb_addr, [1:0] l2_wb_idx;              output l2_wb_rdy
 // 桥→L2：output l2_rf_fill_valid, [2:0] l2_rf_fill_idx, [4:0] l2_rf_fill_byte_off, l2_rf_fill_last,
 //                [`AXI_DATA_W-1:0] l2_rf_fill_data, l2_rf_err_valid, [2:0] l2_rf_err_idx,
 //                [1:0] l2_rf_err_resp, l2_wb_rd_req, [1:0] l2_wb_rd_idx, l2_wb_done_valid,
@@ -429,7 +430,7 @@ endcase
 //        input [`CACHE_LINE_BITS-1:0] l2_wb_rd_data
 ```
 
-> **接口差异**：`04-frontend.md` §6 的 `l2_req_*` 目前**没有** ready/credit 反压位，而 L2 无法保证"永远能接收"（miss 表有限）→ L1↔L2 接口必须补 `l2_req_ready`（1 bit）或 `l2_credit[2:0]`；本文件不修改该文件，登记在 §9.5 R3。
+> **接口层次说明**：本节信号是**桥的内部接口**（L2 的 Refill/Victim Buffer ↔ AXI 引擎）。L2 对上层（L1I/L1D/非缓存）的请求接口是 `06-lsu-mem.md` §5.2 的 `l2_req_valid/we/rdy[3:0]` + `l2_req_addr/wdata/wstrb/cbo/id` / `l2_rsp_*`——**反压位 `l2_req_rdy[3:0]` 已在该文件定义**，故 §9.5 R3 的缺口已闭合，只需 `04-frontend.md` §6 的取指侧视图与之对齐。
 
 ---
 
@@ -453,7 +454,7 @@ endcase
 | `rid` 比较 + 表项/`byte_off` 更新 | 4.0 ns | 只比较 4 个 ID 队头；表项写为单点 |
 | `bid` 匹配 + 表项回收 | 2.5 ns | 每 ID 一个 head 指针，不全表搜索 |
 | 地址译码（L2/UC/非法） | 2.0 ns | `[31:20]`/`[31:16]` 常量比较，与 TLB 并行 |
-| 反压组合链（`l2_*_ready`） | 3.0 ns | 队列满标志寄存输出，不穿透组合链 |
+| 反压组合链（`l2_*_rdy`） | 3.0 ns | 队列满标志寄存输出，不穿透组合链 |
 
 ---
 
@@ -487,7 +488,7 @@ endcase
 
 ### 8.3 ILA 观测点与协议断言
 
-**ILA 观测点**（深度建议 8192 ≈82 µs @100 MHz；`err_pulse` 触发时冻结 `mberrstat` 快照）：① AXI 边界 `ar*/r*/aw*/w*/b*` 及各 `valid&&ready`；② 读引擎 `rd_state`(打包)、`beat_cnt`、`byte_off`、`id_fifo_head[3:0]`；③ 写引擎 `wr_state`、`wr_beat_cnt`、`b_wait_fifo_head`；④ 非缓存 `uc_q_valid`、`uc_req_we/addr`、`uc_resp_valid/fault/cause`；⑤ 桥与反压 `l2_rf_valid/ready`、`l2_wb_valid/ready`、`l2_miss_pending`；⑥ 超时 `tmo_cnt`（最大者）、`timeout_hit/id/src`。触发条件：`err_pulse`、`timeout_hit`、`uc_resp_fault`、`l2_*_stall` 持续 >200 拍。
+**ILA 观测点**（深度建议 8192 ≈82 µs @100 MHz；`err_pulse` 触发时冻结 `mberrstat` 快照）：① AXI 边界 `ar*/r*/aw*/w*/b*` 及各 `valid&&ready`；② 读引擎 `rd_state`(打包)、`beat_cnt`、`byte_off`、`id_fifo_head[3:0]`；③ 写引擎 `wr_state`、`wr_beat_cnt`、`b_wait_fifo_head`；④ 非缓存 `uc_q_valid`、`uc_req_we/addr`、`uc_resp_valid/fault/cause`；⑤ 桥与反压 `l2_rf_valid/rdy`、`l2_wb_valid/rdy`、`l2_miss_pending`；⑥ 超时 `tmo_cnt`（最大者）、`timeout_hit/id/src`。触发条件：`err_pulse`、`timeout_hit`、`uc_resp_fault`、`l2_*_stall` 持续 >200 拍。
 
 `` `ifdef SIM_ASSERT `` 断言清单：① `arvalid&&!arready` ⇒ `ar*` 不变（`aw*/w*` 同理）；② `arlen/awlen ≤ 4'd15`，行访问 `len+1 == `AXI_BEATS_PER_LINE`，设备访问 `len==0`；③ `arburst==awburst==2'b01`、`arlock==awlock==2'b00`、`arsize/awsize==3'b010`；④ `araddr[1:0]==0 && awaddr[1:0]==0`，且 `addr[11:0]+(len+1)*(1<<size) ≤ 4096`（不跨 4 KB）；⑤ `rvalid` 拍数 == `len+1` 且 `rlast` 恰在末拍，`rvalid&&!rready` ⇒ 载荷不变；⑥ `wid == 对应事务 awid`、`wstrb != 0`、`wlast` 恰在末拍；⑦ `bvalid` 数 == 已发 AW 数、`bid` ∈ 已分配 ID、无未匹配 B；⑧ 未映射/核内地址（`region==5/3/4`）**从不出现**在 AXI 上；⑨ 表项占用 ≤8（读）/≤4（写），在途设备读/写各 ≤1；⑩ 复位释放后 ≥2 拍内 `ar/aw/w/bvalid==0`、无 X 传播；⑪ `rd_err_valid`/`wr_err_valid` 每次错误只脉冲 1 拍，`drop` 表项在 `rlast`/`bvalid` 后释放。
 
@@ -536,16 +537,26 @@ synth_design -top soc_top -part xc7a200tfbg676-2 -flatten_hierarchy rebuilt -ret
 4. `axi_clock_converter_0` 无需改配置（频率无关，内部 FIFO 自动反压）；但 100→33 MHz 带宽比约 3:1，DDR 侧成为瓶颈，`03-cache.md` §9 的命中率目标更重要。
 5. ⚠️ **待确认（不在本次交付内验证）**：`MULT_F=33`+`DIVCLK_DIVIDE=2` 给出的 VCO=1650 MHz 超出 Artix-7 **-2** MMCM VCO 上限（数据手册约 1440 MHz），属平台既有疑点（当前 50 MHz 配置已是该值）。升频不改变 VCO，故不使该疑点恶化；但重新生成 IP 时若 Vivado 报 DRC，需先与平台侧确认。
 
+### 9.4b 裁定记录（2026-09-13，上级决策）
+
+| 编号 | 冲突 | **裁定** | 理由 |
+|---|---|---|---|
+| D-1 | 非缓存访问时机：`06-lsu-mem.md` §7（MEM 级执行 + 强序队列）vs 本文件 §5.2（提交门控） | **采用"ROB 头部门控（head-gated）"**：非缓存 load/store 只在 `rob_idx == rob_head` 时发往 `uncached_unit`；发出后**不得重放/重发**；其数据在写回后立即提交。**不是**"提交后才发"（那会死锁：ROB 头部指令永远无法置 `done`） | 平台设备存在读副作用（UART RBR/IIR 读清、NAND 数据口、仿真 VIRTUAL_UART）。头部门控保证：任何清空都只可能来自更年轻的指令（该 load 比它们老，因而**不会**被清掉），既不投机也不丢副作用；同时避免死锁 |
+| D-2 | AXI 端口归属：`l2_cache.v` 暴露 AXI vs L2 经桥接 | **`l2_cache.v` 不直接暴露 AXI**；L2 通过 refill/victim 队列连到 `axi_bridge`；**非缓存单元直接连到 `axi_bridge`**（不经 L2、不分配 L2 行） | 非缓存访问必须强序且不能污染 L2；桥内两个客户端（L2、UC）+ 设备保留槽的仲裁更简单；`06-lsu-mem.md` §5.2 的 AXI 端口应删除，改由本文件 §5/§6 定义 |
+| D-3 | 设备访问 `awcache/arcache` 编码 | 取 `4'b0000`（Device Non-bufferable） | AXI 规范；平台不解释该位（无功能影响，仅语义正确性） |
+
 ### 9.5 差异与风险清单（本次核查发现，需上游文件配合）
 
 | # | 差异/风险 | 处置建议 |
 |---|---|---|
-| R1 | `../06-bus-axi.md` §2.1 把设备访问 `cache` 写作 `4'b0010`（=Normal Non-cacheable）；本规格改为 `4'b0000`（Device Non-bufferable，符合 AXI 编码与 I/O 语义） | 以 §1.4 为准；平台不解释该位，无功能影响 |
-| R2 | L2 miss 跟踪容量未定义：`../03-cache.md` §4 只写"4 项 Refill Buffer"，而 AXI 读表要求 8 项未完成 | 二选一并同步：① L2 增加 8 项 miss 表（推荐，`tgt[2:0]`）；② 读表降为 4 项、`tgt[1:0]` |
-| R3 | `04-frontend.md` §6 的 `l2_req_*` 无 ready/credit 反压位，而 L2 无法保证永远可接收 | L1↔L2 接口补 `l2_req_ready`（1 bit）或 `l2_credit[2:0]`；桥侧语义见 §6.2 |
-| R4 | 本文件新增宏（`AXI_RD_TBL_DEPTH`/`AXI_WR_TBL_DEPTH`/`AXI_REFILL_Q_DEPTH`/`AXI_VICTIM_Q_DEPTH`/`UC_Q_DEPTH`/`UC_OSTD`/`AXI_TIMEOUT_CYCLES`/`AXI_ID_*`）与 2 个 CSR（`0xBC0/0xBC1`） | 需登记进 `rtl/pkg/rv32gc_defs.vh` 与 `07-priv-csr-mmu.md`；本文件未改动它们 |
+| R1 | 设备访问 `cache` 编码：`../06-bus-axi.md` §2.1 与 `06-lsu-mem.md` §5.6/§7 都写 `4'b0010`（=Normal Non-cacheable）；本规格按 AXI 编码改为 `4'b0000`（Device Non-bufferable，符合 I/O 语义） | 以 §1.4 为准；平台不解释该位，无功能影响，但三份文档应统一 |
+| R2 | 读并发容量：L2 已发布为 **Refill 4 项 + Victim 4 项**（`06-lsu-mem.md` §5.4/§5.5），而本规格按要求实现 **8 项读表** | 8 项作为上限、稳态占用 ≤6（4 refill + 1 设备保留 + 1 预取）；若要真正并发 8，需把 L2 Refill Buffer 扩到 8 并同步 `tgt` 位宽 |
+| R3 | 反压：`04-frontend.md` §6 的取指侧 `l2_req_*` 无 ready/credit 位 | **已由 `06-lsu-mem.md` §5.2 的 `l2_req_rdy[3:0]` 闭合**；只需把取指侧视图与之对齐 |
+| R4 | 本文件新增宏（`AXI_RD_TBL_DEPTH`/`AXI_WR_TBL_DEPTH`/`AXI_REFILL_Q_DEPTH`/`AXI_VICTIM_Q_DEPTH`/`UC_Q_DEPTH`/`UC_OSTD`/`AXI_TIMEOUT_CYCLES`/`AXI_ID_*`）与 2 个 CSR（`0xBC0/0xBC1`，经查 `07-priv-csr-mmu.md` 未占用该地址） | 需登记进 `rtl/pkg/rv32gc_defs.vh` 与 `07-priv-csr-mmu.md`；本文件未改动它们 |
 | R5 | 平台 CONFREG 有 FPGA/仿真两套地址（`0x1FD0_0000`/`0x1FAF_0000`），**偏移也不同** | 软件用设备树/宏区分；核内两条窗口都按非缓存处理（§2.1） |
 | R6 | 仿真 SoC 为 128 bit AXI + 64 bit 地址 wire、`debug0_wb_rf_wen` 仅 1 位，与 FPGA SoC 不同 | 仿真时定义 `` `AXI128 ``；`debug0_wb_rf_wen` 恒按 `[3:0]` 声明（bit0 有效） |
 | R7 | 平台所有从设备恒 `resp=00`，未映射地址落 DDR 默认通路 | **必须**核内拒绝未映射地址（§2.3）+ 保留超时看门狗（§3.5），不能依赖平台报错 |
 | R8 | 写通道绕过 `axi_2x1_mux` 直连时钟桥，读通道经该 mux 与调试加载器仲裁 | 读延迟/顺序不可预测：不得假设读写配对超时相等；建议读路径超时阈值单独放宽 |
 | R9 | 平台 `axi_2x1_mux` 的 S00 只接 AR/R，调试加载器（`debug_sram`）是**另一个读主设备** | 读带宽会被调试通道分走；上板调试结束后建议在平台侧关闭该通道（不改本核） |
+| R10 | **非缓存执行策略冲突**：`06-lsu-mem.md` §7 为"load 在 MEM 级执行、非缓存写走强序队列排空、写响应错误非精确记账"；本文档 §5.2 为**提交门控**（到达 ROB 头前不发 AXI 事务） | 必须二选一：① 采纳提交门控（本文件）——杜绝投机设备读的副作用（16550 RBR/IIR 读清、NAND 数据口、仿真 `VIRTUAL_UART`），代价是 ROB 头串行；② 采纳 06 方案——延迟更短，但需为"读有副作用"的窗口加白名单，否则清空/误预测会丢数据。建议 ①（与 `../03-cache.md` §5 的"不投机"意图一致） |
+| R11 | **AXI 端口的归属切分**：本文档把 AXI 端口放在 `rtl/bus/axi_master.v`（读/写引擎 + 桥）；`06-lsu-mem.md` §5.2 把 `arid/araddr/…` 直接列在 `l2_cache.v` 端口上，而其 §1.1 框图又画 `l2_cache.v ─► axi_master.v` | 二者是同一逻辑的两种切分，必须冻结其一：推荐"`l2_cache.v` 只做阵列 + 4 源仲裁，AXI 端口在 `axi_master.v`"（与 `00-conventions.md` §6 的目录规划一致）；同理，非缓存单元是直接进桥还是经 L2 源 3（`06-lsu-mem.md` §5.3 取源 3）也需冻结——本文件 §5.1 的 `uc_axi_*` 按"直接进桥"给出，若改走源 3 只替换该组端口，其余逻辑不变 |

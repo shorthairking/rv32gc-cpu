@@ -46,7 +46,7 @@
 
 - **读引擎**：把 L2 的行填充请求（32 B = 8 beat）转换为 AXI 突发读；支持最多 8 个未完成突发；按 `RID` 把返回数据分发到对应 MSHR。
 - **写引擎**：把脏行写回（8 beat 突发）发送到 AXI；支持最多 4 个未完成写；`B` 响应只做完成记账（错误响应记录到 `mstatus` 无关的错误状态寄存器，并触发可屏蔽的机器级访问错误中断/异常由总线错误路径处理）。
-- **设备通道**：非缓存单拍读写，`len=0`、`size` 按访问宽度、`cache=4'b0010`（device non-bufferable）、`prot` 按特权级/访存类型编码；同一地址保序（简单 in-order 队列）。
+- **设备通道**：非缓存单拍读写，`len=0`、`size` 按访问宽度、`cache=4'b0000`（AXI Device Non-bufferable；平台不解释该位，见 `spec/08-bus-axi.md` §9.5 R1）、`prot` 按特权级/访存类型编码；同一地址保序（简单 in-order 队列）。
 
 ### 2.2 AXI ID 分配
 
@@ -94,7 +94,15 @@
 ## 4. 时钟与复位
 
 - **时钟**：CPU 与 CPU 侧 AXI 使用 `cpu_clk`；平台 uncore（DDR/UART/NAND/MAC/CONFREG）使用 33 MHz `aclk`。两者之间已有平台 `axi_clock_converter_0` 完成异步跨时钟域，**本核不需要额外处理 CDC**。
-- **升频方法**（阶段五）：把 `chiplab/IP/xilinx_ip/<ver>/clk_pll_33/clk_pll_33.xci` 的 `CLKOUT1_REQUESTED_OUT_FREQ` 从 50 改为 100（同一 PLL 的 CLKOUT2..7 已经是 100 MHz，VCO 支持），重新生成 IP；同时把 `chip/soc_demo/loongson/config.h` 的 `` `define FREQ 32'd33000000 `` 与 SoC 中 `CORE_CLOCKS_PER_SEC` 改为 `100_000_000`（这两个值当前与 50 MHz 的 `cpu_clk` 不一致，属于平台遗留问题）。
+- **升频方法（2026-09-13 依实际 `.xci` 参数修正）**：
+  `clk_pll_33` 实为 **PLLE2_ADV**，实测参数为 `PRIM_IN_FREQ=100 MHz`、`DIVCLK_DIVIDE=2`、`CLKFBOUT_MULT_F=33`（→ **VCO = 1650 MHz**）、`CLKOUT0_DIVIDE_F=33`（→ `cpu_clk` = **50 MHz**）、`CLKOUT1_DIVIDE=50`（→ `uncore_clk` = 33 MHz）。因此"CLKOUT2..7 已是 100 MHz"的说法**不成立**（那是未使用输出的默认请求值）。
+  可选方案（按推荐度排序）：
+  1. **直接用板级 100 MHz 作为 `cpu_clk`**（`clk` 引脚，`soc_up.xdc` 的 `create_clock -period 10.000`）：无需改动时钟 IP，零 IP 风险；代价是 SoC 顶层一行改动（本项目在自有工程中保留该改动，或在本项目副本中实现）；
+  2. 把 `CLKOUT0_DIVIDE_F` 由 33 改为 **16.5** → 100 MHz（VCO 不变），需确认 PLLE2 的分数分频被 Vivado 接受；
+  3. 用 tcl 重新生成 `clk_pll_33`（`CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {100.000}` + `generate_target`），由向导重算分频比；
+  4. 新建一个 `clk_wiz` IP（tcl `create_ip`）专门产生 100 MHz。
+  **注意（平台既有风险）**：VCO = 1650 MHz 可能超过 Artix-7 **-2** 的 PLLE2 VCO 上限（约 1600 MHz）；重新生成/校验 IP 时若报 DRC，需按方案 3/4 重算 VCO。
+  同时必须把 `chip/soc_demo/loongson/config.h` 的 `` `define FREQ 32'd33000000 `` 与 SoC 中 `CORE_CLOCKS_PER_SEC` 改为**实际频率**（当前值 33 MHz 与 50 MHz 的 `cpu_clk` 已不一致，属平台遗留问题）。
 - **复位**：`aresetn` 在 SoC 中由 Xilinx 互连的 `S00_AXI_ARESET_OUT_N` 驱动；核内做 2 级同步后作为内部同步复位。
 
 ## 5. 平台集成步骤（Vivado CLI）

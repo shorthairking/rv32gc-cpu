@@ -173,7 +173,7 @@ RVC 在 ID 级由 `rvc_expand.v` 展开为等价的 32 位指令后进入同一�
 | C.LWSP/C.LDSP/C.FLDSP/C.FLWSP | LW/LD/FLD/FLW（rs1=x2） | rd=x0 时非法 |
 | C.SWSP/C.SDSP/C.FSDSP/C.FSWSP | SW/SD/FSD/FSW（rs1=x2） | — |
 | C.NOP / C.EBREAK | NOP / EBREAK | — |
-| C.LD/C.SD（Zcd） | LD/SD | 本设计 FLEN=64，支持 Zcd |
+| C.FLD/C.FSD/C.FLDSP/C.FSDSP（Zcd） | FLD/FSD | RV32 下 Zcd 提供的是**压缩浮点双精度访存**；整数 `C.LD/C.SD` 属 RV64 专有，**RV32 不存在**（因此不存在任何 64 位整数访存指令） |
 
 **取指对齐**：ID 级每周期从取指队列取出最多 4 条**已展开**的 32 位指令；若 16 B 取指块中的 RVC 边界导致某条指令跨块，由 `fetch_queue` 负责拼接（见 `04-frontend.md`）。
 

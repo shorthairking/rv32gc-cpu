@@ -117,7 +117,7 @@ module lsu(
   input  wire [6:0] rt_commit_rob_idx, flush_rob_idx;
   output wire redirect_valid;                    output wire [31:0] redirect_pc;
   output wire [6:0] redirect_rob_idx;
-  output wire [63:0] perf_cnt_l1d_access, perf_cnt_l1d_miss, perf_cnt_mshr_full, perf_cnt_stb_full,
+  output wire [63:0] perf_cnt_dcache_access, perf_cnt_dcache_miss, perf_cnt_mshr_full, perf_cnt_stb_full,
                      perf_cnt_fwd_hit, perf_cnt_fwd_partial, perf_cnt_replay, perf_cnt_split,
                      perf_cnt_amo, perf_cnt_lr, perf_cnt_sc_fail, perf_cnt_uncached, perf_cnt_cbo
 );
@@ -162,7 +162,7 @@ wdata = swd[31:0] << (8*o);   swd >>= (8*nb);  p += nb;  rem -= nb;
 | SH `o=3` / SW `o=0` | 3 / 0 | `4'h8` / `4'hF` | `4'h1` / — | 拍2 用 `swd>>8` |
 | SD `o=0` / `o≠0` | 0 / 1~3 | `4'hF` / 按公式 | `4'hF` / 按公式 | `swd`、`swd>>32`（`o≠0` 共 3 拍） |
 
-**load 对齐器**：`data64 = {beat1_word, beat0_word} >> (8*o)`，再按 `size`/`unsigned` 符号或零扩展（`size=3` 不扩展）。第二拍复用同行命中路径，不重复分配 MSHR。
+**load 对齐器**：`data = {beatN, …, beat1, beat0} >> (8*o)`（N=1：≤4 B 访问；N=2：8 B 且 `o≠0`），再按 `size`/`unsigned` 符号或零扩展（`size=3` 不扩展）。第二拍复用同行命中路径，不重复分配 MSHR。
 
 ### 2.6 浮点访存（FLW/FLD/FSW/FSD）
 
@@ -217,7 +217,7 @@ module lsq(
 | `mshr_idx` / `mshr_valid` / `uncached` | 3+1+1 | ✓ | ✓ | 缺失挂起关联（§3.7）/ 窗口解码 |
 | `beat_cnt` / `beat0_data` | 2+32 | ✓ | ✓ | 拆分进度与第一拍数据 |
 | `fwd_hit` / `fwd_strb` / `replay` | 1+8+1 | ✓ | — | 转发命中掩码 / 违例置位 |
-| `ss_id` / `ss_wait` / `ss_wait_valid` / `stq_prev_same_set` | 6+5+1+5 | ✓ | ✓ | store-set 预测器与同 set 链表（§3.5） |
+| `ss_id` / `ss_wait` / `ss_wait_valid`（LDQ）；`ss_id` / `stq_prev_same_set`（STQ） | 6+5+1；6+5 | ✓ | ✓ | store-set 预测器与同 set 链表（§3.5） |
 
 ### 3.3 分配与释放
 
@@ -390,7 +390,8 @@ module l2_cache(
   output wire l2_rsp_valid, l2_rsp_err;              // 每拍最多一个响应：整行或单拍
   output wire [1:0] l2_rsp_src, l2_rsp_id;
   output wire [255:0] l2_rsp_data;   output wire [31:0] l2_rsp_rdata;  // 源 0/1 / 源 3
-  // ---- AXI4 主设备（06 §2；默认 32 bit 数据，`AXI64/`AXI128 时 arlen 变 3/1）----
+  // ---- AXI4 主设备（**端口集合/位宽的权威定义见 `08-bus-axi.md` §1**：另含 `wid`、`arlock/awlock`、
+  //      `arprot/awprot` 等，由 `bus/axi_master.v` 补齐；本节只列 L2 直接驱动的核心信号）----
   output wire [3:0] arid, awid, arlen, awlen, wstrb, arcache, awcache;
   output wire [31:0] araddr, awaddr, wdata;      output wire [2:0] arsize, awsize;
   output wire [1:0] arburst, awburst;
@@ -482,6 +483,8 @@ module l2_cache(
 
 ## 7. 非缓存访问与 MMU 交互
 
+> **裁定（2026-09-13）**：非缓存 load/store 采用 **ROB 头部门控**（`rob_idx == rob_head` 时才发往 `uncached_unit`，发出后不重放），L2 **不**暴露 AXI 端口，非缓存单元**直接连 `axi_bridge`**；设备访问 `awcache/arcache = 4'b0000`。详见 `08-bus-axi.md` §9.4b。
+
 ### 7.1 设备窗口读写与 `fence` 顺序
 
 - **窗口判定**在 LSU 内按物理地址完成（与 `bus/addr_decode.v` 同一张表，00 §2.2 / 06 §3）：DDR `0x0000_0000-0x07FF_FFFF`、SRAM `0x1C00_0000-0x1C0F_FFFF` → 可缓存；`0x1FD0_0000`/`0x1FAF_0000`/`0x1FE0_0000`/`0x1FE7_8000`/`0x1FE8_0000`/`0x1FF0_0000` → 非缓存；CLINT `0x1F00_0000`、PLIC `0x1F10_0000` → **核内截获，不产生 AXI 访问**（`uncached_unit.v` 直接应答）。
@@ -507,9 +510,9 @@ module l2_cache(
 
 | 计数器 | 事件 / 用途 |
 |---|---|
-| `l1d_access` / `l1d_hit` / `l1d_miss` | L1D 请求 / 命中 / 缺失 → 命中率（目标 ≥95%，`../03-cache.md` §9） |
-| `l2_access` / `l2_hit` / `l2_miss` / `l2_prefetch` | L2 请求/命中/缺失（目标 ≥80%）/ 预取发出 |
-| `l1d_mshr_full` / `stb_full` / `stq_full` / `ldq_full` | 结构满导致的停等周期 → 队列深度是否合理 |
+| `dcache_access` / `dcache_hit` / `dcache_miss` | L1D 请求 / 命中 / 缺失 → 命中率（目标 ≥95%，`../03-cache.md` §9；命名对齐 `09-verification-interface.md` 的 `perf_cnt_dcache_miss`） |
+| `l2_access` / `l2_hit` / `l2_miss` / `l2_prefetch` | L2 请求/命中/缺失（目标 ≥80%，`perf_cnt_l2_miss` 见 09）/ 预取发出 |
+| `mshr_full` / `stb_full` / `stq_full` / `ldq_full` | 结构满导致的停等周期 → 队列深度是否合理 |
 | `fwd_hit` / `fwd_partial` / `split` / `split_cross_line` | 全字节/部分字节转发命中、非对齐拆分（含跨行）计数 |
 | `replay` / `replay_mem_cycle` | 违例重放次数 / 重放阻塞周期 → store-set 预测器调参 |
 | `amo` / `lr` / `sc_fail` / `uncached` / `cbo` / `tlb_ptw_ad_update` | 原子指令与竞争、设备访问、维护指令、A/D 置位次数 |

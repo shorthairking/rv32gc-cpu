@@ -40,7 +40,7 @@
 - **替换**：伪 LRU；配合 **Victim Buffer（4 项）** 暂存被替换的脏行，避免写回阻塞填充。
 - **Store→Load 转发**：在 LSU/LSQ 内部完成（Store Buffer 与 LSQ 地址比较），转发延迟 1 周期；部分重叠时按字节拼接。
 - **原子指令**：`lr.w/sc.w` 使用保留集（reservation set：1 项，记录物理地址 + 有效位）；AMO 在 D-Cache 命中时独占该行完成读-改-写（缺失时先 refill 再执行）。
-- **Zicbom（`cbo.clean/flush/inval/zero`）**：按行（32 B，Zicbom block size = 32 B）在 L1D/L2 中执行 clean（脏行写回）、inval（无效化，脏数据丢弃）、flush（写回+无效化）。这是**非一致性 DMA 的正确性基础**（见 §6）。
+- **Zicbom（`cbo.clean/flush/inval/zero`）**：按行（32 B，Zicbom block size = 32 B）执行 clean（脏行写回）、inval（无效化，脏数据丢弃）、flush（写回+无效化）。**关键约束（2026-09-13 裁定）**：`cbo.clean/flush` 必须把数据**推过 L2 直达 DDR（或至少使 L2 中的该行干净且对后续 DMA 可见）**，并且在完成前**阻塞提交**——否则平台 DMA 引擎会读到旧数据。这是**非一致性 DMA 的正确性基础**（见 §6 与 `spec/06-lsu-mem.md` §6）。
 
 ## 4. L2 Cache（统一，PIPT）
 
@@ -72,6 +72,7 @@
    - 在设备树中给 NAND/MAC 节点加 `dma-noncoherent;`，让 `dma-direct` 走非一致性路径。
 3. **兜底方案**：若某版本内核缺少 Zicbom 支持，则在核内提供**非缓存窗口**（把 DMA 缓冲区分配在 `0x1C00_0000` SRAM 的非缓存别名区，或在核内把某一个物理窗口固定配置为非缓存），驱动改用该区域做 bounce buffer。
 4. **验证方法**：用"CPU 写缓冲 → DMA 读 → DMA 写 → CPU 读"的定向测试程序（在 u-boot 阶段验证）覆盖 clean/inval/flush 三种操作；随后在 Linux 上用 NAND 读写 + `md5sum` 做端到端校验。
+5. **已知限制（必须由软件回避）**：平台**不提供 Cache 一致性信号（无 snoop）**，因此 ① DMA 对 `lr.w/sc.w` 保留集的写入硬件**不可观测**；② AMO 与 DMA 对同一 Cache 行的并发访问**没有原子性保证**。软件约定：DMA 缓冲区不与原子变量/LR-SC 序列共享 Cache 行；必要时用非缓存窗口。
 
 ## 7. 与 AXI 的交互
 
