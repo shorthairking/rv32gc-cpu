@@ -1,0 +1,34 @@
+// RV32GC 流水级划分与各级功能（含乱序窗口）
+digraph pipeline {
+  graph [rankdir=LR, fontname="Helvetica", fontsize=11, splines=polyline, nodesep=0.25, ranksep=0.45];
+  node  [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=9, width=1.45, height=0.95, fillcolor="#e8f0fe", color="#4a6fa5"];
+  edge  [color="#40506b", fontname="Helvetica", fontsize=8];
+
+  F0 [label="IF0\nPC 选择\nBPU 查询\n(BTB/Gshare/局部/RAS)", fillcolor="#dbe7ff"];
+  F1 [label="IF1\nI-Cache 读\nTag/Data BRAM", fillcolor="#dbe7ff"];
+  F2 [label="IF2\nWay 选择/对齐\n取指队列(16B)", fillcolor="#dbe7ff"];
+  DE [label="ID\n译码/RVC 展开\n立即数/分支识别", fillcolor="#dbe7ff"];
+  RE [label="RN\n重命名/ROB 分配\n空闲表/checkpoint", fillcolor="#dbe7ff"];
+  DI [label="DP\n分发到 IQ/LSQ\nstore 数据准备", fillcolor="#dbe7ff"];
+  IS [label="IS\n唤醒/选择×4\n读 PRF/旁路", fillcolor="#e2f5d8"];
+  EX [label="EX\nALU×2/BRU/MDU\nAGU/FPU", fillcolor="#fff3c4"];
+  ME [label="MEM\nD-Cache/TLB\nstore buffer", fillcolor="#f3e2f5"];
+  WB [label="WB\n写回 PRF\n唤醒后继", fillcolor="#e2f5d8"];
+  RT [label="RT\nROB 提交×4\nCSR/异常/store\n预测器更新", fillcolor="#d8f0e8"];
+
+  F0 -> F1 -> F2 -> DE -> RE -> DI -> IS -> EX -> ME -> WB -> RT;
+
+  // 乱序反馈
+  IS -> IS [label=" 唤醒/选择", style=dashed];
+  EX -> IS [label="结果旁路唤醒", style=dashed, color="#3f8f78", fontcolor="#3f8f78"];
+  WB -> IS [style=dashed, color="#3f8f78"];
+  ME -> IS [label="load 唤醒", style=dashed, color="#3f8f78", fontcolor="#3f8f78"];
+  IS -> EX [label="乱序发射\n(每周期最多 4 条)", color="#3f8f78", fontcolor="#3f8f78", style=bold];
+  RT -> RE [label="分支错误清空/恢复 RAT", color="#c04040", fontcolor="#c04040", style=dashed, constraint=false];
+  RT -> F0 [label="trap / 中断入口", color="#c04040", fontcolor="#c04040", style=dashed, constraint=false];
+  EX -> F0 [label="分支解析重定向", color="#c04040", fontcolor="#c04040", style=dashed, constraint=false];
+  ME -> F0 [label="非对齐/页错误重定向", color="#c04040", fontcolor="#c04040", style=dashed, constraint=false];
+
+  { rank=same; F0; F1; F2; DE; RE; DI }
+  { rank=same; IS; EX; ME; WB; RT }
+}

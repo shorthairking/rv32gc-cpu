@@ -1,0 +1,72 @@
+// RV32GC 四发射乱序处理器整体结构图
+digraph cpu_block {
+  graph [rankdir=LR, fontname="Helvetica", fontsize=12, splines=polyline, nodesep=0.35, ranksep=0.55, compound=true];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, fillcolor="#eef3fb", color="#4a6fa5"];
+  edge  [fontname="Helvetica", fontsize=9, color="#40506b"];
+
+  subgraph cluster_fe {
+    label="前端（顺序）"; style="rounded,dashed"; color="#7a8fb5"; fontsize=11;
+    PC     [label="PC 生成\n(PC Gen)", fillcolor="#dce9ff"];
+    BPU    [label="分支预测器\n锦标赛 Gshare+局部\nBTB 512×4way / RAS 32", fillcolor="#ffe9cc", color="#c98f3c"];
+    IF1    [label="IF1\nI-Cache 索引", fillcolor="#dce9ff"];
+    IF2    [label="IF2\nI-Cache 命中/取指队列\n16B/周期", fillcolor="#dce9ff"];
+    ID     [label="ID 译码\nRVC 展开 / 立即数\n非法指令检测", fillcolor="#dce9ff"];
+    RN     [label="RN 重命名\nRAT/空闲表/ROB 分配\n分支 checkpoint", fillcolor="#dce9ff"];
+    DP     [label="DP 分发\n发射队列 / LSQ 分配", fillcolor="#dce9ff"];
+  }
+
+  subgraph cluster_be {
+    label="后端（乱序执行 / 顺序提交）"; style="rounded,dashed"; color="#8fb57a"; fontsize=11;
+    IQ     [label="发射队列\n整型 IQ 32\n访存 IQ 24\n浮点 IQ 16", fillcolor="#e2f5d8", color="#5d8f45"];
+    IS     [label="IS 唤醒/选择\n每周期 4 条\n读物理寄存器堆", fillcolor="#e2f5d8", color="#5d8f45"];
+    ALU0   [label="ALU0", fillcolor="#fff3c4"];
+    ALU1   [label="ALU1", fillcolor="#fff3c4"];
+    BRU    [label="BRU 分支单元", fillcolor="#fff3c4"];
+    MDU    [label="MDU 乘除\n(DSP48 乘法/迭代除法)", fillcolor="#fff3c4"];
+    LSU    [label="LSU/AGU\n2 load 或 1ld+1st", fillcolor="#fff3c4"];
+    FPU    [label="FPU\nFMA/FADD/FMUL/FDIV/FSQRT", fillcolor="#fff3c4"];
+    WB     [label="WB 写回\n唤醒后继", fillcolor="#e2f5d8", color="#5d8f45"];
+    ROB    [label="ROB 128 项\n顺序提交 4 条/周期\n精确异常", fillcolor="#d8f0e8", color="#3f8f78"];
+  }
+
+  subgraph cluster_mem {
+    label="存储子系统"; style="rounded,dashed"; color="#b58fb5"; fontsize=11;
+    L1I    [label="L1I 16KB 4way 32B\nVIPT 别名安全", fillcolor="#f3e2f5", color="#8f5d8f"];
+    L1D    [label="L1D 32KB 8way 32B\nwrite-back / write-allocate", fillcolor="#f3e2f5", color="#8f5d8f"];
+    L2     [label="L2 256KB 8way 32B PIPT\nMSHR / victim / 预取", fillcolor="#f3e2f5", color="#8f5d8f"];
+    MMU    [label="MMU Sv32\nITLB/DTLB + L2TLB\n硬件页表遍历", fillcolor="#f0e6d2", color="#a58a4a"];
+  }
+
+  subgraph cluster_sys {
+    label="特权/系统"; style="rounded,dashed"; color="#b58f8f"; fontsize=11;
+    CSR    [label="CSR 文件\nM/S/U 模式\nPMP 16 项", fillcolor="#fbe4e4", color="#a55a5a"];
+    CLINT  [label="内部 CLINT\nmtime/mtimecmp/msip", fillcolor="#fbe4e4", color="#a55a5a"];
+    PLIC   [label="内部 PLIC\n外部中断 intrpt[7:0]", fillcolor="#fbe4e4", color="#a55a5a"];
+    TRAP   [label="异常/中断\n精确提交", fillcolor="#fbe4e4", color="#a55a5a"];
+  }
+
+  AXI [label="AXI4 主设备桥\n32bit / ID=4bit\nI / D-refill / WB / 设备", shape=box3d, fillcolor="#e8e8e8", color="#555555"];
+  EXT [label="chiplab SoC\n(DDR / UART / NAND / MAC / CONFREG)", shape=box3d, fillcolor="#f5f5f5", color="#777777"];
+
+  PC -> BPU   [label="预测"];
+  PC -> IF1;
+  BPU -> PC  [label="重定向", style=dashed];
+  IF1 -> IF2 -> ID -> RN -> DP -> IQ -> IS;
+  IS -> ALU0; IS -> ALU1; IS -> BRU; IS -> MDU; IS -> LSU; IS -> FPU;
+  ALU0 -> WB; ALU1 -> WB; MDU -> WB; FPU -> WB;
+  BRU -> PC  [label="分支解析/重定向", color="#c04040", fontcolor="#c04040"];
+  LSU -> L1D [label="load/store"];
+  WB -> ROB;
+  LSU -> ROB [label="访存完成"];
+  ROB -> CSR [label="提交"];
+  ROB -> L1D [label="store 提交", style=dashed];
+  ROB -> RN  [label="分支恢复/清空", color="#c04040", fontcolor="#c04040", style=dashed];
+  IF1 -> L1I [style=dotted];
+  L1I -> IF2 [style=dotted];
+  L1I -> L2;  L1D -> L2;  L2 -> AXI -> EXT;
+  MMU -> L1I [style=dotted, label="PA"];
+  MMU -> L1D [style=dotted];
+  CLINT -> TRAP; PLIC -> TRAP; TRAP -> CSR;
+  TRAP -> PC [label="trap 入口", style=dashed, color="#c04040", fontcolor="#c04040"];
+  CSR -> ROB [label="CSR 读"];
+}

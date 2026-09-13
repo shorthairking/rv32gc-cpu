@@ -1,0 +1,76 @@
+// 乱序执行数据通路：重命名 / 发射 / 执行 / 提交
+digraph ooo {
+  graph [rankdir=LR, fontname="Helvetica", fontsize=11, splines=polyline, nodesep=0.3, ranksep=0.5];
+  node  [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=9, fillcolor="#eef3fb", color="#4a6fa5"];
+  edge  [fontname="Helvetica", fontsize=8, color="#40506b"];
+
+  UOP [label="uop\n(来自 ID：opcode/rs1/rs2/rd/imm/pc/预测信息)", fillcolor="#f7f7f7"];
+
+  subgraph cluster_ren {
+    label="重命名"; color="#7a8fb5"; style="rounded,dashed";
+    RAT  [label="RAT 32×2\n(整数/浮点)", fillcolor="#dbe7ff"];
+    FRE  [label="空闲物理寄存器表\n128+128", fillcolor="#dbe7ff"];
+    CKPT [label="checkpoint ×4\n(分支时快照 RAT/FRE)", fillcolor="#dbe7ff"];
+  }
+
+  subgraph cluster_rob {
+    label="ROB（128 项，顺序提交）"; color="#3f8f78"; style="rounded,dashed";
+    ROBENT [label="ROB 表项\npc | rd_phys | rd_old | 完成 | 异常 | 访存 | 分支 | store 数据", fillcolor="#d8f0e8"];
+    RETSEL [label="提交选择\n(每周期 4 条)", fillcolor="#d8f0e8"];
+  }
+
+  subgraph cluster_iq {
+    label="发射队列与选择"; color="#5d8f45"; style="rounded,dashed";
+    IQI [label="整型 IQ 32 项", fillcolor="#e2f5d8"];
+    IQM [label="访存 IQ 24 项", fillcolor="#e2f5d8"];
+    IQF [label="浮点 IQ 16 项", fillcolor="#e2f5d8"];
+    SEL [label="老化选择器 ×4\n(wakeup/select)", fillcolor="#e2f5d8"];
+  }
+
+  PRF [label="物理寄存器堆\n整数 128×32b\n浮点 128×64b\n(读端口 8 + 写端口 6)", fillcolor="#fff8dd", color="#c9a227"];
+
+  subgraph cluster_ex {
+    label="执行单元"; color="#c9a227"; style="rounded,dashed";
+    A0 [label="ALU0", fillcolor="#fff3c4"];
+    A1 [label="ALU1", fillcolor="#fff3c4"];
+    BR [label="BRU", fillcolor="#fff3c4"];
+    MD [label="MDU (乘法 4 级流水\n除法 32 周期迭代)", fillcolor="#fff3c4"];
+    AG [label="AGU + LSU", fillcolor="#fff3c4"];
+    FP [label="FPU (FMA 5 级\nFDIV/FSQRT 迭代)", fillcolor="#fff3c4"];
+  }
+
+  subgraph cluster_lsq {
+    label="访存队列"; color="#8f5d8f"; style="rounded,dashed";
+    LDQ [label="Load Queue 32", fillcolor="#f3e2f5"];
+    STQ [label="Store Queue 32\n(地址+数据)", fillcolor="#f3e2f5"];
+    DIS [label="存储相关性预测\n+ 违例重放", fillcolor="#f3e2f5"];
+  }
+
+  DCC [label="L1D / L2 / AXI", fillcolor="#f3e2f5"];
+  WBU [label="写回/唤醒总线", fillcolor="#d8f0e8"];
+
+  UOP -> RAT -> PRF [label="读源物理号"];
+  RAT -> ROBENT [label="分配表项"];
+  FRE -> RAT;
+  CKPT -> RAT [style=dashed, label="恢复"];
+  ROBENT -> IQI [label="整型指令"];
+  ROBENT -> IQM [label="访存指令"];
+  ROBENT -> IQF [label="浮点指令"];
+  IQI -> SEL; IQM -> SEL; IQF -> SEL;
+  SEL -> PRF [label="读操作数"];
+  PRF -> A0; PRF -> A1; PRF -> BR; PRF -> MD; PRF -> AG; PRF -> FP;
+  AG -> LDQ [label="load"];
+  AG -> STQ [label="store"];
+  LDQ -> DIS; STQ -> DIS;
+  DIS -> LDQ [label="forward/重放", style=dashed];
+  LDQ -> DCC [label="缺失/未缓存"];
+  DCC -> STQ [label="refill"];
+  STQ -> DCC [label="提交写入"];
+  A0 -> WBU; A1 -> WBU; BR -> WBU; MD -> WBU; LDQ -> WBU; FP -> WBU;
+  WBU -> PRF [label="写结果"];
+  WBU -> SEL [label="唤醒", style=dashed, color="#3f8f78"];
+  WBU -> ROBENT [label="标记完成"];
+  ROBENT -> RETSEL -> ROBENT [label="提交", style=dashed];
+  RETSEL -> FRE [label="回收旧物理寄存器", style=dashed];
+  RETSEL -> STQ [label="store 提交", style=dashed];
+}

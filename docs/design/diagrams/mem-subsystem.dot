@@ -1,0 +1,54 @@
+// 存储层次、MMU 与 AXI 总线
+digraph mem {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=11, splines=polyline, nodesep=0.35, ranksep=0.5];
+  node  [shape=box, style="filled,rounded", fontname="Helvetica", fontsize=9, fillcolor="#f3e2f5", color="#8f5d8f"];
+  edge  [fontname="Helvetica", fontsize=8, color="#40506b"];
+
+  subgraph cluster_core {
+    label="处理器核"; style="rounded,dashed"; color="#4a6fa5";
+    VA [label="虚拟地址\n(IF: PC / MEM: AGU 结果)", fillcolor="#dbe7ff", color="#4a6fa5"];
+    subgraph cluster_tlb {
+      label="MMU (Sv32)"; color="#a58a4a"; style="rounded,dashed";
+      ITLB [label="ITLB 32 项全相联", fillcolor="#f0e6d2", color="#a58a4a"];
+      DTLB [label="DTLB 64 项全相联", fillcolor="#f0e6d2", color="#a58a4a"];
+      L2TLB [label="L2 TLB 256 项 4 路\n(共享, ASID/global)", fillcolor="#f0e6d2", color="#a58a4a"];
+      PTW  [label="硬件页表遍历器\n2 级 PTE 读 + A/D 位更新", fillcolor="#f0e6d2", color="#a58a4a"];
+    }
+    PA [label="物理地址", fillcolor="#dbe7ff", color="#4a6fa5"];
+    L1I [label="L1I 16KB 4way 32B\nVIPT 别名安全", fillcolor="#f3e2f5"];
+    L1D [label="L1D 32KB 8way 32B\nwrite-back/allocate\n8 MSHR + store buffer", fillcolor="#f3e2f5"];
+    L2 [label="L2 统一 256KB 8way 32B PIPT\n4 refill / victim buffer\nnext-line 预取", fillcolor="#f3e2f5"];
+  }
+
+  UNC [label="非缓存/设备通道\n(uncached, 单拍, 强序)", fillcolor="#ffe9cc", color="#c98f3c"];
+  subgraph cluster_int {
+    label="CPU 内部设备（地址窗口被核内截获，不下 AXI）"; style="rounded,dashed"; color="#a55a5a";
+    CLINT [label="CLINT @0x1F00_0000\nmtime/mtimecmp/msip", fillcolor="#fbe4e4", color="#a55a5a"];
+    PLICx [label="PLIC @0x1F10_0000\n外部源 = intrpt[7:0]", fillcolor="#fbe4e4", color="#a55a5a"];
+  }
+
+  AXI [label="AXI4 主设备桥\n32bit data / 4bit ID / 4bit len\nID0=取指 ID1=读refill ID2=写回 ID3=设备", shape=box3d, fillcolor="#e8e8e8", color="#555555"];
+  CC  [label="axi_clock_converter\n(CPU 100MHz → SoC 33MHz)", shape=box3d, fillcolor="#f0f0f0", color="#777777"];
+  subgraph cluster_soc {
+    label="chiplab SoC (33MHz)"; style="rounded,dashed"; color="#777777";
+    DDR [label="DDR3 MIG\n128MiB @0x0000_0000", fillcolor="#eeeeee", color="#777777"];
+    SRAM [label="SRAM 1MiB @0x1C00_0000", fillcolor="#eeeeee", color="#777777"];
+    UART [label="UART 16550 @0x1FE0_01E0", fillcolor="#eeeeee", color="#777777"];
+    NANDc [label="NAND 控制器 @0x1FE7_8000\n(+DMA 引擎 0x1FD0_1160)", fillcolor="#eeeeee", color="#777777"];
+    CONF [label="CONFREG @0x1FAF_E000", fillcolor="#eeeeee", color="#777777"];
+  }
+
+  VA -> ITLB; VA -> DTLB;
+  ITLB -> PA [label="命中"]; DTLB -> PA [label="命中"];
+  ITLB -> L2TLB [style=dashed]; DTLB -> L2TLB [style=dashed];
+  L2TLB -> PTW [label="缺失", style=dashed, color="#c04040", fontcolor="#c04040"];
+  PTW -> L2 [label="PTE 读", style=dashed];
+  PTW -> L2TLB [label="填充", style=dashed];
+  PA -> L1I; PA -> L1D;
+  L1I -> L2 [label="缺失"]; L1D -> L2 [label="缺失/写回"];
+  L2 -> AXI;
+  L1D -> UNC [label="设备访问"];
+  UNC -> AXI [label="非缓存读写"];
+  UNC -> CLINT; UNC -> PLICx;
+  AXI -> CC -> DDR; CC -> SRAM; CC -> UART; CC -> NANDc; CC -> CONF;
+}

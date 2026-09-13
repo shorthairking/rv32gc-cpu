@@ -1,0 +1,31 @@
+# 构建产物与临时文件
+build/
+*.o
+*.d
+*.a
+*.so
+*.elf
+*.bin
+*.hex
+*.mif
+*.vcd
+*.fst
+*.jou
+*.log
+obj_dir/
+*.Xil/
+.vivado/
+*.str
+*.pb
+work/
+
+# 工具链与第三方源码（由脚本按需拉取）
+tools/
+third_party/
+
+# 编辑器/系统
+.vscode/
+.idea/
+*~
+.DS_Store
+*.swp
