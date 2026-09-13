@@ -38,13 +38,22 @@
 // #define SSTC_SUPPORTED / SSCOFPMF_SUPPORTED / SMSTATEEN_SUPPORTED / SMDBLTRP_SUPPORTED
 // #define MSECCFG_SUPPORTED
 
-// ---- PMP (set entries to 0 if the DUT has no PMP) ----
-#define UDB_NUM_PMP_ENTRIES 0    /* 待 PMP 里程碑 */
-#define UDB_NUM_PMP_ENTIRES 0
-#define UDB_NUM_USABLE_PMP_ENTRIES 0
-#define UDB_PMP_GRANULARITY 4
-// #define UDB_PMP_NAPOT_SUPPORTED
-// #define UDB_PMP_TOR_SUPPORTED
+// ---- PMP（阶段 2A：16 项，G=0 → 4 字节粒度，TOR/NA4/NAPOT 全部实现）----
+// 注意三点（依据 riscv-arch-test 框架与 ISA 手册，勿凭直觉改）：
+//  · 项数：check_defines.h 要求 UDB_NUM_USABLE_PMP_ENTRIES >= 8，否则 #error；
+//    框架给 U/S 铺背景区用 **第 UDB_NUM_USABLE_PMP_ENTRIES-1 项**（rvtest_pmp_macros.h），
+//    故必须与实际实现的 16 项一致（背景项落在 PMP15）。
+//  · UDB_NUM_PMP_ENTIRES 是上游的**拼写错**，但框架同时引用两者，两个都要定义。
+//  · 粒度：**UDB 语义是"log2(字节数)"= G+2**（Spike 参考配置 PMP_GRANULARITY=2 ↔ grain=4 B
+//    ↔ 规格 G=0，见 riscv-arch-test/config/spike/spike-rv32-max/*.yaml）。本核 G=0（pmpaddr
+//    32 位全可写、NA4 可选），故写 2；写 4（=G=2）会让 PMPSm 的 grain 用例按"低位只读零"判，
+//    而 DUT 行为是 G=0 → 签名不符的假失败。
+#define UDB_NUM_PMP_ENTRIES 16
+#define UDB_NUM_PMP_ENTIRES 16
+#define UDB_NUM_USABLE_PMP_ENTRIES 16
+#define UDB_PMP_GRANULARITY 2
+#define UDB_PMP_NAPOT_SUPPORTED
+#define UDB_PMP_TOR_SUPPORTED
 
 // mtvec/stvec alignment: these are BYTE alignment values (powers of two), not
 // the power-of-2 exponent used in sail.json's base_alignment field.

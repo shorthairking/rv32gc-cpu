@@ -10,6 +10,7 @@
 #
 # 用法:
 #   scripts/run_arch_test.sh <group>/<name>            例: I/I-add-00
+#   scripts/run_arch_test.sh PMPS/PMPS-01              （特权组：自动在 tests/priv/ 下解析）
 #   scripts/run_arch_test.sh I/I-add-00 rv32i_zicsr ilp32
 # 环境变量:
 #   RV32GC_TIMEOUT=<拍数>   覆盖仿真超时（arch-test 规模较大，建议 ≥ 3e7）
@@ -18,15 +19,16 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AT_SRC="${AT_SRC:-$(cd "$ROOT/.." && pwd)/riscv-arch-test}"
-REL="$1"                                   # 例: I/I-add-00
+REL="$1"                                   # 例: I/I-add-00（或特权组 PMPS/PMPS-01）
 # MARCH：显式第 2 参数 > 环境变量 MARCH > 留空（由 arch_test_build.sh 从用例头部的
 # `# MARCH:` 自动解析，例如 Zicbom 需要 rv32i_zicbom_zicsr_zifencei）。留空可避免用错 ISA
 # 串导致 "unrecognized opcode ... extension required"。
 MARCH="${2:-${MARCH:-}}"
 MABI="${3:-ilp32}"
-MABI="${3:-ilp32}"
 NAME="$(basename "$REL")"
+# 用例源解析：非特权组在 tests/rv32i/，特权组在 tests/priv/（同一 group/name 结构）
 SRC="$AT_SRC/tests/rv32i/$REL.S"
+[ -f "$SRC" ] || SRC="$AT_SRC/tests/priv/$REL.S"
 OUT="$ROOT/sim/arch_test/out"
 CC=riscv32-unknown-linux-gnu-gcc
 OBJCOPY=riscv32-unknown-linux-gnu-objcopy

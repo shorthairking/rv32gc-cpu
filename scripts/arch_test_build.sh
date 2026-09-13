@@ -37,13 +37,17 @@ OUT="${2:-$ROOT/sim/arch_test/out}"
 # 因此这里做**并集**：基座（DUT 实际实现）rv32imac + zicsr + zifencei + zicntr
 # ∪ 头部声明中出现的其它扩展（zicbom/zihintpause/zalrsc/zaamo/...）。
 BASE_EXT="imac_zicsr_zifencei_zicntr"
+# 注意：**特权组**（tests/priv/**）的头部写的是 `# MARCH: rv${XLEN}i_zicsr_zifencei…`
+# （78 个 PMP 用例全部如此），而非特权组一律写死 `rv32`。若不做变量替换，下面的字符类会在
+# `$` 处截断，HEADER_MARCH 变成 `rv`，最终合成出 `rv32imac_…_rv` 这种非法 MARCH（gcc 报错）。
 HEADER_MARCH="$(sed -n '/START_TEST_CONFIG/,/END_TEST_CONFIG/p' "$TEST_SRC" \
+                | sed -e 's/[$]{XLEN}/32/g' \
                 | sed -n 's/^[[:space:]]*#[[:space:]]*MARCH:[[:space:]]*\([A-Za-z0-9_.]*\).*/\1/p' \
                 | head -1)"
-# 从头部串里抽出 rv32 之后的扩展名（去掉 rv32i/rv32im 之类的基础部分）
+# 从头部串里抽出 rv32 之后的扩展名（去掉 rv32i/rv32im/rv32ifd 之类的基础部分）
 HEADER_EXT=""
 if [ -n "$HEADER_MARCH" ]; then
-  HEADER_EXT="$(printf '%s' "$HEADER_MARCH" | sed 's/^rv32[eim]*//')"
+  HEADER_EXT="$(printf '%s' "$HEADER_MARCH" | sed 's/^rv32[a-z]*//')"
 fi
 # 扩展名规范化 + 去重（含别名归一），避免出现 `_c_..._zca` 这类重复与非法组合：
 #   · `c` → `zca`（GCC 不允许 c 与 zca 同时出现，也不允许重复）
@@ -57,7 +61,7 @@ hdr  = sys.argv[2] if len(sys.argv) > 2 else ""
 
 ALIAS = {"c": "zca", "m": "m", "a": "a", "f": "f", "d": "d",
          "zmmul": "zmmul", "zaamo": "zaamo", "zalrsc": "zalrsc"}
-DROP = {"i", "e", "g", "m", "a", "c", "zmmul"}   # 基础字母/别名：由基座承担或不单列
+DROP = {"i", "e", "g", "m", "a", "c", "zmmul", "rv"}   # 基础字母/别名：由基座承担或不单列
 
 def toks(s):
     s = s.strip().lstrip("_")

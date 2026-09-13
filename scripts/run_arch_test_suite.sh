@@ -32,8 +32,16 @@ MARCH="${MARCH:-}"
 MABI="${MABI:-ilp32}"
 JOBS="${JOBS:-1}"
 
-DIR="$AT_SRC/tests/rv32i/$GROUP"
-[ -d "$DIR" ] || { echo "ERROR: 找不到组目录 $DIR"; exit 2; }
+# 组目录解析：非特权组 tests/rv32i/<组>；特权组 tests/priv/<组>
+#   · scripts/run_arch_test_suite.sh PMPS        → 自动回退到 tests/priv/PMPS
+#   · scripts/run_arch_test_suite.sh priv/PMPS   → 显式指定特权组
+case "$GROUP" in
+  priv/*) GROUP="${GROUP#priv/}"; DIR="$AT_SRC/tests/priv/$GROUP" ;;
+  *)      DIR="$AT_SRC/tests/rv32i/$GROUP"
+          [ -d "$DIR" ] || DIR="$AT_SRC/tests/priv/$GROUP" ;;
+esac
+[ -d "$DIR" ] || { echo "ERROR: 找不到组目录 $DIR（已尝试 tests/rv32i 与 tests/priv）"; exit 2; }
+echo "[suite] 组目录: ${DIR#$AT_SRC/}"
 
 mapfile -t TESTS < <(ls "$DIR"/*.S 2>/dev/null | sort | while read -r f; do
                        b="$(basename "$f" .S)"; [[ "$b" =~ $FILTER ]] && echo "$b"; done)
@@ -54,7 +62,7 @@ run_one() {
     echo "PASS $GROUP/$name" >> "$RES"
     echo "  PASS $GROUP/$name"
   else
-    local cyc; cyc="$(grep -oE 'TB: cycles=[0-9]+' "$log" | tail -1)"
+    local cyc; cyc="$(grep -aoE 'TB: cycles=[0-9]+' "$log" | tail -1)"
     echo "FAIL $GROUP/$name ${cyc}" >> "$RES"
     echo "  FAIL $GROUP/$name ${cyc}  (log: $log)"
   fi
