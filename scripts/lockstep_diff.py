@@ -36,12 +36,24 @@ def main():
     pc_only = '--pc-only' in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     sp, rtl = parse_spike(args[0]), parse_rtl(args[1])
+    # 对齐：跳过 Spike 自身的启动跳板（RTL 从 ELF 入口直接开始）
+    if sp and rtl:
+        target = rtl[0][0]
+        k = 0
+        while k < len(sp) and sp[k][0] != target:
+            k += 1
+        if k:
+            print("[align] 跳过 Spike 启动跳板 %d 条提交" % k)
+            sp = sp[k:]
     print("spike commits=%d  rtl commits=%d" % (len(sp), len(rtl)))
     n = min(len(sp), len(rtl))
     for i in range(n):
         a, b = sp[i], rtl[i]
         # 比对 PC 与写回（rd/wd），不比对 RVC 展开后的 instr（spike 显示原始指令）
-        if a[0] != b[0] or (not pc_only and (a[2] or -1) != (b[2] or -1)) or (not pc_only and a[3] != b[3]):
+        rd_diff = (not pc_only) and ((a[2] or -1) != (b[2] or -1))
+        # 仅当两侧都写寄存器时才比对写数据（分支/store 不写寄存器）
+        wd_diff = (not pc_only) and (a[2] is not None) and (b[2] is not None) and (a[3] != b[3])
+        if a[0] != b[0] or rd_diff or wd_diff:
             print("首个分歧 @ commit %d:" % (i + 1))
             print("  spike: pc=%08x instr=%08x rd=%s wd=%08x" % (a[0], a[1], a[2], a[3]))
             print("  rtl  : pc=%08x instr=%08x rd=%s wd=%08x" % (b[0], b[1], b[2], b[3]))

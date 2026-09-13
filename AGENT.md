@@ -299,9 +299,11 @@
 
 **本阶段修复的关键缺陷（均经仿真定位）**：I-Cache 行内半字位偏移错（idx*2 当成位索引）、行标签比较用完整地址比行号、flush 与 AXI 响应同拍导致 busy 永久卡死、JAL 在 EX 被误清导致 ra 未写、ecall/ebreak 未按 op_class 门控、AXI 读响应握手自取消（d_rsp_valid 永不为 1）、load-use 停顿冻结整条流水导致死锁（改为只冻结前端 + EX 插气泡）、mstatus/sstatus 拼接位宽错（41/33 位截断）。
 
-**进行中**：
-1. `memtest`（64 KiB 字节/半字/字/走位/非对齐混合测试）尚未通过。已建立**锁步定位工具链**：`scripts/lockstep.sh` + `scripts/lockstep_diff.py`（Spike 提交轨迹 vs 本核提交轨迹，自动报首个分歧点）；已解决 Spike 侧三个环境问题（提交日志在 stderr 且块缓冲、`0x0` 布局与设备区冲突 → 统一 `0x8000_0000`、测试访问的平台地址需映射或改指 scratch），下一步用该工具定位首个分歧指令。
-2. `hello` 稳定 PASS（回归基线），`AXI_SLAVE_UNIT` / `EXEC_UNIT_TESTS` / `DECODER_UNIT_TESTS` 全绿。
+**已解决（锁步定位 → 修复）**：`memtest` 通过。用 `scripts/lockstep.sh` + `lockstep_diff.py` 比对 Spike 提交轨迹，首个分歧定位到 `crt0` 的 `bgeu t0,t1` 方向错误，根因是 **WB→ID 旁路缺失**——寄存器堆在 posedge 写入、ID 为组合读，当生产者处于 WB 而消费者同拍处于 ID 时会读到旧值（经典"写优先寄存器堆"漏洞；长停顿场景必现）。修复：在 ID 读端口显式旁路 WB 写数据（`id_byp_a/b`），此后**前 287 条提交与 Spike 完全一致**，`memtest` 由 FAIL 转 PASS。
+
+**当前状态**：`SIM: PASS hello` / `SIM: PASS memtest` / `AXI_SLAVE_UNIT: PASS (79)` / `EXEC_UNIT_TESTS: PASS (2461)` / `DECODER_UNIT_TESTS: PASS (257)`。
+
+**进行中**：arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通——需要 0x0 处放跳转桩（本核复位 PC=0）把控制权交给 `0x8000_2000` 的 `rvtest_entry_point`，签名由 TB 的 `+sig_dump` 导出。
 
 **待办（阶段 2A 剩余）**：memtest 通过 → arch-test 子集（I/M/Zicsr/Zifencei/Zca）在本核上跑通 → CSR/异常/PMP 完善 → Sv32 MMU + L1 Cache → FPGA tcl 与上板 B1~B3。
 

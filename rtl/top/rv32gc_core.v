@@ -390,6 +390,14 @@ module rv32gc_core (
   wire sq_ex  = trap_take | xret_take | ex_br_redirect;
   wire sq_mem = trap_take | xret_take;
 
+  // ============================================================ WB→ID 旁路
+  // 关键：寄存器堆在 posedge 写入、ID 为组合读，若生产者处于 WB 而消费者同拍处于 ID，
+  // 消费者会读到旧值（经典的"写优先寄存器堆"漏洞）。此处显式旁路 WB 的写数据。
+  wire        id_byp_a = wb_wen && (wb_rd_q == dec_rs1) && (dec_rs1 != 5'd0);
+  wire        id_byp_b = wb_wen && (wb_rd_q == dec_rs2) && (dec_rs2 != 5'd0);
+  wire [31:0] id_rdata_a = id_byp_a ? wb_wdata : rf_rdata_a;
+  wire [31:0] id_rdata_b = id_byp_b ? wb_wdata : rf_rdata_b;
+
   // ============================================================ 时序
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -536,8 +544,8 @@ module rv32gc_core (
           ex_pc_q        <= id_pc_q;
           ex_instr_q     <= id_instr_q;
           ex_imm_q       <= dec_imm;
-          ex_rs1_val_q   <= rf_rdata_a;
-          ex_rs2_val_q   <= rf_rdata_b;
+          ex_rs1_val_q   <= id_rdata_a;   // 含 WB→ID 旁路
+          ex_rs2_val_q   <= id_rdata_b;
           ex_rs1_q       <= dec_rs1;
           ex_rs2_q       <= dec_rs2;
           ex_rd_q        <= dec_rd;

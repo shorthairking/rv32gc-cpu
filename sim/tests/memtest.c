@@ -7,7 +7,10 @@
  *   通过：返回 0；失败：打印诊断信息并返回 1
  *===========================================================================*/
 
-#define VUART (*(volatile unsigned char *)0x1FAFFF10u)
+#ifndef VUART_ADDR
+#define VUART_ADDR 0x1FAFFF10u   /* 仿真 VIRTUAL_UART；锁步构建可用 -DVUART_ADDR=... 改指已映射的 scratch */
+#endif
+#define VUART (*(volatile unsigned char *)VUART_ADDR)
 
 #define BASE  0x00010000u          /* 64 KiB 测试区起点 */
 #define BYTE_N  (16u * 1024u)      /* [0x10000, 0x14000) 字节  */

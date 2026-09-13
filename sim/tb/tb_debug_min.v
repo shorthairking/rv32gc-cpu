@@ -75,7 +75,7 @@ module tb_debug_min;
       $display("C%0d pc=%h instr=%h rd=%0d wd=%h wen=%b", cyc, dut.u_core.wb_pc_q,
                dut.u_core.wb_instr_q, dut.u_core.wb_rd_q, dut.u_core.wb_wdata, dut.u_core.wb_wen);
     end
-    if (cyc > 10000) begin $display("[dbg] 结束"); $finish; end
+    if (cyc > 4000000) begin $display("[dbg] 结束"); $finish; end
     if (cyc > 100000000) begin
       $display("cyc=%0d pc=%h ifrdy=%b line=%b | f:busy=%b reqv=%b reqa=%h tag=%h | axird=%0d | stall=%b memstall=%b memst=%0d memop=%0d memaddr=%h | commit=%b wbv=%b memv=%b redir=%b",
         cyc, dut.u_core.pc_q, dut.u_core.if_ready, dut.u_core.line_valid,
