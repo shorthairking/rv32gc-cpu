@@ -28,22 +28,22 @@
     chosen {
         /* SPI 小引导把控制权交给 DDR 主镜像后，OpenSBI/U-Boot 继续用这份 DTB */
         stdout-path = "serial0:115200n8";
-        bootargs    = "console=ttyS0,115200n8 earlycon=ns16550a,mmio32,0x1fe001e0 rdinit=/sbin/init";
+        bootargs    = "console=ttyS0,115200n8 earlycon=uart8250,mmio,0x1fe001e0 rdinit=/sbin/init";
     };
 
     cpus {
         #address-cells = <1>;
         #size-cells    = <0>;
-        timebase-frequency = <50000000>;   /* mtime 频率 = cpu_clk（D4：核内 CLINT 每拍递增） */
+        timebase-frequency = <33000000>;   /* mtime 频率 = cpu_clk = 33 MHz（用户第 8 轮拍板：上板用 33 MHz）*/
 
         cpu@0 {
             device_type        = "cpu";
             reg                = <0>;
             status             = "okay";
-            compatible         = "riscv";
+            compatible         = "chiplab,rv32gc", "riscv";
             riscv,isa          = "rv32imafdc_zicsr_zifencei_zicntr";
             mmu-type           = "riscv,sv32";
-            clock-frequency    = <50000000>;   /* cpu_clk 50 MHz（uncore 33 MHz） */
+            clock-frequency    = <33000000>;   /* cpu_clk = uncore_clk = 33 MHz（用户拍板；clk_pll_33 clk_out1）*/
 
             cpu0_intc: interrupt-controller {
                 #interrupt-cells = <1>;
@@ -67,7 +67,7 @@
 
         /* ---- 核内 CLINT（D5）：0x1F00_0000 —— msip/mtimecmp/mtime ---- */
         clint: clint@1f000000 {
-            compatible          = "sifive,clint0", "riscv,clint0";
+            compatible          = "chiplab,clint", "sifive,clint0";   /* riscv,clint0 已被 binding 标 deprecated */
             reg                 = <0x1f000000 0x00010000>;
             interrupts-extended = <&cpu0_intc 3>,   /* M 软件中断 */
                                   <&cpu0_intc 7>;   /* M 定时器中断 */
@@ -75,7 +75,7 @@
 
         /* ---- 核内 PLIC（D5）：SiFive PLIC 1.0.0 布局，8 源 2 上下文 ---- */
         plic: plic@1f100000 {
-            compatible          = "sifive,plic-1.0.0", "riscv,plic0";
+            compatible          = "chiplab,plic", "sifive,plic-1.0.0"; /* riscv,plic0 已被 binding 标 deprecated */
             reg                 = <0x1f100000 0x00300000>;   /* 含 0x20_0000 threshold / 0x20_1000 claim */
             #interrupt-cells    = <1>;
             #address-cells      = <0>;
@@ -87,7 +87,10 @@
 
         /* ---- SPI NOR（S25FL128SAGMFI001，16 MiB）：复位取指 XIP 窗口 1 MiB + 别名 64 KiB ---- */
         spi0: flash@1c000000 {
-            compatible   = "jedec,spi-nor";
+            /* 复位取指窗口：**内存映射只读 flash**。本阶段只做 XIP 读，
+             * SPI 控制器的寄存器接口未建模；jedec,spi-nor 需挂在 SPI 控制器之下，
+             * 直挂 soc 不符 binding 模型，故改用内存映射 flash 口径（见 08 知识文档 §2）。 */
+            compatible   = "cfi-flash";
             reg          = <0x1c000000 0x00100000>,   /* XIP 窗口：SPI_XIP_BASE，1 MiB（D16） */
                            <0x1fe80000 0x00010000>;   /* 别名窗口：SPI_XIP_ALIAS_BASE */
             spi-max-frequency = <25000000>;
@@ -118,8 +121,9 @@
             current-speed     = <115200>;
             interrupts        = <1>;
             interrupt-parent  = <&plic>;
-            reg-shift         = <0>;
-            reg-io-width      = <4>;
+            reg-shift         = <0>;   /* 参考 loongson32_ls.dts 的 UART 节点不给 reg-shift/reg-io-width
+                                        * ⇒ 二者取默认（0 / 1 字节步进）。写 4 会让 8250 驱动按 32 位 MMIO
+                                        * 访问，与本平台字节步进的寄存器口不符。 */
         };
 
         /* ---- NAND 控制器（K9F1G08U0C，128 MiB；数据口 = 基址 +0x40） ---- */

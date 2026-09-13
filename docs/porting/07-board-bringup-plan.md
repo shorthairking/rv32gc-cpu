@@ -149,8 +149,10 @@
 
 ## 8. 用户已拍板的决策（2026-09-13，本计划按此执行）
 
-1. **D-1 时钟：定为 33 MHz**（不用 50 MHz）。⇒ 综合/实现以 33 MHz 为目标频率（`clk_pll_33` 的
-   `clk_out1` 与 `chip/soc_demo/loongson/config.h` 的 `FREQ` 同步改；`timebase-frequency` 相应 33 MHz）。
+1. **D-1 时钟：定为 33 MHz**（不用 50 MHz）。⇒ **cpu_clk 取 `clk_pll_33` 的 `clk_out2`（33 MHz）**，
+   原 `clk_out1`（50 MHz）不再给核；`chip/soc_demo/loongson/config.h` 的 `FREQ` 同步改 33，
+   DTS 的 `/cpus/timebase-frequency` 与 CPU `clock-frequency` 均为 `33000000`（已落实，`check_dts.sh` 已断言）。
+   综合/实现的时序目标 = 33 MHz（周期 30.303 ns），WNS ≥ 0。
 2. **D-2 顺序：先把 ④ 的 Cache 做出来，再上板测试**。⇒ 上板动作推迟到 L1I/L1D 完成并回归全绿之后；
    Cache 的最小可用规格（L1I 16 KB/4 路 + L1D 写直达不写分配 + XIP 绕 Cache + `fence.i`）见 `AGENT.md` §7。
 3. **D-3 线材/环境**：已具备（按 chiplab 上板教程准备）⇒ 无需额外采购；B1 可直接用串口 + 下载线开工。
@@ -179,6 +181,30 @@
 | U-Boot | `https://source.denx.de/u-boot/u-boot.git`（镜像 `https://github.com/u-boot/u-boot`） | `git clone --depth=1 https://source.denx.de/u-boot/u-boot.git u-boot` | 引导器；起点 `qemu-riscv32_defconfig`（RV32），按本平台改 DRAM/串口/CLINT/PLIC 地址 |
 | OpenSBI（RV32 Linux 必需 SBI） | `https://github.com/riscv-software-src/opensbi` | `git clone --depth=1 https://github.com/riscv-software-src/opensbi.git opensbi` | `PLATFORM=generic`（支持 RV32）+ `FW_PAYLOAD`（带 U-Boot）或 `FW_DYNAMIC` |
 | （可选）Buildroot 造 rootfs | `https://gitlab.com/buildroot.org/buildroot.git` | 同上 | initramfs 优先；NAND/UBIFS 本阶段不验 |
+
+### 10.1 DDR 布局与链接地址（依据 08 知识文档 §3/§4 的实测事实）
+
+| 镜像 | 链接/加载地址 | 依据 |
+|---|---|---|
+| OpenSBI（M 模式固件） | `0x0000_0000`（`FW_TEXT_START=0`，RV32 generic 默认 0） | `opensbi/firmware/objects.mk:16-19` |
+| U-Boot（S 模式 payload） | **`0x0040_0000`**（`CONFIG_TEXT_BASE=0x00400000`） | OpenSBI RV32 默认 `FW_PAYLOAD_ALIGN=0x400000`；也可改成 `FW_PAYLOAD_OFFSET=0x200000` + `TEXT_BASE=0x00200000`，**二者必须一致** |
+| Linux 内核 | 由 U-Boot `loadaddr` 决定（建议 `0x0200_0000` 起，避免与 OpenSBI/U-Boot 重叠） | — |
+| DTB | NAND `dtb` 分区（可选）或 U-Boot 内嵌；地址由 U-Boot `fdt_addr` 决定 | — |
+| SPI 小引导 | `0x1C00_0000`（XIP，≤1 MiB） | D16②；`scripts/pack_boot_image.sh` 已硬校验 |
+
+命令口径（供实现时照抄，来自 08 知识文档）：
+```
+# U-Boot（RV32 + S 模式，需要 SBI）
+make CROSS_COMPILE=riscv32-unknown-linux-gnu- qemu-riscv32smodedefconfig   # 或 qemu-riscv32_defconfig（M 模式）
+# OpenSBI（RV32，generic 平台），把 U-Boot 当 payload
+make PLATFORM=generic PLATFORM_RISCV_XLEN=32 CROSS_COMPILE=riscv32-unknown-linux-gnu- \
+     FW_PAYLOAD_PATH=<u-boot>/u-boot.bin
+# Linux（主线没有 rv32_defconfig 文件；同名 make 目标 ≡ defconfig + 32-bit.config 片段）
+make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- rv32_defconfig
+make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j$(nproc)
+```
+串口口径：DTS 按参考 `loongson32_ls.dts` 的字节步进写法（`reg = <0x1fe001e0 0x10>`，**不写** `reg-io-width`），
+故内核命令行用 **`earlycon=uart8250,mmio,0x1fe001e0`**（不是 `mmio32`）。
 
 **知识库接入方式**（用户拉取后告诉我即可，我来做）：
 把三个仓库放在 `/home/shorthair/dsh/rv32-cpu/` 下（与 `rv32gc-cpu/`、`riscv-arch-test/` 同级），

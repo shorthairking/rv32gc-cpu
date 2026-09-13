@@ -91,7 +91,7 @@ ck("CLINT 声明 M 软件(3)/定时器(7)中断", ('&cpu0_intc 3' in do) and ('&
 ck("PLIC 声明 M(11)/S(9) 外部中断", ('&cpu0_intc 11' in do) and ('&cpu0_intc 9' in do))
 ck("CPU 中断控制器存在（cpu-intc）", '"riscv,cpu-intc"' in db)
 tb = re.search(r"timebase-frequency = <0x([0-9a-f]+)>", db)
-ck("timebase-frequency = 50 MHz（clk 见 AGENT.md 平台表）", tb and int(tb.group(1),16) == 50000000,
+ck("timebase-frequency = 33 MHz（用户拍板上板时钟）", tb and int(tb.group(1),16) == 33000000,
    f"(dts={int(tb.group(1),16) if tb else '缺'})")
 
 # 分区断言：SPI boot ≤1 MiB；NAND 分区总长 = 128 MiB
