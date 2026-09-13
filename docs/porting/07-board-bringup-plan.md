@@ -81,7 +81,7 @@
 
 | 步 | 操作 | 通过判据 |
 |---|---|---|
-| B2-1 | 烧 `spi_flash.img`（≤1 MiB）+ 把 DDR 主镜像（含 U-Boot）放到 NAND `kernel` 分区（0x0004_0000） | 串口出现 SPI 桩横幅 **→** DDR 镜像横幅（顺序与 `BOOT_CHAIN` 仿真一致） |
+| B2-1 | 烧 `spi_flash.img`（≤1 MiB）+ DDR 主镜像（含 U-Boot）经 JTAG/串口放入 DDR（**NAND 路径可选**） | 串口出现 SPI 桩横幅 **→** DDR 镜像横幅（顺序与 `BOOT_CHAIN` 仿真一致） |
 | B2-2 | U-Boot 起来后设 `mtdparts`（`nand-flash:256K(env),50M(kernel)ro,1M(dtb),-(rootfs)`）、`loadaddr`、`fdt_addr` | `=> ` 提示符；`mtd list` 分区表与 DTS 一致 |
 | B2-3 | `mtd read kernel ${loadaddr}` + `md` 校验 | 读回数据与原镜像一致（先跑 CRC） |
 | B2-4 | 串口命令行基本操作（`mw`/`md`/`sf`/`nand`） | 全部命令可用；无 data abort |
@@ -91,7 +91,7 @@
 | 步 | 操作 | 通过判据 |
 |---|---|---|
 | B3-1 | U-Boot 引导内核（NAND 或 TFTP）+ dtb | 内核打印 `Memory: 128MB`、`riscv_timer`、`sifive-plic`、`mtd` 分区信息，与 DTS 完全一致 |
-| B3-2 | 挂载 rootfs（UBIFS/initramfs） | 出现 `login`/`#` |
+| B3-2 | 挂载 rootfs（initramfs 优先；NAND/UBIFS 为**可选**，本阶段不验） | 出现 `login`/`#` |
 | B3-3 | 稳定性 | 连续重启 5 次全通过；`dmesg` 无 illegal instruction/page fault |
 
 ---
@@ -147,20 +147,16 @@
 
 ---
 
-## 8. 待用户确认的决策点（**上板前必须拍板**）
+## 8. 用户已拍板的决策（2026-09-13，本计划按此执行）
 
-1. **D-1 时钟**：B1 先用 **50 MHz**（与仿真一致）还是直接 **33 MHz**（更保守、与参考工程默认一致）？
-   建议：**先用 50 MHz**，WNS<0 时自动退到 33 MHz。
-2. **D-2 Cache 与 B3 的顺序**：④（L1I/L1D/L2 + CBO）尚未完成。选项：
-   (a) **先完成 ④ 再上板**（B3 更有把握，但要多花 2~4 人日）；
-   (b) **先做 B1/B2**（不依赖 Cache），B3 是否用无 Cache 版本先"跑到 `#`"再补 Cache；
-   (c) ④ 只做**最小可用 Cache**（L1I 16 KB/4 路 + L1D 写直达，不做 MSHR/预取/L2）。
-   建议：**(b) + (c)**——先上 B1/B2 拿到"板子+工具链+烧写"全流程信心，同时并行做最小 Cache，B3 用带 Cache 的版本。
-3. **D-3 线材/环境**：确认有下载线、串口线、可用的 SPI flash 与 NAND（板载），以及可否把板子接到常用工作机。
-4. **D-4 镜像来源**：U-Boot/Linux 用 chiplab 参考仓库（LA32R 版，需要移植）还是用上游 RISC-V U-Boot/Linux
-   （自建 `rv32` 配置）？建议：**上游 RISC-V 主线**（`qemu-riscv32`/`sifive_u` 之外的 minimalist 配置更省事），
-   DTS 用本仓库的 `rv32gc-chiplab.dts`。
-5. **D-5 验收口径**：B3 是否必须"从 NAND 根文件系统启动到 login"，还是"initramfs 到 `#`"即可作为本阶段通过？
+1. **D-1 时钟：定为 33 MHz**（不用 50 MHz）。⇒ 综合/实现以 33 MHz 为目标频率（`clk_pll_33` 的
+   `clk_out1` 与 `chip/soc_demo/loongson/config.h` 的 `FREQ` 同步改；`timebase-frequency` 相应 33 MHz）。
+2. **D-2 顺序：先把 ④ 的 Cache 做出来，再上板测试**。⇒ 上板动作推迟到 L1I/L1D 完成并回归全绿之后；
+   Cache 的最小可用规格（L1I 16 KB/4 路 + L1D 写直达不写分配 + XIP 绕 Cache + `fence.i`）见 `AGENT.md` §7。
+3. **D-3 线材/环境**：已具备（按 chiplab 上板教程准备）⇒ 无需额外采购；B1 可直接用串口 + 下载线开工。
+4. **D-4 镜像来源**：用**上游 RISC-V 主线 U-Boot/Linux**（仓库由用户自行拉取；本计划 §10 给出链接与配置起点）。
+5. **D-5 验收口径（本阶段）**：**主线是"CPU 能正常执行指令"**——B1/B2 的通过判据以"取指/执行/访存/中断
+   在 33 MHz 实板上稳定正确"为准；**NAND 与 rootfs 暂不验证**（§0 的 B3 中 NAND 相关条目降级为可选）。
 
 ---
 
@@ -171,3 +167,21 @@
 3. B2：串口完整日志（SPI 桩 → DDR → U-Boot `=>`）+ `mtd list` 输出 + `md` 校验片段；
 4. B3：内核启动日志（含 `Memory:`/`riscv_timer`/`sifive-plic`/`mtd` 行）+ `#` 提示符；
 5. 每次失败现场（串口最后 50 行 + VIO 抓的 PC/priv）。
+
+
+---
+
+## 10. 上游仓库清单（D-4：由用户拉取后建立知识库）
+
+| 仓库 | 链接 | 建议克隆 | 用途/配置起点 |
+|---|---|---|---|
+| Linux 主线 | `https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git`（镜像 `https://github.com/torvalds/linux`） | `git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux` | RV32 内核；`arch/riscv/configs/` 下若有 `rv32_defconfig` 直接用，否则 `defconfig` + `CONFIG_32BIT=y`；DTS 用本仓库 `sw/board/rv32gc-chiplab.dts` |
+| U-Boot | `https://source.denx.de/u-boot/u-boot.git`（镜像 `https://github.com/u-boot/u-boot`） | `git clone --depth=1 https://source.denx.de/u-boot/u-boot.git u-boot` | 引导器；起点 `qemu-riscv32_defconfig`（RV32），按本平台改 DRAM/串口/CLINT/PLIC 地址 |
+| OpenSBI（RV32 Linux 必需 SBI） | `https://github.com/riscv-software-src/opensbi` | `git clone --depth=1 https://github.com/riscv-software-src/opensbi.git opensbi` | `PLATFORM=generic`（支持 RV32）+ `FW_PAYLOAD`（带 U-Boot）或 `FW_DYNAMIC` |
+| （可选）Buildroot 造 rootfs | `https://gitlab.com/buildroot.org/buildroot.git` | 同上 | initramfs 优先；NAND/UBIFS 本阶段不验 |
+
+**知识库接入方式**（用户拉取后告诉我即可，我来做）：
+把三个仓库放在 `/home/shorthair/dsh/rv32-cpu/` 下（与 `rv32gc-cpu/`、`riscv-arch-test/` 同级），
+我在 `/home/shorthair/dsh/rv32-cpu/.dsh-kb/sources.json` 里加三条源，**root 精确到文档/配置子目录**
+（避免把整个源码树塞进索引，例如 `linux/Documentation`、`linux/arch/riscv`、`linux/arch/riscv/configs`、
+`u-boot/doc`、`u-boot/arch/riscv`、`u-boot/configs`、`opensbi/docs`），再 `kb_manage action=reindex`。
