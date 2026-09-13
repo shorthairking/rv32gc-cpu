@@ -458,8 +458,8 @@ module rv32gc_core (
                   end else if (m_split_q) begin
                     // 第二次访问：地址 +4（4 字节对齐），字节使能/数据按剩余部分
                     m_addr_q  <= {m_addr_q[31:2], 2'b00} + 32'd4;
-                    m_wdata_q <= (m_size_q == `MSZ_HALF) ? {16'd0, a1_wdata[31:16]} :
-                                                           {a1_wdata[31:16], 16'd0};
+                    // 第二次访问的数据：原始 store 数据右移 (4-shift) 字节
+                    m_wdata_q <= mem_rs2_val_q >> (8 * (4 - m_shift_q));
                     m_wstrb_q <= m_wstrb2_q;
                     memst_q   <= M_REQ2;
                   end else memst_q <= M_DONE;
