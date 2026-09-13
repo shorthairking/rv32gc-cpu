@@ -123,7 +123,20 @@
 
 - **时钟**：`aclk` 由平台 `clk_pll_33/clk_out1` 提供。阶段一默认 50 MHz，阶段五改为 100 MHz（同时把 `chip/soc_demo/loongson/config.h` 的 `FREQ` 宏改为 `100_000_000`）。
 - **复位**：`aresetn` 为低有效异步复位。核内统一做"异步置位、同步释放"两级同步，产生 `reset_sync_n`；调试逻辑与 CLINT 使用同一复位域。
-- **复位后的状态**：PC = `0x0000_0000`（可由参数 `RESET_PC` 覆盖；chiplab 平台从 `0x1c00_0000`（SRAM）或 SPI Flash 启动的约定见 `../porting/01-uboot.md`）；CSR 取规范复位值；Cache/TLB/BPU 全部无效化。
+- **复位后的状态**：PC = `` `RESET_PC ``（默认 `0x0000_0000`）；CSR 取规范复位值；Cache/TLB/BPU 全部无效化。
+- **平台复位向量（硬约束，见 `AGENT.md` §2 D16）**：chiplab 的复位取指地址是 **`0x1C00_0000`**
+  （SPI Flash XIP 的 1 MiB 窗口，`chiplab/IP/AMBA/axi_mux_syn.v:946` 的地址判决），
+  DDR3 在 `0x0`，**没有硬件 boot ROM**。因此：
+  1. 上板/启动链路验证必须用 `-DRESET_PC=32'h1C000000`（仿真默认 `0x0`，适用于 hello/memtest/arch-test）；
+  2. **取指命中 SPI 窗口时必须绕过 I-Cache**——XIP 读没有 cache 一致性语义，缓存后无法感知
+     flash 侧变化，且会让每次取指都吃满 AXI 延迟；
+  3. 引导软件在 SPI 窗口内的代码**只能用 PC 相对寻址**：`0x1C00_0000` 到 DDR `0x0` 相距
+     ~448 MiB，超出 `auipc`+12 位立即数（±2 MiB）的覆盖范围，跨窗口跳转必须靠完整 32 位
+     地址运算（`auipc`+`addi` 组成地址后再 `jalr`），链接时按窗口分段（`.text.spi`/`.text.ddr`）；
+  4. 引导早期**不得开 MMU**（SPI 窗口在 Sv32 下需显式映射）；进入内核后 DRAM 基址 `0x0`
+     与 RV32 Linux 的 `PAGE_OFFSET=0xC0000000` 天然吻合，不再依赖 SPI 窗口。
+  5. 仿真侧对应模型：`sim/tb/sim_axi_slave.v` 的 SPI 窗口 + `sim/tests/spi_boot.S` 自检
+     （`scripts/run_spi_boot_test.sh`）。
 
 ---
 

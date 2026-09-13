@@ -64,6 +64,7 @@
 | D13 | 乘法器用 DSP48E1（`*` 推断），除法器/浮点自研 | 避免 `div_gen`/`floating_point` IP 的仿真依赖（Verilator 无法编译 .xci）；面积与延迟可控 | 直接例化 IP：仿真环境受限 |
 | D14 | 分区统一定义为 `256K(env),50M(kernel)ro,1M(dtb),-(rootfs)` | 解决参考实现/DTS/文档三处冲突，且避免环境变量与内核镜像冲突 | 沿用 50M@0：env 无处安放 |
 | D15 | **平台适配（不做 AXI 编址改造）**：核**不改**平台 AXI 地址映射；RISC-V 侧靠"三处约定"适配：① 上板复位向量取平台启动窗口 `0x1C00_0000`（SPI-XIP/SRAM，`RESET_PC` 为编译期宏）；② 镜像/软件按平台 DDR `0x0000_0000` 链接加载（RISC-V 习惯的 `0x8000_0000` 不适用；`0x8000_0000` 仅仿真里给 arch-test 用）；③ RISC-V 期望的 CLINT/PLIC `0x0200_0000/0x0C00_0000` 平台没有 → 用 D5 的**核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）**，并在 DTS/OpenSBI 参数与文档中显式声明 | 依据平台硬事实：DDR3 是 **AXI 默认从设备，位于 `0x0–0x07FF_FFFF`**；`0x1C00_0000` 只是 1 MiB 启动窗口；CONFREG/UART/NAND 是 SoC 设备窗口（`docs/kb/01-chiplab-platform.md` §3、`docs/design/00-overview.md` §2.2）。**AXI 编址与指令集无关**，ISA 也不规定物理地址映射，故"为符合 RV32 而改 AXI 编址"既不必要也不正确 | 直接改平台 RTL/约束：改 SoC 顶层与工程、失去平台复用，且与 LA32R 参考实现冲突 |
+| D16 | **SPI-Flash XIP 启动（`0x1C00_0000`）是平台硬约束，必须由核 + 引导软件适配；禁止改平台**。核侧三件事：① `RESET_PC` 取 `0x1C00_0000`；② 取指命中 **SPI 窗口时绕过 I-Cache**（XIP 无 cache 一致性语义）；③ 引导软件第一条指令必须落在 SPI 窗口内、且**只用 PC 相对寻址**（`0x1C00_0000` 超出 `auipc`+12 位立即数的 ±2 MiB 覆盖范围，跨窗口跳转必须靠完整 32 位 `auipc+jalr`/`jal`，链接时按窗口分段）。早期**不得开 MMU**（SPI 窗口在 MMU 下需显式映射；RV32 Linux `PAGE_OFFSET=0xC0000000` 与平台 DDR `0x0` 天然吻合，故内核阶段不再依赖 SPI 窗口） | **源码级依据**（2026-09-13 核对 chiplab）：<br>· `chiplab/IP/AMBA/axi_mux_syn.v:946` `rd_addr_hit[1] = (araddr[31:16]==16'h1fe8) \|\| (araddr[31:20]==12'h1c0); //SPI`；`:854` 同式写命中；`:860` `wr_addr_hit[0] = ~\|wr_addr_hit[4:1]` → **DDR3 = AXI 默认从设备，位于 `0x0–0x07FF_FFFF`**<br>· `chip/soc_demo/loongson/soc_top.v:992` `axi_slave_mux .spi_boot(1'b1)`（常量 1）、`:1223` `spi_flash_ctrl .spi_addr(16'h1fe8)`<br>· `IP/SPI/godson_sbridge_spi.v:189` `io_hit=(buf_addr[31:4]=={spi_addr,12'b0})`、`:194` `buf_addr_t[31:20]==12'h1fc ? {12'h0,addr[19:0]} : {8'h0,addr[23:0]}`<br>· `docs/FPGA_run_linux/linux_run.md`：先把 PMON/u-boot 烧到可插拔 SPI flash，上电即从 SPI 运行<br>· `fpga/nscscc-team/uart_debug/uart_debug.v:41` `SRAM_START_ADDR=32'h1c000000` | ① 改平台 AXI 编址/把 DDR 挪到 `0x8000_0000`：要改 SoC 顶层 + vivado 工程 + 约束，失去平台复用，且与 LA32R 参考实现冲突（与 D15 同一理由）；② 复位 PC 留在 `0x8000_0000`：该地址落在 **DDR3**（上电内容未定义）→ 上板必然跑飞；③ 开 Cache 后再从 SPI XIP：XIP 读被缓存且无一致性维护 → 取指错乱 |
 
 ---
 
@@ -193,10 +194,57 @@
 
 ---
 
+## 4.5 工作方式（强制）：子 Agent 并行 + 启动读取清单
+
+### 4.5.1 每次会话开工必读（按顺序）
+
+1. **`PROMPT.md`** —— 项目总提示词（任务背景、硬性指标、平台与移植约束、强制流程）。
+   **每个新会话/新阶段的第一件事就是读它**，不要凭记忆假设其内容。
+2. 本文件 `AGENT.md`：§2 关键决策、**§6 阶段总结（含各轮进展）**、§7 当前状态与下一阶段计划。
+3. `NEXT_SESSION.md`：上一轮交接的"当前卡点 + 下一步"（最新一轮的事实以它为准）。
+4. `git log --oneline | head` + `git status --short`：确认工作区干净、知道从哪个提交接手。
+5. 需要 ISA/arch-test/工具链知识时用 `kb_search`（**不要直接读大文件**）；本项目自己的
+   知识库在 `docs/kb/`。
+
+### 4.5.2 **默认用子 Agent 并行推进**（强制倾向）
+
+本项目任务高度可并行（RTL 子模块、每个 arch-test 组、移植子任务、文档核查、缺陷定位）。
+**默认行为是"先拆分、再并行"**，而不是单线程一步步做：
+
+| 场景 | 要求 |
+|---|---|
+| ≥2 个彼此独立的子任务（如"跑 N 个 arch-test 组"、"查 3 个模块的同一个问题"、"同时验证 2 个假设"） | **必须**用 `subagent` / `subagent_fork` 并行发起（在同一条消息里发多个调用），不要在一条链上串行做 |
+| 需要读取大量文件后只回一个结论（日志分析、代码搜索、报告核查） | 交给子 Agent，**只要结论不要中间过程**，以保护主上下文 |
+| 单个任务超过 ~10 次工具调用且与主线独立 | 交给子 Agent |
+| 长时仿真/构建（arch-test 整组、Vivado 综合、锁步） | 用**后台 bash job**（`run_in_background`）与其它工作并行；不要空等 |
+| 多个互不依赖的归档/总结/报告 | 用 `workflow` 工具扇出（仅在任务规模确实需要多 Agent 编排时） |
+| 真正串行、强依赖前一步结果的工作（例如"先修 RTL 再跑回归"） | 由主 Agent 自己做，不要为了并行而并行 |
+
+**并行时的硬性纪律**：
+
+1. **一个任务只做一件事**，且能自证完成（给出可复现的命令与判定输出）。
+2. 子 Agent **必须**收到自包含的提示词：环境路径、要改/要读的文件、验收命令、禁止事项
+   （不要改上游 `riscv-arch-test`/`chiplab`/内核树、不要动 `docs/design/spec/` 的位域真源等）。
+3. **避免写冲突**：并行的子 Agent 不得同时改同一个文件；RTL 相关改动建议串行或按模块切分。
+4. 主 Agent 负责：**汇总证据 → 更新 `AGENT.md`/`NEXT_SESSION.md` → git 提交**（子 Agent 不提交）。
+5. 子 Agent 的结论**不等于**验收：关键结论（尤其是"某功能已通过"）必须由主 Agent 用
+   命令复跑一次确认（本项目的教训：曾把 DUT 缺陷误判为框架缺陷，见 §6 第 7 轮"更正"）。
+
+### 4.5.3 并行典型拆分（本项目常用）
+
+* **arch-test 组**：每组一个子 Agent/后台 job，最后汇总 PASS/FAIL 计数。
+* **缺陷定位**：一个子 Agent 收集证据（轨迹/波形/参考模型），另一个设计对照实验（旧版本
+  RTL、单点回退），主 Agent 合并结论。
+* **RTL 子模块**：译码/CSR/前端/访存互不相同的文件，可并行；**接口位域改动必须串行**
+  （先改 `rtl/pkg/rv32gc_defs.vh` 真源，再同步 `docs/design/spec/02-*`、`03-*`）。
+* **文档核查**：把"核对 X 与 Y 是否一致"的机械性检查交给子 Agent。
+
+---
+
 ## 5. 阶段交接规则（强制）
 
 1. **每阶段结束**：必须在本文件 §6（阶段总结）追加该阶段总结，并在 §7 更新"下一阶段任务与计划"，然后**停止执行**，等待用户明确指令（例如"开始阶段 2A"）后再继续。
-2. **每阶段开始**：先读本文件 §2（决策）、§6/§7（上一阶段总结与计划），并按需用 `kb_search` 检索 `docs/kb/` 与 ISA 手册，避免重复推导。
+2. **每阶段开始**：先读 `PROMPT.md`、本文件 §2（决策）、§6/§7（上一阶段总结与计划），并按需用 `kb_search` 检索 `docs/kb/` 与 ISA 手册，避免重复推导。
 3. **长上下文管理**：
    - 设计细节写进 `docs/design/`，移植细节写进 `docs/porting/`，新知识写进 `docs/kb/`（并 `kb_manage action=reindex`）；
    - 每阶段结束提交 git（提交信息格式：`<阶段>: <摘要>`）；
@@ -491,12 +539,28 @@ rd=rs2/rd=rs1=rs2、store 清保留集、SC 消费保留集、AMO 读-改-写、
 - ✅ **arch-test 5 组全绿**：`I` 39/39、`M` 8/8、`Zicsr` 6/6、`Zifencei` 1/1、`Zca` 26/26（共 80 例 0 失败）
 - ✅ **锁步 5994 条提交与 Spike 完全一致**（`sim/tests/out/lockstep_bench_hi.elf`）
 - ✅ A 扩展（LR/SC/AMO）执行通路已实现（写回阶段 + 读-改-写 + 保留集 + 原子对齐检查）
-- ⏭ 下一步：Zaamo/Zalrsc 的 trap 签名记录一致性 → CSR/异常/PMP 完善 → Sv32 MMU + Cache → FPGA 上板
+- ⏭ 下一步：**SPI-XIP 启动链路（2A-7a，见 §2 D16）** → PMP → Sv32 MMU + Cache → 上板 B1~B3
 - 📌 **平台适配结论（D15）**：不需要改 chiplab 的 AXI 编址（编址与 ISA 无关，DDR 是 AXI 默认从设备在 `0x0`）；需要的是复位向量 `0x1C00_0000`、镜像按 `0x0` 链接、以及把核内 CLINT/PLIC（`0x1F00_0000/0x1F10_0000`）写进 DTS/SBI —— 已作为任务 2A-7 列入
 - 📄 **下一会话请直接使用 `NEXT_SESSION.md` 中的提示词**（自包含：环境、命令、当前卡点、下一步）
 
 
 > **阶段 2A 的实施依据**：`docs/design/spec/`（实现级规格书）已全部就绪，RTL 开发按 `spec/00-conventions.md` §8 的顺序自底向上推进；每写一个模块，先按 `spec/09-verification-interface.md` §4 建对应单元测试。
+
+**常用命令（回归与验证入口）**
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+bash scripts/run_sim.sh hello            # SIM: PASS hello
+bash scripts/run_sim.sh memtest          # SIM: PASS memtest
+bash scripts/run_unit_axi.sh             # AXI_SLAVE_UNIT: PASS (79)
+bash scripts/run_unit_exec.sh            # EXEC_UNIT_TESTS: PASS (2461)
+bash scripts/run_unit_decoder.sh         # DECODER_UNIT_TESTS: PASS (254)
+bash scripts/run_lrsc_test.sh            # LRSC_DIRECTED: PASS（A 扩展定向自测 28 项）
+bash scripts/run_arch_test_suite.sh I    # 整组批量（JOBS=4 更快；MARCH 自动合成，勿写死）
+bash scripts/run_spi_boot_test.sh        # SPI_BOOT: PASS（RESET_PC=0x1C00_0000 启动链路，2A-7a）
+```
+> `run_arch_test_suite.sh` 支持 `JOBS`/`RV32GC_TIMEOUT`/`SKIP_BUILD`；`run_spi_boot_test.sh`
+> 用于 **D16 的 SPI-XIP 启动**（不传 `RESET_PC` 的普通回归仍用 `0x0`）。
 
 **下一阶段（阶段 2A）任务与计划**
 
@@ -508,7 +572,10 @@ rd=rs2/rd=rs1=rs2、store 清保留集、SC 消费保留集、AMO 读-改-写、
 | 2A-4 | MMU（Sv32 TLB+PTW）与 L1I/L1D、L2 | `rtl/mmu/`、`rtl/mem/` | Cache/TLB 单元测试通过 |
 | 2A-5 | arch-test 接入（Spike 生成签名）+ 自研裸机测试框架 | `sw/tests/`、`sim/log` | I/M/A/F/D/C/Zicsr/Zifencei 子集全绿 |
 | 2A-6 | FPGA 工程脚本与上板 | `fpga/build_chiplab.tcl`、bit 流 | 串口输出 + 数码管正确 + 60 MHz 收敛 |
-| 2A-7 | **平台适配（复位向量/镜像布局/RISC-V 内存映射）**：`RESET_PC=0x1C00_0000` 上板取值、平台 DDR `0x0` 链接脚本、DTS/OpenSBI 的 DRAM 基址与核内 CLINT/PLIC 地址声明、地址映射自检 | `docs/porting/00-overview.md` §平台适配、`sim/tests/link.ld`（0x0 已就绪）、`platform_override`/DTS 片段 | 上板从 `0x1C00_0000` 启动→跳 DDR；软件（OpenSBI/U-Boot/内核）按 `0x0` DRAM 与 `0x1F00_0000/0x1F10_0000` 的 CLINT/PLIC 跑通 |
+| 2A-7a | **SPI-XIP 启动链路（仿真可验）**：`sim_axi_slave.v` 增加 SPI 窗口（`0x1C00_0000`+`0x1FE8_0000` 别名，只读，`+SPI_INIT=` 载镜像）；`sim/tests/spi_boot.S` + 专用链接脚本（`.text.spi`→`0x1C00_0000`、`.text.ddr`→`0x0`）；`scripts/run_spi_boot_test.sh` 以 `-DRESET_PC=32'h1C000000` 编译 RTL 并断言 `SPI_BOOT: PASS`；取指命中 SPI 窗口时绕过 I-Cache | 见 §2 D16 的源码级依据；`sim/log/dbg/spi_link.ld` 雏形已写 | **无 Cache 的基线核**：`RESET_PC=0x1C000000` → SPI 窗口取首条指令 → 算术自检 → `auipc+jalr` **跨 ~448 MiB** 跳 DDR `0x0` → DDR 内算术/写读回 → 退出码 0；且 arch-test 17 组回归不受影响 |
+| 2A-7b | **启动镜像三件套**：SPI 小引导（0x1C00_0000，PC 相对，能初始化 UART 并跳 DDR）→ DDR 主镜像（`0x0` 起，OpenSBI+U-Boot）→ NAND 分区（D14）；产出烧写/打包脚本 | `sw/` 下的 board 目录 + `scripts/` 打包脚本 | SPI 镜像 ≤1 MiB 且全部 PC 相对；DDR 镜像按 `0x0` 链接；三者能串起来跑到 U-Boot 提示符（先仿真后上板） |
+| 2A-7c | **DTS/OpenSBI 内存映射声明**：DRAM 基址 `0x0`+128 MiB、核内 CLINT/PLIC `0x1F00_0000/0x1F10_0000`、UART `0x1FE0_01E0`、SPI `0x1C00_0000`、NAND 分区 | `docs/porting/00-overview.md` §平台适配、DTS/`platform_override` 片段 | `dtc` 编译通过；OpenSBI 启动打印的内存/中断信息与 DTS 一致 |
+| 2A-7d | **FPGA tcl 与上板 B1~B3**：`fpga/tcl/build_chiplab.tcl`（工程内生成，不改 chiplab 源树）→ 约束复用 `soc_up.xdc` → 综合实现 → 60 MHz 收敛 → 上板串口输出 + 从 `0x1C00_0000` 启动 | `fpga/`、Vivado 报告 | 上板从 SPI 启动打印串口信息；时序报告 WNS≥0 @60 MHz；B1~B3 通过 |
 
 **阶段二开工前需要用户确认/配合的事项**
 1. ~~在沙箱外执行 `sudo apt install verilator iverilog gtkwave`~~ → **已完成**（Verilator 5.020 / Icarus Verilog 12.0 已就绪，`xvlog/xelab/xsim` 亦可用）；

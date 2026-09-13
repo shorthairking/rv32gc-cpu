@@ -78,15 +78,21 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 5. **⚠️ 上一轮的一个错误结论已更正**：`Zalrsc-sc.w-00` 的失败**不是** upstream ACT4 生成器缺陷，
    而是本核的 MEM 转发缺陷（#4 之①）。`scripts/tests/arch_sigreg_clobber_report.md` 顶部有更正
    横幅；`arch_scan_sigreg_clobber.py` 的值模型作废，**不要据此判定生成器缺陷**。
-6. **下一步（阶段 2A 剩余，按 `AGENT.md` §7 任务表）**：
-   a. **PMP**（`UDB_NUM_PMP_ENTRIES` 仍为 0；内核/SBI 需要）—— 实现 pmpcfg0-3/pmpaddr0-15 +
-      S/U 访问检查（L/X/W/R + TOR/NA4/NAPOT），再跑 `tests/priv/PMPS|PMPSm|PMPU|PMPZaamo|PMPZalrsc|
-      PMPZca|PMPF` 组（注意框架的 -T 顺序约定）；
-   b. **Sv32 MMU（TLB+PTW）+ L1I/L1D/L2 Cache**（2A-4）—— 有 Cache 后 CBO 才需要真正实现
-      clean/flush/inval/zero 语义（目前是"走 LSU 的空操作"，只实现了许可与陷阱）；
-   c. 继续试跑未接入组（`Zimop` 0/40、`Zcmop` 0/8 —— 都是 MOP 类预留编码，按规范"未实现的
-      MOP 应执行而不产生副作用"，需要给译码加 MOP 处理；`Zicsr` 已过）；
-   d. FPGA tcl 与上板 B1~B3。
+6. **下一步（阶段 2A 剩余，按 `AGENT.md` §7 任务表；顺序即优先级）**：
+   a. **[P1] 2A-7a SPI-XIP 启动链路（仿真可验）** —— 见 `AGENT.md` §2 **D16**：chiplab 复位取指
+      地址是 **`0x1C00_0000`**（SPI Flash XIP，`IP/AMBA/axi_mux_syn.v` 的 `[31:20]==0x1c0` 判决），
+      DDR3 在 `0x0`，**没有硬件 boot ROM**。要做：`sim_axi_slave.v` 的 SPI 窗口（已改，未提交）+
+      `sim/tests/spi_boot.S`（`.text.spi`→`0x1C00_0000`、`.text.ddr`→`0x0`，用 `auipc+jalr` 跨
+      ~448 MiB 跳转）+ `scripts/run_spi_boot_test.sh`（`-DRESET_PC=32'h1C000000`，断言
+      `SPI_BOOT: PASS`）；取指命中 SPI 窗口须绕过 I-Cache。
+   b. **[P1] PMP**（`UDB_NUM_PMP_ENTRIES` 仍为 0；内核/SBI 需要）—— 实现 pmpcfg0-3/pmpaddr0-15 +
+      S/U 访问检查（L/X/W/R + TOR/NA4/NAPOT），再跑 `tests/priv` 的 `PMPS`(11)/`PMPSm`(38)/`PMPU`(11)/
+      `PMPZaamo`(1)/`PMPZalrsc`(1)/`PMPZca`(15)/`PMPF`(1)；
+   c. **[P2] Sv32 MMU（TLB+PTW）** → 跑 `tests/priv/ExceptionsSv`(8) 等；**L1I/L1D/L2 Cache**（2A-4）——
+      有 Cache 后 CBO 才需要真正实现 clean/flush/inval/zero 语义（目前是"走 LSU 的空操作"）；
+   d. **[P2] 未接入组**：`Zimop` 0/40、`Zcmop` 0/8（MOP 预留编码，规范要求"未实现的 MOP 应执行
+      而不产生副作用"，需给译码加 MOP 处理）；
+   e. **[P3] 2A-7b~d**：启动镜像三件套 → DTS/OpenSBI 声明 → FPGA tcl 与上板 B1~B3。
 7. **本轮新增工具/资产**：`sim/tb/tb_trace_mem.v`（提交轨迹 + D 侧请求/响应 + AXI 通道追踪，
    定位本轮三个缺陷的关键工具）、`sim/tb/tb_axi_slave_rw.v`（从设备写后读可见性独立复现台）、
    `sim/tests/lrsc.S` + `scripts/run_lrsc_test.sh`（A 扩展定向自测）、`scripts/tests/`

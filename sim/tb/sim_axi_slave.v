@@ -38,6 +38,8 @@
 module sim_axi_slave #(
   parameter MEM_LO_BYTES = 32'h0100_0000,   // 0x0000_0000 起 16 MiB
   parameter MEM_HI_BYTES = 32'h0010_0000,   // 0x8000_0000 起 1 MiB（arch-test 用）
+  parameter SPI_BYTES    = 32'h0010_0000,   // 0x1C00_0000 起 1 MiB（SPI Flash XIP 启动窗口）
+  parameter SPI_INIT     = "",              // SPI 窗口镜像（hex，字节宽度，@地址）
   parameter MEM_LO_INIT  = "",              // $readmemh 文件（字节宽度，@地址 格式）
   parameter MEM_HI_INIT  = ""
 )(
@@ -101,6 +103,16 @@ module sim_axi_slave #(
   localparam [31:0] CONF_SIM_BASE  = 32'h1FAF_0000;
   localparam [31:0] CONF_SIM_LAST  = 32'h1FAF_FFFF;
 
+  // ---- SPI Flash XIP 窗口（平台硬事实）----
+  // chiplab `IP/AMBA/axi_mux_syn.v` 的地址判决：
+  //   rd_addr_hit[1] = (araddr[31:16]==16'h1fe8) || (araddr[31:20]==12'h1c0)   // SPI
+  // 即 **0x1C00_0000 起 1 MiB 是 SPI Flash 的 XIP 窗口**（另有 0x1FE8_0000 别名）。
+  // 平台就是从这里取复位后的第一条指令（PMON/u-boot 在 SPI flash 里）。
+  localparam [31:0] SPI_BASE       = 32'h1C00_0000;
+  localparam [31:0] SPI_LAST       = 32'h1C0F_FFFF;   // 1 MiB
+  localparam [31:0] SPI_ALIAS_BASE = 32'h1FE8_0000;   // 平台给同一个控制器留的别名窗口
+  localparam [31:0] SPI_ALIAS_LAST = 32'h1FE8_FFFF;
+
   localparam [31:0] UART_BASE      = 32'h1FE0_0000;
   localparam [31:0] UART_LAST      = 32'h1FE0_3FFF;
   localparam [31:0] UART_REG_BASE  = 32'h1FE0_01E0;
@@ -126,6 +138,7 @@ module sim_axi_slave #(
   localparam [2:0] R_CFG    = 3'd2;   // CONFREG FPGA
   localparam [2:0] R_CFS    = 3'd3;   // CONFREG 仿真
   localparam [2:0] R_UART   = 3'd4;
+  localparam [2:0] R_SPI    = 3'd6;   // SPI Flash XIP（只读；写忽略）
   localparam [2:0] R_NONE   = 3'd5;   // 未映射 → SLVERR
 
   //--------------------------------------------------------------------------
@@ -133,6 +146,7 @@ module sim_axi_slave #(
   //--------------------------------------------------------------------------
   reg [7:0] mem_lo [0:MEM_LO_BYTES-1];
   reg [7:0] mem_hi [0:MEM_HI_BYTES-1];
+  reg [7:0] mem_spi[0:SPI_BYTES-1];      // SPI Flash XIP 窗口（只读，未初始化字节按 0 读）
 
   //--------------------------------------------------------------------------
   // 2. CONFREG / UART 内部寄存器
@@ -160,6 +174,8 @@ module sim_axi_slave #(
       else if (a >= CONF_FPGA_BASE && a <= CONF_FPGA_LAST)           region_of = R_CFG;
       else if (a >= CONF_SIM_BASE  && a <= CONF_SIM_LAST)            region_of = R_CFS;
       else if (a >= UART_BASE      && a <= UART_LAST)                region_of = R_UART;
+      else if ((a >= SPI_BASE && a <= SPI_LAST) ||
+               (a >= SPI_ALIAS_BASE && a <= SPI_ALIAS_LAST))         region_of = R_SPI;
       else                                                           region_of = R_NONE;
     end
   endfunction
@@ -174,6 +190,10 @@ module sim_axi_slave #(
         mem_byte_read = (mem_lo[a] !== 8'hxx) ? mem_lo[a] : 8'h00;
       else if (a >= MEM_HI_BASE && a <= MEM_HI_LAST)
         mem_byte_read = (mem_hi[a - MEM_HI_BASE] !== 8'hxx) ? mem_hi[a - MEM_HI_BASE] : 8'h00;
+      else if (a >= SPI_BASE && a <= SPI_LAST)
+        mem_byte_read = (mem_spi[a - SPI_BASE] !== 8'hxx) ? mem_spi[a - SPI_BASE] : 8'h00;
+      else if (a >= SPI_ALIAS_BASE && a <= SPI_ALIAS_LAST)
+        mem_byte_read = (mem_spi[a - SPI_ALIAS_BASE] !== 8'hxx) ? mem_spi[a - SPI_ALIAS_BASE] : 8'h00;
       else
         mem_byte_read = 8'h00;
     end
@@ -249,7 +269,7 @@ module sim_axi_slave #(
       beat_read_data = 32'h0000_0000;
       for (k = 0; k < 4; k = k + 1)
         if ((k >= lo) && (k < (lo + n))) begin
-          if (region_of(a) == R_MEM_LO || region_of(a) == R_MEM_HI)
+          if (region_of(a) == R_MEM_LO || region_of(a) == R_MEM_HI || region_of(a) == R_SPI)
             beat_read_data[k*8 +: 8] = mem_byte_read(wa + k);
           else
             beat_read_data[k*8 +: 8] = device_byte_read(wa + k);
@@ -363,6 +383,7 @@ module sim_axi_slave #(
             endcase
           end
         end
+        R_SPI: ;                                // SPI Flash：XIP 读窗口，写不落地（真实器件需命令序列）
         default: ;                              // 未映射：不落地，由 werr_q 报 SLVERR
       endcase
     end
@@ -501,15 +522,17 @@ module sim_axi_slave #(
   // 7. 镜像载入（$readmemh；文件名空则跳过）
   //    参数 MEM_*_INIT 为编译期默认值，运行时可用 +MEM_LO_INIT=/+MEM_HI_INIT= 覆盖
   //--------------------------------------------------------------------------
-  reg [8*1024-1:0] lo_init_f, hi_init_f;
+  reg [8*1024-1:0] lo_init_f, hi_init_f, spi_init_f;
 
   initial begin
     /* verilator lint_off WIDTHEXPAND */
-    lo_init_f = MEM_LO_INIT;     // "" 参数默认 8 bit，此处零扩展到文件名缓冲
-    hi_init_f = MEM_HI_INIT;
+    lo_init_f  = MEM_LO_INIT;     // "" 参数默认 8 bit，此处零扩展到文件名缓冲
+    hi_init_f  = MEM_HI_INIT;
+    spi_init_f = SPI_INIT;
     /* verilator lint_on WIDTHEXPAND */
     if ($value$plusargs("MEM_LO_INIT=%s", lo_init_f)) ;
     if ($value$plusargs("MEM_HI_INIT=%s", hi_init_f)) ;
+    if ($value$plusargs("SPI_INIT=%s", spi_init_f)) ;
     if (lo_init_f != "") begin
       $display("[AXI-SLAVE] $readmemh MEM_LO_INIT=%0s -> mem_lo[0:%0d]", lo_init_f, MEM_LO_BYTES-1);
       $readmemh(lo_init_f, mem_lo);
@@ -517,6 +540,11 @@ module sim_axi_slave #(
     if (hi_init_f != "") begin
       $display("[AXI-SLAVE] $readmemh MEM_HI_INIT=%0s -> mem_hi[0:%0d]", hi_init_f, MEM_HI_BYTES-1);
       $readmemh(hi_init_f, mem_hi);
+    end
+    if (spi_init_f != "") begin
+      $display("[AXI-SLAVE] $readmemh SPI_INIT=%0s -> mem_spi[0:%0d] (XIP @0x1C00_0000)",
+               spi_init_f, SPI_BYTES-1);
+      $readmemh(spi_init_f, mem_spi);
     end
   end
 

@@ -63,6 +63,13 @@
 
 ### 3.2 平台使用
 
+- **复位取指窗口 = SPI Flash XIP `0x1C00_0000`（1 MiB）**：chiplab 的地址判决
+  （`IP/AMBA/axi_mux_syn.v`）把 `[31:20]==0x1c0` 接到 SPI 控制器，DDR3 是 AXI 默认从设备位于
+  **`0x0`**，**没有硬件 boot ROM**。因此：① 上板/启动验证必须 `-DRESET_PC=32'h1C000000`；
+  ② RISC-V 习惯的 `0x8000_0000` 复位**不适用**（那是 DDR3 段，上电内容未定义）；
+  ③ 取指命中 SPI 窗口必须**绕过 I-Cache**；④ 引导软件在 SPI 窗口内**只能用 PC 相对寻址**
+  （`0x1C00_0000` 与 DDR `0x0` 相距 ~448 MiB，超出 `auipc` 立即数范围，须用完整 32 位地址运算
+  再 `jalr`）；⑤ 引导早期**不得开 MMU**。详见 `AGENT.md` §2 D16。
 - chiplab 原为 LA32R 设计：**不要**沿用 LA32R 的任何虚拟地址（KSEG 别名 `0x9fe0_xxxx`/`0xa000_0000|`）与 LA32R 的 IRQ 编号约定。
 - 仿真与 FPGA 的 **CONFREG 地址/偏移不同**（见 `docs/kb/01-chiplab-platform.md` §4）；仿真用 `confreg_sim.v`（`0x1FAF_0000`，含 VIRTUAL_UART/IO_SIMU），FPGA 用 `confreg_syn.v`（`0x1FD0_0000`）。
 - 平台的 verilator difftest 依赖 **LA32R NEMU**，RV32 **不能**使用；请自建 TB，并用 **Spike**（自行编译）作为参考模型与 arch-test 签名来源。
@@ -81,6 +88,14 @@
 
 ### 3.4 工作方式
 
+- **子 Agent 并行优先（强制倾向）**：项目任务高度可并行（arch-test 各组、RTL 子模块、
+  移植子任务、日志/代码核查、缺陷定位）。默认"先拆分、再并行"：
+  - 彼此独立的子任务（≥2 个）**必须**用 `subagent` / `subagent_fork` 在同一条消息里并行发起；
+  - 读大量文件只回一个结论的活（日志分析、搜索、核查）交给子 Agent，以保护主 Agent 上下文；
+  - 长时仿真/构建（arch-test 整组、Vivado、锁步）用**后台 job** 与其它工作并行，不要空等；
+  - 子 Agent 不得同时改同一文件；RTL 位域改动必须串行（先改 `rtl/pkg/rv32gc_defs.vh` 真源）；
+  - **子 Agent 不提交 git**，其结论必须由主 Agent 复跑命令确认后才算验收。
+  详细纪律见 `AGENT.md` §4.5。
 - **知识检索优先**：RISC-V 规范/测试/工具链知识用 `kb_search`（不要读大文件）；本项目自己的知识库在 `rv32gc-cpu/docs/kb/`。
 - **每阶段结束**：更新 `AGENT.md` 的阶段总结与下一阶段计划 → git 提交 → **停下等待用户明确指令**（不要自动进入下一阶段）。
 - **需要权限或遇到冲突**：用中文提问，给出选项与推荐项。
@@ -92,10 +107,11 @@
 
 ### 第 0 步：进入项目（每次会话必做）
 
-1. 读 `rv32gc-cpu/AGENT.md`：§2 关键决策、§6 阶段总结、§7 当前状态与下一阶段计划；
-2. 读 `rv32gc-cpu/PROMPT.md`（本文件）；
-3. 按需 `kb_search` 检索 `docs/kb/`、ISA 手册、arch-test 覆盖点；
-4. 检查 git 状态与上一阶段提交，确认工作区干净。
+1. 读 `rv32gc-cpu/PROMPT.md`（本文件，任务背景/硬性指标/平台约束/强制流程）；
+2. 读 `rv32gc-cpu/AGENT.md`：§2 关键决策、**§4.5 工作方式（子 Agent 并行）**、§6 阶段总结、§7 当前状态与下一阶段计划；
+3. 读 `rv32gc-cpu/NEXT_SESSION.md`：上一轮交接的当前卡点与下一步；
+4. 按需 `kb_search` 检索 `docs/kb/`、ISA 手册、arch-test 覆盖点；
+5. 检查 git 状态与上一阶段提交，确认工作区干净。
 
 ### 第 1 步：设计方案（已完成，见 `docs/design/`）
 
@@ -130,6 +146,11 @@
 ---
 
 ## 五、当前状态快照（随阶段更新）
+
+> **阶段 2A 已完成**（2026-09-13，第 8 轮）：顺序 5 级 RV32GC 基线核跑通
+> **arch-test 17 组 123 例 0 失败** + hello/memtest + 单元测试 + A 扩展定向自测全绿；
+> 下一步是 **PMP → Sv32 MMU + L1/L2 Cache → 平台适配（SPI 启动）→ FPGA 上板**。
+> 最新事实以 `AGENT.md` §6/§7 与 `NEXT_SESSION.md` §4 为准。
 
 - **阶段一已完成并获用户审阅通过**：设计文档 9 篇、移植方案 6 篇、知识库 7 篇、结构图/数据通路图 5 张、`AGENT.md`、本提示词；已提交 git。
 - **环境就绪**：Verilator 5.020 + Icarus Verilog 12.0 已安装（用户完成）；Vivado 2025.2 可用；`/opt/riscv` GCC 16.1.0 可用；网络可用。
