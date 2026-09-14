@@ -18,6 +18,16 @@
 //        本设计按 2A 口径保留组合读（32×64 = 2048 bit，规模可控、不构成
 //        BRAM 退化风险），并在综合报告中复核。如 M4 时序/面积需要，改
 //        Block Memory Generator IP + 双分支（红线 1/2），接口不变。
+//
+// 勘误（2026-09-14，随 tb_fregfile.sv 首跑修复）：读口原用 `function rd_port`
+//   读 `fpr[]` 实现；**iverilog 12.0 对"函数体内读模块级数组"不建立写依赖**
+//   ⇒"读地址不变、只有阵列变化"时读口不重算，返回陈旧值（复位后表现为恒 x；
+//   实测 dut.fpr[0]=0 而 rdata*=x）。已改为三条内联 `assign`（端口/语义不变，
+//   两模拟器依赖均正确）；缺陷最小复现与回归哨兵见 sim/unit/tb_fregfile.sv。
+//   规约依据：`docs/kb/tools-and-flow.md` §2.1「iverilog 表征缺陷规约」第 ① 条
+//   ——被 `function` 读取的信号必须显式作为 `function` 的 `input` 传入，不得让
+//   `function` 直接引用模块级 `reg`/`wire`。本文件比该条更严：读口**完全不用**
+//   `function`，一律三条同构内联 `assign`（条件表达式 == 纯组合 mux，红线 3）。
 //==============================================================================
 `include "rv32_defs.vh"
 `include "core_params.vh"
@@ -57,25 +67,20 @@ module fregfile #(
     end
 
     // ---- 读口：写优先（同拍同号返回写入值） ----
-    // 三个读口共用一个函数，保证口径唯一（避免三处各自实现漂移）。
+    // 三条内联 `assign` + 条件表达式：纯组合读口 mux，无副作用（红线 3）。
     //
-    // `always` 块用在这里的理由：这是**纯组合的读口 mux**，且需要"写优先"
-    // 这一条件选择；用 assign + function 表达同一语义会让每个读口重复三遍
-    // 三元表达式。此处保持 function 形式（无副作用、单输出），符合
-    // AGENT.md §4.3 的精神（避免给多个 reg 赋值的 always @(*)）。
-    function [FLEN-1:0] rd_port;
-        input [4:0] idx;
-        begin
-            if (we && (rd == idx)) begin
-                rd_port = wdata;          // 写优先旁路
-            end else begin
-                rd_port = fpr[idx];
-            end
-        end
-    endfunction
-
-    assign rdata1 = rd_port(rs1);
-    assign rdata2 = rd_port(rs2);
-    assign rdata3 = rd_port(rs3);
+    // ★★ 必须内联，**不能**改写成"function 内读 fpr[]"（2026-09-14 实测缺陷）：
+    //    iverilog 12.0 对**函数体内读模块级数组**不建立写依赖 ⇒ 读口在
+    //    "读地址不变、只有阵列变化"时不重算，读到**陈旧值**（复位后表现为
+    //    恒 `x`，实测：复位后固定读 f0 ⇒ rdata*=x，而层次引用 dut.fpr[0]=0）。
+    //    最小复现（含 Verilator 对照）见 sim/unit/tb_fregfile.sv 头注；
+    //    tb_fregfile.sv 的"复位后零抖动读"即为该缺陷的回归哨兵。
+    //    内联写法在 iverilog 12.0 与 Verilator 5.020 下行为一致且正确。
+    //
+    // 口径唯一性由三条 assign 的同构写法保证（同一模板三处展开，改一处必
+    // 三处同步——已由 tb_fregfile.sv 的"三读口并发/部分冲突"用例把住）。
+    assign rdata1 = (we && (rd == rs1)) ? wdata : fpr[rs1];
+    assign rdata2 = (we && (rd == rs2)) ? wdata : fpr[rs2];
+    assign rdata3 = (we && (rd == rs3)) ? wdata : fpr[rs3];
 
 endmodule

@@ -17,6 +17,42 @@
 //      （f-st-ext.adoc:186-188 norm:ieee_std_tininess）。
 //   ⑦ fflags 精确：NV/DZ(无)/OF/UF/NX。
 //
+// ★ 缺陷修复记录（2026-09-14）——精确抵消零的符号（IEEE-754-2008 §6.3）
+//   原实现只把零符号用在 both_zero 特殊值通路（zero_sign）。两个**非零**操作数
+//   精确抵消时 sum_mag==0 掉进舍入原语，而 fpu_round_s/d 的 sign 接的是
+//   sum_sign（精确抵消时恒为 0）⇒ 无论舍入模式都返回 +0：违反 §6.3 对 RDN 的
+//   −0 要求（fadd.s(1.0,−1.0,RDN) 曾给 0x00000000，应为 0x80000000）。
+//   修复：在四处舍入调用前新增 exact_cancel 判据（fpu_add_s/d：两个非零操作数
+//   等值异号；fpu_fma_s/d：加数对阶后与积精确异号等值），把它并入舍入符号
+//      round_sign = sum_sign | (exact_cancel & (rm == RDN))
+//   精确抵消时 sum_mag==0 ⇒ 舍入原语走 zero_out 分支，只取符号、不产生
+//   OF/UF/NX，故该修复不改变 fflags。(+0)+(−0) 双零通路与 RNE/RTZ/RUP/RMM
+//   行为均保持不变。
+//   验证：.work_fpu/verify_cancel.sh（定向"精确抵消+RDN"家族 ≥2 万例）与定点
+//   TB .work_fpu/tb_cancel_directed.sv；原均匀随机家族不含该用例（实测
+//   add_s 0/6000、add_d 0/600、fma_s 0/4000、fma_d 0/500），故此前未暴露。
+//
+// ★ 缺陷修复记录（2026-09-14，#2）——FMA-NV 误报（NaN 乘数 × Inf + 异号 Inf 加数）
+//   现象：fpu_fma_s/fpu_fma_d 在"任一乘数为 NaN、另一乘数为 Inf、且加数（含
+//   neg_add / neg_prod 取反后）为异号 Inf"时给 NV=1；结果位本就正确（canonical
+//   NaN），仅 fflags 错。IEEE-754-2008 / RISC-V 口径：qNaN 输入**不**报 NV，
+//   唯一允许"qNaN 也报 NV"的场景是 0×∞（f-st-ext.adoc:310-312
+//   norm:fma_nv_flag，即 p_inf_zero 项，本修复**不动**它）。
+//   根因：`inf_special = p_inf_zero | (p_inf & c_inf & (p_sign != c_sign))` 与
+//   give_nan 里的同一项没有排除 NaN 操作数。p_inf = a_inf|b_inf 只判"指数全 1"，
+//   NaN 的 frac≠0 不在该判据内 ⇒ NaN×Inf 也命中；NaN 的符号位又随机扰动
+//   p_sign，使加数为**同号** Inf 时也可能被判成异号相消。
+//   修复：该项统一提取为
+//      inf_opp = p_inf & c_inf & (p_sign != c_sign) & ~any_nan
+//   （any_nan = a_nan | b_nan | c_nan），由 inf_special / give_nan 共用一份，
+//   杜绝同一表达式两处不同步再次引入偏差。结果位不变（give_nan 本来就被
+//   any_nan 覆盖 ⇒ canonical NaN）；add 侧无此问题（a_inf/b_inf 已要求
+//   frac==0，本身排除 NaN）故未动。
+//   验证：定点 TB（/tmp/tb_fma_nv_directed.sv，26 例，含 neg_prod/neg_add/RDN
+//   变体与控制例）修复前 10 例 FAIL（全部"结果对、NV 误置"）→ 修复后 0 例 FAIL；
+//   .work_fpu/verify_cancel.sh 12345（fmad）/777（fma）由 FAIL 转 PASS；控制例
+//   真 Inf−Inf 仍 NV=1、0×∞+qNaN 仍 NV=1、同号 Inf 加数仍 NV=0。
+//
 // ★ 红线 1/2（IP 优先 + 双分支）
 //   检索结论：Vivado 有 `Floating-Point Operator v7.1` IP，支持 Add/Sub、
 //   Multiply、FMA、Divide、Square root，可配 binary32/64 与多周期流水 ⇒
@@ -319,19 +355,7 @@ module fpu_add_s (
     wire [511:0] sum_mag  = sum_sign ? (~sum_tc[511:0] + 512'd1) : sum_tc[511:0];
     wire [1023:0] sum_mag_x = sum_mag;   // 零扩展到舍入原语域
 
-    // ---- 交给共享舍入原语 ----
-    wire [31:0] round_result;
-    wire [4:0]  round_flags;
-    fpu_round_s u_round (
-        .sign   (sum_sign),
-        .sig    (sum_mag_x),
-        .exp    (base),
-        .rm     (rm),
-        .result (round_result),
-        .fflags (round_flags)
-    );
-
-    // ---- 特殊值优先（规范口径见文件头） ----
+    // ---- 特殊值判据（必须先于舍入原语声明：精确抵消零的符号要用到 both_zero） ----
     wire any_nan   = a_nan | b_nan;
     wire nan_nv    = a_snan | b_snan;
     wire inf_opp   = a_inf & b_inf & (a_sign != b_sign);   // Inf − Inf 同号? 见下
@@ -339,6 +363,25 @@ module fpu_add_s (
 
     // 注意：b_sign 已含 op_sub 的取反，故"符号不同"即代表异号无穷相减 ⇒ NV
     wire zero_sign = (a_sign == b_sign) ? a_sign : (rm == 3'b010);
+
+    // ---- 精确抵消零的符号（IEEE-754-2008 §6.3；缺陷修复见文件头） ----
+    // 两个**非零**操作数等值异号（x + (−x) / x − x）⇒ 精确和为零：除 RDN 外给
+    // +0，RDN 给 −0。同号非零之和不可能为零；异号双零已由 both_zero 单独处理，
+    // 故 sum_mag==0 且非 both_zero 即该情形（此时 sum_sign 恒为 0）。
+    wire exact_cancel = (sum_mag == 512'd0) & ~both_zero & (a_sign != b_sign);
+    wire round_sign   = sum_sign | (exact_cancel & (rm == 3'b010));
+
+    // ---- 交给共享舍入原语 ----
+    wire [31:0] round_result;
+    wire [4:0]  round_flags;
+    fpu_round_s u_round (
+        .sign   (round_sign),
+        .sig    (sum_mag_x),
+        .exp    (base),
+        .rm     (rm),
+        .result (round_result),
+        .fflags (round_flags)
+    );
 
     localparam [31:0] CANON_S = 32'h7FC0_0000;
 
@@ -417,22 +460,28 @@ module fpu_add_d (
     wire [4095:0] sum_mag  = sum_sign ? (~sum_tc[4095:0] + 4096'd1) : sum_tc[4095:0];
     wire [8191:0] sum_mag_x = sum_mag;   // 零扩展到舍入原语域
 
+    // ---- 特殊值判据（必须先于舍入原语声明：精确抵消零的符号要用到 both_zero） ----
+    wire any_nan   = a_nan | b_nan;
+    wire nan_nv    = a_snan | b_snan;
+    wire inf_opp   = a_inf & b_inf & (a_sign != b_sign);
+    wire both_zero = a_zero & b_zero;
+    wire zero_sign = (a_sign == b_sign) ? a_sign : (rm == 3'b010);
+
+    // ---- 精确抵消零的符号（IEEE-754-2008 §6.3；缺陷修复见文件头） ----
+    // 同 fpu_add_s：两个非零操作数等值异号 ⇒ 精确零，RDN 给 −0、其余模式 +0。
+    wire exact_cancel = (sum_mag == 4096'd0) & ~both_zero & (a_sign != b_sign);
+    wire round_sign   = sum_sign | (exact_cancel & (rm == 3'b010));
+
     wire [63:0] round_result;
     wire [4:0]  round_flags;
     fpu_round_d u_round (
-        .sign   (sum_sign),
+        .sign   (round_sign),
         .sig    (sum_mag_x),
         .exp    (base),
         .rm     (rm),
         .result (round_result),
         .fflags (round_flags)
     );
-
-    wire any_nan   = a_nan | b_nan;
-    wire nan_nv    = a_snan | b_snan;
-    wire inf_opp   = a_inf & b_inf & (a_sign != b_sign);
-    wire both_zero = a_zero & b_zero;
-    wire zero_sign = (a_sign == b_sign) ? a_sign : (rm == 3'b010);
 
     localparam [63:0] CANON_D = 64'h7FF8_0000_0000_0000;
 
@@ -542,23 +591,10 @@ module fpu_fma_s (
     wire          sum_sign = sum_tc[1024];
     wire [1023:0] sum_mag  = sum_sign ? (~sum_tc[1023:0] + 1024'd1) : sum_tc[1023:0];
 
-    // ---- 一次舍入 ----
-    wire [31:0] round_result;
-    wire [4:0]  round_flags;
-    fpu_round_s u_round (
-        .sign   (sum_sign),
-        .sig    (sum_mag),
-        .exp    (base[12:0]),      // S 的 base ∈ [-175, ~1000]，13 bit 足够
-        .rm     (rm),
-        .result (round_result),
-        .fflags (round_flags)
-    );
-
-    // ---- 特殊值 ----
+    // ---- 特殊值判据（必须先于舍入原语声明：精确抵消判据要用到它们） ----
     wire p_inf_zero = (a_inf & b_zero) | (a_zero & b_inf);   // Inf×0 ⇒ 必报 NV
     wire p_inf      = a_inf | b_inf;
     wire any_nan    = a_nan | b_nan | c_nan;
-    wire any_snan   = a_snan | b_snan | c_snan;
 
     // 积是否**恰好**为零（任一侧为零且另一侧有限）：此时结果等于把加数
     // 直接相加，零的符号必须按 IEEE 加法规则决定（不能用回合路径，它会
@@ -566,16 +602,42 @@ module fpu_fma_s (
     wire p_zero  = (a_zero & ~b_inf) | (b_zero & ~a_inf);
     wire p_finite_zero = p_zero & ~p_inf_zero;
 
+    // ---- 精确抵消零的符号（IEEE-754-2008 §6.3；缺陷修复见文件头） ----
+    // 加数对阶后与积**精确异号等值**（两者均非零）⇒ 精确和为零：除 RDN 外给
+    // +0，RDN 给 −0。舍入通路里积与加数均非零（积为零的情形已由
+    // p_finite_zero 另行处理），故 sum_mag==0 即该情形。
+    wire exact_cancel = (sum_mag == 1024'd0) & ~p_finite_zero & (p_sign != c_sign);
+    wire round_sign   = sum_sign | (exact_cancel & (rm == 3'b010));
+
+    // ---- 一次舍入 ----
+    wire [31:0] round_result;
+    wire [4:0]  round_flags;
+    fpu_round_s u_round (
+        .sign   (round_sign),
+        .sig    (sum_mag),
+        .exp    (base[12:0]),      // S 的 base ∈ [-175, ~1000]，13 bit 足够
+        .rm     (rm),
+        .result (round_result),
+        .fflags (round_flags)
+    );
+
+    // ---- 特殊值（其余判据） ----
+    wire any_snan   = a_snan | b_snan | c_snan;
+
     // 有效零：积为零（含符号）与加数为零（含符号）的相加
     wire p_sign_w = p_sign;                 // 积的符号（p_zero 时即其零符号）
     wire eff_zero = p_finite_zero & c_zero;
     // IEEE：同号零 ⇒ 该符号；异号零 ⇒ RDN 给 −0，否则 +0（RNE/RMM/RUP）
     wire eff_zero_sign = (p_sign_w == c_sign) ? p_sign_w : (rm == 3'b010);
 
-    // Inf × 0：RISC-V 要求即使加数为 qNaN 也置 NV（f-st-ext.adoc:310-312）
-    wire inf_special = p_inf_zero | (p_inf & c_inf & (p_sign != c_sign));
+    // "积 Inf 与加数 Inf 异号"（真 Inf−Inf）：必须排除 NaN 操作数——p_inf 只看
+    // a_inf|b_inf（不判 frac），NaN×Inf 会误命中，见文件头"缺陷修复记录②"。
+    wire inf_opp = p_inf & c_inf & (p_sign != c_sign) & ~any_nan;
+    // Inf × 0：RISC-V 要求即使加数为 qNaN 也置 NV（f-st-ext.adoc:310-312）。
+    // ★ 该项**不**受 any_nan 屏蔽：0×∞ + qNaN 加数仍必须报 NV（norm:fma_nv_flag）。
+    wire inf_special = p_inf_zero | inf_opp;
     // 结果必须为 canonical NaN 的情形：任一 NaN 输入、Inf×0、Inf−Inf（异号）
-    wire give_nan = any_nan | p_inf_zero | (p_inf & c_inf & (p_sign != c_sign));
+    wire give_nan = any_nan | p_inf_zero | inf_opp;
 
     // Inf 结果：积为 Inf（且非 Inf×0、非同号 Inf 相减、无 NaN）
     wire give_pinf = p_inf & ~p_inf_zero & ~(c_inf & (c_sign != p_sign)) & ~any_nan;
@@ -689,23 +751,10 @@ module fpu_fma_d (
     wire          sum_sign = sum_tc[8192];
     wire [8191:0] sum_mag  = sum_sign ? (~sum_tc[8191:0] + 8192'd1) : sum_tc[8191:0];
 
-    // ---- 一次舍入 ----
-    wire [63:0] round_result;
-    wire [4:0]  round_flags;
-    fpu_round_d u_round (
-        .sign   (sum_sign),
-        .sig    (sum_mag),
-        .exp    (base[13:0]),      // D 的 base ∈ [-2148, 971]，14 bit 足够
-        .rm     (rm),
-        .result (round_result),
-        .fflags (round_flags)
-    );
-
-    // ---- 特殊值 ----
+    // ---- 特殊值判据（必须先于舍入原语声明：精确抵消判据要用到它们） ----
     wire p_inf_zero = (a_inf & b_zero) | (a_zero & b_inf);   // Inf×0 ⇒ 必报 NV
     wire p_inf      = a_inf | b_inf;
     wire any_nan    = a_nan | b_nan | c_nan;
-    wire any_snan   = a_snan | b_snan | c_snan;
 
     // 积是否**恰好**为零（任一侧为零且另一侧有限）：此时结果等于把加数
     // 直接相加，零的符号必须按 IEEE 加法规则决定（不能用回合路径，它会
@@ -713,16 +762,40 @@ module fpu_fma_d (
     wire p_zero  = (a_zero & ~b_inf) | (b_zero & ~a_inf);
     wire p_finite_zero = p_zero & ~p_inf_zero;
 
+    // ---- 精确抵消零的符号（IEEE-754-2008 §6.3；缺陷修复见文件头） ----
+    // 同 fpu_fma_s：加数对阶后与积精确异号等值 ⇒ 精确零，RDN 给 −0、其余 +0。
+    wire exact_cancel = (sum_mag == 8192'd0) & ~p_finite_zero & (p_sign != c_sign);
+    wire round_sign   = sum_sign | (exact_cancel & (rm == 3'b010));
+
+    // ---- 一次舍入 ----
+    wire [63:0] round_result;
+    wire [4:0]  round_flags;
+    fpu_round_d u_round (
+        .sign   (round_sign),
+        .sig    (sum_mag),
+        .exp    (base[13:0]),      // D 的 base ∈ [-2148, 971]，14 bit 足够
+        .rm     (rm),
+        .result (round_result),
+        .fflags (round_flags)
+    );
+
+    // ---- 特殊值（其余判据） ----
+    wire any_snan   = a_snan | b_snan | c_snan;
+
     // 有效零：积为零（含符号）与加数为零（含符号）的相加
     wire p_sign_w = p_sign;                 // 积的符号（p_zero 时即其零符号）
     wire eff_zero = p_finite_zero & c_zero;
     // IEEE：同号零 ⇒ 该符号；异号零 ⇒ RDN 给 −0，否则 +0（RNE/RMM/RUP）
     wire eff_zero_sign = (p_sign_w == c_sign) ? p_sign_w : (rm == 3'b010);
 
-    // Inf × 0：RISC-V 要求即使加数为 qNaN 也置 NV（f-st-ext.adoc:310-312）
-    wire inf_special = p_inf_zero | (p_inf & c_inf & (p_sign != c_sign));
+    // "积 Inf 与加数 Inf 异号"（真 Inf−Inf）：必须排除 NaN 操作数（同 fpu_fma_s，
+    // p_inf 不判 frac ⇒ NaN×Inf 误命中），见文件头"缺陷修复记录②"。
+    wire inf_opp = p_inf & c_inf & (p_sign != c_sign) & ~any_nan;
+    // Inf × 0：RISC-V 要求即使加数为 qNaN 也置 NV（f-st-ext.adoc:310-312）。
+    // ★ 该项**不**受 any_nan 屏蔽：0×∞ + qNaN 加数仍必须报 NV（norm:fma_nv_flag）。
+    wire inf_special = p_inf_zero | inf_opp;
     // 结果必须为 canonical NaN 的情形：任一 NaN 输入、Inf×0、Inf−Inf（异号）
-    wire give_nan = any_nan | p_inf_zero | (p_inf & c_inf & (p_sign != c_sign));
+    wire give_nan = any_nan | p_inf_zero | inf_opp;
 
     // Inf 结果：积为 Inf（且非 Inf×0、非同号 Inf 相减、无 NaN）
     wire give_pinf = p_inf & ~p_inf_zero & ~(c_inf & (c_sign != p_sign)) & ~any_nan;
