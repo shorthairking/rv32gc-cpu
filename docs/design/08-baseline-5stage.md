@@ -476,6 +476,12 @@ flowchart LR
 
 **U 模式可访问**：仅 `cycle`/`time`/`instret`(`0xC00`/`0xC01`/`0xC02`) 与高半部 `0xC80`/`0xC81`/`0xC82`，且受 `mcounteren`/`scounteren` 门控。
 
+**U 模式 CSR 不落地 —— 用户已定 / 母 Agent 裁决（2026-09-14）**：
+
+- **裁决：2A 不落地 U 模式 CSR**（`ustatus`/`uie`/`utvec`/`uscratch`/`uepc`/`ucause`/`utval`/`uip`）。理由为**规范真值**：本工作区手册版本为 **20250508**（`riscv-isa-manual/src/unpriv/preface.adoc:208`），该版本 `csrs.adoc` 的 CSR Listing **已撤回**这一组表（`csrs.adoc` 全文无 `ustatus`/`uie`/`utvec`/`uscratch`/`uepc`/`ucause`/`utval`/`uip`，亦**无** "User Trap Setup / User Trap Handling" 表；可复核命令 `grep -n "ustatus\|utvec\|uscratch\|uepc\|ucause\|utval\|uip" riscv-isa-manual/src/priv/csrs.adoc` 无输出）。`rv32_defs.vh` §4.10 中保留的整组地址常量**仅为 1P10 口径的历史登记**，不可作为 1P12 之后的合规依据。
+- **裁决：2A 的 U 模式陷阱直接上报 M 模式**。U 模式下发生的异常/中断不经 U 侧 CSR 落地，一律走 M 侧入口（写 `mcause`/`mepc`/`mtval`/`mstatus.MPP`）；委托给 S 的路径仍按 `medeleg`/`mideleg` 与 T5 的"源特权级 < 目标委托特权级"门控判定，**与 U 模式 CSR 是否落地无关**。
+- **落地形态**：`rtl/pkg/rv32_defs.vh` 中该组常量保持由 `RV32GC_IMPLEMENT_U_MODE_CSRS`（值 **0**）统一门控，**不改动该门控**；门控为 0 时这组地址一律按**未实现**处理 ⇒ U/S 访问报非法指令（cause 2），符合本节的"访问权限"口径。
+
 **访问权限**：U 访问非上述 CSR ⇒ 非法指令（cause 2）；S 访问 M 专属 CSR ⇒ 非法指令（cause 2）；未实现地址 ⇒ 非法指令（cause 2）；`tval` = 指令位（T1）。
 
 ### 6.3 陷阱与中断口径
@@ -731,6 +737,39 @@ include_priv_tests: True                     # 特权子集是 M2 判据
 | 未实现扩展（`Zb*`/`Zk*`/向量/`Zacas`/`Zabha`/`Zfa*`/`Zcmop`/`Zicond`/`Zihint*`/`Zicboz`/`Zicbop` 等） | 2A 范围外（`cbo.zero` 属 Zicboz，**2A 不含**；见 §11 待确认项） |
 
 > **筛选纪律**：排除清单必须**逐条可复核**（每条写明理由），不得用"全排除"或"跑不过就加排除"的方式放水；M2 的"全绿"判据必须能追溯到**具体通过清单**。
+
+#### 8.2.1 arch-test DUT 硬依赖登记（M2 硬要求，已核实）
+
+以下三条是**参考模型侧**（`riscv-arch-test/tests/env/` 与 DUT 配置）的硬依赖，任一不满足都会导致 M2 判据 ① **全部挂死或全挂**，**不属 DUT 功能缺陷**，因此必须在 DUT 配置阶段一次做对：
+
+**(a) 启动代码必须显式置 `mstatus.FS=Dirty`，且 DUT 配置必须定义 `STANDARD_SM_SUPPORTED` 与 `F_SUPPORTED`。**
+
+| 依据 | 事实 |
+|---|---|
+| `tests/env/rvtest_setup.h:935` | `RVTEST_BOOT_TO_MMODE` 的 M 模式初始化（清 `mie`/`mip`、关委托、清理 `pmpcfg`/`pmpaddr` 等）**整体包在 `#ifdef STANDARD_SM_SUPPORTED` 内**；未定义该宏 ⇒ **整段 M/S 初始化被跳过** |
+| `tests/env/rvtest_setup.h:1331` | `mstatus.FS = 11`（`MSTATUS_FS`，`tests/env/encoding.h:32` = `0x6000`）的 `csrs mstatus, t0` 由 `#if defined(F_SUPPORTED) \|\| defined(ZFINX_SUPPORTED)` **门控**；未定义 ⇒ 不置 Dirty |
+| 后果 | 复位后 `mstatus.FS=Off` ⇒ 本核 rv32if/rv32ifd 用例（`flw`/`fsw`/`fld`/`fsd`/OP-FP 全族）**全部在第一条 FP 指令上挂死**；且 M/S 初始化缺失导致后续一切特权用例失序 |
+
+⇒ **M2 前置门禁**：DUT 配置（`udb_config` 与 `dut_include_dir` 下的 YAML/头文件）**必须**定义 `STANDARD_SM_SUPPORTED` 与 `F_SUPPORTED` 两个宏；本地 TB 启动代码（`sim/tb/prog/` 与 `sim/arch_test/` 的 `boot`/`link` 侧）**必须**显式写 `mstatus.FS = 2'b11`，**不得**依赖测试自身隐含设置。
+
+**(b) CSR 文件必须让 `mcountinhibit`(`0x320`) 与 `mhpmevent3..31`(`0x323..0x33F`) 可写。**
+
+| 依据 | 事实 |
+|---|---|
+| `tests/env/rvtest_setup.h:1063` | `csrw mcountinhibit, zero` —— 注释明写"**This is reserved if mcountinhibit is not implemented, and might trap or have unspecified behavior**" |
+| `tests/env/rvtest_setup.h:1066-1095` | `csrw mhpmevent3, zero` … `csrw mhpmevent31, zero`（29 条），注释明写"**They must be implemented.**" |
+| 后果 | 上述地址若按**未实现**处理（报非法指令）或者在 `csr_file.v` 里做**严格只读/只读-0** 且不吞写 ⇒ arch-test 在**启动阶段**（`RVTEST_BOOT_TO_MMODE`，早于任何用例主体）即挂死 ⇒ **全部用例全挂**，与 DUT 指令功能无关 |
+
+⇒ **M2 硬要求**：`mcountinhibit` 与 `mhpmevent3..31` 必须**接受写入**。本项目 2A 不实现计数器事件选择逻辑，故采用 **WARL / 部分实现**口径：**吞写并保持读 0**（即写不进但也**不抛异常**），必须在 `csr_file.v` 中显式列出这些地址为"已实现但吞写"，**不得**把它们归入"未实现地址"分支。
+
+**(c) 行号依据留痕**（均可直接复核，防止后续手册升级后静默失配）：
+
+```
+riscv-arch-test/tests/env/rvtest_setup.h:935        #ifdef STANDARD_SM_SUPPORTED（M/S 初始化门控）
+riscv-arch-test/tests/env/rvtest_setup.h:1331       #if defined(F_SUPPORTED) || defined(ZFINX_SUPPORTED)（FS=Dirty）
+riscv-arch-test/tests/env/rvtest_setup.h:1059-1129  csrw mcountinhibit / mhpmevent3..31（计数器写序列）
+riscv-arch-test/tests/env/encoding.h:32             #define MSTATUS_FS 0x00006000
+```
 
 ### 8.3 Spike 锁步
 

@@ -80,9 +80,11 @@ spike --version     # 预期 /opt/riscv/bin/spike
 
 - 验证（可选）：`spike --isa=rv32imafdc_zicsr_zifencei_zicntr_zicbom <elf>`。
 - arch-test 官方调用口径：`spike --instructions=100000000 -l --log-commits --log=<trace> --isa=rv32imafd_zicclsm_zicsr_zifencei_zicntr_zaamo_zalrsc`（`--log-commits` 输出在 **stderr**）。
+- ✅ **已就绪（2026-09-14）**：`/opt/riscv/bin/spike` 1.1.1-dev，经母 Agent 实测（ISA 串解析、commitlog 走 stderr、`--instructions` 限流、裸 ELF 需 `-m` 映射含头 PT_LOAD）。
 
 ## 7. 纪律提醒（对本文件读者）
 
+- **kb 检索环境（2026-09-14 发现，待处理）**：常驻 `kb_search` 的 LSA 语义层已退化（返回无关命中）；`kb_get`（path+行号）与直接 `read` 手册源文件完全正常。已做：CLI `node dsh-extension/bin/riscv-kb.js build --no-lsa` 把磁盘索引重建为纯词法版；**待用户重启 `dsh web` 使常驻进程重载**。重启前子 Agent 查 ISA 细节一律用 `kb_get`/`read`（`riscv-isa-manual/src/**`），不依赖 `kb_search` 排序。
 - 母 Agent 只调度；子 Agent 路由 opencode-go-chat/deepseek-v4.1-flash；知识盲区：kb → 联网 → 自试≤3 → 上报。
 - **goal 纪律（AGENT.md §0.7）**：纯派发不挂 goal；禁止轮询子 Agent（等宿主完成通知）；子 Agent 自驱一次做完；goal 工具仅顶层 Agent 可用。
 - 旧项目（master 分支、kb 中 rv32gc-project 来源）只作反面教训，禁止照抄。
