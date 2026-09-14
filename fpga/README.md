@@ -111,3 +111,23 @@ LUT 会爆且时序会崩，此时再检查 `ram_style` 是否被综合属性覆
 4. 复位后**期望**：串口出现 `[RV32-GC] SPI stub at 0x1C000000 … -> jump DDR 0x0`，
    随后 DDR 镜像横幅（B2 阶段才有 U-Boot）；
 5. 判据与失败排查见 `../docs/porting/07-board-bringup-plan.md` §3（B1 表）与 §6（风险 R1~R8）。
+
+### 2.5 平台侧改动的幂等脚本
+
+```bash
+bash fpga/patch_platform_33mhz.sh            # dry-run：只打印将要做的改动
+bash fpga/patch_platform_33mhz.sh --apply    # 实际写入（自动 .bak 备份）
+```
+脚本做三件事（见 §2.1）：① `soc_top.v` 的 `clk_pll_33` 不再用 `clk_out1(50MHz)`；
+② 加 `assign cpu_clk = uncore_clk;`（33 MHz 同域）；③ `config.h` 的 `FREQ` → 33。
+**上板动作（综合/下载/烧写）按用户要求等审阅放行后执行**；脚本本身可随时 dry-run 自检。
+
+### 2.6 仍待补的上板前准备（不需要板子，但需要跑 Vivado/改平台副本）
+
+1. `fpga/rtl/soc_top_rv32gc.v`：平台 `soc_top.v`（1788 行）的**最小差异副本** —— 把 LA32R 核例化
+   换成我们的 `core_top`（端口对照表见 §2.2），其余互连/时钟/DDR/UART/NAND/SPI 原样保留。
+2. `fpga/tcl/build_chiplab.tcl`：`create_project`（part `xc7a200tfbg676-2`）→ 加平台 RTL + `soc_top_rv32gc.v`
+   + 本仓库 `rtl/**` + `soc_up.xdc` → `synth_1`/`impl_1` → `report_utilization`/`report_timing_summary`/
+   `report_cdc` → `write_bitstream`。
+3. `fpga/tcl/program_fpga.tcl`：`open_hw_manager` + `program_hw_devices`（下载线）。
+4. 综合后复核 §2.3 的两条判据（WNS ≥ 0 @33 MHz；BRAM 推断正确），把结果写回 `docs/porting/07-board-bringup-plan.md` §11.2。

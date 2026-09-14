@@ -944,6 +944,20 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 22 轮：上板前准备（不需要板子的部分）
+
+| 项 | 结果 |
+|---|---|
+| **BRAM 推断属性** | `rtl/frontend/rv32_icache.v`、`rtl/mem/rv32_dcache.v` 的 `line_mem`/`tag_mem` 加 `(* ram_style = "block" *)`：仿真行为不变（`hello PASS`、`DCACHE_UNIT 59`+`DWRITE_THRU 14` 复跑 PASS），用于避免 512×256 阵列被 Vivado 推断成分布式 RAM（LUT 爆/时序崩）——对应计划 §11.2 风险 2 |
+| **33 MHz 时钟接线（关键发现）** | 100 MHz→33 MHz **无精确 MMCM 解**（VCO 只能落在 1087.5 → 32.95 MHz，偏差 0.15%）⇒ 上板方案定为**直接复用平台 `clk_pll_33` 的 `clk_out2`(33 MHz) 同时驱动 `cpu_clk` 与 `uncore_clk`**：精确、且 CPU 与 uncore **同域 ⇒ AXI 全同步、无 CDC**（参考 LA32R 核是 50/33 双域，我们不需要）。平台侧只需两处改动：`soc_top.v:1463` 的 `.clk_out1(cpu_clk)` 留空 + 新增 `assign cpu_clk = uncore_clk;`，并同步 `config.h` 的 `FREQ=33` |
+| **幂等脚本** | 新增 `fpga/patch_platform_33mhz.sh`（默认 dry-run，`--apply` 才写，自动 `.bak` 备份；实测 dry-run 正确识别两处待改） |
+| **端口核对 / B1 清单** | `fpga/README.md` 新增 §2：2.1 时钟方案与理由、2.2 `core_top` ↔ `soc_top` 端口核对表（含 `intrpt` 源号约定 1=UART/2=SPI/3=NAND/4=MAC/5=DMA 与 `RESET_PC` 必须写字面量 `32'h1C000000`）、2.3 BRAM 推断检查方法与判据（`report_utilization`/`report_cdc`）、2.4 B1 上板步骤、2.6 仍待补清单 |
+| 仍待补（不需板子，但需跑 Vivado/改平台副本） | ① `fpga/rtl/soc_top_rv32gc.v`（平台 soc_top 的最小差异副本，把 LA32R 核换成 `core_top`）；② `fpga/tcl/build_chiplab.tcl`（工程+综合+实现+报告+bitstream）；③ `fpga/tcl/program_fpga.tcl`；④ 综合后把 WNS/BRAM 结果写回计划 §11.2 |
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
