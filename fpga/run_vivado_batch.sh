@@ -50,5 +50,5 @@ TINFO_DIR="$VIVADO_ROOT/lib/lnx64.o/Rhel/9"
 if [ -f "$TINFO_DIR/libtinfo.so.5" ]; then
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$TINFO_DIR"
 fi
-cd "$(dirname "$TCL")/../.." 2>/dev/null || true
+cd "$REPO_ROOT" || true   # 仓库根（脚本位置推出，与 tcl 放在哪一层无关）
 exec "$VIVADO_ROOT/bin/vivado" -mode batch -notrace -source "$TCL" -tclargs "$@"

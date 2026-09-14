@@ -1016,6 +1016,21 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 第 25 轮（续）：**BRAM 结论修正** —— 上一行的"`8-3391` 计数 0"是假象；用户拍板改用 `blk_mem_gen` IP
+
+| 项 | 实测/结论 |
+|---|---|
+| **⚠️ 修正一处错误结论** | 本节上方"核级综合 `Synth 8-3391` 计数 = 0 ⇒ 阵列已被推断为 RAM"**不成立**。真实原因是 `fpga/rtl/core_top_synth_wrap.v` 把 AXI 主设备输出写成了**悬空内部 wire**（不是模块端口）⇒ 整个核被综合器优化掉：综合"成功"但网表为空（`RAMB36=0 RAMB18=0 LUTRAM=0`、Place 报 `ERROR: [Place 30-494] The design is empty`）。**空设计当然不会报 RAM 推断错误**。已修：把 26 个 AXI 主设备输出 + 4 个调试输出全部**引出为端口**（`core_top_synth_wrap.v` 重写），核级数据从此可信 |
+| **BRAM 推断的真实失败（整板日志原文）** | `WARNING: [Synth 8-4767] Trying to implement RAM 'line_mem0_reg' in registers. Block RAM or DRAM implementation is not possible` + `RAM "line_mem0..7_reg" dissolved into registers`（8 个 D-Cache 数据阵列全中）；tag 阵列与 I-Cache 阵列则是 `[Synth 8-6849] Infeasible attribute ram_style = "block" ... trying to implement using LUTRAM`（退成 LUTRAM） |
+| **根因（硬事实）** | 我们的数据阵列是**组合读**（`assign data = line_memX[set];`），而 **BRAM 读端口带输出寄存器、只能同步读**；一旦标了 `ram_style="block"`，Vivado 不许退 LUTRAM，就直接把阵列**退化成触发器**。8 路 × 128 组 × 256 bit = **26 万 FF**（Artix-7 200T 仅 27 万 FF）⇒ 实现必然失败 |
+| **用户裁决（口径）** | Cache **数据**部分是 KB 级，退成 LUTRAM 会吃掉大量 LUT 且级间延迟不可接受 ⇒ **必须占板上 BRAM 资源**；且**不直接用原语、也不靠 `ram_style` 推断**，要**直接例化 Vivado 自带的 Block Memory Generator IP 核**。tag/valid/替换位等小阵列留在 LUTRAM 可接受 |
+| **实现（本轮落地）** | ① 新增包装模块 `rtl/mem/rv32_cache_bram.v`：综合走 `ifdef RV32_BRAM_IP` ⇒ 例化 IP `bmg_cache_1024x32`（Simple Dual Port、1024×32、字节写使能、读延迟 1 拍）；仿真走同一模块内的行为模型，**逐拍等价**（读端口无条件读，同拍同址读写 = 读旧值）⇒ iverilog 全套回归不需要 Xilinx 库<br>② 新增 `fpga/tcl/create_cache_bram_ip.tcl`（幂等：建 IP + `generate_target` + **追加** `verilog_define RV32_BRAM_IP`），已接入 `build_chiplab.tcl` 与 `synth_core_only.tcl`<br>③ 地址映射定为"每 way 一个 BRAM，10 位地址 = `{组号, 行内字号}`"，即 32 B 行 = 8 个 32 位字 |
+| **IP 路径实测（`fpga/tcl/diag/probe_ip_bram.tcl`）** | 12 个实例（= L1D 8 路 + L1I 4 路）综合结果：**`RAMB36=12 RAMB18=0 LUTRAM=0 REGS=0`** —— 每个 1024×32 阵列精确占 1 个 RAMB36，零 LUTRAM、零触发器（器件共 365 个 RAMB36 ⇒ 占用 3.3%） |
+| **连带约束（已写进包装注释，交给 Cache 改造遵守）** | 数据阵列改同步读后：可缓存 load / 取指命中**各多 1 拍**（store 与所有旁路快路径仍保持组合直通、不加拍）；同一 way 的 BRAM 每拍只能一次写，且"同拍读写同址"时读出的数据不可用 ⇒ Cache 侧必须显式做冒险检查并重发读 |
+| **已派出** | 两个子 Agent 分别改 `rtl/mem/rv32_dcache.v`、`rtl/frontend/rv32_icache.v`（只许改自己那一个文件 + 自己的单元 TB；不许碰父模块与回归基线表）；硬判据：单元/定向测试全绿 + `FENCEI_SMC`/`SPI_BOOT` PASS + hello/memtest 新拍数上报 |
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。

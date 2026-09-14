@@ -25,6 +25,10 @@ create_project -force core_only $PROJDIR -part $PART
 # 必须切 Manual Compile Order 并显式设 top，否则报 "No Verilog or VHDL sources found in project"。
 set_property source_mgmt_mode None [current_project]
 
+# Cache 数据阵列 = Vivado blk_mem_gen IP（用户口径：不用 ram_style 推断原语）
+set IP_DIR "$OUTDIR/ip"
+source "$OURREPO/fpga/tcl/create_cache_bram_ip.tcl"
+
 # 头文件 + 本核 RTL + 综合包装
 set VH [glob -nocomplain "$OURREPO/rtl/pkg/*.vh"]
 if { [llength $VH] > 0 } {

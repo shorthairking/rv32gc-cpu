@@ -98,11 +98,19 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
         缺 `libtinfo.so.5`（`LD_LIBRARY_PATH=$VIVADO_ROOT/lib/lnx64.o/Rhel/9`）、**工程模式自动层次引擎失效**
         （`set_property source_mgmt_mode None` + 显式 top；同机非工程模式正常，平凡工程同样报错）、沙箱下 HOME 必须指到工作区
         （`.vivado_home`）⇒ 统一入口 **`bash fpga/run_vivado_batch.sh <tcl> [args]`**；
-        ③ BRAM 修复功能验收：`FULL_REGRESSION: PASS（281/7，"与基线逐项一致"）`、`hello 308`、`memtest 1,021,800`（不变），
-        核级综合 `Synth 8-3391` **计数 0**；④ 整板综合已越过 2025.2 的阻塞点（11 个 IP 的 OOC run 全 100%，含 `axi_2x1_mux`），
-        顶层综合推进到我们的核。
-        **下一步**：等核级/整板的 **WNS + RAMB36/18 计数 + impl/bitstream**，回填 `docs/porting/07-board-bringup-plan.md` §11.2，
-        然后按 `docs/porting/07-board-bringup-plan.md` 走 B1（**上板动作本身仍等用户放行**）。
+        ③ BRAM 修复的功能验收通过：`FULL_REGRESSION: PASS（281/7，"与基线逐项一致"）`、`hello 308`、`memtest 1,021,800`（不变）；
+        ④ 整板综合越过 2025.2 的阻塞点（11 个 IP OOC 全 100%，含 `axi_2x1_mux`）。
+        **⚠️ 重要修正（勿沿用旧结论）**：先前"核级 `Synth 8-3391` 计数 0 ⇒ BRAM 已修好"是**假象** —— 包装
+        `fpga/rtl/core_top_synth_wrap.v` 把 AXI 主设备输出写成悬空 wire ⇒ 整个核被优化掉（`Place 30-494 The design is empty`）。
+        整板日志的真实结论：8 个 L1D 数据阵列 `[Synth 8-4767] ... dissolved into registers`（26 万触发器，200T 放不下），
+        tag 阵列与 L1I 阵列退成 LUTRAM。**根因：组合读不可能落 BRAM**（BRAM 读端口带输出寄存器，只能同步读）。
+        **用户裁决**：Cache 数据必须占板上 BRAM 资源，且**直接例化 Vivado 自带 `blk_mem_gen` IP 核**（不直接用原语、
+        不靠 `ram_style` 推断）；tag/valid/替换位留 LUTRAM 可接受。已落地 `rtl/mem/rv32_cache_bram.v`
+        （综合走 IP 分支 / 仿真走逐拍等价的行为模型）+ `fpga/tcl/create_cache_bram_ip.tcl`（幂等生成 IP）；
+        IP 路径实测 **12 个实例 ⇒ RAMB36=12 / RAMB18=0 / LUTRAM=0 / REGS=0**。
+        两个 Cache 的数据阵列改造已派子 Agent（各自只改一个文件）。
+        **下一步**：收子 Agent 结果 → 全量回归（新拍数要重定基线）→ 整板 `build_chiplab.tcl`（含 IP）拿
+        **WNS + RAMB36 计数 + bitstream** 回填 `docs/porting/07-board-bringup-plan.md` §11.2 → B1（**上板动作仍等用户放行**）。
         环境口径全文见 `fpga/README.md` §2.7；诊断脚本 `fpga/tcl/diag/`。
    b0k. ✅ **已完成（第 21 轮）**：**④ 的 L1D 落地，④ 项完成** —— `rtl/mem/rv32_dcache.v`（32 KB = 128 组 × 8 路 ×
        32 B、VIPT、**写直达+不写分配**、读分配整行填充、RR、XIP 旁路、原子/CBO 失效失效、`ENABLE` 安全阀）；

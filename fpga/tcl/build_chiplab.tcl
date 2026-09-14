@@ -52,6 +52,12 @@ puts "== part = [get_property PART [current_project]] =="
 set_property source_mgmt_mode None [current_project]
 puts "== source_mgmt_mode = [get_property source_mgmt_mode [current_project]]（应为 None=Manual）=="
 
+#--------------------------------------------------------------- Cache 数据阵列的 BRAM IP
+# 用户口径（第 25 轮）：Cache 数据必须落板上 BRAM，且**直接例化 Vivado 自带 blk_mem_gen IP**
+# （本核 RTL 里的 `rtl/mem/rv32_cache_bram.v` 在综合时用 `ifdef RV32_BRAM_IP` 选 IP 分支）。
+set IP_DIR "$OUTDIR/ip"
+source "$OURREPO/fpga/tcl/create_cache_bram_ip.tcl"
+
 #--------------------------------------------------------------- 加入本核 RTL
 # 头文件（`include "rv32gc_defs.vh"）：必须放进 verilog_header 文件集
 set HDL_DIRS [list "$OURREPO/rtl/pkg" "$OURREPO/rtl/decode" "$OURREPO/rtl/exec" "$OURREPO/rtl/frontend" \
