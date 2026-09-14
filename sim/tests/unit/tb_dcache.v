@@ -324,8 +324,19 @@ module tb_dcache;
     ckw(hit, "C3a 命中行的 store 必须命中");
     ckw(n_bus_wr == i0 + 1, "C3b store 命中仍必须落总线（写直达）");
     ckw(!alloc_seen, "C3c store 命中不得分配新行");
-    // 直接观测阵列：该行（组=0x24[11:5]，路=命中的路）word1 已被更新
-    ckw(u_dc.line_mem[{7'd1, hw}][63:32] === 32'h5A5A_1234,   // 组 1 = 0x24[11:5]
+    // 直接观测阵列：该行（组=0x24[11:5]=1，路=命中的路 hw）word1 已被更新
+    // ⚠ 第 23 轮 BRAM 可推断性改造后：数据阵列由"1 个 [0:1023] 数组"改成"**每路 1 个**数组"
+    //   （`line_mem0..line_mem7`，各 `[0:127]`，索引 = 组号）⇒ 这里的探针按 `hw` 选路、
+    //   按组号 1 索引。**检查语义不变**（仍要求命中 store 后该路该行 word1 == 0x5A5A1234）：
+    //   `line_mem[{set,way}]` ≡ `line_mem<way>[set]`。
+    ckw((hw == 3'd0) ? (u_dc.line_mem0[7'd1][63:32] === 32'h5A5A_1234) :
+        (hw == 3'd1) ? (u_dc.line_mem1[7'd1][63:32] === 32'h5A5A_1234) :
+        (hw == 3'd2) ? (u_dc.line_mem2[7'd1][63:32] === 32'h5A5A_1234) :
+        (hw == 3'd3) ? (u_dc.line_mem3[7'd1][63:32] === 32'h5A5A_1234) :
+        (hw == 3'd4) ? (u_dc.line_mem4[7'd1][63:32] === 32'h5A5A_1234) :
+        (hw == 3'd5) ? (u_dc.line_mem5[7'd1][63:32] === 32'h5A5A_1234) :
+        (hw == 3'd6) ? (u_dc.line_mem6[7'd1][63:32] === 32'h5A5A_1234) :
+                       (u_dc.line_mem7[7'd1][63:32] === 32'h5A5A_1234),
         "C3d store 命中后 Cache 行数据被更新（word1=0x5A5A1234）");
     ckw(u_slave.mem_lo[32'h24] == 8'h34, "C3e store 命中也落了内存（写直达，不产生脏行）");
     do_acc(32'h0000_0024, 1'b0, 32'd0, 4'd0, 1'b0, 1'b0, 1'b0, rd, err, hit, alloc_seen, hw);

@@ -51,7 +51,7 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
 ```
 注意：Spike 的 `--log-commits` 输出在 **stderr**（用 `2>&1 1>/dev/null`）；Spike 的内存映射用 `-m0x80000000:0x10000000,...`（0x0 布局会与设备区冲突）；本核复位 PC=0，跑 0x8000_0000 布局的镜像需要 **`-DRESET_PC=32'h8000_0000`** 重编或用 `arch_stub.S` 跳转桩。
 
-## 4. 当前状态与卡点（**滚动更新**：下表事实截至第 13 轮结束，请从这里接手）
+## 4. 当前状态与卡点（**滚动更新**：下表事实截至第 25 轮结束，请从这里接手）
 
 1. **端到端**：`SIM: PASS hello`、`SIM: PASS memtest`；单元测试全绿（AXI 79 / EXEC 2461 / DECODER 254）。
    **新增（第 9 轮）**：`bash scripts/run_spi_boot_test.sh` → **`SPI_BOOT: PASS`**（441 拍）——
@@ -92,6 +92,18 @@ python3 scripts/lockstep_diff.py <spike.log> <rtl.log> [--pc-only]
       tval = 被拒 parcel 地址；③ 访存**非对齐优先于 PMP**；④ **AMO 被 PMP 拒恒报 cause 7**
       （Spike `amo()` + `convert_load_traps_to_store_traps`）；⑤ 非法指令的 cause 2 往往只是
       "取指本该被拒却没拒"的下游症状，先查取指侧。
+   b0l. 🚧 **进行中（第 25 轮；第 22~24 轮细节见 `AGENT.md` §6）**：**按用户拍板改用 Vivado 2023.2 并把 chiplab 回退初始态后重试上板构建**。
+        已完成：① chiplab 回退到 pristine（`git checkout -- .` + `git clean -xdf`，`git status` 全空，HEAD `a2e11b3`），
+        33 MHz 补丁重打（只动 `soc_top.v` 4 行）；② 定位并绕过 Vivado 2023.2 在本机（Ubuntu 24.04 + 沙箱）的**三个坑**：
+        缺 `libtinfo.so.5`（`LD_LIBRARY_PATH=$VIVADO_ROOT/lib/lnx64.o/Rhel/9`）、**工程模式自动层次引擎失效**
+        （`set_property source_mgmt_mode None` + 显式 top；同机非工程模式正常，平凡工程同样报错）、沙箱下 HOME 必须指到工作区
+        （`.vivado_home`）⇒ 统一入口 **`bash fpga/run_vivado_batch.sh <tcl> [args]`**；
+        ③ BRAM 修复功能验收：`FULL_REGRESSION: PASS（281/7，"与基线逐项一致"）`、`hello 308`、`memtest 1,021,800`（不变），
+        核级综合 `Synth 8-3391` **计数 0**；④ 整板综合已越过 2025.2 的阻塞点（11 个 IP 的 OOC run 全 100%，含 `axi_2x1_mux`），
+        顶层综合推进到我们的核。
+        **下一步**：等核级/整板的 **WNS + RAMB36/18 计数 + impl/bitstream**，回填 `docs/porting/07-board-bringup-plan.md` §11.2，
+        然后按 `docs/porting/07-board-bringup-plan.md` 走 B1（**上板动作本身仍等用户放行**）。
+        环境口径全文见 `fpga/README.md` §2.7；诊断脚本 `fpga/tcl/diag/`。
    b0k. ✅ **已完成（第 21 轮）**：**④ 的 L1D 落地，④ 项完成** —— `rtl/mem/rv32_dcache.v`（32 KB = 128 组 × 8 路 ×
        32 B、VIPT、**写直达+不写分配**、读分配整行填充、RR、XIP 旁路、原子/CBO 失效失效、`ENABLE` 安全阀）；
        **`memtest` 1,116,795 → 1,021,800 拍（−8.5%，相对无 Cache 共 −49.6%）、`hello` 347 → 308 拍**；

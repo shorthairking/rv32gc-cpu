@@ -45,3 +45,6 @@ sim/tests/out/
 sim/arch_test/out/
 sim/tests/out/
 sim/log/
+
+# Vivado 工程/综合/实现产物（可由 fpga/tcl/*.tcl 重新生成）
+fpga/out/

@@ -98,9 +98,27 @@ module rv32_icache #(
 
   //-----------------------------------------------------------------------------
   // 阵列（一行 32 B；tag 20 bit；valid 单独一条 512 bit 寄存器便于 1 拍全清）
+  //
+  // ⚠ BRAM 可推断性（第 23 轮修复，实测依据见 fpga/out/core_synth.log 8-4767/8-3391）：
+  //   原来用"**一个** 512 行数组 + 每拍 4 个不同 index 并行读（{set,way} 4 种拼法）"，
+  //   在 Vivado 眼里是一个"4 读口 + 1 写口"的多端口 RAM —— 不属于任何可推断模板
+  //   （UG901「RAM Coding Examples」只认 1 读 1 写 / 2 读 / 简单双口；UG573「RAM 推断规则」
+  //   同理），于是被判定 `memory pattern used is not supported`。
+  //   ⇒ 改成 **每路一个独立数组**（`line_mem0..line_mem3`，各 `[0:SETS-1]`，索引 = 组号）：
+  //     每个数组天然"1 读口（index=lk_set）+ 1 写口（index=fill_set）"⇒ 正好是单时钟简单双口
+  //     BRAM 模板，Vivado 每路推一个 RAMB36（256 bit 数据 + 奇偶校验位拼接）。
+  //   同时：**数据阵列不复位**（BRAM 数据位没有复位端，带复位的数组会整体退化成触发器；
+  //   valid_q 复位为 0 ⇒ 复位后必不命中，阵列里的 X 永远不会被当作有效数据读出）。
+  //   功能语义（VIPT / RR / 单未完成缺失 / XIP 旁路 / fence.i 整表失效 / ENABLE）逐拍不变。
   //-----------------------------------------------------------------------------
-  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem [0:ENT-1];   // {set[6:0], way[1:0]}；ram_style 供 Vivado 正确推断 BRAM
-  (* ram_style = "block" *) reg [255:0] line_mem [0:ENT-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem0  [0:SETS-1];   // 路 0..3，每路独立数组
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem1  [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem2  [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem3  [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem0 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem1 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem2 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem3 [0:SETS-1];
   reg [ENT-1:0]       valid_q;                // 同上索引；fence.i 一拍全清
   // 组内轮转牺牲指针（RR 替换）：128 组 × 7 bit 打成**一整条寄存器**，
   // 复位/fence.i 都是一次赋值（不是"数组 + for 循环"——那种写法 verilator 直接报错）。
@@ -114,10 +132,10 @@ module rv32_icache #(
   wire [19:0] lk_tag   = req_line[31:12];          // 物理标记
 
   wire [3:0]  way_vld = valid_q[{lk_set, 2'b00} +: WAYS];
-  wire [TAG_W-1:0] tag_w0 = tag_mem[{lk_set, 2'b00}];
-  wire [TAG_W-1:0] tag_w1 = tag_mem[{lk_set, 2'b01}];
-  wire [TAG_W-1:0] tag_w2 = tag_mem[{lk_set, 2'b10}];
-  wire [TAG_W-1:0] tag_w3 = tag_mem[{lk_set, 2'b11}];
+  wire [TAG_W-1:0] tag_w0 = tag_mem0[lk_set];      // 每路 1 个读口（地址 = 组号）
+  wire [TAG_W-1:0] tag_w1 = tag_mem1[lk_set];
+  wire [TAG_W-1:0] tag_w2 = tag_mem2[lk_set];
+  wire [TAG_W-1:0] tag_w3 = tag_mem3[lk_set];
 
   wire [3:0] way_hit = { (tag_w3 == lk_tag) && way_vld[3],
                          (tag_w2 == lk_tag) && way_vld[2],
@@ -128,10 +146,10 @@ module rv32_icache #(
                        way_hit[1] ? 2'd1 :
                        way_hit[2] ? 2'd2 : 2'd3;
 
-  wire [255:0] data_w0 = line_mem[{lk_set, 2'b00}];
-  wire [255:0] data_w1 = line_mem[{lk_set, 2'b01}];
-  wire [255:0] data_w2 = line_mem[{lk_set, 2'b10}];
-  wire [255:0] data_w3 = line_mem[{lk_set, 2'b11}];
+  wire [255:0] data_w0 = line_mem0[lk_set];
+  wire [255:0] data_w1 = line_mem1[lk_set];
+  wire [255:0] data_w2 = line_mem2[lk_set];
+  wire [255:0] data_w3 = line_mem3[lk_set];
   wire [255:0] hit_data = (hit_way == 2'd0) ? data_w0 :
                           (hit_way == 2'd1) ? data_w1 :
                           (hit_way == 2'd2) ? data_w2 : data_w3;
@@ -151,6 +169,7 @@ module rv32_icache #(
   reg [6:0]  set_q;           // 在途缺失的组号
   reg [19:0] tag_q;           // 在途缺失的物理标记
   reg [31:0] fill_addr_q;     // 在途请求行地址（PA；填充侧 XIP 判定用）
+  reg [1:0]  fill_way_q;      // 该笔缺失的 RR 牺牲路（接受拍锁存：写阵列与 valid 置位必须同路）
   reg        fill_xip_q;      // 在途请求的窗口归属（D16②，发起拍采样）
   reg        fill_kill_q;     // 在途填充被 fence.i 打断 ⇒ 响应到达时丢弃并重发
   reg        mem_taken_q;     // 该笔 AXI 读已被主设备接受（AR 之前已在途）
@@ -165,10 +184,17 @@ module rv32_icache #(
                   !(invalidate && mem_taken_q) && CACHE_ON &&
                   !(fill_xip_q | `IS_SPI_XIP(fill_addr_q)) && !axi_rsp_err;
 
+  // 每路一个写使能（写地址 = 组号 set_q，数据 = tag_q / axi_rsp_data）：
+  // 每个数组只有"1 读口 + 1 写口"，符合 UG901 单时钟简单双口 RAM 模板。
+  wire we_w0 = fill_now && (fill_way_q == 2'd0);
+  wire we_w1 = fill_now && (fill_way_q == 2'd1);
+  wire we_w2 = fill_now && (fill_way_q == 2'd2);
+  wire we_w3 = fill_now && (fill_way_q == 2'd3);
+
   assign req_ready     = (state_q == S_IDLE);
   assign axi_rsp_ready = (state_q == S_FILL);   // 收到即接收（整行 32 B 一次给全）
 
-  assign dbg_alloc_wen  = fill_now;
+  assign dbg_alloc_wen  = we_w0 | we_w1 | we_w2 | we_w3;   // == fill_now（按路译码后的或）
   assign dbg_alloc_addr = fill_addr_q;
   assign dbg_hit        = hit;
   assign dbg_hit_way    = hit_way;
@@ -184,6 +210,7 @@ module rv32_icache #(
       state_q       <= S_IDLE;
       set_q         <= 7'd0;
       tag_q         <= 20'd0;
+      fill_way_q    <= 2'd0;
       fill_addr_q   <= 32'd0;
       fill_xip_q    <= 1'b0;
       fill_kill_q   <= 1'b0;
@@ -233,6 +260,7 @@ module rv32_icache #(
               mem_taken_q   <= 1'b0;
               set_q         <= lk_set;
               tag_q         <= lk_tag;
+              fill_way_q    <= vic_way;   // 锁存牺牲路：填充写阵列与 valid 置位必须同路
             end
           end
         end
@@ -247,11 +275,15 @@ module rv32_icache #(
               axi_req_valid <= 1'b1;    // 地址不变（axi_req_addr 保持）
             end else begin
               if (fill_now) begin
-                // 填充：RR 牺牲路；XIP / 总线错误 / ENABLE=0 已在 fill_now 里排除
-                tag_mem[{set_q, vic_way}] <= tag_q;
-                line_mem[{set_q, vic_way}] <= axi_rsp_data;
+                // 填充：RR 牺牲路（`fill_way_q` = 发起本笔缺失时锁存的牺牲路；
+                //   XIP / 总线错误 / ENABLE=0 已在 fill_now 里排除）。
+                //   每个数组一个写口，使能按路译码 ⇒ 保持"单写口"模板。
+                if (we_w0) begin tag_mem0[set_q] <= tag_q; line_mem0[set_q] <= axi_rsp_data; end
+                if (we_w1) begin tag_mem1[set_q] <= tag_q; line_mem1[set_q] <= axi_rsp_data; end
+                if (we_w2) begin tag_mem2[set_q] <= tag_q; line_mem2[set_q] <= axi_rsp_data; end
+                if (we_w3) begin tag_mem3[set_q] <= tag_q; line_mem3[set_q] <= axi_rsp_data; end
                 valid_q[{set_q, 2'b00} +: WAYS] <=
-                    valid_q[{set_q, 2'b00} +: WAYS] | (4'b0001 << vic_way);
+                    valid_q[{set_q, 2'b00} +: WAYS] | (4'b0001 << fill_way_q);
                 rr_q[set_q * SET_W +: SET_W] <= rr_nxt;
               end
               state_q   <= S_RESP;

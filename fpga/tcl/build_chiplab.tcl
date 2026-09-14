@@ -41,6 +41,17 @@ open_project $XPR
 puts "== 工程已打开: [current_project] =="
 puts "== part = [get_property PART [current_project]] =="
 
+#--------------------------------------------------------------- 【本机实测必做】切 Manual Compile Order
+# 现象（Vivado 2023.2 @ Ubuntu 24.04，本机实测）：工程模式的**自动层次引擎失效** ——
+#   CRITICAL WARNING [filemgmt 20-730] Could not find a top module in the fileset sources_1
+#   ERROR [Common 17-53] Unable to launch Synthesis run. No Verilog or VHDL sources found in project
+# 即使显式 set_property top 也会被判 "can not be validated"。同一台机上**非工程模式**
+# （read_verilog + synth_design）完全正常，说明是工程层次引擎（子进程）本身的问题。
+# 绕过：按 Vivado 自己给的提示切到 Manual Compile Order（source_mgmt_mode None），
+# 之后显式 set_property top 生效，synth/impl 均实测可跑（见 fpga/README §2.7）。
+set_property source_mgmt_mode None [current_project]
+puts "== source_mgmt_mode = [get_property source_mgmt_mode [current_project]]（应为 None=Manual）=="
+
 #--------------------------------------------------------------- 加入本核 RTL
 # 头文件（`include "rv32gc_defs.vh"）：必须放进 verilog_header 文件集
 set HDL_DIRS [list "$OURREPO/rtl/pkg" "$OURREPO/rtl/decode" "$OURREPO/rtl/exec" "$OURREPO/rtl/frontend" \
@@ -56,12 +67,13 @@ set VFILES {}
 foreach d $HDL_DIRS { foreach f [glob -nocomplain "$d/*.v"] { lappend VFILES $f } }
 puts "== 待加入本核 RTL: [llength $VFILES] 个 .v =="
 add_files -norecurse -fileset sources_1 $VFILES
-update_compile_order -fileset sources_1
+catch { update_compile_order -fileset sources_1 }
 
-# 顶层：平台自己的 soc_top（工程里已设）；这里显式确认
+# 顶层：平台自己的 soc_top；Manual 模式下必须**显式**再设一次（自动引擎不再接管）
+set_property top soc_top [current_fileset]
 set TOP [get_property top [current_fileset]]
 puts "== 顶层模块 = $TOP（应为 soc_top）="
-if { $TOP ne "soc_top" } { puts "WARN: 顶层不是 soc_top，请检查工程设置" }
+if { $TOP ne "soc_top" } { puts "ERROR: 顶层不是 soc_top（Manual 模式下 top 未生效）"; exit 1 }
 
 #--------------------------------------------------------------- IP 版本升级（工程由旧版 Vivado 建立时必须）
 # 现象：不升级时 OOC run 会被标 locked、`module 'clk_pll_33' not found`（本项目实测：2023.2 建的工程

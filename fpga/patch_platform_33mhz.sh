@@ -26,7 +26,7 @@ APPLY=0; [ "${1:-}" = "--apply" ] && APPLY=1
 need_top=0; need_cfg=0
 grep -q "clk_out1( )," "$TOP" 2>/dev/null || grep -q "clk_out1(  )," "$TOP" 2>/dev/null || need_top=1
 grep -q "assign cpu_clk *= *uncore_clk" "$TOP" || need_top=1
-grep -qE "^#define +FREQ +33\b" "$CFG" 2>/dev/null || need_cfg=1
+grep -qE '^[`#]define +FREQ +32.d33000000' "$CFG" 2>/dev/null || need_cfg=1   # 平台原文即 `` `define FREQ 32'd33000000 ``
 
 echo "patch_platform_33mhz: 平台=$PLAT"
 echo "  · soc_top.v  需要改动: $([ $need_top -eq 1 ] && echo 是 || echo 否（已打过）)"

@@ -137,15 +137,43 @@ module rv32_dcache #(
 
   //-----------------------------------------------------------------------------
   // 阵列（一行 32 B；tag 20 bit；valid 单独一条 1024 bit 寄存器）
+  //
+  // ⚠ BRAM 可推断性（第 23 轮修复；实测依据 fpga/out/core_synth.log 233-243）：
+  //   原来"**一个** 1024 行数组 + 每拍 8 个不同 index 并行读（{set,way} 8 种拼法），
+  //   外加失效查表又 8 路读 tag_mem"在 Vivado 眼里是 `RAM has too many ports (16)`
+  //   的多端口 RAM（UG901「RAM Coding Examples」/ UG573「RAM 推断规则」只认
+  //   1 读 1 写（简单双口）、2 读、2 读写等模板），于是 tag_mem 被判"改用触发器"、
+  //   line_mem 命中 `Synth 8-4767`（多写口/无效写）⇒ 8-3391 直接报错。
+  //   ⇒ 改成 **每路一个独立数组**（`line_mem0..line_mem7`，各 `[0:SETS-1]`，索引 = 组号）：
+  //     每个数组只有 1 个读口（lookup）和 1 个写口（填充分配 / 命中 store 更新，二者互斥）；
+  //     `tag_mem0..7` 有 2 个读口（lookup + 失效查表），正好是双读口 RAM 模板。
+  //   同时：**数据阵列不复位**（BRAM 数据位无复位端；复位后 `valid_q` 全 0 ⇒ 必不命中，
+  //   阵列里的 X 不可能被当成有效数据）。功能语义（VIPT / 写直达不写分配 / RR /
+  //   单未完成缺失 / XIP 与 PTW/原子/CBO 旁路 / ENABLE）逐拍不变。
   //-----------------------------------------------------------------------------
-  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem [0:ENT-1];  // {set[6:0], way[2:0]}；ram_style 供 Vivado 正确推断 BRAM
-  (* ram_style = "block" *) reg [255:0] line_mem [0:ENT-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem0 [0:SETS-1];    // 路 0..7，每路独立数组
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem1 [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem2 [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem3 [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem4 [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem5 [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem6 [0:SETS-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem7 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem0 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem1 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem2 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem3 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem4 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem5 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem6 [0:SETS-1];
+  (* ram_style = "block" *) reg [255:0]    line_mem7 [0:SETS-1];
   reg [ENT-1:0]   valid_q;                 // 同上索引（整条寄存器：复位/清空一次赋值）
   // 组内轮转牺牲指针（RR 替换）：128 组 × 3 bit 打成**一整条寄存器**（不是"数组 + for"）。
   reg [SETS*WAY_W-1:0] rr_q;
 
   //-----------------------------------------------------------------------------
   // 组合查表：一次索引到单组，只比较 8 路标记（不做任何 128 组遍历）
+  //   每路各读自己那个数组的一个地址（组号），即"每数组 1 个读口"。
   //-----------------------------------------------------------------------------
   wire [31:0] lk_line = {up_req_addr[31:5], 5'b0};   // 行对齐
   wire [6:0]  lk_set  = up_req_addr[11:5];           // VIPT 组索引（页内位）
@@ -153,14 +181,14 @@ module rv32_dcache #(
 
   wire [7:0] way_vld = valid_q[{lk_set, 3'b000} +: WAYS];
 
-  wire [TAG_W-1:0] tag_w0 = tag_mem[{lk_set, 3'd0}];
-  wire [TAG_W-1:0] tag_w1 = tag_mem[{lk_set, 3'd1}];
-  wire [TAG_W-1:0] tag_w2 = tag_mem[{lk_set, 3'd2}];
-  wire [TAG_W-1:0] tag_w3 = tag_mem[{lk_set, 3'd3}];
-  wire [TAG_W-1:0] tag_w4 = tag_mem[{lk_set, 3'd4}];
-  wire [TAG_W-1:0] tag_w5 = tag_mem[{lk_set, 3'd5}];
-  wire [TAG_W-1:0] tag_w6 = tag_mem[{lk_set, 3'd6}];
-  wire [TAG_W-1:0] tag_w7 = tag_mem[{lk_set, 3'd7}];
+  wire [TAG_W-1:0] tag_w0 = tag_mem0[lk_set];
+  wire [TAG_W-1:0] tag_w1 = tag_mem1[lk_set];
+  wire [TAG_W-1:0] tag_w2 = tag_mem2[lk_set];
+  wire [TAG_W-1:0] tag_w3 = tag_mem3[lk_set];
+  wire [TAG_W-1:0] tag_w4 = tag_mem4[lk_set];
+  wire [TAG_W-1:0] tag_w5 = tag_mem5[lk_set];
+  wire [TAG_W-1:0] tag_w6 = tag_mem6[lk_set];
+  wire [TAG_W-1:0] tag_w7 = tag_mem7[lk_set];
 
   wire [7:0] way_hit = { (tag_w7 == lk_tag) && way_vld[7],
                          (tag_w6 == lk_tag) && way_vld[6],
@@ -176,14 +204,14 @@ module rv32_dcache #(
                        way_hit[4] ? 3'd4 : way_hit[5] ? 3'd5 :
                        way_hit[6] ? 3'd6 : 3'd7;
 
-  wire [255:0] data_w0 = line_mem[{lk_set, 3'd0}];
-  wire [255:0] data_w1 = line_mem[{lk_set, 3'd1}];
-  wire [255:0] data_w2 = line_mem[{lk_set, 3'd2}];
-  wire [255:0] data_w3 = line_mem[{lk_set, 3'd3}];
-  wire [255:0] data_w4 = line_mem[{lk_set, 3'd4}];
-  wire [255:0] data_w5 = line_mem[{lk_set, 3'd5}];
-  wire [255:0] data_w6 = line_mem[{lk_set, 3'd6}];
-  wire [255:0] data_w7 = line_mem[{lk_set, 3'd7}];
+  wire [255:0] data_w0 = line_mem0[lk_set];
+  wire [255:0] data_w1 = line_mem1[lk_set];
+  wire [255:0] data_w2 = line_mem2[lk_set];
+  wire [255:0] data_w3 = line_mem3[lk_set];
+  wire [255:0] data_w4 = line_mem4[lk_set];
+  wire [255:0] data_w5 = line_mem5[lk_set];
+  wire [255:0] data_w6 = line_mem6[lk_set];
+  wire [255:0] data_w7 = line_mem7[lk_set];
   wire [255:0] hit_line = (hit_way == 3'd0) ? data_w0 : (hit_way == 3'd1) ? data_w1 :
                           (hit_way == 3'd2) ? data_w2 : (hit_way == 3'd3) ? data_w3 :
                           (hit_way == 3'd4) ? data_w4 : (hit_way == 3'd5) ? data_w5 :
@@ -262,20 +290,58 @@ module rv32_dcache #(
   wire [255:0] sid_line_upd = (sid_line_q & ~st_mask_sh) | (st_data_sh & st_mask_sh);
 
   // 失效查表（CBO / 旁路写完成时用）：同样是"索引一次 + 8 路并行比较"
+  //   每路读各自数组的 `sid_set_q` 地址 ⇒ tag 数组的第 2 个读口（lookup 是第 1 个）。
   wire [7:0] inv_vld = valid_q[{sid_set_q, 3'b000} +: WAYS];
-  wire [7:0] inv_wh  = { (tag_mem[{sid_set_q, 3'd7}] == sid_tag_q) && inv_vld[7],
-                         (tag_mem[{sid_set_q, 3'd6}] == sid_tag_q) && inv_vld[6],
-                         (tag_mem[{sid_set_q, 3'd5}] == sid_tag_q) && inv_vld[5],
-                         (tag_mem[{sid_set_q, 3'd4}] == sid_tag_q) && inv_vld[4],
-                         (tag_mem[{sid_set_q, 3'd3}] == sid_tag_q) && inv_vld[3],
-                         (tag_mem[{sid_set_q, 3'd2}] == sid_tag_q) && inv_vld[2],
-                         (tag_mem[{sid_set_q, 3'd1}] == sid_tag_q) && inv_vld[1],
-                         (tag_mem[{sid_set_q, 3'd0}] == sid_tag_q) && inv_vld[0] };
+  wire [7:0] inv_wh  = { (tag_mem7[sid_set_q] == sid_tag_q) && inv_vld[7],
+                         (tag_mem6[sid_set_q] == sid_tag_q) && inv_vld[6],
+                         (tag_mem5[sid_set_q] == sid_tag_q) && inv_vld[5],
+                         (tag_mem4[sid_set_q] == sid_tag_q) && inv_vld[4],
+                         (tag_mem3[sid_set_q] == sid_tag_q) && inv_vld[3],
+                         (tag_mem2[sid_set_q] == sid_tag_q) && inv_vld[2],
+                         (tag_mem1[sid_set_q] == sid_tag_q) && inv_vld[1],
+                         (tag_mem0[sid_set_q] == sid_tag_q) && inv_vld[0] };
 
   // 本拍请求是否需要"延迟副作用"
   wire sid_inv_now = req_take && CACHE_ON && cacheable &&
                      ( up_cbo | (up_req_we && (up_atomic | up_bypass)) );        // 失效
   wire sid_upd_now = req_take && can_acc && up_req_we && hit_raw;                // 命中 store 更新
+
+  //-----------------------------------------------------------------------------
+  // 每路一个写使能 —— 每个数组只有 1 个写口（UG901 单时钟简单双口模板）
+  //   写数据（tag/data）由两路 mux 先选好，写地址由 `sid_set_q`/`req_set_q` 选好，
+  //   只有 **写使能** 按路译码；两条写路径（填充分配 / 命中 store 更新）天然互斥：
+  //   · 填充分配发生在缺失的 FSM 路径（`st_q==S_FILL`，接受拍起 `up_req_ready=0`）；
+  //   · 命中 store 更新发生在快路径（该笔不是可缓存 load ⇒ 既不进 FSM 也不改 st_q）。
+  //-----------------------------------------------------------------------------
+  wire [6:0]  fill_set    = req_set_q;          // 分配写地址（组号）
+  wire [2:0]  fill_way    = req_vic_q;          // RR 牺牲路（缺失接受拍锁存）
+  wire        fill_we_now = CACHE_ON && (st_q == S_FILL) && dl_rsp_valid && !dl_rsp_err;
+
+  wire [2:0]  upd_way     = sid_way_q;                                  // 命中 store 的更新路
+  wire [6:0]  upd_set     = sid_set_q;
+  wire        upd_we_now  = CACHE_ON && dn_rsp_valid && !dn_rsp_err && sid_upd_q;
+
+  wire [6:0]   mem_waddr  = fill_we_now ? fill_set : upd_set;
+  wire [2:0]   mem_way    = fill_we_now ? fill_way : upd_way;
+  wire [TAG_W-1:0] mem_wtag = req_tag_q;                                // 只有分配写 tag
+  wire [255:0] mem_wdata  = fill_we_now ? dl_rsp_data : sid_line_upd;
+
+  wire we_f0 = fill_we_now && (mem_way == 3'd0);
+  wire we_f1 = fill_we_now && (mem_way == 3'd1);
+  wire we_f2 = fill_we_now && (mem_way == 3'd2);
+  wire we_f3 = fill_we_now && (mem_way == 3'd3);
+  wire we_f4 = fill_we_now && (mem_way == 3'd4);
+  wire we_f5 = fill_we_now && (mem_way == 3'd5);
+  wire we_f6 = fill_we_now && (mem_way == 3'd6);
+  wire we_f7 = fill_we_now && (mem_way == 3'd7);
+  wire we_u0 = upd_we_now && (mem_way == 3'd0);
+  wire we_u1 = upd_we_now && (mem_way == 3'd1);
+  wire we_u2 = upd_we_now && (mem_way == 3'd2);
+  wire we_u3 = upd_we_now && (mem_way == 3'd3);
+  wire we_u4 = upd_we_now && (mem_way == 3'd4);
+  wire we_u5 = upd_we_now && (mem_way == 3'd5);
+  wire we_u6 = upd_we_now && (mem_way == 3'd6);
+  wire we_u7 = upd_we_now && (mem_way == 3'd7);
 
   assign dbg_alloc_store = CACHE_ON && dn_rsp_valid && !dn_rsp_err && sid_upd_q;
 
@@ -355,11 +421,20 @@ module rv32_dcache #(
         sid_line_q  <= hit_line;
       end
       // ---------------- 延迟副作用：下游单拍响应拍落地 ----------------
+      //   store 命中更新行（写数据 = sid_line_upd）与失效都只碰"每路独立数组"的
+      //   那一个数组的同一个写口（写地址 = 组号，写使能按路译码）。
       if (dn_rsp_valid) begin
         sid_upd_q <= 1'b0;
         sid_inv_q <= 1'b0;
         if (!dn_rsp_err) begin
-          if (sid_upd_q) line_mem[{sid_set_q, sid_way_q}] <= sid_line_upd;
+          if (we_u0) line_mem0[upd_set] <= mem_wdata;
+          if (we_u1) line_mem1[upd_set] <= mem_wdata;
+          if (we_u2) line_mem2[upd_set] <= mem_wdata;
+          if (we_u3) line_mem3[upd_set] <= mem_wdata;
+          if (we_u4) line_mem4[upd_set] <= mem_wdata;
+          if (we_u5) line_mem5[upd_set] <= mem_wdata;
+          if (we_u6) line_mem6[upd_set] <= mem_wdata;
+          if (we_u7) line_mem7[upd_set] <= mem_wdata;
           if (sid_inv_q) valid_q[{sid_set_q, 3'b000} +: WAYS] <=
                              valid_q[{sid_set_q, 3'b000} +: WAYS] & ~inv_wh;
         end
@@ -403,8 +478,15 @@ module rv32_dcache #(
               up_rsp_err_q   <= 1'b1;
             end else begin
               // 整行到齐：分配（RR 牺牲路）＋把本次 load 要的那个字返回
-              tag_mem[{req_set_q, req_vic_q}]  <= req_tag_q;
-              line_mem[{req_set_q, req_vic_q}] <= dl_rsp_data;
+              //   每路一个独立数组 ⇒ 写使能按路译码，写地址 = 组号（单写口模板）
+              if (we_f0) begin tag_mem0[fill_set] <= mem_wtag; line_mem0[fill_set] <= mem_wdata; end
+              if (we_f1) begin tag_mem1[fill_set] <= mem_wtag; line_mem1[fill_set] <= mem_wdata; end
+              if (we_f2) begin tag_mem2[fill_set] <= mem_wtag; line_mem2[fill_set] <= mem_wdata; end
+              if (we_f3) begin tag_mem3[fill_set] <= mem_wtag; line_mem3[fill_set] <= mem_wdata; end
+              if (we_f4) begin tag_mem4[fill_set] <= mem_wtag; line_mem4[fill_set] <= mem_wdata; end
+              if (we_f5) begin tag_mem5[fill_set] <= mem_wtag; line_mem5[fill_set] <= mem_wdata; end
+              if (we_f6) begin tag_mem6[fill_set] <= mem_wtag; line_mem6[fill_set] <= mem_wdata; end
+              if (we_f7) begin tag_mem7[fill_set] <= mem_wtag; line_mem7[fill_set] <= mem_wdata; end
               valid_q[{req_set_q, 3'b000} +: WAYS] <=
                   valid_q[{req_set_q, 3'b000} +: WAYS] | (8'b0000_0001 << req_vic_q);
               rr_q[req_set_q * WAY_W +: WAY_W] <= req_vic_q + 3'd1;   // 轮转

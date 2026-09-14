@@ -21,6 +21,9 @@ set PERIOD  [expr {$argc >= 4 ? [lindex $argv 3] : "30.303"}]
 file mkdir $OUTDIR
 set PROJDIR "$OUTDIR/proj_core_only"
 create_project -force core_only $PROJDIR -part $PART
+# 【本机实测必做】Vivado 2023.2 @ Ubuntu 24.04 的工程模式自动层次引擎失效（详见 build_chiplab.tcl 顶部注释），
+# 必须切 Manual Compile Order 并显式设 top，否则报 "No Verilog or VHDL sources found in project"。
+set_property source_mgmt_mode None [current_project]
 
 # 头文件 + 本核 RTL + 综合包装
 set VH [glob -nocomplain "$OURREPO/rtl/pkg/*.vh"]
@@ -37,7 +40,8 @@ lappend VFILES "$OURREPO/fpga/rtl/core_top_synth_wrap.v"
 puts "== 核级综合：RTL=[llength $VFILES] 个 .v，part=$PART，周期=$PERIOD ns =="
 add_files -norecurse $VFILES
 set_property top core_top_synth_wrap [current_fileset]
-update_compile_order -fileset sources_1
+catch { update_compile_order -fileset sources_1 }
+puts "== top = [get_property top [current_fileset]]，nverilog = [llength [get_files -of [get_filesets sources_1] *.v]] =="
 
 # 33 MHz 主时钟约束（含 I/O 延迟的简化模型）
 set xdc "$OUTDIR/core_only.xdc"

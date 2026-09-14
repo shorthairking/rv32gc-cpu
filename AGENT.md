@@ -989,6 +989,33 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+### 第 25 轮：用户拍板改用 **Vivado 2023.2**（本机已装）+ chiplab 回退初始态重试实现 + 环境三坑定位
+
+**用户指令（本轮输入）**：① 用户已在当前环境安装 Vivado **2023.2**，要求回退 chiplab 到初始状态后**再次尝试实现**；
+② **禁止进入 Windows 环境**（此前我查到 `D:\FPGA\Vivado\2023.2` 是 Windows 版并考虑经 `cmd.exe` 调，已放弃这条路）；
+③ 提示"看 PATH，应有 Vivado 路径"，随后提示"chiplab 文档/知识库提到使用前需运行特定脚本创建工程"。
+
+| 项 | 实测结果 |
+|---|---|
+| Vivado 2023.2 就位 | `/home/shorthair/fpga/Vivado/2023.2`（`vivado -version` → **SW Build 4029153 / 2023.2**）；`~/.bashrc:149` 已 `source .../Vivado/2023.2/settings64.sh`；同机还有 `/home/shorthair/fpga/Vitis_HLS/2023.2`。**2025.2 已不在该目录下** |
+| chiplab 回退初始态 | `git -C chiplab checkout -- .` + `git clean -xdf`（清 11 个被 2025.2 `upgrade_ip` 改写过的 `.xci`、125 个 IP 生成产物、`system_run.{cache,hw,runs}`、`.bak*`）⇒ `git status` **全空**、HEAD=`a2e11b3`；`axi_2x1_mux.xci` 与 `IP/xilinx_ip/2019.2` 均在库内，回退后完好 |
+| 33 MHz 补丁复打 | `bash fpga/patch_platform_33mhz.sh --apply` ⇒ 只改 `soc_top.v`（+4/−1：`.clk_out1()` 留空 + `assign cpu_clk = uncore_clk;`）。**顺带修掉脚本误判**：`config.h` 是 `` `define FREQ 32'd33000000 ``（不是 `#define`，平台原文即 33 MHz），旧检测式恒判"需要改动"，已改正则；实测 dry-run 现输出 `config.h FREQ→33: 否（已是 33）` |
+| **环境坑①（不修则一启动就死）** | `couldn't load file "librdi_commontasks.so": libtinfo.so.5: cannot open shared object file`。根因：本机 **Ubuntu 24.04**，而 Vivado 2023.2 自带依赖目录只有 `Ubuntu/{18,20,22}`、`Rhel/{8,9}`、`SuSE` ⇒ 加载器按发行版找不到 `Ubuntu/24`，而系统只有 `libtinfo.so.6`。修法（实测通过）：`LD_LIBRARY_PATH=$VIVADO_ROOT/lib/lnx64.o/Rhel/9:$LD_LIBRARY_PATH`（该目录**只含** `libtinfo.so.5`，不覆盖其它库） |
+| **环境坑②（本轮最大发现，决定成败）** | 加文件后报 `CRITICAL WARNING [filemgmt 20-730] Could not find a top module in the fileset sources_1` → `ERROR [Common 17-53] Unable to launch Synthesis run. No Verilog or VHDL sources found in project`；**即使显式 `set_property top` 也被判 "can not be validated"**。分层定位（`fpga/tcl/diag/probe_layers.tcl`）：同一台机上 **非工程模式** `read_verilog`+`synth_design -rtl` **完全正常**、独立 `xvlog` 也正常 ⇒ **工程模式的自动层次引擎（本机）失效**，与我们的 RTL 无关（连 `module foo(input a,output b); assign b=~a;` 的平凡工程同样报错）。**绕过（实测通过）**：`set_property source_mgmt_mode None [current_project]`（Manual Compile Order）+ 显式 `set_property top <top> [current_fileset]` ⇒ 平凡工程 `synth_design Complete! 100%`、本核 20 文件被接受 |
+| 环境坑③（沙箱） | `~/.Xilinx` 被沙箱拒绝写（`touch` 直接 `Permission denied`）⇒ 沿用工作区 HOME：`HOME=<工作区>/rv32gc-cpu/.vivado_home`（已 gitignore）。`/tmp` 虽可写但同样报坑②，与 HOME 无关 |
+| 新脚本 | `fpga/run_vivado_batch.sh`：统一入口，封装上述三条（Vivado 版本路径、`Rhel/9` 的 LD_LIBRARY_PATH、工作区 HOME），用法 `bash fpga/run_vivado_batch.sh <tcl> [args...]`。两个 tcl（`build_chiplab.tcl`/`synth_core_only.tcl`）已加入 Manual 模式 + 显式 top |
+| 诊断脚本归档 | `fpga/tcl/diag/{probe_sources,probe_trivial,probe_layers,probe_manual_mode}.tcl`（保留，作为环境坑②的可复现证据）；`fpga/out/` 已加入 `.gitignore` 并 `git rm --cached`（历史入库的 Vivado 工程产物出库，本地文件保留） |
+| **BRAM 修复的功能验收（主 Agent 亲跑）** | `bash scripts/run_full_regression.sh` ⇒ **`FULL_REGRESSION: PASS（PASS 计数=281 FAIL 计数=7）`，"与基线逐项一致"**；`hello` **308** 拍、`memtest` **1,021,800** 拍（与第 21 轮基线完全相同）⇒ 第 24 轮派出的 BRAM 修复（去阵列复位 + 每路独立数组）**功能零回退** |
+| 核级综合（BRAM 推断第二判据） | `Synth 8-3391`（"Unable to infer a block/distributed RAM"）**出现次数 = 0**（第 24 轮同一脚本下必现）⇒ 阵列已被推断为 RAM。`RAMB36/RAMB18` 精确计数与 WNS 见下一轮（运行中） |
+| 整板综合（本轮关键突破） | 11 个 IP 的 OOC run 全部 **100%**（含此前卡死的 `axi_2x1_mux_synth_1`）⇒ 顶层综合正常推进到我们的核（runme.log 出现 `rv32_icache`/`rv32_axi_master` 等模块的 `Synth 8-3354`）——**2025.2 的 `module 'axi_2x1_mux' not found` 阻塞点在 2023.2 下消失** |
+| 待办（本轮未完成） | 核级/整板的 WNS、实现、bitstream 结果回填 `docs/porting/07-board-bringup-plan.md` §11.2；`fpga/README.md` §2.7 已写全环境口径 |
+
+**chiplab 文档/知识库口径（用户提示的核对结论）**：chiplab **没有**提供 loongson 平台的工程生成 tcl，只有 `fpga/nscscc-team/run_vivado/create_project.tcl`（另一块板）可作模板；
+其做法与本项目一致（`create_project` → `add_files -scan_for_includes <目录>` → `add_ip` → `upgrade_ip` → 设 top → 设 run strategy）。
+本项目继续复用现成 `fpga/loongson/2023.2/system_run.xpr`（含 MIG/DDR3/clk_pll_33 等 11 个 IP，重建代价过高）。
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。

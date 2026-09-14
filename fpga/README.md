@@ -131,3 +131,40 @@ bash fpga/patch_platform_33mhz.sh --apply    # 实际写入（自动 .bak 备份
    `report_cdc` → `write_bitstream`。
 3. `fpga/tcl/program_fpga.tcl`：`open_hw_manager` + `program_hw_devices`（下载线）。
 4. 综合后复核 §2.3 的两条判据（WNS ≥ 0 @33 MHz；BRAM 推断正确），把结果写回 `docs/porting/07-board-bringup-plan.md` §11.2。
+
+### 2.7 Vivado 2023.2 在本机跑批处理（2026-09-14 实测，**必读**）
+
+本机是 WSL2 + **Ubuntu 24.04**，Vivado 用 **2023.2**：`/home/shorthair/fpga/Vivado/2023.2`
+（`~/.bashrc:149` 已 source 其 `settings64.sh`）。**必须用 2023.2**：平台工程是用 2023.2 建的，
+含 `xilinx.com:ip:axi_interconnect:1.7`（`axi_2x1_mux`、`axi_interconnect_0`）；2025.2 的 IP 目录里
+已无 1.7 版本 ⇒ IP 被锁、`No upgrade is available`、无 OOC run ⇒ 顶层综合报
+`[Synth 8-439] module 'axi_2x1_mux' not found`（本项目第 21 轮实测）。
+
+统一入口（下面三个绕过都封装好了）：
+
+```bash
+bash fpga/run_vivado_batch.sh <script.tcl> [tclargs...]
+# 例：整板综合+实现+bitstream
+bash fpga/run_vivado_batch.sh fpga/tcl/build_chiplab.tcl \
+     /home/shorthair/dsh/rv32-cpu/chiplab /home/shorthair/dsh/rv32-cpu/rv32gc-cpu \
+     /home/shorthair/dsh/rv32-cpu/chiplab/fpga/loongson/2023.2/system_run.xpr \
+     /home/shorthair/dsh/rv32-cpu/rv32gc-cpu/fpga/out/board_2023 8
+```
+
+三个必做绕过（缺一个都跑不起来，均已固化进 `run_vivado_batch.sh` / 两个 tcl）：
+
+| # | 现象（本机实测） | 绕过 |
+|---|---|---|
+| ① | `couldn't load file "librdi_commontasks.so": libtinfo.so.5: cannot open shared object file` —— Vivado 自带依赖目录只有 `Ubuntu/{18,20,22}`、`Rhel/{8,9}`、`SuSE`，加载器按发行版找不到 `Ubuntu/24` | `export LD_LIBRARY_PATH=$VIVADO_ROOT/lib/lnx64.o/Rhel/9:$LD_LIBRARY_PATH`（该目录**只有** libtinfo.so.5，不会覆盖其它系统库） |
+| ② | `CRITICAL WARNING [filemgmt 20-730] Could not find a top module in the fileset sources_1`，随后 `ERROR [Common 17-53] Unable to launch Synthesis run. No Verilog or VHDL sources found in project`。**根因是工程模式的自动层次引擎在本机失效**：连 `module foo(input a, output b); …` 的平凡工程也报同样错，同一台机上**非工程模式**`read_verilog`+`synth_design` 完全正常（`xvlog` 单独跑也正常） | 打开/新建工程后立刻 `set_property source_mgmt_mode None [current_project]`（Manual Compile Order），并**显式**再设一次 `set_property top <top> [current_fileset]`；否则 top 会被判 "can not be validated" 并清空 |
+| ③ | 沙箱下 `~/.Xilinx` 不可写 ⇒ `Failed to create directory to save app.xml` | `HOME=<工作区>/rv32gc-cpu/.vivado_home`（已 gitignore；包装脚本默认即此） |
+
+平台被工具链改脏后的**回退到初始状态**（第 25 轮用户要求的口径）：
+
+```bash
+git -C ../chiplab checkout -- . && git -C ../chiplab clean -xdf   # 撤掉 2025.2 升级过的 .xci、生成产物、工程 runs
+bash fpga/patch_platform_33mhz.sh --apply                        # 再打 33 MHz 补丁（只动 soc_top.v 4 行）
+```
+
+实测日志口径：`fpga/out/board_2023.log`（整板）、`fpga/out/core_only_2023.log`（核级）。
+
