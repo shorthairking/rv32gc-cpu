@@ -188,7 +188,7 @@ module tb_pc_gen_top;
         @(negedge aclk) seq_adv_valid = 1'b0;
         repeat (2) @(posedge aclk); #1;
         chk("C3 no advance keeps pc", RESET_PC + 32'd10, pc);
-        chk("C3 pc_sel==SEQ", 2'd5, pc_sel);          // 无推进时 SEL_HOLD=0
+        chk("C3 pc_sel==HOLD(0) when stalled", 2'd0, pc_sel);
         @(negedge aclk) seq_adv_valid = 1'b1;
         @(posedge aclk); #1;
         chk("C3 pc_sel==SEQ(5) when advancing", 2'd5, pc_sel);

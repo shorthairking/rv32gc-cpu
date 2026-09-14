@@ -517,9 +517,11 @@ module csr_file (
     // ---- mip 视图：软件位（SSIP/STIP/SEIP）+ 核内设备驱动位 ----
     //      MEIP/MTIP/MSIP 只读，由 CLINT/PLIC 驱动（08 §6.6）
     wire [31:0] mip_dev =
-        (irq_msip << `RV32GC_MIP_MSIP_BIT) | (irq_mtip << `RV32GC_MIP_MTIP_BIT) |
-        (irq_meip << `RV32GC_MIP_MEIP_BIT) | (irq_stip << `RV32GC_MIP_STIP_BIT) |
-        (irq_seip << `RV32GC_MIP_SEIP_BIT);
+        ({31'b0, irq_msip} << `RV32GC_MIP_MSIP_BIT) |
+        ({31'b0, irq_mtip} << `RV32GC_MIP_MTIP_BIT) |
+        ({31'b0, irq_meip} << `RV32GC_MIP_MEIP_BIT) |
+        ({31'b0, irq_stip} << `RV32GC_MIP_STIP_BIT) |
+        ({31'b0, irq_seip} << `RV32GC_MIP_SEIP_BIT);
     wire [31:0] mip_sw_all =
         (mip_sw[0] << `RV32GC_MIP_SSIP_BIT) |
         (mip_sw[1] << `RV32GC_MIP_STIP_BIT) |
@@ -634,7 +636,6 @@ module csr_file (
                 12'h32C, 12'h32D, 12'h32E, 12'h32F, 12'h330, 12'h331, 12'h332, 12'h333,
                 12'h334, 12'h335, 12'h336, 12'h337, 12'h338, 12'h339, 12'h33A, 12'h33B,
                 12'h33C, 12'h33D, 12'h33E,
-                `RV32GC_CSR_MHARTID_PLACEHOLDER_UNUSED,
                 `RV32GC_CSR_MHPMEVENT31:   csr_rdata = 32'h0;
                 default:                csr_rdata = 32'h0;
             endcase

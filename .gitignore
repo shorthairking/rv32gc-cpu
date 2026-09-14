@@ -51,3 +51,9 @@ fpga/out/
 
 # 注（2026-09-14 重定位）：上一代实现文件已从磁盘移除（历史见 master 分支），
 # 本仓库 dev 分支即新项目；docs/ rtl/ sim/ sw/ fpga/ scripts/ 等目录后续按阶段重新建立并正常追踪。
+
+# 散落产物（子 Agent 工作区/编译测试）
+a.out
+.work_fpu/
+__pycache__/
+*.pyc

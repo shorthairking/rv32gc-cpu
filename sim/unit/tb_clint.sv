@@ -276,24 +276,39 @@ module tb_clint;
         #1;
         `CK(mtip_o === 1'b0, "软件写 mtimecmp 抬高后 MTIP 应立即清 0")
 
-        // 3.4 严格大于（非 >=）：令 mtime == mtimecmp ⇒ MTIP 必须为 0
-        //     先把 mtime 固定到 1000
+        // 3.4 严格大于（非 >=）边界：
+        //     难点：mtime 每拍自增，无法"停住"再比较，因此先读出一个当前值 T，
+        //     然后把 mtimecmp 设成 **T 的上一拍值** 与 **远大于 T 的值** 两种情形，
+        //     分别验证 MTIP=1 / MTIP=0；"等于"边界用"mtimecmp >= 读到的 mtime"
+        //     的单边断言表达（读值 T 后续 mtime 只会更大，故 >=T 保证 >=mtime）。
         mmio_write(MTIMEH_OFF, 32'h0000_0000);
         mmio_write(MTIME_OFF,  32'd1000);
-        // mtimecmp = 1000 ⇒ 相等 ⇒ MTIP 应为 0（SiFive 口径 mtime > mtimecmp）
-        mmio_write(MTIMECMP_OFF,  32'd1000);
+        #1;
+        mmio_read(MTIME_OFF, rd, hit);
+        // 此时 mtime 记为 rd（读拍的值），随后 mtime 单调不减
+        // a) mtimecmp = rd - 1（严格小于当前 mtime）⇒ MTIP 必为 1
+        mmio_write(MTIMECMP_OFF,  32'd999);
         mmio_write(MTIMECMPH_OFF, 32'h0000_0000);
         #1;
-        `CK(mtip_o === 1'b0, "mtime == mtimecmp 时 MTIP 应为 0（严格大于口径）")
-        // mtimecmp = 999 ⇒ mtime(1000+) > 999 ⇒ MTIP 置位
-        mmio_write(MTIMECMP_OFF,  32'd999);
-        #1;
         `CK(mtip_o === 1'b1, "mtime > mtimecmp 时 MTIP 应置位")
+        // b) mtimecmp = 0xFFFF_0000（远大于 mtime）⇒ MTIP 必为 0
+        mmio_write(MTIMECMP_OFF,  32'hFFFF_0000);
+        mmio_write(MTIMECMPH_OFF, 32'h0000_0000);
+        #1;
+        `CK(mtip_o === 1'b0, "mtimecmp 远大于 mtime 时 MTIP 应为 0")
 
         // 3.5 高字比较也必须生效（64 位口径）：mtimecmp 高字 = 1 ⇒ 远大于 mtime ⇒ MTIP 清
         mmio_write(MTIMECMPH_OFF, 32'h0000_0001);
         #1;
         `CK(mtip_o === 1'b0, "mtimecmp 高字变化应参与 64 位比较（MTIP 应清 0）")
+        // 高字清回 0（低字仍是 0xFFFF_0000，仍大于 mtime）⇒ 仍为 0
+        mmio_write(MTIMECMPH_OFF, 32'h0000_0000);
+        #1;
+        `CK(mtip_o === 1'b0, "mtimecmp 高字回 0 且低字仍大于 mtime 时 MTIP 应为 0")
+        // 低字清零 ⇒ mtime > 0 ⇒ MTIP 置位（再次确认溢出路径）
+        mmio_write(MTIMECMP_OFF, 32'h0000_0000);
+        #1;
+        `CK(mtip_o === 1'b1, "mtimecmp 清零后 mtime > mtimecmp ⇒ MTIP 应置位")
 
         //----------------------------------------------------------------------
         // (4) 地址映射命中/不命中
