@@ -15,10 +15,28 @@
 //   fsqrt.s/d = √rs1，**单次**正确舍入（按 rm）
 //   特殊值（IEEE-754 + RISC-V 口径）：
 //     NaN ⇒ canonical NaN（含 sNaN 则同时 NV）
-//     0÷0、∞÷∞ ⇒ qNaN + NV ；有限非零÷0 ⇒ ±∞ + DZ
-//     ∞÷有限 ⇒ ±∞ ；有限÷∞ ⇒ ±0 ；0÷有限非零 ⇒ ±0
+//     0÷0、∞÷∞ ⇒ qNaN + NV ；有限非零÷0 ⇒ ±∞ + DZ（★ ∞÷0 ⇒ ±∞ 且**无** flag）
+//     ∞÷有限非零、∞÷0 ⇒ ±∞ ；有限÷∞ ⇒ ±0 ；0÷有限非零 ⇒ ±0
 //     √(+x) ⇒ 正值 ；√(−0) = −0 ；√(−x)、√(−∞) = qNaN + NV ；√(+∞) = +∞
 //   fflags：NV / DZ / OF / UF / NX
+//
+// ★ 缺陷修复记录（2026-09-14）—— fdiv(±∞, ±0) 误报 DZ（IEEE-754-2008 §7.3）
+//   现象：fdiv.s/d(±∞, ±0) 的结果位型本来就对（±∞），但**多置 DZ**。Spike 1.1.1-dev
+//   实测同一批用例 fcsr=0（fdiv.d(∞,±0)→无 flag、fdiv.d(1,+0)→DZ、fdiv.d(0,0)→NV）。
+//   根因：fdiv 特殊值判据的**分支次序**——`else if (b_zero)` 排在 `else if (a_inf)`
+//   之前，∞÷0 先命中"有限非零 ÷ 0 ⇒ ±∞ + DZ"，而该分支只判除数、对被除数没有任何
+//   约束，其隐含前提"被除数为有限非零"没有任何代码兜住。
+//   规范口径：IEEE-754-2008 §7.3 divideByZero 仅当**被除数为有限非零**、除数为零、
+//   且结果精确为无穷时置位；被除数本身是 ∞ 时不适用 ⇒ ∞÷0 = ±∞ 且无任何 flag
+//   （RISC-V 沿用该口径；0÷0 与 ∞÷∞ 仍是 qNaN + NV）。结果符号仍为两操作数符号异或。
+//   修法：把 `a_inf` 分支整体提到 `b_zero` **之前**（S/D 共用该分支，结果位型按
+//   fmt_d 选），次序变为：
+//     NaN → (0/0 | ∞/∞)→qNaN+NV → a_inf→±Inf(无flag) → b_zero(此时 a 必为有限
+//     非零)→±Inf+DZ → (b_inf | a_zero)→±0 → 迭代
+//   其余分支一字未动；并在 b_zero 分支补上"a 必为有限非零"的次序依赖注释。
+//   验证：.work_fpu/verify_fdiv_special.sh（定向 CORE 10 = S4+D6 与 EXTRA 8，同一
+//   条目表逐条与 Spike 对齐，含 done 单脉冲探针；修复前 CORE 4/10、EXTRA 3/8 FAIL
+//   → 修复后 0 FAIL）；既有回归 .work_fpu/verify_sqrt_all.sh 默认路径与 --quick 全 PASS。
 //
 // ★ 拍数参数真源
 //   `RV32GC_FDIV_CYCLES` / `RV32GC_FSQRT_CYCLES` 定义于 `rtl/pkg/core_params.vh`
@@ -394,16 +412,22 @@ module fpu_div_sqrt #(
                         result_r <= fmt_d ? CANON_D : CANON_S;
                         fflags_r <= 5'b10000;
                         done_r   <= 1'b1;  busy_r <= 1'b0;
-                    end else if (b_zero) begin
-                        // 有限非零 ÷ 0 ⇒ ±∞ + DZ
-                        result_r <= fmt_d ? {a_sign ^ b_sign, 11'h7FF, 52'b0}
-                                          : {32'b0, a_sign ^ b_sign, 8'hFF, 23'b0};
-                        fflags_r <= 5'b01000;
-                        done_r   <= 1'b1;  busy_r <= 1'b0;
                     end else if (a_inf) begin
+                        // ∞ ÷ 有限非零、∞ ÷ 0 ⇒ ±∞，**无任何 flag**
+                        //   ★ ∞÷0 必须走这里：IEEE-754-2008 §7.3 divideByZero 只在
+                        //   被除数为**有限非零**时置位；本分支必须排在 b_zero 之前
+                        //   （缺陷修复记录见文件头）。
                         result_r <= fmt_d ? {a_sign ^ b_sign, 11'h7FF, 52'b0}
                                           : {32'b0, a_sign ^ b_sign, 8'hFF, 23'b0};
                         fflags_r <= 5'b00000;
+                        done_r   <= 1'b1;  busy_r <= 1'b0;
+                    end else if (b_zero) begin
+                        // 有限非零 ÷ 0 ⇒ ±∞ + DZ
+                        //   ★ 次序依赖：走到这里 a 必为**有限非零**（NaN / ∞ / 0 都已被
+                        //   上面的分支拦截）；若把本分支提到 a_inf 之前，∞÷0 会误置 DZ。
+                        result_r <= fmt_d ? {a_sign ^ b_sign, 11'h7FF, 52'b0}
+                                          : {32'b0, a_sign ^ b_sign, 8'hFF, 23'b0};
+                        fflags_r <= 5'b01000;
                         done_r   <= 1'b1;  busy_r <= 1'b0;
                     end else if (b_inf || a_zero) begin
                         result_r <= fmt_d ? {a_sign ^ b_sign, 63'b0}
