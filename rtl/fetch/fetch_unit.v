@@ -14,7 +14,7 @@
 //      M2 接入 ptw.v 后只需换掉内部那一个 assign（见 §2 注释）；
 //   ③ XIP 旁路判定（**用物理地址**）：PA[31:20]==12'h1C0 || PA[31:16]==16'h1FE8
 //      ⇒ uncached=1，取指**不查/不写 L1I、不分配 Tag**，走直连 AXI；
-//   ④ 取指 PMP：按 **16-bit parcel 逐个** pmp_check_v（本设计选择，§5.5 抉择 2）；
+//   ④ 取指 PMP：按 **16-bit parcel 逐个** 例化 pmp_check（本设计选择，§5.5 抉择 2）；
 //      无执行权限 ⇒ fetch_exc_valid=1、cause=1（instruction access fault）、
 //      mtval = **该 parcel 的虚拟地址**（§5.5 抉择 7/8）。
 //
@@ -26,16 +26,16 @@
 //   · 不做 Sv32 翻译（M2 的 ptw.v）；不做 L1I Cache 控制（rtl/cache/l1i.v）；
 //     不做跨窗口跳转自动修正（§5.1 ⑥：开 MMU 前不加任何修正）。
 //
-// 【PMP 检查口径（本模块自带的组合 pmp_check_v，只读端口）】
-//   规格 §5.1 ③ 要求「调用 pmp_check」；rtl/mem/pmp_check.v 归 M 级、由另一
-//   子任务交付，本任务禁止创建 rtl/mem/ 下的文件。为**不重复造轮子**，
-//   本模块将检查内联为一个 function（pmp_check_v），其输入 = 本模块的 PMP
-//   CSR 映像端口（pmpcfg_i/pmpaddr_i），语义按 docs/kb/isa-notes.md §3：
+// 【PMP 检查口径（**例化 rtl/mem/pmp_check.v**，2026-09-14 集成消重）】
+//   规格 §5.1 ③ 要求「调用 pmp_check」。原实现把检查内联为 function
+//   `pmp_check_v`（当时 rtl/mem/ 不在该子任务范围内）；rtl/mem/pmp_check.v
+//   交付后，本模块已改为**例化该模块**（见 §5 的 u_pmp_chk_lo / u_pmp_chk_hi），
+//   语义按 docs/kb/isa-notes.md §3：
 //     · 静态优先级：编号最低的、命中该笔的项说了算（norm:pmpentrypriority）
 //     · A=OFF 项跳过；A=TOR 上界 = 前一个**已编程**项的 pmpaddr
 //     · G=0 ⇒ 4 B 粒度，NA4 可用
 //     · 无匹配项：M 模式 ⇒ 允许；S/U ⇒ 拒绝（已实现 16 项，norm:pmpnoentry_match）
-//   当 rtl/mem/pmp_check.v 落地后，此处应改为模块例化（接口已按该方向预留）。
+//   ★ 现已完成上述「改为模块例化」，取指与访存共用同一份 PMP 实现。
 //
 // 【组合逻辑风格（AGENT.md §4 红线 3 / 08 §7.4）】
 //   全部组合逻辑 = assign + function。本模块**只有一处** always 块：
@@ -156,10 +156,6 @@ module fetch_unit #(
                                    (PMP_ENTRIES <= 4)  ? 2 :
                                    (PMP_ENTRIES <= 8)  ? 3 :
                                    (PMP_ENTRIES <= 16) ? 4 : 5;
-
-    // `for` 循环的整数迭代变量必须声明为 reg（Verilog-2001 无 integer 循环变量的
-    // 隐式声明；此处是唯一的声明，循环体本身是组合)，见下方 function。
-    integer i;
 
     //==========================================================================
     // 1. PCC（pc_gen.v）：产生 fetch_pc 与其推进量
@@ -318,8 +314,56 @@ module fetch_unit #(
     wire [31:0] check_va_lo     = insn_pa_base;              // 起始 parcel 的地址
     wire [31:0] check_va_hi     = insn_pa_base + 32'd2;      // +2 parcel 的地址
 
-    wire pmp_ok_lo = pmp_check_v(check_va_lo, priv);
-    wire pmp_ok_hi = pmp_check_v(check_va_hi, priv);
+    // ---- PMP 检查：**例化 rtl/mem/pmp_check.v**（消重，2026-09-14 集成改动）----
+    //   口径（与内联实现逐条一致，仅"由谁实现匹配"改变）：
+    //     · 权限 = X（可执行）：acc_type_i = 2（pmp_check.v 的 T_EXEC）
+    //     · 每笔 = **一个 16-bit parcel**（§5.5 抉择 2）⇒ acc_bytes_i = 2
+    //     · 特权级 = 取指特权级（MPRV 不影响取指，08 §6.4）
+    //     · 被拒 ⇒ allow_o=0，fault_cause_o=1（instruction access fault）
+    //   ★ 与内联实现的**唯一语义差异**（有益且符合规范）：pmp_check 要求匹配项
+    //     **覆盖该笔的全部字节**（norm:pmpfullmatch_required，08 §5.5 抉择 3）；
+    //     内联版只比较起始地址。取指粒度（每 parcel 一次检查）不变。
+    wire pmp_allow_lo, pmp_allow_hi;
+    wire [`RV32GC_CAUSE_W-1:0] pmp_cause_lo, pmp_cause_hi;
+
+    pmp_check #(
+        .PMP_ENTRIES (PMP_ENTRIES)      // ★ pmp_check 无 PMP_ENTRY_W 参数（每项恒 8 bit）
+    ) u_pmp_chk_lo (
+        .clk             (aclk),
+        .rst_n           (aresetn),
+        .cfg_i           (pmpcfg_i),
+        .addr_i          (pmpaddr_i),
+        .acc_pa_i        (check_va_lo),
+        .acc_bytes_i     (5'd2),
+        .acc_priv_i      (priv),
+        .acc_type_i      (2'd2),
+        .allow_o         (pmp_allow_lo),
+        .fault_cause_o   (pmp_cause_lo),
+        .hit_o           (),
+        .hit_idx_o       (),
+        .denied_by_full_o()
+    );
+
+    pmp_check #(
+        .PMP_ENTRIES (PMP_ENTRIES)      // ★ pmp_check 无 PMP_ENTRY_W 参数（每项恒 8 bit）
+    ) u_pmp_chk_hi (
+        .clk             (aclk),
+        .rst_n           (aresetn),
+        .cfg_i           (pmpcfg_i),
+        .addr_i          (pmpaddr_i),
+        .acc_pa_i        (check_va_hi),
+        .acc_bytes_i     (5'd2),
+        .acc_priv_i      (priv),
+        .acc_type_i      (2'd2),
+        .allow_o         (pmp_allow_hi),
+        .fault_cause_o   (pmp_cause_hi),
+        .hit_o           (),
+        .hit_idx_o       (),
+        .denied_by_full_o()
+    );
+
+    wire pmp_ok_lo = pmp_allow_lo;
+    wire pmp_ok_hi = pmp_allow_hi;
 
     // 第一个故障 parcel 决定 tval（低地址优先，与「逐 parcel 顺序检查」一致）
     wire        pmp_fault      = ~pmp_ok_lo | (~pmp_ok_hi & ilen32);
@@ -382,78 +426,11 @@ module fetch_unit #(
     end
 
     //==========================================================================
-    // 9. PMP 匹配检查（只读端口；语义见文件头）
-    //    纯组合 function：输入 (PA, priv)，输出该 PA 是否具 X（可执行）权限。
-    //    用 integer（而非 function 内局部 reg）表达循环变量是 Verilog-2001 惯例。
-    //
-    //    注（避免重复造轮子 / 真源纪律）：本 function 是 PMP 检查的**临时内联
-    //    实现**，只服务于 F 级取指这一笔；完整 16 项实现归 rtl/mem/pmp_check.v
-    //    （M 级，另一子任务）。两者共用 rtl/pkg/rv32_defs.vh §7 的位域常量，
-    //    不各自硬编码。本任务的文件范围禁止创建 rtl/mem/**，故此处内联。
+    // 9. PMP 检查（**已消重**：改为例化 rtl/mem/pmp_check.v，见 §5 的两处例化）
+    //    本节原为内联 function `pmp_check_v`；2026-09-14 集成时按母 Agent 派活
+    //    要求改为模块例化，使**取指与访存共用同一份** PMP 匹配实现，避免两处
+    //    各自维护、口径漂移。语义差异见 §5 的 ★ 注。
     //==========================================================================
-    function pmp_check_v;
-        input  [31:0] pa_f;
-        input  [1:0]  priv_f;
-        integer       k;
-        reg           matched;
-        reg           x_ok;
-        reg    [31:0] tor_lo;      // TOR 下界（前一个已编程项的 pmpaddr<<2）
-        reg    [31:0] tor_hi;
-        reg    [7:0]  cfg_t;
-        reg    [31:0] addr_t;
-        reg    [31:0] size_mask;   // NAPOT：块内偏移掩码（低位全 1）
-        reg    [31:0] block_base;  // NAPOT：块基址（pmpaddr 清掉尾部 1）
-        begin
-            matched   = 1'b0;
-            x_ok      = 1'b0;
-            tor_lo    = 32'h0000_0000;
-            tor_hi    = 32'h0000_0000;
-            k         = 0;
-            // 静态优先级：**编号最低的命中项**决定结果（norm:pmpentrypriority）
-            while ((k < PMP_ENTRIES) && !matched) begin
-                cfg_t  = pmpcfg_i[k*PMP_ENTRY_W +: PMP_ENTRY_W];
-                addr_t = pmpaddr_i[k*32 +: 32];
-                case (cfg_t[`RV32GC_PMP_A_LSB +: 2])
-                    `RV32GC_PMP_A_OFF: begin
-                        // A=OFF：不参与匹配；TOR 的「前一个已编程项」需跳过它
-                    end
-                    `RV32GC_PMP_A_TOR: begin
-                        // G=0 ⇒ 4 B 粒度，TOR 上界 = pmpaddr<<2，不做低位掩码回卷
-                        tor_hi = {addr_t[29:0], 2'b00};
-                        if ((pa_f >= tor_lo) && (pa_f < tor_hi)) begin
-                            matched = 1'b1;
-                            x_ok    = cfg_t[`RV32GC_PMP_X_BIT];
-                        end
-                        tor_lo = tor_hi;              // 成为下一项 TOR 的下界
-                    end
-                    `RV32GC_PMP_A_NA4: begin
-                        if ((pa_f >> 2) == addr_t) begin
-                            matched = 1'b1;
-                            x_ok    = cfg_t[`RV32GC_PMP_X_BIT];
-                        end
-                        tor_lo = {addr_t[29:0], 2'b00} + 32'd4;
-                    end
-                    default: begin  // `RV32GC_PMP_A_NAPOT
-                        // NAPOT：pmpaddr 尾部连续 1 的个数定块大小（G=0，最小 8 B）
-                        if      (~addr_t[0]) size_mask = 32'h0000_0003;
-                        else if (~addr_t[1]) size_mask = 32'h0000_000F;
-                        else if (~addr_t[2]) size_mask = 32'h0000_00FF;
-                        else if (~addr_t[3]) size_mask = 32'h0000_FFFF;
-                        else if (~addr_t[4]) size_mask = 32'h000F_FFFF;
-                        else                 size_mask = 32'hFFFF_FFFF;
-                        block_base = {addr_t[29:0], 2'b00} & ~size_mask;
-                        if (((pa_f & ~size_mask) == block_base)) begin
-                            matched = 1'b1;
-                            x_ok    = cfg_t[`RV32GC_PMP_X_BIT];
-                        end
-                        tor_lo = block_base + size_mask + 32'd1;
-                    end
-                endcase
-                k = k + 1;
-            end
-            // 无匹配项：M 模式 ⇒ 允许；S/U ⇒ 拒绝（已实现 16 项，norm:pmpnoentry_match）
-            pmp_check_v = matched ? x_ok : (priv_f == PRIV_M);
-        end
-    endfunction
+
 
 endmodule

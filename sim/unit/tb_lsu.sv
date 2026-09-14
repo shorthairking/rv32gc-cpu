@@ -199,9 +199,10 @@ module tb_lsu_top;
         end
     endtask
 
+    // a 为字节 PA；pmpaddr 为 ISA 口径 PA>>2（[norm:pmp_addr_encoding]）
     task set_addr(input integer i, input [31:0] a);
         begin
-            pmp_addr[i*32 +: 32] = a;
+            pmp_addr[i*32 +: 32] = a >> 2;
         end
     endtask
 

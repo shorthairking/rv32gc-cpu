@@ -164,7 +164,23 @@ module lsu #(
     output wire [1:0]  eff_priv_o,        // MPRV≠0 时按 MPP（§6.4）
     output wire        eff_sum_o,         // SUM 生效条件
     output wire        eff_mxr_o,         // MXR 生效条件
-    output wire [1:0]  need_perm_o        // 本笔所需权限 {R,W,X}
+    output wire [1:0]  need_perm_o,       // 本笔所需权限 {R,W,X}
+
+    //--------------------------------------------------------------------------
+    // F. AMO/LR/SC 读相返回（★ 2026-09-14 core_top 集成补丁，母 Agent 授权）
+    //    amo_unit 的 `rdata_i`/`rdata_valid_i` 原为**常量硬接**（32'd0/1'b0），
+    //    而它们是 AMO 读-改-写语义的必需输入，且 lsu 未把该通路引出端口 ⇒
+    //    core_top 无法闭环。此处**仅新增两个输入端口**并接到 amo_unit 例化，
+    //    不改变任何已有端口名/位宽/逻辑。
+    //      接线口径（core_top）：接 L1D 读返回 ——
+    //        .amo_rdata_i       (l1d_cs_rdata)   // L1D 读数据
+    //        .amo_rdata_valid_i (l1d 读命中标志) // 读数据到齐那拍
+    //    兼容性提醒：新增输入端口后，已有 `sim/unit/tb_lsu.sv` 未驱动它们
+    //    （该 TB 不消费 amo_* 输出，判定不受影响）；后续修订该 TB 时按上面
+    //    口径补驱动，或显式接 0。
+    //--------------------------------------------------------------------------
+    input  wire [31:0] amo_rdata_i,       // L1D 读返回数据（AMO/LR/SC 的旧值）
+    input  wire        amo_rdata_valid_i  // L1D 读数据有效（读命中当拍）
 );
 
     //==========================================================================
@@ -452,8 +468,8 @@ module lsu #(
         .misaligned_i   (any_misalign),
         .pmp_deny_i     (amo_pmp_deny),
         .rs2_i          (store_data_i),
-        .rdata_i        (32'd0),             // ★ L1D 读返回：由 cache 组别接线（本任务范围外）
-        .rdata_valid_i  (1'b0),              // ★ 同上；2A 集成时接 l1d 的 rvalid
+        .rdata_i        (amo_rdata_i),       // ★ 2026-09-14：接 L1D 读返回（原为常量 0）
+        .rdata_valid_i  (amo_rdata_valid_i), // ★ 同上；由 core_top 接 l1d 读有效标志
         .rd_old_o       (amo_rd_old),
         .sc_success_o   (amo_sc_ok),
         .wdata_o        (amo_wdata),

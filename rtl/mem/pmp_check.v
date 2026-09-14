@@ -39,9 +39,22 @@
 //      access-fault cause」；AMO 的内部读+写两相由 `amo_unit.v` 统一按 store 口径
 //      上报，故对外**只可能是 cause 7**。
 //
-//  G=0 粒度（08 §6.5 用户裁决）—— `pmpaddr` 读写**不做低位掩码**；
-//      **NA4 可用**（A=10 覆盖 4 B）；NAPOT 的编码为「N 个连续 1 的最低地址位 + 1 个 0」，
-//      本模块用「尾随 0 计数」解出 NAPOT 掩码，天然支持 N=0（=8 B 块，编码 …0001）。
+//  ★ 地址口径 —— **ISA 口径**（[norm:pmp_addr_encoding]，
+//      riscv-isa-manual/src/priv/machine.adoc:3379-3383）：
+//        「Each PMP address register encodes bits 33-2 of a 34-bit physical address
+//          for RV32」⇒ **pmpaddr[i] = PA >> 2**，绝**不是**字节地址本身。
+//      本模块内部一律在「**字地址**」空间比较（字地址 = PA[33:2]，位宽与 pmpaddr 相同）：
+//        · 输入 acc_pa_i 是**字节物理地址**，换算成本笔覆盖的字区间
+//          [PA>>2, (PA + bytes - 1)>>2]（与「比较时 pmpaddr<<2」严格等价：PMP 区域最小
+//          4 B 且 4 B 对齐 ⇒ 「覆盖任一字节」⟺「覆盖任一字」，「覆盖全部字节」⟺「全部字」）。
+//        · TOR 的上下界、NA4 的单元、NAPOT 的块基址/掩码全部在字地址空间表达
+//          （TOR 的 y 与 pmpaddr 同尺度；NA4 = 1 个字；NAPOT 掩码 = 低 (n+1) 位）。
+//
+//  G=0 粒度（08 §6.5 用户裁决）—— `pmpaddr` 读写**不做低位掩码**（32 位全部有效；
+//      G≥1 的「低位读作全 1/全 0」掩码见 machine.adoc:3519-3528，本设计 G=0 不适用）；
+//      **NA4 可用**（A=10 覆盖 4 B = 1 个字）；NAPOT 块大小 = 2^(n+3) 字节，
+//      n = `pmpaddr` 低位**连续 1** 的个数（n=0 ⇒ 8 B，低位模式 …yyy0；
+//      全 1 ⇒ 覆盖最大块，见表 machine.adoc:3463-3493）。
 //
 //------------------------------------------------------------------------------
 // 风格（AGENT.md §4.3 组合逻辑红线）：
@@ -53,8 +66,9 @@
 //                         不参与任何逻辑；保留以便后续插入时序断言）
 //   cfg_i[2*N*8-1:0]    : N 项 pmpcfg 的平铺视图：{..., cfg1[7:0], cfg0[7:0]}
 //                         （第 i 项的 8 bit 位于 [i*8+7 : i*8]）
-//   addr_i[15:0]        : N 项 pmpaddr[31:0]（每项 32 bit，仅 [29:0] 有效）
-//   acc_pa_i[31:0]      : 本笔访问的**物理地址**（S 级 PA，PMP 检查在翻译之后）
+//   addr_i[N*32-1:0]    : N 项 pmpaddr[31:0]（**ISA 口径**：PA[33:2]；G=0 ⇒ 32 位全部有效）
+//   acc_pa_i[31:0]      : 本笔访问的**物理字节地址**（S 级 PA，PMP 检查在翻译之后；
+//                         模块内部按 PA>>2 换算到字地址口径后与 pmpaddr 比较）
 //   acc_bytes_i[4:0]    : 本笔访问字节数（1/2/4；非对齐拆分后每笔为 1 或多个字节）
 //   acc_priv_i[1:0]     : 发起访问的有效特权级（MPRV=1 时已由 lsu 换成 MPP）
 //   acc_type_i[1:0]     : 访问类型 —— 0=load、1=store、2=execute、3=AMO/LRSC/CMO
@@ -85,10 +99,10 @@ module pmp_check #(
 
     // ---- PMP 配置与地址（来自 csr_file，按项平铺） ----
     input  wire [PMP_ENTRIES*8-1:0] cfg_i,          // 每项 8 bit：{L,0,A[1:0],X,W,R}
-    input  wire [PMP_ENTRIES*32-1:0] addr_i,        // 每项 32 bit pmpaddr（有效 [29:0]）
+    input  wire [PMP_ENTRIES*32-1:0] addr_i,        // 每项 32 bit pmpaddr（ISA 口径 = PA>>2）
 
     // ---- 本笔访问（单笔：拆笔由 lsu.v 负责） ----
-    input  wire [ADDR_W-1:0]        acc_pa_i,       // 访问物理地址（翻译后的 S 级 PA）
+    input  wire [ADDR_W-1:0]        acc_pa_i,       // 访问**字节**物理地址（翻译后的 S 级 PA）
     input  wire [BYTES_W-1:0]       acc_bytes_i,    // 本笔字节数（1/2/4）
     input  wire [1:0]               acc_priv_i,     // 有效特权级：00=U 01=S 11=M
     input  wire [1:0]               acc_type_i,     // 0=load 1=store 2=execute 3=AMO/LRSC/CMO
@@ -114,10 +128,13 @@ module pmp_check #(
     localparam [1:0] A_NA4   = `RV32GC_PMP_A_NA4;
     localparam [1:0] A_NAPOT = `RV32GC_PMP_A_NAPOT;
 
-    // NAPOT 编码字段宽（`pmpaddr` 中承载「连续 1」的位数）。
-    // RV32 下 `pmpaddr` 有效位为 [29:0]（PA[33:4] 的 32 位截取，见 rv32_defs §7），
-    // 低位 [ADDR_W-3:0] 用于 NAPOT 编码 —— 取 ADDR_W-3 = 29 位。
-    localparam integer NAPOT_FIELD_W = ADDR_W - 3;   // 29
+    // ★ 地址换算尺度：pmpaddr = PA >> PMP_SHIFT（RV32 ⇒ 2，[norm:pmp_addr_encoding]）。
+    //   本模块的全部匹配都在「字地址」（= PA[33:2]）空间进行，字地址位宽 = pmpaddr 位宽。
+    localparam integer PMP_SHIFT = 2;
+
+    // NAPOT 编码承载「连续 1」的位宽 = **整个 pmpaddr**（ISA 口径下 pmpaddr 的 32 位
+    // 全部是 PA[33:2] 的位，低位不做掩码）：n 可达 32（全 1 ⇒ 覆盖整空间）。
+    localparam integer NAPOT_FIELD_W = ADDR_W;   // 32
 
     localparam [1:0] PRIV_U  = `RV32GC_PRIV_U;
     localparam [1:0] PRIV_S  = `RV32GC_PRIV_S;
@@ -126,69 +143,84 @@ module pmp_check #(
     //==========================================================================
     // 2. 纯组合辅助函数
     //==========================================================================
-    // ---- 2.1 NAPOT 掩码解码 -------------------------------------------------
-    // 手册编码表（riscv-isa-manual machine.adoc，`NAPOT range encoding`）：
+    // ---- 2.1 NAPOT 掩码解码（**字地址**空间） -------------------------------
+    // 手册编码表（riscv-isa-manual machine.adoc:3463-3493，`NAPOT range encoding`；
+    // 引子见 machine.adoc:3458-3462 [norm:pmp_napot_encoding_low_bits]）：
     //   pmpaddr 低位模式              匹配类型   覆盖大小
+    //   yyyy...yyyy                    NA4        4   B
     //   yyyy...yyy0                    NAPOT      8   B
     //   yyyy...yy01                    NAPOT      16  B
     //   yyyy...y011                    NAPOT      32  B
-    //   ...                           ...        ...
-    //   y011...1111                    NAPOT      2^(XLEN)   B
-    //   0111...1111                    NAPOT      2^(XLEN+1) B
-    //   1111...1111                    NAPOT      2^(XLEN+2) B
+    //   ...                            ...        ...
+    //   yy01...1111                    NAPOT      2^(XLEN)   B
+    //   y011...1111                    NAPOT      2^(XLEN+1) B
+    //   0111...1111                    NAPOT      2^(XLEN+2) B
+    //   1111...1111                    NAPOT      2^(XLEN+3) B
     //
-    // ⇒ 决定大小的量是「从 bit0 起**连续 1** 的个数 n」：
+    // ⇒ 决定大小的量是「从 bit0 起**连续 1** 的个数 n」（0 ≤ n ≤ ADDR_W）：
     //     n=0（…yyy0）⇒  8  B = 2^(0+3)
     //     n=1（…yy01）⇒ 16  B = 2^(1+3)
     //     n=2（…y011）⇒ 32  B = 2^(2+3)
     //     n=3（…0111）⇒ 64  B = 2^(3+3)
-    //   即 **覆盖字节数 = 2^(n+3)**，块内**字节**偏移位宽 = n+3。
-    //   （+3 = 2 位「位地址→字节地址」尺度 + 1 位 N=0 起跳，见上表首行。）
+    //   即 **覆盖字节数 = 2^(n+3)**。换算到本模块的**字地址**空间（1 字 = 4 B）：
+    //     覆盖字数 = 2^(n+3)/4 = 2^(n+1) ⇒ 块内字偏移位宽 = n+1，
+    //     掩码 m = 低 (n+1) 位全 1，块基址 = pmpaddr & ~m，块顶 = pmpaddr | m。
+    //   （自然对齐由编码保证：清掉编码位后基址自动对齐到块大小。）
     //
     //   ★ 关键易错点：**不能**去数尾随 0 个数（地址高位全 0 时会把整个空间算成一个块）。
-    //     唯一正确的量是低位「连续 1」的个数；全 1 编码（n 达到字段宽）表示最大块。
-    //
-    //   本函数返回「块大小 - 1」形式的字节掩码（低位全 1）。
-    function [ADDR_W-1:0] napot_bytemask;
-        input [ADDR_W-1:0] pa;       // pmpaddr
-        integer n;                   // 低位连续 1 的个数
+    //     唯一正确的量是低位「连续 1」的个数；全 1 编码表示最大块。
+    function integer napot_ones;
+        input [ADDR_W-1:0] a;        // pmpaddr（字地址口径）
+        integer k;                   // 低位连续 1 的个数
         begin
-            n = 0;
+            k = 0;
             // 从最低位起数连续 1（NAPOT 编码的核心量）
-            while ((n < NAPOT_FIELD_W) && (pa[n] == 1'b1)) begin
-                n = n + 1;
+            while ((k < NAPOT_FIELD_W) && (a[k] == 1'b1)) begin
+                k = k + 1;
             end
-            // 覆盖字节数 = 2^(n+3)；n = NAPOT_FIELD_W（全 1）⇒ 取最大可表示块，
-            // 此时 n+3 = ADDR_W ⇒ 掩码全 1（覆盖整个地址空间），移位需防越界。
-            if ((n + 3) >= ADDR_W) begin
-                napot_bytemask = {ADDR_W{1'b1}};
+            napot_ones = k;
+        end
+    endfunction
+
+    // 返回「块内字地址掩码」（低 n+1 位全 1）。
+    // n = ADDR_W-1（全 1 编码）⇒ n+1 = ADDR_W ⇒ 掩码全 1（块取最大，覆盖整个地址空间）；
+    // 移位需防越界。
+    function [ADDR_W-1:0] napot_wordmask;
+        input [ADDR_W-1:0] a;
+        integer n;
+        begin
+            n = napot_ones(a);
+            if ((n + 1) >= ADDR_W) begin
+                napot_wordmask = {ADDR_W{1'b1}};
             end else begin
-                napot_bytemask = ({{(ADDR_W-1){1'b0}}, 1'b1} << (n + 3)) - 1'b1;
+                napot_wordmask = ({{(ADDR_W-1){1'b0}}, 1'b1} << (n + 1)) - 1'b1;
             end
         end
     endfunction
 
-    // ---- 2.2 单笔访问命中判定 -----------------------------------------------
-    // 返回 1 表示 addr 落在该项覆盖范围内；同时给出「是否覆盖首字节 / 是否覆盖
-    // 全部字节」。整笔匹配用 all（规范强制），选项用 any（规范强制）。
-    // 说明：用整笔字节区间 [addr, addr+bytes-1] 与项区间求交。
-    function hit_any_byte;
-        input [ADDR_W-1:0] lo;      // 本笔首地址
-        input [ADDR_W-1:0] hi;      // 本笔末地址（= lo + bytes - 1）
+    // ---- 2.2 单笔访问命中判定（**字地址**区间，含端点） ----------------------
+    // 返回 1 表示本笔访问的字区间与项覆盖的字区间有交集。整笔匹配用 all
+    // （规范强制 [norm:pmp_full_match_required]，machine.adoc:3577-3582），
+    // 选项用 any（规范强制 [norm:pmp_entry_priority]，machine.adoc:3575-3577）。
+    // 说明：区间求交 ⟺ 区间长度非负下的 `lo<=base_h && hi>=base_l`；
+    //       项区间为空（TOR 的 pmpaddr[i-1] >= pmpaddr[i]）由上层 ent_valid 门控。
+    function hit_any_word;
+        input [ADDR_W-1:0] lo;      // 本笔首字（含）
+        input [ADDR_W-1:0] hi;      // 本笔末字（含，= (PA + bytes - 1)>>2）
         input [ADDR_W-1:0] base_l;  // 项覆盖起点（含）
         input [ADDR_W-1:0] base_h;  // 项覆盖终点（含）
         begin
-            hit_any_byte = (lo <= base_h) && (hi >= base_l);
+            hit_any_word = (lo <= base_h) && (hi >= base_l);
         end
     endfunction
 
-    function hit_all_bytes;
+    function hit_all_word;
         input [ADDR_W-1:0] lo;
         input [ADDR_W-1:0] hi;
         input [ADDR_W-1:0] base_l;
         input [ADDR_W-1:0] base_h;
         begin
-            hit_all_bytes = (lo >= base_l) && (hi <= base_h);
+            hit_all_word = (lo >= base_l) && (hi <= base_h);
         end
     endfunction
 
@@ -225,14 +257,17 @@ module pmp_check #(
     endfunction
 
     //==========================================================================
-    // 3. 本笔访问字节区间（含端点）
+    // 3. 本笔访问的**字地址**区间（含端点）—— ISA 口径：字地址 = PA[33:2] = PA>>2
     //==========================================================================
-    // 注意：hi 用零扩展加法，溢出（跨 4 GB）在 RV32 物理地址空间不存在；
-    // 显式加宽 1 位再截断以免综合工具误判位宽。
-    wire [ADDR_W:0] acc_lo_x = {1'b0, acc_pa_i};
-    wire [ADDR_W:0] acc_hi_x = acc_lo_x + {{(ADDR_W+1-BYTES_W){1'b0}}, acc_bytes_i} - 1'b1;
-    wire [ADDR_W-1:0] acc_lo = acc_pa_i;
-    wire [ADDR_W-1:0] acc_hi = acc_hi_x[ADDR_W-1:0];
+    // 输入 acc_pa_i 是**字节**物理地址；末字节 = PA + bytes - 1。
+    // 注意：末字节用零扩展加法，溢出（跨 4 GB）在 RV32 物理地址空间不存在；
+    // 显式加宽 1 位再移位，避免综合工具误判位宽。
+    // 与「把 pmpaddr<<2 还原成字节地址再比较」等价：PMP 区域最小 4 B 且 4 B 对齐，
+    // 故「覆盖任一字节」⟺「覆盖任一字」、「覆盖全部字节」⟺「全部字」。
+    wire [ADDR_W:0] acc_hi_x = {1'b0, acc_pa_i}
+                             + {{(ADDR_W+1-BYTES_W){1'b0}}, acc_bytes_i} - 1'b1;
+    wire [ADDR_W-1:0] acc_lo = {{PMP_SHIFT{1'b0}}, acc_pa_i[ADDR_W-1:PMP_SHIFT]};
+    wire [ADDR_W-1:0] acc_hi = {{PMP_SHIFT{1'b0}}, acc_hi_x[ADDR_W-1:PMP_SHIFT]};
 
     wire [2:0] need_perm = type_to_perm(acc_type_i);
     wire       need_r    = need_perm[2];
@@ -275,36 +310,42 @@ module pmp_check #(
             assign ent_a[gi] = c[`RV32GC_PMP_A_LSB +: 2];
             assign ent_l[gi] = c[`RV32GC_PMP_L_BIT];
 
-            // ---- 各项覆盖区间（单位：字节地址） ----
-            // A=OFF   ：无覆盖（区间退化为空，由 ent_any 的 A!=OFF 门控）
-            // A=TOR   ：[pmpaddr[i-1] , pmpaddr[i] - 1]（i=0 时下界为 0）
-            //           规范口径：y < pmpaddr[i] 即被覆盖；下界取上一项地址。
-            //           ★ 注意 TOR 的地址语义是「pmpaddr 直接就是字节地址」，不做 4 B 移位
-            //             （G=0 且本设计 pmpaddr 值为地址口径，见 core_params §6）。
-            // A=NA4   ：[pmpaddr , pmpaddr + 3]（G=0 ⇒ 可用）
-            // A=NAPOT ：[pmpaddr & ~mask , (pmpaddr & ~mask) | mask]（NAPOT 向下对齐）
-            wire [ADDR_W-1:0] napot_msk = napot_bytemask(a);
+            // ---- 各项覆盖区间（**字地址**单位；1 字 = 4 B） ----
+            // A=OFF   ：无覆盖（ent_valid=0）
+            // A=TOR   ：y ∈ [pmpaddr[i-1], pmpaddr[i]) —— 上界**不含**
+            //           （[norm:pmp_a_field_tor]，machine.adoc:3496-3500）；i=0 时下界 0。
+            //           pmpaddr[i-1] >= pmpaddr[i] ⇒ 该匹配**无任何地址**（machine.adoc:3504
+            //           NOTE）⇒ ent_valid=0（同时挡掉 a=0 时 (a-1) 回绕的伪区间）。
+            // A=NA4   ：y == pmpaddr[i]（1 个字 = 4 B；G=0 ⇒ 可选，machine.adoc:3522）
+            // A=NAPOT ：y ∈ [a & ~m, a | m]，m = napot_wordmask(a)
+            //           （块基址/块顶在字地址空间，等价于字节口径下 pmpaddr<<2 的还原）
+            wire [ADDR_W-1:0] napot_msk  = napot_wordmask(a);
+            wire [ADDR_W-1:0] napot_base = a & ~napot_msk;
+            wire [ADDR_W-1:0] napot_top  = napot_base | napot_msk;
+
+            wire ent_is_off   = (ent_a[gi] == A_OFF);
+            wire ent_is_tor   = (ent_a[gi] == A_TOR);
+            wire tor_nonempty = (a_prev < a);          // pmpaddr[i-1] < pmpaddr[i]
+            wire ent_valid    = !ent_is_off && (!ent_is_tor || tor_nonempty);
 
             assign ent_low[gi] =
-                (ent_a[gi] == A_TOR)   ? a_prev :
-                (ent_a[gi] == A_NA4)   ? a :
-                (ent_a[gi] == A_NAPOT) ? (a & ~napot_msk) :
-                                         a;      // OFF：区间无意义（由 ent_any 门控）
+                ent_is_tor              ? a_prev :
+                (ent_a[gi] == A_NAPOT)  ? napot_base :
+                                          a;        // NA4 / OFF（OFF 由 ent_valid 门控）
 
             assign ent_high[gi] =
-                (ent_a[gi] == A_TOR)   ? (a - 1'b1) :
-                (ent_a[gi] == A_NA4)   ? (a + 32'd3) :
-                (ent_a[gi] == A_NAPOT) ? ((a & ~napot_msk) | napot_msk) :
-                                         a;
+                ent_is_tor              ? (a - 1'b1) :   // 上界不含 ⇒ 含端点式取 a-1
+                (ent_a[gi] == A_NAPOT)  ? napot_top :
+                                          a;
 
             // ---- 覆盖判定 ----
-            // ent_any：命中该笔的**任一字节**（规范用于**选**项）
-            // ent_all：覆盖该笔的**全部字节**（规范用于**判**权，整笔匹配强制）
-            wire a_off = (ent_a[gi] == A_OFF);
-            assign ent_any[gi] = !a_off &&
-                                 hit_any_byte(acc_lo, acc_hi, ent_low[gi], ent_high[gi]);
-            assign ent_all[gi] = !a_off &&
-                                 hit_all_bytes(acc_lo, acc_hi, ent_low[gi], ent_high[gi]);
+            // ent_any：命中该笔的**任一字节/字**（规范用于**选**项 [norm:pmp_entry_priority]）
+            // ent_all：覆盖该笔的**全部字节/字**（规范用于**判**权，整笔匹配强制
+            //          [norm:pmp_full_match_required]）
+            assign ent_any[gi] = ent_valid &&
+                                 hit_any_word(acc_lo, acc_hi, ent_low[gi], ent_high[gi]);
+            assign ent_all[gi] = ent_valid &&
+                                 hit_all_word(acc_lo, acc_hi, ent_low[gi], ent_high[gi]);
 
             // ---- 权限判定 [norm:pmprwxcheck] ----
             // L=0 且访问特权级为 M ⇒ 成功；

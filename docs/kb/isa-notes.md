@@ -117,12 +117,28 @@
   → `riscv-isa-manual/src/priv/supervisor.adoc`（kb chunk 10790，lines 1723-1854）
 - **实现含义**：页表遍历的**每一次隐式访存**都必须过 PMP；且该项的异常 cause 是**访问类型对应的 access-fault**，与页错误区分。
 
-### 3.4 A 字段编码提醒
+### 3.4 A 字段编码提醒（**地址口径已按 ISA 修正**，2026-09-14）
 
-- `pmpaddr` 的 TOR 匹配语义：某地址 `y` 若 `y < pmpaddr[i]` 则被覆盖（结合上一项的边界）。
-  → `riscv-arch-test/coverpoints/norm/PMPSm.yaml`（kb chunk 8639，lines 95-102）
+- **`pmpaddr` 的地址口径（ISA 口径，勿再按字节地址理解）**：RV32 下每个 `pmpaddr` 编码
+  **34 位物理地址的 [33:2]**，即 **`pmpaddr = PA >> 2`**（G=0 ⇒ 32 位全部有效、不做低位掩码）。
+  → `riscv-isa-manual/src/priv/machine.adoc:3379-3383` `[norm:pmp_addr_encoding]`
+  （摘录：“Each PMP address register encodes bits 33-2 of a 34-bit physical address for RV32,
+  as shown in Figure…”，NOTE 见 :3387-3396：Sv32 支持 34 位物理地址，故 PMP 必须支持宽于 XLEN 的地址）
+  - **实现含义**：匹配比较在**字地址空间**进行 —— 访存物理地址要换到同尺度（`PA>>2`）后与
+    `pmpaddr` 比较；TOR 的边界、NA4 的单元、NAPOT 的块基址/掩码全部是同尺度量。
+- **NAPOT 尺寸编码**：块大小 = **2^(n+3) 字节**，`n` = `pmpaddr` 低位**连续 1** 的个数
+  （`n=0` ⇒ 8 B，低位模式 `…yyy0`；全 1 ⇒ 最大块）。低位是**尺寸编码**，不是基址位。
+  → machine.adoc:3458-3493 `[norm:pmp_napot_encoding_low_bits]` + NAPOT 编码表；
+  G≥1 时低位“读作全 1 / 全 0”的掩码见 machine.adoc:3519-3528（本设计 **G=0**，不适用）。
+- **L 位与 M 模式**：**L=0 时任何匹配该项的 M 模式访问一律成功**（R/W/X 只约束 S/U）；
+  **L=1** 时 R/W/X 才**对所有特权级（含 M）**生效。
+  → machine.adoc:3557-3563 `[norm:pmp_l_bit_m_mode_enforcement]`；
+  R/W/X 判定总则见 machine.adoc:3584-3590 `[norm:pmp_rwx_check]`。
+- `pmpaddr` 的 TOR 匹配语义：项 *i* 匹配任何地址 *y* 满足 `pmpaddr[i-1] <= y < pmpaddr[i]`
+  （上界**不含**；项 0 的下界为 0）；`pmpaddr[i-1] >= pmpaddr[i]` ⇒ 该项**无任何匹配地址**。
+  → machine.adoc:3496-3504 `[norm:pmp_a_field_tor]` + NOTE
 - `A=TOR` 相关的覆盖点集合：`PMPSmcg/{cpcfgAtorall, cpcfgAtor, cpcfgAtor0, cpcfgAtorbot, cpcfgAtor_nonoverlap}`。
-  → 同上（kb chunk 8639）
+  → `riscv-arch-test/coverpoints/norm/PMPSm.yaml`（kb chunk 8639，lines 95-102）
 
 ---
 

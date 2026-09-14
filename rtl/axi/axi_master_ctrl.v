@@ -79,7 +79,7 @@ module axi_master_ctrl #(
     output wire [DATA_W-1:0]    rdata_data,
     output wire [ID_W-1:0]      rdata_id,
     output wire                 rdata_last,
-    input  wire                 rdata_ready,
+    input  wire                 rdata_ready,   // 消费侧 ready：2A 无背压通路 ⇒ 不参与逻辑（见 §4）
 
     // ---- 完成/错误 ----
     output wire                 done,        // 单拍脉冲：本笔（含拆分后的第二笔）完成
@@ -236,7 +236,14 @@ module axi_master_ctrl #(
     assign rdata_data  = m_rdata;
     assign rdata_id    = m_rid;
     assign rdata_last  = m_rlast;
-    assign rdata_ready = 1'b1;      // 本控制器始终收下读数据（无背压）
+    // ★ `rdata_ready` 是**消费侧（核内填充通路）给出的 ready**，方向为模块**输入**
+    //   （core_top 直接把它接常量 1'b1：MSHR 填充恒可收；tb_axi_master_ctrl 也按输入驱动）。
+    //   本控制器在 2A **不实现读数据背压**：R 通道由 `m_rready = r_go` 收数，
+    //   `rdata_valid` 是逐 beat 的单拍脉冲，模块无法因下游未 ready 而反压从端
+    //   ⇒ 该输入**不被任何逻辑消费**，模块内**不得**对它赋值
+    //   （旧版误写 `assign rdata_ready = 1'b1;`，被 Verilator 判 %Error-ASSIGNIN：
+    //    对 input 赋值）。若要改成 output/内部 wire，须同步改 core_top 的 `1'b1`
+    //    常量接线与 tb_axi_master_ctrl 的端口连接（本任务范围外，见交付报告）。
 
     // ---- AW ----
     assign m_awid    = id_q;

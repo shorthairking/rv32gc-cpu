@@ -165,7 +165,12 @@ module tb_fetch_unit_top;
     endtask
 
     //--------------------------------------------------------------------------
-    // PMP 编程助手（G=0，4 B 粒度）：把项 idx 设为 NAPOT 覆盖 4 B @ pa_base，权限 rwx
+    // PMP 编程助手（G=0，4 B 粒度）：把项 idx 设为 NA4 覆盖 4 B @ pa_base，权限 rwx
+    //   ★ L=1（[norm:pmp_l_bit_m_mode_enforcement]，machine.adoc:3557-3563）：L=0 时
+    //     **M 模式匹配访问一律成功**、R/W/X 只约束 S/U；要让「M 模式也受 PMP 约束」
+    //     这一断言（C4）成立且合 ISA，项必须 L=1。
+    //   ★ 地址口径：pmpaddr 编码 34 位物理地址的 [33:2] ⇒ 编程写 `pa_base >> 2`
+    //     （[norm:pmp_addr_encoding]，machine.adoc:3379-3383）。
     //--------------------------------------------------------------------------
     task automatic pmp_set_na4_rwx;
         input integer idx;
@@ -177,6 +182,7 @@ module tb_fetch_unit_top;
             cfg[`RV32GC_PMP_W_BIT] = 1'b1;
             cfg[`RV32GC_PMP_X_BIT] = 1'b1;
             cfg[`RV32GC_PMP_A_LSB +: 2] = `RV32GC_PMP_A_NA4;
+            cfg[`RV32GC_PMP_L_BIT] = 1'b1;   // L=1：M 模式也受 R/W/X 约束（ISA 口径）
             pmpcfg_i[idx*8 +: 8]   = cfg;
             pmpaddr_i[idx*32 +: 32] = pa_base >> 2;
         end
@@ -389,10 +395,13 @@ module tb_fetch_unit_top;
         chk1 ("C4 RW-only entry: exception", 1'b1, fetch_exc_valid);
         chk5 ("C4 cause=1 (no execute perm)", CAUSE_IAF, fetch_exc_cause);
         chk32("C4 mtval = parcel VA", RESET_PC, fetch_exc_tval);
-        // M 模式也受 PMP 约束（PMP 对 M 模式同样生效）
+        // M 模式也受 PMP 约束 —— 前提是该项 **L=1**
+        //（[norm:pmp_l_bit_m_mode_enforcement]，machine.adoc:3557-3563：L=1 ⇒ R/W/X
+        //  对所有特权级生效；L=0 时 M 模式匹配访问一律成功。本项的 L=1 由
+        //  pmp_set_na4_rwx 设置。）
         @(negedge aclk) priv = PRIV_M;
         #1;
-        chk1("C4 M-mode also blocked by non-X entry", 1'b1, fetch_exc_valid);
+        chk1("C4 M-mode blocked by non-X L=1 entry", 1'b1, fetch_exc_valid);
         @(negedge aclk) fetch_rsp_valid = 1'b0;
         @(posedge aclk); #1;
 

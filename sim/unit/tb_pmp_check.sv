@@ -9,13 +9,19 @@
 // 覆盖要求（验收判据 ③，逐条对应）：
 //   · TOR   : ≥2 例（含第 0 项 TOR 下界=0、上界=pmpaddr[i]）
 //   · NA4   : ≥2 例（G=0 下可用；覆盖 4 B）
-//   · NAPOT : ≥2 例（含 N=0 的 8 B 编码 …0001、更大块）
+//   · NAPOT : ≥2 例（含 N=0 的 8 B 编码 …yyy0、更大块）
 //   · OFF   : ≥2 例（不匹配任何地址）
 //   · 16 项优先级：**低编号优先**（项 0 与项 1 都命中 ⇒ 项 0 决定结果）
-//   · G=0 粒度：NA4 确实生效（不做低位掩码）
+//   · G=0 粒度：NA4 可用且 `pmpaddr` 低位全部有效（**不做低位掩码**）
 //   · 无匹配：M 成功 / S 失败 / U 失败
 //   · AMO 被 PMP 拒 **恒 cause 7**（T4）
 //   · 非对齐跨区域拆两笔，**每笔独立**（部分通过、部分失败）
+//
+// ★ 地址口径（本 TB 的第一条纪律，2026-09-14 修正）：
+//   ISA 规定 `pmpaddr` 编码 RV32 34 位物理地址的 **[33:2]**（即 pmpaddr = PA>>2，
+//   [norm:pmp_addr_encoding]，machine.adoc:3379-3383），**不是**字节地址本身。
+//   因此本 TB 的所有 `set_addr()` **一律经 pa2addr()/napot_addr() 换算**；
+//   断言的访存地址 acc_pa 仍是**字节物理地址**（与 pmp_check 的 acc_pa_i 端口契约一致）。
 //
 // 判定纪律（08 §8.1"未捕获即失败"）：
 //   · 任何断言不成立 ⇒ 立即 $fatal（非零退出码），且**绝不打印 PASS**；
@@ -130,6 +136,21 @@ module tb_pmp_check_top;
         end
     endtask
 
+    //--------------------------------------------------------------------------
+    // ISA 口径换算助手（[norm:pmp_addr_encoding]，machine.adoc:3379-3383）：
+    //   pmpaddr 编码 34 位物理地址的 [33:2] ⇒ 编程时写 `pa >> 2`。
+    //--------------------------------------------------------------------------
+    function [31:0] pa2addr(input [31:0] pa);
+        pa2addr = pa >> 2;
+    endfunction
+
+    // NAPOT 编码（手册表 machine.adoc:3463-3493）：块大小 = 2^(n+3) 字节、
+    // 字节基址自然对齐 ⇒ pmpaddr = (base>>2) | (低 n 位全 1)。
+    //   n=0 ⇒ 8  B（低位 …yyy0，无 1）；n=1 ⇒ 16 B（…yy01）；n=3 ⇒ 64 B（低 3 位 1）
+    function [31:0] napot_addr(input [31:0] byte_base, input integer n);
+        napot_addr = (byte_base >> 2) | ((32'd1 << n) - 32'd1);
+    endfunction
+
     task clear_all;
         integer i;
         begin
@@ -204,7 +225,7 @@ module tb_pmp_check_top;
         //======================================================================
         clear_all;
         set_entry(0, A_OFF, 1'b0, 1'b1, 1'b1, 1'b1);   // OFF + 全权限
-        set_addr (0, 32'h0000_1000);
+        set_addr (0, pa2addr(32'h0000_1000));           // OFF ⇒ 值无意义，仍按 ISA 口径写
         // 例 0-1：S 模式 load 到该地址 ⇒ 无匹配 ⇒ **失败**
         acc_pa = 32'h0000_1000; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; n_off = n_off + 1;
@@ -227,12 +248,13 @@ module tb_pmp_check_top;
         $display("  [OFF]    3 例通过（无匹配：S/U 失败、M 成功）");
 
         //======================================================================
-        // 组 1：TOR —— [pmpaddr[i-1], pmpaddr[i]-1]（≥2 例）
+        // 组 1：TOR —— 字地址口径 y ∈ [pmpaddr[i-1], pmpaddr[i])，上界**不含**
+        //   对应字节区间 = [pmpaddr[i-1]<<2, (pmpaddr[i]<<2) - 1]（≥2 例）
         //======================================================================
-        // ---- 例 1-1：项 0 单独 TOR，下界恒 0，上界 = pmpaddr[0] ----
+        // ---- 例 1-1：项 0 单独 TOR，下界恒 0，上界 = pmpaddr[0]（字节 0x8000） ----
         clear_all;
         set_entry(0, A_TOR, 1'b0, 1'b1, 1'b1, 1'b1);   // R+W，L=0
-        set_addr (0, 32'h0000_8000);                    // TOR 上界（不含）
+        set_addr (0, pa2addr(32'h0000_8000));           // TOR 上界（不含）
         n_tor = n_tor + 1;
         // 1-1a：地址 0x0000_7FFC 在 [0, 0x7FFF] 内 ⇒ S 放行
         acc_pa = 32'h0000_7FFC; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
@@ -253,9 +275,9 @@ module tb_pmp_check_top;
         // ---- 例 1-2：项 1 TOR 与项 0 TOR 构成区间 ----
         clear_all;
         set_entry(0, A_TOR, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (0, 32'h8000_0000);                    // 项 0：下界 0，上界 0x7FFF_FFFF
+        set_addr (0, pa2addr(32'h8000_0000));           // 项 0：下界 0，上界 0x7FFF_FFFF
         set_entry(1, A_TOR, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (1, 32'hC000_0000);                    // 项 1：下界 0x8000_0000，上界 0xBFFF_FFFF
+        set_addr (1, pa2addr(32'hC000_0000));           // 项 1：下界 0x8000_0000，上界 0xBFFF_FFFF
         n_tor = n_tor + 1;
         // 1-2a：地址 0xA000_0000 命中项 1
         acc_pa = 32'hA000_0000; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
@@ -274,7 +296,7 @@ module tb_pmp_check_top;
         // ---- 例 2-1：NA4 精确覆盖 4 B，界内放行、界外拒绝 ----
         clear_all;
         set_entry(0, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (0, 32'h1000_0000);                    // 覆盖 0x1000_0000..0x1000_0003
+        set_addr (0, pa2addr(32'h1000_0000));           // 覆盖 0x1000_0000..0x1000_0003
         n_na4 = n_na4 + 1;
         // 2-1a：界内（末字节 + 3）⇒ 放行
         acc_pa = 32'h1000_0000; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
@@ -282,19 +304,22 @@ module tb_pmp_check_top;
         // 2-1b：界外（+4）⇒ 无匹配 ⇒ S 失败
         acc_pa = 32'h1000_0004; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; expect_deny("NA4-1b(out)", C_LOAD_ACCESS);
-        // 2-1c：**G=0 生效证据** —— pmpaddr 低位不做掩码，NA4 起址可非 4 B 对齐
-        //        若实现错误地做了块对齐（G>0 行为），0x1000_0001 会落到不同块
-        set_addr (0, 32'h1000_0001);
-        acc_pa = 32'h1000_0001; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
-        #1; expect_allow("NA4-1c(g0-unaaligned-base)");
-        // 2-1d：该 NA4 单元外 1 B ⇒ 拒
-        acc_pa = 32'h1000_0005; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
-        #1; expect_deny("NA4-1d(out-1B)", C_LOAD_ACCESS);
+        // 2-1c：**G=0 生效证据** —— `pmpaddr` 低位**全部有效、不做掩码**：
+        //        NA4 单元 = pmpaddr 的整个字（4 B 一档），相邻单元可分别寻址
+        //        （ISA 口径下 NA4 单元必然 4 B 对齐，不存在「非对齐起址」；
+        //         旧写法把 pmpaddr 当字节地址，是本 TB 本轮修正的口径错误）。
+        set_addr (0, pa2addr(32'h1000_0004));           // 覆盖 0x1000_0004..0x1000_0007
+        acc_pa = 32'h1000_0004; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
+        #1; expect_allow("NA4-1c(g0-low-bits-live)");
+        // 2-1d：**上一个 4 B 单元**（只差 pmpaddr 最低位）⇒ 无匹配 ⇒ 拒
+        //        （若实现错误地对 pmpaddr 低位做掩码，这两档会并成一个块 ⇒ 误放行）
+        acc_pa = 32'h1000_0000; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
+        #1; expect_deny("NA4-1d(low-bit-matters)", C_LOAD_ACCESS);
 
         // ---- 例 2-2：NA4 + L=1 + U 模式权限位判定 ----
         clear_all;
         set_entry(0, A_NA4, 1'b1, 1'b1, 1'b0, 1'b0);   // L=1，只有 R
-        set_addr (0, 32'h2000_0000);
+        set_addr (0, pa2addr(32'h2000_0000));
         n_na4 = n_na4 + 1;
         // 2-2a：U 模式 load（需 R，有）⇒ 放行
         acc_pa = 32'h2000_0000; acc_bytes = 5'd4; acc_priv = PRIV_U; acc_type = T_LOAD;
@@ -309,15 +334,16 @@ module tb_pmp_check_top;
 
         //======================================================================
         // 组 3：NAPOT —— 覆盖 2^(n+3) 字节（≥2 例），n = pmpaddr 低位**连续 1** 个数
-        //   手册编码表（riscv-isa-manual machine.adoc pmpcfg-napot 表）：
+        //   手册编码表（riscv-isa-manual machine.adoc:3463-3493，NAPOT range encoding）：
         //     pmpaddr 低位 …yyy0  ⇒  8  B（n=0）
         //                  …yy01  ⇒ 16  B（n=1）
         //                  …y011  ⇒ 32  B（n=2）
         //                  …0111  ⇒ 64  B（n=3）
+        //   ★ 低位是**尺寸编码**（pmpaddr 口径），不是字节基址位。
         //======================================================================
-        // ---- 例 3-1：NAPOT n=0（8 B 块，pmpaddr 低位 …0000） ----
+        // ---- 例 3-1：NAPOT n=0（8 B 块，pmpaddr 低位 …yyy0） ----
         clear_all;
-        set_addr (0, 32'h3000_0000);                   // n=0 ⇒ 8 B 块
+        set_addr (0, napot_addr(32'h3000_0000, 0));    // n=0 ⇒ 8 B 块 @0x3000_0000
         set_entry(0, A_NAPOT, 1'b0, 1'b1, 1'b1, 1'b1);
         n_napot = n_napot + 1;
         // 3-1a：块内末字节（+7）放行
@@ -326,15 +352,15 @@ module tb_pmp_check_top;
         // 3-1b：块外（+8）拒
         acc_pa = 32'h3000_0008; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; expect_deny("NAPOT-1b(n0-out)", C_LOAD_ACCESS);
-        // 3-1c：**NAPOT 向下对齐** —— pmpaddr=0x3000_0004（低位 …0100，n=0 ⇒ 8 B）
-        //        块基址向下对齐到 0x3000_0000 ⇒ 0x3000_0001 也应命中
-        set_addr (0, 32'h3000_0004);
-        acc_pa = 32'h3000_0001; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
-        #1; expect_allow("NAPOT-1c(n0-aligned-down)");
+        // 3-1c：**NAPOT 低位掩码生效** —— 8 B 块覆盖 **2 个字**，故访问块内
+        //        **第二个字** 0x3000_0004（其字地址 ≠ pmpaddr 本身）也命中；
+        //        若实现误按「pmpaddr == 访存字」精确比较，则该访问不命中。
+        acc_pa = 32'h3000_0004; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
+        #1; expect_allow("NAPOT-1c(n0-second-word)");
 
         // ---- 例 3-2：NAPOT n=3（64 B 块，pmpaddr 低位 …0111 = 0x7） ----
         clear_all;
-        set_addr (0, 32'h4000_0007);                   // n=3 ⇒ 64 B 块
+        set_addr (0, napot_addr(32'h4000_0000, 3));    // n=3 ⇒ 64 B 块 @0x4000_0000
         set_entry(0, A_NAPOT, 1'b0, 1'b1, 1'b1, 1'b1);
         n_napot = n_napot + 1;
         // 3-2a：块内末字节（+63）放行
@@ -346,16 +372,16 @@ module tb_pmp_check_top;
         // 3-2c：整笔 4 B 落在块内 ⇒ 放行
         acc_pa = 32'h4000_003C; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; expect_allow("NAPOT-2c(n3-4B)");
-        // 3-2d：**n=1（16 B）**边界验证 —— pmpaddr 低位 …0001
+        // 3-2d：**n=1（16 B）**边界验证 —— pmpaddr 低位 …yy01
         clear_all;
-        set_addr (0, 32'h5000_0001);                   // n=1 ⇒ 16 B 块
+        set_addr (0, napot_addr(32'h5000_0000, 1));    // n=1 ⇒ 16 B 块 @0x5000_0000
         set_entry(0, A_NAPOT, 1'b0, 1'b1, 1'b1, 1'b1);
         acc_pa = 32'h5000_000F; acc_bytes = 5'd1; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; expect_allow("NAPOT-3a(n1-in)");
         acc_pa = 32'h5000_0010; acc_bytes = 5'd1;
         #1; expect_deny("NAPOT-3b(n1-out)", C_LOAD_ACCESS);
         n_napot = n_napot + 1;
-        $display("  [NAPOT]  3 组例通过（n=0 8B / n=1 16B / n=3 64B，含向下对齐）");
+        $display("  [NAPOT]  3 组例通过（n=0 8B / n=1 16B / n=3 64B，含低位掩码生效）");
 
         //======================================================================
         // 组 4：16 项优先级 —— **低编号优先**
@@ -363,11 +389,11 @@ module tb_pmp_check_top;
         //   ⇒ 必须由**项 0** 决定 ⇒ 拒绝
         //======================================================================
         clear_all;
-        // 项 0：覆盖 0x6000_0000 的 NAPOT（64 B；低位 …0111 ⇒ n=3），**无任何权限**
-        set_addr (0, 32'h6000_0007);
+        // 项 0：覆盖 0x6000_0000 的 NAPOT（64 B；低位 …y011 ⇒ n=3），**无任何权限**
+        set_addr (0, napot_addr(32'h6000_0000, 3));
         set_entry(0, A_NAPOT, 1'b1, 1'b0, 1'b0, 1'b0);   // L=1, R=W=X=0 ⇒ 必拒
         // 项 1：覆盖同一地址的 NAPOT，全权限
-        set_addr (1, 32'h6000_0007);
+        set_addr (1, napot_addr(32'h6000_0000, 3));
         set_entry(1, A_NAPOT, 1'b1, 1'b1, 1'b1, 1'b1);   // 全权限
         n_prio = n_prio + 1;
         acc_pa = 32'h6000_0010; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
@@ -380,11 +406,11 @@ module tb_pmp_check_top;
         // ---- 例 4-2：3 项同时命中，验证命中**最低编号**（项 7 优先于项 9） ----
         clear_all;
         set_entry(9, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (9, 32'h6100_0000);
+        set_addr (9, pa2addr(32'h6100_0000));
         set_entry(7, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (7, 32'h6100_0000);
+        set_addr (7, pa2addr(32'h6100_0000));
         set_entry(3, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (3, 32'h6100_0000);
+        set_addr (3, pa2addr(32'h6100_0000));
         n_prio = n_prio + 1;
         acc_pa = 32'h6100_0000; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; expect_hit_idx("PRIO-3(idx3)", 4'd3); expect_allow("PRIO-3(allow)");
@@ -429,7 +455,7 @@ module tb_pmp_check_top;
         clear_all;
         // 6-1：命中项但**无 W 权限**，AMO 访问 ⇒ 恒 cause 7
         set_entry(0, A_NA4, 1'b1, 1'b1, 1'b0, 1'b0);     // L=1，只有 R
-        set_addr (0, 32'h8000_0000);
+        set_addr (0, pa2addr(32'h8000_0000));
         acc_pa = 32'h8000_0000; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_AMO;
         #1; n_amo = n_amo + 1;
         expect_deny("AMO-1(no-W)", C_STORE_ACCESS);       // 恒 7
@@ -455,12 +481,14 @@ module tb_pmp_check_top;
         //     笔0 首→单元末；笔1 下一单元 → 末
         //======================================================================
         // 场景：地址 0x9000_0002，4 B 访问 ⇒ 拆为
-        //   笔0 = 0x9000_0002, 2 B（覆盖 0x9000_0002-03）
-        //   笔1 = 0x9000_0004, 2 B（覆盖 0x9000_0004-05）
-        // 配置：项 0 = NA4 覆盖笔 0（允许）；笔 1 无覆盖 ⇒ 独立失败
+        //   笔0 = 0x9000_0002, 2 B（覆盖 0x9000_0002-03，字 0x2400_0000）
+        //   笔1 = 0x9000_0004, 2 B（覆盖 0x9000_0004-05，字 0x2400_0001）
+        // 配置：项 0 = NAPOT n=1（16 B @0x9000_0000）⇒ 两笔都被同一项覆盖
+        //   （ISA 口径下 NA4 单元必然 4 B 对齐 ⇒ 不能用「起址 0x9000_0002 的 NA4」
+        //     表达跨笔场景，改用 16 B NAPOT，两笔同项覆盖的语义不变）
         clear_all;
-        set_entry(0, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (0, 32'h9000_0002);                      // NA4 覆盖 0x9000_0002..05
+        set_entry(0, A_NAPOT, 1'b0, 1'b1, 1'b1, 1'b1);
+        set_addr (0, napot_addr(32'h9000_0000, 1));       // 覆盖 0x9000_0000..0F
         // 7-1：笔 0 ⇒ 放行
         acc_pa = 32'h9000_0002; acc_bytes = 5'd2; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; n_split = n_split + 1;
@@ -475,7 +503,7 @@ module tb_pmp_check_top;
         //     把项 0 改为 NA4 @ 0x9000_0004（只覆盖笔 1）⇒ 笔 0 无匹配 ⇒ 失败
         clear_all;
         set_entry(0, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (0, 32'h9000_0004);
+        set_addr (0, pa2addr(32'h9000_0004));
         // 笔 0（0x9000_0002）⇒ 无匹配 ⇒ S 失败
         acc_pa = 32'h9000_0002; acc_bytes = 5'd2; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; n_split = n_split + 1;
@@ -491,7 +519,7 @@ module tb_pmp_check_top;
         //     笔字节 = 0x9000_0002..05；项覆盖 02..03 ⇒ 只覆盖部分 ⇒ **失败**
         clear_all;
         set_entry(0, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-        set_addr (0, 32'h9000_0000);                      // 覆盖 0x9000_0000..03
+        set_addr (0, pa2addr(32'h9000_0000));             // 覆盖 0x9000_0000..03
         acc_pa = 32'h9000_0002; acc_bytes = 5'd4; acc_priv = PRIV_S; acc_type = T_LOAD;
         #1; n_split = n_split + 1;
         if (denied_by_full !== 1'b1) begin
@@ -513,7 +541,7 @@ module tb_pmp_check_top;
         clear_all;
         for (i = 0; i < N; i = i + 1) begin
             set_entry(i, A_NA4, 1'b0, 1'b1, 1'b1, 1'b1);
-            set_addr (i, 32'hA000_0000 + i*32'h10);
+            set_addr (i, pa2addr(32'hA000_0000 + i*32'h10));
         end
         // 第 15 项（最后一项）必须真实生效
         acc_pa = 32'hA000_0000 + 15*32'h10; acc_bytes = 5'd4;
