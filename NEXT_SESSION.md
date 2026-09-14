@@ -11,6 +11,17 @@
   - `docs/porting/01-overview.md` 02-uboot 03-linux-opensbi 04-nand-driver 05-rootfs（5 篇）
   - `docs/kb/platform-facts.md` isa-notes.md tools-and-flow.md（3 篇）
 
+## 1.5 阶段二 2A 当前状态（2026-09-14，提交 `5086589`）
+
+- **模块波次已交付且全部通过母 Agent 复跑验收**（单元 TB 全绿、唯一 PASS、变异反证）：
+  - `rtl/pkg/*.vh`（4 处宏缺陷修复：内层反引号/FP_F5_FCVT/TVEC_BASE_MSK/MMIO_HI16_MSK，pkg_check 断言防回归）
+  - `rtl/fetch/`（pc_gen/fetch_unit/parcel_align）、`rtl/decode/`（decoder/dec_imm/dec_csr/compressed_expand）
+  - `rtl/exec/`（alu/bru/mdu(IP 化：3×mult_gen DSP×12 + 1×unsigned div_gen)/exe_ctrl(M>W>RF)/fpu_add/fpu_mul/fpu_div_sqrt(fsqrt 已修)/fpu_cmp/fpu_cvt/fregfile）
+  - `rtl/mem/`（lsu/pmp_check/amo_unit/mmio_route/cmo_unit）、`rtl/csr/`（csr_file/priv_ctrl/trap_ctrl/ptw/tlb）、`rtl/clint/clint.v`、`rtl/plic/plic.v`、`rtl/cache/`（l1i/l1d/BRAM 双分支/mshr）、`rtl/axi/`（axi_req_desc/axi_master_ctrl）
+  - `fpga/tcl/create_ip.tcl`（已实跑：mult_gen×3 + div_gen，26/28 项自检 0 error）
+- **用户指令（2026-09-14）**：当前阶段在此暂停，等用户指令再继续下一阶段。
+- **下一步（用户指令后）**：① FPU 收尾：`fpu.v` 顶层 + `tb_fpu.sv`/`tb_fregfile.sv`（fp_op 编码 0-25 见 fpu_cmp/cvt 头注）；② `core_top.v` 集成（接线要点：csr_file 陷阱为分组原子写 trap_we[1:0]+trap_epc/cause/tval；axi_master_ctrl 端口 req_beats_1/2、wb_ready；lsu 的 amo rdata_i/rdata_valid_i 由 l1d 读返回接；fetch 内联 PMP 集成时改例化 rtl/mem/pmp_check.v；cmo 维护以 l1d.idle 判定完成）；③ M1 仿真（tb_core_top + tb_m1_uart + sim_mem_model，首条取指=0x1C000000+UART 回显）；④ M2 arch-test（DUT 宏 STANDARD_SM_SUPPORTED/F_SUPPORTED、test_config.yaml 编译器名改写、exclude.list）+ Spike 锁步（/opt/riscv/bin/spike 已装）；⑤ M3 DDR3 裸机内存测试；⑥ M4 Vivado 综合/时序；⑦ M5 上板。
+
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
 
 1. 新项目载体 = **就地沿用 `rv32gc-cpu/` dev 分支**（不再另建 rv32gc-cpu-v2/；旧实现文件已从磁盘移除，历史在 master）。
