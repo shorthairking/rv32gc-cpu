@@ -24,7 +24,7 @@
 本机 `~/.dsh/settings.yaml` 已开启子 Agent 模型选择（`subagent-model-selection: enabled: true`），且 `allowedModels` 中**已包含该路由**。因此：
 
 - **不需要在 WSL 里安装 opencode 本体**；模型由 dsh 的 opencode-go-chat 网关提供。
-- 母 Agent 每次调用 `subagent`/`subagent_fork` 时，在参数里**显式携带 `provider`/`model`** 即可（`AGENT.md` §0.2 已写死）。
+- 母 Agent 每次调用 `subagent`/`subagent_fork` 时，在参数里**显式携带 `provider`/`model`/`reasoning_effort`** 即可（`AGENT.md` §0.2 已写死：`provider: "opencode-go-chat"`、`model: "deepseek-v4.1-flash"`、`reasoning_effort: "max"`）。
 
 验证方法（新会话里让母 Agent 执行）：
 
@@ -55,12 +55,13 @@ subagent(
 【参考】AGENT.md §4 红线；docs/design/spec/02-uop-and-decode.md（如已存在）",
   provider: "opencode-go-chat",
   model: "deepseek-v4.1-flash",
+  reasoning_effort: "max",
   run_in_background: true
 )
 ```
 
 - 新任务用 `subagent`；需要延续母 Agent 会话上下文的任务用 `subagent_fork`。
-- `reasoning_effort` 缺省（用模型默认档）；如需显式档位，先用 `list_subagent_models` 查该模型支持的档位。
+- `reasoning_effort` 固定 `"max"`（用户指令 2026-09-14）；该模型已实测支持 off/minimal/low/medium/high/xhigh/max 七档；若核实发现不支持 max，报告用户，不得擅自降档。
 - 三个子 Agent 的职责/写权限边界见 `AGENT.md` §5：testing 与 info 默认只读；coding 只动指派范围。
 
 ## 5. 常见问题

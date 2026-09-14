@@ -85,7 +85,7 @@ spike --version     # 预期 /opt/riscv/bin/spike
 ## 7. 纪律提醒（对本文件读者）
 
 - **kb 检索环境（2026-09-14 发现，待处理）**：常驻 `kb_search` 的 LSA 语义层已退化（返回无关命中）；`kb_get`（path+行号）与直接 `read` 手册源文件完全正常。已做：CLI `node dsh-extension/bin/riscv-kb.js build --no-lsa` 把磁盘索引重建为纯词法版；**待用户重启 `dsh web` 使常驻进程重载**。重启前子 Agent 查 ISA 细节一律用 `kb_get`/`read`（`riscv-isa-manual/src/**`），不依赖 `kb_search` 排序。
-- 母 Agent 只调度；子 Agent 路由 opencode-go-chat/deepseek-v4.1-flash；知识盲区：kb → 联网 → 自试≤3 → 上报。
+- 母 Agent 只调度；子 Agent 路由 opencode-go-chat/deepseek-v4.1-flash，**reasoning_effort 一律 "max"**（2026-09-14 用户指令，已实测支持）；知识盲区：kb → 联网 → 自试≤3 → 上报。
 - **goal 纪律（AGENT.md §0.7）**：纯派发不挂 goal；禁止轮询子 Agent（等宿主完成通知）；子 Agent 自驱一次做完；goal 工具仅顶层 Agent 可用。
 - 旧项目（master 分支、kb 中 rv32gc-project 来源）只作反面教训，禁止照抄。
 - 阶段一结束必须停下等用户审阅后再进阶段二（2A 顺序 5 级基线核）。

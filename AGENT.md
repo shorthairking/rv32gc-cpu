@@ -21,7 +21,7 @@
 - 每次调用必须显式携带模型路由字段（即"opencode 提供的 ds 4.1 flash 模型"）：
   - `provider: "opencode-go-chat"`
   - `model: "deepseek-v4.1-flash"`
-  - `reasoning_effort`：缺省（用该模型默认档）。
+  - `reasoning_effort: "max"`（**2026-09-14 用户指令：每次调用一律 max 档**；派活前用 `list_subagent_models` 核实该模型支持 max 档——已实测支持 off/minimal/low/medium/high/xhigh/max；若某次核实发现不支持 max，**报告用户**，不得擅自降档或缺省）。
 - 若当前会话的 `subagent`/`subagent_fork` 工具参数里**没有** `provider`/`model` 字段：先调用 `list_subagent_models`（若已注册）核实；仍没有 → **停止并报告用户**（宿主未开启子 Agent 模型选择，见 `USAGE.md` §2），不得退化成用母 Agent 自身模型跑子 Agent。
 - 任务拆分、派活格式与分工边界见 §5。
 

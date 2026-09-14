@@ -1,0 +1,851 @@
+`timescale 1ns/1ps
+//==============================================================================
+// rv32_defs.vh —— RV32-GC 项目「位域/编码」唯一真源（Unique Source of Truth）
+//==============================================================================
+// 项目    : rv32gc-cpu（阶段二 2A：单发射顺序 5 级基线核）
+// 作用域  : 指令编码常量、CSR 地址全表、异常/中断 cause、mtvec MODE、PMP 常量、
+//           AXI 常量、陷阱取值口径宏。
+// 风格    : Verilog-2001 兼容；只允许 localparam / `define / `ifdef；
+//           **本文件内不得出现任何 always 块与模块/端口声明**（组合逻辑风格红线，
+//           AGENT.md §4.3；本文件本就不含行为逻辑）。
+// 引用    : 每个段落头写明出处。出处分三类——
+//           [ISA:path:line]     = riscv-isa-manual 源文件行号（可复核）
+//           [ENC:binutils:pkg]  = 由 riscv-gnu-toolchain/binutils/include/opcode/
+//                                 riscv-opc.h 的 MATCH_*/MASK_* 反推（可复核，见 §3 表）
+//           [DOC:docs/...]      = 本项目设计文档（口径，非 ISA 真值）
+// 版本纪律: 改动先改本文件，再全量同步所有使用处；改完用 grep 核对两侧（AGENT.md §3.2）。
+//==============================================================================
+
+
+
+//==============================================================================
+// 1. 地址/数据宽度（与平台侧真源 chiplab/chip/soc_demo/loongson/config.h:46-100 一致）
+//    [DOC:docs/kb/platform-facts.md §1.3]
+//==============================================================================
+
+
+
+
+//==============================================================================
+// 2. 指令长度编码（操作数最低 2 位）
+//    [ISA:riscv-isa-manual/src/unpriv/intro.adoc:439-460]
+//    —— 32 bit 指令最低两位恒为 11；16 bit 压缩指令最低两位 != 11。
+//==============================================================================
+
+
+//==============================================================================
+// 3. 主操作码（opcode[6:0]）与 funct3/funct7/funct5 常量
+//    每条均在注释中给出 [ENC:riscv-opc.h] 的 MATCH/MASK 反推依据。
+//    opcode 常量统一命名 RV32GC_OP_*；字段常量按指令族命名。
+//==============================================================================
+
+// ---- 3.1 主操作码 [DOC:riscv-isa-manual/src/unpriv/rv-32-64g.adoc:13-23 opcode map] ----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                           //             fmin/fmax/fcvt/fmv/fcmp/fclass
+
+// ---- 3.2 LOAD（opcode=0000011）：funct3 选择 [ENC:MATCH_LB=0x03 MASK=0x707f 等] ----
+
+
+
+
+
+
+// ---- 3.3 STORE（opcode=0100011）[ENC:SB=0x23/SH=0x1023/SW=0x2023 MASK=0x707f] ----
+
+
+
+
+// ---- 3.4 BRANCH（opcode=1100011）[ENC:BEQ=0x63/BNE=0x1063/BLT=0x4063/BGE=0x5063/
+//      BLTU=0x6063/BGEU=0x7063 MASK=0x707f] ----
+
+
+
+
+
+
+
+// ---- 3.5 OP-IMM（opcode=0010011）[ENC:ADDI=0x13 MASK=0x707f；SLLI_RV32=0x1013
+//      MASK=0xfe00707f(funct7=0000000)；SRLI_RV32=0x5013(funct7=0000000)；
+//      SRAI_RV32=0x40005013(funct7=0100000)] —— 移位立即数在 RV32 上位 5 位必须为 0 ----
+
+
+
+
+
+
+
+
+
+
+
+// ---- 3.6 OP（opcode=0110011）[ENC:ADD=0x33/SUB=0x40000033/SLL=0x1033/SLT=0x2033/
+//      SLTU=0x3033/XOR=0x4033/SRL=0x5033/SRA=0x40005033/OR=0x6033/AND=0x7033
+//      MASK=0xfe00707f] ----
+
+
+
+
+
+
+
+
+
+
+
+// ---- 3.7 M 扩展：乘法/除法（opcode=0110011，funct7=0000001）
+//      [ENC:MUL=0x2000033(f3=0)/MULH=0x2001033(1)/MULHSU=0x2002033(2)/MULHU=0x2003033(3)/
+//       DIV=0x2004033(4)/DIVU=0x2005033(5)/REM=0x2006033(6)/REMU=0x2007033(7)，MASK=0xfe00707f] ----
+
+
+
+
+
+
+
+
+
+
+// ---- 3.8 A 扩展（opcode=0101111，funct3=010）
+//      [ENC:AMOADD_W=0x202f/AMOSWAP_W=0x800202f/LR_W=0x1000202f/SC_W=0x1800202f/
+//       AMOXOR_W=0x2000202f/AMOOR_W=0x4000202f/AMOAND_W=0x6000202f/AMOMIN_W=0x8000202f/
+//       AMOMAX_W=0xa000202f/AMOMINU_W=0xc000202f/AMOMAXU_W=0xe000202f；MASK=0xf800707f
+//       ⇒ insn[31:27]=funct5、insn[26:25]=aq/rl、insn[24:20]=rs2]
+//      注：AMO 家族的 funct5 位于 insn[31:27]，而 rf 的 aq/rl 位于 insn[26:25]，
+//          故本文件用 RV32GC_AMO_*（5 位）而非「funct7」，避免与 rf 混用出错。 ----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---- 3.9 SYSTEM（opcode=1110011）[ENC:PRIV=0x73 MASK=0x707f；CSR 三条 f3=001/010/011] ----
+
+
+
+
+
+
+
+
+// rs2 域（funct3=000 时 insn[24:20]）作为 PRIV 功能码；
+// f7=insn[31:25]。以下为完整 32 位 MATCH 值（含 f7/rs2/rs1/rd 全零），可直接比较。
+
+
+
+
+
+
+
+// ---- 3.10 MISC-MEM（opcode=0001111）[ENC:FENCE=0xf MASK=0x707f；FENCE_I=0x100f
+//      MASK=0x707f ⇒ f3=000 fence / f3=001 fence.i] ----
+
+
+
+// ---- 3.11 Zicbom：cbo.clean / cbo.flush / cbo.inval
+//      **2A 范围：只含 Zicbom 的 clean/flush/inval；cbo.zero 属 Zicboz，明确排除**
+//      （08-baseline-5stage.md §8.2 排除清单与 §11 R1；
+//        任务书口径：Zicboz/cbo.zero 归后续阶段，本真源**不定义其编码**）。
+//      [ENC:CBO_INVAL=0x200f(f3=010,f7=0000000,rs2=00000)
+//            CBO_CLEAN=0x10200f(rs2=00001)
+//            CBO_FLUSH=0x20200f(rs2=00010)
+//            MASK=0xfff07fff ⇒ opcode=0001111、funct3=010、funct7=0000000、
+//            rs2=insn[24:20] 选择动作，rs1=insn[19:15] 为地址，rd 忽略(应为 x0)]
+//      ★ 关键：clean/flush 的 funct7 相同，**只靠 rs2 区分**；而 insn[24:20] 同时是
+//        OP-FP 的 fmt(insn[26:25])+rs2 区段的低 5 位，故译码器必须把 (opcode,funct3)
+//        与 rs2 一起比较，不得只看 funct7。 ----
+
+
+
+
+
+// `define RV32GC_CBO_ZERO   5'b00100   // (Zicboz) cbo.zero —— **2A 不定义，禁止启用**
+
+// ---- 3.12 LOAD-FP / STORE-FP（flw/fsw 属 F；fld/fsd 属 D）
+//      [ENC:FLW=0x2007(f3=010) / FLD=0x3007(f3=011) / FSW=0x2027 / FSD=0x3027，MASK=0x707f] ----
+
+
+
+
+
+// ---- 3.13 OP-FP：fmt 位段（insn[26:25]）
+//      [ENC:FADD_S=0x53(fmt=00)/FADD_D=0x2000053(fmt=01)
+//           FSGNJ_D=0x22000053/MASK=0xfe00707f ⇒ insn[26:25]=fmt、insn[31:27]=funct5]
+//      ★ 注意：OP-FP 的 funct7 = {funct5[6:0], fmt[1:0]} 的低 7 位，
+//        即 OP-FP 的「funct7 低 2 位」就是 fmt，**不是** funct7[1:0] 的独立编码；
+//        译码时必须把 fmt 与 funct5 分开比较，禁止把 fmt 塞进 funct7 常量。 ----
+
+
+// funct5（insn[31:27]）[ENC 见上行 MATCH 值]
+
+
+
+
+
+
+
+
+
+
+
+
+// funct3
+
+
+
+
+
+
+
+
+
+// rs2 变体选择（与 fmt 正交）
+
+
+//      fcvt.fmt.fmt 的转换矩阵 [ENC:FCVT_S_D=0x40100053(fmt=00,入口 rs2=00001)
+//           FCVT_D_S=0x42000053(fmt=01,入口 rs2=00000)
+//           FCVT_W_S=0xc0000053(出口 fmt=00,rs2=00000)  FCVT_WU_S=0xc0100053(rs2=00001)
+//           FCVT_W_D=0xc2000053(出口 fmt=01)           FCVT_WU_D=0xc2100053(rs2=00001)
+//           FCVT_S_W=0xd0000053(入口 fmt=00)           FCVT_S_WU=0xd0100053(rs2=00001)
+//           FCVT_D_W=0xd2000053(入口 fmt=01)           FCVT_D_WU=0xd2100053(rs2=00001)]
+//      出口口径（写整数）：源 fmt 由 insn[26:25] 给出、rs2[0] 选 W/WU。
+//      入口口径（写 FP）  ：目标 fmt 由 insn[26:25] 给出、rs2[0] 选 W/WU。
+//      F↔D 互转           ：目标 fmt 由 insn[26:25] 给出、rs2 = 源 fmt（S=0/D=1）。
+
+// ---- 3.14 FMA 族（fmadd/fmsub/fnmsub/fnmadd）
+//      [ENC:FMADD_S=0x43/MASK=0x600007f；FMADD_D=0x2000043 ⇒ fmt=insn[26:25]]
+//      rd/rs1/rs2/rs3（insn[31:27]）为标准 R4 型；funct3 恒 000（RM 位）。 ----
+
+
+
+
+
+
+
+//==============================================================================
+// 4. CSR 地址全表（12 bit）
+//    [ISA:riscv-isa-manual/src/priv/csrs.adoc:131-523 「CSR Listing」逐行核对]
+//    每条后 [csrs.adoc:NNN] 给出该表行号。
+//    访问权限由地址高 4 位编码：csr[11:10]=读写属性、csr[9:8]=最低可访问特权级
+//    [ISA:csrs.adoc:25-49]。
+//    ★ 规格纠偏：docs/design/08-baseline-5stage.md §6.2 把 mepc/mcause/mtval/mip
+//      写成 0x340/0x342/0x343/0x344（错位一格）；规范真值为 0x341/0x342/0x343/0x344，
+//      0x340 是 mscratch。本真源一律用**规范值**。
+//==============================================================================
+
+// ---- 4.1 CSR 地址权限编码 [ISA:csrs.adoc:25-49] ----
+
+
+
+// ---- 4.2 非特权：FP 与计数器 [ISA:csrs.adoc:145-190] ----
+
+
+
+
+
+
+
+
+
+
+// ---- 4.3 S 模式 [ISA:csrs.adoc:195-270] ----
+
+
+
+
+
+
+
+
+
+
+
+// 未实现（2A 不落地，仅登记以免误用）：
+//   sieh 0x114 / scountinhibit 0x120 / siph 0x154 / scountovf 0xDA0
+//   等高半部/扩展 CSR 不在 2A 范围（[ISA:csrs.adoc:208,216,225,227]）。
+
+// ---- 4.4 M 模式：信息寄存器 [ISA:csrs.adoc:383-389] ----
+
+
+
+
+
+// ---- 4.5 M 模式：陷阱设置 [ISA:csrs.adoc:391-407] ----
+
+
+
+
+
+
+
+
+
+
+
+// ---- 4.6 M 模式：环境配置 [ISA:csrs.adoc:432-437] ----
+
+
+
+// ---- 4.7 M 模式：陷阱处理 [ISA:csrs.adoc:409-420] ----
+
+
+
+
+
+
+// ---- 4.8 M 模式：PMP 配置/地址寄存器 [ISA:csrs.adoc:439-451] ----
+// RV32 下 pmpcfg0..3 覆盖 16 项（每 CSR 4 项 × 8 bit）；
+// pmpcfg4..15 是 RV64 的 64 项形态（本设计 16 项，不使用）。
+
+
+
+
+
+// pmpaddr1..15 = 0x3B1..0x3BF（等距，逐项定义以便静态查表）
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---- 4.9 M 模式：计数器 [ISA:csrs.adoc:471-500] ----
+
+
+
+//      ★ arch-test 新版启动代码**无条件**写 mcountinhibit 与 mhpmevent3..31
+//        （riscv-arch-test/tests/env/rvtest_setup.h:1059-1129）⇒ 2A 的 csr_file
+//        必须让 mcountinhibit（0x320）与 mhpmevent3..31（0x323..0x33F）可写
+//        （WARL 吞写或部分实现），否则回归会在启动阶段挂死。详见报告「遗留/风险」。
+
+
+
+
+
+// ---- 4.10 U 模式 CSR [ENC:binutils riscv-opc.h:4289-4296 / DECLARE_CSR:5610-5617] ----
+//      ★ 版本敏感声明（必须如实标注）：
+//        本工作区手册版本为 20250508（riscv-isa-manual/src/unpriv/preface.adoc:208），
+//        该版本 **csrs.adoc 的 CSR Listing 已不含 ustatus/uie/utvec/uscratch/uepc/
+//        ucause/utval/uip 表**（检索 csrs.adoc 全文无 ustatus），
+//        machine.adoc:152 仅以 misa 的 "User mode implemented" 位表达 U 模式存在；
+//        binutils 亦把这一组标注为 PRIV_SPEC_CLASS_1P10 起、1P12 移除
+//        （riscv-opc.h:5610-5617 的第三个参数 = PRIV_SPEC_CLASS_1P12）。
+//        工程口径：本设计实现 M/S/U 三特权级模型，按任务要求给出这一组地址常量
+//        （"完整 M/S/U 模型"），但**必须**在 csr_file.v 里以
+//        `RV32GC_IMPLEMENT_U_MODE_CSRS` 开关统一控制是否真正落地/暴露。
+//        地址值出自 binutils（1P10 口径），不可作为 1P12 之后的合规依据。
+
+
+
+
+
+
+
+
+
+//==============================================================================
+// 5. mstatus / sstatus / mcause / mtvec 位域
+//    [DOC:docs/design/06-csr-privilege.md §3；ISA:riscv-isa-manual/src/priv/machine.adoc]
+//==============================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// FS 字段编码
+
+
+
+
+
+// ---- 5.2 特权级编码（与 mstatus.MPP 同编码） ----
+
+
+
+
+// ---- 5.3 mtvec / stvec（BASE + MODE） ----
+//      [ISA:riscv-isa-manual/src/priv/machine.adoc] BASE 4 B 对齐（低 2 位 0）；
+//      MODE：0=Direct、1=Vectored（Vectored 要求 BASE 256 B 对齐，低 8 位 0）。
+//      用户口径：**实现 Vectored**（08-baseline-5stage.md §6.5）。
+
+
+
+
+
+
+
+
+// ---- 5.4 mepc / sepc 对齐（IALIGN=16 ⇒ 只有 bit0 恒 0；bit1 可写） ----
+//      [ISA:riscv-isa-manual/src/priv/machine.adoc:1689-1696  norm:mepc_align]
+
+
+//==============================================================================
+// 6. 异常/中断 cause 编码
+//    [ISA:riscv-isa-manual/src/priv/machine.adoc；DOC:docs/kb/isa-notes.md T1-T8；
+//     DOC:docs/design/08-baseline-5stage.md §6.3]
+//==============================================================================
+
+
+
+
+// ---- 6.1 异常（Interrupt=0）：2A 实现 0/1/2/3/4/5/6/7/8/9/11/12/13/15 ----
+//      08 §6.2 明确「medeleg 不实现 10/11/14」中的 10/14 为保留项；
+//      11 (mecall) 作为 M→(delegated target) 的 ecall 码保留定义。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// 说明：cause 10/14 为保留（Reserved），2A 不产生。
+
+// ---- 6.2 中断（Interrupt=1）：M 专属 3/7/11，S 级 1/5/9 ----
+
+
+
+
+
+
+// 便捷掩码（mip/mie 的位位置即 cause 码）
+
+
+
+
+
+
+
+
+
+//==============================================================================
+// 7. PMP 常量（16 项，粒度 G=0）
+//    [ISA:riscv-isa-manual/src/priv/machine.adoc（PMP CSRs / Priority and Matching Logic）；
+//     DOC:docs/kb/isa-notes.md §3；DOC:docs/design/08-baseline-5stage.md §5.5 抉择 5/6]
+//==============================================================================
+
+
+
+
+// ---- pmpcfg 位域 [ISA:3A0 描述] ----
+
+
+
+
+
+
+// ---- A 字段编码 ----
+
+
+
+
+// ---- 匹配语义常量（供 pmp_check.v 使用） ----
+
+
+
+//==============================================================================
+// 8. Sv32（satp.MODE / PTE 字段）
+//    [ISA:riscv-isa-manual/src/priv/supervisor.adoc；DOC:docs/kb/isa-notes.md §2]
+//==============================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//==============================================================================
+// 9. AXI4 常量（核内主端口控制器用）
+//    [DOC:docs/kb/platform-facts.md §1.3；DOC:docs/design/05-cache-memory.md §4.2；
+//     DOC:docs/design/08-baseline-5stage.md §7.2]
+//==============================================================================
+
+
+
+
+
+
+
+
+
+
+
+// ---- size：3'b010 = 4 B（=2^2） ----
+
+
+
+// ---- len：4 bit，最大 16 beat ----
+
+// ---- burst ----
+
+
+
+// ---- lock：平台只接 arlock[0:0]/awlock[0:0] ⇒ 核内高位必须显式置 0 ----
+
+// ---- cache/prot（08 §7.1 要点 4） ----
+
+
+
+// ---- resp ----
+
+
+
+
+// ---- 4 KiB 边界（控制器必须在描述符生成时拆分） ----
+
+
+
+//==============================================================================
+// 10. 陷阱取值口径开关与平台窗口常量（供取值/译码共用，避免各处硬编码）
+//     窗口值 [DOC:docs/kb/platform-facts.md §2；DOC:docs/design/05-cache-memory.md §5.1]
+//==============================================================================
+// mtval 写「故障指令位」：**本设计选择实现**（规范为可选）
+// [ISA:riscv-isa-manual/src/priv/machine.adoc:2039-2094；DOC:docs/kb/isa-notes.md T1]
+
+// 取指 PMP 检查粒度 = 16-bit parcel：**本设计选择**（规范未明说）
+// [DOC:docs/kb/isa-notes.md T2；DOC:docs/design/08-baseline-5stage.md §5.5 抉择 2]
+
+// 非对齐 vs page/access fault：**本设计选择非对齐优先** [DOC:docs/kb/isa-notes.md T3]
+
+// 2A 不实现 Zicboz（cbo.zero）—— 保留位域不保留逻辑
+// [DOC:docs/design/08-baseline-5stage.md §11 R1；DOC:docs/design/06-csr-privilege.md §7]
+
+// U 模式专用 CSR（ustatus 等）是否落地：见 §4.10 的版本敏感声明
+
+// ---- 核内 MMIO 窗口（取指/访存译码共用；核内截获，绝不发 AXI） ----
+//      每个窗口都给出「(mask,value)」二元组，比较形式统一为 ((PA & mask) == value)；
+//      mask 的位宽 = 该处比较所用的地址位段宽（16 或 12）。
+
+
+
+
+// ---- 平台从设备窗口（同上口径，供 mmio_route/axi_req_desc 共用一份译码） ----
+
+
+
+
+
+
+// ---- XIP 主窗口位段（`RV32GC_XIP_HI20_MSK` / `RV32GC_XIP_HI20_VAL` / `RV32GC_XIP_HI20`）----
+//      ★ 已于 2026-09-14 迁出本文件：这组宏现在**唯一定义在 `rtl/pkg/core_params.vh` §2**，
+//        以避免 core_params.vh 反向依赖 rv32_defs.vh（依赖方向固定为
+//        `rv32_defs.vh → core_params.vh`，两者互不反向引用）。
+
+ // RV32_DEFS_VH
+//==============================================================================
+// core_params.vh —— RV32-GC 项目「结构/平台参数」唯一真源（Unique Source of Truth）
+//==============================================================================
+// 项目    : rv32gc-cpu（阶段二 2A：单发射顺序 5 级基线核，见
+//           docs/design/08-baseline-5stage.md；本文件所有取值与该文一致）
+// 作用域  : 复位/取指地址、平台地址映射、流水级参数、Cache 参数、PMP 项数、
+//           核内设备参数、IP 双分支开关、启动预期常量。
+// 风格    : Verilog-2001 兼容；只允许 localparam / `define / `ifdef；
+//           **本文件不得出现 always 块、模块或端口声明**（AGENT.md §4.3 红线）。
+// 依赖    : 本文件可被独立 include；`RV32GC_USE_VIVADO_IP` 在综合脚本中定义、
+//           在 iverilog/Verilator 回归中**从不定义**（默认走仿真行为模型）。
+// 引用强度: [DOC] 项目文档口径 / [KB] 已核实的知识库事实 / [MEASURED] 本会话实测
+//==============================================================================
+
+
+
+//==============================================================================
+// 1. 复位与取指
+//    [DOC:docs/design/08-baseline-5stage.md §4.3；DOC:docs/kb/platform-facts.md §7]
+//    平台无硬件 boot ROM（soc_top.v:664-1885 无 ROM 例化）⇒ 上板复位取指必须落在
+//    SPI Flash XIP 窗口；chiplab 侧佐证：software/bsp/env/convert.c:88 的 "@1c000000"、
+//    sims/verilator/testbench/include/common.h:9 的 FIRST_INST_ADDRESS 0x1c000000。
+//    ★ 依赖声明：本文件**自包含**（可单独 include，无需先 include 其它头文件）；
+//      其常量不得反向依赖 `rtl/pkg/rv32_defs.vh` 的宏。若某常量两者都需要，
+//      **定义在本文件**（参数/地址口径类），由 rv32_defs.vh 侧只做注释指引。
+//      （推荐 include 顺序仍为 rv32_defs.vh → core_params.vh，但非强制。）
+//==============================================================================
+
+
+
+// ---- SPI XIP 窗口与别名（同一片 SPI 存储体的两个视图） ----
+//    [DOC:docs/kb/platform-facts.md §2.3] godson_sbridge_spi.v:192-194 做别名归一，
+//    soc_top.v:1227 传入 spi_addr=16'h1fe8。
+
+
+
+
+// ---- XIP 主窗口高 12 位位段判定（**唯一定义处**；2026-09-14 由 rv32_defs.vh §10 迁入） ----
+//      比较形式与 §2 MMIO 掩码统一为 ((PA[31:20] & MSK) == VAL)。
+
+
+
+
+//==============================================================================
+// 2. 平台地址映射（核内不实现外设；外设条目只作软件/注释口径）
+//    [DOC:docs/kb/platform-facts.md §2；DOC:docs/design/05-cache-memory.md §5.1]
+//==============================================================================
+// ---- DDR3：平台默认从设备（axi_mux_syn.v:860/951 的 addr_hit[0]） ----
+
+
+
+
+
+
+// ---- 核内私有设备（必须核内截获；平台 axi_mux 未占用这些地址） ----
+//    不截获的后果：静默落到 DDR3 默认通路 ⇒ 无声数据损坏。
+
+
+
+
+
+// ---- 平台外设/配置窗口（核内**不实现**，仅登记以统一软件口径与译码） ----
+
+
+
+
+
+
+
+// ---- MMIO 判定掩码（译码只写一处；与 rv32_defs.vh §10 的 *_HIT_VAL 配套） ----
+
+
+
+
+
+//==============================================================================
+// 3. 时钟与时间基准
+//    [DOC:docs/kb/platform-facts.md §5；DOC:docs/design/01-overview-datapath.md §7.1]
+//    上板口径：cpu_clk = uncore_clk = 33 MHz（clk_pll_33.clk_out2），同域无 CDC；
+//    仿真按相同频率给时钟，不改变同域性质。
+//==============================================================================
+
+
+
+
+
+//==============================================================================
+// 4. 流水线与微架构参数（**2A 口径**：单发射、顺序、5 级 F/D/E/M/W）
+//    [DOC:docs/design/08-baseline-5stage.md §1.1、§5.0]
+//    ★ 注意：2B（4 发射乱序、11 级）是后置里程碑，本文件不得预置其参数。
+//==============================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---- 2A 性能非门禁项，登记以便跨阶段口径一致 ----
+
+
+//==============================================================================
+// 5. 核内 CLINT / PLIC 参数
+//    [DOC:docs/design/08-baseline-5stage.md §6.6；DOC:docs/design/06-csr-privilege.md §8]
+//==============================================================================
+// ---- CLINT 寄存器偏移（基址 RV32GC_CLINT_BASE） ----
+
+
+
+
+
+
+
+// ---- PLIC 参数（2 个上下文：0=M⇒MEIP、1=S⇒SEIP；源 1..5） ----
+
+
+
+
+
+
+// ---- PLIC 寄存器映射（偏移） ----
+
+
+
+
+
+// ---- intrpt[4:0] → PLIC 源号 默认接线（**实现 plic.v 时定稿**，RTL 与 DTS 只写一处） ----
+//      [DOC:docs/design/08-baseline-5stage.md §6.6 表；平台侧 intr_out 组成见 soc_top.v:725]
+
+
+
+
+
+
+
+//==============================================================================
+// 6. PMP 参数（16 项，粒度 G=0 ⇒ 4 B，NA4 可用）
+//    [DOC:docs/design/08-baseline-5stage.md §5.5 抉择 5/6；DOC:docs/kb/isa-notes.md §3.1]
+//==============================================================================
+
+
+
+
+
+
+
+//==============================================================================
+// 7. Cache / CMO 参数（2A）：L1I 16 KB（2 路/32 B 行）、L1D 32 KB（4 路/32 B 行）
+//    [DOC:docs/design/05-cache-memory.md §3.1；DOC:docs/design/08-baseline-5stage.md §1.1]
+//    ★ 2A **不实现 L2**；L2 参数仅作后置里程碑（M6）口径登记，下面均标注 L2_ 前缀。
+//    ★ 用户裁决：CMO block size —— clean/flush = 64 B（L2 行）、zero = 32 B（L1D 行）；
+//      发现路径为设备树属性，不新增 CSR（08 §6.5）。
+//==============================================================================
+// ---- L1I ----
+
+
+
+
+
+
+
+// ---- L1D ----
+
+
+
+
+
+
+
+
+
+
+// ---- L2（2A 不实现；仅登记 M6 口径） ----
+
+
+
+
+// ---- CMO block size（用户裁决 2026-09-14，08 §6.5） ----
+
+
+
+
+
+//==============================================================================
+// 8. AXI 控制器参数（2A：核内手写主端口控制器，边界判定见 08 §7.1）
+//==============================================================================
+
+
+
+
+
+
+
+
+
+//==============================================================================
+// 9. IP 双分支开关（AGENT.md §4 红线 1/2；08 §3.3、§7.3）
+//    `RV32GC_USE_VIVADO_IP`：**综合脚本定义**（synth.tcl 走 Vivado IP）；
+//    **iverilog / Verilator 回归从不定义**（走逐拍等价行为模型）。
+//    宏名固定，不得改名（08 §3.3 第 3 条）。
+//==============================================================================
+// 提示：不要在此处 `define RV32GC_USE_VIVADO_IP——默认必须是"未定义=仿真行为模型"。
+
+
+
+
+  
+  
+
+// 各类 IP 的归属登记（供综合脚本与评审核对；红线 1 要求留检索结论）
+
+
+
+
+
+//==============================================================================
+// 10. 启动/回归预期常量（供 M1 TB 与后续自检脚本使用；不含任何行为逻辑）
+//==============================================================================
+
+
+//      ^ 2A 实现的扩展集合（08 §1.1）。**仅作字符串标识**（报告/日志用）；
+//        不得用于条件编译（Verilog 宏在 `ifdef` 中不能比较字符串内容）。
+//        Spike 侧 --isa 字符串须另按 spike 实际接受的形式书写（08 §8.3）。
+
+
+
+
+
+
+
+
+ // CORE_PARAMS_VH
+module mac_top;
+  parameter integer W = 2;
+  localparam integer S = (RV32GC_L1I_SIZE_KB * 1024);
+  initial begin
+    $display("W=%0d S=%0d", W, S);
+    if (W != 2) $display("BAD");
+    $finish;
+  end
+endmodule

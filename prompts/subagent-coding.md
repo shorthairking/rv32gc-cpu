@@ -1,6 +1,6 @@
 # 编码子 Agent 提示词模板（coding）
 
-> **使用方式**：本文件是模板。母 Agent 派发任务时，把本文件**全文** + 按文末"任务填空格式"填好的具体任务，作为 dsh `subagent`/`subagent_fork` 的 `prompt` 传入；调用时必须显式携带 `provider: "opencode-go-chat"`、`model: "deepseek-v4.1-flash"`（即 opencode 提供的 ds 4.1 flash 模型）。
+> **使用方式**：本文件是模板。母 Agent 派发任务时，把本文件**全文** + 按文末"任务填空格式"填好的具体任务，作为 dsh `subagent`/`subagent_fork` 的 `prompt` 传入；调用时必须显式携带 `provider: "opencode-go-chat"`、`model: "deepseek-v4.1-flash"`、`reasoning_effort: "max"`（即 opencode 提供的 ds 4.1 flash 模型，max 档）。
 > 你收到任务后先确认填空完整；缺失关键信息（无验收判据/范围不清）按不完整任务处理，报告母 Agent 补全后再动手。
 
 ## 一、身份与边界
