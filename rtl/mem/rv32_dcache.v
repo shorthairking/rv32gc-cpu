@@ -138,8 +138,8 @@ module rv32_dcache #(
   //-----------------------------------------------------------------------------
   // 阵列（一行 32 B；tag 20 bit；valid 单独一条 1024 bit 寄存器）
   //-----------------------------------------------------------------------------
-  reg [TAG_W-1:0] tag_mem  [0:ENT-1];      // {set[6:0], way[2:0]}
-  reg [255:0]     line_mem [0:ENT-1];
+  (* ram_style = "block" *) reg [TAG_W-1:0] tag_mem [0:ENT-1];  // {set[6:0], way[2:0]}；ram_style 供 Vivado 正确推断 BRAM
+  (* ram_style = "block" *) reg [255:0] line_mem [0:ENT-1];
   reg [ENT-1:0]   valid_q;                 // 同上索引（整条寄存器：复位/清空一次赋值）
   // 组内轮转牺牲指针（RR 替换）：128 组 × 3 bit 打成**一整条寄存器**（不是"数组 + for"）。
   reg [SETS*WAY_W-1:0] rr_q;

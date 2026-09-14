@@ -53,3 +53,61 @@ vivado -mode batch -nojournal -nolog -source fpga/tcl/create_clk_wiz_cpu.tcl -tc
 - [ ] 综合 → 实现 → `report_timing_summary`（WNS ≥ 0 @ 目标频率，否则按 `07-fpga-timing.md` §2 降级）
 - [ ] `write_bitstream` + 上板 B1~B8（bring-up 顺序见 `07-fpga-timing.md` §5）
 - [ ] `program_fpga.tcl` 下载脚本
+
+---
+
+## 2. 上板前准备清单（阶段 2A，2026-09-13 定稿；**上板动作本身等用户放行**）
+
+### 2.1 CPU 时钟＝33 MHz：**直接取平台 `clk_pll_33` 的 `clk_out2`**（不再新建 IP）
+
+用户第 8 轮拍板上板时钟 33 MHz。**实现方式不是**给核建独立 Clocking Wizard，而是：
+
+```
+clk_pll_33 (
+  .clk_in1 (clk),          // 板级 100 MHz（soc_up.xdc: create_clock -period 10.000）
+  .clk_out1(  ),           // 原 50 MHz（原给 cpu_clk）—— 现在**不用**
+  .clk_out2(uncore_clk)    // 33 MHz：uncore（DDR/UART/NAND/SPI/MAC）**并且**给 cpu_clk
+);
+```
+
+把 `chip/soc_demo/loongson/soc_top.v` 里 CPU 的时钟从 `clk_out1` 改为 `clk_out2`（或把两者接同一网络），
+并同步 `chip/soc_demo/loongson/config.h` 的 `FREQ` → **33**。**为什么不用独立 MMCM 精确合成 33 MHz**：
+100 MHz 到 33 MHz 没有整数/0.125 步进可精确表示的比（`100×M/DIVCLK = 33×CLKOUT0` 在 VCO 600~1440 内
+无精确解，如 VCO=1087.5 → 32.95 MHz，偏差 0.15%）。用平台自己的 `clk_out2`（由平台 PLL 配置生成）
+既精确又**让 CPU 与 uncore 同域 ⇒ AXI 全同步、无 CDC**（参考 LA32R 核是 50/33 双域，我们不需要）。
+`tcl/create_clk_wiz_cpu.tcl` 保留，供将来要做独立时钟域时用（`-tclargs 33` 会由 Wizard 求解近似值）。
+
+### 2.2 AXI 端口核对（`core_top` ↔ `soc_top` 的 CPU 例化位）
+
+| 方向 | 本核 `rtl/top/core_top.v` | 平台 `soc_top.v` 里 CPU 例化的同名网络 | 备注 |
+|---|---|---|---|
+| 时钟/复位 | `aclk`, `aresetn` | `cpu_clk`(2.1 后 = clk_out2), `resetn` | 33 MHz 同域 |
+| 中断 | `intrpt[7:0]` | `{3'b0, dma_int, nand_int, spi_inta_o, uart0_int, mac_int}` | PLIC 源号固定 1=UART0/2=SPI/3=NAND/4=MAC/5=DMA（与 DTS 一致） |
+| 读通道 | `arid/araddr/arlen/arsize/arburst/arlock/arcache/arprot/arvalid/arready` + `rid/rdata/rresp/rlast/rvalid/rready` | 同名 | `arid` 恒 4'b0；取指 8 beat、数据单拍、**行填充 8 beat（ID=1）** |
+| 写通道 | `awid/awaddr/awlen/awsize/awburst/awlock/awcache/awprot/awvalid/awready` + `wid/wdata/wstrb/wlast/wvalid/wready` + `bid/bresp/bvalid/bready` | 同名 | L1D 为写直达：每笔 store 一次单拍写 |
+| 复位向量 | `-DRESET_PC=32'h1C00_0000`（编译期宏）| — | **必须写 Verilog 字面量**（写 `0x…` 会让 core 报无关语法错） |
+
+核对方法：`grep -n "\.arid\|\.araddr\|\.intrpt\|\.clk" chip/soc_demo/loongson/soc_top.v | head`，
+与本表逐行对照；本阶段**不改平台互连编址**（D15）。
+
+### 2.3 BRAM 推断（本次已加属性）
+
+`rtl/frontend/rv32_icache.v` 与 `rtl/mem/rv32_dcache.v` 的 `line_mem`/`tag_mem` 已加
+`(* ram_style = "block" *)`（仿真行为不变；`hello`/`DCACHE_UNIT` 复跑仍 PASS）。
+综合后请在报告里确认：
+```tcl
+open_run synth_1 ; report_utilization -hierarchical -file util.rpt
+report_cdc -file cdc.rpt          # 33 MHz 同域后应无 CDC 违例
+```
+判据：`RAMB36/RAMB18` 有明显占用、**`LUTRAM` 里看不到 512×256 的大阵列**（若被推断成分布式 RAM，
+LUT 会爆且时序会崩，此时再检查 `ram_style` 是否被综合属性覆盖）。
+
+### 2.4 B1 上板步骤（等用户放行后执行）
+
+1. `vivado -mode batch -source tcl/build_chiplab.tcl`（阶段五待补）→ 综合/实现/生成 bitstream，
+   **先看 WNS ≥ 0（33 MHz / 30.303 ns）**；
+2. JTAG 下载 bitstream；串口 **115200 8N1** 打开；
+3. 烧 `sw/board/out/spi_flash.img`（≤1 MiB，`scripts/pack_boot_image.sh` 产物）到 SPI flash；
+4. 复位后**期望**：串口出现 `[RV32-GC] SPI stub at 0x1C000000 … -> jump DDR 0x0`，
+   随后 DDR 镜像横幅（B2 阶段才有 U-Boot）；
+5. 判据与失败排查见 `../docs/porting/07-board-bringup-plan.md` §3（B1 表）与 §6（风险 R1~R8）。
