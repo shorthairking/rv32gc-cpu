@@ -49,14 +49,5 @@ sim/log/
 # Vivado 工程/综合/实现产物（可由 fpga/tcl/*.tcl 重新生成）
 fpga/out/
 
-# === 已废弃实现（2026-09-14 起不再追踪；文件保留在磁盘，仅作参考）===
-# 本仓库只追踪 Agent 建立/交接类文档（AGENT.md / PROMPT.md / NEXT_SESSION.md）
-# 与 .gitignore 本身；其余全部为上一代低质量实现，已取消追踪。
-README.md
-a.out
-/docs/
-/fpga/
-/rtl/
-/scripts/
-/sim/
-/sw/
+# 注（2026-09-14 重定位）：上一代实现文件已从磁盘移除（历史见 master 分支），
+# 本仓库 dev 分支即新项目；docs/ rtl/ sim/ sw/ fpga/ scripts/ 等目录后续按阶段重新建立并正常追踪。
