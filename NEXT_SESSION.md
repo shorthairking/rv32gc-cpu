@@ -34,15 +34,15 @@
 
 T1 mtval 写指令位=可选（本设计选择实现）；T2 取指 PMP 按 memory operation 独立检查、2B-parcel 是本设计选择（非规范强制）、无执行权限报 instruction access fault；T3 非对齐 vs page/access fault 优先级=实现可选（本设计选非对齐优先）；T4 AMO 被 PMP 拒恒 cause 7；T5 陷阱不降级委托、medeleg 逻辑 64 位（RV32 经 medelegh 别名）；T6 中断取点规范未明说（本设计纪律：副作用已落地之后取）；T7 MPRV 按 MPP 语义、xRET 到 <M 清 MPRV；T8 Zicbom rs1 不要求块对齐、CMO 不产生非对齐异常；menvcfg.CBIE/CBCFE 门控 S/U 模式 cbo.*。
 
-## 5. 待用户裁决清单（阶段一审阅时一并提出）
+## 5. 阶段一审阅裁决（2026-09-14，用户已拍板，全部生效）
 
-1. chiplab 工作树 dirty 改动（33MHz 补丁 + IP 升级产物）是否纳入新基线。
-2. PLIC 源号映射方案（06 §8.3 提议：源 1-5 = UART0/NAND/DMA/SPI/MAC；是否允许改 soc_top.v 启用更多源）。
-3. CMO block size 软件发现路径（05 §7.2 提议：设备树属性，无自定义 CSR）。
-4. mtvec/stvec 是否实现 Vectored 模式。
-5. NAND 门禁 D1/D2/D5 的解锁方式（几何实测/平台文档/原理图）。
-6. Spike 重取编译（需 device-tree-compiler + libboost-regex/system-dev，sudo 不可用，可能需用户在沙箱外安装）。
-7. PMP 粒度 G=0（NA4 可用）的面积权衡（06 §6.3，P-4 待测）。
+1. **chiplab 回退**：已回退干净（HEAD `a2e11b3`，0 dirty；原接线 `clk_out1=cpu_clk`(50M)/`clk_out2=uncore_clk`(33M) 恢复）；不采用旧项目任何修改。
+2. **chiplab 可改**：本项目可不受限制地修改 chiplab（按需，含 `soc_top.v`/`intrpt` 扩展）。
+3. **CMO block size**（已定）：cbo.clean/flush block=64B（L2 行）、cbo.zero=32B（L1D 行）；设备树属性 `riscv,cbom-block-size`/`riscv,cboz-block-size` 发现；无自定义 CSR。
+4. **mtvec/stvec Vectored**（已定）：实现。
+5. **NAND**（已定）：无原始资料；以 chiplab RTL（`nand.v`/`apb_dev_top_with_nand.v`）与 la32r-Linux 驱动（`ls1a_nand.c`）为准；**不改 chiplab NAND 模块**；几何口径按"块 128KiB=主区 64 页×2048B，备用区另行"工作。
+6. **Spike**（已定）：由用户在沙箱外编译，目标安装路径 `/opt/riscv/bin/spike`；编译命令见 §6；编好后知会母 Agent 记录版本。
+7. **PMP 粒度**（已定）：保持 G=0（NA4 可用）；资源允许前提下性能优先，资源告警再议。
 
 ## 6. 常用命令
 
@@ -55,6 +55,31 @@ source /home/shorthair/fpga/Vivado/2023.2/settings64.sh
 export LD_LIBRARY_PATH=/home/shorthair/fpga/Vivado/2023.2/lib/lnx64.o/Rhel/9:$LD_LIBRARY_PATH
 /opt/riscv/bin/riscv32-unknown-linux-gnu-gcc --version
 ```
+
+## 6.5 Spike 编译（用户执行，沙箱外；装好后通知母 Agent）
+
+```bash
+# 1) 依赖（需 sudo，沙箱内不可用，由用户执行）
+sudo apt-get install device-tree-compiler libboost-regex-dev libboost-system-dev
+
+# 2) 取源码（二选一）
+# A) 独立仓库（推荐）
+git clone https://github.com/riscv-software-src/riscv-isa-sim ~/riscv-isa-sim
+cd ~/riscv-isa-sim
+# B) 或复用工具链子模块（版本与工具链匹配）
+# cd /home/shorthair/dsh/rv32-cpu/riscv-gnu-toolchain && git submodule update --init spike && cd spike
+
+# 3) 编译安装到 /opt/riscv（与工具链同前缀）
+mkdir build && cd build
+../configure --prefix=/opt/riscv --enable-commitlog
+#   若提示不认识 --enable-commitlog（老版本无该选项），去掉它重试
+make -j$(nproc)
+sudo make install
+spike --version     # 预期 /opt/riscv/bin/spike
+```
+
+- 验证（可选）：`spike --isa=rv32imafdc_zicsr_zifencei_zicntr_zicbom <elf>`。
+- arch-test 官方调用口径：`spike --instructions=100000000 -l --log-commits --log=<trace> --isa=rv32imafd_zicclsm_zicsr_zifencei_zicntr_zaamo_zalrsc`（`--log-commits` 输出在 **stderr**）。
 
 ## 7. 纪律提醒（对本文件读者）
 

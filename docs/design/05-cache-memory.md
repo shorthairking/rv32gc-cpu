@@ -233,7 +233,7 @@ graph TD
 
 - **管理指令 block size = 64 B**（等于 L2 行大小）。理由：CMO 的契约对象是「与内存之间的一致性粒度」，本设计的跨层一致性由 L2 承担；L1 行 32 B 是 L2 行的子集，对 64 B block 做 clean/flush 必然覆盖对应的两个 L1 行。
 - **`cbo.zero` 的 zero block size = 32 B**（等于 L1D 行大小）。理由：`cbo.zero` 是「块写」，直接打在 L1D 上最经济；取 64 B 会让一次 `cbo.zero` 跨越两个 L1 行与可能的页边界，带来不必要的两页页表检查。
-- **软件发现路径**：ISA 未规定固定的发现寄存器（Zicbom 本身不定义专用 CSR），因此本设计**不新增非标准 CSR**，而是要求引导/内核侧通过设备树属性（如 `riscv,cbom-block-size = <64>`、`riscv,cboz-block-size = <32>`）获得。该口径与 Linux 内核既有的 `riscv,cbom-block-size` 解析方式一致，属于「待用户定」项之一（见 §9）。
+- **软件发现路径**：ISA 未规定固定的发现寄存器（Zicbom 本身不定义专用 CSR），因此本设计**不新增非标准 CSR**，而是要求引导/内核侧通过设备树属性（如 `riscv,cbom-block-size = <64>`、`riscv,cboz-block-size = <32>`）获得。该口径与 Linux 内核既有的 `riscv,cbom-block-size` 解析方式一致。**用户已定（2026-09-14）**：`cbo.clean`/`cbo.flush` block = **64 B**（L2 行）、`cbo.zero` block = **32 B**（L1D 行）；发现路径沿用设备树属性 `riscv,cbom-block-size`/`riscv,cboz-block-size`，**不新增自定义 CSR**（裁决口径：按对 CPU 性能较好的方式）。详见 §9。
 - **粒度对齐**：两个值都是 2 的幂且 ≥ 4 B，满足 `rs1` 不必对齐时「按含 `rs1` 的 block 对齐后操作」的要求。
 
 ### 7.3 CSR 门控（ISA 强制项）
@@ -324,8 +324,8 @@ graph TD
 | 编号 | 项 | 状态 | 说明 |
 |---|---|---|---|
 | C-1 | L1I 为 2 路，若 arch-test/Linux 出现 I-Cache 冲突抖动 | 待测 | 可通过把 L1I 改 4 路（容量不变、组数减半）缓解；参数已在 §3.1 集中定义，改动只影响一处 |
-| C-2 | CMO block size 的软件发现路径（设备树属性 vs 自定义 CSR） | **待用户定** | 本文 §7.2 取「设备树属性、不新增非标准 CSR」；若用户要求走 CSR 发现，需另开任务 |
-| C-3 | `cbo.zero` block size 取 32 B 与 `cbo.clean` 的 64 B 不一致 | 待用户定 | 两者在 ISA 中本就是两个独立可发现量（`cmo.adoc` Software Discovery 分列），但需确认 Linux/OpenSBI 是否接受 |
+| C-2 | CMO block size 的软件发现路径（设备树属性 vs 自定义 CSR） | **用户已定（2026-09-14）** | 裁决：经设备树属性 `riscv,cbom-block-size`/`riscv,cboz-block-size` 发现，**不新增自定义 CSR**（口径：按对 CPU 性能较好的方式）；与本文 §7.2 一致 |
+| C-3 | `cbo.zero` block size 取 32 B 与 `cbo.clean` 的 64 B 不一致 | **用户已定（2026-09-14）** | 裁决：`cbo.clean`/`cbo.flush` block = **64 B**（L2 行）、`cbo.zero` block = **32 B**（L1D 行）；两者在 ISA 中本就是两个独立可发现量（`cmo.adoc` Software Discovery 分列），按此落地 |
 | C-4 | L2 包容性（inclusive）在 256 KB 下对 L1 的独占反压 | 待测 | 若 L2 失效压力过大，退化为 NINE（non-inclusive non-exclusive）策略；需在 RTL 中预留策略开关 |
 | C-5 | 4 K 边界与 AXI 突发拆分 | 待实现 | 64 B 行在 4 KiB 边界上除最后一行外均对齐，但跨 4 K 的首行需拆突发；拆分由 Vivado AXI IP 处理，本设计只需保证不生成跨 4 K 的单条 `AxLEN` |
 | C-6 | `AxCACHE`/`AxPROT` 在 chiplab `axi_mux` 上是否被透传 | 待核实 | 平台 `axi_mux_syn.v` 未见对 `cache`/`prot` 的语义依赖（仅转发），但上板前需以仿真波形确认 |

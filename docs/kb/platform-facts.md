@@ -207,17 +207,20 @@
 
 | 文件 | 处置 |
 |---|---|
-| `chip/soc_demo/loongson/soc_top.v` | **modified** —— 含 §5 的 33 MHz 方案改动；**处置待定** |
+| `chip/soc_demo/loongson/soc_top.v` | **modified** —— 含 §5 的 33 MHz 方案改动；**处置：用户已定（2026-09-14），已回退干净基线（见下）** |
 | `IP/xilinx_ip/2023.2/axi_clock_converter_0/axi_clock_converter_0.xcix` | modified |
 | `IP/xilinx_ip/2023.2/mig_axi_32_loongson/mig_axi_32.xci` | modified |
 | `fpga/loongson/2023.2/system_run.xpr` | modified（Vivado 工程文件，工具回写） |
 
 **未跟踪文件（`??`）**：`IP/xilinx_ip/2023.2/axi_2x1_mux/` 下的一批 IP 产物（`.dcp`/`.veo`/`.vho`/`.xml`/`*_clocks.xdc`/`*_ooc.xdc`/`*_sim_netlist.v[hdl]`/`*_stub.v[hdl]`/`doc/`/`hdl/`/`sim/`/`simulation/`/`synth/`）。
 
-**处置口径（待母 Agent/用户拍板）**：
-1. **不动 chiplab 的任何文件** —— 本项目红线；上述 dirty 状态是**继承的既有状态**，不是本项目本轮产生的。
-2. `soc_top.v` 的 33 MHz 改动是本项目**必需**的（否则 CPU 域与 uncore 域不同频）；但它**污染了平台仓库**。可选路线：(a) 保持就地修改并记录为"平台补丁"；(b) 上游化为独立 patch 文件，平台树还原。
-3. **本节只做快照与登记，不做任何写操作。**
+**处置口径**：
+
+1. **用户已定（2026-09-14）：chiplab 工作树已回退干净基线** —— HEAD `a2e11b3`，`git status --porcelain` 为 **0 dirty**；原接线 `clk_out1=cpu_clk`(50 MHz)/`clk_out2=uncore_clk`(33 MHz) 已恢复。不采用旧项目任何修改。
+   - **沿用提示**：上述「§8 快照」按其采集时点记录，回退后**已不反映当前状态**；当前状态以本条为准。
+2. **用户许可**：**本项目可不受限制地按需修改 chiplab**（含 `soc_top.v` 与 `intrpt` 扩展）——原先「不动 chiplab 任何文件」的红线**已由用户裁决解除**。
+3. `soc_top.v` 的 33 MHz 改动若后续仍需要，按第 2 条就地修改即可并记录为"平台补丁"。
+4. **本节只做快照与登记，不做任何写操作。**
 
 ---
 

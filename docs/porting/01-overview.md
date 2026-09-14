@@ -175,6 +175,8 @@
 
 - **注意**：分区口径写的是 `50M(kernel)ro`，即 kernel 分区标记只读。**注意 U-Boot 的 `mtdparts` 语法里 `ro` 的语义**需在实现时确认（通常只影响 Linux MTD 侧的分区只读标志，U-Boot 侧仍可擦写）。[工程约定] / 待核实。
 
+> **用户已定（2026-09-14）**：NAND 分区/几何的裁决口径 —— 以 chiplab RTL（`IP/APB_DEV/NAND/nand.v`、`apb_dev_top_with_nand.v`）与 la32r-Linux 驱动（`ls1a_nand.c`）的**实际实现为准**；工作口径 "块 128 KiB = 主区 64 页 × 2048 B，备用区 64 × 64 B 另行"；**不修改 chiplab NAND 模块**。本节分区表（`256K/50M/1M/-`）为项目自定义约定，块对齐仍按 128 KiB 核算。详见 `04-nand-driver.md` §1.2/§8。
+
 ### 3.4 与 SPI NOR 的分工
 
 - SPI NOR = 16 MiB，存放 **PMON / 早期引导 / U-Boot**（DIP 插座）。[旧项目转述]

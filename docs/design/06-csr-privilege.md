@@ -143,7 +143,7 @@ U 模式访问其它任何 CSR ⇒ 非法指令异常。S 模式访问 M 模式 
 - `MODE=0`（Direct）：所有陷阱 pc ← `BASE`。
 - `MODE=1`（Vectored）：**同步异常** pc ← `BASE`；**中断** pc ← `BASE + 4 × cause`（例如 M 定时器中断 cause=7 ⇒ `BASE+0x1C`）。——`kb` chunk 10544 与 `riscv-arch-test/coverpoints/norm/ExceptionsSm.yaml:220-224`。
 - `MODE ≥ 2` 保留。实现可在 Vectored 下施加比 Direct 更严的对齐约束（`kb` chunk 10544）。
-- **本设计口径**：`BASE` 强制 4 B 对齐（低 2 位置 0）；若实现 Vectored，则要求 `BASE` 256 B 对齐（即低 8 位为 0）以便用 `BASE | (cause << 2)` 直接合成，无需加法器（这正是手册 NOTE 提到的动机）。**是否支持 Vectored 待用户确认**（见 §11）。
+- **本设计口径**：`BASE` 强制 4 B 对齐（低 2 位置 0）；**用户已定（2026-09-14）：实现 Vectored 模式**，故 Vectored 下要求 `BASE` 256 B 对齐（即低 8 位为 0），以便用 `BASE | (cause << 2)` 直接合成，无需加法器（这正是手册 NOTE 提到的动机）。见 §11 P-3。
 - `stvec` 语义同构（BASE 4 B 对齐，`riscv-isa-manual/src/priv/supervisor.adoc` Supervisor Trap Vector Base Address Register，`kb` chunk 10755）。
 
 ### 3.3 `mepc` / `sepc`
@@ -485,20 +485,22 @@ assign int_out = {1'b0,dma_int,nand_int,spi_inta_o,uart0_int,mac_int};
 
 | 引脚 | 源 | 本设计提议的中断号 |
 |---|---|---|
-| `intrpt[0]` | `mac_int` | 待定 |
-| `intrpt[1]` | `uart0_int` | 待定 |
-| `intrpt[2]` | `spi_inta_o` | 待定 |
-| `intrpt[3]` | `nand_int` | 待定 |
-| `intrpt[4]` | `dma_int` | 待定 |
+| `intrpt[0]` | `mac_int` | 待实现时定 |
+| `intrpt[1]` | `uart0_int` | 待实现时定 |
+| `intrpt[2]` | `spi_inta_o` | 待实现时定 |
+| `intrpt[3]` | `nand_int` | 待实现时定 |
+| `intrpt[4]` | `dma_int` | 待实现时定 |
 
-**提议方案（"待用户定"）**：由于 `intrpt` 只有 5 位而 RISC-V PLIC 源可扩展至 1023，本项目采用**核内 PLIC + 固定编号映射**：
+**提议方案**：由于 `intrpt` 只有 5 位而 RISC-V PLIC 源可扩展至 1023，本项目采用**核内 PLIC + 固定编号映射**：
 
 - 将 `intrpt[0]`–`intrpt[4]` 映射为核内 PLIC 的**源 1–5**（PLIC 源 0 保留为「无中断」）；
 - 在 PLIC 中为每个源提供独立的 enable / pending / claim-complete 寄存器，因此**内核仍能区分中断源**，不丢失信息；
 - 建议的语义分配（供 OpenSBI/Linux 设备树使用）：源 1 = UART0（串口控制台，最高频），源 2 = NAND（存储），源 3 = DMA（NAND 驱动依赖），源 4 = SPI，源 5 = MAC；
 - 若用户希望保持「引脚号 = PLIC 源号」的直通（即 `intrpt[n]` ⇒ 源 `n+1`）则上述建议调整；**该映射一经确定，必须写进设备树与 OpenSBI 平台代码，不得在 RTL 与软件两侧各写一份**。
 
-**风险**：`intrpt[7:5]` 硬连 0，意味着**平台侧无法把 8 个源的完整信息传给核**。若将来需要 >5 个源（例如启用 MAC 的多个中断位），只能改 `soc_top.v`——这与「不改 SoC 顶层」的口径冲突，须由用户决策。**当前不实现该扩展。**
+**用户已定（2026-09-14）**：**允许修改 chiplab**（含 `soc_top.v` 与 `intrpt` 扩展），按实际需要修改；**PLIC 源号映射在实现时定**（上文建议仅供参考，届时以设备树/OpenSBI 的唯一一份定义为准）。
+
+**风险**：`intrpt[7:5]` 硬连 0，意味着**平台侧无法把 8 个源的完整信息传给核**。若将来需要 >5 个源（例如启用 MAC 的多个中断位），只能改 `soc_top.v`——**用户已定（2026-09-14）许可本项目按需修改 chiplab**，原先「不改 SoC 顶层」的约束不再成立。**当前不实现该扩展。**
 
 ### 8.4 PLIC 寄存器布局（本设计）
 
@@ -546,10 +548,10 @@ assign int_out = {1'b0,dma_int,nand_int,spi_inta_o,uart0_int,mac_int};
 
 | 编号 | 项 | 状态 | 说明 |
 |---|---|---|---|
-| P-1 | PLIC 源号映射（`intrpt[4:0]` ⇒ PLIC 源 1–5 的语义分配） | **待用户定** | §8.3 给出提议；需用户确认后写进设备树/OpenSBI |
-| P-2 | `intrpt[7:5]` 硬连 0，平台无法传 >5 源 | **待用户定** | 若需扩展须改 `soc_top.v`，与「不改 SoC 顶层」冲突 |
-| P-3 | `mtvec`/`stvec` 是否实现 Vectored 模式 | **待用户定** | 实现 Vectored 需 `BASE` 256 B 对齐约束；Direct-only 更省面积 |
-| P-4 | PMP 粒度 `G=0`（NA4 可用）在 16 项下的面积 | 待测 | 16 项 NA4/TOR/NAPOT 的组合比较器是组合逻辑热点，需在时序收敛时评估是否需流水 |
+| P-1 | PLIC 源号映射（`intrpt[4:0]` ⇒ PLIC 源 1–5 的语义分配） | **用户已定（2026-09-14）** | 裁决：允许修改 chiplab（含 `soc_top.v`/`intrpt` 扩展），按实际需要；**源号映射在实现时定**（§8.3 的建议仅供实现参考） |
+| P-2 | `intrpt[7:5]` 硬连 0，平台无法传 >5 源 | **用户已定（2026-09-14）** | 裁决：允许修改 chiplab（含 `soc_top.v`/`intrpt` 扩展），原「不改 SoC 顶层」约束解除；扩展与否按实际需要 |
+| P-3 | `mtvec`/`stvec` 是否实现 Vectored 模式 | **用户已定（2026-09-14）** | 裁决：**实现 Vectored 模式**；需落实 `BASE` 256 B 对齐约束（§3.2） |
+| P-4 | PMP 粒度 `G=0`（NA4 可用）在 16 项下的面积 | **用户已定（2026-09-14）** | 裁决：**保持 `G=0`（NA4 可用）**；资源允许前提下性能优先，资源告警再议（16 项 NA4/TOR/NAPOT 的组合比较器是组合逻辑热点，时序收敛时评估是否需流水） |
 | P-5 | `misa` 的扩展位取值（含 `S`/`U` 位） | 待实现 | Linux 依赖 `misa` 判定；须与 arch-test 的 MARCH 一致 |
 | P-6 | A/D 位硬件更新（Svade 未实现方案）的实现代价 | 待测 | 硬件更新需原子读改写 PTE，可能与 L1D 写通道争用；备选是实现 Svade（A/D 缺失即 page fault，由软件设位） |
 | P-7 | `MPRV=1` 且 `MPP=S` 时 `SUM` 生效的旁路路径 | **高风险** | `norm:mstatussumopmprvmpp` 明确要求；漏实现会导致 M 模式模拟 U 访问时静默越权 |

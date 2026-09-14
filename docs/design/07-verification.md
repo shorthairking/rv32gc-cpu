@@ -276,7 +276,7 @@ export HOME=<工作区>/<项目>/.vivado_home
 #   set_property source_mgmt_mode None
 ```
 
-- **`fpga/run_vivado_batch.sh` 待建**（见 §9 前置项），统一封装上述三条环境设置 + `vivado -mode batch -source <tcl>`。
+- **`fpga/run_vivado_batch.sh` 待建**（见 §9 前置项；**用户已定（2026-09-14）：保持待建，阶段二建立**），统一封装上述三条环境设置 + `vivado -mode batch -source <tcl>`。
 - 综合脚本必须只包含本项目的 `rtl/**`，不修改 chiplab 平台文件。
 - 时序验收：`report_timing_summary` 无负 slack（33 MHz 下）；面积验收：BRAM/DSP 占用在 `xc7a200tfbg676-2` 容量内。
 
@@ -327,18 +327,18 @@ sim/            # 仿真 TB 与回归脚本
   lockstep/     # Spike 锁步比对
   regress.sh    # 顶层回归入口（"未捕获即失败"）
 fpga/
-  run_vivado_batch.sh   # 【待建】Vivado 统一入口
+  run_vivado_batch.sh   # 【待建】Vivado 统一入口；**用户已定（2026-09-14）**：保持待建，阶段二建立
   *.tcl                 # 综合/实现脚本
 tools/
-  spike/                # 【待建】Spike 源码与编译产物（不复制旧项目产物）
+  spike/                # 【待建】Spike 源码与编译产物（不复制旧项目产物）；**用户已定（2026-09-14）**：由用户编译安装到 `/opt/riscv/bin/spike`
 ```
 
 ### 9.2 前置项（**必须先完成，否则 L2 无法启动**）
 
 | 编号 | 前置项 | 状态 | 说明 |
 |---|---|---|---|
-| V-1 | **Spike 重取并编译** | **待办** | 工作区当前无可用 spike 二进制（实测 `which spike` 无输出）；Spike 是 L2 锁步的参考模型，缺失则整层无法进行。旧项目编译产物不得复制（`AGENT.md` §3.4） |
-| V-2 | **`fpga/run_vivado_batch.sh`** | **待办** | 统一 Vivado 入口，封装 `LD_LIBRARY_PATH`、`HOME=.vivado_home`、`source_mgmt_mode None`（`AGENT.md` §2 三个坑） |
+| V-1 | **Spike 重取并编译** | **用户已定（2026-09-14）** | 裁决：**由用户在沙箱外编译并安装到 `/opt/riscv/bin/spike`**；需系统依赖 `device-tree-compiler`、`libboost-regex-dev`、`libboost-system-dev`，编译命令见 `NEXT_SESSION.md` §6.5；编译完成后通知母 Agent 记录版本。旧项目编译产物不得复制（`AGENT.md` §3.4） |
+| V-2 | **`fpga/run_vivado_batch.sh`** | **待建（阶段二建立）** | 用户已定（2026-09-14）：保持待建，阶段二建立。统一 Vivado 入口，封装 `LD_LIBRARY_PATH`、`HOME=.vivado_home`、`source_mgmt_mode None`（`AGENT.md` §2 三个坑） |
 | V-3 | arch-test 编译/运行环境 | 待建 | 需 `riscv32-unknown-linux-gnu-gcc`（`/opt/riscv`）、链接脚本、signature 比对；arch-test 官方配置期望 `riscv64-unknown-elf-gcc`，**本机为 `riscv32-unknown-linux-gnu-`**，需在 `test_config.yaml` 中改写编译器名 |
 | V-4 | RV32/Sv32 测试筛选清单 | 待建 | 只跑 `sv32_*` 变体；sv39/sv48/sv57 与 RV64 测试加入排除清单 |
 | V-5 | signature 比对工具 | 待建 | arch-test 的 `signature` 区需与参考模型比对；这是「未捕获即失败」在 L2 的落点 |
@@ -391,7 +391,7 @@ TOTAL=NN  PASS_COUNT=NN  FAIL_COUNT=NN  RESULT=pass|fail
 
 | 编号 | 项 | 状态 | 说明 |
 |---|---|---|---|
-| V-6 | Spike 编译需系统依赖（`device-tree-compiler`、`libboost-regex-dev`、`libboost-system-dev`，见 `riscv-arch-test/config/spike/ci.yaml`），而本机 `sudo` 不可用 | **待用户定** | 若依赖缺失，需用户在沙箱外安装（`AGENT.md` §2） |
+| V-6 | Spike 编译需系统依赖（`device-tree-compiler`、`libboost-regex-dev`、`libboost-system-dev`，见 `riscv-arch-test/config/spike/ci.yaml`），而本机 `sudo` 不可用 | **用户已定（2026-09-14）** | 裁决：由用户在沙箱外编译并安装到 `/opt/riscv/bin/spike`（命令见 `NEXT_SESSION.md` §6.5）；编译完成后通知母 Agent 记录版本 |
 | V-7 | arch-test 官方配置默认参考模型为 `sail_riscv_sim`（`config/spike/spike-rv32g/test_config.yaml` 的 `ref_model_exe`），而非 Spike 本身 | 待定 | 需确认是「Spike 作为 DUT 的参考」还是「Sail 作参考」；本项目锁步对象是 Spike，故需自建比对器 |
 | V-8 | 编译器名差异：本机 `riscv32-unknown-linux-gnu-gcc` vs arch-test 期望 `riscv64-unknown-elf-gcc` | 待处理 | 需在 `test_config.yaml` 中改写；注意 RV32 的 `-march/-mabi` 组合 |
 | V-9 | 上板 33 MHz 与目标 100 MHz 的性能统计不可直接比较 | 已识别 | L4 数值必须标注运行频率；`AGENT.md` §3.2 要求性能口径明确 |
