@@ -114,6 +114,11 @@ module pmp_check #(
     localparam [1:0] A_NA4   = `RV32GC_PMP_A_NA4;
     localparam [1:0] A_NAPOT = `RV32GC_PMP_A_NAPOT;
 
+    // NAPOT 编码字段宽（`pmpaddr` 中承载「连续 1」的位数）。
+    // RV32 下 `pmpaddr` 有效位为 [29:0]（PA[33:4] 的 32 位截取，见 rv32_defs §7），
+    // 低位 [ADDR_W-3:0] 用于 NAPOT 编码 —— 取 ADDR_W-3 = 29 位。
+    localparam integer NAPOT_FIELD_W = ADDR_W - 3;   // 29
+
     localparam [1:0] PRIV_U  = `RV32GC_PRIV_U;
     localparam [1:0] PRIV_S  = `RV32GC_PRIV_S;
     localparam [1:0] PRIV_M  = `RV32GC_PRIV_M;
@@ -122,29 +127,43 @@ module pmp_check #(
     // 2. 纯组合辅助函数
     //==========================================================================
     // ---- 2.1 NAPOT 掩码解码 -------------------------------------------------
-    // NAPOT 编码：`pmpaddr` 低位为「N 个连续 1 后接一个 0」（独占尾随 0）。
-    //   编码 …0001 ⇒ N=0 ⇒ 8 B 块（掩码低 3 位）
-    //   编码 …0011 ⇒ N=1 ⇒ 16 B 块
-    //   编码 …0111 ⇒ N=2 ⇒ 32 B 块
-    // 即块内偏移位宽 = (尾随 0 个数 + 1)，块大小 = 2^(trailing_zeros+1) 字节。
-    // 本函数返回「块大小 - 1」形式的字节掩码（低位全 1 的掩码）。
+    // 手册编码表（riscv-isa-manual machine.adoc，`NAPOT range encoding`）：
+    //   pmpaddr 低位模式              匹配类型   覆盖大小
+    //   yyyy...yyy0                    NAPOT      8   B
+    //   yyyy...yy01                    NAPOT      16  B
+    //   yyyy...y011                    NAPOT      32  B
+    //   ...                           ...        ...
+    //   y011...1111                    NAPOT      2^(XLEN)   B
+    //   0111...1111                    NAPOT      2^(XLEN+1) B
+    //   1111...1111                    NAPOT      2^(XLEN+2) B
+    //
+    // ⇒ 决定大小的量是「从 bit0 起**连续 1** 的个数 n」：
+    //     n=0（…yyy0）⇒  8  B = 2^(0+3)
+    //     n=1（…yy01）⇒ 16  B = 2^(1+3)
+    //     n=2（…y011）⇒ 32  B = 2^(2+3)
+    //     n=3（…0111）⇒ 64  B = 2^(3+3)
+    //   即 **覆盖字节数 = 2^(n+3)**，块内**字节**偏移位宽 = n+3。
+    //   （+3 = 2 位「位地址→字节地址」尺度 + 1 位 N=0 起跳，见上表首行。）
+    //
+    //   ★ 关键易错点：**不能**去数尾随 0 个数（地址高位全 0 时会把整个空间算成一个块）。
+    //     唯一正确的量是低位「连续 1」的个数；全 1 编码（n 达到字段宽）表示最大块。
+    //
+    //   本函数返回「块大小 - 1」形式的字节掩码（低位全 1）。
     function [ADDR_W-1:0] napot_bytemask;
         input [ADDR_W-1:0] pa;       // pmpaddr
-        integer z;                   // 尾随 0 计数
+        integer n;                   // 低位连续 1 的个数
         begin
-            z = 0;
-            // 从最低位起数连续 0；z 最多到 ADDR_W-1（pa==0 在规范中不是合法 NAPOT
-            // 编码，此处保守退化，绝不让 X/Z 传播到掩码）。
-            while ((z < ADDR_W-1) && (pa[z] == 1'b0)) begin
-                z = z + 1;
+            n = 0;
+            // 从最低位起数连续 1（NAPOT 编码的核心量）
+            while ((n < NAPOT_FIELD_W) && (pa[n] == 1'b1)) begin
+                n = n + 1;
             end
-            if (z >= ADDR_W-1) begin
-                // 退化：4 B 块（最低 2 位全 1 ⇒ 掩码 = 3）
-                napot_bytemask = {{(ADDR_W-2){1'b0}}, 2'b11};
+            // 覆盖字节数 = 2^(n+3)；n = NAPOT_FIELD_W（全 1）⇒ 取最大可表示块，
+            // 此时 n+3 = ADDR_W ⇒ 掩码全 1（覆盖整个地址空间），移位需防越界。
+            if ((n + 3) >= ADDR_W) begin
+                napot_bytemask = {ADDR_W{1'b1}};
             end else begin
-                // 块内偏移位宽 = z + 1 ⇒ 字节掩码 = (1 << (z+1)) - 1
-                // 注意 z 最大 30 ⇒ z+1 最大 31，移位量位宽足够且不越界。
-                napot_bytemask = ({{(ADDR_W-1){1'b0}}, 1'b1} << (z + 1)) - 1'b1;
+                napot_bytemask = ({{(ADDR_W-1){1'b0}}, 1'b1} << (n + 3)) - 1'b1;
             end
         end
     endfunction
@@ -325,13 +344,24 @@ module pmp_check #(
 
     // 5.2 把 one-hot 编码成索引（组合或树；16 项 ⇒ 4 bit）
     //     纯 assign 表达，不用 always。
-    assign sel_idx = { (|sel_onehot[15:8]),
-                       (|sel_onehot[15:12]) | (|sel_onehot[11:8]),
-                       (|sel_onehot[15:14]) | (|sel_onehot[13:12]) |
-                       (|sel_onehot[11:10]) | (|sel_onehot[9:8]),
-                       (sel_onehot[15] | sel_onehot[13] | sel_onehot[11] |
-                        sel_onehot[9]  | sel_onehot[7]  | sel_onehot[5]  |
-                        sel_onehot[3]  | sel_onehot[1]) };
+    //     编码口径（已穷举 16 个 one-hot 逐个验证）：
+    //       idx[k] = 存在任一 sel_onehot[i] 且 (i>>k)&1 == 1
+    //       idx[3] set = {8..15}
+    //       idx[2] set = {4,5,6,7, 12,13,14,15}
+    //       idx[1] set = {2,3, 6,7, 10,11, 14,15}
+    //       idx[0] set = {1,3,5,7,9,11,13,15}
+    //     ★ 易错点：必须按「(i>>k)&1」的**完整集合**写；凭直觉按 4 项分组会把
+    //       高半部误排除（本文件首版即因此把 idx=4 误算为 0，已修正并穷举验证）。
+    assign sel_idx = {
+        (sel_onehot[15] | sel_onehot[14] | sel_onehot[13] | sel_onehot[12] |
+         sel_onehot[11] | sel_onehot[10] | sel_onehot[9]  | sel_onehot[8]),   // idx[3]
+        (sel_onehot[15] | sel_onehot[14] | sel_onehot[13] | sel_onehot[12] |
+         sel_onehot[7]  | sel_onehot[6]  | sel_onehot[5]  | sel_onehot[4]),   // idx[2]
+        (sel_onehot[15] | sel_onehot[14] | sel_onehot[11] | sel_onehot[10] |
+         sel_onehot[7]  | sel_onehot[6]  | sel_onehot[3]  | sel_onehot[2]),   // idx[1]
+        (sel_onehot[15] | sel_onehot[13] | sel_onehot[11] | sel_onehot[9]  |
+         sel_onehot[7]  | sel_onehot[5]  | sel_onehot[3]  | sel_onehot[1])    // idx[0]
+    };
 
     // 5.3 汇总：是否命中、被选中项是否整笔全覆盖、被选中项权限是否足够
     wire hit_any_flat = |sel_onehot;

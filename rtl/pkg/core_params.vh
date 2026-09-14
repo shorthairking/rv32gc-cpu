@@ -48,7 +48,8 @@
 // ---- DDR3：平台默认从设备（axi_mux_syn.v:860/951 的 addr_hit[0]） ----
 `define RV32GC_DDR_BASE       32'h0000_0000
 `define RV32GC_DDR_SIZE_MB    128
-`define RV32GC_DDR_SIZE       (RV32GC_DDR_SIZE_MB * 1024 * 1024)  // 0x0800_0000
+`define RV32GC_DDR_SIZE       (`RV32GC_DDR_SIZE_MB * 1024 * 1024)  // 0x0800_0000
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 `define RV32GC_DDR_LIMIT      32'h0800_0000                        // 开区间上界
 `define RV32GC_DDR_HI4_VAL    4'h0                                 // PA[31:28]==0 判可缓存
 
@@ -68,7 +69,20 @@
 `define RV32GC_MAC_BASE         32'h1FF0_0000   // MAC（不使用）
 
 // ---- MMIO 判定掩码（译码只写一处；与 rv32_defs.vh §10 的 *_HIT_VAL 配套） ----
-`define RV32GC_MMIO_HI16_MSK   16'hFFFF_0000   // PA[31:16] 窗口比较（高 16 位）
+`define RV32GC_MMIO_HI16_MSK   32'hFFFF_0000   // PA[31:16] 窗口比较（高 16 位）
+//      ^^ 位宽必须是 32（与下面 RV32GC_MMIO_HI20_MSK 同一「32 位全宽掩码」口径）：
+//         原写 16'hFFFF_0000 ⇒ sized literal 仅 16 位，iverilog 报
+//         "Numeric constant truncated to 16 bits"，实测展开值 0x0000_0000，掩码失效
+//         （2026-09-14 修复；回归锁定见 sim/unit/pkg_check.v (B2)）。
+//      ★ 口径并存说明（2026-09-14）：本宏是 **32 位全宽掩码**口径，供
+//        `(PA[31:0] & RV32GC_MMIO_HI16_MSK)` 这类**全宽**用法；
+//        现网 rtl/mem/mmio_route.v 与 rtl/axi/axi_req_desc.v 采用的是
+//        rv32_defs.vh §10 的「**先切片再比**」16 位口径（即先
+//        `wire [15:0] pa_hi16 = pa_i[31:16];`，再
+//        `(pa_hi16 & RV32GC_CLINT_HIT_MSK) == RV32GC_CLINT_HIT_VAL`，
+//        mask/val 均为 16 位）。两套口径**共存**：全宽用法用本宏，切片用法用
+//        §10 那组；不要为了"统一"而删改其中任一套，更不得改本宏的值
+//        （本宏为 32 位全宽，值恒为 0xFFFF_0000）。
 `define RV32GC_MMIO_HI16_LSB   16
 `define RV32GC_MMIO_HI20_MSK   32'hFFF0_0000   // PA[31:20] 窗口比较（XIP 主窗口）
 `define RV32GC_MMIO_HI20_LSB   20
@@ -104,6 +118,9 @@
 
 // ---- 2A 性能非门禁项，登记以便跨阶段口径一致 ----
 `define RV32GC_FPRIV           1                // 2A 不流水化 FPU（多拍定长）
+// ---- FPU 分期参数（2A）：fdiv/fsqrt 的 busy 拍数；唯一真源，FPU 侧只读本宏（DOC:08-baseline-5stage.md §5.3 ①） ----
+`define RV32GC_FDIV_CYCLES  32   // 2A fdiv 迭代拍数（busy 周期），可调；FPU 内以 ifdef 可选覆盖
+`define RV32GC_FSQRT_CYCLES 32   // 2A fsqrt 迭代拍数（busy 周期），可调；FPU 内以 ifdef 可选覆盖
 
 //==============================================================================
 // 5. 核内 CLINT / PLIC 参数
@@ -159,18 +176,22 @@
 //==============================================================================
 // ---- L1I ----
 `define RV32GC_L1I_SIZE_KB       16
-`define RV32GC_L1I_SIZE_BYTES    (RV32GC_L1I_SIZE_KB * 1024)   // 16384
+`define RV32GC_L1I_SIZE_BYTES    (`RV32GC_L1I_SIZE_KB * 1024)   // 16384
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 `define RV32GC_L1I_WAYS          2
 `define RV32GC_L1I_LINE_BYTES    32
-`define RV32GC_L1I_SETS          (RV32GC_L1I_SIZE_BYTES / (RV32GC_L1I_WAYS * RV32GC_L1I_LINE_BYTES))
+`define RV32GC_L1I_SETS          (`RV32GC_L1I_SIZE_BYTES / (`RV32GC_L1I_WAYS * `RV32GC_L1I_LINE_BYTES))
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 `define RV32GC_L1I_INDEX_BITS    8       // VA[12:5]（256 组）
 `define RV32GC_L1I_OFFSET_BITS   5       // 行内偏移 VA[4:0]
 // ---- L1D ----
 `define RV32GC_L1D_SIZE_KB       32
-`define RV32GC_L1D_SIZE_BYTES    (RV32GC_L1D_SIZE_KB * 1024)   // 32768
+`define RV32GC_L1D_SIZE_BYTES    (`RV32GC_L1D_SIZE_KB * 1024)   // 32768
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 `define RV32GC_L1D_WAYS          4
 `define RV32GC_L1D_LINE_BYTES    32
-`define RV32GC_L1D_SETS          (RV32GC_L1D_SIZE_BYTES / (RV32GC_L1D_WAYS * RV32GC_L1D_LINE_BYTES))
+`define RV32GC_L1D_SETS          (`RV32GC_L1D_SIZE_BYTES / (`RV32GC_L1D_WAYS * `RV32GC_L1D_LINE_BYTES))
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 `define RV32GC_L1D_INDEX_BITS    8       // VA[12:5]（256 组）
 `define RV32GC_L1D_OFFSET_BITS   5
 `define RV32GC_L1_CACHEABLE      1       // L1 写回 + 写分配
@@ -196,7 +217,8 @@
 `define RV32GC_AXI_ID_CMO       4'd3
 `define RV32GC_AXI_MAX_BEATS    16      // 4 bit len ⇒ ≤16 beat = 64 B（32 bit 数据）
 `define RV32GC_AXI_BEAT_BYTES   4       // 每 beat 4 B
-`define RV32GC_AXI_LINE_FILL_LEN (RV32GC_L1I_LINE_BYTES / RV32GC_AXI_BEAT_BYTES)  // 8 beat
+`define RV32GC_AXI_LINE_FILL_LEN (`RV32GC_L1I_LINE_BYTES / `RV32GC_AXI_BEAT_BYTES)  // 8 beat
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 `define RV32GC_AXI_OUTSTANDING   1      // 2A：同一时刻只允许一笔读或一笔写在途
 
 //==============================================================================

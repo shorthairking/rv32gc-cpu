@@ -81,7 +81,7 @@ graph TD
 | 索引位 | VA[12:5] | VA[12:5] | PA[14:6] |
 | Tag 位 | VA[31:13] | VA[31:13] | PA[31:15] |
 | 写策略 | —  | 写回 + 写分配 | 写回 + 写分配 |
-| 替换策略 | 伪 LRU（1 bit/组） | 真 LRU（4 路，树形） | 伪 LRU（3 bit/组） |
+| 替换策略 | 伪 LRU（1 bit/组） | **4 路 PLRU 树（3 bit/组）**（用户裁决性能优先 + 母 Agent 批准，2026-09-14） | 伪 LRU（3 bit/组） |
 | 一致性 | 无需（取指侧靠 cbo.inval） | 写回，不监听 | 写回，不监听 |
 | 数据阵列 | Block Memory Generator（简单双口） | Block Memory Generator（真双口） | Block Memory Generator（真双口） |
 | **地址空间视图** | **虚拟地址**（VA tag） | **虚拟地址**（VA tag） | **物理地址**（PA tag） |
@@ -327,6 +327,6 @@ graph TD
 | C-2 | CMO block size 的软件发现路径（设备树属性 vs 自定义 CSR） | **用户已定（2026-09-14）** | 裁决：经设备树属性 `riscv,cbom-block-size`/`riscv,cboz-block-size` 发现，**不新增自定义 CSR**（口径：按对 CPU 性能较好的方式）；与本文 §7.2 一致 |
 | C-3 | `cbo.zero` block size 取 32 B 与 `cbo.clean` 的 64 B 不一致 | **用户已定（2026-09-14）** | 裁决：`cbo.clean`/`cbo.flush` block = **64 B**（L2 行）、`cbo.zero` block = **32 B**（L1D 行）；两者在 ISA 中本就是两个独立可发现量（`cmo.adoc` Software Discovery 分列），按此落地 |
 | C-4 | L2 包容性（inclusive）在 256 KB 下对 L1 的独占反压 | 待测 | 若 L2 失效压力过大，退化为 NINE（non-inclusive non-exclusive）策略；需在 RTL 中预留策略开关 |
-| C-5 | 4 K 边界与 AXI 突发拆分 | 待实现 | 64 B 行在 4 KiB 边界上除最后一行外均对齐，但跨 4 K 的首行需拆突发；拆分由 Vivado AXI IP 处理，本设计只需保证不生成跨 4 K 的单条 `AxLEN` |
+| C-5 | 4 K 边界与 AXI 突发拆分 | **已实现（2026-09-14）** | 4K 边界拆分现由核内在描述符生成与控制器两处落地：`rtl/axi/axi_req_desc.v` 给出拆分判定与信息（`desc_split` / `desc_to_4k` / `desc_beats`，组合输出唯一赋值点），`rtl/axi/axi_master_ctrl.v` 按 `req_split` / `req_beats_1` / `req_beats_2` 执行「首笔在 4 K 边界处截断 + 第二笔自动接续」；单元测试 `tb_axi_master_ctrl`（其中 C5 用例）覆盖「不生成跨 4 K 的单条 `AxLEN`」。原口径保留：64 B 行在 4 KiB 边界上除最后一行外均对齐，但跨 4 K 的首行需拆突发 |
 | C-6 | `AxCACHE`/`AxPROT` 在 chiplab `axi_mux` 上是否被透传 | 待核实 | 平台 `axi_mux_syn.v` 未见对 `cache`/`prot` 的语义依赖（仅转发），但上板前需以仿真波形确认 |
 | C-7 | XIP 窗口旁路判定若被写成「VA 判定」而非「PA 判定」 | **高风险** | 这正是 `AGENT.md` §3.3 点名的 VA/PA 混用静默错；判定必须在物理地址侧、且总线地址寄存器只有一个赋值点 |

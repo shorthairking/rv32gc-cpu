@@ -209,7 +209,12 @@
 `define RV32GC_FP_F5_FSQRT   5'b01011
 `define RV32GC_FP_F5_FSGNJ   5'b00100   // fsgnj/fsgnjn/fsgnjx 由 funct3 区分
 `define RV32GC_FP_F5_FMINMAX 5'b00101   // fmin/fmax 由 funct3 区分
-`define RV32GC_FP_F5_FCVT    ('h8 >> 3) // = 5'b01000（fcvt.T.S/D）
+`define RV32GC_FP_F5_FCVT    5'b01000   // fcvt.T.S/D（F↔D 互转）
+//      ★ 2026-09-14 修正：本宏原写作 `('h8 >> 3)` 而注释称 5'b01000；实测 8>>3 = 1
+//        ⇒ 展开值 5'b00001，会把 fcvt.s.d / fcvt.d.s 误判为非法指令。
+//        依据（两条独立佐证）：① riscv-opc.h 的 MATCH FCVT_S_D=0x4010_0053 /
+//        FCVT_D_S=0x4200_0053，insn[31:27] 均 = 01000；② GNU as 实测编码
+//        fcvt.s.d = 0x401574d3 / fcvt.d.s = 0x420605d3，右移 27 位同为 01000。
 `define RV32GC_FP_F5_FMV_CMP 5'b11100   // fmv.x.w/fclass（funct3 区分）
 `define RV32GC_FP_F5_FMV_X_W 5'b11100   // 同组别名（可读性）
 `define RV32GC_FP_F5_FMV_W_X 5'b11110   // fmv.w.x
@@ -423,7 +428,11 @@
 `define RV32GC_TVEC_MODE_VECTORED 2'b01
 `define RV32GC_TVEC_BASE_ALIGN_DIRECT    2    // Direct  ：BASE 低 2 位为 0
 `define RV32GC_TVEC_BASE_ALIGN_VECTORED  8    // Vectored：BASE 低 8 位为 0
-`define RV32GC_TVEC_BASE_MSK             12'hFFF_FFFC  // Direct 下 BASE 提取掩码
+`define RV32GC_TVEC_BASE_MSK             32'hFFFF_FFFC  // Direct 下 BASE 提取掩码（清 MODE[1:0]、保留 BASE[31:2]）
+//      ★ 2026-09-14 修正（同批扫描发现的「值 ≠ 注释」缺陷）：原写作 `12'hFFF_FFFC`，
+//        iverilog 报 “Extra digits given for sized hex constant / Numeric constant
+//        truncated to 12 bits”，实测展开值仅 12'hFFC ⇒ 无法充当 32 位 mtvec 的
+//        BASE 提取掩码（会把 BASE[31:12] 一并清 0）。注释语义未变，只修正取值。
 
 // ---- 5.4 mepc / sepc 对齐（IALIGN=16 ⇒ 只有 bit0 恒 0；bit1 可写） ----
 //      [ISA:riscv-isa-manual/src/priv/machine.adoc:1689-1696  norm:mepc_align]
@@ -436,7 +445,8 @@
 //==============================================================================
 `define RV32GC_CAUSE_W         5       // cause 码位宽（不含 Interrupt 位）
 `define RV32GC_MCAUSE_INT_BIT  31      // [ISA] mcause[31]=1 表示中断
-`define RV32GC_MCAUSE_INT_MSK  (32'h1 << RV32GC_MCAUSE_INT_BIT)
+`define RV32GC_MCAUSE_INT_MSK  (32'h1 << `RV32GC_MCAUSE_INT_BIT)
+//      ^^ iverilog 兼容: 内层宏引用带反引号 (2026-09-14)
 
 // ---- 6.1 异常（Interrupt=0）：2A 实现 0/1/2/3/4/5/6/7/8/9/11/12/13/15 ----
 //      08 §6.2 明确「medeleg 不实现 10/11/14」中的 10/14 为保留项；

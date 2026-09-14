@@ -56,25 +56,27 @@ module parcel_align (
     localparam ILEN_BITS    = `RV32GC_ILEN;          // 32
 
     //--------------------------------------------------------------------------
-    // 1. word_o 的两个 parcel
-    //    · word_o 的 VA 若 4 B 对齐，则 [15:0] 是 VA+0（低 parcel）、
-    //      [31:16] 是 VA+2（高 parcel）—— 这是本模块与 fetch_unit 的固定约定。
-    //    · 若 word_o 的 VA 只 2 B 对齐（跨字起始），fetch_unit 保证高半[31:16]
-    //      被**丢弃**（该处是本字的另一条指令），此时高 parcel 无意义。
+    // 1. 指令起始 parcel = word_o 的**低半**（word_va_o 4 B 对齐，小端）
+    //    RV32 小端：低地址半字在低 16 位；指令起始 VA 4 B 对齐时，
+    //    起始 parcel 就是 word_o[15:0]，其 opcode[1:0] 决定指令长度：
+    //      · != 2'b11 ⇒ 16 bit 压缩指令（C 扩展），到此为止
+    //      · == 2'b11 ⇒ 32 bit 指令的前 16 bit，还需 **下一个 parcel**（VA+2）
     //--------------------------------------------------------------------------
-    wire [15:0] lo_parcel = word_o[15:0];
-    wire [15:0] hi_parcel = word_o[31:16];
+    wire [15:0] lo_parcel = word_o[15:0];   // 起始 parcel
 
     wire lo_is_compressed = (lo_parcel[1:0] != 2'b11);   // 2 bit opcode：!=11 ⇒ 16 bit
     wire lo_is_32bit      = (lo_parcel[1:0] == 2'b11);   // ==11 ⇒ 32 bit 指令前 16 bit
 
     //--------------------------------------------------------------------------
-    // 2. 拼接：16 bit 直通；32 bit = {carry_parcel_i, hi_parcel}
-    //    口径：word_o[31:16] 存放「字节偏移 +2」的半字，字内小端 ⇒ 它是指令的
-    //    高半，下一 parcel 是低半。（RV32 小端：半字 0 在低地址。）
+    // 2. 拼接：16 bit 直通；32 bit = {第二 parcel, 起始 parcel}
+    //    口径：RV32 小端 ⇒ 指令的**低位半字在低地址**。故：
+    //      · insn[15:0] = 起始 parcel（VA+0）
+    //      · insn[31:16] = 下一个 parcel（VA+2），即 carry_parcel_i
+    //    carry_parcel_i 的 VA 应是 word_va_o+2（同一行内）或下一行的低半
+    //    （跨行）；两种情况**拼接方式相同**，故本模块对行边界不敏感。
     //--------------------------------------------------------------------------
     wire [31:0] insn_16 = {16'h0000, lo_parcel};
-    wire [31:0] insn_32 = {carry_parcel_i, hi_parcel};
+    wire [31:0] insn_32 = {carry_parcel_i, lo_parcel};
 
     assign ilen32_o      = lo_is_32bit;
     assign insn_o        = lo_is_32bit ? insn_32 : insn_16;
@@ -83,8 +85,8 @@ module parcel_align (
 
     //--------------------------------------------------------------------------
     // 3. 指令起始 VA
-    //    · 16 bit：就是 word_va_o 的 parcel 位置
-    //    · 32 bit：同起始（低 parcel 即起始），无偏移
+    //    · 16 bit：起始 parcel 在 word_va_o
+    //    · 32 bit：起始 parcel 也在 word_va_o（低半即指令前 16 bit），无偏移
     //    本模块只做「+0」；VA 的推进/pc+2/pc+4 由 PCC（pc_gen.v）负责，
     //    避免同一地址在两个模块里各算一次（08 §3.3 真源纪律）。
     //--------------------------------------------------------------------------

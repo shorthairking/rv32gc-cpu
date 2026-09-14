@@ -65,7 +65,7 @@ module pc_gen (
     // ---- 观察输出 ----
     output wire [31:0] pc,              // 当前取指 PC（虚拟地址）
     output wire [31:0] pc_next,         // 本拍选的下一 PC（= 下拍 pc）
-    output wire [1:0]  pc_sel,          // 0=保持 1=复位 2=异常/中断 3=BRU 4=断点 5=顺序
+    output wire [3:0]  pc_sel,          // 0=保持 1=复位 2=异常/中断 3=BRU 4=断点 5=顺序
     output wire [31:0] pc_plus2,
     output wire [31:0] pc_plus4
 );
@@ -75,6 +75,15 @@ module pc_gen (
     //    08 §4.3 / §5.1 ①：RESET_PC = 0x1C00_0000（SPI Flash XIP 主窗口）
     //--------------------------------------------------------------------------
     localparam [31:0] RESET_PC = `RV32GC_RESET_PC;
+
+    //--------------------------------------------------------------------------
+    // 0.1 取值口径的**编译期自检**（把规格字面值写进可执行代码，而非只写在注释里）
+    //     08 §4.3 / §5.1 ①：RESET_PC 必须 = 32'h1C00_0000（SPI Flash XIP 主窗口）。
+    //     真源仍在 core_params.vh；此处只做「真源 == 规格字面值」的等价断言：
+    //     有人误改真源时 RESET_PC_OK 立刻变 0（下游 TB/顶层可引用它做 fail-closed 检查）。
+    //--------------------------------------------------------------------------
+    localparam [31:0] RESET_PC_SPEC = 32'h1C00_0000;   // 规格字面值（08 §4.3）
+    localparam        RESET_PC_OK   = (RESET_PC == RESET_PC_SPEC);
 
     //--------------------------------------------------------------------------
     // 1. PC 选择类型（给 pc_sel 以可读名字；不用枚举/typedef，保持 Verilog-2001）
@@ -147,7 +156,7 @@ module pc_gen (
                                       redirect_bru_pc, pc_seq);
 
     assign pc_next = pc_next_i;
-    assign pc_sel  = {1'b0, sel};
+    assign pc_sel  = {1'b0, sel};   // 4 bit：便于波形/断言直接看来源编号
 
     //--------------------------------------------------------------------------
     // 4. PC 寄存器：**本模块唯一的 always 块**

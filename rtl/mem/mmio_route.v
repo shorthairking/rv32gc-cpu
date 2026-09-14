@@ -81,11 +81,14 @@ module mmio_route #(
     //==========================================================================
     // ---- 2.1 核内私有窗口（PA[31:16] 全比较） --------------------------------
     // [DOC:08 §6.6；rv32_defs.vh §10]
+    // 地址字面量登记（供 grep 复核与代码走查；与 rv32_defs.vh/core_params.vh 一致）：
+    //   CLINT_BASE = 0x1F00_0000     PLIC_BASE = 0x1F10_0000
+    //   XIP 主窗口 = 0x1C00_0000     XIP 别名  = 0x1FE8_0000
     wire [15:0] pa_hi16 = pa_i[31:16];
 
-    // CLINT 0x1F00_0000 —— ★ 绝不发 AXI
+    // CLINT 0x1F00_0000 —— ★ 绝不发 AXI（核内截获，见 §6.6 的静默数据损坏说明）
     wire clint_hit = ((pa_hi16 & `RV32GC_CLINT_HIT_MSK) == `RV32GC_CLINT_HIT_VAL);
-    // PLIC  0x1F10_0000 —— ★ 绝不发 AXI
+    // PLIC  0x1F10_0000 —— ★ 绝不发 AXI（核内截获）
     wire plic_hit  = ((pa_hi16 & `RV32GC_CLINT_HIT_MSK) == `RV32GC_PLIC_HIT_VAL);
 
     assign clint_hit_o  = clint_hit;

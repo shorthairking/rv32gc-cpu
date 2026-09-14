@@ -137,7 +137,7 @@ module fetch_unit #(
     // 输出：PCC 观察（供波形/断言；也是本模块与 pc_gen 的链路证据）
     //------------------------------------------------------------------
     `ifdef RV32GC_FETCH_UNIT_EXPOSE_PC_SEL
-    ,output wire [1:0]  fetch_pc_sel
+    ,output wire [3:0]  fetch_pc_sel
     `endif
 );
 
@@ -177,7 +177,7 @@ module fetch_unit #(
 
     wire [31:0] fetch_pc_w;
     wire [31:0] pc_next_w;
-    wire [1:0]  pc_sel_w;
+    wire [3:0]  pc_sel_w;
     wire [31:0] pc_plus2_w;
     wire [31:0] pc_plus4_w;
 
@@ -275,13 +275,22 @@ module fetch_unit #(
         .cross_pending_o(cross_pending)
     );
 
-    // 交出的 16 bit parcel：压缩指令 ⇒ 取低半；32 bit ⇒ 取高半（+2 处），
-    // 因为 D 级译码的「parcel 流」以 +2 为单位推进（§4.3 取指粒度）。
-    assign parcel_insn = ilen32 ? fetch_word[31:16] : fetch_word[15:0];
+    // 交出的 16 bit parcel = **指令的起始 parcel**（§4.3 取指粒度 = 16-bit parcel）：
+    //   · 压缩指令 ⇒ 它就是整条指令（右对齐 16 bit）
+    //   · 32 bit 指令 ⇒ 它是指令的前 16 bit（低位半字）；完整 32 bit 由
+    //     `fetch_data` 给出，D 级不应只看 `parcel_o` 就把 32 bit 指令当作完整指令。
+    //   word_o 的 VA 4 B 对齐（fetch_req_pa 已对齐），故起始 parcel 恒为 [15:0]。
+    assign parcel_insn = fetch_word[15:0];
 
-    //--- carry：32 bit 指令需要的「+2 parcel」来自下一取指字 ---
-    //  说明：本模块用「上一拍取到的下一个字」作为 carry。直连通路（uncached）
-    //  下，下一字的 PA = 本字 PA + 4（XIP 无回卷修正，§5.1 ⑥）。
+    //--- parcel_align 的 carry 输入：32 bit 指令缺失的那一半 ---
+    //  口径（与 parcel_align.v §2 一致，RV32 小端 ⇒ 低半字在低地址）：
+    //    · 起始字 VA 4 B 对齐时，[15:0] = 指令前 16 bit、[31:16] = 指令后 16 bit
+    //      ⇒ 后 16 bit **已在同一次 fetch_rsp 里**，不需要跨拍 carry。
+    //    · 只有「指令起始落在字的高半」这一边界情形（M2 的 C 扩展混合流）才
+    //      需要从**下一个字**的低半借 16 bit。
+    //  本模块按统一口径实现：把「本拍返回字的 [31:16]」锁存为 carry 候选，
+    //  由 parcel_align 只在确实需要（cross_pending=1）时使用；需要时拉低
+    //  fetch_valid 并停顿一拍（§5.0），保证 D 级永不见到半条指令。
     reg         carry_valid;
     reg  [15:0] carry_parcel;
     reg  [31:0] carry_va;
@@ -295,13 +304,22 @@ module fetch_unit #(
     //==========================================================================
     // 两个待检 parcel：起始 parcel（lo）与需要时的 +2 parcel（hi）。
     // 压缩指令只检 1 个 parcel；32 bit 指令检 2 个（本设计选择）。
+    //
+    // ★ 地址口径（AGENT.md §3.3「VA/PA 混用是静默错」）：
+    //   检查必须针对**正在被检验的那个 parcel 自己的地址**，而不是取指字对齐
+    //   地址（把 parcel 地址向下对齐会让 VA+2 的 parcel 被当成 VA 处那一个，
+    //   使「逐 parcel 检查」名存实亡 —— 这正是本设计选择要体现的差别）。
+    //   翻译启用后 PMP 针对**翻译后的物理地址**（§5.4 ③）；2A/M1 Bare 下 PA==VA。
+    //   TOR/NA4/NAPOT 的匹配按**该 parcel 的实际地址**进行。
+    wire [31:0] insn_pa_base  = sv32_translate_en ? fetch_pc_pa : insn_va;
+
     wire [15:0] check_parcel_lo = fetch_word[15:0];
     wire [15:0] check_parcel_hi = fetch_word[31:16];
-    wire [31:0] check_va_lo     = {insn_va[31:2], 2'b00};        // 4 B 对齐字起始
-    wire [31:0] check_va_hi     = {insn_va[31:2], 2'b00} + 32'd2; // +2
+    wire [31:0] check_va_lo     = insn_pa_base;              // 起始 parcel 的地址
+    wire [31:0] check_va_hi     = insn_pa_base + 32'd2;      // +2 parcel 的地址
 
-    wire pmp_ok_lo = pmp_check_v(fetch_pc_pa, priv);
-    wire pmp_ok_hi = pmp_check_v({fetch_pc_pa[31:2], 2'b00} + 32'd2, priv);
+    wire pmp_ok_lo = pmp_check_v(check_va_lo, priv);
+    wire pmp_ok_hi = pmp_check_v(check_va_hi, priv);
 
     // 第一个故障 parcel 决定 tval（低地址优先，与「逐 parcel 顺序检查」一致）
     wire        pmp_fault      = ~pmp_ok_lo | (~pmp_ok_hi & ilen32);
@@ -353,8 +371,12 @@ module fetch_unit #(
             carry_va      <= 32'h0000_0000;
         end else if (insn_valid & ~fetch_busy) begin
             last_ilen32_r <= ilen32;
+            // carry = 本拍返回字中的下一个 parcel（[31:16]，即 VA+2）：
+            //   压缩指令（2 B）⇒ 指令是 [15:0]，下一个 parcel 在 [31:16]
+            //   32 bit 指令（4 B）⇒ 下一个 parcel 已是下一字的 [15:0]，
+            //                       故 carry 的 VA 记 VA+4（下一拍对得上）
             carry_valid   <= 1'b1;
-            carry_parcel  <= parcel_insn;
+            carry_parcel  <= fetch_word[31:16];
             carry_va      <= insn_va + 32'd2;
         end
     end

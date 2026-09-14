@@ -25,6 +25,9 @@ module tb_pc_gen_top;
 
     localparam integer CLK_PERIOD = 10;   // 10 ns / 拍（频率与判定无关）
 
+    // C4b 结束后 PC 被停在该地址；C4c 断点用例据此断言 PC 冻结。
+    localparam [31:0] BRK_PC = 32'h0000_0100;
+
     //---- DUT 端口 ----
     reg         aclk;
     reg         aresetn;
@@ -40,7 +43,7 @@ module tb_pc_gen_top;
 
     wire [31:0] pc;
     wire [31:0] pc_next;
-    wire [1:0]  pc_sel;
+    wire [3:0]  pc_sel;
     wire [31:0] pc_plus2;
     wire [31:0] pc_plus4;
 
@@ -146,6 +149,8 @@ module tb_pc_gen_top;
         @(negedge aclk) aresetn = 1'b0;
         repeat (2) @(posedge aclk);
         #1;
+        // C0: 编译期等价断言 —— 真源 RESET_PC 必须等于规格字面值 32'h1C00_0000
+        chk1("C0 RESET_PC == 32'h1C00_0000 (spec literal)", 1'b1, dut.RESET_PC_OK);
         chk("C1 reset: pc==RESET_PC", RESET_PC, pc);
         chk("C1 reset: pc_plus2",      RESET_PC + 32'd2, pc_plus2);
         chk("C1 reset: pc_plus4",      RESET_PC + 32'd4, pc_plus4);
@@ -166,7 +171,7 @@ module tb_pc_gen_top;
         repeat (3) @(posedge aclk);
         #1;
         chk("C2 rst_hold freeze: pc==RESET_PC", RESET_PC, pc);
-        chk("C2 rst_hold wins over seq: pc_sel", 2'd1, pc_sel);   // SEL_RST
+        chk("C2 rst_hold wins over seq: pc_sel", 4'd1, pc_sel);   // SEL_RST
         @(negedge aclk) begin rst_hold = 1'b0; seq_adv_valid = 1'b0; seq_len32 = 1'b0; end
         @(posedge aclk); #1;
 
@@ -188,10 +193,10 @@ module tb_pc_gen_top;
         @(negedge aclk) seq_adv_valid = 1'b0;
         repeat (2) @(posedge aclk); #1;
         chk("C3 no advance keeps pc", RESET_PC + 32'd10, pc);
-        chk("C3 pc_sel==HOLD(0) when stalled", 2'd0, pc_sel);
+        chk("C3 pc_sel==HOLD(0) when stalled", 4'd0, pc_sel);
         @(negedge aclk) seq_adv_valid = 1'b1;
         @(posedge aclk); #1;
-        chk("C3 pc_sel==SEQ(5) when advancing", 2'd5, pc_sel);
+        chk("C3 pc_sel==SEQ(5) when advancing", 4'd5, pc_sel);
 
         //==================================================================
         // C4: 重定向优先级（§5.1 ①：重定向 > 顺序推进）
@@ -208,7 +213,7 @@ module tb_pc_gen_top;
         #1;   // 组合判定（重定向下拍生效）
         @(posedge aclk); #1;
         chk("C4a BRU redirect pc", 32'h1C00_1000, pc);
-        chk("C4a BRU sel", 2'd3, pc_sel);
+        chk("C4a BRU sel", 4'd3, pc_sel);
         @(negedge aclk) begin redirect_bru_valid = 1'b0; seq_adv_valid = 1'b0; end
         @(posedge aclk); #1;
 
@@ -223,13 +228,14 @@ module tb_pc_gen_top;
         #1;
         @(posedge aclk); #1;
         chk("C4b EXC beats BRU: pc", 32'h0000_0100, pc);
-        chk("C4b EXC sel", 2'd2, pc_sel);
+        chk("C4b EXC sel", 4'd2, pc_sel);
         @(negedge aclk) begin
             redirect_exc_valid = 1'b0; redirect_bru_valid = 1'b0; seq_adv_valid = 1'b0;
         end
         @(posedge aclk); #1;
 
         //---- C4c: 断点（§4.4：F 级制造重定向，2A 允许停在当前 PC） ----
+        //   C4b 已把 PC 停在 0x0000_0100；断点期间 PC 必须冻结在该值。
         @(negedge aclk) begin
             break_point   = 1'b1;
             seq_adv_valid = 1'b1;    // 断点必须压过顺序推进
@@ -237,12 +243,11 @@ module tb_pc_gen_top;
         end
         #1;
         @(posedge aclk); #1;
-        chk("C4c break point holds pc (redirect to self)",
-            RESET_PC, pc);
-        chk("C4c break sel", 2'd4, pc_sel);
+        chk("C4c break point holds pc (redirect to self)", BRK_PC, pc);
+        chk("C4c break sel", 4'd4, pc_sel);
         // 断点期间再等 2 拍，PC 不得前进
         repeat (2) @(posedge aclk); #1;
-        chk("C4c break keeps pc frozen", RESET_PC, pc);
+        chk("C4c break keeps pc frozen", BRK_PC, pc);
         @(negedge aclk) begin break_point = 1'b0; seq_adv_valid = 1'b0; end
         @(posedge aclk); #1;
 
@@ -255,7 +260,7 @@ module tb_pc_gen_top;
         #1;
         @(posedge aclk); #1;
         chk("C4d BRU beats break: pc", XIP_ALIAS + 32'h40, pc);
-        chk("C4d BRU beats break: sel", 2'd3, pc_sel);
+        chk("C4d BRU beats break: sel", 4'd3, pc_sel);
         @(negedge aclk) begin
             break_point = 1'b0; redirect_bru_valid = 1'b0;
         end

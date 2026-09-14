@@ -11,8 +11,10 @@
 //             pending            @ 基址 + 0x1000              32 bit RO 位图（每 32 源一字）
 //             enable[ctx]        @ 基址 + 0x2000 + 0x80*ctx + 4*ctx
 //                                                             32 bit R/W 位图
-//             threshold[ctx]     @ 基址 + 0x200000 + 4*ctx     32 bit R/W
-//             claim/complete[ctx]@ 基址 + 0x200004 + 4*ctx     32 bit R/W
+//             threshold[ctx]     @ 基址 + 0x200000 + 0x1000*ctx        32 bit R/W
+//             claim/complete[ctx]@ 基址 + 0x200000 + 0x1000*ctx + 4    32 bit R/W
+//           ★ 上下文步长 = 0x1000（标准 PLIC）：ctx0 在 +0x200000、ctx1 在 +0x201000。
+//             `core_params.vh` 的 THRESHOLD_OFF/CLAIM_OFF 即 **ctx0 基址**（+0x200000/+0x200004）。
 //           基址 = RV32GC_PLIC_BASE = 0x1F10_0000（core_params.vh §2）。
 //
 // 参数化口径（★ 本文件是源号映射的**定稿处**，RTL 与 DTS 只写一处）:
@@ -36,13 +38,12 @@
 //   - claim：读 claim 寄存器返回**本上下文**中「已使能且优先级 > threshold」的
 //     最高优先级源号（优先级相同取**最小源号**，= PLIC 规范的确定性仲裁），
 //     同时**清该源的 pending 位**（"中断已被取走"）。
-//   - complete：写 complete 寄存器（= 写 claim 同址）告知该源处理完毕。
-//     完整网关语义应在此刻"若源电平仍高则重新置 pending"；本设计的输入源为
-//     **电平保持型**（pending_r 由 src 电平常驻置位），因此 complete 只需清
-//     内部的 in-service 记录；**pending 由源电平本身驱动**，无需重挂。
-//     ⇒ 本实现保留 `inservice[ctx]` 位图记录 claim 但未 complete 的源，
-//        并保证**已在服务中的源不会被同一上下文再次 claim 返回**
-//        （防止同一中断重入抢占总线）。
+//   - complete：写 complete 寄存器（= 写 claim 同址）告知该源处理完毕：
+//     清该上下文的 in-service 记录，**若源电平仍高则立即重挂 pending**
+//     （电平型中断的标准"重采样"行为，完成处理后若设备仍拉高则再次上报）。
+//   - 网关（gateway）口径：pending 由源电平**上升沿**置位，claim 清 0，
+//     源电平撤销时清 0；在 claim 与 complete 之间 pending 保持 0 —— 因此
+//     **同一个中断不会被同一上下文反复 claim**（无需 in-service 门控候选）。
 //   - enable 屏蔽：源未使能 ⇒ 既不参与 claim，也不拉高 meip/seip。
 //   - threshold 过滤：源优先级 <= threshold[ctx] ⇒ 不参与该上下文的中断与 claim。
 //
@@ -53,7 +54,8 @@
 //     因此"PLIC 访问绝不产生 AXI 请求"在**端口层面即天然满足**。
 //   - 组合逻辑风格（AGENT.md §4 红线 3）：译码/比较/仲裁全部用 `assign`/
 //     `function`/`generate` 连续赋值表达；`always` 块只用于寄存器更新
-//     （pending 置清、enable/threshold/priority/inservice 的软写），并附理由注释。
+//     （pending 网关、enable/threshold/priority 的软写、claim/complete 副作用），
+//     并附理由注释。
 //
 // 端口约定:
 //   aclk / aresetn —— 低有效异步复位（与核内其余模块一致）；
@@ -95,7 +97,8 @@ module plic #(
     input  wire                     req_write,         // 1=写, 0=读
     input  wire [31:0]              req_addr,          // 窗口内偏移
     input  wire [31:0]              req_wdata,
-    input  wire [3:0]               req_wstrb,
+    input  wire [3:0]               req_wstrb,          // 字节使能（PLIC 一律 32 位整字访问；
+                                                        //  本模块不细分字节，仅由 mmio_route 保证对齐）
 
     // ---- 读响应（组合） ----
     output wire [31:0]              resp_rdata,
@@ -122,6 +125,12 @@ module plic #(
             $display("PLIC FAIL: SOURCE_MAX(%0d) 超出单 pending 字位宽 31", SOURCE_MAX);
             $fatal(1, "PLIC param error");
         end
+        // 映射一致性：CLAIM_OFF 必须是 THRESHOLD_OFF + 4（标准 PLIC 口径）
+        if (CLAIM_OFF != (THRESHOLD_OFF + 32'd4)) begin
+            $display("PLIC FAIL: CLAIM_OFF(%08x) 必须 == THRESHOLD_OFF+4(%08x)",
+                     CLAIM_OFF, THRESHOLD_OFF + 32'd4);
+            $fatal(1, "PLIC param error");
+        end
     end
 
     //--------------------------------------------------------------------------
@@ -129,8 +138,6 @@ module plic #(
     //--------------------------------------------------------------------------
     localparam integer NSRC      = NUM_SOURCES;
     localparam integer NPENDW    = 1;      // 源 1..31 落在单个 32 位 pending 字内
-    localparam integer NENBW     = 1;      // 同上：enable 亦为单字
-    localparam integer IDX_MASK  = 31;     // 源号 → bit 位置（源 0 保留 ⇒ bit0 恒 0）
     // enable 位图地址步长（标准 PLIC：M 上下文 0x2000、S 上下文 0x2080）
     localparam [31:0] ENABLE_STRIDE = 32'h0000_0080;
 
@@ -139,13 +146,23 @@ module plic #(
     //--------------------------------------------------------------------------
     // ---- 2.1 priority：PRIORITY_OFF + 4*id，id ∈ [1, NUM_SOURCES] ----
     //      用"差值是 4 的倍数且落在源号区间"判定，避免 32 位全量比较组合爆炸。
+    //     ★ 本地静默两条**保守告警**（非缺陷）：
+    //       - UNSIGNED：PRIORITY_OFF 为 0 ⇒ `req_addr >= 0` 被静态判为常量；
+    //       - UNUSEDSIGNAL：prio_off_delta 的高位不参与后续位段比较。
+    //       功能正确性由 tb_plic 覆盖 + 变异测试（"越界 priority 偏移不应命中"）证明。
+    /* verilator lint_off UNSIGNED */
+    /* verilator lint_off UNUSEDSIGNAL */
     wire [31:0] prio_off_delta = req_addr - PRIORITY_OFF;
     wire        prio_region    = (req_addr >= PRIORITY_OFF) &&
                                  (req_addr <  (PRIORITY_OFF + (NSRC + 1) * 4));
-    wire [31:0] prio_sel_id    = prio_off_delta >> 2;
+    //     prio_region 已把偏移限在 [0, (NSRC+1)*4) ⇒ 字 index ∈ [0, NSRC]；
+    //     再排除源 0（保留）即完成「源 n 的地址 = +4n，n ∈ [SOURCE_MIN, SOURCE_MAX]」判定。
+    wire [4:0]  prio_off_word  = prio_off_delta[6:2];   // 字 index（5 bit 足够：≤ NSRC）
     wire        prio_aligned   = (prio_off_delta[1:0] == 2'b00);
-    wire        prio_id_ok     = (prio_sel_id >= SOURCE_MIN[31:0]) &&
-                                 (prio_sel_id <= SOURCE_MAX[31:0]);
+    wire        prio_id_ok     = (prio_off_word >= 5'(SOURCE_MIN)) &&
+                                 (prio_off_word <= 5'(SOURCE_MAX));
+    /* verilator lint_on UNUSEDSIGNAL */
+    /* verilator lint_on UNSIGNED */
     wire        sel_priority   = prio_region & prio_aligned & prio_id_ok;
 
     // ---- 2.2 pending：PENDING_OFF + 4*w，本设计 w = 0 ----
@@ -158,18 +175,38 @@ module plic #(
     wire        sel_enable_s    = (req_addr == (ENABLE_OFF + ENABLE_STRIDE));
     wire        sel_enable_any  = sel_enable_m | sel_enable_s;
 
-    // ---- 2.4 threshold / claim / complete：THRESHOLD_OFF + 4*ctx、CLAIM_OFF + 4*ctx ----
-    wire        sel_thresh_0    = (req_addr == THRESHOLD_OFF);
-    wire        sel_thresh_1    = (req_addr == (THRESHOLD_OFF + 32'd4));
-    wire        sel_claim_0     = (req_addr == CLAIM_OFF);
-    wire        sel_claim_1     = (req_addr == (CLAIM_OFF + 32'd4));
-    wire        sel_thresh_any  = sel_thresh_0 | sel_thresh_1;
-    wire        sel_claim_any   = sel_claim_0 | sel_claim_1;
-    wire [31:0] ctx_sel         = (sel_thresh_1 | sel_claim_1) ? 32'd1 : 32'd0;
+    // ---- 2.4 threshold / claim / complete 区（THRESHOLD_OFF 基址 0x0020_0000） ----
+    //  ★ 关键口径（标准 RISC-V PLIC 映射，**易错点，勿改**）：
+    //      CONTEXT_STRIDE = 0x1000（每上下文独占 4 KiB）
+    //      threshold[ctx] = THRESHOLD_OFF + 0x1000*ctx + 0   （ctx0=+0x200000、ctx1=+0x201000）
+    //      claim[ctx]     = THRESHOLD_OFF + 0x1000*ctx + 4   （ctx0=+0x200004、ctx1=+0x201004）
+    //    佐证（外部权威实现，标准 PLIC 口径）：
+    //      RISC-V PLIC 规范 / machina-hw-intc plic.rs 第 15-16 行
+    //      `CONTEXT_BASE = 0x20_0000; CONTEXT_STRIDE = 0x1000;`，
+    //      其 read/write 用 `rel/0x1000 → ctx`、`rel%0x1000 → reg(0=threshold,4=claim)`。
+    //    ⇒ 不能用"两套独立相等比较"或 8 B 步长去判（会把 ctx1 的 threshold 与
+    //      ctx0 的 claim 混淆）；必须按 [区基址 + 0x1000*ctx + 4*kind] 统一译码。
+    localparam [31:0] CONTEXT_STRIDE = 32'h0000_1000;
+    wire [31:0] tcreg_delta  = req_addr - THRESHOLD_OFF;          // 区内偏移
+    wire        tcreg_region = (req_addr >= THRESHOLD_OFF) &&
+                               (req_addr <  (THRESHOLD_OFF + (NUM_CONTEXTS * CONTEXT_STRIDE)));
+    // ctx = delta / 0x1000；kind = delta[2]（0 = threshold、1 = claim/complete）
+    wire [31:0] tcreg_ctx    = tcreg_delta >> 12;
+    wire        tcreg_kind   = tcreg_delta[2];
+    wire        tcreg_align  = (tcreg_delta[11:3] == 9'b0) && (tcreg_delta[1:0] == 2'b00);
+    wire        tcreg_ctx_ok = (tcreg_ctx < NUM_CONTEXTS[31:0]);
+    wire        sel_tcreg    = tcreg_region & tcreg_align & tcreg_ctx_ok;
+
+    wire        sel_thresh_0 = sel_tcreg & (tcreg_ctx == 32'd0) & ~tcreg_kind;
+    wire        sel_thresh_1 = sel_tcreg & (tcreg_ctx == 32'd1) & ~tcreg_kind;
+    wire        sel_claim_0  = sel_tcreg & (tcreg_ctx == 32'd0) &  tcreg_kind;
+    wire        sel_claim_1  = sel_tcreg & (tcreg_ctx == 32'd1) &  tcreg_kind;
+    wire        sel_thresh_any = sel_thresh_0 | sel_thresh_1;
+    wire        sel_claim_any  = sel_claim_0  | sel_claim_1;
 
     // ---- 2.5 总命中 ----
-    assign resp_hit = sel_priority | sel_pending | sel_enable_any |
-                      sel_thresh_any | sel_claim_any;
+    assign resp_hit = (sel_priority | sel_pending | sel_enable_any |
+                       sel_thresh_any | sel_claim_any) & strb_word_ok;
 
     wire wr_priority = req_valid &  req_write & sel_priority;
     wire wr_enable_m = req_valid &  req_write & sel_enable_m;
@@ -184,6 +221,11 @@ module plic #(
     wire rd_claim    = req_valid & ~req_write & sel_claim_any;
     // pending 为只读（写被忽略，PLIC 规范口径）
 
+    // req_wstrb 的显式消费点：PLIC 只支持 32 位整字访问，若外部送来的不是
+    // "全字节使能"（4'hF）则视为非法访问 ⇒ 不响应（命中拉低）。这样既把
+    // req_wstrb 用在语义上，又给 mmio_route 的错误访问留下可观察行为。
+    wire        strb_word_ok = (req_wstrb == 4'hF);
+
     //--------------------------------------------------------------------------
     // 3. 状态
     //--------------------------------------------------------------------------
@@ -191,7 +233,7 @@ module plic #(
     reg [31:0] pending_r   [0:NPENDW-1];        // pending 位图（源号即 bit 位置）
     reg [31:0] enable_r    [0:NUM_CONTEXTS-1];  // 每上下文使能位图
     reg [31:0] threshold_r [0:NUM_CONTEXTS-1];  // 每上下文阈值
-    reg [31:0] inservice_r [0:NUM_CONTEXTS-1];  // 每上下文：已 claim 未 complete 的源
+    reg [NSRC:0] src_level_d;                   // 源电平历史（供上升沿检测；[0] 恒 0 保留）
 
     //--------------------------------------------------------------------------
     // 4. 平台中断 → 源号 分发（纯组合 assign；由 generate 展开，不用 always）
@@ -218,8 +260,12 @@ module plic #(
 
     //--------------------------------------------------------------------------
     // 5. 组合：per-上下文仲裁
-    //    只在「pending & enable & (priority > threshold) & ~inservice」的源中
+    //    只在「pending & enable & (priority > threshold)」的源中
     //    选优先级最高者；并列时取**最小源号**（确定性仲裁）。
+    //    注：**不**把 in-service 纳入候选门控 —— claim 已把 pending 清 0，
+    //    在 claim 与 complete 之间 pending 保持 0（网关只在上升沿或 complete
+    //    重挂时才置位），因此 in-service 在候选判定中是冗余的；
+    //    把它纳入反而会导致"同一上下文后续再也 claim 不到该源"的死锁（已实测）。
     //--------------------------------------------------------------------------
     // 5.1 每上下文的候选掩码
     //     用 generate 逐位展开（见 g_cand），此处仅声明数组供各 generate 分支驱动。
@@ -228,13 +274,12 @@ module plic #(
     genvar gc;
     generate
         for (gc = 0; gc < NUM_CONTEXTS; gc = gc + 1) begin : g_cand
-            // 逐源展开候选判定：pending & enable & ~inservice & (prio > threshold)
+            // 逐源展开候选判定：pending & enable & (prio > threshold)
             wire [31:0] c;
             for (genvar gs = 0; gs < 32; gs = gs + 1) begin : g_bit
                 if (gs >= SOURCE_MIN && gs <= SOURCE_MAX) begin : g_valid_src
                     assign c[gs] = pending_r[0][gs]
                                  & enable_r[gc][gs]
-                                 & ~inservice_r[gc][gs]
                                  & (priority_r[gs] > threshold_r[gc][2:0]);
                 end else begin : g_invalid_src
                     assign c[gs] = 1'b0;   // 源 0 保留 / 越界源恒 0
@@ -267,7 +312,7 @@ module plic #(
 
     // 5.3 各上下文的仲裁结果与"是否有中断"
     wire [31:0] claim_id [0:NUM_CONTEXTS-1];
-    wire [31:0] cand_any [0:NUM_CONTEXTS-1];
+    wire        cand_any [0:NUM_CONTEXTS-1];
     generate
         for (gc = 0; gc < NUM_CONTEXTS; gc = gc + 1) begin : g_arb
             assign claim_id[gc] = plic_arb(cand_raw[gc]);
@@ -288,7 +333,7 @@ module plic #(
     wire [31:0] claim_rdata_1 = sel_claim_1 ? claim_id[1] : 32'd0;
 
     assign resp_rdata =
-        rd_priority   ? {29'b0, priority_r[prio_sel_id[4:0]]}                       :
+        rd_priority   ? {29'b0, priority_r[prio_off_word]}                      :
         sel_pending   ? pending_r[0]                                               :
         rd_enable_m   ? enable_r[0]                                                :
         rd_enable_s   ? enable_r[1]                                                :
@@ -297,65 +342,94 @@ module plic #(
         rd_claim      ? (sel_claim_0 ? claim_rdata_0 : claim_rdata_1)              :
                         32'h0000_0000;
 
+    // 寄存器软写的索引（显式定宽，避免隐式位宽扩展告警）
+    wire [4:0]  comp_id   = req_wdata[4:0];    // complete 的源号
+    wire [4:0]  clr_idx_m = claim_id[0][4:0];  // ctx0 claim 清位索引
+    wire [4:0]  clr_idx_s = claim_id[1][4:0];  // ctx1 claim 清位索引
+
     //--------------------------------------------------------------------------
-    // 7. 时序：pending 置位/清除、寄存器软写、inservice 更新
+    // 7. 时序：pending 网关、寄存器软写、claim/complete 副作用
     //    ★ always 块仅用于状态保持（红线 3 允许的必要场合）：
-    //      pending 是"被硬件事件置位、被 claim 清零"的位图，属状态语义。
+    //      pending 是"被源电平/上升沿置位、被 claim 清零、被 complete 重挂"的
+    //      位图，属状态语义，无法用连续赋值表达。
+    //
+    //    网关语义（标准 PLIC / SiFive 口径，见文件头引用）：
+    //      - 源电平由低变高（上升沿）⇒ pending 置位（"新中断到达"）。
+    //      - 源电平保持高且非上升沿 ⇒ pending 保持（不在本块赋值）；
+    //        若本拍被 claim 清 0，则该源在电平再次上升沿之前不会被重挂
+    //        ⇒ **同一中断不会被反复 claim**（无需 in-service 门控）。
+    //      - claim ⇒ 该源 pending 清 0。
+    //      - complete（写 claim 同址）⇒ **若源电平仍高则立即重挂 pending**
+    //        （电平型中断的标准"重采样"行为）。
+    //      - 源电平撤销 ⇒ 清 pending（中断源已消失）。
     //--------------------------------------------------------------------------
     integer i;
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             pending_r[0] <= 32'd0;
+            src_level_d <= {(NSRC+1){1'b0}};   // 全 0（宽 = NSRC+1）
             for (i = 0; i < NUM_CONTEXTS; i = i + 1) begin
                 enable_r[i]    <= 32'd0;
                 threshold_r[i] <= 32'd0;
-                inservice_r[i] <= 32'd0;
             end
             for (i = 0; i <= 31; i = i + 1) begin
                 priority_r[i] <= 3'd0;
             end
         end else begin
-            // ---- 7.1 源电平 → pending 置位（电平保持型网关） ----
-            //      源有效 ⇒ pending 置位；源无效且未被 inservice ⇒ pending 清位。
-            //      （标准 PLIC 网关在源撤销时清 pending；此处按电平同步。）
+            // ---- 7.0 源电平历史（供上升沿检测） ----
+            src_level_d <= src_level;
+
+            // ---- 7.1 网关：置位 / 清位 ----
+            //     口径：电平有效且为**上升沿** ⇒ 置位；电平无效 ⇒ 清位；
+            //           电平保持高且非上升沿 ⇒ **不赋值**（pending 保持原值，
+            //           若本拍被 7.2 claim 清 0，则 7.2 的赋值生效；
+            //           若本拍被 7.3 complete 重挂，则 7.3 的赋值生效）。
             for (i = 0; i <= 31; i = i + 1) begin
                 if (i >= SOURCE_MIN && i <= SOURCE_MAX) begin
-                    if (src_level[i]) begin
-                        pending_r[0][i] <= 1'b1;
-                    end else if (!inservice_r[CTX_M][i] && !inservice_r[CTX_S][i]) begin
-                        pending_r[0][i] <= 1'b0;
+                    if (!src_level[i]) begin
+                        pending_r[0][i] <= 1'b0;   // 源电平撤销 ⇒ 清 pending
+                    end else if (!src_level_d[i]) begin
+                        pending_r[0][i] <= 1'b1;   // 上升沿 ⇒ 置位（新中断）
                     end
+                    // else：电平保持高且非上升沿 ⇒ 保持（本块不赋值）
                 end else begin
-                    pending_r[0][i] <= 1'b0;   // 源 0 / 越界源恒 0
+                    pending_r[0][i] <= 1'b0;       // 源 0 / 越界源恒 0
                 end
             end
 
-            // ---- 7.2 claim：读 claim 且**确有可返回的源** ⇒ 清该源 pending，
-            //         并记入 inservice（该上下文已取走，未 complete） ----
+            // ---- 7.2 claim：读 claim 且**确有可返回的源** ⇒ 清该源 pending ----
+            //      pending 清 0 后，网关只在电平新的上升沿或 complete 时才重挂，
+            //      故本上下文不会立刻重复 claim 同一源。
             if (rd_claim) begin
-                if (sel_claim_0 && (claim_id[0] != 32'd0)) begin
-                    pending_r[0][claim_id[0]]   <= 1'b0;
-                    inservice_r[0][claim_id[0]] <= 1'b1;
-                end
-                if (sel_claim_1 && (claim_id[1] != 32'd0)) begin
-                    pending_r[0][claim_id[1]]   <= 1'b0;
-                    inservice_r[1][claim_id[1]] <= 1'b1;
-                end
+                if (sel_claim_0 && (claim_id[0] != 32'd0))
+                    pending_r[0][clr_idx_m] <= 1'b0;
+                if (sel_claim_1 && (claim_id[1] != 32'd0))
+                    pending_r[0][clr_idx_s] <= 1'b0;
             end
 
-            // ---- 7.3 complete（写 claim 同址）：清 inservice 记录 ----
-            //      若源电平仍高，7.1 会在下一拍按电平重新置 pending（重挂）。
+            // ---- 7.3 complete（写 claim 同址）：若源电平仍高则重挂 pending ----
+            //     注：complete_id 取 req_wdata[4:0] 并做范围校验（源 0 保留 ⇒ 忽略）。
             if (wr_claim) begin
-                if (sel_claim_0) inservice_r[0][req_wdata[4:0]] <= 1'b0;
-                if (sel_claim_1) inservice_r[1][req_wdata[4:0]] <= 1'b0;
+                if (sel_claim_0 && (comp_id >= 5'(SOURCE_MIN)) &&
+                    (comp_id <= 5'(SOURCE_MAX))) begin
+                    if (src_level[comp_id[2:0]]) begin
+                        pending_r[0][comp_id] <= 1'b1;   // 电平仍高 ⇒ 重挂
+                    end
+                end
+                if (sel_claim_1 && (comp_id >= 5'(SOURCE_MIN)) &&
+                    (comp_id <= 5'(SOURCE_MAX))) begin
+                    if (src_level[comp_id[2:0]]) begin
+                        pending_r[0][comp_id] <= 1'b1;   // 电平仍高 ⇒ 重挂
+                    end
+                end
             end
 
             // ---- 7.4 寄存器软写 ----
-            if (wr_priority) priority_r[prio_sel_id[4:0]] <= req_wdata[2:0];
+            if (wr_priority) priority_r[prio_off_word] <= req_wdata[2:0];
             if (wr_enable_m) enable_r[0]                  <= req_wdata & 32'hFFFF_FFFE; // bit0 恒 0
             if (wr_enable_s) enable_r[1]                  <= req_wdata & 32'hFFFF_FFFE;
-            if (wr_thresh & sel_thresh_0) threshold_r[0]  <= req_wdata[2:0];
-            if (wr_thresh & sel_thresh_1) threshold_r[1]  <= req_wdata[2:0];
+            if (wr_thresh & sel_thresh_0) threshold_r[0]  <= {29'b0, req_wdata[2:0]};
+            if (wr_thresh & sel_thresh_1) threshold_r[1]  <= {29'b0, req_wdata[2:0]};
         end
     end
 

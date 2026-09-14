@@ -11,6 +11,10 @@
 //             (4) **依赖方向**：`RV32GC_XIP_HI20*` 已迁至 core_params.vh ⇒
 //                 core_params.vh 自包含、不再反向依赖 rv32_defs.vh（2026-09-14）。
 //                 本 TB 因此先用 core_params.vh 的宏做一次取值检查。
+//             (5) 2026-09-14 修复的「宏值 ≠ 注释宣称值」缺陷回归锁定：
+//                 `RV32GC_FP_F5_FCVT`（原 ('h8 >> 3)，实测求值 5'b00001）、
+//                 `RV32GC_TVEC_BASE_MSK`（原 12'hFFF_FFFC，实测被截断为 12'hFFC）
+//                 与 `RV32GC_MMIO_HI16_MSK`（原 16'hFFFF_0000，实测被截断为 0）。
 // 判定    : 任一断言不成立 ⇒ 立即 $fatal（非零退出码），且**绝不打印 PASS**；
 //           全部通过才在最后打印 `PKG_CHECK: PASS`。
 //           调用方（验收命令）必须以「输出末行含 PKG_CHECK: PASS」且「进程退出码 0」
@@ -51,9 +55,23 @@ module pkg_check_top;
     localparam        CBOZ_BLK     = `RV32GC_CBOZ_BLOCK_SIZE;
     localparam        MSHR_DEPTH   = `RV32GC_MEMSHR_DEPTH;
     localparam [31:0] CLK_HZ       = `RV32GC_CLK_HZ;
+    // ---- core_params.vh：宏体内层引用的取值镜像（2026-09-14 iverilog 兼容自检） ----
+    //      这些常量由「宏体内部再引用其它宏」的表达式得出；iverilog 12.0 只在体
+    //      内引用带反引号时才继续展开内层宏，因此它们同时充当
+    //      「内层宏引用已加反引号」的机器检查（裸名会在此处 Unable to bind parameter）。
+    localparam [31:0] SE_DDR       = `RV32GC_DDR_SIZE;
+    localparam [31:0] SE_L1I_BYTES = `RV32GC_L1I_SIZE_BYTES;
+    localparam [31:0] SE_L1I_SETS  = `RV32GC_L1I_SETS;
+    localparam [31:0] SE_L1D_BYTES = `RV32GC_L1D_SIZE_BYTES;
+    localparam [31:0] SE_L1D_SETS  = `RV32GC_L1D_SETS;
+    localparam [31:0] SE_MC_INT_MSK= `RV32GC_MCAUSE_INT_MSK;   // rv32_defs.vh
+    localparam [31:0] SE_AXI_FILL  = `RV32GC_AXI_LINE_FILL_LEN; // 8 beat（同为内层引用宏）
     // ---- core_params.vh：XIP 高 12 位位段（2026-09-14 由位域真源迁入本包） ----
     localparam [11:0] XIP_HI20_V   = `RV32GC_XIP_HI20_VAL;
     localparam [11:0] XIP_HI20_M   = `RV32GC_XIP_HI20_MSK;
+    // ---- core_params.vh：MMIO 窗口掩码（2026-09-14 修复锁定；统一 32 位全宽口径） ----
+    localparam [31:0] MMIO_HI16_MSK = `RV32GC_MMIO_HI16_MSK;
+    localparam [31:0] MMIO_HI20_MSK = `RV32GC_MMIO_HI20_MSK;
     // ---- rv32_defs.vh ----
     localparam [11:0] CSR_MSTATUS  = `RV32GC_CSR_MSTATUS;
     localparam [11:0] CSR_MISA     = `RV32GC_CSR_MISA;
@@ -97,6 +115,17 @@ module pkg_check_top;
     wire [11:0] xip_hi20_msk = `RV32GC_XIP_HI20_MSK;
     wire xip_hi20_ok = (xip_hi20_val === 12'h1C0) && (xip_hi20_msk === 12'hFFF) &&
                        (((XIP_BASE >> 20) & xip_hi20_msk) === xip_hi20_val);
+    // ---- MMIO 高 16 位窗口掩码：必须真能提取 PA[31:16]（2026-09-14 修复锁定） ----
+    //      真源原写作 `16'hFFFF_0000`——16 位 sized literal ⇒ iverilog 报
+    //      "Numeric constant truncated to 16 bits"，实测展开值 32'h0000_0000，
+    //      (PA & MASK) 恒为 0 ⇒ PA[31:16] 窗口比较全部落空。已修为 32'hFFFF_0000。
+    wire mmio_hi16_ok = (MMIO_HI16_MSK === 32'hFFFF_0000) &&
+                        (((32'h1F00_0000 & MMIO_HI16_MSK) >> 16) === 16'h1F00) &&
+                        ((32'h1FE8_5678 & MMIO_HI16_MSK) === 32'h1FE8_0000) &&
+                        ((32'h0000_1234 & MMIO_HI16_MSK) === 32'h0000_0000);
+    //      与 HI20 掩码同一口径：两者都必须 32 位全宽，且 HI16 掩码覆盖 HI20 掩码。
+    wire mmio_msk_consistent = (MMIO_HI20_MSK === 32'hFFF0_0000) &&
+                               ((MMIO_HI16_MSK & MMIO_HI20_MSK) === MMIO_HI20_MSK);
 
     //--------------------------------------------------------------------------
     // 3. 断言（全部 $fatal；不打 PASS）
@@ -146,6 +175,24 @@ module pkg_check_top;
         if (!xip_hi20_ok) begin
             $display("SYSCK FAIL: XIP_HI20 val/msk = %03x/%03x, XIP_BASE=%08x",
                      xip_hi20_val, xip_hi20_msk, XIP_BASE);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+
+        // (B2) MMIO 高 16 位窗口掩码（2026-09-14 修复锁定）：宏展开值必须等于
+        //      注释宣称的 PA[31:16] 掩码 32'hFFFF_0000（原 16'hFFFF_0000 展开为 0）。
+        if (MMIO_HI16_MSK !== 32'hFFFF_0000) begin
+            $display("SYSCK FAIL: RV32GC_MMIO_HI16_MSK=%08x expect 32'hFFFF_0000 (PA[31:16] 窗口掩码)",
+                     MMIO_HI16_MSK);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (!mmio_hi16_ok) begin
+            $display("SYSCK FAIL: RV32GC_MMIO_HI16_MSK 不能提取 PA[31:16] (=%08x)",
+                     MMIO_HI16_MSK);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (!mmio_msk_consistent) begin
+            $display("SYSCK FAIL: MMIO 掩码口径不一致 HI16=%08x HI20=%08x",
+                     MMIO_HI16_MSK, MMIO_HI20_MSK);
             $fatal(1, "PKG_CHECK FAIL");
         end
 
@@ -231,6 +278,16 @@ module pkg_check_top;
         end
         if (`RV32GC_CSR_MHARTID !== 12'hF14) begin
             $display("SYSCK FAIL: mhartid 地址错"); $fatal(1, "PKG_CHECK FAIL");
+        end
+
+        // (D2) mtvec 位域宏（2026-09-14 修复锁定）：Direct 下 BASE 提取掩码必须
+        //      清 MODE[1:0] 且保留 BASE[31:2]。真源原写作 `12'hFFF_FFFC`——iverilog
+        //      报「Extra digits / truncated to 12 bits」，实测展开值仅 12'hFFC
+        //      （会把 BASE[31:12] 一并清 0）；已修为 32'hFFFF_FFFC。
+        if (`RV32GC_TVEC_BASE_MSK !== 32'hFFFF_FFFC) begin
+            $display("SYSCK FAIL: RV32GC_TVEC_BASE_MSK=%08x expect 32'hFFFF_FFFC",
+                     `RV32GC_TVEC_BASE_MSK);
+            $fatal(1, "PKG_CHECK FAIL");
         end
 
         // (E) cause 码
@@ -326,6 +383,16 @@ module pkg_check_top;
         if (`RV32GC_OP_FP !== 7'b1010011 || !fmt_ok) begin
             $display("SYSCK FAIL: OP-FP opcode/fmt 错"); $fatal(1, "PKG_CHECK FAIL");
         end
+        // ---- 2026-09-14 修复锁定（判据：真源宏**展开值**必须等于注释宣称值）----
+        //      真源 §3.13 的 `RV32GC_FP_F5_FCVT` 原写作 `('h8 >> 3)`，注释却称
+        //      5'b01000；实测 8>>3 = 1 ⇒ 展开值 5'b00001，会让 fcvt.s.d(0x401574d3)
+        //      / fcvt.d.s(0x420605d3) 被误判为非法指令。已修为 5'b01000；
+        //      若有人改回表达式或改错值，本断言立即 $fatal（绝不打印 PASS）。
+        if (`RV32GC_FP_F5_FCVT !== 5'b01000) begin
+            $display("SYSCK FAIL: RV32GC_FP_F5_FCVT=%05b expect 5'b01000 (fcvt.T.S/D)",
+                     `RV32GC_FP_F5_FCVT);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
         if (`RV32GC_FP_F5_FADD !== 5'b00000 || `RV32GC_FP_F5_FDIV !== 5'b00011 ||
             `RV32GC_FP_F5_FSQRT !== 5'b01011 || `RV32GC_FP_F5_FSGNJ !== 5'b00100 ||
             `RV32GC_FP_F5_FCMP !== 5'b10100) begin
@@ -391,11 +458,48 @@ module pkg_check_top;
             $display("SYSCK FAIL: 2A 扩展实现开关错"); $fatal(1, "PKG_CHECK FAIL");
         end
 
-        // (K) 关键值打印（供验收命令与人工复核留痕）
+        // (K) iverilog 兼容断言组（2026-09-14）：宏体内层宏引用必须带反引号。
+        //     ★ 这 6 条同时是「修复验收判据」：若内层引用被改回裸名，本组所在的
+        //       localparam 镜像（§1 的 SE_*）会在 elaboration 阶段直接
+        //       `Unable to bind parameter` ⇒ 编译失败，本文件根本跑不到这里；
+        //       若有人把数值改错，则在此处 $fatal（绝不打印 PASS）。
+        if (SE_L1I_BYTES !== 16384) begin
+            $display("SYSCK FAIL: RV32GC_L1I_SIZE_BYTES=%0d expect 16384", SE_L1I_BYTES);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (SE_L1I_SETS !== 256) begin
+            $display("SYSCK FAIL: RV32GC_L1I_SETS=%0d expect 256", SE_L1I_SETS);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (SE_L1D_BYTES !== 32768) begin
+            $display("SYSCK FAIL: RV32GC_L1D_SIZE_BYTES=%0d expect 32768", SE_L1D_BYTES);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (SE_L1D_SETS !== 256) begin
+            $display("SYSCK FAIL: RV32GC_L1D_SETS=%0d expect 256", SE_L1D_SETS);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (SE_DDR !== (128 * 1024 * 1024)) begin
+            $display("SYSCK FAIL: RV32GC_DDR_SIZE=%0d expect 134217728 (128MiB)", SE_DDR);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        if (SE_MC_INT_MSK !== 32'h80000000) begin
+            $display("SYSCK FAIL: RV32GC_MCAUSE_INT_MSK=%08x expect 80000000", SE_MC_INT_MSK);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+        // 内层引用宏的第 7 处（AXI 行填充长度）同批修复，一并断言，防回归。
+        if (SE_AXI_FILL !== 8) begin
+            $display("SYSCK FAIL: RV32GC_AXI_LINE_FILL_LEN=%0d expect 8", SE_AXI_FILL);
+            $fatal(1, "PKG_CHECK FAIL");
+        end
+
+        // (L) 关键值打印（供验收命令与人工复核留痕）
         $display("RESET_PC     = %08x", RESET_PC);
         $display("XIP base/ali = %08x / %08x", XIP_BASE, XIP_ALIAS);
         $display("XIP HI20 val/msk = %03x / %03x (defined in core_params.vh)",
                  XIP_HI20_V, XIP_HI20_M);
+        $display("MMIO HI16/HI20 msk = %08x / %08x (均 32 位全宽；2026-09-14 修复后展开值)",
+                 MMIO_HI16_MSK, MMIO_HI20_MSK);
         $display("CLINT / PLIC = %08x / %08x", CLINT_BASE, PLIC_BASE);
         $display("mstatus      = %03x", CSR_MSTATUS);
         $display("mepc/mcause  = %03x / %03x", CSR_MEPC, CSR_MCAUSE);
@@ -403,12 +507,22 @@ module pkg_check_top;
         $display("XLEN         = %0d, IALIGN = %0d", XLEN_L, `RV32GC_IALIGN);
         $display("clk/timebase = %0d Hz", CLK_HZ);
         $display("L1I/L1D      = %0d KB / %0d KB", L1I_KB, L1D_KB);
+        $display("L1I bytes/sets = %0d / %0d (iverilog 内层宏引用已带反引号)",
+                 SE_L1I_BYTES, SE_L1I_SETS);
+        $display("L1D bytes/sets = %0d / %0d", SE_L1D_BYTES, SE_L1D_SETS);
+        $display("DDR size     = %0d (0x%08x)", SE_DDR, SE_DDR);
+        $display("mcause_int_msk = %08x, axi_line_fill_len = %0d",
+                 SE_MC_INT_MSK, SE_AXI_FILL);
         $display("cause exc 1/2/5/7/12 = %0d/%0d/%0d/%0d/%0d",
                  `RV32GC_EXC_INSN_ACCESS_FAULT, `RV32GC_EXC_ILLEGAL_INSN,
                  `RV32GC_EXC_LOAD_ACCESS_FAULT, `RV32GC_EXC_STORE_ACCESS_FAULT,
                  `RV32GC_EXC_INSN_PAGE_FAULT);
         $display("cbo rs2 inval/clean/flush = %0d/%0d/%0d",
                  cbo_inval, cbo_clean, cbo_flush);
+        $display("FP_F5_FCVT   = %05b (fcvt.T.S/D；2026-09-14 修复后展开值)",
+                 `RV32GC_FP_F5_FCVT);
+        $display("TVEC_BASE_MSK= %08x (Direct BASE 提取掩码；2026-09-14 修复后展开值)",
+                 `RV32GC_TVEC_BASE_MSK);
 
         // 到达此处 = 全部断言通过
         $display("PKG_CHECK: PASS");

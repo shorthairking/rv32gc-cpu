@@ -54,7 +54,14 @@ module cache_tag_array #(
     input  wire [ADDR_W-1:0]      rd_addr,    // 组索引
     output wire [TAG_W-1:0]       rd_tag_r,   // 读回 tag（1 拍后有效）
     output wire                   rd_valid_r, // 读回 valid（1 拍后有效）
-    output wire                   rd_dirty_r  // 读回 dirty（1 拍后有效）
+    output wire                   rd_dirty_r, // 读回 dirty（1 拍后有效）
+
+    // ---- 维护（RMW：只改 dirty，**保留** tag/valid） ----
+    //   为 cbo.clean 提供"清 dirty 但不失效、不破坏数据"的能力。
+    //   注：BRAM 是字级写口；此处用"读改写"在**同一拍**完成（读旧值 → 只改
+    //   dirty 位 → 写回），读地址与写地址相同，行为模型与 BRAM 语义一致）。
+    input  wire                   dirty_clr_en,   // 清 dirty 使能（按组）
+    input  wire [ADDR_W-1:0]      dirty_clr_addr  // 组索引
 );
     // ---- 元数据打包：单条 BRAM 字 = { tag, dirty, valid } ----
     localparam integer META_W = TAG_W + 2;              // 1 bit dirty + 1 bit valid
@@ -84,6 +91,8 @@ module cache_tag_array #(
     //     .dinb  ({META_W{1'b0}}),
     //     .doutb ()            // 读数据（由行为模型同一接口提供，见下）
     // );
+    // ※ 维护（只清 dirty）：同名 IP 的写口支持字节使能 ⇒ 用 wea 仅使能
+    //   dirty 位所在字节即可（与仿真分支的"只改 dirty"语义逐拍等价）。
     // ※ 例化主体由 create_ip.tcl 生成（blk_mem_gen_cache_tag.xci）；
     //   META_W = TAG_W+2 需与 IP 的 Write/Read Width 一致（按 32 bit 对齐时取高位）。
 `endif
@@ -105,7 +114,11 @@ module cache_tag_array #(
     reg [META_W-1:0] rd_meta_q;
 
     always @(posedge clk) begin
-        if (wr_en) meta_q[wr_addr] <= wr_meta;   // 同步写
+        if (wr_en) meta_q[wr_addr] <= wr_meta;   // 同步写（整项）
+        // ---- 维护：只清 dirty，保留 tag/valid（读改写，同址同拍） ----
+        if (dirty_clr_en) begin
+            meta_q[dirty_clr_addr][DIRTY_B] <= 1'b0;
+        end
         if (rd_en) rd_meta_q <= meta_q[rd_addr]; // 同步读（先读后写：同址同拍读旧值）
     end
 

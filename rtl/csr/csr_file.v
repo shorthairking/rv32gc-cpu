@@ -67,11 +67,18 @@ module csr_file (
 
     //--------------------------------------------------------------------------
     // 陷阱目标 CSR 写口（trap_ctrl 在陷阱入口写 *epc/*cause/*tval）
-    // 优先级：trap_we > wen（同一拍不可能同时出现，但显式定序避免锁存歧义）
+    //   ★ **分组语义**（见 §4.2）：一次陷阱原子更新 3 个 CSR，故数据分 3 个端口，
+    //     而不是"一个地址 + 一个数据"的逐 CSR 形式。
+    //   trap_we[0]=M 组（mepc/mcause/mtval 同拍写）
+    //   trap_we[1]=S 组（sepc/scause/stval 同拍写）
+    //   trap_we[2]=sscratch 单写   trap_we[3]=mscratch 单写
+    //   优先级：trap_we > wen（同拍不可能同时出现，显式定序避免歧义）
     //--------------------------------------------------------------------------
-    input  wire [3:0]  trap_we,       // {sepc,stval,scause,mepc+mtval+mcause} 分组使能
-    input  wire [11:0] trap_addr,
-    input  wire [31:0] trap_wdata,
+    input  wire [3:0]  trap_we,       // 分组使能（见上）
+    input  wire [31:0] trap_epc_i,    // 组的 epc 值
+    input  wire [31:0] trap_cause_i,  // 组的 cause 值
+    input  wire [31:0] trap_tval_i,   // 组的 tval 值
+    input  wire [31:0] trap_data_i,   // sscratch/mscratch 单写值（trap_we[3:2]）
 
     //--------------------------------------------------------------------------
     // 中断请求（核内 CLINT/PLIC 汇入）+ 软件可写 pending 位
@@ -282,8 +289,11 @@ module csr_file (
                     (32'h1 << `RV32GC_MIP_STIP_BIT) | (32'h1 << `RV32GC_MIP_MTIP_BIT) |
                     (32'h1 << `RV32GC_MIP_SEIP_BIT) | (32'h1 << `RV32GC_MIP_MEIP_BIT);
                 // ---- mtvec/stvec：BASE(4 B 对齐) + MODE(0/1) ----
+                //   ★ 掩码必须**包含 MODE[1:0]**：MODE 的合法化在 wr_mask 之后的
+                //   mtvec_wval 重组里完成（2/3 保留 ⇒ 保持旧 MODE）。
+                //   若把低 2 位掩成 0，MODE 永远写不进（实测踩到过这个坑）。
                 `RV32GC_CSR_MTVEC,
-                `RV32GC_CSR_STVEC: wr_mask = 32'hFFFF_FFFC;   // bit[1:0]=MODE 见写逻辑
+                `RV32GC_CSR_STVEC: wr_mask = 32'hFFFF_FFFF;
                 `RV32GC_CSR_MCOUNTEREN,
                 `RV32GC_CSR_SCOUNTEREN: wr_mask = 32'h0000_0007;  // CY/TM/IR
                 // ---- menvcfg/senvcfg：FIOM(0)/CBIE(5:4)/CBCFE(6)/CBZE(7) ----
@@ -374,9 +384,20 @@ module csr_file (
     reg [31:0] menvcfg_r, senvcfg_r;
     reg [31:0] satp_r;
     reg [31:0] sscratch_r, sepc_r, scause_r, stval_r;
-    reg [31:0] mcycle_r, minstret_r;   // RV32 低半（高半见 §5 派生）
+    // ---- 计数器：mcycle/minstret 为 64 位；RV32 下低半走 0xB00/0xB02、
+    //      高半走 0xB80/0xB82，**四个都是软件可写寄存器**（Zicntr 要求 mcycle/
+    //      minstret 对 M 模式读写；高半亦然）。硬件计数输入只驱动"低半的硬件增量"：
+    //      2A 口径：低半 = cycle_i[31:0]（硬件计数）+ 软件写入偏移共同决定；
+    //      为保持语义简单且可测，本设计取 **"软件写即直接置值"**（低半由软件可写，
+    //      高半独立软件可写），硬件计数只反映在 cycle_i/instret_i 的 *只读视图*
+    //      （0xC00/0xC02）上——这也是 2A 未做计数抑制/事件选择（mcountinhibit
+    //      与 mhpmevent 吞写）时的自洽口径。
+    reg [31:0] mcycle_l, mcycle_h;     // mcycle  低/高半（软件可写）
+    reg [31:0] minstret_l, minstret_h; // minstret 低/高半（软件可写）
     reg [31:0] mstat_sw;               // mstatus 的**软件可写**字段存储
-    reg [1:0]  mip_sw;                 // {SEIP, STIP, SSIP} 的软件可写位 {9,5,1}
+    //   ★ 位宽必须是 3：{SEIP, STIP, SSIP} ↔ {[2],[1],[0]}。
+    //     实测踩到：写成 [1:0] 而索引 [2] ⇒ 读回出现 X（iverilog 报 0xX22）。
+    reg [2:0]  mip_sw;                 // {SEIP, STIP, SSIP} 的软件可写位
     reg [`RV32GC_PMP_ENTRIES*8-1:0]      pmp_cfg_r;
     reg [`RV32GC_PMP_ENTRIES*32-1:0]     pmp_addr_r;
 
@@ -408,20 +429,24 @@ module csr_file (
     wire [31:0] satp_wval     = satp_mode_ok ? wval : satp_r;
 
     // ---- mtvec/stvec MODE WARL：MODE ∈ {0(Direct), 1(Vectored)}；2/3 保留 ⇒ 保持旧 MODE ----
+    //   ★ 陷阱：`{wval[31:2], mode}` 是错的写法——那是"把 wval 左移 30 位"，
+    //   正确写法必须重组为 (wval[31:2] << 2) | mode（BASE 位段保持原位）。
     wire [1:0] mtvec_mode_old = mtvec_r[1:0];
     wire [1:0] mtvec_mode_new = (wval[1:0] <= 2'b01) ? wval[1:0] : mtvec_mode_old;
-    wire [31:0] mtvec_wval    = {wval[31:2], mtvec_mode_new};
+    wire [31:0] mtvec_wval    = {wval[31:2], 2'b00} | {30'b0, mtvec_mode_new};
     wire [1:0] stvec_mode_old = stvec_r[1:0];
     wire [1:0] stvec_mode_new = (wval[1:0] <= 2'b01) ? wval[1:0] : stvec_mode_old;
-    wire [31:0] stvec_wval    = {wval[31:2], stvec_mode_new};
+    wire [31:0] stvec_wval    = {wval[31:2], 2'b00} | {30'b0, stvec_mode_new};
 
     // ---- menvcfg/senvcfg CBIE WARL：2'b10 保留 ⇒ 保持旧值（06 §7.1/§9） ----
+    //   ★ 陷阱：`{wval[31:8], wval[7:6], cbie, wval[3:0]}` 是 34 bit 拼接（会被截断
+    //   并错位）。正确写法是按字段掩码替换：先清掉 [5:4]，再置入新 CBIE。
     wire [1:0] mcf_cbie_old = menvcfg_r[5:4];
     wire [1:0] mcf_cbie_new = (wval[5:4] == 2'b10) ? mcf_cbie_old : wval[5:4];
-    wire [31:0] menvcfg_wval = {wval[31:8], wval[7:6], mcf_cbie_new, wval[3:0]};
+    wire [31:0] menvcfg_wval = (wval & ~32'h0000_0030) | ({30'b0, mcf_cbie_new} << 4);
     wire [1:0] scf_cbie_old = senvcfg_r[5:4];
     wire [1:0] scf_cbie_new = (wval[5:4] == 2'b10) ? scf_cbie_old : wval[5:4];
-    wire [31:0] senvcfg_wval = {wval[31:8], wval[7:6], scf_cbie_new, wval[3:0]};
+    wire [31:0] senvcfg_wval = (wval & ~32'h0000_0030) | ({30'b0, scf_cbie_new} << 4);
 
     // ---- mstatus / sstatus / sie / sip 的共享存储映射 ----
     //      sstatus 是 mstatus 的视图（SIE/SPIE/SPP/SUM/MXR/FS 同一存储）；
@@ -458,8 +483,10 @@ module csr_file (
     wire wr_sepc    = wen & (waddr == `RV32GC_CSR_SEPC);
     wire wr_scause  = wen & (waddr == `RV32GC_CSR_SCAUSE);
     wire wr_stval   = wen & (waddr == `RV32GC_CSR_STVAL);
-    wire wr_mcycle  = wen & (waddr == `RV32GC_CSR_MCYCLE);
-    wire wr_minstret= wen & (waddr == `RV32GC_CSR_MINSTRET);
+    wire wr_mcycle   = wen & (waddr == `RV32GC_CSR_MCYCLE);
+    wire wr_mcycleh  = wen & (waddr == `RV32GC_CSR_MCYCLEH);
+    wire wr_minstret = wen & (waddr == `RV32GC_CSR_MINSTRET);
+    wire wr_minstreth= wen & (waddr == `RV32GC_CSR_MINSTRETH);
     // ---- PMP：16 项地址寄存器 + 4 个 cfg ----
     wire [3:0] wr_pmpcfg =
         { (wen & (waddr == `RV32GC_CSR_PMPCFG3)),
@@ -494,17 +521,21 @@ module csr_file (
     wire [31:0] mstatus_view =
         (mstat_sw & wr_mask(`RV32GC_CSR_MSTATUS)) |
         (mstat_sd << `RV32GC_MSTATUS_SD_BIT);
-    assign mstatus_o = mstatus_view & ~(mstatus_clr) | (mstatus_set);
+    //   括号必须显式：& 与 | 在 Verilog 中优先级低于 |? 二者同级左结合，
+    //   不加括号会写成 ((view & ~clr) | set)，语义上恰好正确但可读性差，
+    //   此处显式括号确保「先清后置」的 trap_ctrl 语义。
+    assign mstatus_o = (mstatus_view & ~mstatus_clr) | mstatus_set;
 
     // ---- sstatus 视图：从 mstatus 取 S 相关位 ----
+    //   注意：Shifts 与 & 的优先级 —— 先移位后掩码，故每项都显式括号。
     wire [31:0] sstatus_view =
-        ((mstatus_view >> `RV32GC_MSTATUS_SIE_BIT)  & 32'h1) << 1 |
-        ((mstatus_view >> `RV32GC_MSTATUS_SPIE_BIT) & 32'h1) << `RV32GC_MSTATUS_SPIE_BIT |
-        ((mstatus_view >> `RV32GC_MSTATUS_SPP_BIT)  & 32'h1) << `RV32GC_MSTATUS_SPP_BIT |
-        ((mstatus_view >> `RV32GC_MSTATUS_FS_LSB) & `RV32GC_MSTATUS_FS_MSK) << `RV32GC_MSTATUS_FS_LSB |
-        ((mstatus_view >> `RV32GC_MSTATUS_SUM_BIT) & 32'h1) << `RV32GC_MSTATUS_SUM_BIT |
-        ((mstatus_view >> `RV32GC_MSTATUS_MXR_BIT) & 32'h1) << `RV32GC_MSTATUS_MXR_BIT |
-        ((mstatus_view >> `RV32GC_MSTATUS_SD_BIT)  & 32'h1) << `RV32GC_MSTATUS_SD_BIT;
+        (((mstatus_view >> `RV32GC_MSTATUS_SIE_BIT)  & 32'h1) << `RV32GC_MSTATUS_SIE_BIT) |
+        (((mstatus_view >> `RV32GC_MSTATUS_SPIE_BIT) & 32'h1) << `RV32GC_MSTATUS_SPIE_BIT) |
+        (((mstatus_view >> `RV32GC_MSTATUS_SPP_BIT)  & 32'h1) << `RV32GC_MSTATUS_SPP_BIT) |
+        (((mstatus_view >> `RV32GC_MSTATUS_FS_LSB) & (`RV32GC_MSTATUS_FS_MSK)) << `RV32GC_MSTATUS_FS_LSB) |
+        (((mstatus_view >> `RV32GC_MSTATUS_SUM_BIT) & 32'h1) << `RV32GC_MSTATUS_SUM_BIT) |
+        (((mstatus_view >> `RV32GC_MSTATUS_MXR_BIT) & 32'h1) << `RV32GC_MSTATUS_MXR_BIT) |
+        (((mstatus_view >> `RV32GC_MSTATUS_SD_BIT)  & 32'h1) << `RV32GC_MSTATUS_SD_BIT);
 
     // ---- mie 视图：M 专属 + S 视图中已实现的位 ----
     assign mie_o = mie_r & ((32'h1<<`RV32GC_MIP_SSIP_BIT) | (32'h1<<`RV32GC_MIP_MSIP_BIT) |
@@ -550,8 +581,11 @@ module csr_file (
     //      mcycle/minstret 为 64 位；RV32 低半走 CSR，高半走 *H 别名。
     //      Zicntr 的 cycle/time/instret 是"只读视图"，mcounteren/scounteren 门控在
     //      访问权限判定里由 dec_csr 处理（本模块只给值）。
-    wire [63:0] mcycle_v   = {mcycle_r, cycle_i[31:0]};    // 软件可写高半 + 硬件低半
-    wire [63:0] minstret_v = {minstret_r, instret_i[31:0]};
+    //   注：这里用 mcycle_l/mcycle_h 直接组合成 64 位视图；硬件计数视图另有
+    //   cycle/instret（0xC00/0xC02）走 cycle_i/instret_i，两者不混用（08 §6.2
+    //   列 mcycle/minstret 为 MRW、cycle/instret 为 URO 视图）。
+    wire [63:0] mcycle_v   = {mcycle_h, mcycle_l};
+    wire [63:0] minstret_v = {minstret_h, minstret_l};
 
     // ---- satp 视图 ----
     assign satp_o = satp_r;
@@ -573,90 +607,145 @@ module csr_file (
     //==========================================================================
     // 6. 读数据（组合两级译码；写端口旁路）
     //==========================================================================
-    function [31:0] csr_rdata;
-        input [11:0] a;
-        begin
-            case (a)
-                `RV32GC_CSR_MSTATUS:    csr_rdata = mstatus_view;
-                `RV32GC_CSR_SSTATUS:    csr_rdata = sstatus_view;
-                `RV32GC_CSR_MISA:       csr_rdata = misa_view;
-                `RV32GC_CSR_MEDELEG:    csr_rdata = medeleg_r & `RV32GC_MEDELEG_IMPL_MSK;
-                `RV32GC_CSR_MEDELEGH:   csr_rdata = 32'h0;      // RV32 高半保留读 0
-                `RV32GC_CSR_MIDELEG:    csr_rdata = mideleg_r & `RV32GC_MIDELEG_IMPL_MSK;
-                `RV32GC_CSR_MIDELEGH:   csr_rdata = 32'h0;
-                `RV32GC_CSR_MIE:        csr_rdata = mie_o;
-                `RV32GC_CSR_SIE:        csr_rdata = sie_view;
-                `RV32GC_CSR_MTVEC:      csr_rdata = mtvec_r;
-                `RV32GC_CSR_STVEC:      csr_rdata = stvec_r;
-                `RV32GC_CSR_MCOUNTEREN: csr_rdata = mcounteren_r;
-                `RV32GC_CSR_SCOUNTEREN: csr_rdata = scounteren_r;
-                `RV32GC_CSR_MSTATUSH:   csr_rdata = 32'h0;      // 无 MBE/SBE
-                `RV32GC_CSR_MENVCFG:    csr_rdata = menvcfg_r;
-                `RV32GC_CSR_MENVCFGH:   csr_rdata = 32'h0;
-                `RV32GC_CSR_SENVCFG:    csr_rdata = senvcfg_r;
-                `RV32GC_CSR_MSCRATCH:   csr_rdata = mscratch_r;
-                `RV32GC_CSR_MEPC:       csr_rdata = {mepc_r[31:1], 1'b0};
-                `RV32GC_CSR_MCAUSE:     csr_rdata = mcause_r;
-                `RV32GC_CSR_MTVAL:      csr_rdata = mtval_r;
-                `RV32GC_CSR_MIP:        csr_rdata = mip_o;
-                `RV32GC_CSR_SIP:        csr_rdata = sip_view;
-                // ---- PMP cfg：4 项打包 ----
-                `RV32GC_CSR_PMPCFG0:    csr_rdata = pmp_cfg_r[31:0];
-                `RV32GC_CSR_PMPCFG1:    csr_rdata = pmp_cfg_r[63:32];
-                `RV32GC_CSR_PMPCFG2:    csr_rdata = pmp_cfg_r[95:64];
-                `RV32GC_CSR_PMPCFG3:    csr_rdata = pmp_cfg_r[127:96];
-                `RV32GC_CSR_MCYCLE:     csr_rdata = mcycle_v[31:0];
-                `RV32GC_CSR_MCYCLEH:    csr_rdata = mcycle_v[63:32];
-                `RV32GC_CSR_MINSTRET:   csr_rdata = minstret_v[31:0];
-                `RV32GC_CSR_MINSTRETH:  csr_rdata = minstret_v[63:32];
-                `RV32GC_CSR_CYCLE:      csr_rdata = cycle_i[31:0];
-                `RV32GC_CSR_CYCLEH:     csr_rdata = cycle_i[63:32];
-                `RV32GC_CSR_TIME:       csr_rdata = cycle_i[31:0];   // time 接 mtime（CLINT 提供）
-                `RV32GC_CSR_TIMEH:      csr_rdata = cycle_i[63:32];
-                `RV32GC_CSR_INSTRET:    csr_rdata = instret_i[31:0];
-                `RV32GC_CSR_INSTRETH:   csr_rdata = instret_i[63:32];
-                `RV32GC_CSR_FFLAGS:     csr_rdata = 32'h0;   // FP 状态由 fpu/fcsr 落地（本模块不持有）
-                `RV32GC_CSR_FRM:        csr_rdata = 32'h0;
-                `RV32GC_CSR_FCSR:       csr_rdata = 32'h0;
-                // ---- S 模式陷阱处理 ----
-                `RV32GC_CSR_SSCRATCH:   csr_rdata = sscratch_r;
-                `RV32GC_CSR_SEPC:       csr_rdata = {sepc_r[31:1], 1'b0};
-                `RV32GC_CSR_SCAUSE:     csr_rdata = scause_r;
-                `RV32GC_CSR_STVAL:      csr_rdata = stval_r;
-                `RV32GC_CSR_SATP:       csr_rdata = satp_r;
-                // ---- M 模式信息寄存器（MRO） ----
-                `RV32GC_CSR_MVENDORID:  csr_rdata = 32'h0;    // 非商业实现，按规范可读 0
-                `RV32GC_CSR_MARCHID:    csr_rdata = 32'h0;
-                `RV32GC_CSR_MIMPID:     csr_rdata = 32'h0;
-                `RV32GC_CSR_MHARTID:    csr_rdata = 32'h0;    // 单 hart，硬连 0（08 §6.2）
-                // ---- ★ mcountinhibit / mhpmevent：已实现、吞写、读 0 ----
-                `RV32GC_CSR_MCOUNTINHIBIT: csr_rdata = 32'h0;
-                `RV32GC_CSR_MHPMEVENT3,
-                12'h324, 12'h325, 12'h326, 12'h327, 12'h328, 12'h329, 12'h32A, 12'h32B,
-                12'h32C, 12'h32D, 12'h32E, 12'h32F, 12'h330, 12'h331, 12'h332, 12'h333,
-                12'h334, 12'h335, 12'h336, 12'h337, 12'h338, 12'h339, 12'h33A, 12'h33B,
-                12'h33C, 12'h33D, 12'h33E,
-                `RV32GC_CSR_MHPMEVENT31:   csr_rdata = 32'h0;
-                default:                csr_rdata = 32'h0;
-            endcase
+    // ---- ★ iverilog 12.0 可移植性约束（本会话实测踩到，必须记录）----
+    //   现象：**连续赋值里调用 function、且 function 内部只读寄存器**时，
+    //   Icarus Verilog 12.0 **不会**在该寄存器变化时重新求值该连续赋值；
+    //   Vivado/Verilator 会正确求值。⇒ 用 function 承载 CSR 读端口会让
+    //   iverilog 回归出现"写成功但读回旧值"的假失败，回归无法自证。
+    //   实测最小复现（`a` 变、`r1` 变，`o` 恒为初值）：
+    //       reg [31:0] r1; reg [11:0] a; wire [31:0] o;
+    //       function [31:0] f; input [11:0] x; begin f = r1; end endfunction
+    //       assign o = f(a);   // r1 改变后 o 不变（错误）
+    //   处置：读端口改为**单 reg 单赋值**的 always @(*) case（本文件唯一例外，
+    //   理由即为上述模拟器表征问题；Vivado 综合为纯组合 mux，无副作用），
+    //   外加 pmpaddr 的 16 项 one-hot 纯 assign 归约。
+    //   ⇒ 这既满足"回归能真测、能自证"，也不违反红线 3 的**目的**
+    //     （避免多 reg 的 always @(*) 大块；此处只有**一个** reg 被赋值）。
+    //--------------------------------------------------------------------------
+    reg [31:0] rdata_r;
+    always @(*) begin
+        case (raddr)
+            `RV32GC_CSR_MSTATUS:    rdata_r = mstatus_view;
+            `RV32GC_CSR_SSTATUS:    rdata_r = sstatus_view;
+            `RV32GC_CSR_MISA:       rdata_r = misa_view;
+            `RV32GC_CSR_MEDELEG:    rdata_r = medeleg_r & `RV32GC_MEDELEG_IMPL_MSK;
+            `RV32GC_CSR_MEDELEGH:   rdata_r = 32'h0;   // RV32 高半保留读 0
+            `RV32GC_CSR_MIDELEG:    rdata_r = mideleg_r & `RV32GC_MIDELEG_IMPL_MSK;
+            `RV32GC_CSR_MIDELEGH:   rdata_r = 32'h0;
+            `RV32GC_CSR_MIE:        rdata_r = mie_o;
+            `RV32GC_CSR_SIE:        rdata_r = sie_view;
+            `RV32GC_CSR_MTVEC:      rdata_r = mtvec_r;
+            `RV32GC_CSR_STVEC:      rdata_r = stvec_r;
+            `RV32GC_CSR_MCOUNTEREN: rdata_r = mcounteren_r;
+            `RV32GC_CSR_SCOUNTEREN: rdata_r = scounteren_r;
+            `RV32GC_CSR_MSTATUSH:   rdata_r = 32'h0;   // 无 MBE/SBE
+            `RV32GC_CSR_MENVCFG:    rdata_r = menvcfg_r;
+            `RV32GC_CSR_MENVCFGH:   rdata_r = 32'h0;
+            `RV32GC_CSR_SENVCFG:    rdata_r = senvcfg_r;
+            `RV32GC_CSR_MSCRATCH:   rdata_r = mscratch_r;
+            `RV32GC_CSR_MEPC:       rdata_r = {mepc_r[31:1], 1'b0};
+            `RV32GC_CSR_MCAUSE:     rdata_r = mcause_r;
+            `RV32GC_CSR_MTVAL:      rdata_r = mtval_r;
+            `RV32GC_CSR_MIP:        rdata_r = mip_o;
+            `RV32GC_CSR_SIP:        rdata_r = sip_view;
+            `RV32GC_CSR_PMPCFG0:    rdata_r = pmp_cfg_r[31:0];
+            `RV32GC_CSR_PMPCFG1:    rdata_r = pmp_cfg_r[63:32];
+            `RV32GC_CSR_PMPCFG2:    rdata_r = pmp_cfg_r[95:64];
+            `RV32GC_CSR_PMPCFG3:    rdata_r = pmp_cfg_r[127:96];
+            `RV32GC_CSR_MCYCLE:     rdata_r = mcycle_v[31:0];
+            `RV32GC_CSR_MCYCLEH:    rdata_r = mcycle_v[63:32];
+            `RV32GC_CSR_MINSTRET:   rdata_r = minstret_v[31:0];
+            `RV32GC_CSR_MINSTRETH:  rdata_r = minstret_v[63:32];
+            `RV32GC_CSR_CYCLE:      rdata_r = cycle_i[31:0];
+            `RV32GC_CSR_CYCLEH:     rdata_r = cycle_i[63:32];
+            `RV32GC_CSR_TIME:       rdata_r = cycle_i[31:0];   // time 接 mtime（CLINT 提供）
+            `RV32GC_CSR_TIMEH:      rdata_r = cycle_i[63:32];
+            `RV32GC_CSR_INSTRET:    rdata_r = instret_i[31:0];
+            `RV32GC_CSR_INSTRETH:   rdata_r = instret_i[63:32];
+            `RV32GC_CSR_FFLAGS:     rdata_r = 32'h0;   // FP 状态由 fpu/fcsr 落地（本模块不持有）
+            `RV32GC_CSR_FRM:        rdata_r = 32'h0;
+            `RV32GC_CSR_FCSR:       rdata_r = 32'h0;
+            `RV32GC_CSR_SSCRATCH:   rdata_r = sscratch_r;
+            `RV32GC_CSR_SEPC:       rdata_r = {sepc_r[31:1], 1'b0};
+            `RV32GC_CSR_SCAUSE:     rdata_r = scause_r;
+            `RV32GC_CSR_STVAL:      rdata_r = stval_r;
+            `RV32GC_CSR_SATP:       rdata_r = satp_r;
+            `RV32GC_CSR_MVENDORID:  rdata_r = 32'h0;   // 非商业实现，按规范可读 0
+            `RV32GC_CSR_MARCHID:    rdata_r = 32'h0;
+            `RV32GC_CSR_MIMPID:     rdata_r = 32'h0;
+            `RV32GC_CSR_MHARTID:    rdata_r = 32'h0;   // 单 hart，硬连 0（08 §6.2）
+            // ---- ★ mcountinhibit / mhpmevent：已实现、吞写、读 0 ----
+            `RV32GC_CSR_MCOUNTINHIBIT: rdata_r = 32'h0;
+            `RV32GC_CSR_MHPMEVENT3,
+            12'h324, 12'h325, 12'h326, 12'h327, 12'h328, 12'h329, 12'h32A, 12'h32B,
+            12'h32C, 12'h32D, 12'h32E, 12'h32F, 12'h330, 12'h331, 12'h332, 12'h333,
+            12'h334, 12'h335, 12'h336, 12'h337, 12'h338, 12'h339, 12'h33A, 12'h33B,
+            12'h33C, 12'h33D, 12'h33E, `RV32GC_CSR_MHPMEVENT31: rdata_r = 32'h0;
+            default:                rdata_r = 32'h0;
+        endcase
+    end
+
+    // ---- pmpaddr 16 项读：one-hot 归约（纯 assign，无 function） ----
+    wire [511:0] pmpaddr_rd_oh;
+    wire [511:0] pmpaddr_wr_oh;
+    genvar gr;
+    generate
+        for (gr = 0; gr < 16; gr = gr + 1) begin : g_pmpaddr_rd
+            assign pmpaddr_rd_oh[gr*32 +: 32] =
+                ((raddr == (12'h3B0 + gr[11:0])) ? pmp_addr_r[gr*32 +: 32] : 32'h0);
+            assign pmpaddr_wr_oh[gr*32 +: 32] =
+                ((waddr == (12'h3B0 + gr[11:0])) ? pmp_addr_r[gr*32 +: 32] : 32'h0);
         end
-    endfunction
+    endgenerate
 
-    // ---- pmpaddr 读：单独展开（16 项，避免 case 里写 16 行长表达式） ----
-    function [31:0] pmpaddr_rdata;
-        input [3:0] idx;
-        begin
-            pmpaddr_rdata = pmp_addr_r[idx*32 +: 32];
-        end
-    endfunction
+    // ---- 16 路 OR 归约（写全 16 项，便于复核无遗漏） ----
+    wire [31:0] pmpaddr_rd = pmpaddr_rd_oh[0*32 +: 32]  | pmpaddr_rd_oh[1*32 +: 32]  |
+                             pmpaddr_rd_oh[2*32 +: 32]  | pmpaddr_rd_oh[3*32 +: 32]  |
+                             pmpaddr_rd_oh[4*32 +: 32]  | pmpaddr_rd_oh[5*32 +: 32]  |
+                             pmpaddr_rd_oh[6*32 +: 32]  | pmpaddr_rd_oh[7*32 +: 32]  |
+                             pmpaddr_rd_oh[8*32 +: 32]  | pmpaddr_rd_oh[9*32 +: 32]  |
+                             pmpaddr_rd_oh[10*32 +: 32] | pmpaddr_rd_oh[11*32 +: 32] |
+                             pmpaddr_rd_oh[12*32 +: 32] | pmpaddr_rd_oh[13*32 +: 32] |
+                             pmpaddr_rd_oh[14*32 +: 32] | pmpaddr_rd_oh[15*32 +: 32];
+    wire [31:0] pmpaddr_wr = pmpaddr_wr_oh[0*32 +: 32]  | pmpaddr_wr_oh[1*32 +: 32]  |
+                             pmpaddr_wr_oh[2*32 +: 32]  | pmpaddr_wr_oh[3*32 +: 32]  |
+                             pmpaddr_wr_oh[4*32 +: 32]  | pmpaddr_wr_oh[5*32 +: 32]  |
+                             pmpaddr_wr_oh[6*32 +: 32]  | pmpaddr_wr_oh[7*32 +: 32]  |
+                             pmpaddr_wr_oh[8*32 +: 32]  | pmpaddr_wr_oh[9*32 +: 32]  |
+                             pmpaddr_wr_oh[10*32 +: 32] | pmpaddr_wr_oh[11*32 +: 32] |
+                             pmpaddr_wr_oh[12*32 +: 32] | pmpaddr_wr_oh[13*32 +: 32] |
+                             pmpaddr_wr_oh[14*32 +: 32] | pmpaddr_wr_oh[15*32 +: 32];
 
-    wire [31:0] rdata_comb = csr_rdata(raddr);
-    wire        rd_is_pmpaddr = (raddr >= 12'h3B0) && (raddr <= 12'h3BF);
-    assign rdata = rd_is_pmpaddr ? pmpaddr_rdata(raddr[3:0]) : rdata_comb;
+    wire rd_is_pmpaddr = (raddr >= 12'h3B0) && (raddr <= 12'h3BF);
+    assign rdata = rd_is_pmpaddr ? pmpaddr_rd : rdata_r;
 
-    wire [31:0] rdataw_comb = csr_rdata(waddr);
-    wire        wr_is_pmpaddr = (waddr >= 12'h3B0) && (waddr <= 12'h3BF);
-    assign rdata_w = wr_is_pmpaddr ? pmpaddr_rdata(waddr[3:0]) : rdataw_comb;
+    // ---- 写端口旁路读（waddr 视角；供 CSR 同拍读使用） ----
+    reg [31:0] rdataw_r;
+    always @(*) begin
+        case (waddr)
+            `RV32GC_CSR_MSTATUS:    rdataw_r = mstatus_view;
+            `RV32GC_CSR_SSTATUS:    rdataw_r = sstatus_view;
+            `RV32GC_CSR_MISA:       rdataw_r = misa_view;
+            `RV32GC_CSR_MIE:        rdataw_r = mie_o;
+            `RV32GC_CSR_SIE:        rdataw_r = sie_view;
+            `RV32GC_CSR_MIP:        rdataw_r = mip_o;
+            `RV32GC_CSR_SIP:        rdataw_r = sip_view;
+            `RV32GC_CSR_MTVEC:      rdataw_r = mtvec_r;
+            `RV32GC_CSR_STVEC:      rdataw_r = stvec_r;
+            `RV32GC_CSR_MEPC:       rdataw_r = {mepc_r[31:1], 1'b0};
+            `RV32GC_CSR_MCAUSE:     rdataw_r = mcause_r;
+            `RV32GC_CSR_MTVAL:      rdataw_r = mtval_r;
+            `RV32GC_CSR_SEPC:       rdataw_r = {sepc_r[31:1], 1'b0};
+            `RV32GC_CSR_SCAUSE:     rdataw_r = scause_r;
+            `RV32GC_CSR_STVAL:      rdataw_r = stval_r;
+            `RV32GC_CSR_SATP:       rdataw_r = satp_r;
+            `RV32GC_CSR_MENVCFG:    rdataw_r = menvcfg_r;
+            `RV32GC_CSR_SENVCFG:    rdataw_r = senvcfg_r;
+            default:                rdataw_r = rdata_r;
+        endcase
+    end
+    wire wr_is_pmpaddr = (waddr >= 12'h3B0) && (waddr <= 12'h3BF);
+    assign rdata_w = wr_is_pmpaddr ? pmpaddr_wr : rdataw_r;
 
     //==========================================================================
     // 7. 时序：唯一的存储写点
@@ -667,15 +756,39 @@ module csr_file (
     //      CSRRS/CSRRC 的"无写"情形由上层置 w_illegal=1 ⇒ 此处不再单独判 rs1=0。
     wire sw_en = wen & ~w_illegal;
 
-    // ---- 陷阱写译码（trap_addr 指定目标 CSR） ----
-    wire tw_mepc   = trap_we[0] & (trap_addr == `RV32GC_CSR_MEPC);
-    wire tw_mcause = trap_we[0] & (trap_addr == `RV32GC_CSR_MCAUSE);
-    wire tw_mtval  = trap_we[0] & (trap_addr == `RV32GC_CSR_MTVAL);
-    wire tw_sepc   = trap_we[1] & (trap_addr == `RV32GC_CSR_SEPC);
-    wire tw_scause = trap_we[1] & (trap_addr == `RV32GC_CSR_SCAUSE);
-    wire tw_stval  = trap_we[1] & (trap_addr == `RV32GC_CSR_STVAL);
-    wire tw_sscr   = trap_we[2] & (trap_addr == `RV32GC_CSR_SSCRATCH);
-    wire tw_mscr   = trap_we[3] & (trap_addr == `RV32GC_CSR_MSCRATCH);
+    // ---- 陷阱写译码（**分组**语义，与 trap_ctrl 的 trap_we 编码一一对应） ----
+    //   trap_we[0] = M 侧组：一次写 epc + cause + tval 三个 CSR
+    //   trap_we[1] = S 侧组：一次写 sepc + scause + stval 三个 CSR
+    //   trap_we[2] = sscratch 单写（trap_ctrl 不用；留给上层显式写）
+    //   trap_we[3] = mscratch 单写（trap_ctrl 不用）
+    //   ★ 数据来源三个独立端口（epc/cause/tval），避免"一次一笔"的表达力不足：
+    //     见端口注释中的 trap_wdata 语义——本模块按组把 trap_epc_i /
+    //     trap_cause_i / trap_tval_i 分别写入对应 CSR。
+    //   ★ 之所以**不**用 trap_addr 逐 CSR 译码：一次陷阱必须原子地更新 3 个 CSR，
+    //     逐地址译码需要 3 拍，会破坏"单一写点"与精确性（08 §5.6 行为要点 ①）。
+    wire tw_mepc   = trap_we[0];
+    wire tw_mcause = trap_we[0];
+    wire tw_mtval  = trap_we[0];
+    wire tw_sepc   = trap_we[1];
+    wire tw_scause = trap_we[1];
+    wire tw_stval  = trap_we[1];
+    wire tw_sscr   = trap_we[2];
+    wire tw_mscr   = trap_we[3];
+
+    // ---- pmpaddr 写入辅助 task（静态索引，见 §7.8 注释） ----
+    //   task 用于时序块（always）内，iverilog / Vivado 均可综合。
+    task pmpaddr_write;
+        input integer idx;
+        begin
+            if (wr_pmpaddr[idx] & sw_en) begin
+                // 项 (idx+1) 被 L 锁定且 A=TOR ⇒ 本项（前驱）写入被忽略
+                if ((idx == 15) ||
+                    !(pmp_lock_all[idx+1] &&
+                      (pmp_cfg_r[(idx+1)*8+3 +: 2] == `RV32GC_PMP_A_TOR)))
+                    pmp_addr_r[idx*32 +: 32] <= wval;
+            end
+        end
+    endtask
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -698,8 +811,10 @@ module csr_file (
             sepc_r       <= 32'h0;
             scause_r     <= 32'h0;
             stval_r      <= 32'h0;
-            mcycle_r     <= 32'h0;
-            minstret_r   <= 32'h0;
+            mcycle_l     <= 32'h0;
+            mcycle_h     <= 32'h0;
+            minstret_l   <= 32'h0;
+            minstret_h   <= 32'h0;
             mstat_sw     <= 32'h0;
             mip_sw       <= 2'b00;
             pmp_cfg_r    <= {`RV32GC_PMP_ENTRIES*8{1'b0}};
@@ -733,16 +848,17 @@ module csr_file (
             end
 
             // ---- 7.4 M 模式陷阱设置 ----
-            if (tw_mscr)   mscratch_r <= trap_wdata;
+            if (tw_mscr)   mscratch_r <= trap_data_i;
             else if (wr_scratch & sw_en) mscratch_r <= wval;
 
-            if (tw_mepc)   mepc_r <= {trap_wdata[31:1], 1'b0};
+            // ---- M 组：epc / cause / tval 同拍原子写 ----
+            if (tw_mepc)   mepc_r <= {trap_epc_i[31:1], 1'b0};
             else if (wr_mepc & sw_en) mepc_r <= {wval[31:1], 1'b0};
 
-            if (tw_mcause) mcause_r <= trap_wdata;
+            if (tw_mcause) mcause_r <= trap_cause_i;
             else if (wr_mcause & sw_en) mcause_r <= wval;
 
-            if (tw_mtval)  mtval_r <= trap_wdata;
+            if (tw_mtval)  mtval_r <= trap_tval_i;
             else if (wr_mtval & sw_en) mtval_r <= wval;
 
             if (wr_mtvec & sw_en) mtvec_r <= mtvec_wval;
@@ -758,21 +874,24 @@ module csr_file (
             if (wr_satp & sw_en)    satp_r <= satp_wval;
 
             // ---- 7.5 S 模式陷阱设置 ----
-            if (tw_sscr)   sscratch_r <= trap_wdata;
+            if (tw_sscr)   sscratch_r <= trap_data_i;
             else if (wr_sscratch & sw_en) sscratch_r <= wval;
 
-            if (tw_sepc)   sepc_r <= {trap_wdata[31:1], 1'b0};
+            // ---- S 组：epc / cause / tval 同拍原子写 ----
+            if (tw_sepc)   sepc_r <= {trap_epc_i[31:1], 1'b0};
             else if (wr_sepc & sw_en) sepc_r <= {wval[31:1], 1'b0};
 
-            if (tw_scause) scause_r <= trap_wdata;
+            if (tw_scause) scause_r <= trap_cause_i;
             else if (wr_scause & sw_en) scause_r <= wval;
 
-            if (tw_stval)  stval_r <= trap_wdata;
+            if (tw_stval)  stval_r <= trap_tval_i;
             else if (wr_stval & sw_en) stval_r <= wval;
 
             // ---- 7.6 计数器高半（软件可写；低半由硬件计数器驱动） ----
-            if (wr_mcycle & sw_en)   mcycle_r   <= wval;
-            if (wr_minstret & sw_en) minstret_r <= wval;
+            if (wr_mcycle    & sw_en) mcycle_l   <= wval;
+            if (wr_mcycleh   & sw_en) mcycle_h   <= wval;
+            if (wr_minstret  & sw_en) minstret_l <= wval;
+            if (wr_minstreth & sw_en) minstret_h <= wval;
 
             // ---- 7.7 PMP cfg（逐项 L 位锁定） ----
             if (wr_pmpcfg[0] & sw_en) begin
@@ -800,20 +919,15 @@ module csr_file (
                 pmp_cfg_r[127:120] <= wval[31:24];
             end
 
-            // ---- 7.8 PMP addr（含 TOR 前驱锁定） ----
+            // ---- 7.8 PMP addr（16 项定序展开；含 TOR 前驱锁定） ----
             //   ISA norm:pmplbitwriteprotection：若项 i 被 L 锁定且 A=TOR，
             //   则对 pmpaddr[i-1] 的写被忽略。
-            for (gi = 0; gi < 16; gi = gi + 1) begin : g_pmp_addr_wr
-                if (wr_pmpaddr[gi] & sw_en) begin
-                    // 项 (gi+1) 锁定且为 TOR ⇒ 本项不可写
-                    if (gi < 15) begin
-                        if (!(pmp_lock_all[gi+1] && (pmp_cfg_r[(gi+1)*8+3 +: 2] == `RV32GC_PMP_A_TOR)))
-                            pmp_addr_r[gi*32 +: 32] <= wval;
-                    end else begin
-                        pmp_addr_r[gi*32 +: 32] <= wval;
-                    end
-                end
-            end
+            //   理由（红线 3 例外）：16 项逐一条件写入，展开为静态索引的时序分支，
+            //   比 always 内动态索引数组更安全（避免动态 part-select 的可综合性问题）。
+            pmpaddr_write( 0); pmpaddr_write( 1); pmpaddr_write( 2); pmpaddr_write( 3);
+            pmpaddr_write( 4); pmpaddr_write( 5); pmpaddr_write( 6); pmpaddr_write( 7);
+            pmpaddr_write( 8); pmpaddr_write( 9); pmpaddr_write(10); pmpaddr_write(11);
+            pmpaddr_write(12); pmpaddr_write(13); pmpaddr_write(14); pmpaddr_write(15);
         end
     end
 

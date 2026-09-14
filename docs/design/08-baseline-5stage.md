@@ -151,8 +151,8 @@ scripts/          # 回归入口、镜像打包、环境封装
 
 | 目录 | 文件 | 职责 |
 |---|---|---|
-| `rtl/pkg/` | `rv32_defs.vh` | **唯一真源**：AW/W/DW/ID 位宽、地址窗口常量（`XIP_BASE`/`CLINT_BASE`/`PLIC_BASE` 等）、cause 编码、CSR 地址、`RESET_PC`、PMA 类别枚举 |
-| | `core_params.vh` | **唯一真源**：流水级参数、L1 参数（容量/路数/行大小/组数）、PMP 项数（16）、`IALIGN=32`、MXLEN=32 |
+| `rtl/pkg/` | `rv32_defs.vh` | **唯一真源**：AW/W/DW/ID 位宽、地址窗口常量（`XIP_BASE`/`CLINT_BASE`/`PLIC_BASE` 等）、cause 编码、CSR 地址、PMA 类别枚举 |
+| | `core_params.vh` | **唯一真源**：流水级参数、L1 参数（容量/路数/行大小/组数）、PMP 项数（16）、`RESET_PC`、`IALIGN=32`、MXLEN=32 |
 | `rtl/top/` | `core_top.v` | 顶层，48 端口逐字契约（§4）；例化五级与核内设备 |
 | `rtl/fetch/` | `pc_gen.v` | PCC（PC 生成与选择：顺序/重定向/断点） |
 | | `fetch_unit.v` | F 级顶层：L1I 接口、XIP 旁路判定、取指 PMP 检查（按 16-bit parcel） |
@@ -380,10 +380,10 @@ flowchart LR
 |---|---|---|---|---|
 | `alu.v` | 整数算术/逻辑/移位/比较；`lui`/`auipc` | in: `a`,`b`,`alu_op`,`pc`；out: `result` | 纯组合，`assign`/`function` 为主 | `tb_alu.sv` |
 | `bru.v` | 条件分支判定、`jal`/`jalr` 目标计算 | in: `rs1`,`rs2`,`imm`,`pc`,`br_op`；out: `taken`,`target` | E 级解析 → 触发重定向（冲刷 D/M/W 中已取指令） | `tb_bru.sv` + 定向分支测试 |
-| `mdu.v` | `mul`/`mulh`/`mulhsu`/`mulhu`/`div`/`divu`/`rem`/`remu` | in: `a`,`b`,`mdu_op`,`flush`；out: `result`,`busy` | **多拍**（2A 允许简单逐位实现，`busy` 冻结前端）；乘除法**允许 2A 用简单迭代实现**（性能非 2A 门禁），但**必须**在 M4 评估面积/时序；Vivado `Multiplier`/`Divider Generator` IP + 仿真行为模型双分支（红线 1/2） | `tb_mdu.sv` + arch-test rv32im |
+| `mdu.v` | `mul`/`mulh`/`mulhsu`/`mulhu`/`div`/`divu`/`rem`/`remu` | in: `a`,`b`,`mdu_op`,`flush`；out: `result`,`busy` | **多拍**（`busy` 冻结前端）。**IP 化选型定稿（用户指令 2026-09-14）**：① **乘法 = 3× Vivado `mult_gen`（Multiplier IP，PG108）**，**ss/su/uu 三个 32×32 实例**（signed×signed / signed×unsigned / unsigned×unsigned）——「su 实例一并覆盖 mulhsu 与 mulhu」被反例 a=b=0x8000_0000 否决（signed×unsigned 高半部 = 0xFFFF_FFFF，而 mulhu 要求 0x4000_0000）；`Use_Mults` ⇒ 走 **DSP48**，`PipeStages=0` ⇒ **纯组合输出**（3 实例 × 4 DSP = **DSP48×12**）。② **除法 = 1× Vivado `div_gen`（Divider Generator IP，PG151）**，**无符号 unsigned**、**radix-2**、32/32、`remainder_type=Remainder`（商与余数同拍给出）——PG151 有符号实例只输出**幅值**商/余数、符号修正仍须在 IP 外完成，且无法承担 divu/remu，故只例化一个无符号 `div_gen` 实例覆盖 div/divu/rem/remu（除零、-2^31÷-1 两条 ISA 特例由 IP 外 `function` 旁路）。③ **硬性口径：E 级/hazard 必须按 `busy`/`done` 握手消费，禁止硬编码完成拍数**——仿真分支除法 33 拍；综合分支以 IP 的 `m_axis_dout_tvalid` 为完成标志（IP 自报 latency=34 拍 + 启动对齐），**两分支完成拍不同**（乘法两分支逐拍一致）。仿真 = 逐拍等价行为模型双分支（宏 `RV32GC_USE_VIVADO_IP` 只由综合脚本定义，iverilog/Verilator 从不定义）；生成脚本 `fpga/tcl/create_ip.tcl` 已实跑通过（4 IP、26 项配置自检 0 error）；综合实测 LUT 1690 / FF 3470 / DSP48×12 / BRAM 0、0 error；**必须**在 M4 评估面积/时序 | `tb_mdu.sv` + arch-test rv32im |
 | `fpu.v` 等 | F/D 全部指令（`fadd/fsub/fmul/fdiv/fsqrt/fmadd/fmsub/fnmadd/fnmsub/fcvt/fcmp/fsgnj/fmin/fmax/flw/fsw/fclass/fmv`） | in: `a`,`b`,`rm`,`fp_op`；out: `result`,`fflags_we`,`fflags`,`busy` | **分期与流水化要求**见下方 | `tb_fpu*.sv` + arch-test rv32ifd/`F`/`D` 子集 |
 | `fregfile.v` | 浮点寄存器堆（`f0`–`f31`，F 视图 32 bit / D 视图 64 bit） | in: `rs1`,`rs2`,`rs3`,`rd`,`we`,`wdata`；out: `rdata1`,`rdata2`,`rdata3` | 写优先读口 + 旁路；`f0`–`f31` 在 D 视图下为 64 位 | `tb_fregfile.sv` |
-| `exe_ctrl.v` | E 级控制与旁路选择 | in: 各级结果与标签；out: 选中的操作数 | 旁路优先级：**W > M > 寄存器堆**；负载结果的旁路见 §5.0 的 load-use 口径 | 集成 TB |
+| `exe_ctrl.v` | E 级控制与旁路选择 | in: 各级结果与标签；out: 选中的操作数 | 旁路优先级：**M > W > 寄存器堆**（更年轻者优先：M 级指令比 W 级年轻，两者同写同一 rd 时取 M）；负载结果的旁路见 §5.0 的 load-use 口径（2026-09-14 母 Agent 裁决修正） | 集成 TB |
 
 **FPU 分期与流水化要求（2A 明确口径）**：
 
@@ -572,8 +572,8 @@ flowchart TD
 | `0x0000_0000` + 4×id | 优先级寄存器（每源一个，32 位） |
 | `0x0000_1000` + 4×id | pending 位组（每 32 源一个 32 位字） |
 | `0x0000_2000` + 4×ctx | enable 位组 |
-| `0x0020_0000` + 4×ctx | 上下文阈值（threshold） |
-| `0x0020_0004` + 4×ctx | claim / complete |
+| `0x0020_0000` + 0x1000×ctx | 上下文阈值（threshold）[ctx]（0x1000 为标准 PLIC 上下文步长；此前 4×ctx 会令 S 上下文译码不到） |
+| `0x0020_0004` + 0x1000×ctx | claim / complete（= threshold[ctx] + 4） |
 
 **`intrpt[4:0]` 接线口径**：平台把 5 个中断源送到 `intrpt[4:0]`（`soc_top.v:725` 的 `{3'b0, int_out[4:0]}`；`int_out = {1'b0,dma_int,nand_int,spi_inta_o,uart0_int,mac_int}`）：
 
@@ -619,6 +619,9 @@ flowchart TD
 ### 7.2 AXI 端口常量
 
 `awlock`/`arlock` 高位显式置 0（§4.2）；`awid`/`arid` 2A 只用 `4'd0`（单笔在途），为 L2 阶段预留 ID 语义（`4'd1`=D 填充、`4'd2`=脏行写回、`4'd3`=CMO）——2A 可只发 `4'd0`，但**端口占位与注释必须写明**。
+
+- **集成接线：控制器与 L1D 的实际端口（2026-09-14）**：`rtl/axi/axi_master_ctrl.v` 请求侧除 `req_len`/`req_beats` 外，实际还有 `req_split`、**`req_beats_1`**、**`req_beats_2`**（4 K 拆分显式化：首笔 / 第二笔各几 beat；`req_split = 0` 时 `req_beats_2` 被忽略），这两个 beat 数由 `rtl/axi/axi_req_desc.v` 的 `desc_beats`/`desc_split`/`desc_to_4k` 侧算出后驱动；L1D 侧写回通路的实际端口为 **`wb_ready`**（`rtl/cache/l1d.v`：写回数据接收就绪，**仅在 `MS_WB_BUS` 推总线阶段为 1**，抓行阶段为 0，控制器必须按 `valid && ready` 握手）。集成 `core_top` 时按上述**实际端口名**接线，不得另起名或省掉拆分端口。
+- **L1D 的 clean/inval 为 256 拍逐组扫描（BRAM 无整阵列写口）**：`cbo.clean`/`cbo.flush`/`cbo.inval` 触发后，L1D 用 `maint_idx_q` **逐组**推进（`SETS = 256`，**一拍一组**、每拍写该组全部路的 Tag/valid/dirty），**没有**「整阵列一次写完」的写口。因此调用方（`cmo_unit` 一侧的 LSU 维护路径）**必须以 L1D 的 `idle` 判定扫描完成后再放行后续访问**，扫描在途期间不得发起新的 L1D 访问。
 
 ### 7.3 Cache 数据阵列：Block Memory Generator + 仿真行为模型双分支
 

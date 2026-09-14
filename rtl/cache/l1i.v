@@ -4,9 +4,9 @@
 // 项目  : rv32gc-cpu（阶段二 2A：单发射顺序 5 级基线核）
 // 归属  : docs/design/05-cache-memory.md §3.1/§5.2/§8；08-baseline-5stage.md §5.1
 //
-// 结构（05 §3.1 参数表，真源 = rtl/pkg/core_params.vh §7）：
-//   - 容量 **16 KB**、**2 路**、32 B 行、256 组（16384 B）
-//   - 索引位 = VA[12:5]（256 组）；行内偏移 VA[4:0]；Tag = VA[31:13]（19 bit）
+// 结构（05 §3.1 参数表）：
+//   - 容量 **16 KB**、**2 路**、32 B 行、**256 组**（16 × 1024 = 16384 B）
+//   - 索引 = VA[12:5]（8 bit）；行内偏移 = VA[4:0]；Tag = VA[31:13]（19 bit）
 //   - 只读：I-Cache 不参与写通道（05 §3.2「为何 L1I 不做写通道」）
 //   - 替换：2 路**伪 LRU（1 bit/组）**（05 §3.1 表格口径）
 //
@@ -16,16 +16,21 @@
 //   判定对象是 **PA 不是 VA**（05 §9 C-7 高风险项：VA/PA 混用是静默错）。
 //
 // 时序结构（BRAM 只能同步读的必然结果，见 08 §7.3）：
-//   - Tag 与 Data 都是同步读（读延迟 1 拍）。
-//   - 访问拍 S0：cs_req 有效 → tag 阵列读索引、data 阵列读索引+偏移。
-//   - S0 末：tag 读数据与 data 读数据同时有效 ⇒ 当拍完成比较与命中判定，
-//     cs_ready 在 S0 末拉高、cs_rdata 当拍有效 ⇒ **命中路径 1 拍**。
-//     （`rd_*_r` 是被沿寄存的输出，与访问拍的解码结果同拍出现，故无需额外等拍。）
-//   - 缺失：S0 末置 miss_x，驱动 MSHR/总线填充；填充期间 cs_ready=0；
-//     每个回填 beat 按 fill_word_idx 写入相应路的行内字。
+//   - Tag 与 Data 均为同步读（读延迟 1 拍）。
+//   - 访问拍 S0：cs_req 有效 ⇒ 两阵列同时以索引寻址。
+//   - S0 末：tag 读数据与 data 读数据**同拍**有效 ⇒ 当拍完成比较、命中判定，
+//     cs_ready 于 S0 末拉高、cs_rdata 当拍有效 ⇒ **命中路径 1 拍**。
+//   - 缺失：S0 末置 miss；驱动填充请求；填充期间 cs_ready=0；
+//     每个回填 beat 按 fill_word_idx 写入目标路，最后一拍落 tag+valid。
 //
-// 说明（红线 3）：除「状态寄存器更新」与「数组行为模型」外，全部用
-//   assign/连续赋值；阵列例化由 generate 完成。
+// ★ 参数默认值直接取自真源宏（rtl/pkg/core_params.vh §7）：
+//   注意 `RV32GC_L1I_SETS` 等是"计算型宏"，其内层宏引用**必须带反引号**
+//   （iverilog 12.0 不会对宏体内的裸名再展开，会让 parameter 初值报
+//   "Unable to bind parameter"）。该 pkg 侧问题已于 2026-09-14 修复，
+//   因此本文件可以直接使用宏，无需字面量兜底。
+//
+// 说明（红线 3）：除"状态寄存器更新"与"阵列行为模型"外全部用 assign；
+//   阵列例化走 generate。
 //==============================================================================
 `timescale 1ns / 1ps
 
@@ -33,17 +38,16 @@
 `include "rtl/pkg/core_params.vh"
 
 module l1i #(
-    // ---- 组织参数（默认 = rtl/pkg/core_params.vh §7 的 L1I 口径；真源勿改） ----
-    parameter integer WAYS       = `RV32GC_L1I_WAYS,          // 2 路
-    parameter integer SETS       = `RV32GC_L1I_SETS,          // 256 组
-    parameter integer LINE_BYTES = `RV32GC_L1I_LINE_BYTES,    // 32 B 行
-    parameter integer INDEX_BITS = `RV32GC_L1I_INDEX_BITS,    // 8 = VA[12:5]
-    parameter integer OFF_BITS   = `RV32GC_L1I_OFFSET_BITS,   // 5 = VA[4:0]
-    parameter integer TAG_LSB    = 13,                        // VA 中 tag 起始位
-    parameter integer TAG_W      = 19,                        // VA[31:13]
-    parameter integer DATA_W     = 32,                        // AXI beat
+    // ---- 组织参数（= core_params.vh §7 的 L1I 口径：16 KB / 2 路 / 32 B 行） ----
+    parameter integer WAYS       = `RV32GC_L1I_WAYS,          // 路数 = 2
+    parameter integer SETS       = `RV32GC_L1I_SETS,          // 组数 = 256
+    parameter integer LINE_BYTES = `RV32GC_L1I_LINE_BYTES,    // 行大小 = 32 B
+    parameter integer INDEX_BITS = `RV32GC_L1I_INDEX_BITS,    // VA[12:5]
+    parameter integer OFF_BITS   = `RV32GC_L1I_OFFSET_BITS,   // VA[4:0]
+    parameter integer TAG_W      = 19,       // VA[31:13]
+    parameter integer DATA_W     = 32,       // AXI beat 位宽
     parameter integer OWNER_W    = 2,
-    parameter [OWNER_W-1:0] OWNER_I_FILL = 2'd0               // 归属：I-Cache 填充
+    parameter [OWNER_W-1:0] OWNER_I_FILL = 2'd0    // 归属：I-Cache 填充
 ) (
     input  wire                 clk,
     input  wire                 rst_n,
@@ -52,8 +56,8 @@ module l1i #(
     // 取指单元 <-> L1I
     //------------------------------------------------------------------
     input  wire                 cs_req,        // 取指请求
-    input  wire [31:0]          cs_paddr,      // ★ 物理地址（XIP 判定）
-    input  wire [31:0]          cs_vaddr,      // 虚拟地址（索引/tag/偏移）
+    input  wire [31:0]          cs_paddr,      // ★ 物理地址（XIP 判定用）
+    input  wire [31:0]          cs_vaddr,      // 虚拟地址（索引/tag/偏移用）
     output wire                 cs_ready,      // 本位数据可用（命中或回填完成）
     output wire [31:0]          cs_rdata,      // 返回的对齐 32 bit 字
     output wire                 cs_uncached,   // 1 = XIP 旁路（走 uncached 直通）
@@ -69,23 +73,23 @@ module l1i #(
     input  wire                 fill_accepted, // 控制器已接受（alloc_ready）
     input  wire                 fill_valid,    // 回填 beat 有效
     input  wire [31:0]          fill_data,     // 回填 beat 数据
-    input  wire [4:0]           fill_word_idx, // 本 beat 的行内字序号（0..7）
+    input  wire [4:0]           fill_word_idx, // 本 beat 行内字序号（0..7）
     input  wire                 fill_done,     // 最后一 beat 已收（mshr done）
 
     //------------------------------------------------------------------
     // 维护
     //------------------------------------------------------------------
     input  wire                 inval_all,     // 整体失效（fence.i / cbo.inval）
-    output wire                 idle           // 无在途事务（可取指）
+    output wire                 idle           // 无在途事务
 );
     //--------------------------------------------------------------------------
     // 1. 派生常量
     //--------------------------------------------------------------------------
-    localparam integer WORD_BYTES = DATA_W / 8;                       // 4 B
-    localparam integer WORDS     = LINE_BYTES / WORD_BYTES;           // 8 字/行
-    localparam integer WIDX_BITS = $clog2(WORDS);                     // 3 bit
-    localparam integer DATA_ADDR_W = INDEX_BITS + WIDX_BITS;          // 11 bit
-    localparam integer WAY_W      = (WAYS > 1) ? $clog2(WAYS) : 1;    // 1 bit
+    localparam integer WORD_BYTES  = DATA_W / 8;                  // 4 B/字
+    localparam integer WORDS       = LINE_BYTES / WORD_BYTES;      // 8 字/行
+    localparam integer WIDX_BITS   = 3;                            // log2(8)
+    localparam integer DATA_ADDR_W = INDEX_BITS + WIDX_BITS;       // 11 bit
+    localparam integer WAY_W       = 1;                            // 2 路
 
     //--------------------------------------------------------------------------
     // 2. 地址字段（VA 口径）
@@ -93,221 +97,200 @@ module l1i #(
     wire [INDEX_BITS-1:0] va_index  = cs_vaddr[OFF_BITS +: INDEX_BITS];
     wire [TAG_W-1:0]      va_tag    = cs_vaddr[31 -: TAG_W];
     wire [OFF_BITS-1:0]   va_offset = cs_vaddr[OFF_BITS-1:0];
-    wire [WIDX_BITS-1:0]  va_widx   = va_offset[OFF_BITS-1 -: WIDX_BITS];
 
     //--------------------------------------------------------------------------
-    // 3. XIP 旁路（**PA** 口径；05 §5.2 口径 1）
+    // 3. XIP 旁路判定（**物理地址**口径；05 §5.2 口径 1、§9 C-7）
     //--------------------------------------------------------------------------
     wire xip_hit_hi20 = ((cs_paddr[31:20] & `RV32GC_XIP_HI20_MSK) == `RV32GC_XIP_HI20_VAL);
     wire xip_hit_hi16 = (cs_paddr[31:16] == `RV32GC_SPI_HIT_VAL);
     wire xip_bypass   = xip_hit_hi20 | xip_hit_hi16;
     assign cs_uncached = xip_bypass;
 
-    // 真正进入 Cache 阵列的访问（旁路请求被剔除）
+    // 进入 Cache 阵列的访问（旁路请求被剔除：不查、不写、不分配）
     wire access = cs_req & ~xip_bypass;
 
     //--------------------------------------------------------------------------
     // 4. 状态寄存器
     //--------------------------------------------------------------------------
-    reg                  miss_q;         // 本笔未命中（在途）
-    reg                  fill_active_q;  // 填充在途
-    reg [31:0]           fill_paddr_q;   // 在途填充的行基址（物理地址，唯一赋值点）
-    reg [WAY_W-1:0]      fill_way_q;     // 在途填充写入的路
-    reg [SETS-1:0]       plru_q;         // 每 1 bit 伪 LRU：1 ⇒ way1 为 LRU
-    reg [31:0]           hit_data_q;     // 命中数据寄存（cs_ready 拍）
+    reg              miss_q;         // 未命中（在途）
+    reg              fill_active_q;  // 填充在途
+    reg              fill_taken_q;   // 本笔填充请求已被接受（防重复发起）
+    reg [31:0]       fill_line_q;    // 在途填充行基址（物理地址，唯一赋值点）
+    reg              fill_way_q;     // 在途填充目标路（2 路 ⇒ 1 bit）
+    reg [SETS-1:0]   plru_q;         // 伪 LRU：1 ⇒ way1 为 LRU，0 ⇒ way0 为 LRU
 
     //--------------------------------------------------------------------------
-    // 5. Tag 阵列（每路一份）
+    // 5. Tag 阵列（每路）与数据阵列（每路）
     //--------------------------------------------------------------------------
     wire [TAG_W-1:0] tag_rdata [0:WAYS-1];
     wire             tag_vld   [0:WAYS-1];
+    wire [DATA_W-1:0] data_rdata[0:WAYS-1];
 
-    // 写口（每路一份）
-    wire                 tag_we    [0:WAYS-1];
-    wire [INDEX_BITS-1:0] tag_waddr[0:WAYS-1];
-    wire [TAG_W-1:0]     tag_wdata[0:WAYS-1];
-    wire                 tag_wvld [0:WAYS-1];
-
-    //--------------------------------------------------------------------------
-    // 6. 数据阵列（每路一份；A=填充写、B=访问读）
-    //--------------------------------------------------------------------------
-    wire [DATA_W-1:0]    data_rdata[0:WAYS-1];
-    wire                 data_we   [0:WAYS-1];
-    wire [DATA_ADDR_W-1:0] data_waddr[0:WAYS-1];
-    wire [DATA_W-1:0]    data_wdata[0:WAYS-1];
-
-    // 回填写入地址/数据（所有路共享同一地址与数据，只对目标路拉写使能）
-    wire [DATA_ADDR_W-1:0] fill_waddr = {fill_paddr_q[OFF_BITS +: INDEX_BITS],
-                                         fill_word_idx[WIDX_BITS-1:0]};
+    // 填充写口（两路共享地址/数据，仅目标路拉写使能）
+    wire [INDEX_BITS-1:0]  fill_idx  = fill_line_q[OFF_BITS +: INDEX_BITS];
+    wire [TAG_W-1:0]       fill_tag  = fill_line_q[31 -: TAG_W];
+    wire [DATA_ADDR_W-1:0] fill_waddr = {fill_idx, fill_word_idx[WIDX_BITS-1:0]};
 
     genvar gw;
     generate
         for (gw = 0; gw < WAYS; gw = gw + 1) begin : g_way
-            // ---- Tag 阵列 ----
+            wire way_sel      = (fill_way_q == gw[0]);
+            wire way_fill_dat = fill_active_q & fill_valid & way_sel;
+            wire way_fill_tag = fill_active_q & fill_done  & way_sel;
+
             cache_tag_array #(
                 .TAG_W  (TAG_W),
                 .SETS   (SETS),
                 .ADDR_W (INDEX_BITS)
             ) u_tag (
                 .clk        (clk),
-                .wr_en      (tag_we[gw]),
-                .wr_addr    (tag_waddr[gw]),
-                .wr_tag     (tag_wdata[gw]),
-                .wr_valid   (tag_wvld[gw]),
-                .wr_dirty   (1'b0),                 // I-Cache 无 dirty
-                .rd_en      (access),               // 访问拍读索引
+                // 写优先级：失效 > 填充落 tag
+                // ★ inval_all 必须真正清 valid：否则 fence.i / cbo.inval 后
+                //   旧 tag 仍命中 ⇒ 取到陈旧指令（静默错）。
+                .wr_en      (inval_all | way_fill_tag),
+                .wr_addr    (inval_all ? va_index
+                                       : fill_line_q[OFF_BITS +: INDEX_BITS]),
+                .wr_tag     (fill_tag),
+                .wr_valid   (inval_all ? 1'b0 : 1'b1),
+                .wr_dirty   (1'b0),                  // I-Cache 无 dirty
+                .rd_en      (access),
                 .rd_addr    (va_index),
                 .rd_tag_r   (tag_rdata[gw]),
                 .rd_valid_r (tag_vld[gw]),
                 .rd_dirty_r ()
             );
 
-            // ---- 数据阵列 ----
             cache_array_bram #(
                 .DW     (DATA_W),
                 .DEPTH  (SETS * WORDS),
                 .ADDR_W (DATA_ADDR_W)
             ) u_data (
                 .clk      (clk),
-                .a_en     (data_we[gw]),
-                .a_we     (4'hF),                   // 整字写（beat 粒度）
-                .a_addr   (data_waddr[gw]),
-                .a_din    (data_wdata[gw]),
+                .a_en     (way_fill_dat),
+                .a_we     (4'hF),                    // 整字写（beat 粒度）
+                .a_addr   (fill_waddr),
+                .a_din    (fill_data),
                 .a_dout_r (),
                 .b_en     (access),
-                .b_addr   ({va_index, va_widx}),
+                .b_addr   ({va_index, va_offset[OFF_BITS-1 -: WIDX_BITS]}),
                 .b_dout_r (data_rdata[gw])
             );
         end
     endgenerate
 
     //--------------------------------------------------------------------------
-    // 7. 命中判定（tag 读数据与访问拍解码同拍出现 ⇒ 当拍比较）
+    // 6. 命中判定（tag 读数据与访问拍解码同拍出现 ⇒ 当拍比较；1 拍命中）
     //--------------------------------------------------------------------------
-    wire [TAG_W-1:0] tag_arr [0:WAYS-1];
-    wire             hit_arr [0:WAYS-1];
-    generate
-        for (gw = 0; gw < WAYS; gw = gw + 1) begin : g_hit
-            assign tag_arr[gw] = tag_rdata[gw];
-            assign hit_arr[gw] = tag_vld[gw] & (tag_rdata[gw] == va_tag);
-        end
-    endgenerate
-
-    wire any_hit = |hit_arr;
+    wire hit0 = tag_vld[0] & (tag_rdata[0] == va_tag);
+    wire hit1 = tag_vld[1] & (tag_rdata[1] == va_tag);
+    wire any_hit = hit0 | hit1;
 
     //--------------------------------------------------------------------------
-    // 8. 替换选择：伪 LRU（1 bit/组）
-    //    0 ⇒ way0 优先被替换；1 ⇒ way1 优先被替换
+    // 7. 替换选择：伪 LRU（1 bit/组）
     //--------------------------------------------------------------------------
-    wire lru_way = plru_q[va_index];            // 2 路下即是"应替换的路"
-
-    // 命中路号（2 路：直接取 way1 的命中位）
-    wire way1_hit = hit_arr[1];
-    wire [WAY_W-1:0] hit_way = (WAYS == 2) ? {way1_hit} : {WAY_W{1'b0}};
-
-    // 填充目标路：缺失时按 LRU 选；最简 2 路下无"全 invalid"特判（valid=0 的路由
-    // 伪 LRU 位决定；复位后 plru 全 0 ⇒ 首次总是填 way0，way1 在 way0 被复用时进入）
-    wire [WAY_W-1:0] fill_way = (WAYS == 2) ? {lru_way} : {WAY_W{1'b0}};
+    wire lru_is_way1  = plru_q[va_index];      // 1 ⇒ way1 优先被替换
+    wire fill_way_sel = lru_is_way1;
 
     //--------------------------------------------------------------------------
-    // 9. 填充写口生成：复用 tag_we/tag_wdata/data_we/data_wdata
+    // 8. 输出（组合，全部 assign）
     //--------------------------------------------------------------------------
-    generate
-        for (gw = 0; gw < WAYS; gw = gw + 1) begin : g_fill
-            wire this_way_fill = fill_active_q & fill_valid &
-                                 (fill_way_q == gw[WAY_W-1:0]);
-            assign data_we[gw]    = this_way_fill;
-            assign data_waddr[gw] = fill_waddr;
-            assign data_wdata[gw] = fill_data;
+    wire [31:0] hit_data = hit1 ? data_rdata[1] : data_rdata[0];
 
-            // Tag 写：最后一 beat 到齐时落 tag+valid（索引来自行基址）
-            assign tag_we[gw]    = fill_done & (fill_way_q == gw[WAY_W-1:0]);
-            assign tag_waddr[gw] = fill_paddr_q[OFF_BITS +: INDEX_BITS];
-            assign tag_wdata[gw] = fill_paddr_q[31 -: TAG_W];
-            assign tag_wvld[gw]  = 1'b1;
-        end
-    endgenerate
-
-    // 失效：覆盖所有路的 validity（写 valid=0）
-    generate
-        for (gw = 0; gw < WAYS; gw = gw + 1) begin : g_inval
-            // 注：tag_we 已由填充占用；inval 与 fill 不会同拍（idle 才允许 inval）
-        end
-    endgenerate
-
-    //--------------------------------------------------------------------------
-    // 10. 输出（组合）
-    //--------------------------------------------------------------------------
-    // 命中数据：取命中路的数据读输出
-    wire [DATA_W-1:0] hit_data = (WAYS == 2) ? (way1_hit ? data_rdata[1] : data_rdata[0])
-                                             : data_rdata[0];
+    // 一笔"新缺失"：本拍有访问、未命中、且当前无在途填充
+    // ★ 只有在没有在途填充时才可能发起新填充；在途期间不得重复发起
+    //   （否则 fill_req 会在收尾拍抖动，造成上游重复记账）。
+    wire new_miss = access & ~any_hit & ~fill_active_q;
 
     assign idle      = ~miss_q & ~fill_active_q;
     assign cs_miss   = access & (miss_q | ~any_hit);
     assign cs_ready  = access & ~miss_q & ~fill_active_q & any_hit;
     assign cs_rdata  = hit_data;
 
-    // 填充请求：缺失且无在途填充 ⇒ 发起（地址 = 行基址，物理地址唯一赋值点）
-    assign fill_req   = access & ~any_hit & ~fill_active_q & ~miss_q & xip_bypass == 1'b0;
+    // 填充请求：新缺失且未被接受 ⇒ 保持拉高直到被接受（valid&&ready 握手）
+    assign fill_req   = new_miss & ~fill_taken_q;
     assign fill_paddr = {cs_paddr[31:OFF_BITS], {OFF_BITS{1'b0}}};
     assign fill_owner = OWNER_I_FILL;
-    assign fill_beats = WORDS[4:0] - 5'd1;
+    assign fill_beats = WORDS[4:0] - 5'd1;     // 8 beat ⇒ 7
+
+    // 请求已被接受（本拍握手成功）
+    wire fill_take = fill_req & fill_accepted;
 
     //--------------------------------------------------------------------------
-    // 11. 时序：状态更新
-    //     必须用 always 块：这是状态元件（寄存/阵列写口），无法用 assign 表达。
+    // 9. 时序：状态更新
+    //    必须用 always 块：状态元件（寄存器），无法用 assign 表达。
+    //    推进条件一律用 valid && ready（三件套纪律）。
     //--------------------------------------------------------------------------
-    integer i;
     always @(posedge clk) begin
         if (!rst_n) begin
             miss_q        <= 1'b0;
             fill_active_q <= 1'b0;
-            fill_paddr_q  <= 32'h0;
-            fill_way_q    <= {WAY_W{1'b0}};
+            fill_taken_q  <= 1'b0;
+            fill_line_q   <= 32'h0;
+            fill_way_q    <= 1'b0;
             plru_q        <= {SETS{1'b0}};
         end else if (inval_all) begin
-            // 整体失效：清 plru、放弃在途（fill 由 MSHR 侧终止）
+            // 整体失效（fence.i / cbo.inval）
             miss_q        <= 1'b0;
             fill_active_q <= 1'b0;
+            fill_taken_q  <= 1'b0;
             plru_q        <= {SETS{1'b0}};
         end else begin
-            // ---- 伪 LRU 更新：命中时把命中路标记为"最近使用"（另一位为 LRU） ----
+            // ---- 伪 LRU：命中时保护命中路（另一位成为 LRU） ----
             if (access & any_hit) begin
-                if (WAYS == 2) plru_q[va_index] <= ~way1_hit;  // 命中 way1 ⇒ LRU=way0
+                plru_q[va_index] <= ~hit1;     // 命中 way1 ⇒ LRU=way0
             end
 
-            // ---- 缺失登记与填充推进 ----
-            if (fill_active_q) begin
-                if (fill_done) fill_active_q <= 1'b0;          // 填充完成
-            end else if (access & ~any_hit) begin
-                miss_q <= 1'b1;
-                if (fill_accepted) begin
-                    fill_active_q <= 1'b1;
-                    fill_paddr_q  <= {cs_paddr[31:OFF_BITS], {OFF_BITS{1'b0}}};
-                    fill_way_q    <= fill_way;
-                end
-            end else if (access & any_hit) begin
+            // ---- 填充握手：接受后转入"在途填充" ----
+            if (fill_take) begin
+                fill_active_q <= 1'b1;
+                fill_taken_q  <= 1'b1;
+                fill_line_q   <= fill_paddr;
+                fill_way_q    <= fill_way_sel;
+                miss_q        <= 1'b1;
+            end
+
+            // ---- 在途填充推进：最后一 beat 到齐 ⇒ 释放 ----
+            if (fill_active_q & fill_valid & fill_done) begin
+                fill_active_q <= 1'b0;
+                fill_taken_q  <= 1'b0;
+                miss_q        <= 1'b0;
+            end
+
+            // ---- 命中 ⇒ 清 miss ----
+            if (access & any_hit & ~miss_q) begin
                 miss_q <= 1'b0;
             end
         end
     end
 
     //--------------------------------------------------------------------------
-    // 12. 参数自检
+    // 10. 参数自检：锁定与 core_params.vh §7 的口径一致（字面量 ↔ 宏对照）
     //--------------------------------------------------------------------------
     initial begin
-        if (WAYS != `RV32GC_L1I_WAYS || SETS != `RV32GC_L1I_SETS ||
-            LINE_BYTES != `RV32GC_L1I_LINE_BYTES) begin
-            $display("L1I FAIL: 组织参数与 core_params.vh 的 L1I 口径不一致");
+        // 与真源宏逐项比对（编译期即锁定：参数默认值必须等于 core_params.vh 口径）
+        if (WAYS != `RV32GC_L1I_WAYS) begin
+            $display("L1I FAIL: WAYS=%0d 应为 %0d", WAYS, `RV32GC_L1I_WAYS);
             $fatal(1, "L1I PARAM FAIL");
         end
-        if (WAYS != 2) begin
-            $display("L1I FAIL: 本实现按 2 路伪 LRU 定稿（WAYS=%0d）", WAYS);
+        if (SETS != `RV32GC_L1I_SETS) begin
+            $display("L1I FAIL: SETS=%0d 应为 %0d", SETS, `RV32GC_L1I_SETS);
             $fatal(1, "L1I PARAM FAIL");
         end
-        if (SETS != (1 << INDEX_BITS) || (SETS * WAYS * LINE_BYTES) != `RV32GC_L1I_SIZE_BYTES) begin
-            $display("L1I FAIL: 容量/索引推导不符（%0d×%0d×%0dB ≠ %0dB）",
-                     SETS, WAYS, LINE_BYTES, `RV32GC_L1I_SIZE_BYTES);
+        if (LINE_BYTES != `RV32GC_L1I_LINE_BYTES) begin
+            $display("L1I FAIL: LINE_BYTES=%0d 应为 %0d", LINE_BYTES, `RV32GC_L1I_LINE_BYTES);
+            $fatal(1, "L1I PARAM FAIL");
+        end
+        if (INDEX_BITS != 8 || OFF_BITS != 5 || TAG_W != 19) begin
+            $display("L1I FAIL: 索引/偏移/tag 位宽不符");
+            $fatal(1, "L1I PARAM FAIL");
+        end
+        if ((SETS * WAYS * LINE_BYTES) != `RV32GC_L1I_SIZE_BYTES) begin
+            $display("L1I FAIL: 容量 = %0d B，应为 %0d B（16 KB）",
+                     SETS * WAYS * LINE_BYTES, `RV32GC_L1I_SIZE_BYTES);
+            $fatal(1, "L1I PARAM FAIL");
+        end
+        if (WORDS != 8) begin
+            $display("L1I FAIL: 每行字数 = %0d，应为 8", WORDS);
             $fatal(1, "L1I PARAM FAIL");
         end
     end
