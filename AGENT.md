@@ -975,6 +975,20 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 24 轮：核级综合（不需要平台 IP）—— **BRAM 推断失败被实测抓到**
+
+| 项 | 结果 |
+|---|---|
+| 为什么要核级综合 | 整板综合被平台缺件挡住（`axi_2x1_mux` 源缺失，见第 23 轮）。为不空等，先给**本核自己**做综合/实现，直接回答计划 §11.2 的两个未知（33 MHz 时序、BRAM 推断）。口径：核级数据**不含**平台互连/DDR/UART/NAND，不能替代整板判据 |
+| 新增 | `fpga/rtl/core_top_synth_wrap.v`（把 `core_top` 的 AXI 从设备侧输入绑常量，使本核可独立综合）+ `fpga/tcl/synth_core_only.tcl`（`create_project` part `xc7a200tfbg676-2`、加我们 `rtl/**` + 包装、`create_clock -period 30.303` 于 `aclk`、综合+实现、打印 WNS/WHS 与 RAMB36/RAMB18/LUTRAM 计数、出报告到 `fpga/out/`） |
+| **实测发现（重要）** | `ERROR: [Synth 8-3391] Unable to infer a block/distributed RAM for 'line_mem_reg' because the memory pattern used is not supported` ⇒ **两个 Cache 的 `line_mem`/`tag_mem` 阵列当前无法被推断成 RAM** —— 正是 §11.2 风险 2 的具体化。若不修，33 MHz 下 LUT 会爆（且实现必然失败） |
+| 处置 | 已派子 Agent 修：**去掉数据阵列复位**（BRAM 数据位不可复位，改用 `valid_q` 决定命中）+ **改成"每路一个数组"**（`line_mem0..N`，地址 = set）以匹配单/双端口 BRAM 模式；要求功能语义完全不变（VIPT/RR/单未完成缺失/XIP 旁路/写直达/原子与 CBO 钩子/`fence.i`/`ENABLE`），并以 **`run_full_regression.sh` 全绿 + `hello 308`/`memtest 1,021,800` 不变** 为硬判据，再用 `synth_core_only.tcl` 确认 `RAMB36/RAMB18 > 0` |
+| 环境坑（再次确认） | Vivado 批量模式必须能写 `~/.Xilinx`（否则 `Failed to create directory to save app.xml` 早退）；核级综合约 7 分钟跑完一轮 |
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
