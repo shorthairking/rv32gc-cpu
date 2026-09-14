@@ -959,6 +959,22 @@ arch-test 与 hello/memtest 无影响，已复跑）。
 
 ---
 
+---
+
+### 第 23 轮：上板前准备收尾（Vivado 流程实跑，发现平台缺件）
+
+| 项 | 结果 |
+|---|---|
+| **平台顶层无需副本（重要发现）** | 平台 `chip/soc_demo/loongson/soc_top.v:723` 例化的模块名就是 **`core_top`**，其 **48 个端口与我们 `rtl/top/core_top.v` 逐字一致**（aclk/aresetn/intrpt[7:0] + AXI4 + debug 组）⇒ **不需要 `soc_top_rv32gc.v` 副本、不需要端口适配**；且 chiplab 仓库**不含参考核**（文档明说"添加处理器核代码后可直接综合"）⇒ 工程里只加我们的 `rtl/**`，同名冲突不存在 |
+| **33 MHz 平台补丁已应用** | `bash fpga/patch_platform_33mhz.sh --apply` 已执行（自动 `.bak`）：`soc_top.v` 的 `.clk_out1()` 留空 + `assign cpu_clk = uncore_clk;`（33 MHz 同域无 CDC）；`config.h` 的 `FREQ` = `32'd33000000`。工程目录与 `IP/xilinx_ip` 均已备份 |
+| **新增构建/下载脚本** | `fpga/tcl/build_chiplab.tcl`（打开现成 `.xpr` → 加我们 `rtl/**`（含 `.vh` 头文件设为 global include）→ **`upgrade_ip` 升级旧版 IP** → 重置所有 run（含 IP 的 OOC run）→ 综合/实现/bitstream → `report_utilization`/`report_timing_summary`/`report_cdc` + 打印 WNS）；`fpga/tcl/program_fpga.tcl`（open_hw_manager → program_hw_devices） |
+| **实跑结果（Vivado 2025.2）** | ✅ 工程升级、我们 19 个 RTL 加入成功、顶层 `soc_top` 确认；✅ **11 个 IP 成功升级**（`upgrade_ip`+`generate_target`）；❌ **综合仍失败**：2 个 IP 的 OOC 运行报 `[Synth 8-439] module 'axi_2x1_mux' not found` / `module 'axi_interconnect_0' not found`，`wait_on_run synth_1` 随之失败 ⇒ **WNS 与 BRAM 推断尚未测到** |
+| **根因（已定位，非本核问题）** | `module axi_2x1_mux` 在**整个工作区所有 `.v` 里都搜不到**，其 `.xci` 也不引用任何 `.v` 文件；`chiplab/IP/myCPU/` 为空 ⇒ **平台工程缺件**：`axi_2x1_mux` 是自定义 IP，其 RTL 源未随这次 checkout 提供（本 checkout 只有 `IP/AMBA/{axi2apb,axi_mux_n4ddr,axi_mux_sim,axi_mux_syn}.v`）。缺件使参考工程同样无法综合 ⇒ **不是我们 RTL/IP 的问题** |
+| 下一步（无需板子） | ① 拿到 `axi_2x1_mux` 的 IP 源（chiplab 官方发布包/`IP/xilinx_ip` 完整件；参考 `Quick-Start.md` 关于"添加 myCPU/IP 下的 xilinx IP"的说明）后重跑 `build_chiplab.tcl`；② 或用平台 2019.2 树 + Vivado 2019.2 复现（本机只装 2025.2）；③ 拿到综合报告后把 **WNS（33 MHz / 30.303 ns）与 BRAM 推断**回填 `docs/porting/07-board-bringup-plan.md` §11.2 |
+| 环境坑（记录） | Vivado 批量模式**必须能写 `~/.Xilinx`**（IP catalog/临时文件），受限沙箱下会以 `Failed to create directory to save app.xml` 早退（本项目实测）；本会话已用放宽权限跑通到综合阶段 |
+
+---
+
 ## 7. 当前状态与下一阶段计划
 
 **当前状态（2026-09-13，阶段 2A 进行中）**：已完成第 1~9 轮。
