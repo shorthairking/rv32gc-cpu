@@ -51,6 +51,14 @@
 - **子 Agent 的结论不等于验收**：关键结论（尤其"某项已通过"）必须由母 Agent 用命令复跑一次确认；
 - 任何测试/回归脚本必须**"未捕获即失败"**：判定失败、输出未捕获、兜底文案一律不得含 PASS 字样（旧项目曾因此发生过"假 PASS"事故）。
 
+### 0.7 goal 工具纪律（防 token 空转，2026-09-14 新增）
+
+- **宿主事实**：goal 工具（`create_goal`/`update_goal`）只允许**顶层（母）Agent** 创建/更新；子 Agent 调用会被宿主拒绝（"Execution rejects non-human and subagent authority"）。因此**不存在"子 Agent 自己挂 goal"的用法**——子 Agent 的"自驱"靠它**在一次运行内持续迭代直到完成**（子 Agent 模板已写明），母 Agent 不介入中间过程。
+- **母 Agent 挂 goal 的前提**：仅当母 Agent 在**多轮之间每轮都有实质调度/验收工作**（例如"派活 → 复跑验收 → 再派活 → 台账 → 提交"的长链路）时才 `create_goal`。**纯"派发子 Agent 并等结果"的工作流禁止挂 goal**：派发后结束回合安静等通知，宿主会在子 Agent 结束时自动唤醒母 Agent，无需任何 goal 轮。
+- **禁止轮询（硬性）**：母 Agent 在任何回合内都**不得**用 `list_agents`、`send_message`、重复 bash 查询等方式"查看子 Agent 做完没有"，也不得发催促消息。等结果就靠宿主完成通知。
+- **goal 轮最小开销**：若正处于 goal 轮且当前只剩"等子 Agent"一件事：先检查一遍有无**可并行推进的独立工作**（另一个独立子任务、台账整理等）；有就做，没有就**用一两行消息结束本轮**——不查状态、不催促、不复述计划。
+- **派活粒度**：子 Agent 一次运行应能独立完成整件事。任务太大就拆成多个**彼此独立**的子任务并行派发；确需延续上下文的后续任务用 `subagent_fork`。禁止"派一个子 Agent 干半件事再等母 Agent 逐步确认"的碎片化派活。
+
 ---
 
 ## 1. 任务目标与硬性指标（需求不变，与旧 AGENT.md §0 / all_task.md 一致）
@@ -172,7 +180,8 @@
 
 - ≥2 个彼此独立的子任务**必须**在同一条消息里并行发起（`subagent`/`subagent_fork` 多调用）；
 - 并行子 Agent **不得同时写同一个文件**；RTL 位域/接口改动**必须串行**；
-- 长时仿真/构建用后台 job（`run_in_background`）与其它工作并行，不要空等。
+- 长时仿真/构建用后台 job（`run_in_background`）与其它工作并行，不要空等；
+- **等待纪律（§0.7）**：子 Agent 后台运行期间母 Agent 不得轮询其状态；宿主在子 Agent 结束时自动通知。等待期间只做可并行的事，没有就结束回合。
 
 ### 5.3 分工边界
 
@@ -205,13 +214,24 @@
 
 ---
 
-## 8. 阶段总结（新项目，暂空）
+## 8. 阶段总结（新项目）
 
-（每阶段结束时在此追加。）
+### 阶段 0（2026-09-14，已提交）
+
+- 重启五件套就位（本文件 / README.md / USAGE.md / prompts/×3）；项目载体重定为**就地沿用 `rv32gc-cpu/`（dev 分支）**；旧实现文件已从磁盘移除（历史冻结在 master）；全部路径口径统一，提交 `22ee44e`。
+- 用户指令补丁：新增 **§0.7 goal 工具纪律**（纯派发不挂 goal、禁止轮询子 Agent、子 Agent 自驱一次做完；宿主 goal 工具禁止子 Agent 创建），三个子 Agent 模板与 USAGE.md/README.md 同步。
+
+### 阶段一（2026-09-14，已提交）
+
+- **info 复核**：14 组平台/环境/需求事实逐条带行号核实（core_top 48 端口、地址映射、AXI、时钟、软件底座、工具链、ISA 自洽性），发现并修正多项口径：平台文档 8bit len/[7:0] intrpt 为过时文档（以 config.h+soc_top.v 为准）、CLINT/PLIC 两地址未被占用但落 DDR3 默认通路（须核内截获）、分区口径系旧项目自定义约定、la32r-uboot 无 RISCV_M_MODE 宏（用 RISCV_MMODE/SMODE）、Spike 缺失、chiplab 工作树 dirty 快照。
+- **coding 产出 15 篇**：`docs/design/`×7、`docs/porting/`×5、`docs/kb/`×3；母 Agent 按 §0.6 逐判据复跑验收全部通过（文件/图/参数/引用分级/禁词六类判据）。
+- **ISA 口径引用闭环**：T1–T8 补齐规范出处（mtval 写指令位=可选、2B-parcel=本设计选择、非对齐优先级=实现可选、AMO 被 PMP 拒恒 cause 7、陷阱不降级委托、中断取点规范未明说、MPRV 按 MPP 语义、Zicbom rs1 不要求对齐），5 个文件同步修正。
+- **知识库重建**：3711 文档（旧 rv32gc-project 残留已清，新 docs 已收录，rv32gc-project 源根=rv32gc-cpu/docs）。
+- **遗留**：7 项待用户裁决（见 NEXT_SESSION.md §5：chiplab dirty 处置、PLIC 源号映射、CMO block size 发现路径、mtvec Vectored、NAND 门禁 D1/D2/D5、Spike 重取、PMP 粒度 G=0）。
 
 ---
 
 ## 9. 当前状态与下一步
 
-- **阶段 0 已完成**：`AGENT.md`（本文件）、`prompts/subagent-{coding,testing,info}.md`、`USAGE.md`、`README.md` 就绪；项目载体已定（2026-09-14）：就地沿用 `rv32gc-cpu/`（`dev` 分支，旧实现文件已移除，`master` 保留冻结历史），路径口径已统一并提交。
-- **当前（2026-09-14）**：用户已发出"开始阶段一"指令。阶段一进行中：派 info 子 Agent 复核平台事实与需求 → 派 coding 子 Agent 重写 `docs/design`、`docs/porting`、`docs/kb` → 重建知识库索引 → 更新 §8/§9 并 git 提交 → 停下等用户审阅。
+- **阶段一已完成**：15 篇文档落盘并验收、知识库已重建、台账已更新、已 git 提交。**停下，等待用户审阅阶段一产物**（`docs/design`、`docs/porting`、`docs/kb`）**并对 NEXT_SESSION.md §5 的 7 项裁决给出意见**。
+- **下一步（用户审阅通过后）**：按用户指令进入阶段二（2A 顺序 5 级基线核：RV32GC+CSR+PMP+Sv32+Cache+AXI+上板）。开工清单：读 NEXT_SESSION.md → 按 §0.2 确认子 Agent 路由 → 按 §6 阶段二关键验收拆任务派 coding/testing。

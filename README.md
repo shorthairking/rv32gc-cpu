@@ -28,6 +28,7 @@ rv32gc-cpu/（dev 分支）
 3. **WSL-only**：禁止修改或调用任何 Windows 环境下的命令或文件；环境缺失报告用户，由用户配置安装。
 4. **子 Agent 模型**：母 Agent 用 dsh 的 `subagent`/`subagent_fork` 调用子 Agent，显式指定 `provider: "opencode-go-chat"`、`model: "deepseek-v4.1-flash"`（opencode 提供的 ds 4.1 flash 模型）。
 5. **编码红线**：禁止使用原语（先检索 Vivado IP）；大量组合逻辑用 `assign`；避免重复造轮子（尤其 AXI，用 Vivado 成熟 IP/wrapper）。
+6. **goal 纪律**：goal 仅母 Agent 多轮实质调度时使用；纯派发子 Agent 的工作不挂 goal、不轮询，子 Agent 完成时宿主自动通知；子 Agent 一次运行自驱做完（宿主 goal 工具禁止子 Agent 创建）。
 
 ## 快速开始
 
