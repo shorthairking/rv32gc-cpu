@@ -59,7 +59,16 @@
 /*------------------------------------------------------------------------------
  * 5. ISA 扩展 / 特权模式（本核 2A 的真实能力，core_params.vh §1/§10）
  *    · I/M/A/F/D/C + Zicsr/Zifencei/Zicntr/Zicbom；
- *    · M/S/U + Sv32 + PMP16；
+ *    · M/S/U 特权级；
+ *    · **Sv32 暂不声明**（见下"不声明"说明）——不是 DUT 没有 Sv32 部件，
+ *      而是 Sv32 被 ACT 框架使用的前提 `sfence.vma` 尚未译码：
+ *        · tests/env/utils.h:64-69 `RVTEST_SFENCE_VMA_IF_SUPPORTED` 在
+ *          `SV32_SUPPORTED` 被定义时会**无条件插入 `sfence.vma`**；
+ *        · rtl 侧该指令未译码（core_top.v 头注「已知遗留 L2：sfence.vma 未译码」，
+ *          tlb.v 头注 L3/L4 同口径）⇒ 一执行就非法指令陷入，与参考模型分歧；
+ *        · 故"声明 Sv32 支持"会**超出 DUT 实际可依赖的能力**（over-declare）。
+ *      待 M2 补齐 sfence.vma（含取指侧翻译，core_top.v 遗留 L1）后，
+ *      在本文件与 rv32gc-2a.yaml 同步恢复 `SV32_SUPPORTED` 即可。
  *    · F/D 相关宏（F_SUPPORTED）按任务书要求写在 rvmodel_macros.h 里。
  *----------------------------------------------------------------------------*/
 #define ZICSR_SUPPORTED
@@ -67,7 +76,7 @@
 #define ZICBOM_SUPPORTED
 #define S_SUPPORTED
 #define U_SUPPORTED
-#define SV32_SUPPORTED
+/* #define SV32_SUPPORTED */   /* ← 见上：待 sfence.vma 译码后恢复（当前会引入非法指令） */
 
 /*------------------------------------------------------------------------------
  * 6. 明确**不**支持（保持未定义即可；在此登记以免后人"顺手加宏"）

@@ -488,6 +488,10 @@ module tb_arch_test #(
             end
 
             // ---- 写通道 ----
+            // ★ 单笔在途的严格口径：B 响应**被主机收下（b_fire）之后**才重新放开 AW，
+            //   否则会出现"新 AW 已收下、但上一笔 B 仍未收下"⇒ wready = wr_pend & ~bvalid
+            //   恒 0 ⇒ 主机 W 拍永远等不到 wready 的死锁（2026-09-15 实测踩到：
+            //   主机连续两条 store 时挂死，AXI 计数冻结在 aw=w_beat=63）。
             if (aw_fire) begin
                 aw_count  <= aw_count + 32'd1;
                 aw_addr_q <= awaddr;
@@ -495,22 +499,24 @@ module tb_arch_test #(
                 aw_id_q   <= awid;
                 w_cnt_q   <= 5'd0;
                 wr_pend   <= 1'b1;
-                awready_r <= 1'b0;                  // 单笔在途
+                awready_r <= 1'b0;                  // 单笔在途：B 收下前不再接新 AW
             end
 
             if (w_fire) begin
                 w_beat_count <= w_beat_count + 32'd1;
                 do_write(aw_addr_q + {w_cnt_q, 2'b00}, wdata, wstrb);
                 if (wlast) begin
-                    wr_pend   <= 1'b0;
-                    bvalid_r  <= 1'b1;
-                    awready_r <= 1'b1;              // 释放：可接下一笔
+                    wr_pend  <= 1'b0;
+                    bvalid_r <= 1'b1;               // 回 B；awready 保持 0，等 b_fire
                 end else begin
                     w_cnt_q <= w_cnt_q + 5'd1;
                 end
             end
 
-            if (b_fire) bvalid_r <= 1'b0;
+            if (b_fire) begin
+                bvalid_r  <= 1'b0;
+                awready_r <= 1'b1;                  // B 已收下 ⇒ 可接下一笔写
+            end
         end
     end
 
@@ -749,6 +755,15 @@ module tb_arch_test #(
                  ar_count, aw_count, r_beat_count, w_beat_count);
         $display("[tb_arch_test] 未登记区域访问: 读=%0d 写=%0d；控制台字符=%0d",
                  unknown_rd_count, unknown_wr_count, uart_chars);
+        // AXI 握手末态（挂死定位用：哪条通道卡住一眼可见）
+        $display("[tb_arch_test] AXI 末态: AR v/r=%b/%b R v/r=%b/%b | AW v/r=%b/%b W v/r=%b/%b B v/r=%b/%b",
+                 arvalid, arready, rvalid, rready,
+                 awvalid, awready, wvalid, wready, bvalid, bready);
+        // 核内末态（**层次引用，仅诊断**；判据一律用 AXI 观测 + 签名比对）：
+        //   fetch_pc = 停在哪条指令；mepc/mcause/mtval = 是否在陷阱里打转
+        $display("[tb_arch_test] 核内末态: fetch_pc=0x%08h pipe_adv=%b m_busy=%b | mepc=0x%08h mcause=0x%08h mtval=0x%08h",
+                 u_dut.u_fetch_unit.fetch_pc, u_dut.pipe_adv, u_dut.m_busy,
+                 u_dut.u_csr_file.mepc_r, u_dut.u_csr_file.mcause_r, u_dut.u_csr_file.mtval_r);
         if ((uart_chars > 0) && ((uart_chars % 64) != 0)) $write("\n");
         $display("[tb_arch_test] 签名导出行数=%0d ⇒ %0s", sig_lines, str_lj(SIG_FILE));
         $display("------------------------------------------------------------------------");

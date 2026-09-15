@@ -20,7 +20,10 @@ kind: architecture configuration
 type: fully configured
 name: rv32gc-2a
 description: >
-  RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom，M/S/U + Sv32 + PMP16（阶段二 2A 单发射顺序 5 级基线核）。
+  RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom，M/S/U + PMP16（阶段二 2A 单发射顺序 5 级基线核）。
+  注：Sv32 **暂不声明** —— ACT 框架只要声明 Sv32 就会无条件插入 sfence.vma
+  （tests/env/utils.h:64-69），而本核该指令尚未译码（core_top.v 已知遗留 L2）
+  ⇒ 会引入非法指令。待 M2 补齐 sfence.vma 后恢复。
   Hand-maintained declaration (UDB unavailable in this environment); keep in sync with
   sim/arch_test/rvtest_config.h.
 
@@ -55,7 +58,10 @@ params:
   MUTABLE_MISA_U: false
   # --- Zicntr：time CSR 由核内实现（不需要 RVTEST_EMULATE_TIME_CSR 模拟路径）---
   TIME_CSR_IMPLEMENTED: true
-  # --- S 模式分页：RV32 ⇒ 仅 Sv32；satp.ASID = 9 bit（rv32_defs.vh §6.2 口径）---
+  # --- S 模式分页：satp.ASID = 9 bit（rv32_defs.vh §6.2 口径）---
+  #     ★ Sv32 本体（satp/PTW/TLB）已在 RTL 中，但 ACT 框架"声明 Sv32 ⇒ 启动码插入
+  #       sfence.vma"（tests/env/utils.h:64-69），而 sfence.vma 未译码 ⇒ 暂不声明；
+  #       恢复条件：RTL 译码 sfence.vma（core_top.v 已知遗留 L2）。
   ASID_WIDTH: 9
   SXLEN: [32]
   UXLEN: [32]

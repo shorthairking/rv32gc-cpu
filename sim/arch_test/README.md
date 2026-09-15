@@ -32,30 +32,39 @@
 | `rv32gc-2a.yaml` | UDB 配置声明（同上：登记用途） |
 | `sail.json` | 参考模型平台描述；run.sh 从中取 `SAIL_*` 编译宏（sig 版 ELF 必需） |
 | `exclude.list` | 排除清单（逐条带理由；`--check-exclude` 防漂移） |
-| `dm_smoke.S` / `dm_csr_raw.S` | 定向程序：底座 PASS 通道自证 / CSR 写后读缺陷复现 |
+| `dm_smoke.S` / `dm_csr_raw.S` / `dm_htif.S` | 定向程序：底座 PASS 通道自证 / CSR 写后读回归 / HTIF 控制台写最小复现 |
 | `../tb/tb_arch_test.sv` | DUT TB：core_top + 自洽 AXI 从设备 + hex 预载 + HTIF(tohost) 终止 + 签名导出 + 超时守卫 |
 
 ## 3. 当前状态（2026-09-15）
 
-- **底座全链路可用**：`--directed dm_smoke` 在 DUT 与 Spike 上跑出逐行一致的签名 ⇒
-  `RV32_ARCH_TEST_RUN: PASS (1/1)`（编译/参考/DUT 仿真/导出/比对五步均被独立执行）。
-- **arch-test 用例当前 FAIL（阻塞在 RTL，不在底座）**：任何 ACT4 用例的启动码
-  `RVTEST_TRAP_PROLOG` 都会做 `csrw mtvec,t2; csrr a4,mtvec; beq` 自检，而本核
-  **CSR 写后读（指令距离 1）读到旧值** ⇒ 自检失败 ⇒ 走 abort ⇒ `mtvec=0` ⇒ 取指跑到 0 并空转。
-  复现：`./sim/arch_test/run.sh --directed dm_csr_raw`（结果区 [0]/[4] 期望 0x800006C0，实测 0x00000000）。
-  证据与分歧上下文见 `work/I-nop-00/`、`work/I-add-00/`（DUT 与 Spike 两侧 dump + 日志）。
-- **RTL 修复方向**（`rtl/` 不在本底座的可写范围内，需另行派活）：
-  `rtl/top/core_top.v:1104` 的旁路 `(csr_wen_w & (mw_csr_addr==de_csr_addr))` 只覆盖
-  "W 写 / E 读同拍"（指令距离 2）；距离 1 的真实冒险是"**M 写 / E 读**"（CSR 读值在
-  `core_top.v:2396` 的 E 级锁存）⇒ 需补 M 级前递（`em_csr_wdata`，注意 WARL 读视图）
-  或在该条件上停顿一拍，交给既有 W→E 旁路兜住。
+**底座本身已自证可用**（三条定向程序在 DUT 与 Spike 上跑出逐行一致的签名）：
+```bash
+./sim/arch_test/run.sh --directed dm_smoke     # PASS（纯整数：编译/参考/DUT/导出/比对全链路）
+./sim/arch_test/run.sh --directed dm_csr_raw   # PASS（CSR 写后读距离 1 = 0x800006C0 ⇒ 96207a9 修复已生效）
+./sim/arch_test/run.sh --directed dm_htif      # PASS（HTIF 控制台写 tohost 窗口无副作用）
+```
+
+**arch-test 用例（I-nop-00 / I-add-00）当前仍 FAIL，阻塞在 DUT（非底座）**，已定位/已排除的链条：
+| # | 现象 | 结论 |
+|---|---|---|
+| 1 | ACT 启动码 mtvec 自检失败（`csrw mtvec; csrr 读回旧值`） | **RTL 缺陷**：CSR 写后读距离 1 缺旁路 ⇒ 已由 `96207a9` 修复，`dm_csr_raw` 复验 PASS |
+| 2 | ACT 用例跑到末尾（签名区已按参考写入 `final_sig_offset=4` / `final_trap_sig_offset=0`；控制台仅出 1 个字符）后 DUT 掉进 **PC=0 的非法指令陷阱环** | **RTL 侧待定位**（本底座给出末态证据）：`fetch_pc=0x0 pipe_adv=1 m_busy=0`、`mcause=0x2`(illegal instruction)、`mepc=0x0`；AXI 五通道全空闲（AR v/r=0/1、AW v/r=0/1、W/R/B=0）⇒ 核在某处跳到/返回到地址 0（0x0 属核 PMA 的可缓存 DDR 窗口，命中缓存后不再发 AXI，故表现为"无总线活动 + 死循环"）。已排除：HTIF 控制台写本身（`dm_htif` PASS）与底座/TB 因素（`dm_smoke`/`dm_csr_raw` PASS） |
+| 3 | 配置面 | `sfence.vma` 未译码（core_top.v 已知遗留 L2）⇒ `rvtest_config.h` **暂不声明 `SV32_SUPPORTED`**（否则 ACT 启动码无条件插入 `sfence.vma`，一执行即非法指令）。恢复条件：RTL 译码 `sfence.vma` |
+
+复现（每条都在 10 分钟内给出精确 FAIL 证据，绝不假 PASS）：
+```bash
+./sim/arch_test/run.sh --cycles 6000 I-nop-00      # 观察：拍数=6000 提交数≈822；
+                                                   #   AXI 末态=全空闲；核内末态: fetch_pc=0x0 mcause=0x2 mepc=0x0
+```
+证据文件：`work/I-nop-00/I-nop-00.dut.log`（DUT 侧末态 + 摘要）、`work/I-nop-00/I-nop-00.spike.sig`
+（参考签名）、`work/evidence/*.log`（历史定位过程：CSR RAW / 提交分歧比对 / 停摆态）。
 
 ## 4. 修复后的验收动作（无需改底座）
 
 ```bash
 ./sim/arch_test/run.sh I-nop-00            # 期望：RV32_ARCH_TEST: I-nop-00 PASS (compared=15020 lines, first_diff=none)
 ./sim/arch_test/run.sh I-add-00            # 期望：RV32_ARCH_TEST: I-add-00 PASS (compared=15412 lines, first_diff=none)
-./sim/arch_test/run.sh --directed dm_csr_raw   # 期望：PASS（距离 1 的 CSR 写后读回读 0x800006C0）
+./sim/arch_test/run.sh --directed dm_csr_raw   # 期望：PASS（CSR 写后读回归）
 ```
 
 ## 5. 备注
