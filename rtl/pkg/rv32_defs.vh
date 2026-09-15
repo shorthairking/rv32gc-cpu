@@ -592,12 +592,32 @@
 // U 模式专用 CSR（ustatus 等）是否落地：见 §4.10 的版本敏感声明
 `define RV32GC_IMPLEMENT_U_MODE_CSRS 0
 // ---- 核内 MMIO 窗口（取指/访存译码共用；核内截获，绝不发 AXI） ----
-//      每个窗口都给出「(mask,value)」二元组，比较形式统一为 ((PA & mask) == value)；
-//      mask 的位宽 = 该处比较所用的地址位段宽（16 或 12）。
+//      ① 64 KiB 窗口（CLINT 与 5 个平台外设页）：给出「(mask,value)」二元组，
+//         比较形式为 ((PA[31:16] & mask) == value)，mask 位宽 = 比较位段宽（16）。
+//      ② PLIC 窗口宽 **4 MiB**（`RV32GC_PLIC_SIZE`，core_params.vh §2）⇒ PA[31:16]
+//         单片比较**表达不了**，一律改用**显式区间比较**：
+//             (PA >= `RV32GC_PLIC_HIT_LO) && (PA < `RV32GC_PLIC_HIT_HI)
+//         即 PA ∈ [0x1F10_0000, 0x1F50_0000)；判定处见 rtl/mem/mmio_route.v §2.1。
+//         ★ 禁止用 mask=16'hFF00 之类"高位掩码"近似 —— 那会把 1FAF/1FD0/1FE0/
+//           1FE7/1FF0 五个平台窗口一并吞进核内 PLIC（静默数据损坏）。
+//         ★ 缺陷史（2026-09-15 修复）：旧判定为 (PA[31:16] == 0x1F10)，窗口仅 64 KiB，
+//           而 PLIC 的 threshold/claim 区在 PLIC_BASE+0x0020_0000（PA 0x1F30_0000 /
+//           0x1F30_1000）⇒ 该区落在窗口之外、静默落 DDR3/AXI 默认通路。
 `define RV32GC_HIT_HI16_MSK   16'hFFFF     // PA[31:16] 全比较（窗口高 16 位）
 `define RV32GC_CLINT_HIT_MSK  `RV32GC_HIT_HI16_MSK
-`define RV32GC_CLINT_HIT_VAL  16'h1F00      // (PA[31:16] == 0x1F00) ⇒ 核内 CLINT
-`define RV32GC_PLIC_HIT_VAL   16'h1F10      // (PA[31:16] == 0x1F10) ⇒ 核内 PLIC
+`define RV32GC_CLINT_HIT_VAL  16'h1F00      // (PA[31:16] == 0x1F00) ⇒ 核内 CLINT（64 KiB，
+//                                          寄存器稀疏映射全在 PA[15:0] 内 ⇒ 等价）
+// ---- PLIC 命中窗口 [LO, HI)（**区间口径唯一真源**；值引用 core_params.vh §2 的
+//      PLIC_BASE / PLIC_SIZE，勿在此硬编码字面量）----
+//      依赖方向 rv32_defs.vh → core_params.vh：使用处必须两者都已 include
+//      （rtl/mem/mmio_route.v 满足；见 AGENT.md §3.2 的 include 顺序）。
+`define RV32GC_PLIC_HIT_LO    `RV32GC_PLIC_BASE                        // 0x1F10_0000（闭）
+`define RV32GC_PLIC_HIT_HI    (`RV32GC_PLIC_BASE + `RV32GC_PLIC_SIZE)  // 0x1F50_0000（开）
+// PLIC 基址的 PA[31:16] 切片（= 0x1F10）：**不是窗口判定依据**，只留给 16 位切片式比较的
+//   遗留处。遗留：rtl/axi/axi_req_desc.v 的 pma_is_plic 仍用它（= 窄口径 64 KiB）；因 PLIC
+//   访问已由 mmio_route 的 no_axi 门控拦截、绝不进入 AXI 描述符通路，该处是**不可达的窄
+//   口径**，待后续任务同步（本次窗口修复不动该文件 —— 见交付说明的遗留项）。
+`define RV32GC_PLIC_HIT_VAL   16'h1F10
 // ---- 平台从设备窗口（同上口径，供 mmio_route/axi_req_desc 共用一份译码） ----
 `define RV32GC_SPI_HIT_VAL    16'h1FE8      // (PA[31:16] == 0x1FE8) ⇒ SPI 别名窗口
 `define RV32GC_APB_UART_VAL   16'h1FE0      // ⇒ UART

@@ -1585,6 +1585,23 @@ module core_top (
     wire [31:0] m_axi_ld_data = (em_mem_op == MEM_LOAD) ? m_axi_ld_data_ext
                                                         : axi_rdata_q;
 
+    //   ★ 2026-09-15 修复（同一条 MMIO 读通路的第二半缺陷）：核内 MMIO 的**寄存器地址**
+    //     —— clint.v/plic.v 的寄存器译码是「窗口内偏移 == 寄存器偏移」的**整字比较**
+    //     （两个模块的头注都写明"核内 MMIO 一律 32 位字对齐访问"），而 LSU 送来的是
+    //     **字节地址**（m_pa_eff = rs1+imm 原样）。若把 lb/lbu/lh/lhu 的字节地址原样
+    //     送去，偏移 0x4001/0x4002/0x4003 都不命中 ⇒ 设备 resp_rdata=0 ⇒ 上面的
+    //     ld_extract 抽到的仍是 0（实测：lbu @+1 读回 0x00 而非 0x66）。
+    //     故**读访问**把地址对齐到 4 B 边界再送设备：设备按整字寄存器应答，
+    //     字节/半字由 ld_extract 按 VA[1:0] 抽取 —— 与 AXI 通路同语义
+    //     （主设备给对齐地址 + 自行选字节道；AXI 是协议允许非对齐，核内 MMIO 是
+    //      设备只认对齐 ⇒ 由主设备侧对齐）。
+    //   · 写访问**不**在此处对齐：clint.v/plic.v 的写口径是"任一 wstrb 有效即整字写
+    //     （不做字节合并）"，对齐后送"左移过的 store 数据"会整字覆盖寄存器；
+    //     即 sb/sh 对核内 MMIO 的写通路是既有未支持项（登记在交付说明的遗留里，
+    //     修复需动 clint.v/plic.v，超出本任务允许的文件范围）。
+    wire [31:0] m_mmio_req_addr = (m_mem_wr_op | m_amo_write)
+                                  ? m_pa_eff : {m_pa_eff[31:2], 2'b00};
+
     wire        l1d_cs_req  = (m_l1d_go | (m_state_q == M_S_PTER) |
                                (m_state_q == M_S_PADW)) & ~m_kill_fsm;
     wire        l1d_cs_we   = (m_state_q == M_S_PADW) ? 1'b1 :
@@ -1664,7 +1681,22 @@ module core_top (
     assign clint_req_wr    = m_mmio_we_q;
     assign plic_req_wr     = m_mmio_we_q;
     assign clint_req_addr  = m_mmio_off_q;
-    assign plic_req_addr   = m_mmio_off_q;
+    //   ★ 2026-09-15 修复（PLIC 寄存器地址译码偏差 +0x100000）：
+    //     m_mmio_off_q = PA − CLINT_BASE 是 **CLINT 窗口内偏移**（二者共用一份记账，
+    //     见 §9 的 M_S_ISS），而 plic.v 的寄存器译码口径是 **PLIC 窗口内偏移**
+    //     （PRIORITY 0x0 / PENDING 0x1000 / ENABLE 0x2000 / THRESHOLD 0x0020_0000，
+    //      见 plic.v 文件头「寄存器映射」）。直接把 m_mmio_off_q 送过去 ⇒ 整个 PLIC
+    //     窗口偏移 +0x100000（= PLIC_BASE − CLINT_BASE）⇒ 寄存器全不命中：
+    //     读恒 0、写被丢弃（核内截获仍然成立，故不报错、只是静默失效）。
+    //     这里减去基址差，恢复「PLIC 窗口内偏移」口径；与读对齐口径同源
+    //     （m_mmio_off_q 由 m_mmio_req_addr 派生 —— 读已按 4 B 对齐，见 §9 的
+    //      m_mmio_req_addr 定义），本行不改动对齐语义。
+    //   · 遗留（**不在本次改动范围**，需另立任务）：mmio_route 的 PLIC 窗口判定是
+    //     PA[31:16]==0x1F10（1F10_0000–1F10_FFFF，仅 64 KiB），而 PLIC 的
+    //     threshold/claim 区在 PLIC_BASE+0x20_0000（PA 0x1F30_0000 / 0x1F31_1000）
+    //     ⇒ 该区访问**不命中核内窗口**（落 DDR3/AXI 默认通路）。本行修复只解决
+    //     「偏移口径」，threshold/claim 的可达性需同步放宽 mmio_route/pkg 的窗口。
+    assign plic_req_addr   = m_mmio_off_q - (`RV32GC_PLIC_BASE - `RV32GC_CLINT_BASE);
     assign clint_req_wdata = m_mmio_wdata_q;
     assign plic_req_wdata  = m_mmio_wdata_q;
     assign clint_req_strb  = m_mmio_strb_q;
@@ -2698,7 +2730,7 @@ module core_top (
                         m_mmio_clint_q <= lsu_clint_plic & m_mr_clint;
                         m_mmio_plic_q  <= lsu_clint_plic & m_mr_plic;
                         m_mmio_we_q    <= m_mem_wr_op | m_amo_write;
-                        m_mmio_off_q   <= m_pa_eff - `RV32GC_CLINT_BASE;
+                        m_mmio_off_q   <= m_mmio_req_addr - `RV32GC_CLINT_BASE;
                         m_mmio_wdata_q <= m_amo_phase_q ? m_amo_wdata_q : m_store_w32;
                         m_mmio_strb_q  <= m_store_strb;
                         m_mmio_pa_q    <= m_pa_eff;
@@ -2781,7 +2813,17 @@ module core_top (
 
                     //----------- 核内 MMIO（CLINT/PLIC）单拍完成 -----------
                     M_S_MMIO: begin
-                        m_rd_data_q <= m_mr_clint ? clint_rdata : plic_rdata;
+                        // ★ 2026-09-15 修复（与 M_S_AXI 同源缺陷的另一处残留）：
+                        //   CLINT/PLIC 的 resp_rdata 是 **32 bit 寄存器整字**，
+                        //   原实现直取整字 ⇒ lb/lbu/lh/lhu 拿到的都是整个字
+                        //   （实测：对 mtimecmp 做 `lbu` 会得到 0x88776655 而不是 0x55）。
+                        //   改为**与 L1D/AXI 通路同一 function** `ld_extract`，按
+                        //   VA[1:0] 做偏移、按 m_lsu_size 截宽度、按 em_mem_unsign
+                        //   做符号/零扩展（三处调用共用一个真源，杜绝口径分叉）。
+                        //   · lw（size=2）⇒ 结果恒等于原字，行为不变；
+                        //   · AMO/LR/SC 恒为字对齐（VA[1:0]=0）且 size=2 ⇒ 行为不变。
+                        m_rd_data_q <= ld_extract(m_mr_clint ? clint_rdata : plic_rdata,
+                                                  m_va[1:0], m_lsu_size, em_mem_unsign);
                         m_state_q   <= M_S_IDLE;
                         m_done_q    <= 1'b1;
                     end

@@ -4,8 +4,9 @@
 // 项目    : rv32gc-cpu（阶段二 2A：单发射顺序 5 级基线核）
 // 出处    : docs/design/08-baseline-5stage.md §5.4 行为要点 ⑦、§6.6 与地址译码流程图
 //           docs/design/05-cache-memory.md §5.1（PMA 表口径）
-// 唯一真源: rtl/pkg/rv32_defs.vh §10（CLINT_HIT_VAL / PLIC_HIT_VAL / *_HIT_VAL 掩码）
-//           rtl/pkg/core_params.vh §1（XIP 主窗口）、§2（平台地址映射与 MMIO 掩码）
+// 唯一真源: rtl/pkg/core_params.vh §1（XIP 主窗口）、§2（平台地址映射：CLINT/PLIC 基址与
+//           尺寸、MMIO 掩码 ⇒ PLIC 窗口 = [RV32GC_PLIC_BASE, +RV32GC_PLIC_SIZE)）
+//           rtl/pkg/rv32_defs.vh §10（*_HIT_VAL 高位掩码；PLIC 区间宏 PLIC_HIT_LO/HI）
 //           **include 顺序：先 rv32_defs.vh 后 core_params.vh**（AGENT.md §3.2）
 //------------------------------------------------------------------------------
 // 为什么必须有这个模块（08 §6.6）：
@@ -17,7 +18,8 @@
 // 译码优先级（严格按下表，逐级 if-else 语义用 assign + 遮蔽表达）：
 //   ① 非对齐判定在**上游 lsu.v** 完成（08 §5.5 抉择 1：非对齐先于 PMP/分流）。
 //   ② PA[31:16]==0x1F00 ⇒ 核内 CLINT          → route=ROUTE_CLINT，**绝不发 AXI**
-//   ③ PA[31:16]==0x1F10 ⇒ 核内 PLIC           → route=ROUTE_PLIC ，**绝不发 AXI**
+//   ③ PA ∈ [0x1F10_0000, 0x1F50_0000) ⇒ 核内 PLIC（4 MiB = PLIC_BASE+PLIC_SIZE）
+//                                              → route=ROUTE_PLIC ，**绝不发 AXI**
 //   ④ PA[31:20]==0x1C0  ⇒ XIP 主窗口（直连）  → route=ROUTE_XIP
 //      PA[31:16]==0x1FE8 ⇒ XIP 别名窗口（直连）→ route=ROUTE_XIP
 //      （XIP 是**直连 AXI**、不查/不写 L1I，但它是独立通路，不是核内寄存器；
@@ -25,6 +27,18 @@
 //   ⑤ 平台外设窗口（1FE0 UART / 1FE7 NAND / 1FD0 confreg_syn / 1FAF confreg_sim /
 //      1FF0 MAC）⇒ route=ROUTE_AXI（**非缓存**，AxCACHE=4'b0000）
 //   ⑥ 其余（0x0–0x07FF_FFFF DDR3 默认通路）⇒ route=ROUTE_AXI（**可缓存**）
+//
+// ★ 2026-09-15 修复（PLIC 核内命中窗口过窄）：旧判定为 PA[31:16]==0x1F10（仅 64 KiB），
+//   而 PLIC 标准映射长 PLIC_SIZE=0x40_0000（core_params.vh §2），threshold/claim 区在
+//   PLIC_BASE+0x0020_0000（PA 0x1F30_0000 / 0x1F30_0004 / 0x1F30_1000）⇒ 该区落在窗口
+//   之外，**静默落到 DDR3/AXI 默认通路**（写 DDR3 内容、读回 0，无声数据损坏）。
+//   现改为**显式区间比较**，窗口 = [PLIC_BASE, PLIC_BASE+PLIC_SIZE) 全长 4 MiB
+//   （下界/上界宏见 rtl/pkg/rv32_defs.vh §10，其值引用 core_params.vh §2 真源）。
+//   ★ 口径锁：sim/unit/tb_lsu.sv 组 E 的 E-3b..E-3h（窗口内 threshold/claim 可达、
+//     上界 0x1F50_0000 为**开区间**、1FAF/1FD0/1FF0 平台窗口不被吞）。
+//   ★ 遗留（**超出本次允许的文件范围**）：rtl/axi/axi_req_desc.v 的 pma_is_plic 仍按
+//     16 位切片口径（64 KiB）。因 PLIC 访问由本模块的 no_axi 门控拦截、绝不进 AXI
+//     描述符通路，该处为不可达的窄口径；待后续任务以同一区间口径同步。
 //
 // ★ 本模块**只做分流判定**，不发请求、不实现协议：AXI 请求描述符的生成属
 //   `rtl/axi/axi_req_desc.v`（cache/axi 组别），LSU 只依据本模块的 route 输出
@@ -61,8 +75,8 @@ module mmio_route #(
     output wire              axi_cached_o,    // 1 ⇒ 走 AXI，AxCACHE=4'b1111
 
     // ---- 细分命中（供 clint/plic 例化与 TB 断言） ----
-    output wire              clint_hit_o,     // 命中 0x1F00_0000 窗口
-    output wire              plic_hit_o,      // 命中 0x1F10_0000 窗口
+    output wire              clint_hit_o,     // 命中 CLINT 窗口 0x1F00_0000（64 KiB）
+    output wire              plic_hit_o,      // 命中 PLIC 窗口 [0x1F10_0000, 0x1F50_0000)（4 MiB）
     output wire              periph_hit_o     // 命中平台外设窗口（UART/NAND/conf/MAC）
 );
 
@@ -76,20 +90,33 @@ module mmio_route #(
     localparam [2:0] ROUTE_AXI   = 3'd4;   // 经核内 AXI 主端口控制器
 
     //==========================================================================
-    // 2. 窗口命中判定（全部走“掩码比较”统一形式，与 axi_req_desc 共用一份表）
-    //    形式统一为 ((PA[hi:lo] & MSK) == VAL)，掩码取自 rtl/pkg 真源。
+    // 2. 窗口命中判定（与 rtl/axi/axi_req_desc.v 共用一份真源表：rtl/pkg）
+    //    · 64 KiB 窗口（CLINT 与 5 个平台外设页）：((PA[31:16] & MSK) == VAL)，
+    //      掩码/取值取自 rtl/pkg/rv32_defs.vh §10（值本身见 core_params.vh §2）。
+    //    · PLIC 窗口宽 4 MiB：**显式区间比较**（见 §2.1），不可用高位掩码近似。
     //==========================================================================
-    // ---- 2.1 核内私有窗口（PA[31:16] 全比较） --------------------------------
-    // [DOC:08 §6.6；rv32_defs.vh §10]
+    // ---- 2.1 核内私有窗口 ----------------------------------------------------
+    // [DOC:08 §6.6；rv32_defs.vh §10；core_params.vh §2]
     // 地址字面量登记（供 grep 复核与代码走查；与 rv32_defs.vh/core_params.vh 一致）：
-    //   CLINT_BASE = 0x1F00_0000     PLIC_BASE = 0x1F10_0000
-    //   XIP 主窗口 = 0x1C00_0000     XIP 别名  = 0x1FE8_0000
+    //   CLINT_BASE = 0x1F00_0000（64 KiB）  PLIC_BASE = 0x1F10_0000（4 MiB）
+    //   PLIC 窗口  = [0x1F10_0000, 0x1F50_0000)
+    //   XIP 主窗口 = 0x1C00_0000            XIP 别名 = 0x1FE8_0000
     wire [15:0] pa_hi16 = pa_i[31:16];
 
     // CLINT 0x1F00_0000 —— ★ 绝不发 AXI（核内截获，见 §6.6 的静默数据损坏说明）
+    //   CLINT 寄存器稀疏映射全在窗口低 64 KiB 内（mtimecmp +0x4000 / mtime +0xBFF8，
+    //   core_params.vh §5）⇒ CLINT_SIZE=64 KiB 与 PA[31:16] 全比较**等价**。
     wire clint_hit = ((pa_hi16 & `RV32GC_CLINT_HIT_MSK) == `RV32GC_CLINT_HIT_VAL);
-    // PLIC  0x1F10_0000 —— ★ 绝不发 AXI（核内截获）
-    wire plic_hit  = ((pa_hi16 & `RV32GC_CLINT_HIT_MSK) == `RV32GC_PLIC_HIT_VAL);
+
+    // PLIC  [0x1F10_0000, 0x1F50_0000) —— ★ 绝不发 AXI（核内截获）
+    //   ★ **显式区间比较**（2026-09-15 修复；形式与上下界宏见 rv32_defs.vh §10）：
+    //     窗口上界 = PLIC_BASE + PLIC_SIZE = 0x1F10_0000 + 0x40_0000 = 0x1F50_0000（开），
+    //     覆盖 PLIC 标准映射全 4 MiB —— 含 threshold/claim 区
+    //     （PLIC_BASE+0x0020_0000 ⇒ PA 0x1F30_0000 / 0x1F30_0004 / 0x1F30_1000）。
+    //   ★ **禁止**改写成 mask=16'hFF00 之类高位掩码近似
+    //     （(PA[31:16] & 16'hFF00) == 16'h1F00 会命中整个 0x1F00..0x1FFF 页段）：
+    //     那会把 1FAF/1FD0/1FE0/1FE7/1FF0 五个平台窗口误判成核内 PLIC（静默数据损坏）。
+    wire plic_hit  = (pa_i >= `RV32GC_PLIC_HIT_LO) && (pa_i < `RV32GC_PLIC_HIT_HI);
 
     assign clint_hit_o  = clint_hit;
     assign plic_hit_o   = plic_hit;

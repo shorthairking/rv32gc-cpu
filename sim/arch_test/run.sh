@@ -26,7 +26,23 @@
 #   ./sim/arch_test/run.sh --list                    # 列出可选用例（含是否被排除）
 #   ./sim/arch_test/run.sh --check-exclude           # 校验 exclude.list 每条规则都有命中
 #   ./sim/arch_test/run.sh --directed dm_csr_raw     # 跑 sim/arch_test/*.S 定向程序（非 ACT 用例）
-#   选项：-v（打印 TB 心跳/提交诊断）、--timeout-vvp N、--cycles N
+#   ./sim/arch_test/run.sh --group I                 # 组批量模式（见下）：按组跑一批用例
+#   ./sim/arch_test/run.sh --group rv32i/I           #   组名 = 目录名 / 相对路径 / 用例名 glob
+#   ./sim/arch_test/run.sh --group 'I-a*' --limit 5  #   冒烟：只跑过滤后的前 5 例
+#   选项：-v（打印 TB 心跳/提交诊断）、--timeout-vvp N、--cycles N、--limit N
+#
+# 【组批量模式（--group）】
+#   组名解析（按 arch-test 仓库实际目录结构）：
+#     · 目录名     ：`I` / `M` / `Zicsr` / `rv32i` / `priv/Sv` …… ⇒ 该目录（含子目录）全部用例；
+#     · 相对路径   ：`tests/rv32i/I` ⇒ 同义；
+#     · 用例名 glob：`I-a*` / `I-nop-00` / `M-*`（可带 `tests/…` 前缀路径 glob）。
+#   执行口径：候选清单 → **按 exclude.list 逐条过滤**（被过滤的每条都打印 INFO，绝不静默丢弃）
+#             → 逐例调用与单例模式**完全相同**的 run_one（同超时/同判据）→ 聚合。
+#   聚合输出（必打）：
+#     `GROUP <组>: <pass> pass / <fail> fail / <skip> skip`   （三者之和 = 实际运行例数）
+#   全绿时**额外**打一行紧凑判语 `GROUP <组>: <pass>/<pass+fail> pass`；
+#   有任何 fail（或一例都没跑成）⇒ 该行**不打印**，最终退出码非零（未捕获即失败）。
+#   ★ 失败路径同样不含任何 PASS 兜底文案（见文首纪律）。
 #
 # 【样例（端到端）】
 #   ./sim/arch_test/run.sh I-nop-00
@@ -112,15 +128,18 @@ cfg_need memory tohost TOHOST_ADDR
 
 # 命令行可覆盖的项
 OPT_VVP_TIMEOUT=""; OPT_CYCLES=""; OPT_VERBOSE=0
+OPT_LIMIT=0; GROUP=""
 MODE="run"; TESTS=()
 
-usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,61p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --list)          MODE="list" ;;
         --check-exclude) MODE="check-exclude" ;;
         --directed)      MODE="directed" ;;
+        --group)         shift; GROUP="${1:-}" ;;
+        --limit)         shift; OPT_LIMIT="${1:-}" ;;
         --timeout-vvp)   shift; OPT_VVP_TIMEOUT="${1:-}" ;;
         --cycles)        shift; OPT_CYCLES="${1:-}" ;;
         -v|--verbose)    OPT_VERBOSE=1 ;;
@@ -132,6 +151,23 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$OPT_VVP_TIMEOUT" ] && TIMEOUT_VVP="$OPT_VVP_TIMEOUT"
 [ -n "$OPT_CYCLES" ] && TIMEOUT_CYCLES="$OPT_CYCLES"
+
+# ---- --group / --limit 的参数校验（fail-closed：参数不合法一律硬失败）----
+if [ -n "$GROUP" ]; then
+    [ "${#TESTS[@]}" -eq 0 ] || die "--group 与位置参数（单例清单）不能同时使用：组模式已指定 ${GROUP}"
+    case "$MODE" in
+        run) MODE="group" ;;
+        *)   die "--group 不能与 --list/--check-exclude/--directed 同时使用（当前模式：${MODE}）" ;;
+    esac
+elif [ "$OPT_LIMIT" != "0" ]; then
+    die "--limit 只用于 --group 组模式（当前未指定 --group）"
+fi
+if [ "$OPT_LIMIT" != "0" ]; then
+    case "$OPT_LIMIT" in
+        ''|*[!0-9]*) die "--limit 需要正整数，收到：${OPT_LIMIT}" ;;
+    esac
+    [ "$OPT_LIMIT" -gt 0 ] || die "--limit 需要正整数，收到：${OPT_LIMIT}"
+fi
 
 #------------------------------------------------------------------------------
 # 2. 工具存在性检查（缺 ⇒ 硬失败，不静默跳过）
@@ -244,6 +280,38 @@ resolve_test() {  # resolve_test <arg> → 打印 arch-test 相对路径；找�
     fi
     if [ "${#matches[@]}" -eq 1 ]; then printf '%s' "${matches[0]}"; return 0; fi
     return 1
+}
+
+#------------------------------------------------------------------------------
+# 5.1 组名解析（--group 用）：目录名 / tests 下相对路径 / 用例名（路径）glob
+#     ★ 只做"清单解析"，不做任何判定；是否被排除由调用方按 exclude.list 过滤 ——
+#       同一套 is_excluded 真源，避免"组模式与单例模式判定口径分叉"。
+#------------------------------------------------------------------------------
+group_dir_help() {  # 解析失败时列出可用组名（按 tests 下**实际**目录，不硬编码）
+    (cd "$ARCH_TEST_ROOT" && find tests -mindepth 1 -maxdepth 2 -type d | sort)
+}
+
+resolve_group() {  # resolve_group <组名> → 打印 arch-test 相对路径（逐行、已排序）
+    local arg="$1" f
+    case "$arg" in
+        # ---- 含通配符：先按 basename 匹配（I-a*），再按相对路径匹配（tests/*/I-a*）----
+        *'*'*|*'?'*|*'['*)
+            all_tests | while IFS= read -r f; do
+                case "$(basename "$f")" in $arg) printf '%s\n' "$f"; continue ;; esac
+                case "$f" in $arg) printf '%s\n' "$f" ;; esac
+            done
+            ;;
+        # ---- 纯名字：目录名（I/Zicsr/Sv…）/ tests 下相对路径（rv32i/I）/ 带 tests/ 前缀 ----
+        *)
+            all_tests | while IFS= read -r f; do
+                case "$f" in
+                    tests/"${arg}"/*)   printf '%s\n' "$f" ;;
+                    tests/*/"${arg}"/*) printf '%s\n' "$f" ;;
+                    "${arg}"/*)         printf '%s\n' "$f" ;;
+                esac
+            done
+            ;;
+    esac
 }
 
 #------------------------------------------------------------------------------
@@ -399,7 +467,7 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
     local dut_ok=1
     if [ "$rc_dut" -ne 0 ] || [ "$n_pass_lines" -ne 1 ]; then
         dut_ok=0
-        printf 'RV32_ARCH_TEST: DUT 仿真未通过（rc=%d TB PASS 行数=%s，见 %s）\n' \
+        printf 'RV32_ARCH_TEST: DUT 仿真未通过（rc=%d TB 通过锚点行数=%s，见 %s）\n' \
                "$rc_dut" "$n_pass_lines" "$dut_log"
         grep -E 'TB_ARCH_TEST: FAIL|HTIF 终止|超时|DIAG' "$dut_log" | head -n 12 | sed 's/^/    /'
     fi
@@ -486,6 +554,61 @@ case "$MODE" in
             run_one "$rel" act
         done
         ;;
+    group)
+        # ---- ① 解析组 → 候选清单（空 ⇒ 硬失败，绝不"跑 0 个算过"）----
+        mapfile -t g_all < <(resolve_group "$GROUP")
+        if [ "${#g_all[@]}" -eq 0 ]; then
+            printf 'RV32_ARCH_TEST_GROUP: 组名 %s 未命中任何用例（候选 0）\n' "$GROUP" >&2
+            printf '  可用组名（目录名 / 相对路径；也可直接用用例名 glob，如 I-a*）：\n' >&2
+            group_dir_help | sed 's/^/    /' >&2
+            exit 2
+        fi
+        # ---- ② 逐条按 exclude.list 过滤（被过滤的逐条打印，不静默丢弃）----
+        g_run=()
+        for rel in "${g_all[@]}"; do
+            if exc_reason="$(is_excluded "$rel")"; then
+                printf 'RV32_ARCH_TEST_GROUP: 过滤 %s —— 命中 exclude.list（%s）\n' "$rel" "$exc_reason"
+            else
+                g_run+=("$rel")
+            fi
+        done
+        printf 'RV32_ARCH_TEST_GROUP: 组 %s —— 候选 %d 例，exclude.list 过滤 %d 例，待运行 %d 例\n' \
+               "$GROUP" "${#g_all[@]}" "$(( ${#g_all[@]} - ${#g_run[@]} ))" "${#g_run[@]}"
+        # ---- ③ --limit：只取（过滤后的）前 N 例（冒烟用；截断数量显式可见）----
+        if [ "$OPT_LIMIT" -gt 0 ] && [ "${#g_run[@]}" -gt "$OPT_LIMIT" ]; then
+            printf 'RV32_ARCH_TEST_GROUP: --limit %d ⇒ 只运行前 %d 例（按路径排序，其余 %d 例本次未运行）\n' \
+                   "$OPT_LIMIT" "$OPT_LIMIT" "$(( ${#g_run[@]} - OPT_LIMIT ))"
+            g_run=("${g_run[@]:0:$OPT_LIMIT}")
+        fi
+        if [ "${#g_run[@]}" -eq 0 ]; then
+            printf 'RV32_ARCH_TEST_GROUP: 组 %s 过滤后没有可运行用例（0 pass / 0 fail / 0 skip）\n' "$GROUP"
+            exit 1
+        fi
+        # ---- ④ 逐例调用**同一个** run_one（超时/判据与单例模式完全一致）----
+        g_pass0=$N_PASS; g_fail0=$N_FAIL; g_skip0=$N_SKIP
+        for rel in "${g_run[@]}"; do
+            run_one "$rel" act || true      # 单例失败不中断本组：聚合成组结论后统一判
+        done
+        g_pass=$((N_PASS - g_pass0)); g_fail=$((N_FAIL - g_fail0)); g_skip=$((N_SKIP - g_skip0))
+        # ---- ⑤ 组聚合（必打一行三项计数；全绿才额外打紧凑判语）----
+        printf -- '------------------------------------------------------------------------\n'
+        printf 'GROUP %s: %d pass / %d fail / %d skip\n' "$GROUP" "$g_pass" "$g_fail" "$g_skip"
+        if [ "$g_fail" -eq 0 ] && [ "$g_pass" -gt 0 ]; then
+            printf 'GROUP %s: %d/%d pass\n' "$GROUP" "$g_pass" "$(( g_pass + g_fail ))"
+            g_verdict=0
+        else
+            printf 'GROUP %s: 未通过 —— %d/%d 例成功（fail=%d skip=%d；本组不输出通过判语）\n' \
+                   "$GROUP" "$g_pass" "$(( g_pass + g_fail ))" "$g_fail" "$g_skip"
+            g_verdict=1
+        fi
+        # 组计数自检：三项之和必须等于实际调用例数（不成立 ⇒ fail-closed 判失败）
+        if [ "$(( g_pass + g_fail + g_skip ))" -ne "${#g_run[@]}" ]; then
+            printf 'RV32_ARCH_TEST_GROUP: 组 %s 计数自检不通过（pass+fail+skip=%d ≠ 运行 %d 例）\n' \
+                   "$GROUP" "$(( g_pass + g_fail + g_skip ))" "${#g_run[@]}"
+            g_verdict=1
+        fi
+        printf 'RV32_ARCH_TEST_GROUP_VERDICT: %s rc=%d\n' "$GROUP" "$g_verdict"
+        ;;
 esac
 
 #------------------------------------------------------------------------------
@@ -500,7 +623,9 @@ fi
 if [ "${#PASS_NAMES[@]}" -gt 0 ]; then
     printf 'RV32_ARCH_TEST_SUMMARY: 通过用例 = %s\n' "${PASS_NAMES[*]}"
 fi
-if [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ]; then
+#   ★ 组模式（--group）下还要求组计数自检通过（g_verdict==0），
+#     否则即便"通过数>0 且失败数==0"也不得打印成功文案（fail-closed）。
+if [ "$N_FAIL" -eq 0 ] && [ "$N_PASS" -gt 0 ] && [ "${g_verdict:-0}" -eq 0 ]; then
     printf 'RV32_ARCH_TEST_RUN: PASS (%d/%d)\n' "$N_PASS" "$((N_PASS + N_FAIL))"
     exit 0
 fi

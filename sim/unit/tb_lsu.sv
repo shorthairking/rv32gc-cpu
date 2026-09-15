@@ -272,6 +272,30 @@ module tb_lsu_top;
         end
     endtask
 
+    // 核内 MMIO 分流检查（route/no_axi/clint_plic 三项口径；PA=VA，翻译关闭）
+    task check_route(input [255:0] name, input [31:0] addr,
+                     input [2:0] expect_route, input expect_noaxi, input expect_cp);
+        begin
+            rs1 = addr; ptw_pa = addr; #1;
+            n_checks = n_checks + 1;
+            if (route !== expect_route) begin
+                $display("FAIL[%0s]: route 期望 %0d 实际 %0d（PA=%08x）",
+                         name, expect_route, route, addr);
+                $fatal(1, "TB_LSU FAIL");
+            end
+            if (no_axi !== expect_noaxi) begin
+                $display("FAIL[%0s]: no_axi 期望 %b 实际 %b（PA=%08x）",
+                         name, expect_noaxi, no_axi, addr);
+                $fatal(1, "TB_LSU FAIL");
+            end
+            if (clint_plic !== expect_cp) begin
+                $display("FAIL[%0s]: clint_plic 期望 %b 实际 %b（PA=%08x）",
+                         name, expect_cp, clint_plic, addr);
+                $fatal(1, "TB_LSU FAIL");
+            end
+        end
+    endtask
+
     //==========================================================================
     // 3. 测试主体
     //==========================================================================
@@ -587,6 +611,30 @@ module tb_lsu_top;
         end
         n_checks = n_checks + 2; n_mmio = n_mmio + 1;
 
+        // ---- E-3b..E-3h：PLIC 命中窗口口径锁（2026-09-15 修复；窗口 4 MiB）----------
+        //   背景（缺陷）：旧判定 PA[31:16]==0x1F10 ⇒ 仅 64 KiB，而 PLIC 的
+        //   threshold/claim 区在 PLIC_BASE+0x0020_0000 ⇒ 该区静默落 DDR3 默认通路。
+        //   修复：mmio_route 用**显式区间比较** [PLIC_BASE, PLIC_BASE+PLIC_SIZE)
+        //         = [0x1F10_0000, 0x1F50_0000)（真源 core_params.vh §2 的 PLIC_SIZE）。
+        //   本组同时锁住三件事：窗口内可达 / 上界为**开**区间 / 平台窗口不被吞
+        //   （后者即"禁止 mask=16'hFF00 类高位掩码近似"的口径锁）。
+        check_route("E3b-plic-threshold-ctx0",  32'h1F30_0000, ROUTE_PLIC, 1'b1, 1'b1);
+        n_mmio = n_mmio + 1;
+        check_route("E3c-plic-claim-ctx0",      32'h1F30_0004, ROUTE_PLIC, 1'b1, 1'b1);
+        n_mmio = n_mmio + 1;
+        check_route("E3d-plic-threshold-ctx1",  32'h1F30_1000, ROUTE_PLIC, 1'b1, 1'b1);
+        n_mmio = n_mmio + 1;
+        // 上界 0x1F50_0000 = PLIC_BASE + PLIC_SIZE **不属** PLIC（开区间；落 AXI 默认通路）
+        check_route("E3e-plic-upper-bound",     32'h1F50_0000, ROUTE_AXI, 1'b0, 1'b0);
+        n_mmio = n_mmio + 1;
+        // 窗口放宽**不得**吞平台窗口：confreg_sim 1FAF / confreg_syn 1FD0 / MAC 1FF0
+        check_route("E3f-confreg-sim",          32'h1FAF_0000, ROUTE_AXI, 1'b0, 1'b0);
+        n_mmio = n_mmio + 1;
+        check_route("E3g-confreg-syn",          32'h1FD0_0000, ROUTE_AXI, 1'b0, 1'b0);
+        n_mmio = n_mmio + 1;
+        check_route("E3h-mac-not-plic",         32'h1FF0_0000, ROUTE_AXI, 1'b0, 1'b0);
+        n_mmio = n_mmio + 1;
+
         // E-4：XIP 主窗口 0x1C00_0000 ⇒ 直连（uncached），**不是**核内寄存器
         rs1 = 32'h1C00_0000; ptw_pa = 32'h1C00_0000; #1;
         if (route !== ROUTE_XIP || xip_direct !== 1'b1) begin
@@ -633,7 +681,7 @@ module tb_lsu_top;
             $fatal(1, "TB_LSU FAIL");
         end
         n_checks = n_checks + 1; n_mmio = n_mmio + 1;
-        $display("  [MMIO]   8 例通过（CLINT/PLIC 绝不发 AXI；XIP 直连；DDR3 可缓存）");
+        $display("  [MMIO]   15 例通过（CLINT/PLIC 绝不发 AXI；PLIC 窗口 4 MiB 含 threshold/claim；XIP 直连；DDR3 可缓存）");
 
         //======================================================================
         // 组 F：拆笔接口（判据 ④ 的隐含要求：非对齐先于 PMP 的拆笔产物）
