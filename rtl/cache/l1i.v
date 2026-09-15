@@ -17,9 +17,15 @@
 //
 // 时序结构（BRAM 只能同步读的必然结果，见 08 §7.3）：
 //   - Tag 与 Data 均为同步读（读延迟 1 拍）。
-//   - 访问拍 S0：cs_req 有效 ⇒ 两阵列同时以索引寻址。
-//   - S0 末：tag 读数据与 data 读数据**同拍**有效 ⇒ 当拍完成比较、命中判定，
-//     cs_ready 于 S0 末拉高、cs_rdata 当拍有效 ⇒ **命中路径 1 拍**。
+//   - 访问拍 S0：cs_req 有效 ⇒ 两阵列同时以索引寻址；S0 末把**本笔请求**
+//     打拍锁存（acc_q / va_tag_q / va_index_q / cs_paddr_q，见 §4.1）。
+//   - S0 末：tag 读数据与 data 读数据同拍有效 ⇒ 用**锁存的请求字段**比对，
+//     当拍给出 cs_ready/cs_miss/cs_rdata ⇒ **命中路径 1 拍**（与旧实现逐拍等价）。
+//   - ★ 组合环口径（2026-09-15 修复，验收判据③）：输出只允许由「寄存的阵列读
+//     数据 + 寄存的请求字段」决定，**不得**再用当前输入的 cs_req 做组合限定；
+//     否则 cs_req → access → cs_ready → 上游 fetch_rsp_valid → fetch_req_valid
+//     → cs_req 构成零延迟组合环（Verilator UNOPTFLAT：
+//     core_top.fu_fetch_req_valid；iverilog 亦判环 ⇒ M1 实测全网 x）。
 //   - 缺失：S0 末置 miss；驱动填充请求；填充期间 cs_ready=0；
 //     每个回填 beat 按 fill_word_idx 写入目标路，最后一拍落 tag+valid。
 //
@@ -120,6 +126,19 @@ module l1i #(
     reg [SETS-1:0]   plru_q;         // 伪 LRU：1 ⇒ way1 为 LRU，0 ⇒ way0 为 LRU
 
     //--------------------------------------------------------------------------
+    // 4.1 ★ 访问流水寄存器（组合环修复：请求接受打拍 + 数据/命中由寄存器决定）
+    //     语义：acc_q 恒等于"上一拍那笔请求是否为本 Cache 访问"（= 旧式组合
+    //     `access` 延迟 1 拍）；va_*_q 与 cs_paddr_q 是**同一次阵列读**所对应的
+    //     请求字段（都在同一个时钟沿锁存）。因此用它们做命中比较/数据选择/
+    //     行基址生成，与旧实现逐拍等价，但彻底切断了输出对 cs_req 的组合依赖。
+    //--------------------------------------------------------------------------
+    reg              acc_q;          // 上一拍接受的访问（组合环的断点）
+    reg [TAG_W-1:0]  va_tag_q;       // 该笔访问的 VA tag（命中比较用）
+    reg [INDEX_BITS-1:0] va_index_q; // 该笔访问的组索引（伪 LRU 更新用）
+    reg [31:0]       cs_paddr_q;     // 该笔访问的物理地址（填充行基址来源）
+    reg              fill_done_q;    // ★ 填充收尾拍：阵列同址被写 ⇒ 读数据需再取一拍
+
+    //--------------------------------------------------------------------------
     // 5. Tag 阵列（每路）与数据阵列（每路）
     //--------------------------------------------------------------------------
     wire [TAG_W-1:0] tag_rdata [0:WAYS-1];
@@ -179,36 +198,49 @@ module l1i #(
     endgenerate
 
     //--------------------------------------------------------------------------
-    // 6. 命中判定（tag 读数据与访问拍解码同拍出现 ⇒ 当拍比较；1 拍命中）
+    // 6. 命中判定（tag 读数据与**锁存请求字段**同拍对应 ⇒ 当拍比较；1 拍命中）
+    //    tag_rdata/tag_vld 是上一拍索引寻址读出的寄存器值，va_tag_q 是同一拍
+    //    锁存的请求 tag ⇒ 两者严格同龄；不使用当前输入的 cs_vaddr/cs_req。
     //--------------------------------------------------------------------------
-    wire hit0 = tag_vld[0] & (tag_rdata[0] == va_tag);
-    wire hit1 = tag_vld[1] & (tag_rdata[1] == va_tag);
-    wire any_hit = hit0 | hit1;
+    wire hit0_q = tag_vld[0] & (tag_rdata[0] == va_tag_q);
+    wire hit1_q = tag_vld[1] & (tag_rdata[1] == va_tag_q);
+    wire any_hit_q = hit0_q | hit1_q;
 
     //--------------------------------------------------------------------------
     // 7. 替换选择：伪 LRU（1 bit/组）
+    //    取**本笔完成访问的组索引**（va_index_q）：命中更新与填充选路必须
+    //    针对同一笔访问，避免请求已改址时选错组。
     //--------------------------------------------------------------------------
-    wire lru_is_way1  = plru_q[va_index];      // 1 ⇒ way1 优先被替换
+    wire lru_is_way1  = plru_q[va_index_q];    // 1 ⇒ way1 优先被替换
     wire fill_way_sel = lru_is_way1;
 
     //--------------------------------------------------------------------------
-    // 8. 输出（组合，全部 assign）
+    // 8. 输出（全部由寄存器决定：阵列读数据 + 请求锁存字段；无 cs_req 组合依赖）
     //--------------------------------------------------------------------------
-    wire [31:0] hit_data = hit1 ? data_rdata[1] : data_rdata[0];
+    wire [31:0] hit_data = hit1_q ? data_rdata[1] : data_rdata[0];
 
-    // 一笔"新缺失"：本拍有访问、未命中、且当前无在途填充
+    // 本拍输出的资格：① 上一拍确实接受了一笔 Cache 访问（acc_q）
+    //              ② 该笔访问的阵列输出**未被同拍写入污染**（~fill_done_q，见下）
+    // ★ fill_done_q 口径：填充最后一拍在"落 tag/valid"的同时也做了一次阵列读，
+    //   但行为模型（与 BRAM 同址同拍先读后写一致）给出的是**写前**旧值 ⇒ 下一拍
+    //   若直接用该读值判定，会对刚填好的行误报 miss 并**重复发起一笔填充**。
+    //   故收尾拍的下一拍只压制判定一拍，让阵列把同一地址再读一次（请求仍持有，
+    //   rd_en=access 自然再读），此后即正常命中。TB 的空闲拍访问不受影响。
+    wire eval_q = acc_q & ~fill_done_q;
+
+    // 一笔"新缺失"：上一拍有访问、未命中、且当前无在途填充
     // ★ 只有在没有在途填充时才可能发起新填充；在途期间不得重复发起
     //   （否则 fill_req 会在收尾拍抖动，造成上游重复记账）。
-    wire new_miss = access & ~any_hit & ~fill_active_q;
+    wire new_miss = eval_q & ~any_hit_q & ~fill_active_q;
 
     assign idle      = ~miss_q & ~fill_active_q;
-    assign cs_miss   = access & (miss_q | ~any_hit);
-    assign cs_ready  = access & ~miss_q & ~fill_active_q & any_hit;
+    assign cs_miss   = eval_q & (miss_q | ~any_hit_q);
+    assign cs_ready  = eval_q & ~miss_q & ~fill_active_q & any_hit_q;
     assign cs_rdata  = hit_data;
 
     // 填充请求：新缺失且未被接受 ⇒ 保持拉高直到被接受（valid&&ready 握手）
     assign fill_req   = new_miss & ~fill_taken_q;
-    assign fill_paddr = {cs_paddr[31:OFF_BITS], {OFF_BITS{1'b0}}};
+    assign fill_paddr = {cs_paddr_q[31:OFF_BITS], {OFF_BITS{1'b0}}};
     assign fill_owner = OWNER_I_FILL;
     assign fill_beats = WORDS[4:0] - 5'd1;     // 8 beat ⇒ 7
 
@@ -228,16 +260,34 @@ module l1i #(
             fill_line_q   <= 32'h0;
             fill_way_q    <= 1'b0;
             plru_q        <= {SETS{1'b0}};
+            acc_q         <= 1'b0;
+            va_tag_q      <= {TAG_W{1'b0}};
+            va_index_q    <= {INDEX_BITS{1'b0}};
+            cs_paddr_q    <= 32'h0;
+            fill_done_q   <= 1'b0;
         end else if (inval_all) begin
-            // 整体失效（fence.i / cbo.inval）
+            // 整体失效（fence.i / cbo.inval）：同时丢弃在途访问的判定资格
+            //   （失效写口刚改过阵列 ⇒ 本拍读数据不再可信，下一拍再重读）
             miss_q        <= 1'b0;
             fill_active_q <= 1'b0;
             fill_taken_q  <= 1'b0;
             plru_q        <= {SETS{1'b0}};
+            acc_q         <= 1'b0;
+            fill_done_q   <= 1'b1;
         end else begin
+            // ---- ★ 请求接受打拍：把本拍被接受的请求（连同其地址字段）锁存 ----
+            //   下次判定/选路只用这组寄存器值（阵列读数据与它们同沿产生）。
+            acc_q      <= access;
+            va_tag_q   <= va_tag;
+            va_index_q <= va_index;
+            cs_paddr_q <= cs_paddr;
+
+            // ---- 填充收尾脉冲（默认清零 ⇒ 只维持一拍）----
+            fill_done_q <= 1'b0;
+
             // ---- 伪 LRU：命中时保护命中路（另一位成为 LRU） ----
-            if (access & any_hit) begin
-                plru_q[va_index] <= ~hit1;     // 命中 way1 ⇒ LRU=way0
+            if (eval_q & any_hit_q) begin
+                plru_q[va_index_q] <= ~hit1_q;    // 命中 way1 ⇒ LRU=way0
             end
 
             // ---- 填充握手：接受后转入"在途填充" ----
@@ -250,14 +300,17 @@ module l1i #(
             end
 
             // ---- 在途填充推进：最后一 beat 到齐 ⇒ 释放 ----
+            //   同拍落 tag/valid（写口）⇒ 触发 fill_done_q 压制下一拍判定，
+            //   让阵列重读一次（消除"刚填完却报 miss ⇒ 重复填充"）。
             if (fill_active_q & fill_valid & fill_done) begin
                 fill_active_q <= 1'b0;
                 fill_taken_q  <= 1'b0;
                 miss_q        <= 1'b0;
+                fill_done_q   <= 1'b1;
             end
 
             // ---- 命中 ⇒ 清 miss ----
-            if (access & any_hit & ~miss_q) begin
+            if (eval_q & any_hit_q & ~miss_q) begin
                 miss_q <= 1'b0;
             end
         end

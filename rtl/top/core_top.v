@@ -36,8 +36,11 @@
 //       ★ 08 §5.3 的「冲刷 D/M/W 中已取指令」按**指令年龄**理解：M/W 持的是
 //         比分支更**老**的指令（分支自身的链接写回就在其中），冲刷它们会丢提交。
 //         本实现严格保证"分支之后（更年轻）的已取指令全部作废"。
-//   (c) **load-use 停顿 1 拍**：load 数据在 M 级末才可用；紧随其后要用该 rd 的
-//       E 级指令停顿 1 拍，由 exe_ctrl 的 W 旁路供给（不造组合提前转发路径）。
+//   (c) **load-use 停顿**：M 级的 load/AMO/LR/SC 结果要到访存**完成拍**才可用
+//       （L1D/MMIO 均为"发请求拍 + 结果下一拍"的两拍口径）；紧随其后要用该 rd
+//       的 E 级指令保持停顿，完成拍由 exe_ctrl 的 **M 旁路**取回 load 数据并随
+//       em_go 锁存进 E→M 寄存器（不造组合提前转发路径）。停顿判据含"访存已完成"
+//       的锁存态 ⇒ 完成即解除、**无自保持死锁**（见 §12 load_use_stall 注释）。
 //   (d) **W 级统一异常入口**：所有同步异常随指令携带异常标记进入 W，
 //       由 trap_ctrl 唯一入口写 *epc/*cause/*tval；core_top 不在别处写陷阱 CSR。
 //   (e) **中断取点**：trap_ctrl 内部已用 `commit_valid` 限定"指令边界之后"（T6）；
@@ -46,6 +49,13 @@
 //       副作用并清掉 M/E/D 槽位 —— 见 `kill_young`。
 //   (g) **中断与异常的提交差异**：同步异常 ⇒ W 的该指令**不提交**；
 //       中断 ⇒ 在提交边界之后取，W 的该指令**照常提交**（只清更年轻的）。
+//   (h) **EM 访存单次启动**：任一 EM 槽的访存指令只启动一次（`m_issued_q` 记账：
+//       启动置位，em_go/kill 清 0）。完成脉冲 `m_done_q` 只维持一拍，**不能**
+//       用作启动判据（完成拍若 pipe_adv=0，下一拍会重复启动同一笔访问）。
+//   (i) **M 级访存"已完成"锁存口径**：`m_mem_done = ~m_is_mem | m_done_q |
+//       (m_issued_q & FSM 空闲)`，是 load-use 解除、M→W 放行、M 级旁路有效的
+//       唯一判据；在途期间 m_issued_q 已置位但 FSM 非空闲 ⇒ **不算**完成
+//       （否则会用陈旧 m_rd_data_q 提前提交/旁路）。
 //
 //------------------------------------------------------------------------------
 // 三、已知遗留（如实登记，不静默跳过）
@@ -266,7 +276,6 @@ module core_top (
     wire        e_stall;
     wire        m_busy;
     wire        m_mem_pending;
-    wire        m_done_q_ok;
     wire        pipe_adv;
     wire        load_use_stall;
     wire        m_kill_fsm;
@@ -1154,7 +1163,11 @@ module core_top (
     reg  [31:0] m_rd_data_q;         // L1D/MMIO/AXI 读回数据
     reg  [31:0] m_amo_wdata_q;       // AMO 写相数据（在 cs_ready 拍锁存）
     reg         m_sc_ok_q;           // SC 成功标志（同上）
-    reg         m_done_q;            // 本笔访存完成（单拍）
+    reg         m_done_q;            // 本笔访存完成（单拍脉冲）
+    reg         m_issued_q;          // ★ 本 EM 访存指令已启动（单次启动记账；
+                                     //   置位：FSM 在本笔指令上启动/直接完成；
+                                     //   清零：EM 槽位更换（em_go）/ 同步让路
+                                     //   （m_kill_fsm）。与 m_done_q 的关系见 §9.2）
     reg         m_mmio_clint_q, m_mmio_plic_q, m_mmio_we_q;
     reg  [31:0] m_mmio_pa_q, m_mmio_off_q, m_mmio_wdata_q;
     reg  [3:0]  m_mmio_strb_q;
@@ -1175,8 +1188,28 @@ module core_top (
                             (em_mem_op == MEM_SC) | (em_mem_op == MEM_CBO) ? 2'b10 : 2'b01;
     wire [31:0] m_pa_eff = m_pa_q + (m_hi_q ? 32'd4 : 32'd0);   // ★ 物理地址唯一赋值点派生
 
-    // M 级忙：FSM 在途 或 手上有未启动的访存
-    assign m_mem_pending = em_valid & m_is_mem & ~m_done_q;
+    // -------------------------------------------------------------------------
+    // ★ 本笔 M 级访存"已完成"口径（load-use 互锁 / 单次启动 / M→W 放行 / M 旁路
+    //   有效性的唯一判据）
+    //   m_mem_done 语义 = 「EM 槽这条指令若为访存，其访存已完成（数据已可交回）」
+    //     · 非访存指令 ⇒ 恒 1（无访存可等）
+    //     · m_done_q             ⇒ 完成脉冲那一拍（数据当拍在 m_rd_data_q）
+    //     · m_issued_q & FSM 空闲 ⇒ 完成态的**锁存**：m_done_q 只维持一拍；
+    //                              若那一拍 pipe_adv=0（E 级 MDU/FPU 多拍停顿），
+    //                              EM 槽仍持有这条已完成的访存指令且数据仍有效
+    //                              ⇒ 必须按"已完成"对待，否则 load_use_stall 会
+    //                              自保持（死锁）且 FSM 会重复启动（M1 的 UART sb
+    //                              会发两次 AW）。
+    //   ★ 必须带 `m_state_q == M_S_IDLE`：在途期间 m_issued_q 也=1 但**数据尚未
+    //     回来**，此时绝不能算完成（否则 W 槽会用陈旧 m_rd_data_q 提前提交、M 旁路
+    //     会转发陈旧值）。正确性依据：FSM 只在完成/异常直接完成时回 IDLE；
+    //     kill 路径同时清 m_issued_q。
+    // -------------------------------------------------------------------------
+    wire m_mem_done = (~m_is_mem) | m_done_q |
+                      (m_issued_q & (m_state_q == M_S_IDLE));
+
+    // M 级忙：FSM 在途 或 手上有**尚未启动**的访存
+    assign m_mem_pending = em_valid & m_is_mem & ~m_mem_done;
     assign m_busy = (m_state_q != M_S_IDLE) | m_mem_pending;
     assign pipe_adv = e_done & ~m_busy & ~load_use_stall;
 
@@ -2002,7 +2035,7 @@ module core_top (
     wire [4:0]  mw_n_exccause = m_exc_cause_sel;
     wire [31:0] mw_n_exctval  = m_exc_tval_sel;
 
-    assign mw_go  = em_valid & (~m_is_mem | m_done_q);
+    assign mw_go  = em_valid & m_mem_done;      // ★ 访存完成（含锁存态）才放行
     assign mw_cap = (mw_go | kill_young) & ~bru_redirect;
 
     // ---- 12.4 M 级的读回/写回数据与旁路 ----
@@ -2015,10 +2048,16 @@ module core_top (
                                 em_result;
     assign m_rd   = em_rd;
     assign m_rf_we= em_valid & (em_wb_sel != WB_NONE) & (em_rd != 5'd0) &
-                    ~m_exc_any & m_done_q_ok;
+                    ~m_exc_any & m_mem_done;    // ★ 只用"访存已完成"的锁存态
 
-    // load-use 停顿 1 拍：M 级是对 GPR 的 load/AMO/LR/SC，且 E 级要用该 rd
-    //   ⇒ 本拍不推进（前端冻结），下一拍 load 已进入 W，由 exe_ctrl 的 W 旁路供给。
+    // load-use 停顿：M 级是对 GPR 的 load/AMO/LR/SC **且其结果尚未可用**，
+    //   而紧随其后的 E 级指令要用该 rd ⇒ 本拍不推进（F/D/E 冻结）。
+    //   ★ 完成即解除（~m_mem_done，而非仅 ~m_done_q）：
+    //     · m_done_q 只维持一拍；若那一拍恰因 E 级多拍（MDU/FPU）而 pipe_adv=0，
+    //       下一拍 m_done_q 已清零 ⇒ 若不加锁存态，本条件自保持 ⇒ **死锁**
+    //       （EM 永远不换人、访存 FSM 还会重复启动）。
+    //     · 解除当拍 m_rf_we=1、m_wdata=m_rd_data_q ⇒ E 级经 M 旁路取到 load 数据，
+    //       随 em_go 锁存进 em_rs1_val/em_store_data（不造组合提前转发路径）。
     wire m_is_load_kind = (em_mem_op == MEM_LOAD) | (em_mem_op == MEM_AMO) |
                           (em_mem_op == MEM_LR)   | (em_mem_op == MEM_SC);
     wire e_use_rs1 = (de_rs1 != 5'd0) & (~de_ill);
@@ -2028,10 +2067,9 @@ module core_top (
                       (de_mem_op == MEM_SC) | (de_mem_op == MEM_FSTORE) |
                       (de_op_type == OPT_BRU) | (de_op_type == OPT_JALR));
     assign load_use_stall = em_valid & m_is_load_kind & (em_rd != 5'd0) &
+                          ~m_mem_done &
                           ((e_use_rs1 & (de_rs1 == em_rd)) |
                            (e_use_rs2 & (de_rs2 == em_rd)));
-
-    assign m_done_q_ok = (~m_is_mem) | m_done_q;
 
     //==========================================================================
     // 13. 主时序块（流水寄存器 / GPR / FP-CSR / mstatus.FS / 计数 / M 级 FSM）
@@ -2104,6 +2142,7 @@ module core_top (
             m_exc_q <= 1'b0; m_exc_cause_q <= 5'd0; m_exc_tval_q <= 32'h0;
             m_rd_data_q <= 32'h0; m_amo_wdata_q <= 32'h0; m_sc_ok_q <= 1'b0;
             m_done_q <= 1'b0;
+            m_issued_q <= 1'b0;
             m_mmio_clint_q <= 1'b0; m_mmio_plic_q <= 1'b0; m_mmio_we_q <= 1'b0;
             m_mmio_pa_q <= 32'h0; m_mmio_off_q <= 32'h0; m_mmio_wdata_q <= 32'h0;
             m_mmio_strb_q <= 4'h0;
@@ -2352,13 +2391,17 @@ module core_top (
                         m_amo_phase_q  <= 1'b0;
                         m_exc_q        <= 1'b0;
                         m_page_fault_q <= 1'b0;
-                        // ★ M1 新发现缺陷（D6）：`~m_done_q` 门控 —— 本笔访存
-                        //   完成的**下一拍** EM 槽仍持有该指令（完成拍 m_busy=1
-                        //   ⇒ pipe_adv=0，EM 没换人），若此处不带 ~m_done_q，
-                        //   FSM 会对**同一条已完成的访存指令**再走一遍
-                        //   IDLE→ISS→AXI：M1 实测 UART 的 sb 被发两次 AW（每次
-                        //   多写一个字符，逐字符回显判据必挂）。
-                        if (em_valid & m_is_mem & ~em_exc_valid & ~m_done_q) begin
+                        // ★ 单次启动口径（修复 D6 的 `~m_done_q` 补丁）：
+                        //   本 EM 访存指令**每笔只启动一次** —— 判据用
+                        //   `~m_issued_q`（本 EM 槽这条指令是否已启动）而不是
+                        //   `~m_done_q`（完成脉冲只维持一拍）。
+                        //   反例（M1 实测 + 本任务验收④）：访存完成拍 pipe_adv=0
+                        //   （E 级 MDU/FPU 多拍停顿）⇒ 下一拍 EM 槽仍持有同一条
+                        //   已完成的访存指令、而 m_done_q 已清零。若只看 ~m_done_q，
+                        //   FSM 会对同一条指令再走一遍 IDLE→ISS→AXI：store 重复发
+                        //   AW（UART 同一字符写两遍）、AMO 重复读改写（副作用翻倍）。
+                        if (em_valid & m_is_mem & ~em_exc_valid & ~m_issued_q) begin
+                            m_issued_q <= 1'b1;
                             if (m_need_tr & tlb_perm_fault) begin
                                 m_pa_q         <= 32'h0;
                                 m_page_fault_q <= 1'b1;
@@ -2372,8 +2415,10 @@ module core_top (
                                 m_pa_q    <= m_need_tr ? tlb_pa : m_va;
                                 m_state_q <= M_S_ISS;
                             end
-                        end else if (em_valid & m_is_mem & em_exc_valid) begin
+                        end else if (em_valid & m_is_mem & em_exc_valid & ~m_issued_q) begin
                             // 取指/译码异常随指令携带 ⇒ 不做访存，直接完成
+                            //   （同样只走一次：异常完成也不需要存储器访问）
+                            m_issued_q    <= 1'b1;
                             m_exc_q       <= 1'b1;
                             m_exc_cause_q <= em_exc_cause;
                             m_exc_tval_q  <= em_exc_tval;
@@ -2546,6 +2591,12 @@ module core_top (
                     default: m_state_q <= M_S_IDLE;
                 endcase
             end
+
+            // ---- ★ 单次启动记账清零：EM 槽位更换（em_go）或同步让路（m_kill_fsm）----
+            //   必须放在 FSM 之后（同一 always 块内最后赋值生效）：进入 M 级的新
+            //   指令一律从"未启动"开始；被 kill 的指令作废，其记账也必须清零
+            //   （否则该槽位再也启动不了访存）。与 m_done_q 同为脉冲语义。
+            if (m_kill_fsm | em_go) m_issued_q <= 1'b0;
         end
     end
 
