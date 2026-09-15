@@ -56,6 +56,23 @@
 //       (m_issued_q & FSM 空闲)`，是 load-use 解除、M→W 放行、M 级旁路有效的
 //       唯一判据；在途期间 m_issued_q 已置位但 FSM 非空闲 ⇒ **不算**完成
 //       （否则会用陈旧 m_rd_data_q 提前提交/旁路）。
+//   (j) **冲刷口径（2026-09-15 修复"陷阱/fence.i 冲刷洞"）**：`kill_young`
+//       （= trap_valid | fencei_busy）拍必须**同时**做到三件事，否则比陷阱指令/
+//       fence.i **更年轻**的已取指令会漏进 W 并提交（实测：ebreak 拍 E 槽指令在
+//       下一拍进 M、再下一拍提交；fence.i 拍 M 槽指令在窗口内提交一次、窗口后
+//       重取又提交一次）：
+//         ① §13(4) EM 槽：kill_young 拍清 `em_valid`（E 槽的更年轻指令不得进 M）；
+//         ② §12.3 `mw_cap`：kill_young 拍关闭 M→W 放行（M 槽的更年轻指令不得进 W）；
+//         ③ fence.i 的**同步启动拍**（W 槽是即将开始扫描的 fence.i）也要关闭 M→W 放行
+//            —— 那一拍 kill_young 尚未拉高（窗口从下一拍起），漏的正是 fence.i+4。
+//       ★ `~bru_redirect` **不属于**冲刷口径：分支在 E 解析时，M/W 槽持的是比分支
+//         **更老**的指令（见 (b)），必须照常提交；旧式 `mw_cap` 把它一并丢掉，会
+//         造成"紧邻取即重定向指令之前那条指令的提交/写回丢失"（本任务一并修复）。
+//       ★ 在途记账：被冲刷指令**刚进 M 槽**（trap 拍：M 槽在上一拍还是陷阱指令；
+//         fence.i 拍：M 槽同上），正常路径下尚未发起任何访存（`m_l1d_go`/
+//         `m_axi_want` 均被 `m_kill_fsm` 门控）；若确已在途，kill 路径把 FSM 强制
+//         回 IDLE 并清 `m_issued_q`（放弃结果），事务本身由 axi_master_ctrl 的
+//         "单笔在途三件套"自行收尾（§11.6 的 done owner 记账不受影响）。
 //
 //------------------------------------------------------------------------------
 // 三、已知遗留（如实登记，不静默跳过）
@@ -990,6 +1007,10 @@ module core_top (
     );
 
     // ---- 7.5 FPU + fregfile ----
+    //   ★ fregfile 写使能必须与 `mw_valid` 相与（2026-09-15 修复）：`mw_fp_we` 是
+    //     随流水携带的**电平**载荷，W 槽被清空/冻结（mw_valid=0）期间仍保持上一拍
+    //     的值 ⇒ 不加门控会在停顿拍重复写同一 FD 项（幂等但脏，且与"提交即一次"
+    //     口径不一致）。W 级 ABI 副作用一律以 `mw_valid` 为总门控。
     wire [63:0] freg_rdata1, freg_rdata2, freg_rdata3;
     wire [6:0]  e_fp_op = fp_op_map(de_fp_op, de_insn32);
     // a 端口是整数操作数：fmv.w.x/fmv.d.x(15) 与 fcvt.{s,d}.{w,wu}(18/19/22/23)
@@ -1037,7 +1058,7 @@ module core_top (
     .rdata1 (freg_rdata1),
     .rdata2 (freg_rdata2),
     .rdata3 (freg_rdata3),
-    .we     (mw_fp_we),
+    .we     (mw_fp_we & mw_valid),
     .rd     (mw_fp_rd),
     .wdata  (mw_fp_wdata)
     );
@@ -1646,7 +1667,13 @@ module core_top (
     .commit_pc     (mw_pc),
     .commit_pc_next(mw_pc_next),
     .commit_insn   (mw_insn_raw),
-    .exc_valid     (mw_exc_valid),
+    //   ★ 异常标记必须与 `mw_valid` 相与（2026-09-15 修复）：`mw_exc_valid` 是随流水
+    //     携带的**电平**载荷，W 槽被清空（mw_valid=0）后仍会保持上一拍的值 ⇒ 若直接把
+    //     裸信号送进 trap_ctrl（`trap_valid = exc_valid | any_irq_v`），会**逐拍重复取
+    //     同一次陷阱**（本任务实测：陷阱后 mw_valid 被清 0，trap_valid 却持续有效 ⇒
+    //     PC 反复回 mtvec、程序卡死；旧实现因"更年轻指令漏进 W 槽"凑巧遮住了该缺陷）。
+    //     W 级 ABI 副作用一律以 `mw_valid` 为总门控（与 commit/csr/w_rf_we 同口径）。
+    .exc_valid     (mw_valid & mw_exc_valid),
     .exc_cause     (mw_exc_cause),
     .exc_tval      (mw_exc_tval),
     .exc_is_fetch  (mw_exc_is_fetch),
@@ -1700,7 +1727,9 @@ module core_top (
     //     状态位，会在"done 已到、M FSM 尚未离开 M_S_AXI"的那一拍**重复发起同一笔
     //     MDTA 事务**（M1 实测：UART 的 sb 连发两次 AW ⇒ 同一字符写两遍）。
     //     故 want 必须排除 done 拍（M_S_AXI 收到 done 当拍就完成并转 IDLE）。
-    wire m_axi_want   = (m_state_q == M_S_AXI) & ~axi_done_q;
+    //   ★ 冲刷拍（m_kill_fsm=kill_young）同样必须排除：该拍 M 槽指令已被判定作废，
+    //     不得再为它发起新的 MDTA 请求（在途记账兜底，见文件头 §2j）。
+    wire m_axi_want   = (m_state_q == M_S_AXI) & ~axi_done_q & ~m_kill_fsm;
     wire axi_free     = (axi_owner_q == AXO_NONE) & ~axi_busy;
     wire grant_wrbk   = axi_free &  l1d_wb_req;
     wire grant_dfil   = axi_free & ~l1d_wb_req &  l1d_fill_req;
@@ -2036,7 +2065,22 @@ module core_top (
     wire [31:0] mw_n_exctval  = m_exc_tval_sel;
 
     assign mw_go  = em_valid & m_mem_done;      // ★ 访存完成（含锁存态）才放行
-    assign mw_cap = (mw_go | kill_young) & ~bru_redirect;
+
+    // ---- 12.3.1 ★ 冲刷门控（2026-09-15 修复"陷阱/fence.i 冲刷洞"）----
+    //   `fencei_sync_pending` = 本拍 W 槽正是**即将启动同步**的 fence.i：
+    //   条件与 §13(9) 的"启动全阵列失效扫描"逐字一致（唯一定义处，两处共用）。
+    //   为什么不能只靠 kill_young：kill_young（= fencei_busy）从**下一拍**才拉高，
+    //   而 M 槽的那条 fence.i+4 恰在本拍被放行 ⇒ 会在窗口内提交一次、窗口后重取
+    //   再提交一次（实测：fence.i+4 提交 2 次）。
+    wire fencei_sync_pending =
+        mw_valid & mw_fence_i & ~mw_exc_valid & ~trap_exc & ~fencei_busy;
+
+    // M→W 放行：M 槽指令已完成，且本拍**不是**冲刷拍（kill_young）也不是
+    // fence.i 同步启动拍 —— 这两种情况下 M 槽持的都是"比陷阱指令/fence.i 更年轻"
+    // 的指令，绝不允许进入 W（否则下一拍被提交：instret/CSR/FP 副作用越界）。
+    //   ★ 不再含 `~bru_redirect`：分支在 E 解析时 M 槽持**更老**指令，必须照常提交
+    //     （见文件头 §2b/§2j；旧式把更老提交一并丢掉）。
+    assign mw_cap = mw_go & ~kill_young & ~fencei_sync_pending;
 
     // ---- 12.4 M 级的读回/写回数据与旁路 ----
     assign m_wdata =
@@ -2245,7 +2289,15 @@ module core_top (
                              ((mw_valid & ~trap_exc) ? 64'd1 : 64'd0);
 
             // ================= (4) EM（E→M）=================
-            if (em_go) begin
+            //   ★ 冲刷优先（2026-09-15 修复）：kill_young（陷阱拍 / fence.i 同步窗口）
+            //     必须清空 EM 槽 —— 此时 E 槽持有的是比陷阱指令/fence.i **更年轻**的
+            //     指令，若照常 `em_go` 锁存，它会在下一拍成为 M 槽指令：
+            //       · 再下一拍经 M→W 放行被提交（W 级越界提交）；
+            //       · 若它是访存指令，M FSM 还会**重新启动**这笔访问（副作用翻倍）。
+            //     与 FD/DE 的 `kill_young ⇒ valid<=0` 口径一致（见文件头 §2j ①）。
+            if (kill_young) begin
+                em_valid <= 1'b0;
+            end else if (em_go) begin
                 em_valid        <= em_n_valid;
                 em_pc           <= de_pc;
                 em_pc_next      <= em_n_pcnext;
@@ -2286,16 +2338,19 @@ module core_top (
             //   ★ **提交即一次**（2026-09-15 修复）：W 是"提交即完成"的单拍槽位
             //     （08 §5.6①：W 级**无背压**），因此 `mw_valid` 只允许在
             //     **本拍确实换人**时为 1，其余拍一律清 0：
-            //         换人 ⟺ mw_cap（M 槽指令已完成/让路，且非分支重定向拍）
+            //         换人 ⟺ mw_cap（M 槽指令已完成 ∧ 非冲刷拍 ∧ 非 fence.i 同步启动拍）
             //               ∧ mw_n_valid（M 槽确有指令）
             //               ∧ pipe_adv（流水本拍推进）
             //     否则同一指令会滞留在 W 槽并**逐拍重复提交**（instret 多计、CSR/FP
             //     副作用重复；trap/fence.i 拍还会重复进入陷阱）。
             //     · 实测触发场景：E 级 MDU/FPU 多拍停顿（pipe_adv=0）而 M 槽指令已完成
             //       ⇒ 旧代码每拍都把同一条指令重新写进 W。
-            //     · pipe_adv=1 但 mw_cap=0（M 槽空 / 访存在途 / 分支重定向拍）同样清 0。
-            //     · trap/fence.i 拍（kill_young）仍走 mw_cap 分支 —— 与本节原注释
-            //       "trap/fence.i 拍必须写（把 mw_valid 清 0）" 的意图一致。
+            //     · pipe_adv=1 但 mw_cap=0（M 槽空 / 访存在途 / **冲刷拍** /
+            //       **分支重定向拍不再清 0**）同样清 0。
+            //     · 冲刷拍（kill_young / fencei_sync_pending）走 else 分支 ⇒ 把 mw_valid
+            //       清 0：比陷阱指令/fence.i 更年轻的 M 槽指令一律不提交（见 §2j ②③）。
+            //     · 注意：**分支重定向拍（bru_redirect）不在冲刷集合内** —— M/W 槽持的
+            //       是比分支更老的指令（§2b），必须照常提交；`mw_cap` 里已无该项。
             if (mw_cap) begin
                 mw_valid        <= mw_n_valid & pipe_adv;
                 mw_pc           <= em_pc;
@@ -2381,7 +2436,7 @@ module core_top (
             // ================= (9) fence.i 全阵列失效扫描 =================
             //   ★ l1i 的 inval_all 只清"当前 cs_vaddr 索引所在组"（l1i.v:150-154）
             //     ⇒ 必须由 core_top 扫 256 组；期间冻结 F 并重定向到 fence.i 之后。
-            if (mw_valid & mw_fence_i & ~mw_exc_valid & ~trap_exc & ~fencei_busy) begin
+            if (fencei_sync_pending) begin
                 fencei_busy  <= 1'b1;
                 fencei_idx_q <= 8'd0;
                 fencei_pc_q  <= mw_pc_next;
