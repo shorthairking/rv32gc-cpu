@@ -11,16 +11,18 @@
   - `docs/porting/01-overview.md` 02-uboot 03-linux-opensbi 04-nand-driver 05-rootfs（5 篇）
   - `docs/kb/platform-facts.md` isa-notes.md tools-and-flow.md（3 篇）
 
-## 1.5 阶段二 2A 当前状态（2026-09-14，提交 `5086589`）
+## 1.5 阶段二 2A 当前状态（2026-09-15，M2 推进中）
 
-- **模块波次已交付且全部通过母 Agent 复跑验收**（单元 TB 全绿、唯一 PASS、变异反证）：
-  - `rtl/pkg/*.vh`（4 处宏缺陷修复：内层反引号/FP_F5_FCVT/TVEC_BASE_MSK/MMIO_HI16_MSK，pkg_check 断言防回归）
-  - `rtl/fetch/`（pc_gen/fetch_unit/parcel_align）、`rtl/decode/`（decoder/dec_imm/dec_csr/compressed_expand）
-  - `rtl/exec/`（alu/bru/mdu(IP 化：3×mult_gen DSP×12 + 1×unsigned div_gen)/exe_ctrl(M>W>RF)/fpu_add/fpu_mul/fpu_div_sqrt(fsqrt 已修)/fpu_cmp/fpu_cvt/fregfile）
-  - `rtl/mem/`（lsu/pmp_check/amo_unit/mmio_route/cmo_unit）、`rtl/csr/`（csr_file/priv_ctrl/trap_ctrl/ptw/tlb）、`rtl/clint/clint.v`、`rtl/plic/plic.v`、`rtl/cache/`（l1i/l1d/BRAM 双分支/mshr）、`rtl/axi/`（axi_req_desc/axi_master_ctrl）
-  - `fpga/tcl/create_ip.tcl`（已实跑：mult_gen×3 + div_gen，26/28 项自检 0 error）
-- **用户指令（2026-09-14）**：当前阶段在此暂停，等用户指令再继续下一阶段。
-- **下一步（用户指令后）**：① FPU 收尾：`fpu.v` 顶层 + `tb_fpu.sv`/`tb_fregfile.sv`（fp_op 编码 0-25 见 fpu_cmp/cvt 头注）；② `core_top.v` 集成（接线要点：csr_file 陷阱为分组原子写 trap_we[1:0]+trap_epc/cause/tval；axi_master_ctrl 端口 req_beats_1/2、wb_ready；lsu 的 amo rdata_i/rdata_valid_i 由 l1d 读返回接；fetch 内联 PMP 集成时改例化 rtl/mem/pmp_check.v；cmo 维护以 l1d.idle 判定完成）；③ M1 仿真（tb_core_top + tb_m1_uart + sim_mem_model，首条取指=0x1C000000+UART 回显）；④ M2 arch-test（DUT 宏 STANDARD_SM_SUPPORTED/F_SUPPORTED、test_config.yaml 编译器名改写、exclude.list）+ Spike 锁步（/opt/riscv/bin/spike 已装）；⑤ M3 DDR3 裸机内存测试；⑥ M4 Vivado 综合/时序；⑦ M5 上板。
+- **M1 已达成**：首条取指 0x1C000000 + UART 回显 PASS（D1-D9 十类缺陷修复：XIP 组合环/取指门控/carry 自锁/写通路/AxCACHE/M FSM/PC 推进/在途保护/done 重复）。
+- **M2 推进中（本轮关键成果，已全部提交）**：
+  - 单元回归 21/21、M1 cycles=464 恒稳、Verilator lint 457（UNOPTFLAT 0）。
+  - 陷阱/特权链路：kill_young 冲刷 M/E 槽、trap 电平门控、fence.i 同步窗、fpcsr 门控（ebreak mcause=3）、mret/sret 重定向、xPP 陷阱语义根因（priv_ctrl/csr_file）。
+  - CSR 旁路链：写→紧邻读（W/M 两级取写数据 M>W）→ WARL 落盘值引擎（csr_landing 单一真源，7+1 条锁步用例）。
+  - 解码修复：addi imm∈[0x400,0x41F] 误译 sub、**JAL 型无 funct3 误判非法**（arch-test 挂死根因①）。
+  - 访存修复：AXI/MMIO uncached 读补 ld_extract、MMIO 读 4B 对齐、PLIC 偏移-0x100000、PLIC 命中窗口 [0x1F10_0000,0x1F50_0000) 4MiB 显式区间。
+  - Spike 锁步底座（108/108 + 反证自测）；arch-test 底座（单例+组批量、exclude.list；I-nop-00/I-add-00 PASS）。
+- **当前后台**：M2 非特权子集批跑（rv32i/{I,M,Zicsr,Zifencei,Zicntr,Zicbom,Zca,F,D}，日志 /tmp/m2_groups.log）。**批跑期间禁止改 RTL**。
+- **下一步（批跑后）**：① 失败用例逐个定位修复（锁步/arch-test 双工具）；② 特权子集 SvPMP；③ 待办清单：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一（区间比较）、plic.v priority/threshold 3bit WARL 与 08 §6.6"32 位"表述对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 写通路字节合并；④ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
 
