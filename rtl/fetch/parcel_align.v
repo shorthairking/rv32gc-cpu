@@ -78,6 +78,19 @@ module parcel_align (
     wire [31:0] insn_16 = {16'h0000, lo_parcel};
     wire [31:0] insn_32 = {carry_parcel_i, lo_parcel};
 
+    //--------------------------------------------------------------------------
+    // 2.1 ★ D3 口径注（carry 通道的**调用方**契约，2026-09-15 集成修复）
+    //   本模块只做位域拼接，**不判断指令起始在字的高半还是低半**——「起始
+    //   parcel 在 word_o 低半」是本模块的输入契约（见 §1）。因此：
+    //     · 低半起始（PC[1]==0，4 B 对齐指令流）：32 bit 指令的两半都在本字内，
+    //       **不需要跨拍 carry** ⇒ 调用方（fetch_unit.v §4.1）把本字高半
+    //       (VA+2) 直接接到 carry_parcel_i/carry_valid_i（= "本字直取"），
+    //       本拍即 insn_valid_o=1（消除原实现"carry 自锁"死锁）。
+    //     · 高半起始（PC[1]==1，上一条是压缩指令）：caller 才用**寄存的**
+    //       carry（下一取指字低半）补齐。
+    //   本模块自身的 insn_valid_o = lo_is_compressed | carry_valid_i 语义不变：
+    //   carry_valid_i=0 时仍不交出半条指令（tb_parcel_align 的 C3 用例）。
+    //--------------------------------------------------------------------------
     assign ilen32_o      = lo_is_32bit;
     assign insn_o        = lo_is_32bit ? insn_32 : insn_16;
     assign insn_valid_o  = lo_is_compressed | carry_valid_i;

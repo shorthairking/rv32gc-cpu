@@ -166,10 +166,18 @@ module fetch_unit #(
     wire fetch_busy      = fetch_pause;
     wire insn_ready_out  = fetch_rsp_valid & ~cross_pending;
 
-    wire seq_adv_valid = fetch_rsp_valid & ~fetch_busy;
+    // ---- 前置声明（值由 §4 的 parcel_align 例化驱动；Verilog 要求"先声明"）----
+    wire        insn_start_lo = ~fetch_pc_w[1];  // 本拍指令的起始 parcel 在字低半（D3）
+    wire        ilen32;                          // 本拍这条指令的长度（1=32 bit，0=16 bit）
 
-    // 上一拍交出的指令长度 → 本次顺序推进量（§5.1 ①）
-    reg last_ilen32_r;
+    // 顺序推进（§5.1 ①）：本拍**真的交出**完整指令（起始 parcel 在低半）才推进。
+    wire seq_adv_valid = fetch_rsp_valid & ~fetch_busy & insn_start_lo;
+    // ★ 推进量 = **本拍交出的这条指令**的长度（§4 parcel_align 的组合输出 ilen32）。
+    //   原实现接 last_ilen32_r（"上一拍交出的长度"）：PC 推进与指令交付发生在
+    //   **同一拍**（都由 fetch_rsp_valid 驱动）⇒ 用上一拍的长度等于永远错一条：
+    //   复位后第一条 32 bit 指令按 +2 推进（last_ilen32_r 复位值 0），
+    //   PC 落到 0x1C00_0002（字内偏移）⇒ D 级从此取错指令（M1 实测复现）。
+    wire seq_len32_w = ilen32;
 
     wire [31:0] fetch_pc_w;
     wire [31:0] pc_next_w;
@@ -188,7 +196,7 @@ module fetch_unit #(
         .redirect_bru_pc   (redirect_bru_pc),
         .break_point       (break_point),
         .seq_adv_valid     (seq_adv_valid),
-        .seq_len32         (last_ilen32_r),
+        .seq_len32         (seq_len32_w),
         .pc                (fetch_pc_w),
         .pc_next           (pc_next_w),
         .pc_sel            (pc_sel_w),
@@ -253,17 +261,45 @@ module fetch_unit #(
     //==========================================================================
     wire [15:0] parcel_insn;
     wire [31:0] insn_va;
-    wire        ilen32;
     wire        insn_valid;
     wire        cross_pending;
     wire [31:0] insn_raw;
 
+    //--------------------------------------------------------------------------
+    // 4.1 ★ D3 修复（carry 自锁）：指令起始 parcel 的位置决定 carry 的来源
+    //     （insn_start_lo 已在 §1 前置声明，PC 推进量 ilen32 也取自本模块输出）
+    //     · insn_start_lo=1 ⇒ 起始 parcel 在取指字**低半**（4 B 对齐的指令流）：
+    //       RV32 小端下 32 bit 指令的两半就是本字的 [15:0] 与 [31:16]
+    //       ⇒ **本字直取**：把本字高半作为 carry 喂给 parcel_align，本拍即得
+    //       完整指令，**不再等下一拍 carry**。
+    //     · insn_start_lo=0 ⇒ 起始 parcel 在**高半**（上一条是压缩指令，M2 场景）：
+    //       低半是上一条指令的尾巴，32 bit 指令的后半在下一取指字的低半
+    //       ⇒ 只有这种情形才用**寄存的 carry**（carry 通道只服务高半起始）。
+    //
+    //     原实现无条件用寄存 carry 且 insn_valid = lo_is_compressed | carry_valid，
+    //     而 carry 寄存器又只在 insn_valid=1 时更新 ⇒ 复位后第一条 32 bit 指令
+    //     （carry_valid=0）永远 insn_valid=0，carry 永不更新（自锁死锁），
+    //     cross_pending 恒 1、fetch_valid 恒 0。
+    //     ★ 语义等价性：本字直取的结果 = {本字[31:16], 本字[15:0]} = 本字，
+    //       与「32 bit 指令 = {carry, 起始 parcel}」的原契约在低半起始下逐位相同。
+    //--------------------------------------------------------------------------
+    wire [15:0] pa_carry_parcel = insn_start_lo ? fetch_word[31:16] : carry_parcel;
+    wire        pa_carry_valid  = insn_start_lo | carry_valid;
+    wire [31:0] pa_carry_va     = insn_start_lo ? (fetch_word_va + 32'd2) : carry_va;
+
+    // ★ D3 补：parcel_align 的输入契约是「word_o 低半 = 指令起始 parcel」。
+    //   起始在**高半**（fetch_pc[1]==1）时该契约不成立（低半是上一条指令的尾巴）
+    //   ⇒ 本拍**一律不出指令**（fetch_valid=0、PC 冻结），避免把"上一条指令的
+    //   尾巴 + 陈旧 carry"当指令交给 D 级（静默错执行）。该情形的完整通路
+    //   （跨字半字保持 + 下一取指字低半拼接）属 M2 的 C 扩展混合流，见交付报告。
+    wire        insn_valid_w    = insn_valid & insn_start_lo;
+
     parcel_align u_parcel_align (
         .word_o        (fetch_word),
         .word_va_o     (fetch_word_va),
-        .carry_valid_i (carry_valid),
-        .carry_parcel_i(carry_parcel),
-        .carry_va_i    (carry_va),
+        .carry_valid_i (pa_carry_valid),
+        .carry_parcel_i(pa_carry_parcel),
+        .carry_va_i    (pa_carry_va),
         .insn_o        (insn_raw),
         .insn_va_o     (insn_va),
         .ilen32_o      (ilen32),
@@ -280,13 +316,14 @@ module fetch_unit #(
 
     //--- parcel_align 的 carry 输入：32 bit 指令缺失的那一半 ---
     //  口径（与 parcel_align.v §2 一致，RV32 小端 ⇒ 低半字在低地址）：
-    //    · 起始字 VA 4 B 对齐时，[15:0] = 指令前 16 bit、[31:16] = 指令后 16 bit
-    //      ⇒ 后 16 bit **已在同一次 fetch_rsp 里**，不需要跨拍 carry。
-    //    · 只有「指令起始落在字的高半」这一边界情形（M2 的 C 扩展混合流）才
-    //      需要从**下一个字**的低半借 16 bit。
-    //  本模块按统一口径实现：把「本拍返回字的 [31:16]」锁存为 carry 候选，
-    //  由 parcel_align 只在确实需要（cross_pending=1）时使用；需要时拉低
-    //  fetch_valid 并停顿一拍（§5.0），保证 D 级永不见到半条指令。
+    //    · 起始 parcel 在字的**低半**（fetch_pc[1]==0，4 B 对齐指令流）：
+    //      [15:0] = 指令前 16 bit、[31:16] = 指令后 16 bit ⇒ 后半**已在同一次
+    //      fetch_rsp 里**，本拍由 §4.1 的 pa_carry_parcel 直接给出（本字直取）。
+    //    · 起始 parcel 在字的**高半**（fetch_pc[1]==1，上一条是压缩指令，M2 场景）：
+    //      需要从**下一个取指字的低半**借 16 bit ⇒ 用下面寄存的 carry。
+    //  本模块按统一口径实现：把「本拍返回字的 [15:0]」（VA+4 那一半）锁存为
+    //  高半起始情形的 carry 候选；低半起始时不锁存（carry_valid 清 0），
+    //  由 pa_carry_* 本字直取，保证 D 级永不见到半条指令。
     reg         carry_valid;
     reg  [15:0] carry_parcel;
     reg  [31:0] carry_va;
@@ -393,7 +430,13 @@ module fetch_unit #(
     assign fetch_insn_va     = insn_va;
     assign fetch_insn_pa     = insn_va;
     assign fetch_ilen32      = ilen32;
-    assign fetch_valid       = insn_valid & ~pmp_fault & ~fetch_ext_fault & ~fetch_busy;
+    // ★ D2 修复（取指门控）：必须由 **fetch_rsp_valid（本拍真的有取指响应）** 门控。
+    //   原式只用 insn_valid（= 本字可拼出完整指令），而复位后 fetch_word 恒 0
+    //   （L1I 阵列未命中 / XIP 保持寄存器为空）⇒ 0x0000 的 [1:0]!=11 被判成
+    //   "16 bit 压缩指令 0x0000"，fetch_valid 在**没有任何响应**的拍被拉高，
+    //   D 级把 0 数据字当指令执行。新口径：有响应才有有效指令。
+    assign fetch_valid       = fetch_rsp_valid & insn_valid_w &
+                               ~pmp_fault & ~fetch_ext_fault & ~fetch_busy;
     assign fetch_uncached_pa = insn_raw;
     assign parcel_o          = parcel_insn;
     assign parcel_is_lo      = ~ilen32;
@@ -409,19 +452,20 @@ module fetch_unit #(
     //==========================================================================
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
-            last_ilen32_r <= 1'b0;
             carry_valid   <= 1'b0;
             carry_parcel  <= 16'h0000;
             carry_va      <= 32'h0000_0000;
-        end else if (insn_valid & ~fetch_busy) begin
-            last_ilen32_r <= ilen32;
-            // carry = 本拍返回字中的下一个 parcel（[31:16]，即 VA+2）：
-            //   压缩指令（2 B）⇒ 指令是 [15:0]，下一个 parcel 在 [31:16]
-            //   32 bit 指令（4 B）⇒ 下一个 parcel 已是下一字的 [15:0]，
-            //                       故 carry 的 VA 记 VA+4（下一拍对得上）
-            carry_valid   <= 1'b1;
-            carry_parcel  <= fetch_word[31:16];
-            carry_va      <= insn_va + 32'd2;
+        end else if (insn_valid_w & ~fetch_busy) begin
+            // ---- D3：carry 寄存器**只服务"高半起始"**（fetch_pc[1]==1）----
+            //   · 低半起始（4 B 对齐指令流）：本字已含 32 bit 指令的两半
+            //     ⇒ carry_valid 清 0（原实现无条件置 1，使陈旧 carry 可能被下一条
+            //       指令误用；且 carry 更新被 insn_valid 门控 ⇒ 与 insn_valid 的
+            //       carry 依赖构成自锁，第一条 32 bit 指令永久卡死）。
+            //   · 高半起始：缺失的一半 = **下一取指字（VA+4）的低半** ⇒ 锁存之，
+            //     其 VA 记 VA+4，供下一拍拼接（M2 半字保持通路补齐后可达）。
+            carry_valid  <= ~insn_start_lo & ilen32;
+            carry_parcel <= fetch_word[15:0];
+            carry_va     <= fetch_word_va + 32'd4;
         end
     end
 

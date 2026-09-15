@@ -761,11 +761,23 @@ module core_top (
     reg  [31:0] xip_word_pa_q;
     reg  [31:0] xip_word_data_q;
     reg         xip_word_vld_q;
+    reg         xip_req_pend_q;    // XIP 取指请求**在途**（已送控制器、数据未回）
     assign axi_rdata_q = rdata;            // R 通道数据（唯一读取点）
 
-    wire xip_req_go   = fu_fetch_req_valid & fu_fetch_req_uncached & ~xip_word_vld_q;
+    wire xip_req_go   = fu_fetch_req_valid & fu_fetch_req_uncached &
+                        ~xip_word_vld_q & ~xip_req_pend_q;
     wire xip_hit_held = xip_word_vld_q & (fu_fetch_req_pa == xip_word_pa_q);
-    assign xip_fetch_busy = xip_req_go | (xip_word_vld_q & ~xip_hit_held);
+    // ★ D1 修复（组合环）：请求在途不得回灌 fetch_pause——
+    //   原式 `xip_req_go | (...)` 使 fetch_pause → fetch_req_valid → xip_req_go →
+    //   xip_fetch_busy → fetch_pause 成环（iverilog 判组合环 ⇒ 全网 x；M1 实测
+    //   pipe_adv=x / fetch_pause=x / fetch_valid=x，一条指令都不提交）。
+    //   新口径：busy = ① **在途请求**（xip_req_pend_q，寄存器 ⇒ 不成环）
+    //                 ② 已握到的字**尚未被消费**（vld 保持且 PC 已前移）。
+    //   ★ 为什么必须有 ①（M1 实测的第二处静默错）：没有在途保护时，重定向
+    //     （如 `j 1b` 自跳）会在旧请求仍在途时又发一笔**不同地址**的 XIP 读，
+    //     先回的旧数据被贴上新的 xip_word_pa_q 标签 ⇒ 命中判定为真 ⇒ 把
+    //     0x0000_0000 当指令交给 D 级（实测：loop 首圈后 PC 落到 0 号陷阱向量）。
+    assign xip_fetch_busy = xip_req_pend_q | (xip_word_vld_q & ~xip_hit_held);
 
     assign fetch_rsp_data  = obs_uncached ? xip_word_data_q : l1i_cs_rdata;
     assign fetch_rsp_va    = {fu_fetch_pc[31:2], 2'b00};
@@ -1650,7 +1662,12 @@ module core_top (
     wire [2:0] axi_ctrl_done_owner;
     wire [31:0] axi_ctrl_done_addr;
 
-    wire m_axi_want   = (m_state_q == M_S_AXI);
+    //   ★ D4 记账要点：MDTA 的完成判定在 done 脉冲那一拍（axi_done_q=1），而
+    //     AXI 控制器在 ST_DONE 之后**已释放总线**（axi_free=1）——若 want 只看
+    //     状态位，会在"done 已到、M FSM 尚未离开 M_S_AXI"的那一拍**重复发起同一笔
+    //     MDTA 事务**（M1 实测：UART 的 sb 连发两次 AW ⇒ 同一字符写两遍）。
+    //     故 want 必须排除 done 拍（M_S_AXI 收到 done 当拍就完成并转 IDLE）。
+    wire m_axi_want   = (m_state_q == M_S_AXI) & ~axi_done_q;
     wire axi_free     = (axi_owner_q == AXO_NONE) & ~axi_busy;
     wire grant_wrbk   = axi_free &  l1d_wb_req;
     wire grant_dfil   = axi_free & ~l1d_wb_req &  l1d_fill_req;
@@ -1674,7 +1691,25 @@ module core_top (
                                     grant_mdta ? 5'd1 :
                                     grant_xipf ? 5'd1 :
                                                  (l1i_fill_beats + 5'd1);
-    wire axi_req_iswr_sel = grant_wrbk;
+    // ---- 11.1.1 ★ D4 修复：MDTA（M 级平台 MMIO/XIP 数据访问）的**写支持** ----
+    //   原实现只把 `grant_wrbk`（L1D 脏行写回）认成写：
+    //     · axi_req_iswr_sel = grant_wrbk ⇒ 对 UART 的 sb 被当**读**发出（AR）；
+    //     · W 数据通路固定取 l1d_wb_*（写回数据流）⇒ MMIO store 无数据可发；
+    //     · M_S_AXI 完成判定按"读"取 rdata ⇒ 写事务无从完成。
+    //   新口径：
+    //     · is_write = 写回 **或** （MDTA 且该笔是写：m_mmio_we_q 在 M_S_ISS 锁存）
+    //       ⇒ axi_master_ctrl 据此**互斥**走 AW/W/B（写）或 AR/R（读）；
+    //     · W 数据/字节使能：写回取 L1D 写回流（l1d_wb_ready/l1d_wb_data），
+    //       MDTA 写取 M 级锁存的 store 数据/字节使能（m_mmio_wdata_q/m_mmio_strb_q）
+    //       —— 同一 mux 覆盖"在途写事务"的整个 ST_AW/ST_W 阶段；
+    //     · 完成：等 B 响应后的 done（见 §11.6 的 done owner 记账）。
+    wire axi_mdta_wr      = (axi_owner_q == AXO_MDTA) & axi_is_wr_q;   // 在途 MDTA 写
+    wire axi_wdata_is_l1d = grant_wrbk | ((axi_owner_q == AXO_WRBK) & axi_is_wr_q);
+    wire axi_wdata_valid_sel = axi_wdata_is_l1d ? l1d_wb_ready : axi_mdta_wr;
+    wire [31:0] axi_wdata_data_sel = axi_wdata_is_l1d ? l1d_wb_data : m_mmio_wdata_q;
+    wire [3:0]  axi_wstrb_sel      = axi_wdata_is_l1d ? 4'hF : m_mmio_strb_q;
+
+    wire axi_req_iswr_sel = grant_wrbk | (grant_mdta & m_mmio_we_q);
 
     // ---- 11.2 axi_req_desc：PMA 译码 + 4 K 拆分描述符（地址窗口唯一实现处）----
     wire        desc_valid_t, desc_split_t, desc_legal_t;
@@ -1730,7 +1765,9 @@ module core_top (
 
     axi_master_ctrl #(
     .ADDR_W (32), .DATA_W (32), .STRB_W (4), .ID_W (4), .LEN_W (4),
-    .SIZE_W (3),  .BURST_W(2),  .CACHE_W(4), .PROT_W(3), .OWNER_W(3)
+    .SIZE_W (3),  .BURST_W(2),  .CACHE_W(4), .PROT_W(3), .OWNER_W(3),
+    // ★ D5：集成侧按描述符属性驱动 AxCACHE/WSTRB（单元 TB 契约值见该模块参数注释）
+    .USE_REQ_ATTRS (1)
     ) u_axi_master_ctrl (
     .clk         (aclk),
     .rst_n       (aresetn),
@@ -1745,8 +1782,12 @@ module core_top (
     .req_beats_2 (axi_beats_2),
     .req_id      (`RV32GC_AXI_ID_I_FILL),
     .req_ready   (axi_req_ready),
-    .wdata_valid (l1d_wb_ready),
-    .wdata_data  (l1d_wb_data),
+    // ---- 请求属性（★ D5：AxCACHE 按描述符 PMA 字段、WSTRB 按本笔字节使能）----
+    .req_cache   (desc_cache_t),
+    .req_strb    (axi_wstrb_sel),
+    // ---- W 数据（★ D4：写回取 L1D 写回流；MDTA 写取 M 级锁存的 store 数据）----
+    .wdata_valid (axi_wdata_valid_sel),
+    .wdata_data  (axi_wdata_data_sel),
     .wdata_ready (axi_wdata_ready),
     .rdata_valid (axi_rdata_valid),
     .rdata_data  (axi_rdata_data),
@@ -1854,6 +1895,12 @@ module core_top (
     );
 
     // ---- 11.6 总线事务记账（owner/beat/done 的唯一定义处）----
+    //   ★ D4 记账要点：axi_ctrl_done（单拍）到达时 owner_q 会**同拍清成 NONE**
+    //     ⇒ "owner_q == AXO_MDTA & axi_done_q" 的组合式永远不成立（完成事件丢失）。
+    //     因此 done 脉冲必须**成对记下来源**（axi_done_owner_q / axi_done_wr_q），
+    //     M 级 FSM 用这一对判定"本笔 MDTA 事务完成"。
+    reg [2:0] axi_done_owner_q;
+    reg       axi_done_wr_q;
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             axi_owner_q <= AXO_NONE;
@@ -1861,6 +1908,8 @@ module core_top (
             axi_beats_q <= 5'd0;
             axi_is_wr_q <= 1'b0;
             axi_done_q  <= 1'b0;
+            axi_done_owner_q <= AXO_NONE;
+            axi_done_wr_q    <= 1'b0;
         end else begin
             axi_done_q <= 1'b0;
             if (axi_owner_q == AXO_NONE) begin
@@ -1874,6 +1923,8 @@ module core_top (
                 if (axi_rdata_valid) axi_beat_q <= axi_beat_q + 5'd1;
                 if (axi_ctrl_done) begin
                     axi_done_q  <= 1'b1;
+                    axi_done_owner_q <= axi_owner_q;
+                    axi_done_wr_q    <= axi_is_wr_q;
                     axi_owner_q <= AXO_NONE;
                     axi_beat_q  <= 5'd0;
                 end
@@ -1881,6 +1932,8 @@ module core_top (
                 if (axi_wb_fire) axi_beat_q <= axi_beat_q + 5'd1;
                 if (axi_ctrl_done) begin
                     axi_done_q  <= 1'b1;
+                    axi_done_owner_q <= axi_owner_q;
+                    axi_done_wr_q    <= axi_is_wr_q;
                     axi_owner_q <= AXO_NONE;
                     axi_beat_q  <= 5'd0;
                 end
@@ -2042,6 +2095,7 @@ module core_top (
             //------------------------ F 级辅助 ------------------------
             fetch_exc_done_q <= 1'b0;
             xip_word_pa_q <= 32'h0; xip_word_data_q <= 32'h0; xip_word_vld_q <= 1'b0;
+            xip_req_pend_q <= 1'b0;
             fencei_busy <= 1'b0; fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
             //------------------------ M 级 FSM ------------------------
             m_state_q <= M_S_IDLE; m_retry_q <= M_S_ISS; m_pa_q <= 32'h0;
@@ -2252,6 +2306,15 @@ module core_top (
             if (fetch_exc_inject)      fetch_exc_done_q <= 1'b1;
             else if (~fetch_exc_valid) fetch_exc_done_q <= 1'b0;
 
+            // ---- XIP 取指：地址锁存 / 在途记账 / 数据保持（§5.4）----
+            //   在途记账：请求被控制器接受时置位，数据回来（vld 置位）时清位。
+            //   它保证 xip_word_pa_q 与随后回来的数据**严格一一对应**（见 §5.4 的
+            //   ★ 说明）；在途期间 fetch_pause=1 ⇒ F 级不会发第二笔不同地址的请求。
+            if (xip_req_pend_q) begin
+                if ((axi_owner_q == AXO_XIPF) & axi_rdata_valid) xip_req_pend_q <= 1'b0;
+            end else if (axi_fire_req & (axi_owner_sel == AXO_XIPF)) begin
+                xip_req_pend_q <= 1'b1;
+            end
             if (xip_req_go) begin
                 xip_word_pa_q <= fu_fetch_req_pa;
             end
@@ -2289,7 +2352,13 @@ module core_top (
                         m_amo_phase_q  <= 1'b0;
                         m_exc_q        <= 1'b0;
                         m_page_fault_q <= 1'b0;
-                        if (em_valid & m_is_mem & ~em_exc_valid) begin
+                        // ★ M1 新发现缺陷（D6）：`~m_done_q` 门控 —— 本笔访存
+                        //   完成的**下一拍** EM 槽仍持有该指令（完成拍 m_busy=1
+                        //   ⇒ pipe_adv=0，EM 没换人），若此处不带 ~m_done_q，
+                        //   FSM 会对**同一条已完成的访存指令**再走一遍
+                        //   IDLE→ISS→AXI：M1 实测 UART 的 sb 被发两次 AW（每次
+                        //   多写一个字符，逐字符回显判据必挂）。
+                        if (em_valid & m_is_mem & ~em_exc_valid & ~m_done_q) begin
                             if (m_need_tr & tlb_perm_fault) begin
                                 m_pa_q         <= 32'h0;
                                 m_page_fault_q <= 1'b1;
@@ -2454,9 +2523,13 @@ module core_top (
                     end
 
                     //----------- 平台 MMIO/XIP 数据访问（AXI 单 beat）-----------
+                    //   ★ D4：完成点 = 本笔 MDTA 事务的 done（读 = R 最后一 beat，
+                    //     写 = **B 响应** 之后的 done），来源用 done 记账对判定
+                    //     （axi_done_owner_q/axi_done_wr_q，见 §11.6）。
+                    //     写事务不需要读回数据（store 无 rd 值）。
                     M_S_AXI: begin
-                        if ((axi_owner_q == AXO_MDTA) & axi_done_q) begin
-                            m_rd_data_q <= axi_rdata_q;
+                        if (axi_done_q & (axi_done_owner_q == AXO_MDTA)) begin
+                            if (~axi_done_wr_q) m_rd_data_q <= axi_rdata_q;
                             m_state_q   <= M_S_IDLE;
                             m_done_q    <= 1'b1;
                         end

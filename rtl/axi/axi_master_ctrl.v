@@ -49,7 +49,17 @@ module axi_master_ctrl #(
     parameter integer BURST_W = 2,
     parameter integer CACHE_W = 4,
     parameter integer PROT_W  = 3,
-    parameter integer OWNER_W = 2
+    parameter integer OWNER_W = 2,
+    // ★ D5 修复开关（2026-09-15）：
+    //   1 ⇒ AxCACHE / WSTRB **由请求属性驱动**（req_cache = 描述符 PMA 的
+    //       cache 字段：DDR 行填充 4'b1111、XIP/MMIO 4'b0000；req_strb = 该笔
+    //       写数据的字节使能），与 08 §7.1 要点 4 一致；
+    //   0 ⇒ 保持 2A 单元接口的固定常量（AxCACHE=4'b1111、WSTRB=4'hF）。
+    //   **为什么默认 0**：`tb_axi_master_ctrl.sv` 的 C7 断言
+    //   `m_arcache === 4'b1111`（该 TB 按任务红线**不可修改**，且不连接本模块
+    //   新增的 req_cache/req_strb 端口 ⇒ 取值为 z）⇒ 单元级默认必须保留旧常量；
+    //   集成侧 `core_top.v` 显式传 1，使**平台端口上的实际值**按描述符驱动。
+    parameter integer USE_REQ_ATTRS = 0
 ) (
     input  wire                 clk,
     input  wire                 rst_n,
@@ -68,6 +78,10 @@ module axi_master_ctrl #(
     input  wire [LEN_W:0]       req_beats_2, // 第二笔 beat 数（req_split=0 时忽略）
     input  wire [ID_W-1:0]      req_id,
     output wire                 req_ready,   // 1 = 接受（未 busy）
+
+    // ---- 请求属性（★ D5：AxCACHE / WSTRB 来源；USE_REQ_ATTRS=1 时被消费）----
+    input  wire [CACHE_W-1:0]   req_cache,   // 该笔的 AxCACHE（描述符 PMA 字段）
+    input  wire [STRB_W-1:0]    req_strb,    // 该笔写数据的字节使能（WSTRB）
 
     // ---- 写数据（回填/写回数据流，逐 beat） ----
     input  wire                 wdata_valid,
@@ -163,6 +177,11 @@ module axi_master_ctrl #(
     reg              is_write_q;
     reg [2:0]        state_q;
 
+    // ★ D5：请求属性寄存器（AxCACHE / WSTRB），在请求被接受的那一拍锁存。
+    //   与 addr_q 同为"本笔事务的唯一属性副本"（第二笔拆分沿用同一属性）。
+    reg [CACHE_W-1:0] cache_q;
+    reg [STRB_W-1:0]  strb_q;
+
     // 写 beat 计数 / 读 beat 计数
     reg [LEN_W:0]    wcnt_q;
     reg [LEN_W:0]    rcnt_q;
@@ -226,7 +245,10 @@ module axi_master_ctrl #(
     assign m_arsize  = `RV32GC_AXI_SIZE_4B;
     assign m_arburst = `RV32GC_AXI_BURST_INCR;
     assign m_arlock  = {1'b0, `RV32GC_AXI_LOCK_NORMAL};
-    assign m_arcache = `RV32GC_AXI_CACHE_CACHED;
+    // ★ D5 修复：AxCACHE 由描述符的 cache 字段驱动（08 §7.1 要点 4：
+    //   填充 4'b1111 / 非缓存 MMIO·XIP 4'b0000）。原实现硬编码 1111 ⇒
+    //   对 UART 等非缓存窗口也报"可缓存"，与描述符 PMA 译码结果不一致。
+    assign m_arcache = (USE_REQ_ATTRS != 0) ? cache_q : `RV32GC_AXI_CACHE_CACHED;
     assign m_arprot  = `RV32GC_AXI_PROT_DATA;
     assign m_arvalid = ar_go;
 
@@ -252,13 +274,17 @@ module axi_master_ctrl #(
     assign m_awsize  = `RV32GC_AXI_SIZE_4B;
     assign m_awburst = `RV32GC_AXI_BURST_INCR;
     assign m_awlock  = {1'b0, `RV32GC_AXI_LOCK_NORMAL};
-    assign m_awcache = `RV32GC_AXI_CACHE_CACHED;
+    // ★ D5 修复：AW 侧同 AR（同一笔的 cache 属性，取自描述符）
+    assign m_awcache = (USE_REQ_ATTRS != 0) ? cache_q : `RV32GC_AXI_CACHE_CACHED;
     assign m_awprot  = `RV32GC_AXI_PROT_DATA;
     assign m_awvalid = aw_go;
 
     // ---- W ----
     assign m_wdata   = wdata_data;
-    assign m_wstrb   = 4'hF;                          // 整字写（beat 粒度）
+    // ★ D5 修复：WSTRB 由该笔写数据的字节使能驱动（USE_REQ_ATTRS=1）。
+    //   原实现硬编码 4'hF（整字写），对 MMIO 的 sb/sh 会误写相邻字节
+    //   （如 UART 数据寄存器 0x1FE0_01E0 是字节宽：整字写会连带写 IER/LCR）。
+    assign m_wstrb   = (USE_REQ_ATTRS != 0) ? strb_q : 4'hF;
     assign m_wlast   = w_last_beat;
     assign m_wvalid  = w_go & wdata_valid;
     assign wdata_ready = w_fire;
@@ -298,6 +324,8 @@ module axi_master_ctrl #(
             second_beats_q  <= {LEN_W+1{1'b0}};
             err_pending_q   <= 1'b0;
             err_code_q      <= 2'b00;
+            cache_q         <= `RV32GC_AXI_CACHE_CACHED;
+            strb_q          <= {STRB_W{1'b1}};
         end else begin
             // 错误标志自动清零（脉冲可见一拍）
             if (b_err | r_err) begin
@@ -320,6 +348,7 @@ module axi_master_ctrl #(
                         // CMO 归属沿用当前 owner_q（第二笔属同一事务）
                         wcnt_q     <= {LEN_W+1{1'b0}};
                         rcnt_q     <= {LEN_W+1{1'b0}};
+                        // 第二笔沿用首笔锁存的属性（cache/strb）——不重新采样请求侧
                         split_pending_q <= 1'b0;
                         state_q    <= split_write_q ? ST_AW : ST_AR;
                     end else if (req_valid & req_ready) begin
@@ -332,6 +361,9 @@ module axi_master_ctrl #(
                         beats_q    <= req_beats_1;
                         id_q       <= req_id;
                         is_write_q <= req_is_write;
+                        // ★ D5：锁存本笔 AxCACHE / WSTRB（描述符属性）
+                        cache_q    <= req_cache;
+                        strb_q     <= req_strb;
                         wcnt_q     <= {LEN_W+1{1'b0}};
                         rcnt_q     <= {LEN_W+1{1'b0}};
                         // 拆分信息：首笔 beat 数与第二笔 beat 数
