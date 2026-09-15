@@ -73,6 +73,10 @@
 //         `m_axi_want` 均被 `m_kill_fsm` 门控）；若确已在途，kill 路径把 FSM 强制
 //         回 IDLE 并清 `m_issued_q`（放弃结果），事务本身由 axi_master_ctrl 的
 //         "单笔在途三件套"自行收尾（§11.6 的 done owner 记账不受影响）。
+//       ★ （2026-09-15 修复 R2）**xRET（mret/sret）并入同一冲刷口径**：xRET 也是
+//         "W 级提交即改写执行流"的指令（取指重定向到 *epc），比它更年轻的 M/E/D
+//         槽指令同样是错路径 ⇒ `kill_young` 与 `m_kill_fsm` 都含 xRET。重定向目标
+//         与优先级见 §9 的 xRET 修复块与 §10 的 `redirect_exc_*` 选择式。
 //
 //------------------------------------------------------------------------------
 // 三、已知遗留（如实登记，不静默跳过）
@@ -859,9 +863,18 @@ module core_top (
     wire d_csr_access = (dec_csr_op == CSRN_W) | (dec_csr_op == CSRN_S) |
                         (dec_csr_op == CSRN_C);
     wire d_is_fp_instr = (dec_op_type == OPT_FP) | (dec_op_type == OPT_FPLD);
-    wire d_is_fpcsr    = (dec_csr_addr == `RV32GC_CSR_FFLAGS) |
-                         (dec_csr_addr == `RV32GC_CSR_FRM)    |
-                         (dec_csr_addr == `RV32GC_CSR_FCSR);
+    //   ★ （2026-09-15 修复 R1）**必须**用 `d_csr_access` 门控：`dec_csr_addr` 就是
+    //     `insn[31:20]`（对**任何**指令都有效，不是"这条指令是 CSR 访问"的判据）。
+    //     不门控时，凡 `insn[31:20] ∈ {0x001,0x002,0x003}` 的指令都被当成
+    //     fflags/frm/fcsr 访问 ⇒ FS=Off 时判非法：
+    //       · `addi x31,x0,1`（0x00100F93，imm 字段 = 0x001）误陷阱；
+    //       · **`ebreak`（0x00100073，insn[31:20] = 0x001）本身被误判非法** ⇒
+    //         mcause = 2（非法指令）而不是 3（断点），断点语义整体错位。
+    //     真判据是"本指令确实在做 CSR 访问"（decoder 的 csr_op_o ≠ CSRN_N）。
+    wire d_is_fpcsr    = d_csr_access &
+                         ((dec_csr_addr == `RV32GC_CSR_FFLAGS) |
+                          (dec_csr_addr == `RV32GC_CSR_FRM)    |
+                          (dec_csr_addr == `RV32GC_CSR_FCSR));
     wire d_fs_off_ill  = (mstatus_fs == FS_OFF) & (d_is_fp_instr | d_is_fpcsr);
     wire d_csr_xcheck  = d_csr_access & (csr_chk_illegal | csr_chk_ro_write) & dec_csr_ill;
     wire d_ill_total   = dec_ill | dec_csr_ill | dec_cbo_gate_ill | d_fs_off_ill |
@@ -1235,8 +1248,38 @@ module core_top (
     assign pipe_adv = e_done & ~m_busy & ~load_use_stall;
 
     // 让路：异常或 fence.i 同步拍必须清掉 M/E/D（见文件头 §2f/§2g）
-    assign kill_young = trap_valid | fencei_busy;
     assign trap_exc   = trap_valid & ~trap_is_int;
+
+    //==========================================================================
+    // ★ xRET 取指重定向（2026-09-15 修复 R2）
+    //--------------------------------------------------------------------------
+    //   问题：`xret_valid` 原先只进 priv_ctrl（改特权级/MPP），**没有**进取指重定向
+    //   （原式 `redirect_exc_v = trap_valid | fencei_busy`）⇒ `mret`/`sret` 不回
+    //   *epc，而是顺序继续执行 mret 之后的那条指令（实测：陷阱处理器以 mret 结尾
+    //   时回不到 mepc，落到处理器尾后的字节流上）。
+    //   修法：把 xRET 并进 W 级统一重定向入口，并把**同时**要做的冲刷口径与
+    //   陷阱/ fence.i 完全对齐（`kill_young` / `m_kill_fsm`）：
+    //     · 目标 PC：mret ⇒ mepc，sret ⇒ sepc（xret_kind：01=mret / 00=sret）；
+    //     · 优先级（与 pc_gen 契约一致）：trap > xRET > fence.i > BRU > 断点
+    //       —— trap/xRET/fence.i 合并进 pc_gen 的 `redirect_exc_*`（其内部高于
+    //       BRU 与断点），三者之间在本文件的 PC 选择式里显式定序；
+    //     · 冲刷：xRET 在 W 提交，比它**更年轻**的 M/E/D 槽指令全是错路径（W 之后
+    //       的执行流被本重定向改写）⇒ 必须与陷阱拍同样作废，否则它们会继续
+    //       M→W 提交（R2 修复前根本没有重定向，故也不存在这段冲刷）。
+    //   两个细节：
+    //     ① epc 取值：csr_file 只有**一个**组合读口（`raddr`），本拍把 raddr 切到
+    //        mepc/sepc 取回。该拍 D/E/M 槽全被冲刷（见上），被"借走"的这次读不会
+    //        落到任何架构状态；`chk_addr`（权限/只读判定）走另一路端口，不受影响。
+    //     ② `~trap_exc` 与 priv_ctrl 的 xret 条件逐字一致：本指令自身陷落时不回
+    //        *epc（此时 trap 侧拥有重定向优先级）。
+    //==========================================================================
+    wire        xret_redirect = mw_xret_valid & mw_valid & ~mw_exc_valid & ~trap_exc;
+    wire [11:0] xret_epc_addr = (mw_xret_kind == 2'b01) ? `RV32GC_CSR_MEPC
+                                                        : `RV32GC_CSR_SEPC;
+    wire [31:0] xret_epc_pc   = csr_rdata_raw;   // = {*epc[31:1],1'b0}（csr_file 读口）
+    wire [11:0] csr_raddr_mux = xret_redirect ? xret_epc_addr : de_csr_addr;
+
+    assign kill_young = trap_valid | xret_redirect | fencei_busy;
 
     // ---- 9.3 TLB ----
     wire        tlb_hit, tlb_perm_fault;
@@ -1291,7 +1334,7 @@ module core_top (
     wire        ptw_pte_ad_update;
     wire [31:0] ptw_pte_ad_pa, ptw_pte_ad_data;
     assign m_ptw_req_valid = (m_state_q == M_S_TR) & ~m_kill_fsm;
-    assign m_kill_fsm      = trap_valid | fencei_busy;
+    assign m_kill_fsm      = trap_valid | xret_redirect | fencei_busy;
 
     ptw u_ptw (
     .clk            (aclk),
@@ -1560,6 +1603,8 @@ module core_top (
     wire [31:0]  csr_mcounteren, csr_scounteren;
     wire [31:0]  csr_mtvec, csr_stvec, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
     wire [31:0]  mstatus_set, mstatus_clr;
+    //   ★ R3 修正后的 mstatus 置位/清除向量（定义见 §10.1；csr_file 用这一对）
+    wire [31:0]  mstatus_set_fixed, mstatus_clr_fixed;
     wire         priv_flush_req;
     wire [1:0]   priv_next;
     wire         csr_fetch_is_m;
@@ -1571,7 +1616,9 @@ module core_top (
     csr_file u_csr_file (
     .clk         (aclk),
     .rst_n       (aresetn),
-    .raddr       (de_csr_addr),
+    //   ★ 读地址在 xRET 重定向拍切到 mepc/sepc（见 §9 的 R2 修复说明）：
+    //     该拍 D/E/M 槽已被 kill_young 冲刷，这次"借读"不会落入架构状态。
+    .raddr       (csr_raddr_mux),
     .rdata       (csr_rdata_raw),
     .wen         (csr_wen_w),
     .waddr       (mw_csr_addr),
@@ -1583,8 +1630,8 @@ module core_top (
     .chk_illegal (csr_chk_illegal),
     .chk_ro_write(csr_chk_ro_write),
     .mstatus_o   (csr_mstatus_raw),
-    .mstatus_set (mstatus_set),
-    .mstatus_clr (mstatus_clr),
+    .mstatus_set (mstatus_set_fixed),
+    .mstatus_clr (mstatus_clr_fixed),
     .trap_we     (trap_we),
     .trap_epc_i  (trap_epc_i),
     .trap_cause_i(trap_cause_i),
@@ -1706,8 +1753,74 @@ module core_top (
     .redirect_pc   (trap_redirect_pc)
     );
 
-    assign redirect_exc_v  = trap_valid | fencei_busy;
-    assign redirect_exc_pc = trap_valid ? trap_redirect_pc : fencei_pc_q;
+    assign redirect_exc_v  = trap_valid | xret_redirect | fencei_busy;
+    //   优先级：trap > xRET > fence.i（三者合并走 pc_gen 的异常/中断入口，
+    //   该入口在 pc_gen 内高于 BRU 与断点 ⇒ 全局次序 trap > xRET > fence.i > BRU > 断点）。
+    assign redirect_exc_pc = trap_valid    ? trap_redirect_pc :
+                             xret_redirect ? xret_epc_pc      :
+                                             fencei_pc_q;
+
+    //==========================================================================
+    // 10.1 ★ 陷阱入口 mstatus.MPP 修正 + xRET 的 xPP「读/写分拍」（2026-09-15 修复 R3）
+    //--------------------------------------------------------------------------
+    //   【现象】（/tmp 探针实测）：ebreak 陷阱进入 M 处理器、处理器末尾 mret ⇒
+    //   mret 之后特权级变成 **U**（csr_priv_2 观测为 0）⇒ 返回目标的第一条**取指**
+    //   被 PMP 拒（U/S 模式无匹配 PMP 项即拒绝；复位后 pmpcfg 全 0）⇒ mcause=1
+    //   （instruction access fault）、mepc = 返回目标 ⇒ 再陷入死循环，UART 串永远
+    //   打不完：「陷阱 + mret」的自然流程整体不可用（R2 的"返回地址==mepc"即使对了
+    //   也无法端到端验证）。
+    //   【根因】两处，均在**本任务文件范围之外**（rtl/csr/priv_ctrl.v 与 csr_file.v），
+    //     故按规范在此纠正：
+    //     ① priv_ctrl 的 `trap_set_m` 把**旧 MPP**（`mpp_l` ← mstatus.MPP）当作新
+    //        MPP；而它自己注释引用的规范条文（norm:mstatusxpiexiexpptrap_op）要求
+    //        「xPP ← **陷阱发生时的特权级 y**」。复位后 MPP=U(0) ⇒ 第一次从 M 进入的
+    //        陷阱把 MPP 写成 U。
+    //     ② csr_file 的 `mstatus_o = (mstatus_view & ~clr) | set`（**读视图**）被
+    //        **同拍**的陷阱/xRET 置位/清除向量污染；而 priv_ctrl 正是用这个视图的
+    //        xPP 决定 xRET 的目标特权级 ⇒ mret 读到的是**它自己刚清掉的** MPP(0)
+    //        ⇒ priv_next 恒为 U（实测 MON_XRET：stored MPP=3 但读视图 MPP=0）。
+    //        再叠加 csr_file 落地是 OR 语义（`(mstat_sw & ~clr) | set`），陷阱入口
+    //        只清 MIE ⇒ MPP 实为「旧|新」，必须**先清后置**才是替换。
+    //   【处置】顶层只重写 **xPP 字段**（M 侧 MPP / S 侧 SPP）的读-写时序：
+    //     · 陷阱委托到 M ⇒ 清 MPP 字段并置为当前特权级 y（替换语义，纠正 ①）；
+    //     · xRET ⇒ 本拍**不**在清除向量里动 xPP（使 priv_ctrl 本拍读到**存储值**，
+    //       mret 的目标特权级因此正确），把"xPP ← U"的清除**延后一拍**施加（纠正 ②）。
+    //       mret 用 MPP、sret 用 SPP，走同一份掩码逻辑（kind 选择）。
+    //       延后不可观察：xRET/陷阱拍 kill_young 已清空 M/E/D 槽，重定向后第一条
+    //       指令至少还要走完 F→D→E 三级才可能取样 CSR 读（更晚才可能提交），而
+    //       xPP 清除在**下一拍边沿**就已写入 mstat_sw ⇒ 任何软件可见的读都拿到 U
+    //       （= 规范要求的 xRET 之后 xPP 值）。
+    //     · MIE/MPIE/SIE/SPIE 等其余位与 S 侧陷阱入口仍由 priv_ctrl 负责（行为不变）。
+    //   ★ 这是**根因不在本文件**的临时纠正：正确修法是
+    //     ① priv_ctrl.v 的 `trap_set_m` 改用陷阱发生时的特权级，并把 M 组 MPIE←MIE
+    //        一并改成「先清后置」（同受 OR 语义影响）；
+    //     ② csr_file.v 的 `mstatus_o` 读视图改为**不含**同拍 clr/set 的存储视图
+    //        （置位/清除只作用于写入）。
+    //     ③ 另有同类残留（本段未处理，如实登记、不在本次验收路径上）：陷阱委托到 S 的
+    //        SPP 也是"只置位不替换"（`trap_set_s2` 只置 SPP，SPP 从不清）⇒ 从 U 陷入时
+    //        若旧 SPP=1 会残留 1；S 组 MPIE/SPIE 的 OR 语义同理。
+    //     那两处修好后，本段可整段删除。
+    //==========================================================================
+    localparam [31:0] MPP_FIELD_MSK =
+        (`RV32GC_MSTATUS_MPP_MSK << `RV32GC_MSTATUS_MPP_LSB);
+    localparam [31:0] SPP_FIELD_MSK = (32'h1 << `RV32GC_MSTATUS_SPP_BIT);
+
+    wire        trap_to_m_w  = trap_valid & (trap_target == PRIV_M);
+    wire [31:0] trap_mpp_set = trap_to_m_w
+                               ? ({30'b0, csr_priv_2} << `RV32GC_MSTATUS_MPP_LSB)
+                               : 32'h0;
+
+    // xRET 本拍要写的 xPP 字段掩码（mret ⇒ MPP；sret ⇒ SPP ⇒ ②：延后一拍施加）
+    wire [31:0] xret_xpp_msk = xret_redirect
+                               ? ((mw_xret_kind == 2'b01) ? MPP_FIELD_MSK
+                                                          : SPP_FIELD_MSK)
+                               : 32'h0;
+    reg  [31:0] xret_xpp_msk_q;      // 上一拍 xRET 的 xPP 清除掩码（寄存器，见 §13）
+
+    assign mstatus_set_fixed = (mstatus_set & ~MPP_FIELD_MSK) | trap_mpp_set;
+    assign mstatus_clr_fixed = (mstatus_clr & ~xret_xpp_msk) |   // ② 本拍先不清 xPP
+                               (trap_to_m_w ? MPP_FIELD_MSK : 32'h0) |  // ① 陷阱 MPP 替换
+                               xret_xpp_msk_q;                  // ② 延后一拍 "xPP ← U"
 
     //==========================================================================
     // 11. AXI 侧：axi_req_desc + axi_master_ctrl + mshr_simple（唯一总线主端口）
@@ -2176,6 +2289,7 @@ module core_top (
             fpu_fflags_q <= 5'd0;
             //------------------------ F 级辅助 ------------------------
             fetch_exc_done_q <= 1'b0;
+            xret_xpp_msk_q   <= 32'h0;      // §10.1 R3②：延后一拍的 xRET xPP 清除掩码
             xip_word_pa_q <= 32'h0; xip_word_data_q <= 32'h0; xip_word_vld_q <= 1'b0;
             xip_req_pend_q <= 1'b0;
             fencei_busy <= 1'b0; fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
@@ -2196,6 +2310,10 @@ module core_top (
         end else begin
             // ================= 默认脉冲清零 =================
             m_done_q          <= 1'b0;
+            // §10.1 R3②：xPP 清除延后一拍施加。★ 仅当本拍**没有**陷阱时才延后：
+            //   若同一拍既提交 xRET 又取陷阱（如中断恰落在 xRET 边界），本拍 mstatus
+            //   归陷阱所有（MPP ← y），此时再延后施加 xRET 的 "xPP←U" 会把它抹掉 ⇒ 门控掉。
+            xret_xpp_msk_q    <= (xret_redirect & ~trap_valid) ? xret_xpp_msk : 32'h0;
             m_ptw_pte_ready_q <= 1'b0;
             m_ptw_pte_resp_v_q<= 1'b0;
             m_ptw_ad_done_q   <= 1'b0;
