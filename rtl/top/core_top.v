@@ -836,7 +836,7 @@ module core_top (
     wire        dec_mret, dec_sret, dec_wfi;
 
     wire        csr_chk_illegal, csr_chk_ro_write;
-    wire [31:0] csr_rdata_raw, csr_rdata_w, csr_mstatus_raw;
+    wire [31:0] csr_rdata_raw, csr_rdata_w, csr_byp_mval, csr_mstatus_raw;
     reg  [4:0]  fflags_r;
     reg  [2:0]  frm_r;
     wire [31:0] menvcfg_cbie_w, senvcfg_cbie_w;
@@ -1094,15 +1094,17 @@ module core_top (
     // ---- 7.8 CSR（Zicsr）：读旧值 / 算新值；旧值随指令流水到 W 写回 rd ----
     //   csr_file.rdata 为组合读；CSR 写在 **W 拍末**才落 csr_file 寄存器
     //   ⇒ "写指令 → E 级读"的同拍旁路必须**两级**（写指令在 M 或在 W）：
-    //     · M 级写（写指令在 M、读指令在 E）：取 `em_csr_wdata`（= E 级算出的 csr_new_e）
-    //     · W 级写（写指令在 W、读指令在 E）：取 `mw_csr_wdata`（= 本拍末落盘的新值）
-    //   ★ 2026-09-15 本任务实测（csr_hazard 分歧根因）：**`csr_file` 的写口旁路读
-    //     `rdata_w` 不能充当旁路值** —— 它 case(waddr) 取的是**寄存器现值**
-    //     （mscratch 落在 default ⇒ `rdata_r`），即写落地（posedge）之前的旧值；
-    //     当 `raddr == waddr`（正是旁路判定的条件）时 `rdata_w == rdata`，等价于没有旁路。
-    //     实测：`csrrw t0,mscratch,s6` 在 W 拍时 de_csr_addr = mw_csr_addr = 0x340、
-    //     `csr_wen_w`=1 ⇒ 旧表达式选中 `rdata_w`，而 rdata = rdata_raw = rdata_w = 旧值(0)
-    //     ⇒ 紧邻 `csrr a0,mscratch` 读到 0（Spike 为 0x1111_1000）。⇒ 两级旁路一律取**写数据**。
+    //     · M 级写（写指令在 M、读指令在 E）：取 `csr_byp_mval`
+    //     · W 级写（写指令在 W、读指令在 E）：取 `csr_rdata_w`
+    //   ★ 2026-09-15 第二轮修复（WARL 残留根治）：**两级旁路一律取 csr_file 的
+    //     post-WARL 落盘值**，不再取"原始写数据"：
+    //       · `csr_rdata_w` = csr_file 写口旁路读：raddr==waddr 时返回该 CSR 的落盘值；
+    //       · `csr_byp_mval` = csr_file 的 M 级旁路预览：把 `em_csr_wdata` 写进
+    //         de_csr_addr 之后的**读回值**（同一 WARL 引擎 csr_landing）。
+    //     旧写法（M/W 都取写数据）会绕过全部 WARL ⇒ `csrw mtvec,0x8000_0002` 后紧邻
+    //     `csrr` 实测 DUT 读回 0x8000_0002 而 Spike 为 0x8000_0000（k=0 分歧）；
+    //     mepc/sepc bit0、medeleg/mideleg 实现位、PMP L 锁定、misa/mcountinhibit/
+    //     mhpmevent 吞写、menvcfg.CBIE 同理。
     //   门控口径（与真实落盘条件逐字对齐）：
     //     · M 级 = `em_valid`（槽有效）∧ `em_csr_we`（确会写；已含 ~e_ill_total/~de_exc_valid）
     //             ∧ `~em_exc_valid`（自身不带异常）。CSR 指令 `m_is_mem=0` ⇒ 不会产生
@@ -1126,7 +1128,8 @@ module core_top (
     wire        csr_byp_hit = csr_em_hit | csr_mw_hit;
     //   ★ 优先级 **M > W**：两条写指令同拍命中同一地址时，M 槽那条**更年轻**
     //     （W 槽比 M 槽老一拍）⇒ E 级读必须看到更年轻那条的新值（程序序在后的写在后）。
-    wire [31:0] csr_byp_val = csr_em_hit ? em_csr_wdata : mw_csr_wdata;
+    //     两个候选值都是 csr_file 的 post-WARL 落盘值（见 §7.8 注释）。
+    wire [31:0] csr_byp_val = csr_em_hit ? csr_byp_mval : csr_rdata_w;
     wire [31:0] csr_base_rd = csr_byp_hit ? csr_byp_val : csr_rdata_raw;
 
     //   mstatus/sstatus 的 FS/SD 位由 core_top 持有 ⇒ 读路径覆盖（csr_file 内那份同步被遮盖）。
@@ -1682,9 +1685,12 @@ module core_top (
     .waddr       (mw_csr_addr),
     .wdata       (mw_csr_wdata),
     .w_illegal   (1'b0),
-    //   `rdata_w` 保留连接但**不再用作旁路值**：它是 waddr 视角的**寄存器现值**
-    //   （写落地前），raddr == waddr 时与 rdata 等值 ⇒ 无旁路效果（见 §7.8 的实测说明）。
+    //   `rdata_w` = 写口旁路读（raddr==waddr ⇒ 该 CSR 的 **post-WARL 落盘值**），
+    //   用作 **W 级**旁路值；`byp_rdata` 是同一 WARL 引擎对**更年轻的 M 级写**
+    //   （byp_wdata = 本拍 M 槽的原始写数据）的预览，用作 **M 级**旁路值（M > W）。
     .rdata_w     (csr_rdata_w),
+    .byp_wdata   (em_csr_wdata),
+    .byp_rdata   (csr_byp_mval),
     .priv        (csr_priv_2),
     .chk_addr    (dec_csr_addr),
     .chk_illegal (csr_chk_illegal),
