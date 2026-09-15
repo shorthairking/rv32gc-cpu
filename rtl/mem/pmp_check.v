@@ -366,20 +366,41 @@ module pmp_check #(
     wire [3:0]             sel_idx;
 
     // 5.1 计算每项的「之前均无命中」条件
+    //   语义：no_prior_hit[i] = 「项 0..i-1 **全部**未命中该笔的任一字节」
+    //                        = ~|{ent_any[i-1], …, ent_any[0]}（i=0 恒 1）
+    //   ★ 拆环（2026-09-15，Verilator UNOPTFLAT）：原写法逐位递推
+    //       assign no_prior_hit[0] = 1'b1;
+    //       assign no_prior_hit[gj] = no_prior_hit[gj-1] && !ent_any[gj-1];
+    //     使**同一向量既被读又被写**，Verilator 5.020 无法证明其逐位无环 ⇒ 判为组合
+    //     自环（独立例化 pmp_check 即告警：`pmp_check.no_prior_hit` 自引用，
+    //     例化路径 no_prior_hit → ASSIGNW(370) → no_prior_hit）。
+    //     现改为**直接对 ent_any 的前 i 项做归约或**：不再出现任何信号自引用，
+    //     语义与递推严格等价（归纳：i=0 ⇒ 1；i→i+1 恰好多与一项 !ent_any[i]）。
+    //     仍为纯 assign + generate（无 always，符合本文件风格纪律）。
+    wire [PMP_ENTRIES-1:0] any_flat;       // ent_any 的**紧凑视图**（归约与 one-hot 选择共用）
+    genvar ga;
+    generate
+        for (ga = 0; ga < PMP_ENTRIES; ga = ga + 1) begin : G_ANYFLAT
+            assign any_flat[ga] = ent_any[ga];
+        end
+    endgenerate
+
     wire [PMP_ENTRIES-1:0] no_prior_hit;   // 第 i 位 = 项 0..i-1 全未命中
     assign no_prior_hit[0] = 1'b1;
     genvar gj;
     generate
         for (gj = 1; gj < PMP_ENTRIES; gj = gj + 1) begin : G_PRIO
-            // no_prior_hit[i] = no_prior_hit[i-1] && !ent_any[i-1]
-            assign no_prior_hit[gj] = no_prior_hit[gj-1] && !ent_any[gj-1];
+            // 等价式（不读自身）：no_prior_hit[i] = ~|any_flat[i-1:0]
+            assign no_prior_hit[gj] = ~|any_flat[gj-1:0];
         end
     endgenerate
 
     genvar gk;
     generate
         for (gk = 0; gk < PMP_ENTRIES; gk = gk + 1) begin : G_SEL
-            assign sel_onehot[gk] = no_prior_hit[gk] && ent_any[gk];
+            // 用 any_flat（紧凑视图）而非 ent_any：与上式共用同一份位视图，
+            //   且使最高位 any_flat[PMP_ENTRIES-1] 亦被读取（避免未用位告警）。
+            assign sel_onehot[gk] = no_prior_hit[gk] && any_flat[gk];
         end
     endgenerate
 

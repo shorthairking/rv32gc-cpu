@@ -21,6 +21,10 @@
 //     常量用 RV32GC_AMO_*（5 位）。见 rv32_defs.vh §3.8。
 //   * Zicbom 的 **cbo.clean/flush/inval 靠 rs2 区分**（funct7 相同）——
 //     **不得只看 funct7**。见 rv32_defs.vh §3.11 的「★ 关键」。
+//   * **funct7/funct5 判别一律先限定主 opcode 家族**：同一 f7 值在不同族下语义不同
+//     （典型：OP 的 sub 用 f7=0100000；而 OP-IMM 的 addi 其 imm[11:5] 恰好也落在
+//     insn[31:25] ⇒ f7=0100000，跨族判据会把 imm∈[0x400,0x41F] 的 addi 误译成 sub）。
+//     本文件的口径：每个 f7/funct5 判据都写成 `is_<族> & (f7 == ...)`（见 §4/§7）。
 //   * 非法指令 ⇒ `ill_instr=1` 且 **tval_o = 原始指令位**（16 位压缩指令也右对齐、
 //     高位清零）——口径 T1（本设计选择实现，右对齐、高位清零）。
 //   * **写只读 CSR ⇒ 非法指令**（Zicsr）；`CSRRS/CSRRC` 且 rs1=x0 **不写** CSR。
@@ -581,13 +585,19 @@ module decoder (
             // 移位类：由 f3 区分
             (f3 == `RV32GC_F3_SLLI || f3 == `RV32GC_F3_SLL) ? ALU_SLL :
             (f3 == `RV32GC_F3_SRLI_SRAI || f3 == `RV32GC_F3_SRL_SRA) ? (
-                // srai 由 f7 区分（OP-IMM）/ sra 由 f7 区分（OP）
-                ((f7 == `RV32GC_F7_SRAI) | (f7 == `RV32GC_F7_OP_ALT)) ? ALU_SRA :
-                                                                        ALU_SRL
+                // ★ **必须分域**：OP-IMM 的 srai 用 F7_SRAI、OP 的 sra 用 F7_OP_ALT。
+                //   两者数值同为 7'b0100000，但判据各自只在其主 opcode 家族内有效；
+                //   不得写成「f7 命中任一常量即 SRA」的跨族判据（见下 add/sub 的同族缺陷）。
+                ((is_opimm & (f7 == `RV32GC_F7_SRAI)) |
+                 (is_op    & (f7 == `RV32GC_F7_OP_ALT))) ? ALU_SRA :
+                                                           ALU_SRL
             ) :
             (f3 == `RV32GC_F3_ADD_SUB) ? (
-                // sub 由 f7 区分（OP）；OP-IMM 的 addi 恒 ADD
-                (f7 == `RV32GC_F7_OP_ALT) ? ALU_SUB : ALU_ADD
+                // sub 只在 **OP**（f3=000 且 f7=0100000）成立；OP-IMM 的 addi 恒 ADD。
+                //   ★ 禁止只看 f7：addi 的 imm[11:5] 就是 insn[31:25]（=f7 域），
+                //     imm ∈ [0x400,0x41F] ⇒ f7=0100000 ⇒ 旧代码误判为 sub
+                //     （2026-09-15 修复；穷举扫描 16384 例仅此 1 处跨族误判）。
+                (is_op & (f7 == `RV32GC_F7_OP_ALT)) ? ALU_SUB : ALU_ADD
             ) :
             (f3 == `RV32GC_F3_SLTI)  ? ALU_SLT  :
             (f3 == `RV32GC_F3_SLTIU) ? ALU_SLTU :

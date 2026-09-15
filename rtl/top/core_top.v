@@ -2283,10 +2283,21 @@ module core_top (
             end
 
             // ================= (5) MW（M→W）=================
-            //   `mw_cap` 在 trap/fence.i 拍也必须写（把 mw_valid 清 0），
-            //    否则 W 槽位会重复提交同一条指令（重复陷阱）。
+            //   ★ **提交即一次**（2026-09-15 修复）：W 是"提交即完成"的单拍槽位
+            //     （08 §5.6①：W 级**无背压**），因此 `mw_valid` 只允许在
+            //     **本拍确实换人**时为 1，其余拍一律清 0：
+            //         换人 ⟺ mw_cap（M 槽指令已完成/让路，且非分支重定向拍）
+            //               ∧ mw_n_valid（M 槽确有指令）
+            //               ∧ pipe_adv（流水本拍推进）
+            //     否则同一指令会滞留在 W 槽并**逐拍重复提交**（instret 多计、CSR/FP
+            //     副作用重复；trap/fence.i 拍还会重复进入陷阱）。
+            //     · 实测触发场景：E 级 MDU/FPU 多拍停顿（pipe_adv=0）而 M 槽指令已完成
+            //       ⇒ 旧代码每拍都把同一条指令重新写进 W。
+            //     · pipe_adv=1 但 mw_cap=0（M 槽空 / 访存在途 / 分支重定向拍）同样清 0。
+            //     · trap/fence.i 拍（kill_young）仍走 mw_cap 分支 —— 与本节原注释
+            //       "trap/fence.i 拍必须写（把 mw_valid 清 0）" 的意图一致。
             if (mw_cap) begin
-                mw_valid        <= mw_n_valid;
+                mw_valid        <= mw_n_valid & pipe_adv;
                 mw_pc           <= em_pc;
                 mw_pc_next      <= em_pc_next;
                 mw_insn_raw     <= em_insn_raw;
@@ -2313,6 +2324,9 @@ module core_top (
                 mw_exc_tval     <= mw_n_exctval;
                 mw_exc_pc       <= em_pc;
                 mw_exc_is_fetch <= em_exc_is_fetch & mw_n_excv;
+            end else begin
+                // 本拍未换人 ⇒ W 槽不得再持有上一条指令（否则重复提交）
+                mw_valid        <= 1'b0;
             end
 
             // ================= (6) GPR 写 =================

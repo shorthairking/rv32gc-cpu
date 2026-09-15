@@ -576,6 +576,68 @@ module tb_decoder_top;
         `CHK(cbo_downgrade_o === 1'b1,   "U 模式叠加后应降级")
 
         //======================================================================
+        // 5.5 ALU 微操作**分域**回归（OP / OP-IMM：同一 funct7 值不得跨族误判）
+        //======================================================================
+        //   缺陷背景（2026-09-15 修复）：alu_op 的 add/sub 判据原先只看 f7、未限定
+        //   `is_op`。OP-IMM 的 imm[11:5] 就是 insn[31:25]（= f7 域）⇒ `addi` 的
+        //   imm ∈ [0x400,0x41F] 时 f7 = 0100000（= OP 的 sub 判据）被误译成 **SUB**。
+        //   下列用例把该边界（含上下界外与控制例）与"OP 侧判据不得被削弱"固化。
+        //   ★ 编码全部由 riscv32-unknown-linux-gnu-as/-objdump 实测（见每条注释）；
+        //     alu_op 编码沿用 decoder.v §0：ADD=0/SUB=1/SLL=2/SRL=6/SRA=7。
+
+        // ---- (1) addi s0,s0,1024 ⇒ 0x40040413（imm[11:5]=0100000：误译区间下界）----
+        //      ★ 修复前 alu_op=1（SUB）⇒ 实算 0xFFFFFC00；正确为 ADD(0)。
+        drv_m(32'h40040413);
+        `CHK(ill_instr_o === 1'b0,       "addi imm=0x400 不应非法")
+        `CHK(imm_o === 32'd1024,         "addi imm=0x400 应立即数 1024")
+        `CHK(alu_op_o === 4'd0,          "addi imm=0x400 应为 ALU_ADD（非 SUB）")
+
+        // ---- (2) addi s0,s0,1055 ⇒ 0x41F40413（imm[11:5]=0100000：误译区间上界）----
+        drv_m(32'h41F40413);
+        `CHK(ill_instr_o === 1'b0,       "addi imm=0x41F 不应非法")
+        `CHK(imm_o === 32'd1055,         "addi imm=0x41F 应立即数 1055")
+        `CHK(alu_op_o === 4'd0,          "addi imm=0x41F 应为 ALU_ADD（非 SUB）")
+
+        // ---- (3) 区间外两侧（控制例）：imm=1023（f7=0x1F）与 imm=1056（f7=0x21）----
+        drv_m(32'h3FF40413);             // addi s0,s0,1023
+        `CHK(alu_op_o === 4'd0,          "addi imm=0x3FF 应为 ALU_ADD")
+        drv_m(32'h42040413);             // addi s0,s0,1056
+        `CHK(alu_op_o === 4'd0,          "addi imm=0x420 应为 ALU_ADD")
+
+        // ---- (4) 负立即数边界：imm=-1024 ⇒ 0xC0040413、imm=-993 ⇒ 0xC1F40413 ----
+        //      注：其 imm[11:5]=1100000/1100000... ≠ 0100000 ⇒ 修复前亦不受影响；
+        //          作为"负立即数不得被判成 sub"的常驻锚点保留（防未来回退）。
+        drv_m(32'hC0040413);
+        `CHK(ill_instr_o === 1'b0,       "addi imm=-1024 不应非法")
+        `CHK(imm_o === 32'hFFFFFC00,     "addi imm=-1024 应立即数 0xFFFFFC00")
+        `CHK(alu_op_o === 4'd0,          "addi imm=-1024 应为 ALU_ADD（非 SUB）")
+        drv_m(32'hC1F40413);
+        `CHK(alu_op_o === 4'd0,          "addi imm=-993 应为 ALU_ADD（非 SUB）")
+
+        // ---- (5) OP-IMM 移位族不受影响：srai ⇒ SRA / srli ⇒ SRL / slli ⇒ SLL ----
+        drv_m(32'h40335293);             // srai x5,x6,3（f3=101 f7=0100000）
+        `CHK(ill_instr_o === 1'b0,       "srai 不应非法")
+        `CHK(alu_op_o === 4'd7,          "srai 应为 ALU_SRA")
+        drv_m(32'h00335293);             // srli x5,x6,3（f3=101 f7=0000000）
+        `CHK(alu_op_o === 4'd6,          "srli 应为 ALU_SRL")
+        drv_m(32'h00331293);             // slli x5,x6,3（f3=001 f7=0000000）
+        `CHK(alu_op_o === 4'd2,          "slli 应为 ALU_SLL")
+
+        // ---- (6) OP 侧判据不得被削弱：sub ⇒ SUB / add ⇒ ADD / sra|srl|sll ----
+        drv_m(32'h407302b3);             // sub x5,x6,x7（f3=000 f7=0100000）
+        `CHK(ill_instr_o === 1'b0,       "sub 不应非法")
+        `CHK(alu_op_o === 4'd1,          "sub 应为 ALU_SUB")
+        drv_m(32'h007302b3);             // add x5,x6,x7（f3=000 f7=0000000）
+        `CHK(ill_instr_o === 1'b0,       "add 不应非法")
+        `CHK(alu_op_o === 4'd0,          "add 应为 ALU_ADD")
+        drv_m(32'h407352b3);             // sra x5,x6,x7（f3=101 f7=0100000）
+        `CHK(alu_op_o === 4'd7,          "sra 应为 ALU_SRA")
+        drv_m(32'h007352b3);             // srl x5,x6,x7（f3=101 f7=0000000）
+        `CHK(alu_op_o === 4'd6,          "srl 应为 ALU_SRL")
+        drv_m(32'h007312b3);             // sll x5,x6,x7（f3=001 f7=0000000）
+        `CHK(alu_op_o === 4'd2,          "sll 应为 ALU_SLL")
+
+        //======================================================================
         // 6. 汇总判定（fail-closed）
         //======================================================================
         $display("checks = %0d, fails = %0d", n_checks, n_fail);
