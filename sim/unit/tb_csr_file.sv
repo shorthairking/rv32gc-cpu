@@ -9,6 +9,10 @@
 //             不报非法、读 0）—— arch-test 启动硬要求（08 §8.2.1(b)）；
 //           ④ medeleg 高半在 RV32 经 medelegh 别名（写被忽略、读 0）；
 //           ⑤ mip 的 SEIP/STIP/SSIP 软件可写、MEIP/MTIP/MSIP 只读（设备驱动）。
+//           ⑥ **陷阱/xRET 的 mstatus 语义闭环**（R3 根因修复；§S）：csr_file 与
+//             priv_ctrl 接成与 core_top 相同的回路，验证「同拍读视图 = 陷阱前值」
+//             （xIE/xPIE/xPP/MIE/SIE 不被同拍 clr/set 污染）、陷阱入口
+//             xPP ← y / xPIE ← xIE 的**替换**语义、以及 xRET 后特权级与 MPP 读回。
 // 怎么判  : 每条用 expect_eq32()/expect_eq1() 断言具体数值，失败即 $fatal（非零退出）。
 //           **兜底分支绝不打印 PASS**；全部检查走完才打印末行 `TB_CSR_FILE_UNIT: PASS`。
 // 失败长什么样: 打印 `TB_CSR_FILE FAIL: <项> got=... exp=...` 后 $fatal(1, "TB_CSR_FILE_UNIT: FAIL")，
@@ -50,6 +54,22 @@ module tb_csr_file_top;
     wire [31:0] satp_o, menvcfg_o, senvcfg_o, mcounteren_o, scounteren_o;
     wire [31:0] mtvec_o, stvec_o, medeleg_o, mideleg_o, mie_o, mip_o;
 
+    //--------------------------------------------------------------------------
+    // ★ R3 根因修复的闭环验证件（§S）：把 csr_file 的**读视图**与 priv_ctrl 的
+    //   判定接成与 core_top §10 相同的回路：
+    //       mstatus_o → priv_ctrl.mstatus_i → mstatus_set/clr → csr_file 落地
+    //   注入点用 OR 合并：priv_ctrl 在无陷阱/xRET 时输出恒 0 ⇒ 既有用例
+    //   （§A–§R）语义逐字不变（本 TB 其余部分仍按原样直接驱动 mstatus_set/clr）。
+    //--------------------------------------------------------------------------
+    wire [31:0] pc_set, pc_clr;
+    reg         pc_trap_valid = 1'b0;
+    reg  [1:0]  pc_trap_target = `RV32GC_PRIV_M;
+    reg         pc_xret_valid = 1'b0;
+    reg  [1:0]  pc_xret_kind = 2'b01;      // 01=mret 00=sret
+    wire [1:0]  pc_priv_o, pc_eff_priv_o, pc_priv_next_o, pc_mpp_o;
+    wire        pc_mprv_o, pc_sum_o, pc_mxr_o, pc_tvm_o, pc_tw_o, pc_tsr_o;
+    wire        pc_fetch_m, pc_flush_req;
+
     csr_file dut (
         .clk(clk), .rst_n(rst_n),
         .raddr(raddr), .rdata(rdata),
@@ -58,7 +78,7 @@ module tb_csr_file_top;
         .priv(priv),
         .chk_addr(chk_addr), .chk_illegal(chk_illegal), .chk_ro_write(chk_ro_write),
         .mstatus_o(mstatus_o),
-        .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
+        .mstatus_set(mstatus_set | pc_set), .mstatus_clr(mstatus_clr | pc_clr),
         .trap_we(trap_we), .trap_epc_i(trap_epc_i), .trap_cause_i(trap_cause_i),
         .trap_tval_i(trap_tval_i), .trap_data_i(trap_data_i),
         .irq_msip(irq_msip), .irq_mtip(irq_mtip), .irq_meip(irq_meip),
@@ -70,6 +90,20 @@ module tb_csr_file_top;
         .mtvec_o(mtvec_o), .stvec_o(stvec_o),
         .medeleg_o(medeleg_o), .mideleg_o(mideleg_o),
         .mie_o(mie_o), .mip_o(mip_o)
+    );
+
+    // ---- 特权级/陷阱语义私有控制器（与 core_top 同口径；csr_wen 旁路一并接上）----
+    priv_ctrl u_pc (
+        .clk(clk), .rst_n(rst_n),
+        .trap_valid(pc_trap_valid), .trap_target(pc_trap_target),
+        .xret_valid(pc_xret_valid), .xret_kind(pc_xret_kind),
+        .mstatus_i(mstatus_o), .csr_wen(wen), .csr_waddr(waddr), .csr_wdata(wdata),
+        .mstatus_set(pc_set), .mstatus_clr(pc_clr),
+        .priv_o(pc_priv_o), .eff_priv_o(pc_eff_priv_o), .mprv_o(pc_mprv_o),
+        .sum_o(pc_sum_o), .mxr_o(pc_mxr_o), .mpp_o(pc_mpp_o),
+        .tvm_o(pc_tvm_o), .tw_o(pc_tw_o), .tsr_o(pc_tsr_o),
+        .fetch_priv_is_m_o(pc_fetch_m), .flush_req(pc_flush_req),
+        .priv_next_o(pc_priv_next_o)
     );
 
     //--------------------------------------------------------------------------
@@ -512,6 +546,130 @@ module tb_csr_file_top;
         csr_write(`RV32GC_CSR_PMPADDR0, 32'h0000_1234);
         csr_read_chk("L 项自身的 pmpaddr 仍可写（本设计口径）",
                      `RV32GC_CSR_PMPADDR0, 32'h0000_1234);
+
+        //======================================================================
+        // S. 【R3 根因修复】陷阱/xRET 的 mstatus 语义 —— csr_file×priv_ctrl 闭环
+        //    ISA norm:mstatusxpiexiexpptrap_op：
+        //      「When a trap is taken from privilege mode y into privilege mode x,
+        //        xPIE is set to the value of xIE; xIE is set to 0; xPP is set to y」
+        //    ISA norm:mstatusxretop：
+        //      「xIE ← xPIE; privilege ← xPP; xPIE ← 1; xPP ← U」
+        //    ★ 本节的"同拍读视图"用例是**反证实验**：若 csr_file 的 `mstatus_o` 含
+        //      同拍的 clr/set，则本拍读到的 MIE/MPP/SIE/SPP 已是"更新后"的值，
+        //      本节断言必须 FAIL（且 §S3 的 mret 目标会错成 U）。
+        //======================================================================
+        priv = `RV32GC_PRIV_M;
+        //   ---- S0：csr_file + priv_ctrl 同步复位 ----
+        rst_n = 0; repeat(4) @(posedge clk); #1;
+        rst_n = 1; repeat(2) @(posedge clk); #1;
+        csr_read_chk("S0 复位 mstatus=0", `RV32GC_CSR_MSTATUS, 32'h0);
+        expect_eq32("S0 priv_ctrl 复位后特权级 = M", {30'b0, pc_priv_o}, 32'h3);
+
+        //   ---- S1：mstatus 基线：MIE=1、SIE=1（MPIE/MPP/SPP 复位为 0）----
+        csr_write(`RV32GC_CSR_MSTATUS,
+                  (32'h1 << `RV32GC_MSTATUS_MIE_BIT) | (32'h1 << `RV32GC_MSTATUS_SIE_BIT));
+        csr_read_chk("S1 mstatus 基线 MIE=1/SIE=1",
+                     `RV32GC_CSR_MSTATUS,
+                     (32'h1 << `RV32GC_MSTATUS_MIE_BIT) | (32'h1 << `RV32GC_MSTATUS_SIE_BIT));
+
+        //   ---- S2：陷阱进入 M（读视图必须是**陷阱前**值；落地是替换语义）----
+        @(negedge clk); pc_trap_valid = 1'b1; pc_trap_target = `RV32GC_PRIV_M; #1;
+        expect_eq1("★ S2 同拍读视图：MIE 仍为陷阱前值 1（未被同拍 clr 污染）",
+                   mstatus_o[`RV32GC_MSTATUS_MIE_BIT], 1'b1);
+        expect_eq32("★ S2 同拍读视图：MPP 仍为陷阱前值 U(0)（未被同拍 set 污染）",
+                    (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h0);
+        expect_eq1("★ S2 同拍读视图：MPIE 仍为陷阱前值 0（未被同拍 set 污染）",
+                   mstatus_o[`RV32GC_MSTATUS_MPIE_BIT], 1'b0);
+        @(posedge clk); #1;
+        @(negedge clk); pc_trap_valid = 1'b0; @(posedge clk); #1;
+        expect_eq32("★ S2 陷阱后 MPP ← y = M(3)（陷阱前 MPP=0 不得残留）",
+                    (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h3);
+        expect_eq1("★ S2 陷阱后 MPIE ← MIE(1)（同拍取陷阱前值；旧实现恒 0）",
+                   mstatus_o[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
+        expect_eq1("S2 陷阱后 MIE ← 0",
+                   mstatus_o[`RV32GC_MSTATUS_MIE_BIT], 1'b0);
+        expect_eq32("S2 陷阱后 priv_ctrl 特权级 = M（陷阱目标）",
+                    {30'b0, pc_priv_o}, 32'h3);
+        csr_read_chk("S2 CSR 读 mstatus：MPP=3/MPIE=1/MIE=0/SIE=1",
+                     `RV32GC_CSR_MSTATUS,
+                     (32'h3 << `RV32GC_MSTATUS_MPP_LSB) |
+                     (32'h1 << `RV32GC_MSTATUS_MPIE_BIT) |
+                     (32'h1 << `RV32GC_MSTATUS_SIE_BIT));
+
+        //   ---- S3：mret ⇒ 特权级 = MPP(前值 = M)、MPP ← U、MPIE ← 1、MIE ← MPIE ----
+        @(negedge clk); pc_xret_valid = 1'b1; pc_xret_kind = 2'b01; #1;
+        expect_eq32("★ S3 同拍读视图：MPP 仍为 3（mret 的 clr 不得污染本拍目标）",
+                    (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h3);
+        expect_eq32("★ S3 同拍：priv_next = MPP = M",
+                    {30'b0, pc_priv_next_o}, 32'h3);
+        @(posedge clk); #1;
+        @(negedge clk); pc_xret_valid = 1'b0; @(posedge clk); #1;
+        expect_eq32("★ S3 mret 后特权级 = M（旧实现读被清掉的 MPP ⇒ 落到 U，必 FAIL）",
+                    {30'b0, pc_priv_o}, 32'h3);
+        expect_eq32("★ S3 mret 后 MPP 读回 = U(0)",
+                    (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h0);
+        expect_eq1("S3 mret 后 MPIE = 1",
+                   mstatus_o[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
+        expect_eq1("S3 mret 后 MIE ← MPIE(1) = 1",
+                   mstatus_o[`RV32GC_MSTATUS_MIE_BIT], 1'b1);
+
+        //   ---- S4：S 侧 —— mret(MPP=S) 降到 S；sret(SPP=0) 再降到 U ----
+        csr_write(`RV32GC_CSR_MSTATUS,
+                  (32'h1 << `RV32GC_MSTATUS_MPP_LSB)   |
+                  (32'h1 << `RV32GC_MSTATUS_MPIE_BIT)  |
+                  (32'h1 << `RV32GC_MSTATUS_SIE_BIT)   |
+                  (32'h1 << `RV32GC_MSTATUS_SPP_BIT));      // SPP=1（故意留残留）
+        @(negedge clk); pc_xret_valid = 1'b1; pc_xret_kind = 2'b01;
+        @(posedge clk); #1;
+        @(negedge clk); pc_xret_valid = 1'b0; @(posedge clk); #1;
+        expect_eq32("★ S4 mret(MPP=S) 后特权级 = S", {30'b0, pc_priv_o}, 32'h1);
+        expect_eq32("S4 mret 后 MPP 读回 = U(0)",
+                    (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h0);
+        //   sstatus 写：SIE=1、SPP=0、SPIE=0
+        csr_write(`RV32GC_CSR_SSTATUS, (32'h1 << `RV32GC_MSTATUS_SIE_BIT));
+        @(negedge clk); pc_xret_valid = 1'b1; pc_xret_kind = 2'b00;
+        @(posedge clk); #1;
+        @(negedge clk); pc_xret_valid = 1'b0; @(posedge clk); #1;
+        expect_eq32("★ S4 sret(SPP=0) 后特权级 = U", {30'b0, pc_priv_o}, 32'h0);
+        expect_eq1("S4 sret 后 SPIE = 1",
+                   mstatus_o[`RV32GC_MSTATUS_SPIE_BIT], 1'b1);
+        expect_eq1("S4 sret 后 SIE ← 旧 SPIE(0) = 0",
+                   mstatus_o[`RV32GC_MSTATUS_SIE_BIT], 1'b0);
+        expect_eq1("S4 sret 后 SPP ← U(0)",
+                   mstatus_o[`RV32GC_MSTATUS_SPP_BIT], 1'b0);
+
+        //   ---- S5：U→S 委托陷阱 ⇒ SPP ← y = U(0)（旧 SPP=1 不得残留）----
+        csr_write(`RV32GC_CSR_SSTATUS,
+                  (32'h1 << `RV32GC_MSTATUS_SIE_BIT) |
+                  (32'h1 << `RV32GC_MSTATUS_SPP_BIT));      // 残留 SPP=1、SIE=1
+        @(negedge clk); pc_trap_valid = 1'b1; pc_trap_target = `RV32GC_PRIV_S; #1;
+        expect_eq1("★ S5 同拍读视图：SIE 仍为陷阱前值 1",
+                   mstatus_o[`RV32GC_MSTATUS_SIE_BIT], 1'b1);
+        expect_eq1("★ S5 同拍读视图：SPP 仍为陷阱前值 1（未被同拍 clr 污染）",
+                   mstatus_o[`RV32GC_MSTATUS_SPP_BIT], 1'b1);
+        @(posedge clk); #1;
+        @(negedge clk); pc_trap_valid = 1'b0; @(posedge clk); #1;
+        expect_eq1("★ S5 陷阱后 SPP ← y = U(0)（旧实现只置位 ⇒ 残留 1，必 FAIL）",
+                   mstatus_o[`RV32GC_MSTATUS_SPP_BIT], 1'b0);
+        expect_eq1("★ S5 陷阱后 SPIE ← 旧 SIE(1)",
+                   mstatus_o[`RV32GC_MSTATUS_SPIE_BIT], 1'b1);
+        expect_eq1("S5 陷阱后 SIE ← 0",
+                   mstatus_o[`RV32GC_MSTATUS_SIE_BIT], 1'b0);
+        expect_eq32("S5 陷阱后 priv_ctrl 特权级 = S（委托目标）",
+                    {30'b0, pc_priv_o}, 32'h1);
+        csr_read_chk("S5 sstatus 视图：SPIE=1/SIE=0/SPP=0",
+                     `RV32GC_CSR_SSTATUS,
+                     (32'h1 << `RV32GC_MSTATUS_SPIE_BIT));
+
+        //   ---- S6：S→S（水平委托）陷阱 ⇒ SPP ← y = S(1) ----
+        csr_write(`RV32GC_CSR_SSTATUS,
+                  (32'h1 << `RV32GC_MSTATUS_SIE_BIT));      // SIE=1、SPP=0、SPIE=0
+        @(negedge clk); pc_trap_valid = 1'b1; pc_trap_target = `RV32GC_PRIV_S; #1;
+        @(posedge clk); #1;
+        @(negedge clk); pc_trap_valid = 1'b0; @(posedge clk); #1;
+        expect_eq1("★ S6 S→S 陷阱：SPP ← y = S(1)",
+                   mstatus_o[`RV32GC_MSTATUS_SPP_BIT], 1'b1);
+        expect_eq32("S6 陷阱后特权级仍 = S", {30'b0, pc_priv_o}, 32'h1);
 
         //======================================================================
         // 汇总

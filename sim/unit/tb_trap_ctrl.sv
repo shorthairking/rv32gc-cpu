@@ -15,6 +15,9 @@
 //              epc bit0 恒 0；
 //           ⑦ mtval：非法指令写**故障指令位**（T1）右对齐高位清零；其余写 VA；
 //           ⑧ trap_target/epc 的 M/S 侧选择（E6：委托到 S 不写 M 侧）。
+//           ⑨ **陷阱入口 xPP/xPIE/xIE 的置换语义**（R3 根因修复；§I）：
+//              MPP ← 陷阱发生时的特权级 y（M→M ⇒ 3、S→M ⇒ 1）、SPP ← y（U→S ⇒ 0，
+//              旧 SPP=1 不得残留）、MPIE ← MIE 取**陷阱前**值（同拍）。
 // 怎么判  : 每条断言具体数值；失败即 $fatal（非零退出），兜底分支不含 PASS。
 // 失败长什么样: `TB_TRAP FAIL: <项> got=... exp=...` 后 $fatal(1, "TB_TRAP_CTRL_UNIT: FAIL")。
 // 顶层    : tb_trap_ctrl_top（验收命令用 -s tb_trap_ctrl_top）
@@ -478,6 +481,96 @@ module tb_trap_ctrl_top;
         p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_S; #1;
         expect_eq1("目标特权级不变（S→S）⇒ flush_req=0", p_flush_req, 1'b0);
         p_trap_valid = 1'b0; #1;
+
+        //======================================================================
+        // I. 【R3 根因修复】陷阱入口 xPP ← y **替换**语义 + MPIE ← MIE 同拍取前值
+        //    （ISA norm:mstatusxpiexiexpptrap_op：
+        //      「xPIE is set to the value of xIE; xIE is set to 0; xPP is set to y」）
+        //----------------------------------------------------------------------
+        //   旧实现两处错（本轮已在 priv_ctrl.v §3.1 修复）：
+        //     ① xPP 写的是**旧 xPP**（M 侧 `mpp_l` ← mstatus.MPP；S 侧 `f_spp`），
+        //        而规范要求 xPP ← **陷阱发生时的特权级 y**；
+        //     ② 只置位不替换：csr_file 落地是 `(stored & ~clr) | set`（OR 语义）
+        //        ⇒ "置 0"（f_mie=0 / SPP=U）必须显式进 clr，否则旧值残留。
+        //   ★ 本节即**反证实验**：把 priv_ctrl 的 `priv_r` 换回 `mpp_l`/`f_spp`，
+        //     或从 clr 里去掉 MPIE/SPIE/SPP 位，本节断言必须 FAIL。
+        //   （"xRET 后特权级与 MPP 读回"的端到端用例在 tb_csr_file.sv §S，
+        //     那里 csr_file 的存储与 priv_ctrl 的判定接成真实闭环。）
+        //======================================================================
+        //   ---- I0：清起点（复位回 M；复位会清 priv_r 的既有状态）----
+        rst_n = 0; repeat(3) @(posedge clk); #1; rst_n = 1; repeat(2) @(posedge clk); #1;
+        expect_eq32("I0 复位后特权级 = M", {30'b0, p_priv_o}, 32'h3);
+
+        //   ---- I1：M→M 陷阱 ⇒ MPP ← y = M(3)；旧 MPP=U 不得残留 ----
+        p_csr_wen = 1'b0;
+        p_mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_U);
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_M; #1;
+        expect_eq32("★ I1 M→M 陷阱：MPP ← y = M(3)（替换；旧 MPP=U 不残留）",
+                    (p_mstatus_set >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h3);
+        expect_eq1("★ I1 MPP 字段进 clr（先清后置 = 替换，非 OR）",
+                   p_mstatus_clr[`RV32GC_MSTATUS_MPP_LSB], 1'b1);
+        expect_eq1("I1 MPP 高位置位与低位一致（MPP[1]）",
+                   p_mstatus_set[`RV32GC_MSTATUS_MPP_LSB + 1], 1'b1);
+        @(posedge clk); #1; p_trap_valid = 1'b0; #1;
+
+        //   ---- I2 前置：mret(MPP=S) ⇒ 特权级降为 S（合法路径，不依赖委托）----
+        p_mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        p_xret_valid = 1'b1; p_xret_kind = 2'b01; #1;
+        expect_eq32("I2 前置：mret 目标 = MPP = S", {30'b0, p_priv_next_o}, 32'h1);
+        @(posedge clk); #1; p_xret_valid = 1'b0; #1;
+        expect_eq32("I2 前置：mret 后特权级 = S", {30'b0, p_priv_o}, 32'h1);
+
+        //   ---- I2：从 S 陷入 M ⇒ MPP ← y = S(1)（旧实现写旧 MPP=0，必 FAIL）----
+        p_mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_U);
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_M; #1;
+        expect_eq32("★ I2 S→M 陷阱：MPP ← y = S(1)",
+                    (p_mstatus_set >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h1);
+        @(posedge clk); #1; p_trap_valid = 1'b0; #1;
+        expect_eq32("I2 后：特权级 = M（陷阱目标）", {30'b0, p_priv_o}, 32'h3);
+
+        //   ---- I3 前置：sret(SPP=0) ⇒ 特权级降为 U ----
+        //   先制造 "priv = S"：从 M 取一个委托到 S 的陷阱
+        p_mstatus_i = mk_mstatus(1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_U);
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_S; #1;
+        @(posedge clk); #1; p_trap_valid = 1'b0; #1;
+        expect_eq32("I3 前置：M→S 陷阱后特权级 = S", {30'b0, p_priv_o}, 32'h1);
+        p_mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        p_xret_valid = 1'b1; p_xret_kind = 2'b00; #1;
+        expect_eq32("I3 前置：sret(SPP=0) 目标 = U", {30'b0, p_priv_next_o}, 32'h0);
+        @(posedge clk); #1; p_xret_valid = 1'b0; #1;
+        expect_eq32("I3 前置：特权级 = U", {30'b0, p_priv_o}, 32'h0);
+
+        //   ---- I3：U→S 陷阱，mstatus 里旧 SPP=1（S 陷阱残留）⇒ SPP 必须 ← y = U(0) ----
+        p_mstatus_i = mk_mstatus(1'b0, 1'b1, 1'b0, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_S; #1;
+        expect_eq1("★ I3 U→S 陷阱：SPP 字段进 clr（替换语义）",
+                   p_mstatus_clr[`RV32GC_MSTATUS_SPP_BIT], 1'b1);
+        expect_eq1("★ I3 U→S 陷阱：SPP ← y = U(0)（旧实现只置位 ⇒ 残留 1，必 FAIL）",
+                   p_mstatus_set[`RV32GC_MSTATUS_SPP_BIT], 1'b0);
+        expect_eq1("I3 U→S 陷阱：SPIE ← 旧 SIE(1)",
+                   p_mstatus_set[`RV32GC_MSTATUS_SPIE_BIT], 1'b1);
+        expect_eq1("I3 U→S 陷阱：SIE ← 0",
+                   p_mstatus_clr[`RV32GC_MSTATUS_SIE_BIT], 1'b1);
+        @(posedge clk); #1; p_trap_valid = 1'b0; #1;
+        expect_eq32("I3 后：特权级 = S（陷阱目标）", {30'b0, p_priv_o}, 32'h1);
+
+        //   ---- I4：MPIE ← MIE 取**陷阱前**值（同拍）----
+        //   4a：MIE=1、MPIE=0 ⇒ 陷阱后 MPIE 必须 = 1
+        p_mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_U);
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_M; #1;
+        expect_eq1("★ I4a M 陷阱：MPIE ← MIE(1)（同拍取陷阱前值）",
+                   p_mstatus_set[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
+        expect_eq1("I4a M 陷阱：MIE ← 0",
+                   p_mstatus_clr[`RV32GC_MSTATUS_MIE_BIT], 1'b1);
+        @(posedge clk); #1; p_trap_valid = 1'b0; #1;
+        //   4b：MIE=0、MPIE=1（旧值）⇒ MPIE 必须被**清**回 0（替换，不得残留 1）
+        p_mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_U);
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_M; #1;
+        expect_eq1("★ I4b M 陷阱：MPIE ← MIE(0) ⇒ set 里无 MPIE",
+                   p_mstatus_set[`RV32GC_MSTATUS_MPIE_BIT], 1'b0);
+        expect_eq1("★ I4b MPIE 进 clr（替换；旧 MPIE=1 不得残留）",
+                   p_mstatus_clr[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
+        @(posedge clk); #1; p_trap_valid = 1'b0; #1;
 
         //======================================================================
         // 汇总

@@ -160,26 +160,40 @@ module priv_ctrl (
     // 3.1 陷阱入口（06 §3.1；ISA norm:mstatusxpiexiexpptrap_op）
     //   「When a trap is taken from privilege mode y into privilege mode x,
     //     xPIE ← xIE; xIE ← 0; xPP ← y.」
-    //   x=M ⇒ MPIE←MIE, MIE←0, MPP←priv_r（合法化）
-    //   x=S ⇒ SPIE←SIE, SIE←0, SPP←priv_r（压成 1 bit：0=U, 1=S）
+    //   x=M ⇒ MPIE←MIE, MIE←0, MPP←**y = 陷阱发生时的特权级 priv_r**（替换）
+    //   x=S ⇒ SPIE←SIE, SIE←0, SPP←y（压成 1 bit：0=U, 1=S；替换）
     //   注意：**委托到 S 时不写 mcause/mepc/mtval 与 MPP/MPIE**
     //   （norm:trapdelSmodenoMmode）——该判定在 trap_ctrl 里，本模块只给 mstatus 位。
+    //
+    //   ★ 根因修复（2026-09-15，R3 的正确修法；见 core_top.v §10 注）：
+    //     ① **xPP ← y**（= `priv_r`，陷阱发生时的特权级），**不是**旧 xPP：
+    //        旧实现把 `mpp_l`（旧 MPP）当新 MPP、`f_spp` 当新 SPP ⇒ 复位后
+    //        MPP=U 时第一次从 M 进入的陷阱把 MPP 写成 U（mret 后掉进 U）。
+    //     ② **替换语义**：csr_file 的落地是 `(stored & ~clr) | set`（OR 语义），
+    //        故"置 0"（f_mie=0 / SPP=U）必须显式进 clr，否则永远清不掉。
+    //     ③ xPIE←xIE、xPP←y 读的必须是**陷阱前**的值：由 csr_file 的读视图
+    //        不含同拍 clr/set 保证（csr_file.v §5 `mstatus_o`）。
     wire trap_to_s = trap_valid && (trap_target == PRIV_S);
     wire trap_to_m = trap_valid && (trap_target == PRIV_M);
 
+    // ---- M 组：MPIE ← MIE（陷阱前）、MPP ← y（替换）----
     wire [31:0] trap_set_m =
-        trap_to_m ? ((({31'b0, f_mie})  << `RV32GC_MSTATUS_MPIE_BIT) |
-                     (({31'b0, mpp_l})  << `RV32GC_MSTATUS_MPP_LSB)) : 32'h0;
+        trap_to_m ? ((({31'b0, f_mie})      << `RV32GC_MSTATUS_MPIE_BIT) |
+                     (({30'b0, priv_r})     << `RV32GC_MSTATUS_MPP_LSB)) : 32'h0;
     wire [31:0] trap_clr_m =
-        trap_to_m ? (32'h1 << `RV32GC_MSTATUS_MIE_BIT) : 32'h0;
+        trap_to_m ? ((32'h1 << `RV32GC_MSTATUS_MIE_BIT) |
+                     (32'h1 << `RV32GC_MSTATUS_MPIE_BIT) |
+                     (`RV32GC_MSTATUS_MPP_MSK << `RV32GC_MSTATUS_MPP_LSB)) : 32'h0;
+
+    // ---- S 组：SPIE ← SIE（陷阱前）、SPP ← y（替换；U ⇒ 0 / S ⇒ 1）----
+    //   M 不可能委托到 S（norm:trap_never_trans_lower，T5）⇒ y ∈ {U, S}。
     wire [31:0] trap_set_s =
-        trap_to_s ? ((({31'b0, f_sie})  << `RV32GC_MSTATUS_SPIE_BIT) |
-                     (({32'b0, f_spp})  << `RV32GC_MSTATUS_SPP_BIT)) : 32'h0;
-    //   SPP 置为发生陷阱时的特权级（U ⇒ 0/S ⇒ 1；M 不可能委托到 S，见 T5）
-    wire [31:0] trap_set_s2 =
-        trap_to_s ? (({32'b0, (priv_r == PRIV_S)}) << `RV32GC_MSTATUS_SPP_BIT) : 32'h0;
+        trap_to_s ? ((({31'b0, f_sie})                << `RV32GC_MSTATUS_SPIE_BIT) |
+                     (({31'b0, (priv_r == PRIV_S)})   << `RV32GC_MSTATUS_SPP_BIT))  : 32'h0;
     wire [31:0] trap_clr_s =
-        trap_to_s ? (32'h1 << `RV32GC_MSTATUS_SIE_BIT) : 32'h0;
+        trap_to_s ? ((32'h1 << `RV32GC_MSTATUS_SIE_BIT) |
+                     (32'h1 << `RV32GC_MSTATUS_SPIE_BIT) |
+                     (32'h1 << `RV32GC_MSTATUS_SPP_BIT)) : 32'h0;
 
     // 3.2 xRET（ISA norm:mstatusxretop）
     //   「xIE ← xPIE; privilege ← xPP; xPIE ← 1; xPP ← 最低已实现特权级(U);
@@ -214,7 +228,7 @@ module priv_ctrl (
     // ---- ★ P1 落地：xRET 目标 < M ⇒ 清 MPRV（mret 回 M 时 xret_low_priv=0，不清） ----
     wire [31:0] xret_clr_mprv = xret_low_priv ? (32'h1 << `RV32GC_MSTATUS_MPRV_BIT) : 32'h0;
 
-    assign mstatus_set = trap_set_m | trap_set_s | trap_set_s2 | xret_set_m | xret_set_s;
+    assign mstatus_set = trap_set_m | trap_set_s | xret_set_m | xret_set_s;
     assign mstatus_clr = trap_clr_m | trap_clr_s | xret_clr_m | xret_clr_s | xret_clr_mprv;
 
     //==========================================================================

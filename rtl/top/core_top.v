@@ -1603,8 +1603,8 @@ module core_top (
     wire [31:0]  csr_mcounteren, csr_scounteren;
     wire [31:0]  csr_mtvec, csr_stvec, csr_medeleg, csr_mideleg, csr_mie, csr_mip;
     wire [31:0]  mstatus_set, mstatus_clr;
-    //   ★ R3 修正后的 mstatus 置位/清除向量（定义见 §10.1；csr_file 用这一对）
-    wire [31:0]  mstatus_set_fixed, mstatus_clr_fixed;
+    //   ★ mstatus 的置位/清除向量由 priv_ctrl 产生，**直接**送 csr_file 落地
+    //     （顶层不再做任何纠正/改写；见 §10 的 R3 根因修复说明）。
     wire         priv_flush_req;
     wire [1:0]   priv_next;
     wire         csr_fetch_is_m;
@@ -1630,8 +1630,8 @@ module core_top (
     .chk_illegal (csr_chk_illegal),
     .chk_ro_write(csr_chk_ro_write),
     .mstatus_o   (csr_mstatus_raw),
-    .mstatus_set (mstatus_set_fixed),
-    .mstatus_clr (mstatus_clr_fixed),
+    .mstatus_set (mstatus_set),
+    .mstatus_clr (mstatus_clr),
     .trap_we     (trap_we),
     .trap_epc_i  (trap_epc_i),
     .trap_cause_i(trap_cause_i),
@@ -1761,66 +1761,22 @@ module core_top (
                                              fencei_pc_q;
 
     //==========================================================================
-    // 10.1 ★ 陷阱入口 mstatus.MPP 修正 + xRET 的 xPP「读/写分拍」（2026-09-15 修复 R3）
+    // 10.1 xPP（xPP/xPIE/xIE）陷阱语义 —— 根因已在子模块修复，顶层**无**纠正层
     //--------------------------------------------------------------------------
-    //   【现象】（/tmp 探针实测）：ebreak 陷阱进入 M 处理器、处理器末尾 mret ⇒
-    //   mret 之后特权级变成 **U**（csr_priv_2 观测为 0）⇒ 返回目标的第一条**取指**
-    //   被 PMP 拒（U/S 模式无匹配 PMP 项即拒绝；复位后 pmpcfg 全 0）⇒ mcause=1
-    //   （instruction access fault）、mepc = 返回目标 ⇒ 再陷入死循环，UART 串永远
-    //   打不完：「陷阱 + mret」的自然流程整体不可用（R2 的"返回地址==mepc"即使对了
-    //   也无法端到端验证）。
-    //   【根因】两处，均在**本任务文件范围之外**（rtl/csr/priv_ctrl.v 与 csr_file.v），
-    //     故按规范在此纠正：
-    //     ① priv_ctrl 的 `trap_set_m` 把**旧 MPP**（`mpp_l` ← mstatus.MPP）当作新
-    //        MPP；而它自己注释引用的规范条文（norm:mstatusxpiexiexpptrap_op）要求
-    //        「xPP ← **陷阱发生时的特权级 y**」。复位后 MPP=U(0) ⇒ 第一次从 M 进入的
-    //        陷阱把 MPP 写成 U。
-    //     ② csr_file 的 `mstatus_o = (mstatus_view & ~clr) | set`（**读视图**）被
-    //        **同拍**的陷阱/xRET 置位/清除向量污染；而 priv_ctrl 正是用这个视图的
-    //        xPP 决定 xRET 的目标特权级 ⇒ mret 读到的是**它自己刚清掉的** MPP(0)
-    //        ⇒ priv_next 恒为 U（实测 MON_XRET：stored MPP=3 但读视图 MPP=0）。
-    //        再叠加 csr_file 落地是 OR 语义（`(mstat_sw & ~clr) | set`），陷阱入口
-    //        只清 MIE ⇒ MPP 实为「旧|新」，必须**先清后置**才是替换。
-    //   【处置】顶层只重写 **xPP 字段**（M 侧 MPP / S 侧 SPP）的读-写时序：
-    //     · 陷阱委托到 M ⇒ 清 MPP 字段并置为当前特权级 y（替换语义，纠正 ①）；
-    //     · xRET ⇒ 本拍**不**在清除向量里动 xPP（使 priv_ctrl 本拍读到**存储值**，
-    //       mret 的目标特权级因此正确），把"xPP ← U"的清除**延后一拍**施加（纠正 ②）。
-    //       mret 用 MPP、sret 用 SPP，走同一份掩码逻辑（kind 选择）。
-    //       延后不可观察：xRET/陷阱拍 kill_young 已清空 M/E/D 槽，重定向后第一条
-    //       指令至少还要走完 F→D→E 三级才可能取样 CSR 读（更晚才可能提交），而
-    //       xPP 清除在**下一拍边沿**就已写入 mstat_sw ⇒ 任何软件可见的读都拿到 U
-    //       （= 规范要求的 xRET 之后 xPP 值）。
-    //     · MIE/MPIE/SIE/SPIE 等其余位与 S 侧陷阱入口仍由 priv_ctrl 负责（行为不变）。
-    //   ★ 这是**根因不在本文件**的临时纠正：正确修法是
-    //     ① priv_ctrl.v 的 `trap_set_m` 改用陷阱发生时的特权级，并把 M 组 MPIE←MIE
-    //        一并改成「先清后置」（同受 OR 语义影响）；
-    //     ② csr_file.v 的 `mstatus_o` 读视图改为**不含**同拍 clr/set 的存储视图
-    //        （置位/清除只作用于写入）。
-    //     ③ 另有同类残留（本段未处理，如实登记、不在本次验收路径上）：陷阱委托到 S 的
-    //        SPP 也是"只置位不替换"（`trap_set_s2` 只置 SPP，SPP 从不清）⇒ 从 U 陷入时
-    //        若旧 SPP=1 会残留 1；S 组 MPIE/SPIE 的 OR 语义同理。
-    //     那两处修好后，本段可整段删除。
+    //   【历史】上一轮（2026-09-15 R3）曾在此加过一段"xPP 读-写时序纠正层"：
+    //   顶层改写 priv_ctrl 送来的 mstatus 置位/清除向量（陷阱 MPP 替换 + 把
+    //   "xRET ⇒ xPP←U" 的清除延后一拍，寄存器 `xret_xpp_msk_q`），以绕过两处
+    //   **子模块根因**：
+    //     ① priv_ctrl `trap_set_m` 把**旧 MPP** 当新 MPP（规范要求 xPP ← 陷阱发生
+    //        时的特权级 y）；S 组 SPP 亦为"只置位不替换"；
+    //     ② csr_file `mstatus_o = (view & ~clr) | set`：**读视图**被同拍 clr/set
+    //        污染 ⇒ priv_ctrl 同一拍读到的 xIE/xPIE/xPP 是"更新后"的值
+    //        （MPIE 恒 0、MIE 恒 1、mret 读到被自己清掉的 MPP ⇒ 目标恒 U）。
+    //   【现状】两处根因已按规范修好（priv_ctrl.v §3.1 替换语义 + 读**前值**；
+    //   csr_file.v §5 读视图不含同拍 clr/set）⇒ 纠正层**整段删除**，`mstatus_set`/
+    //   `mstatus_clr` 由 priv_ctrl 直连 csr_file（见 §10 例化处）。收益：三层组合环
+    //   （priv_ctrl ↔ csr_file ↔ trap_ctrl）一并消除（Verilator UNOPTFLAT -3）。
     //==========================================================================
-    localparam [31:0] MPP_FIELD_MSK =
-        (`RV32GC_MSTATUS_MPP_MSK << `RV32GC_MSTATUS_MPP_LSB);
-    localparam [31:0] SPP_FIELD_MSK = (32'h1 << `RV32GC_MSTATUS_SPP_BIT);
-
-    wire        trap_to_m_w  = trap_valid & (trap_target == PRIV_M);
-    wire [31:0] trap_mpp_set = trap_to_m_w
-                               ? ({30'b0, csr_priv_2} << `RV32GC_MSTATUS_MPP_LSB)
-                               : 32'h0;
-
-    // xRET 本拍要写的 xPP 字段掩码（mret ⇒ MPP；sret ⇒ SPP ⇒ ②：延后一拍施加）
-    wire [31:0] xret_xpp_msk = xret_redirect
-                               ? ((mw_xret_kind == 2'b01) ? MPP_FIELD_MSK
-                                                          : SPP_FIELD_MSK)
-                               : 32'h0;
-    reg  [31:0] xret_xpp_msk_q;      // 上一拍 xRET 的 xPP 清除掩码（寄存器，见 §13）
-
-    assign mstatus_set_fixed = (mstatus_set & ~MPP_FIELD_MSK) | trap_mpp_set;
-    assign mstatus_clr_fixed = (mstatus_clr & ~xret_xpp_msk) |   // ② 本拍先不清 xPP
-                               (trap_to_m_w ? MPP_FIELD_MSK : 32'h0) |  // ① 陷阱 MPP 替换
-                               xret_xpp_msk_q;                  // ② 延后一拍 "xPP ← U"
 
     //==========================================================================
     // 11. AXI 侧：axi_req_desc + axi_master_ctrl + mshr_simple（唯一总线主端口）
@@ -2289,7 +2245,6 @@ module core_top (
             fpu_fflags_q <= 5'd0;
             //------------------------ F 级辅助 ------------------------
             fetch_exc_done_q <= 1'b0;
-            xret_xpp_msk_q   <= 32'h0;      // §10.1 R3②：延后一拍的 xRET xPP 清除掩码
             xip_word_pa_q <= 32'h0; xip_word_data_q <= 32'h0; xip_word_vld_q <= 1'b0;
             xip_req_pend_q <= 1'b0;
             fencei_busy <= 1'b0; fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
@@ -2310,10 +2265,6 @@ module core_top (
         end else begin
             // ================= 默认脉冲清零 =================
             m_done_q          <= 1'b0;
-            // §10.1 R3②：xPP 清除延后一拍施加。★ 仅当本拍**没有**陷阱时才延后：
-            //   若同一拍既提交 xRET 又取陷阱（如中断恰落在 xRET 边界），本拍 mstatus
-            //   归陷阱所有（MPP ← y），此时再延后施加 xRET 的 "xPP←U" 会把它抹掉 ⇒ 门控掉。
-            xret_xpp_msk_q    <= (xret_redirect & ~trap_valid) ? xret_xpp_msk : 32'h0;
             m_ptw_pte_ready_q <= 1'b0;
             m_ptw_pte_resp_v_q<= 1'b0;
             m_ptw_ad_done_q   <= 1'b0;

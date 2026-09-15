@@ -521,10 +521,21 @@ module csr_file (
     wire [31:0] mstatus_view =
         (mstat_sw & wr_mask(`RV32GC_CSR_MSTATUS)) |
         (mstat_sd << `RV32GC_MSTATUS_SD_BIT);
-    //   括号必须显式：& 与 | 在 Verilog 中优先级低于 |? 二者同级左结合，
-    //   不加括号会写成 ((view & ~clr) | set)，语义上恰好正确但可读性差，
-    //   此处显式括号确保「先清后置」的 trap_ctrl 语义。
-    assign mstatus_o = (mstatus_view & ~mstatus_clr) | mstatus_set;
+    //   ★ 根因修复（2026-09-15，R3 的正确修法）：`mstatus_o` 是给 priv_ctrl /
+    //     trap_ctrl 的**组合读视图**，必须只反映**存储值**（组合前值）——同拍陷阱/xRET
+    //     的置位/清除**只作用于写入**（§7.1 `mstat_sw <= (mstat_sw & ~clr) | set`），
+    //     **不得**污染本拍读出的 xIE/xPIE/xPP/MIE/SIE：
+    //       · priv_ctrl 用本拍读出的这些位生成**同一拍**的更新向量 ⇒ 视图若含同拍
+    //         clr/set，则「xPIE ← xIE」读到的是刚被清掉的 xIE（MPIE 恒 0）、
+    //         「xIE ← xPIE」读到刚被置 1 的 xPIE（MIE 恒 1）、mret/sret 的 xPP 目标
+    //         读到被自己清掉的 xPP（恒 U）；
+    //       · trap_ctrl 用本拍读出的 MIE/SIE 做中断全局使能门控 ⇒ 若含同拍 MIE←0，
+    //         会形成「取中断 ⇒ 清 MIE ⇒ 本拍 MIE 读 0 ⇒ 不取中断 ⇒ MIE 又为 1」的
+    //         组合振荡环（Verilator UNOPTFLAT 即由此而来）。
+    //     ⇒ 旧写法 `(mstatus_view & ~mstatus_clr) | mstatus_set` 已弃用：那是把
+    //       "同拍更新"提前暴露到读视图上的写法，与"同拍判定用前值"的规范语义相反。
+    wire [31:0] mstatus_pre = mstatus_view;   // 陷阱/xRET **之前**的 mstatus（同拍判定用）
+    assign mstatus_o = mstatus_pre;
 
     // ---- sstatus 视图：从 mstatus 取 S 相关位 ----
     //   注意：Shifts 与 & 的优先级 —— 先移位后掩码，故每项都显式括号。
