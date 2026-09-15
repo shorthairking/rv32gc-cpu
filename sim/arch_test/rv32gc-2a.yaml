@@ -1,0 +1,76 @@
+#==============================================================================
+# sim/arch_test/rv32gc-2a.yaml —— DUT（rv32gc-2a 基线核）的 UDB 配置声明
+#==============================================================================
+# 项目 : rv32gc-cpu（阶段二 2A；docs/design/08-baseline-5stage.md §8.2/§8.2.1）
+#
+# ★ 状态声明（重要，勿误读）：
+#   本文件是**手工维护的声明件**，形状照 riscv-arch-test 的 UDB 配置
+#   （config/spike/spike-rv32g/spike-rv32g.yaml），但**没有经过 `udb validate cfg`**
+#   —— 本机没有 uv/ruby/bundler（AGENT.md §2 环境事实），`udb` 不可用。
+#   与它对应的生成物 `rvtest_config.h` 同样是手工维护，两者必须保持一致：
+#     · 想改 DUT 能力声明 ⇒ 先改本文件，再同步 rvtest_config.h / rvmodel_macros.h；
+#     · 将来 UDB 可用时，把本文件喂给 `udb cfg-c-header` 即可替换手写版。
+#
+# 能力来源（逐条可核对）：
+#   rtl/pkg/core_params.vh §1（RESET_PC/扩展集合 RV32GC_IMPLEMENTED_*）、§4（XLEN/FLEN）、
+#   §6（PMP 16 项、粒度 G=0）；rtl/csr/csr_file.v（misa 只读、misa 扩展位、mstatus FS 等）。
+#==============================================================================
+$schema: config_schema.json#
+kind: architecture configuration
+type: fully configured
+name: rv32gc-2a
+description: >
+  RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom，M/S/U + Sv32 + PMP16（阶段二 2A 单发射顺序 5 级基线核）。
+  Hand-maintained declaration (UDB unavailable in this environment); keep in sync with
+  sim/arch_test/rvtest_config.h.
+
+implemented_extensions:
+  - { name: I, version: "= 2.1" }
+  - { name: M, version: "= 2.0" }
+  - { name: A, version: "= 2.1.0" }
+  - { name: Zaamo, version: "= 1.0.0" }
+  - { name: Zalrsc, version: "= 1.0.0" }
+  - { name: F, version: "= 2.2.0" }
+  - { name: D, version: "= 2.2.0" }
+  - { name: C, version: "= 2.0" }
+  - { name: Zicsr, version: "= 2.0" }
+  - { name: Zifencei, version: "= 2.0.0" }
+  - { name: Zicntr, version: "= 2.0" }
+  - { name: Zicbom, version: "= 1.0.0" }
+  - { name: S, version: "= 1.13.0" }
+  - { name: U, version: "= 1.0.0" }
+  - { name: Sm, version: "= 1.13.0" }
+
+params:
+  # --- 基本位宽 ---
+  MXLEN: 32
+  # --- misa：只读（csr_file.v:278 `MISA: wr_mask = 0x0`）---
+  MUTABLE_MISA_I: false
+  MUTABLE_MISA_M: false
+  MUTABLE_MISA_A: false
+  MUTABLE_MISA_F: false
+  MUTABLE_MISA_D: false
+  MUTABLE_MISA_C: false
+  MUTABLE_MISA_S: false
+  MUTABLE_MISA_U: false
+  # --- Zicntr：time CSR 由核内实现（不需要 RVTEST_EMULATE_TIME_CSR 模拟路径）---
+  TIME_CSR_IMPLEMENTED: true
+  # --- S 模式分页：RV32 ⇒ 仅 Sv32；satp.ASID = 9 bit（rv32_defs.vh §6.2 口径）---
+  ASID_WIDTH: 9
+  SXLEN: [32]
+  UXLEN: [32]
+  # --- PMP：16 项、粒度 G=0（core_params.vh §6）---
+  #     UDB 侧 PMP_GRANULARITY 单位与 env 约定一致（最小 TOR 区域 4 B ⇒ log2(4) = 2）
+  #     —— 见 rvtest_config.h 里 UDB_PMP_GRANULARITY 的推导注释。
+  PMP_REGIONS: 16
+  # --- mtvec/stvec：BASE 4 B 对齐，MODE 0(Direct)/1(Vectored) 均可写（csr_file.v:431-436）---
+  #     env 侧遇"两者都支持"时选 Direct（rvtest_trap_handler.h:1124）
+  MTVEC_MODES: [0, 1]
+  # --- 未裁决/未验证项（**故意不在此声明**，避免把未验证口径写进 DUT 声明）---
+  #     · MISALIGNED_LDST_* / MISALIGNED_AMO：本核非对齐访存按异常处理（lsu.v:19-23，
+  #       非对齐优先于 PMP/PTW），但"何种组合报 cause 0/4/6"尚未经定向测试裁决 ⇒
+  #       tests/rv32i/Misalign* 见 exclude.list 的 D 段（待验证项）。
+  #     · WRITABLE_HPM_COUNTERS / mhpmevent 事件选择：2A 为吞写读 0（csr_file.v:328-337），
+  #       对应 tests/rv32i/Zihpm 已排除。
+  #     · Zicboz（cbo.zero）：2A 不含（08 §11 R1）；Zicbop 未实现。
+  #     · Smstateen / Sstc / Smepmp / Ssdbltrp / Sscofpmf 等 1P12+/1P13 特性未实现。

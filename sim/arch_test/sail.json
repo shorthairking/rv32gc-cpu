@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "sim/arch_test/sail.json —— ACT4 参考模型（Sail）平台描述 + 本底座的 SAIL_* 编译宏来源。",
+    "项目: rv32gc-cpu 阶段二 2A（docs/design/08-baseline-5stage.md §8.2/§8.3）。",
+    "用法: run.sh 用 python3 读 platform.clint.base 与 platform.simple_interrupt_generator.base，",
+    "      生成 -DSAIL_CLINT_BASE_ADDRESS / -DSAIL_SIMPLE_INTERRUPT_GENERATOR_BASE_ADDRESS",
+    "      （sig 版 ELF 的 tests/env/sail_macros.h 强制要求这两个宏，缺一即编译失败）。",
+    "口径: ”clint” 取核内 CLINT 基址 0x1F00_0000（core_params.vh §5，与 DUT 一致）；",
+    "      DUT 侧该窗口被核内截获、Spike 侧由 -m 映射成普通 RAM（见 run.sh 的 SPIKE_MEM）；",
+    "      simple_interrupt_generator 是 Sail 参考模型专用中断注入设备，本底座**未建模**",
+    "      （本轮范围只跑 rv32i 非特权子集，不涉及中断用例）——登记是为让编译宏有确定取值。",
+    "格式: 严格 JSON（**不带注释**），以便 ACT 框架的 pyjson5 与 run.sh 的 python3 json 都能读。"
+  ],
+  "base": {
+    "xlen": 32
+  },
+  "platform": {
+    "vendorid": 0,
+    "archid": 1,
+    "impid": 0,
+    "hartid": 0,
+    "cache_block_size_exp": 5,
+    "clint": {
+      "supported": true,
+      "base": 520093696,
+      "size": 65536
+    },
+    "simple_interrupt_generator": {
+      "supported": true,
+      "base": 521208064,
+      "size": 32
+    }
+  },
+  "memory": {
+    "regions": [
+      {
+        "base": 2147483648,
+        "size": 1048576,
+        "attrs": { "cacheable": true, "executable": true }
+      },
+      {
+        "base": 469762048,
+        "size": 4096,
+        "attrs": { "cacheable": false, "executable": true }
+      },
+      {
+        "base": 520093696,
+        "size": 65536,
+        "attrs": { "cacheable": false, "executable": false }
+      }
+    ]
+  }
+}

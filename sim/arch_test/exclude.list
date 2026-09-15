@@ -1,0 +1,111 @@
+#==============================================================================
+# sim/arch_test/exclude.list —— arch-test 用例排除清单（逐条带理由，可复核）
+#==============================================================================
+# 项目 : rv32gc-cpu（阶段二 2A；docs/design/08-baseline-5stage.md §8.2「RV32 测试筛选清单」）
+#
+# 语法：<glob>   # <理由>
+#   · glob 相对 **riscv-arch-test 仓库根**（即 `tests/...` 形式），由 run.sh 用 bash
+#     `case` 做通配匹配；命中即**拒绝运行**（rc≠0），不做"跑不过就加排除"的放水。
+#   · 空行与 `#` 开头行忽略；同一行只允许一个 glob。
+#   · `./sim/arch_test/run.sh --check-exclude` 会**逐条校验每个 glob 至少命中一个
+#     真实用例文件**（命中 0 个 ⇒ 判 FAIL），防止清单与测试树漂移。
+#
+# 本核 2A 的能力边界（依据 rtl/pkg/core_params.vh §1/§10、docs/design/08 §1.1）：
+#   RV32I + M + A(Zaamo/Zalrsc) + F + D + C + Zicsr + Zifencei + Zicntr + Zicbom，
+#   M/S/U 特权级 + Sv32 + PMP16；**不含** Zb*/Zk*/Zfa*/Zfh*/Zicboz/Zicbop/Zc*
+#   子扩展声明/向量/Sstc/Smstateen/Smepmp/计数器事件选择等。
+#
+# 本轮底座（08 §8.2 的"非特权子集"第一步）**只跑 tests/rv32i/** 中已声明扩展的组，
+# 故下面 A 段把整个特权子集排除、C 段逐目录排除未实现扩展。**通过清单可追溯**：
+# 未出现在本清单里的用例 = 纳入运行范围。
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# A. 特权子集（整体排除：2A 的 S 模式/T-SBI 特权底座未就绪，test_config.yaml 的
+#    include_priv_tests: False；打开前须先补特权底座与核内 CLINT/PLIC 的行为模型）
+#------------------------------------------------------------------------------
+tests/priv/**                                       # 特权用例整体：本轮不跑（见 A 段说明）
+
+#------------------------------------------------------------------------------
+# B. 非 RV32（本核 MXLEN=32）
+#------------------------------------------------------------------------------
+tests/rv64i/**                                      # RV64 用例组：RV32 核不适用（MXLEN=32）
+tests/rv64e/**                                      # RV64E 用例组：同上
+tests/rv32e/**                                      # RV32E：仅 16 个 GPR，本核为 32 个 GPR 的 RV32I
+
+#------------------------------------------------------------------------------
+# C. RV32 但**未实现/未声明**的扩展（逐目录，理由 = 该扩展不在 2A 能力边界内）
+#------------------------------------------------------------------------------
+tests/rv32i/Zba/**                                  # Zba（地址生成位操作）未实现
+tests/rv32i/Zbb/**                                  # Zbb（基本位操作）未实现
+tests/rv32i/Zbc/**                                  # Zbc（无进位乘法）未实现
+tests/rv32i/Zbkb/**                                 # Zbkb（位操作：加密用）未实现
+tests/rv32i/Zbkc/**                                 # Zbkc（无进位乘法：加密用）未实现
+tests/rv32i/Zbkx/**                                 # Zbkx（交叉排列：加密用）未实现
+tests/rv32i/Zbs/**                                  # Zbs（单比特位操作）未实现
+tests/rv32i/Zknd/**                                 # Zknd（AES 解密）未实现
+tests/rv32i/Zkne/**                                 # Zkne（AES 加密）未实现
+tests/rv32i/Zknh/**                                 # Zknh（SHA-2）未实现
+tests/rv32i/Zksed/**                                # Zksed（SM4）未实现
+tests/rv32i/Zksh/**                                 # Zksh（SM3）未实现
+tests/rv32i/Zacas/**                                # Zacas（原子比较交换）未实现
+tests/rv32i/ZacasZabha/**                           # Zacas+Zabha 组合：两者均未实现
+tests/rv32i/Zabha/**                                # Zabha（字节/半字原子）未实现
+tests/rv32i/Zicond/**                               # Zicond（条件指令）未实现
+tests/rv32i/Zimop/**                                # Zimop（可能为 no-op 的指令）未实现
+tests/rv32i/Zcmop/**                                # Zcmop（压缩 no-op 指令）未实现
+tests/rv32i/Zihintntl/**                            # Zihintntl（非临时局部性提示）未实现/无行为
+tests/rv32i/ZihintntlZca/**                         # Zihintntl+Zca 组合：同上
+tests/rv32i/Zihintpause/**                          # Zihintpause（pause 提示）未实现
+tests/rv32i/Zicboz/**                               # Zicboz（cbo.zero）：2A 明确不含（08 §11 R1）
+tests/rv32i/Zicbop/**                               # Zicbop（预取提示）未实现
+tests/rv32i/Zihpm/**                                # Zihpm（硬件性能计数器事件）：mhpmevent 为吞写读 0，事件选择未实现
+tests/rv32i/Zmmul/**                                # Zmmul（仅乘法子集）：未单独声明；M 组用例已覆盖 mul
+tests/rv32i/ZfaD/**                                 # Zfa（额外浮点）D 变体：未实现
+tests/rv32i/ZfaF/**                                 # Zfa F 变体：未实现
+tests/rv32i/ZfaZfh/**                               # Zfa+Zfh：未实现
+tests/rv32i/ZfaZfhD/**                              # Zfa+Zfh+D：未实现
+tests/rv32i/ZfaZvfh/**                              # Zfa+Zvfh（向量）：未实现
+tests/rv32i/Zfbfmin/**                              # Zfbfmin（bf16 转换）：未实现
+tests/rv32i/Zfh/**                                  # Zfh（半精度浮点）：未实现
+tests/rv32i/ZfhD/**                                 # Zfh+D：未实现
+tests/rv32i/Zfhmin/**                               # Zfhmin：未实现
+tests/rv32i/ZfhminD/**                              # Zfhmin+D：未实现
+tests/rv32i/Zca/**                                  # Zca：2A 声明的是 C 扩展本体，未声明 Zc* 名（RTL 未按 Zc* 族分组验证）
+tests/rv32i/Zcb/**                                  # Zcb 未声明
+tests/rv32i/ZcbM/**                                 # Zcb+M 组合：同上
+tests/rv32i/ZcbZbb/**                               # Zcb+Zbb 组合：同上
+tests/rv32i/Zcd/**                                  # Zcd 未声明
+tests/rv32i/Zcf/**                                  # Zcf 未声明
+
+#------------------------------------------------------------------------------
+# D. 待验证项（**不是"跑不过就排除"**：这些是 2A 尚未做定性裁决的项，
+#    必须先由设计/验证裁决口径后再纳入，否则会把未验证项算进"通过清单"）
+#------------------------------------------------------------------------------
+tests/rv32i/Misalign/**                             # 非对齐访存：本核非对齐口径（08 §5.5 抉择 1）尚未经定向测试确认，先排除
+tests/rv32i/MisalignD/**                            # 非对齐访存（D）：同上
+tests/rv32i/MisalignF/**                            # 非对齐访存（F）：同上
+tests/rv32i/MisalignZca/**                          # 非对齐访存（Zca）：同上 + Zca 未声明
+
+#------------------------------------------------------------------------------
+# E. Sv39/Sv48/Sv57 明确登记（RV32 只有 Sv32；这些变体在 RV64 才有意义）
+#    说明：E 段路径全部落在 A 段的 tests/priv/** 内，此处**逐条登记**是为了让
+#    "RV32 只跑 sv32_* 变体"这条纪律可被单独复核（08 §8.2 的筛选要求原文）。
+#------------------------------------------------------------------------------
+tests/priv/SvPMP/sv39_*                             # Sv39 分页：RV32 无此模式
+tests/priv/SvPMP/sv48_*                             # Sv48 分页：RV32 无此模式
+tests/priv/SvPMP/sv57_*                             # Sv57 分页：RV32 无此模式
+tests/priv/SvPMPZicbo/sv39_*                        # Sv39 + Zicbo：RV32 无此模式
+tests/priv/SvPMPZicbo/sv48_*                        # Sv48 + Zicbo：RV32 无此模式
+tests/priv/SvPMPZicbo/sv57_*                        # Sv57 + Zicbo：RV32 无此模式
+tests/priv/SvZicbo/sv39_*                           # Sv39 + Zicbo：RV32 无此模式
+tests/priv/SvZicbo/sv48_*                           # Sv48 + Zicbo：RV32 无此模式
+tests/priv/SvZicbo/sv57_*                           # Sv57 + Zicbo：RV32 无此模式
+tests/priv/Sv/sv39_*                                # Sv39 通用分页用例：RV32 无此模式
+tests/priv/Sv/sv48_*                                # Sv48 通用分页用例：RV32 无此模式
+tests/priv/Sv/sv57_*                                # Sv57 通用分页用例：RV32 无此模式
+tests/priv/ExceptionsSv/sv39_*                      # Sv39 异常用例：RV32 无此模式
+tests/priv/ExceptionsSvZaamo/sv39_*                 # Sv39 + Zaamo：RV32 无此模式
+tests/priv/ExceptionsSvZalrsc/sv39_*                # Sv39 + Zalrsc：RV32 无此模式
+# 说明：ExceptionsSv*/ 目录实际只含 sv32_*/sv39_* 两族（实测 ls），无 sv48_/sv57_ 文件，
+#       故不登记不存在的前缀 —— 这正是 `--check-exclude` 逐条校验要挡住的那类"空规则"。

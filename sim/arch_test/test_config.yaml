@@ -1,0 +1,61 @@
+#==============================================================================
+# sim/arch_test/test_config.yaml —— ACT4（riscv-arch-test）DUT 配置：rv32gc-2a 基线核
+#==============================================================================
+# 项目 : rv32gc-cpu（阶段二 2A；docs/design/08-baseline-5stage.md §8.2）
+# 依据 : §8.2「必须改写的 test_config.yaml」；§8.2.1（DUT 硬依赖登记）
+#
+# 路径口径：本文件内所有相对路径都相对**本文件所在目录**（= sim/arch_test/），
+#           与 ACT4 的 Config 模型一致（act/config.py: resolve_relative_paths）。
+#
+# 入口：本文件被 `sim/arch_test/run.sh` 读取（不依赖 uv/ruby，见下）；
+#       若将来 UDB 可用，同一份 YAML 也可直接喂给 act：`CONFIG_FILES=<本文件> make`。
+#==============================================================================
+name: rv32gc-2a
+
+# ---- 工具链（★ 本机硬事实：前缀是 riscv32-unknown-linux-gnu-，不是官方默认的 riscv64-unknown-elf-）
+#      AGENT.md §2 / docs/kb/tools-and-flow.md §1：GCC 16.1.0 @ /opt/riscv）
+compiler_exe: /opt/riscv/bin/riscv32-unknown-linux-gnu-gcc
+objdump_exe:  /opt/riscv/bin/riscv32-unknown-linux-gnu-objdump
+
+# ---- 参考模型：Spike（用户已编译安装到 /opt/riscv/bin/spike，实测可用：1.1.1-dev）
+#      口径见 08 §8.3；Spike 用 `+signature=<file> +signature-granularity=4` 导出签名，
+#      与 DUT 侧 TB 导出的签名逐行比对（地址列 + 数据列，比较时取数据列）。
+ref_model_exe: /opt/riscv/bin/spike
+
+# ---- UDB 配置与 DUT 头文件目录
+#      ★ 本机**没有** uv/ruby/bundler ⇒ `udb cfg-c-header` 不可用，
+#        rvtest_config.h 为**手工维护**（见该文件头注），本 YAML 作为其"声明真源"。
+udb_config: rv32gc-2a.yaml
+dut_include_dir: .            # 含 rvmodel_macros.h / rvtest_config.h / link.ld / sail.json
+
+# ---- 链接脚本：RAM_ORIGIN = 0x8000_0000、RAM_LENGTH = 1 MiB，
+#      并显式把复位桩 .boot 放到 0x1C00_0000（本核 `RV32GC_RESET_PC）、
+#      tohost 放到 0x800F_F000（TB 终止探测点）。
+linker_script: link.ld
+
+# ---- 特权子集：本轮底座**只跑 rv32i 非特权用例**（2A 的 T-SBI/特权底座未就绪，
+#      见 exclude.list 的逐条理由）。打开特权子集须先补特权底座与核内 CLINT/PLIC 建模。
+include_priv_tests: False
+
+#------------------------------------------------------------------------------
+# 以下为**本底座自用**的运行口径（ACT 的 Config 模型会忽略未知键；
+# run.sh 读取它们并把等价信息传给 TB 与 Spike；改这里即可整体挪内存布局）
+#------------------------------------------------------------------------------
+# 内存布局（DUT 侧 = link.ld；Spike 侧 = `-m<regions>`；TB 侧 = 模块参数）
+memory:
+  ram_base: 0x80000000
+  ram_size: 0x00100000        # 1 MiB，与 link.ld 的 RAM_LENGTH、TB 的 RAM_WORDS 一致
+  boot_base: 0x1c000000       # 复位向量窗口（.boot 复位桩）
+  boot_size: 0x00001000
+  clint_base: 0x1f000000      # 核内 CLINT：DUT 走核内截获；Spike 侧按普通 RAM 映射
+  clint_size: 0x00010000
+  tohost: 0x800ff000          # link.ld 固定值；run.sh 用 nm 复核后才使用
+
+# Spike 参考模型 ISA 串（= 本核 2A 实现集合：RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom）
+spike_isa: rv32imafdc_zicsr_zifencei_zicntr_zicbom
+
+# 仿真超时（防挂死；vvp 墙钟秒数 / TB 内部拍数）
+# 口径：实测本核在 iverilog 下约 50 拍/指令、I-nop-00 全流程约 3e5 拍 ⇒ 1.5e6 拍
+#       已有 ~5x 余量；若 RTL 挂死则以该拍数终止并如实报 FAIL（不会静默通过）。
+timeout_vvp_seconds: 900
+timeout_cycles: 1500000

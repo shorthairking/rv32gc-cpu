@@ -1092,8 +1092,25 @@ module core_top (
     wire [4:0]  e_fp_fflags_val = fpu_res_v_q ? fpu_fflags_q : fpu_fflags;
 
     // ---- 7.8 CSR（Zicsr）：读旧值 / 算新值；旧值随指令流水到 W 写回 rd ----
-    //   csr_file.rdata 为组合读；写端口旁路 rdata_w 覆盖同拍"W 写 → E 读"冒险。
-    //   FP CSR（fflags/frm/fcsr）由 core_top 持有（csr_file 读回 0）⇒ 在此覆盖。
+    //   csr_file.rdata 为组合读；CSR 写在 **W 拍末**才落 csr_file 寄存器
+    //   ⇒ "写指令 → E 级读"的同拍旁路必须**两级**（写指令在 M 或在 W）：
+    //     · M 级写（写指令在 M、读指令在 E）：取 `em_csr_wdata`（= E 级算出的 csr_new_e）
+    //     · W 级写（写指令在 W、读指令在 E）：取 `mw_csr_wdata`（= 本拍末落盘的新值）
+    //   ★ 2026-09-15 本任务实测（csr_hazard 分歧根因）：**`csr_file` 的写口旁路读
+    //     `rdata_w` 不能充当旁路值** —— 它 case(waddr) 取的是**寄存器现值**
+    //     （mscratch 落在 default ⇒ `rdata_r`），即写落地（posedge）之前的旧值；
+    //     当 `raddr == waddr`（正是旁路判定的条件）时 `rdata_w == rdata`，等价于没有旁路。
+    //     实测：`csrrw t0,mscratch,s6` 在 W 拍时 de_csr_addr = mw_csr_addr = 0x340、
+    //     `csr_wen_w`=1 ⇒ 旧表达式选中 `rdata_w`，而 rdata = rdata_raw = rdata_w = 旧值(0)
+    //     ⇒ 紧邻 `csrr a0,mscratch` 读到 0（Spike 为 0x1111_1000）。⇒ 两级旁路一律取**写数据**。
+    //   门控口径（与真实落盘条件逐字对齐）：
+    //     · M 级 = `em_valid`（槽有效）∧ `em_csr_we`（确会写；已含 ~e_ill_total/~de_exc_valid）
+    //             ∧ `~em_exc_valid`（自身不带异常）。CSR 指令 `m_is_mem=0` ⇒ 不会产生
+    //               M 级访存异常（`m_exc_q`），故无需再与 m_exc_any 相与。
+    //     · W 级 = `csr_wen_w`（= 与 csr_file 写口、mstatus.FS 落盘、commit 同一条件）。
+    //   本拍被作废（kill_young / xret_redirect 冲刷）时 E 槽同拍 `de_valid<=0`，旁路值不会
+    //   落到任何架构状态（仅 E 级组合借用）。
+    //   FP CSR（fflags/frm/fcsr）由 core_top 持有（csr_file 读回 0）⇒ 在此覆盖（含同拍旁路）。
     wire [31:0] csr_fp_view =
         (de_csr_addr == `RV32GC_CSR_FFLAGS) ? {27'b0, fflags_r} :
         (de_csr_addr == `RV32GC_CSR_FRM)    ? {29'b0, frm_r}    :
@@ -1101,16 +1118,57 @@ module core_top (
     wire        csr_is_fp = (de_csr_addr == `RV32GC_CSR_FFLAGS) |
                             (de_csr_addr == `RV32GC_CSR_FRM)    |
                             (de_csr_addr == `RV32GC_CSR_FCSR);
-    wire [31:0] csr_base_rd = (csr_wen_w & (mw_csr_addr == de_csr_addr)) ? csr_rdata_w
-                                                                         : csr_rdata_raw;
-    //   mstatus/sstatus 的 FS/SD 位由 core_top 持有 ⇒ 读路径覆盖（csr_file 内那份同步被遮盖）
+
+    // ---- 7.8.1 CSR 写 → E 级读 同拍旁路（两级；同拍双命中时 younger 优先 = M > W）----
+    wire        csr_em_hit = em_valid & em_csr_we & ~em_exc_valid &
+                             (em_csr_addr == de_csr_addr);
+    wire        csr_mw_hit = csr_wen_w & (mw_csr_addr == de_csr_addr);
+    wire        csr_byp_hit = csr_em_hit | csr_mw_hit;
+    //   ★ 优先级 **M > W**：两条写指令同拍命中同一地址时，M 槽那条**更年轻**
+    //     （W 槽比 M 槽老一拍）⇒ E 级读必须看到更年轻那条的新值（程序序在后的写在后）。
+    wire [31:0] csr_byp_val = csr_em_hit ? em_csr_wdata : mw_csr_wdata;
+    wire [31:0] csr_base_rd = csr_byp_hit ? csr_byp_val : csr_rdata_raw;
+
+    //   mstatus/sstatus 的 FS/SD 位由 core_top 持有 ⇒ 读路径覆盖（csr_file 内那份同步被遮盖）。
+    //   ★ 旁路命中时 FS 必须取**旁路值里的新 FS**（`mstatus_fs` 寄存器本拍末才更新），
+    //     否则 `csrw mstatus,…` 后紧邻 `csrr` 仍会读到旧 FS/SD（同一类"读旧值"缺陷）。
+    wire [1:0]  csr_fs_rd = csr_byp_hit ? csr_byp_val[`RV32GC_MSTATUS_FS_LSB +: 2] : mstatus_fs;
     wire [31:0] csr_base_rd_fs =
         ((de_csr_addr == `RV32GC_CSR_MSTATUS) | (de_csr_addr == `RV32GC_CSR_SSTATUS))
         ? ((csr_base_rd & ~(FS_MASK | SD_MASK)) |
-           ({30'b0, mstatus_fs} << `RV32GC_MSTATUS_FS_LSB) |
-           ((mstatus_fs == FS_DIRTY) ? SD_MASK : 32'h0))
+           ({30'b0, csr_fs_rd} << `RV32GC_MSTATUS_FS_LSB) |
+           ((csr_fs_rd == FS_DIRTY) ? SD_MASK : 32'h0))
         : csr_base_rd;
-    wire [31:0] csr_rdata  = csr_is_fp ? csr_fp_view : csr_base_rd_fs;
+
+    //   FP CSR 的**同拍旁路**（同一类"写 → 紧邻读旧值"缺陷；三个地址**互为别名**：
+    //   写 fcsr 会同时改 fflags/frm）⇒ 按**字段**分别取更年轻写者的新字段值，
+    //   字段掩码与 (7) 的落盘写法逐字一致（fflags=wdata[4:0]；frm：写 frm 取 wdata[2:0]、
+    //   写 fcsr 取 wdata[7:5]）。读者地址决定合成：fflags / frm / fcsr=[7:5]+[4:0]。
+    wire        csr_em_wff = em_valid & em_csr_we & ~em_exc_valid &
+                             ((em_csr_addr == `RV32GC_CSR_FFLAGS) |
+                              (em_csr_addr == `RV32GC_CSR_FCSR));
+    wire        csr_em_wfr = em_valid & em_csr_we & ~em_exc_valid &
+                             ((em_csr_addr == `RV32GC_CSR_FRM) |
+                              (em_csr_addr == `RV32GC_CSR_FCSR));
+    wire        csr_mw_wff = csr_wen_w & ((mw_csr_addr == `RV32GC_CSR_FFLAGS) |
+                                          (mw_csr_addr == `RV32GC_CSR_FCSR));
+    wire        csr_mw_wfr = csr_wen_w & ((mw_csr_addr == `RV32GC_CSR_FRM) |
+                                          (mw_csr_addr == `RV32GC_CSR_FCSR));
+    //   frm 新字段：写者地址决定位段（frm ⇒ [2:0]，fcsr ⇒ [7:5]）
+    wire [2:0]  csr_em_frm_v = (em_csr_addr == `RV32GC_CSR_FRM) ? em_csr_wdata[2:0]
+                                                                : em_csr_wdata[7:5];
+    wire [2:0]  csr_mw_frm_v = (mw_csr_addr == `RV32GC_CSR_FRM) ? mw_csr_wdata[2:0]
+                                                                : mw_csr_wdata[7:5];
+    wire [4:0]  csr_fflags_rd = csr_em_wff ? em_csr_wdata[4:0] :
+                                csr_mw_wff ? mw_csr_wdata[4:0] : fflags_r;
+    wire [2:0]  csr_frm_rd    = csr_em_wfr ? csr_em_frm_v :
+                                csr_mw_wfr ? csr_mw_frm_v : frm_r;
+    wire [31:0] csr_fp_byp =
+        (de_csr_addr == `RV32GC_CSR_FFLAGS) ? {27'b0, csr_fflags_rd} :
+        (de_csr_addr == `RV32GC_CSR_FRM)    ? {29'b0, csr_frm_rd}    :
+        (de_csr_addr == `RV32GC_CSR_FCSR)   ? {24'b0, csr_frm_rd, csr_fflags_rd} :
+                                              csr_fp_view;
+    wire [31:0] csr_rdata  = csr_is_fp ? csr_fp_byp : csr_base_rd_fs;
 
     wire [31:0] csr_src_e = de_csr_zimm ? {27'b0, de_rs1} : e_rs1_byp;
     wire [31:0] csr_new_e = (de_csr_op == CSRN_W) ? csr_src_e :
@@ -1624,6 +1682,8 @@ module core_top (
     .waddr       (mw_csr_addr),
     .wdata       (mw_csr_wdata),
     .w_illegal   (1'b0),
+    //   `rdata_w` 保留连接但**不再用作旁路值**：它是 waddr 视角的**寄存器现值**
+    //   （写落地前），raddr == waddr 时与 rdata 等值 ⇒ 无旁路效果（见 §7.8 的实测说明）。
     .rdata_w     (csr_rdata_w),
     .priv        (csr_priv_2),
     .chk_addr    (dec_csr_addr),
