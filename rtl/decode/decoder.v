@@ -310,9 +310,28 @@ module decoder (
     //--------------------------------------------------------------------------
     // 4.6 JAL / JALR / LUI / AUIPC
     //--------------------------------------------------------------------------
-    //   JAL：f3 必须为 000（其它为保留）
-    wire jal_ok  = (f3 == `RV32GC_F3_ADDI);
-    //   JALR：f3 必须为 000（其它为保留）
+    //   JAL：**J 型格式没有 funct3 字段**。J 型布局是
+    //        `imm[20|10:1|11|19:12] | rd | opcode`（insn[14:12] 落在 imm[19:12]
+    //        之内，是**立即数位**，不是保留字段）
+    //        [ISA:riscv-isa-manual/src/unpriv/rv-32-64g.adoc「RV32/64G Instruction
+    //         Set Listings」编码表：`imm[20\ 10:1\ 11\ 19:12] | rd | opcode < J-type`]；
+    //        [ISA:riscv-isa-manual/src/unpriv/rv32.adoc §Unconditional Jumps：
+    //         J-immediate 是"按 2 B 为单位的带符号偏移"，符号扩展后与指令地址相加]
+    //        ⇒ **任何** JAL 编码都合法（2^20 个偶立即数全合法），jal_ok 恒 1。
+    //   ★ 2026-09-15 根因修复（arch-test I-nop-00 收尾挂死）：
+    //     原实现写成 `f3 == 3'b000`，把 insn[14:12]≠000 的 JAL **整类误判为非法指令**
+    //     （即所有 |imm| 较大的跳转，如 imm[14:12]≠0 的负偏移回跳）：
+    //       · 实测 `j -32`（0xfe1ff06f，imm[14:12]=111）⇒ ill_instr_o=1、
+    //         op_type=OPT_ILL ⇒ bru_redirect 被 `~de_ill` 抑制 ⇒ 该可执行文件末尾
+    //         "打印 RVCP-SUMMARY 串后回跳改名"的控制流断掉；
+    //       · 该指令随即以 mcause=2/mepc=0x80037b04 陷入，而 arch-test 的 rvmodel
+    //         在 exit 路径已把 mtvec 恢复为复位值 0 ⇒ 陷阱目标 = 0 ⇒ PC=0 取指 ⇒
+    //         非法指令（0x0000_0000）⇒ mepc=0 死循环（fetch_pc=0/mcause=2 末态）。
+    //     真源依据：JAL 合法性**只由 opcode 决定**，rd/立即数任意取值均合法。
+    wire jal_ok  = 1'b1;
+    //   JALR：**有** funct3 字段 ⇒ f3 必须为 000（其它为保留）
+    //        [ISA:riscv-isa-manual/src/unpriv/rv-32-64g.adoc 编码表：
+    //         `imm[11:0] | rs1 | 000 | rd | 1100111 < I-type`]
     wire jalr_ok = (f3 == `RV32GC_F3_ADDI);
 
     //--------------------------------------------------------------------------

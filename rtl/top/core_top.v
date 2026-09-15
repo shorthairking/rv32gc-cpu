@@ -1569,6 +1569,21 @@ module core_top (
                                ~(m_mem_wr_op & m_size8 & m_hi_q);
     wire [31:0] m_ld_data_ext = ld_extract(l1d_cs_rdata, m_va[1:0], m_lsu_size,
                                            em_mem_unsign);
+    //   ★ 2026-09-15 根因修复（同类缺陷：AXI 读通路的载入值未做宽度/偏移抽取）：
+    //     平台 AXI 数据读（M_S_AXI）返回的是 **对齐 4 B 字**（AXI 读按 size=2 整字回，
+    //     字节道由主设备自选）⇒ 整数 load 必须与 L1D 通路**同一口径**抽取：
+    //       lb / lbu ⇒ 取 (字 >> 8*VA[1:0]) 的第 0 字节（符号/零扩展按 em_mem_unsign）
+    //       lh / lhu ⇒ 同理取 16 bit
+    //       lw       ⇒ 尺寸 2 ⇒ 结果 = 原字（不受影响）
+    //     非整数 load（MEM_FLOAD：flw/fld，按设计 4 B 对齐）保持原字不动。
+    //     原实现直接把 `axi_rdata_q` 写进 rd ⇒ `lbu` 得到**整字**（实测：地址
+    //     0x80006679 处 NUL 字节被读成整字 0x520a000a）⇒ arch-test rvmodel 的
+    //     `lbu t1,0(a0); beqz t1` 字符循环永远等不到 '\0'，收尾打印死循环、HTIF
+    //     终止码永不写入（I-nop-00/I-add-00 都在此处挂死）。
+    wire [31:0] m_axi_ld_data_ext = ld_extract(axi_rdata_q, m_va[1:0], m_lsu_size,
+                                               em_mem_unsign);
+    wire [31:0] m_axi_ld_data = (em_mem_op == MEM_LOAD) ? m_axi_ld_data_ext
+                                                        : axi_rdata_q;
 
     wire        l1d_cs_req  = (m_l1d_go | (m_state_q == M_S_PTER) |
                                (m_state_q == M_S_PADW)) & ~m_kill_fsm;
@@ -2778,7 +2793,9 @@ module core_top (
                     //     写事务不需要读回数据（store 无 rd 值）。
                     M_S_AXI: begin
                         if (axi_done_q & (axi_done_owner_q == AXO_MDTA)) begin
-                            if (~axi_done_wr_q) m_rd_data_q <= axi_rdata_q;
+                            // ★ 2026-09-15 修复：整数 load 走 `m_axi_ld_data`
+                            //   （已按 VA[1:0]/尺寸抽取 + 符号扩展），不再直取整字。
+                            if (~axi_done_wr_q) m_rd_data_q <= m_axi_ld_data;
                             m_state_q   <= M_S_IDLE;
                             m_done_q    <= 1'b1;
                         end
