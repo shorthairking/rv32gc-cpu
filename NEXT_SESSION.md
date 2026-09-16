@@ -21,7 +21,8 @@
   - 解码修复：addi imm∈[0x400,0x41F] 误译 sub、**JAL 型无 funct3 误判非法**（arch-test 挂死根因①）。
   - 访存修复：AXI/MMIO uncached 读补 ld_extract、MMIO 读 4B 对齐、PLIC 偏移-0x100000、PLIC 命中窗口 [0x1F10_0000,0x1F50_0000) 4MiB 显式区间。
   - Spike 锁步底座（108/108 + 反证自测）；arch-test 底座（单例+组批量、exclude.list；I-nop-00/I-add-00 PASS）。
-- **当前后台**：M2 非特权子集批跑（rv32i/{I,M,Zicsr,Zifencei,Zicntr,Zicbom,Zca,F,D}，日志 /tmp/m2_groups.log）。**批跑期间禁止改 RTL**。
+- **M2 批跑（待重跑）**：上一会话的后台批跑已随会话终止、结果丢失。**新会话开工后重跑**：`cd rv32gc-cpu && { for g in I M Zicsr Zifencei Zicntr Zicbom Zca F D; do ./sim/arch_test/run.sh --group "rv32i/$g"; done; } 2>&1 | tee /tmp/m2_groups.log`（日志 /tmp/m2_groups.log；**批跑期间禁止改 RTL**）。注意：同仓同用例勿并行（work 目录互踩）；单例复跑命令 `./sim/arch_test/run.sh I-nop-00`。
+- **新会话路由已切换**（2026-09-16）：母 Agent = deepseek-official/deepseek-v4-pro；子 Agent = `provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "max"`（settings.yaml allowedModels 已由用户配置，**仅新会话生效**）。
 - **下一步（批跑后）**：① 失败用例逐个定位修复（锁步/arch-test 双工具）；② 特权子集 SvPMP；③ 待办清单：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一（区间比较）、plic.v priority/threshold 3bit WARL 与 08 §6.6"32 位"表述对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 写通路字节合并；④ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
