@@ -26,7 +26,7 @@ rv32gc-cpu/（dev 分支）
 1. **母 Agent 只做调度**：禁止任何实质性工作，所有实质性工作派子 Agent；只负责拆分任务、给精确提示词、汇总证据、台账与 git。
 2. **知识盲区解决路径**（母与子通用）：① 查知识库（kb / AGENT.md）→ ② 联网搜索 → ③ 自行尝试 ≤3 次 → ④ 仍失败则明确上报"无法解决 + 详细疑惑方向或问题"。
 3. **WSL-only**：禁止修改或调用任何 Windows 环境下的命令或文件；环境缺失报告用户，由用户配置安装。
-4. **子 Agent 模型**：母 Agent 用 dsh 的 `subagent`/`subagent_fork` 调用子 Agent，显式指定 `provider: "opencode-go-chat"`、`model: "deepseek-v4.1-flash"`（opencode 提供的 ds 4.1 flash 模型）、`reasoning_effort: "max"`（2026-09-14 用户指令）。
+4. **子 Agent 模型**：母 Agent 用 dsh 的 `subagent`/`subagent_fork` 调用子 Agent，显式指定 `provider: "deepseek-official"`、`model: "deepseek-flash"`（DeepSeek 官方 API 的 ds v4.1）、`reasoning_effort: "max"`（2026-09-14 用户指令）。
 5. **编码红线**：禁止使用原语（先检索 Vivado IP）；大量组合逻辑用 `assign`；避免重复造轮子（尤其 AXI，用 Vivado 成熟 IP/wrapper）。
 6. **goal 纪律**：goal 仅母 Agent 多轮实质调度时使用；纯派发子 Agent 的工作不挂 goal、不轮询，子 Agent 完成时宿主自动通知；子 Agent 一次运行自驱做完（宿主 goal 工具禁止子 Agent 创建）。
 

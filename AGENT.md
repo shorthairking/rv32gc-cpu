@@ -18,10 +18,10 @@
 ### 0.2 子 Agent 一律用 dsh 工具调用，并显式指定模型
 
 - 子 Agent 一律用 **dsh 的 `subagent` / `subagent_fork` 工具**调用，**不使用 opencode 本体**。
-- 每次调用必须显式携带模型路由字段（即"opencode 提供的 ds 4.1 flash 模型"）：
-  - `provider: "opencode-go-chat"`
-  - `model: "deepseek-v4.1-flash"`
-  - `reasoning_effort: "max"`（**2026-09-14 用户指令：每次调用一律 max 档**；派活前用 `list_subagent_models` 核实该模型支持 max 档——已实测支持 off/minimal/low/medium/high/xhigh/max；若某次核实发现不支持 max，**报告用户**，不得擅自降档或缺省）。
+- 每次调用必须显式携带模型路由字段（DeepSeek 官方 API 提供的 ds v4.1 模型）：
+  - `provider: "deepseek-official"`
+  - `model: "deepseek-flash"`（即官方目录 id `deepseek-flash` = DeepSeek-V41-Flash）
+  - `reasoning_effort: "max"`（**2026-09-14 用户指令：每次调用一律 max 档**；官方适配器支持 off/low/high/max，`max` 合法；若某次核实发现不支持 max，**报告用户**，不得擅自降档或缺省）。
 - 若当前会话的 `subagent`/`subagent_fork` 工具参数里**没有** `provider`/`model` 字段：先调用 `list_subagent_models`（若已注册）核实；仍没有 → **停止并报告用户**（宿主未开启子 Agent 模型选择，见 `USAGE.md` §2），不得退化成用母 Agent 自身模型跑子 Agent。
 - 任务拆分、派活格式与分工边界见 §5。
 
@@ -98,7 +98,7 @@
 | 工具链 | `/opt/riscv/bin/riscv32-unknown-linux-gnu-`（GCC 16.1.0） |
 | 仿真器 | Verilator 5.020、Icarus Verilog 12.0（已安装，可用） |
 | 参考模型 | Spike（需重新编译到新项目；旧编译产物在旧项目内，不复制） |
-| 子 Agent 模型 | dsh 已开启"子 Agent 模型选择"，路由 `opencode-go-chat / deepseek-v4.1-flash`（§0.2） |
+| 子 Agent 模型 | dsh 已开启"子 Agent 模型选择"，路由 `deepseek-official / deepseek-flash`（ds v4.1，§0.2） |
 | 知识库 | 常驻 riscv-kb：`kb_search` 工具 / CLI `node dsh-extension/bin/riscv-kb.js search` |
 | 网络 / sudo | 网络可用；`sudo` 不可用（系统包安装需请用户在沙箱外执行） |
 
