@@ -230,8 +230,12 @@ module fpu_div_sqrt #(
     // ★ 必须传**完整**的 sig（D 时可达 163 位），不能只取低 64 位：
     //   quo_r 累积 STEPS_MAX 位，sig = (quo<<1)|sticky 直接落在 rem_r 上，
     //   截断会丢掉全部有效位、结果恒为 0（实测踩到）。
-    wire [1023:0] sig_round_s = rem_r[DW-1:0];
-    wire [8191:0] sig_round_d = rem_r[DW-1:0];
+    // ★ 仿真吞吐优化（2026-09-17，语义不变）：只让**当前格式**的舍入原语活动。
+    //   `result_r <= r_fmt_d ? rd_res : {32'b0, rs_res}` 只取对应格式的结果，
+    //   另一格式的输出恒被丢弃 ⇒ 把它的 sig 输入钳 0（8 K bit 域不再每拍重算，
+    //   iverilog 事件驱动下该实例不再求值）。位级语义与钳零前一致。
+    wire [1023:0] sig_round_s = r_fmt_d ? 1024'd0 : rem_r[DW-1:0];
+    wire [8191:0] sig_round_d = r_fmt_d ? rem_r[DW-1:0] : 8192'd0;
 
     wire [31:0] rs_res;  wire [4:0] rs_fl;
     wire [63:0] rd_res;  wire [4:0] rd_fl;

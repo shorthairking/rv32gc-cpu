@@ -542,11 +542,23 @@ module decoder (
     //==========================================================================
     // 6. 立即数（例化 dec_imm；sel 由本层的型别判定给出）
     //==========================================================================
-    wire sel_i = (is_load | is_jalr | (is_opimm & ~opimm_slli_ok & ~opimm_srxi_ok) |
-                  is_csr_any) |
+    //   ★ 修复记录（2026-09-17）——「FP load/store 立即数丢失」：
+    //     现象（arch-test rv32i/F）：F-flw-00 295 处、F-fsw-00 510 处签名不一致；
+    //     两个用例的共同写法是「先把基址按 ±off 调整、再用 ∓off 访问」
+    //     （例：`addi x1,x3,1240` + `flw f5,-1240(x1)`；`addi x1,x1,-1792` +
+    //      `fsw f24,1792(x1)`）⇒ 立即数一旦为 0，地址就整体偏移 off，
+    //     F-flw 表现为读到**别的数据**（实测 dut=63203b39 / spike=4d5b23ae），
+    //     F-fsw 表现为存到别处、回读拿到 0xdeadbeef（签名区原值）。
+    //     根因：`sel_i`/`sel_s` 漏了 FP 访存族 —— `flw/fld`（OP-LOAD-FP）与
+    //     `fsw/fsd`（OP-STORE-FP）与整数 load/store 的立即数编码**逐位相同**
+    //     （I 型 / S 型），但这里只判了 `is_load`/`is_store` ⇒ 两条 FP 访存
+    //     指令的 imm 落到"无选择"分支（=0）。测试里偏移恰为 0 的那些用例
+    //     （RVTEST_TESTDATA_LOAD_FLOAT_SINGLE 用 `flw f,0(gp)`）因此掩盖了该缺陷。
+    //     修法：把 `is_loadfp` 并入 sel_i、`is_storefp` 并入 sel_s（编码同型）。
+    wire sel_i = (is_load | is_loadfp | is_jalr |
+                  (is_opimm & ~opimm_slli_ok & ~opimm_srxi_ok) | is_csr_any);
                  // C 展开后的等效 lw/addi/jalr 已在对应 opcode 上，无需单独处理
-                 1'b0;
-    wire sel_s = is_store;
+    wire sel_s = is_store | is_storefp;
     wire sel_b = is_branch;
     wire sel_u = is_lui | is_auipc;
     wire sel_j = is_jal;
@@ -671,9 +683,24 @@ module decoder (
     wire fp_to_int = fp_is_fmvx | fp_is_fcmp | fp_is_cvt_out;
 
     // ---- 写回来源 ----
+    //   ★ 修复记录（2026-09-17）——「写 FP 寄存器堆的 FP 计算被误判为 WB_ALU」：
+    //     现象（arch-test rv32i/F）：F-fadd/F-fsub/F-fmul/F-fdiv/F-fsqrt/FMA 等用例的
+    //     签名区有 ~11% 的字从未被写（DUT 侧保持 0xdeadbeef），而 DUT 实际把
+    //     （结果, fflags）写到了**地址 0**（TB 报 1960 次"未登记区域写"）。
+    //     根因：本表达式对 `fadd.s` 这类"写 **FP** 寄存器"的 OP-FP/FMA 指令
+    //     逐条不命中，一直落到兜底分支 `WB_ALU` ⇒ `mw_wb_sel = WB_ALU` 且
+    //     `mw_rd = insn[11:7]`（浮点号）⇒ W 级把它当成整数写回，
+    //     **用 ALU 结果覆盖了同号的整数寄存器 x[rd]**。
+    //     后果：`fadd.s f2,...` 会覆盖 x2（ACT 的签名指针 sp）⇒ 之后所有签名写
+    //     落到地址 0；`fadd.s f20,...` 覆盖 x20 等同理。
+    //     （F-feq/F-flt/F-fle/F-fclass/F-fcvt.w.s 不受影响 —— 它们走 `fp_to_int`
+    //      分支 WB_FP，写的是整数 rd，所以只有 feq 组先前"看起来正常"。）
+    //     修法：写 FP 寄存器堆的 FP 指令（OP-FP 与 FMA 族里 `~fp_to_int` 的那些）
+    //     与 flw 同口径 ⇒ WB_NONE（唯一副作用是 fregfile 写口，由 fp_we_o 表达）。
     assign wb_sel_o =
         (is_load)    ? WB_MEM :
         (is_loadfp)  ? WB_NONE :      // 写 FP 寄存器堆，不走整数写回
+        ((is_opfp | is_fma) & ~fp_to_int) ? WB_NONE :  // ★ 写 FP 的浮点计算（含 FMA）
         (is_amo)     ? WB_MEM :       // AMO/LR/SC 结果写回（按 AMO 语义）
         (is_jal | is_jalr)    ? WB_PC4 :
         (is_csr_any)          ? WB_CSR :

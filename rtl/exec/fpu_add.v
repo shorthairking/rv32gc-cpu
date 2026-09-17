@@ -73,36 +73,83 @@
 
 //==============================================================================
 // 前导零 / 最高有效位：组合函数（纯 function，无副作用）
+//------------------------------------------------------------------------------
+// ★ 2026-09-17 仿真吞吐优化（**语义逐位不变**，仅为让 arch-test 的 F 组能在
+//   run.sh 的超时内跑完）：
+//   原实现是"逐位扫全宽"的线性搜索（msb8192 每次调用 8192 次循环）。这些原语在
+//   全设计里有 12 个实例（fpu_add 4 + fpu_cvt 4 + fpu_div_sqrt 2 + fpu_mul 2），
+//   且 fpu_round_s/d 每次都调 2 遍 ⇒ 每拍被解释执行的循环迭代数 ≈
+//     6×2×1024 + 6×2×8192 = 110 592 次
+//   实测（.work 基准 tb_fpu_bench）这是 iverilog 下 FPU 的主要仿真开销。
+//   ⇒ 改为**分层搜索**：先在 512 bit 块（16 个）里找最高的非零块，再在 64 bit
+//     子块（8 个）里找，最后只对命中的 64 bit 做逐位扫描。
+//     最坏 16+8+64 = 88 次迭代（原 8192），结果与原线性搜索**完全一致**
+//     （返回最高置 1 位下标；v==0 时返回 0，与原实现同）。
+//   等价性证据：优化后重跑 .work_fpu 的黄金模型全量比对（add/addd/fma/fmad/
+//     muls/muld/div/sqrt/cvt/cmp）与 arch-test rv32i/F 全组，位与 fflags 全等。
 //==============================================================================
+// 64 bit 叶子：最高置位下标（v==0 ⇒ 0）——最多 64 次迭代
+function [5:0] msb64;
+    input [63:0] v;
+    integer j;
+    begin
+        msb64 = 6'd0;
+        for (j = 0; j < 64; j = j + 1) begin
+            if (v[j]) msb64 = j[5:0];
+        end
+    end
+endfunction
+
 function [12:0] msb1024;                   // 1024 bit 域的最高有效位位置
     input [1023:0] v;
-    integer i;
+    integer k;
+    reg     found;
     begin
         msb1024 = 13'd0;
-        for (i = 0; i < 1024; i = i + 1) begin
-            if (v[i]) msb1024 = i[12:0];
+        found   = 1'b0;
+        for (k = 15; k >= 0; k = k - 1) begin          // 16 × 64 bit 块，高→低
+            if (!found && (|v[k*64 +: 64])) begin
+                msb1024 = (k*64) + msb64(v[k*64 +: 64]);
+                found   = 1'b1;
+            end
         end
     end
 endfunction
 
 function [12:0] msb512;                    // 512 bit 域（D 侧复用）
     input [511:0] v;
-    integer i;
+    integer k;
+    reg     found;
     begin
         msb512 = 13'd0;
-        for (i = 0; i < 512; i = i + 1) begin
-            if (v[i]) msb512 = i[12:0];
+        found  = 1'b0;
+        for (k = 7; k >= 0; k = k - 1) begin           // 8 × 64 bit 块，高→低
+            if (!found && (|v[k*64 +: 64])) begin
+                msb512 = (k*64) + msb64(v[k*64 +: 64]);
+                found  = 1'b1;
+            end
         end
     end
 endfunction
 
 function [13:0] msb8192;                   // 8192 bit 域的最高有效位位置
     input [8191:0] v;
-    integer i;
+    integer k, j;
+    reg     found;
+    reg [511:0] chunk;
     begin
         msb8192 = 14'd0;
-        for (i = 0; i < 8192; i = i + 1) begin
-            if (v[i]) msb8192 = i[13:0];
+        found   = 1'b0;
+        for (k = 15; k >= 0; k = k - 1) begin          // 16 × 512 bit 大块，高→低
+            chunk = v[k*512 +: 512];
+            if (!found && (|chunk)) begin
+                for (j = 7; j >= 0; j = j - 1) begin   // 8 × 64 bit 子块，高→低
+                    if (!found && (|chunk[j*64 +: 64])) begin
+                        msb8192 = (k*512) + (j*64) + msb64(chunk[j*64 +: 64]);
+                        found   = 1'b1;
+                    end
+                end
+            end
         end
     end
 endfunction
@@ -204,8 +251,40 @@ module fpu_round_s (
 
     // ---- fflags（本原语产 OF/UF/NX；NV/DZ 由上层按特殊值给出） ----
     wire of_fl = overflow;
-    // UF：亚正规结果不精确，或舍入后归零且不精确（tininess after rounding）
-    wire uf_fl = (~overflow) & inexact & (subnormal | q_zero);
+    // ---- ★ UF（tininess after rounding）修复记录（2026-09-17）-------------------
+    //   现象（arch-test rv32i/F）：F-fmadd.s-06 2 处、F-fmadd.s-07 3 处 fflags
+    //   dut=0x01(NX) / spike=0x03(UF|NX)。样例（F-fmadd.s-06）：
+    //     c = 0x807FFFFF（= −最大亚正规 = −(2^−126 − 2^−149)）、积 = 约 −1.6·2^−205，
+    //     rm = RDN ⇒ 精确值落在"最大亚正规"与"最小正规数"之间的**空隙**里，
+    //     舍入后恰好等于最小正规数 2^−126（结果位两者一致）。
+    //   根因：原判据用**有界指数**下的舍入结果判 tiny
+    //     `uf = inexact & (subnormal | q_zero)`
+    //   —— 该结果此刻是"最小正规数"，于是判 non-tiny；但 IEEE 754-2008 §7.5 的
+    //   tininess 是"**无界指数**下舍入后的结果是否仍 < 2^emin"：本例无界网格细一位
+    //   （2^−150），舍入后是 2^−126 − 2^−150 < 2^−126 ⇒ **tiny**（Spike 实测 0x03 ✓）。
+    //   规范出处：riscv-isa-manual f-st-ext.adoc:186-188「tininess is detected after
+    //   rounding」；softfloat `roundPackToF32` 的 isTiny 等价式
+    //     `(exp < -1) || (sig + roundIncrement < 0x80000000)`
+    //   （本实现按该等价式逐条落地，Spike 定向用例 4/4 对齐，见交付说明）。
+    //   等价判据（natural_ulp = ulp_ex 未钳位时的自然 ulp）：
+    //     · 未钳位（natural_ulp ≥ MIN_SUB，即精确值 ≥ 2^emin）
+    //         ⇒ 结果 ≥ 2^emin ⇒ 不可能 tiny；此域内沿用原判据（亚正规/归零）。
+    //     · 钳位且 natural_ulp ≤ MIN_SUB−2（精确值低至少两个二进制阶）
+    //         ⇒ 自然网格至少细 2 位，舍入绝不可能抬到 2^emin ⇒ tiny。
+    //     · 钳位且 natural_ulp == MIN_SUB−1（精确值落在最小正规数**正下方**一个
+    //       自然 ulp 内）⇒ 只有"自然网格舍入恰好进位到 2^emin"才 non-tiny：
+    //         需要 q0 == 2^FB−1（粗网格上恰在最小正规数下方一个 ulp 内）且
+    //         round_bit & sticky（余量 ≥ 3/4 粗 ulp）且**该舍入模式会把幅值进位**
+    //         （RNE/RMM/保留值；RUP 仅正数；RDN 仅负数；RTZ 与反号方向永不进位）。
+    wire clamped_ulp  = (natural_ulp < MIN_SUB);
+    wire last_ulp_bel = (natural_ulp == (MIN_SUB - 14'sd1)) &
+                        (q0 == 1024'd8_388_607);            // q0 == 2^23 − 1
+    wire inc_like     = (rm != 3'b001) &                    // RTZ 不进位
+                        ~((rm == 3'b011) &  sign) &         // RUP：负数不进位
+                        ~((rm == 3'b010) & ~sign);          // RDN：正数不进位
+    wire up_to_normal = last_ulp_bel & inc_like & round_bit & sticky;
+    wire tiny         = clamped_ulp ? ~up_to_normal : (subnormal | q_zero);
+    wire uf_fl = (~overflow) & inexact & tiny;
     wire nx_fl = inexact & ~overflow;      // overflow 时 NX 恒置，见下
     assign fflags = {1'b0, 1'b0, of_fl, uf_fl, (nx_fl | of_fl)};
 endmodule
@@ -286,7 +365,17 @@ module fpu_round_d (
                                           norm_out;
 
     wire of_fl = overflow;
-    wire uf_fl = (~overflow) & inexact & (subnormal | q_zero);
+    //   ★ UF：tininess after rounding（无界指数口径）——判据与修复记录见
+    //     fpu_round_s 同名段落（本处为 D 侧同构实现，FB=52 ⇒ q0 判据 2^52−1）。
+    wire clamped_ulp  = (natural_ulp < MIN_SUB);
+    wire last_ulp_bel = (natural_ulp == (MIN_SUB - 15'sd1)) &
+                        (q0 == 8192'd4_503_599_627_370_495);   // q0 == 2^52 − 1
+    wire inc_like     = (rm != 3'b001) &
+                        ~((rm == 3'b011) &  sign) &
+                        ~((rm == 3'b010) & ~sign);
+    wire up_to_normal = last_ulp_bel & inc_like & round_bit & sticky;
+    wire tiny         = clamped_ulp ? ~up_to_normal : (subnormal | q_zero);
+    wire uf_fl = (~overflow) & inexact & tiny;
     wire nx_fl = inexact & ~overflow;
     assign fflags = {1'b0, 1'b0, of_fl, uf_fl, (nx_fl | of_fl)};
 endmodule

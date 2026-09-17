@@ -29,7 +29,8 @@
 #   ./sim/arch_test/run.sh --group I                 # 组批量模式（见下）：按组跑一批用例
 #   ./sim/arch_test/run.sh --group rv32i/I           #   组名 = 目录名 / 相对路径 / 用例名 glob
 #   ./sim/arch_test/run.sh --group 'I-a*' --limit 5  #   冒烟：只跑过滤后的前 5 例
-#   选项：-v（打印 TB 心跳/提交诊断）、--timeout-vvp N、--cycles N、--limit N
+#   ./sim/arch_test/run.sh --group rv32i/I --jobs 16 #   组模式多进程并行：16 个并发进程（默认 nproc）
+#   选项：-v（打印 TB 心跳/提交诊断）、--timeout-vvp N、--cycles N、--limit N、--jobs N
 #
 # 【组批量模式（--group）】
 #   组名解析（按 arch-test 仓库实际目录结构）：
@@ -37,7 +38,17 @@
 #     · 相对路径   ：`tests/rv32i/I` ⇒ 同义；
 #     · 用例名 glob：`I-a*` / `I-nop-00` / `M-*`（可带 `tests/…` 前缀路径 glob）。
 #   执行口径：候选清单 → **按 exclude.list 逐条过滤**（被过滤的每条都打印 INFO，绝不静默丢弃）
-#             → 逐例调用与单例模式**完全相同**的 run_one（同超时/同判据）→ 聚合。
+#             → --limit 截断 → 逐例走与单例模式**完全相同**的判定流水线（同超时/同判据）→ 聚合。
+#   并行（--jobs N，N>1）：候选清单**先截断再分发**，每一例各起一个**独立子进程**：
+#     · 该例完整 stdout/stderr ⇒ work/<用例>/run.console.log；
+#     · 该例判定 ⇒ work/<用例>/result.txt（`<pass|fail|skip>|<用例>|<fail标签>|<compared行数>`）；
+#     · 子进程退出码 ⇒ work/<用例>/run.rc；
+#     父进程 join 全部子进程后，**按候选清单顺序回放**各例控制台日志（日志形态与串行版同构），
+#     并在父进程内**唯一一次**聚合全局计数 ⇒ 并行下不存在计数器/数组竞争。
+#     ★ 未捕获即失败（并行同样成立）：只有 result.txt 明确记 pass **且** worker rc=0 才计通过；
+#       子进程异常退出/结果文件缺失或损坏/rc 与结论矛盾 ⇒ 该例计 FAIL，并打印 worker rc 与
+#       该例控制台日志末尾（绝不静默丢失）；组计数自检（pass+fail+skip=运行例数）再兜底。
+#     --jobs 只对 --group 生效，N≤0 或非数字一律硬失败（**不静默回退串行**）；--jobs 1 走原串行路径。
 #   聚合输出（必打）：
 #     `GROUP <组>: <pass> pass / <fail> fail / <skip> skip`   （三者之和 = 实际运行例数）
 #   全绿时**额外**打一行紧凑判语 `GROUP <组>: <pass>/<pass+fail> pass`；
@@ -129,9 +140,10 @@ cfg_need memory tohost TOHOST_ADDR
 # 命令行可覆盖的项
 OPT_VVP_TIMEOUT=""; OPT_CYCLES=""; OPT_VERBOSE=0
 OPT_LIMIT=0; GROUP=""
+OPT_JOBS=""; OPT_JOBS_SET=0      # --jobs：只对 --group 生效；空 ⇒ 组模式默认取 nproc
 MODE="run"; TESTS=()
 
-usage() { sed -n '2,61p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR>1 && /^set -u -o pipefail/ { exit } NR>1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -140,6 +152,7 @@ while [ $# -gt 0 ]; do
         --directed)      MODE="directed" ;;
         --group)         shift; GROUP="${1:-}" ;;
         --limit)         shift; OPT_LIMIT="${1:-}" ;;
+        --jobs)          shift; OPT_JOBS="${1:-}"; OPT_JOBS_SET=1 ;;
         --timeout-vvp)   shift; OPT_VVP_TIMEOUT="${1:-}" ;;
         --cycles)        shift; OPT_CYCLES="${1:-}" ;;
         -v|--verbose)    OPT_VERBOSE=1 ;;
@@ -167,6 +180,32 @@ if [ "$OPT_LIMIT" != "0" ]; then
         ''|*[!0-9]*) die "--limit 需要正整数，收到：${OPT_LIMIT}" ;;
     esac
     [ "$OPT_LIMIT" -gt 0 ] || die "--limit 需要正整数，收到：${OPT_LIMIT}"
+fi
+
+# ---- --jobs（并行度）参数校验（fail-closed：不合法一律硬失败，绝不静默回退串行）----
+if [ "$OPT_JOBS_SET" -eq 1 ]; then
+    case "$OPT_JOBS" in
+        ''|*[!0-9]*) die "--jobs 需要正整数，收到：${OPT_JOBS}" ;;
+    esac
+    [ "$OPT_JOBS" -gt 0 ] || die "--jobs 需要正整数，收到：${OPT_JOBS}"
+fi
+if [ "$MODE" = "group" ]; then
+    if [ "$OPT_JOBS_SET" -eq 0 ]; then
+        OPT_JOBS="$(nproc 2>/dev/null | tr -d '[:space:]' || true)"
+        case "$OPT_JOBS" in
+            ''|*[!0-9]*) die "默认并行度取不到（nproc 不可用或输出异常：'${OPT_JOBS}'）；请显式指定 --jobs N" ;;
+        esac
+        [ "$OPT_JOBS" -gt 0 ] || die "默认并行度取到 0（nproc 输出：'${OPT_JOBS}'）；请显式指定 --jobs N"
+    fi
+    if [ "$OPT_JOBS" -gt 1 ]; then
+        # 并行池用 bash 的 `wait -n` 回收槽位（bash ≥ 4.3）；不支持就硬失败，绝不静默串行
+        if [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
+           { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
+            die "并行模式（--jobs ${OPT_JOBS}）依赖 bash≥4.3 的 wait -n；当前 $BASH_VERSION ⇒ 请显式用 --jobs 1"
+        fi
+    fi
+elif [ "$OPT_JOBS_SET" -eq 1 ]; then
+    die "--jobs 只用于 --group 组模式（当前模式：${MODE}）"
 fi
 
 #------------------------------------------------------------------------------
@@ -337,10 +376,21 @@ test_flen() {  # 依据 MARCH 推导 TEST_FLEN（Q=128 / D,g=64 / F=32 / 其余 
 N_RUN=0; N_PASS=0; N_FAIL=0; N_SKIP=0; N_COMPARE_TOTAL=0
 declare -a PASS_NAMES=() FAIL_NAMES=()
 
+# 每例判定结果的**唯一真源**：run_one_body 只把结论写进 $RESULT_FILE（每例自己的文件，
+# 并行时互不干扰），由父进程/串行调用方读取后**唯一一次**更新上面这组全局计数 ——
+# "判定"与"计数"分离 ⇒ 多进程并行下不存在全局计数器/数组竞争。
+#   记录格式（单行）：<pass|fail|skip>|<用例名>|<fail 标签>|<compared 行数>
+RESULT_FILE=""
+record_result() {  # record_result <pass|fail|skip> <name> <fail_label> <compare_lines>
+    [ -n "$RESULT_FILE" ] || return 0
+    local label="${3//|/_}"
+    printf '%s|%s|%s|%s\n' "$1" "$2" "$label" "$4" >"$RESULT_FILE"
+}
+
 # 从 vvp 日志里取 TB 的 PASS 锚点（整行精确匹配；只认 TB 自己打印的那一行）
 tb_pass_count() { grep -cxF 'TB_ARCH_TEST: PASS' "$1" 2>/dev/null || true; }
 
-run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
+run_one_body() {  # run_one_body <arch-test 相对路径> <kind: act|directed>（只打印 + 落盘判定）
     local rel="$1" kind="$2"
     local name; name="$(basename "$rel" .S)"
     local odir="${WORK_DIR}/${name}"
@@ -358,14 +408,14 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
     local exc_reason
     if exc_reason="$(is_excluded "$rel")"; then
         printf 'RV32_ARCH_TEST: SKIP %s —— 命中 exclude.list（理由：%s）\n' "$name" "$exc_reason"
-        N_SKIP=$((N_SKIP + 1))
+        record_result skip "$name" "" 0
         return 0
     fi
     if [ "$CFG_PRIV" != "True" ] && [ "$CFG_PRIV" != "true" ]; then
         case "$rel" in
             tests/priv/*)
                 printf 'RV32_ARCH_TEST: SKIP %s —— 特权用例（include_priv_tests: False）\n' "$name"
-                N_SKIP=$((N_SKIP + 1)); return 0 ;;
+                record_result skip "$name" "" 0; return 0 ;;
         esac
     fi
 
@@ -377,7 +427,7 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
         march="$(test_march "$src")"
         if [ -z "$march" ]; then
             printf 'RV32_ARCH_TEST: FAIL %s —— 用例头缺 MARCH\n' "$name"
-            N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(no-MARCH)"); return 1
+            record_result fail "$name" "$name(no-MARCH)" 0; return 1
         fi
         flen="$(test_flen "$march")"
         test_file_arg=(-DTEST_FILE="\"${name}.S\"")
@@ -395,29 +445,29 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
             "${SCRIPT_DIR}/boot_stub.S" "$src" -o "$elf" >"${odir}/gcc.log" 2>&1; then
         printf 'RV32_ARCH_TEST: FAIL %s —— 编译失败（见 %s）\n' "$name" "${odir}/gcc.log"
         tail -n 15 "${odir}/gcc.log" | sed 's/^/    /'
-        N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(compile)"); return 1
+        record_result fail "$name" "$name(compile)" 0; return 1
     fi
 
     # ---- 7.2 符号复核（fail-closed：与 link.ld 的约定不符即 FAIL）----
     "$NM" "$elf" >"$nm_log" 2>&1 || { printf 'RV32_ARCH_TEST: FAIL %s —— nm 失败\n' "$name";
-                                      N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(nm)"); return 1; }
+                                      record_result fail "$name" "$name(nm)" 0; return 1; }
     local sig_b sig_e tohost entry_sym
     sig_b="$("$NM" "$elf" | awk '$3=="begin_signature"{print $1}')"
     sig_e="$("$NM" "$elf" | awk '$3=="end_signature"{print $1}')"
     tohost="$("$NM" "$elf" | awk '$3=="tohost"{print $1}')"
     entry_sym="$("$NM" "$elf" | awk '$3=="rvtest_entry_point"{print $1}')"
     [ -n "$sig_b" ] && [ -n "$sig_e" ] || { printf 'RV32_ARCH_TEST: FAIL %s —— ELF 缺 begin/end_signature 符号\n' "$name";
-                                            N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(symbols)"); return 1; }
+                                            record_result fail "$name" "$name(symbols)" 0; return 1; }
     local sig_words; sig_words=$(( (0x$sig_e - 0x$sig_b) / 4 ))
     [ "$sig_words" -gt 0 ] || { printf 'RV32_ARCH_TEST: FAIL %s —— 签名区长度为 0\n' "$name";
-                                N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(sig-empty)"); return 1; }
+                                record_result fail "$name" "$name(sig-empty)" 0; return 1; }
     # tohost：link.ld 固定 0x800F_F000 ⇒ 与 test_config.yaml 的 memory.tohost 必须一致
     printf 'RV32_ARCH_TEST_INFO: %s 符号 sig=[0x%s,0x%s) words=%d tohost=0x%s entry=0x%s\n' \
            "$name" "$sig_b" "$sig_e" "$sig_words" "$tohost" "$entry_sym"
     if [ "$((16#${tohost#0x}))" != "$((TOHOST_ADDR))" ]; then
         printf 'RV32_ARCH_TEST: FAIL %s —— tohost=0x%s 与 link.ld/test_config.yaml 约定 %s 不符\n' \
                "$name" "$tohost" "$TOHOST_ADDR"
-        N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(tohost-addr)"); return 1
+        record_result fail "$name" "$name(tohost-addr)" 0; return 1
     fi
 
     # ---- 7.3 Spike 参考签名 ----
@@ -430,14 +480,14 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
         printf 'RV32_ARCH_TEST: FAIL %s —— Spike 参考运行失败（rc=%d 行数=%s 期望=%d，见 %s）\n' \
                "$name" "$rc_spike" "$ref_lines" "$sig_words" "$spike_log"
         tail -n 10 "$spike_log" | sed 's/^/    /'
-        N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(spike)"); return 1
+        record_result fail "$name" "$name(spike)" 0; return 1
     fi
     printf 'RV32_ARCH_TEST_INFO: %s Spike 参考签名 %d 行 ⇒ %s\n' "$name" "$ref_lines" "$ref_sig"
 
     # ---- 7.4 ELF → hex（DDR 区预载）----
     if ! "$OBJCOPY" -O verilog --verilog-data-width=4 "$elf" "$hex" >"${odir}/objcopy.log" 2>&1; then
         printf 'RV32_ARCH_TEST: FAIL %s —— objcopy 转 hex 失败\n' "$name"
-        N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(objcopy)"); return 1
+        record_result fail "$name" "$name(objcopy)" 0; return 1
     fi
     local hex_records; hex_records="$(grep -c '^@' "$hex" || true)"
     printf 'RV32_ARCH_TEST_INFO: %s hex 记录段 %s 个 ⇒ %s\n' "$name" "$hex_records" "$hex"
@@ -456,7 +506,7 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
             "${rtl_srcs[@]}" "${REPO_ROOT}/sim/tb/tb_arch_test.sv" >"$iv_log" 2>&1; then
         printf 'RV32_ARCH_TEST: FAIL %s —— iverilog 编译失败（见 %s）\n' "$name" "$iv_log"
         tail -n 15 "$iv_log" | sed 's/^/    /'
-        N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name(iverilog)"); return 1
+        record_result fail "$name" "$name(iverilog)" 0; return 1
     fi
 
     # ---- 7.6 DUT 仿真 ----
@@ -507,14 +557,175 @@ run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>
 
     if [ "$ok" -eq 1 ]; then
         printf 'RV32_ARCH_TEST: %s PASS (compared=%d lines, first_diff=none)\n' "$name" "$sig_words"
-        N_COMPARE_TOTAL=$((N_COMPARE_TOTAL + sig_words))
-        N_PASS=$((N_PASS + 1)); PASS_NAMES+=("$name")
+        record_result pass "$name" "" "$sig_words"
         return 0
     fi
     printf 'RV32_ARCH_TEST: FAIL %s —— 判据未全部达成（%s）\n' "$name" "$why"
     printf 'RV32_ARCH_TEST_INFO: %s 产物目录 = %s\n' "$name" "$odir"
-    N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$name")
+    record_result fail "$name" "$name" 0
     return 1
+}
+
+#------------------------------------------------------------------------------
+# 7.1 每例判定聚合（全局计数的**唯一**写入点）
+#     只有 result.txt 明确记 pass **且**调用方 rc=0 才计通过；其余一切
+#     （fail/skip 正常路径之外的结果文件缺失、损坏、rc 与结论矛盾、字段非法）
+#     一律按"未捕获"计 FAIL 并打印可诊断证据 —— 与文首纪律一致。
+#------------------------------------------------------------------------------
+uncaught_result() {  # uncaught_result <rel> <rc> <why>
+    local rel="$1" rc="$2" why="$3"
+    local name; name="$(basename "$rel" .S)"
+    local clog="${WORK_DIR}/${name}/run.console.log"
+    N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("${name}(uncaught)")
+    printf 'RV32_ARCH_TEST: FAIL %s —— 未捕获项：%s\n' "$name" "$why"
+    printf 'RV32_ARCH_TEST_INFO: %s worker rc=%s；每例结果文件=%s；控制台日志=%s\n' \
+           "$name" "$rc" "${WORK_DIR}/${name}/result.txt" "$clog"
+    if [ -f "$clog" ]; then
+        printf 'RV32_ARCH_TEST_INFO: %s 该例控制台日志末 15 行：\n' "$name"
+        tail -n 15 "$clog" | sed 's/^/    /'
+    fi
+}
+
+aggregate_result() {  # aggregate_result <rel> <rc> → 0=该例记通过或跳过，1=该例记失败
+    local rel="$1" rc="$2"
+    local name; name="$(basename "$rel" .S)"
+    local rfile="${WORK_DIR}/${name}/result.txt"
+    local st="" rname="" label="" cmp="0" nlines="0"
+    if [ -f "$rfile" ]; then
+        nlines="$(wc -l <"$rfile" 2>/dev/null || echo 0)"
+        if [ "$nlines" -eq 1 ]; then
+            IFS='|' read -r st rname label cmp <"$rfile" || true
+        fi
+    fi
+    case "$st" in
+        pass)
+            case "$cmp" in
+                ''|*[!0-9]*) uncaught_result "$rel" "$rc" "结果文件 compare 字段非法（'$cmp'）"; return 1 ;;
+            esac
+            [ "$rc" -eq 0 ] || { uncaught_result "$rel" "$rc" "结果文件记通过但 worker rc≠0（矛盾）"; return 1; }
+            [ -n "$rname" ] || rname="$name"
+            N_COMPARE_TOTAL=$((N_COMPARE_TOTAL + cmp))
+            N_PASS=$((N_PASS + 1)); PASS_NAMES+=("$rname")
+            return 0 ;;
+        fail)
+            [ -n "$label" ] || label="${name}(no-label)"
+            N_FAIL=$((N_FAIL + 1)); FAIL_NAMES+=("$label")
+            return 1 ;;
+        skip)
+            N_SKIP=$((N_SKIP + 1))
+            return 0 ;;
+        *)
+            uncaught_result "$rel" "$rc" "无有效每例结果文件（行数=${nlines}，文件=${rfile}）"
+            return 1 ;;
+    esac
+}
+
+run_one() {  # run_one <arch-test 相对路径> <kind: act|directed>（串行入口：stdout 直通，与改造前一致）
+    local rel="$1" kind="$2"
+    local name; name="$(basename "$rel" .S)"
+    mkdir -p "${WORK_DIR}/${name}"
+    RESULT_FILE="${WORK_DIR}/${name}/result.txt"
+    rm -f "$RESULT_FILE"
+    local rc=0
+    run_one_body "$rel" "$kind" || rc=$?
+    local st=0
+    aggregate_result "$rel" "$rc" || st=$?
+    RESULT_FILE=""
+    return "$st"
+}
+
+#------------------------------------------------------------------------------
+# 7.2 多进程并行（仅 --group 且 --jobs>1）
+#     子进程只写自己 work/<用例>/ 下的三件产物（互不冲突，也不碰父进程全局量）：
+#       run.console.log —— 该例完整 stdout/stderr（父进程随后按清单顺序回放）
+#       result.txt      —— 判定记录（7.1 的唯一真源）
+#       run.rc          —— 子进程退出码
+#     父进程用 `wait -n` 回收槽位（不猜"谁结束了"：判定一律从文件读），
+#     全部 join 完再回放 + 聚合 ⇒ 无竞争、无静默丢失。
+#------------------------------------------------------------------------------
+run_one_worker() {  # run_one_worker <rel> <kind>
+    local rel="$1" kind="$2"
+    local name; name="$(basename "$rel" .S)"
+    local odir="${WORK_DIR}/${name}"
+    local clog="${odir}/run.console.log" rcfile="${odir}/run.rc"
+    mkdir -p "$odir"
+    : >"$clog"
+    rm -f "${odir}/result.txt" "$rcfile"
+    RESULT_FILE="${odir}/result.txt"
+    printf 'RV32_ARCH_TEST_GROUP_WORKER: %s 并发启动（pid=%d %s）\n' "$name" "$BASHPID" "$(date '+%H:%M:%S')" >&2
+    local rc=0
+    run_one_body "$rel" "$kind" >>"$clog" 2>&1 || rc=$?
+    printf '%d\n' "$rc" >"$rcfile"
+    printf 'RV32_ARCH_TEST_GROUP_WORKER: %s 并发收工（pid=%d %s rc=%d）\n' "$name" "$BASHPID" "$(date '+%H:%M:%S')" "$rc" >&2
+    return "$rc"
+}
+
+# 物理核数（lscpu 取不到 ⇒ 打印空 ⇒ 不做提示；仅用于并发度提示，不参与任何判定）
+physical_cores() {
+    command -v lscpu >/dev/null 2>&1 || return 0
+    lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l
+}
+
+# 并发安全前置检查：work/<用例>/ 以**用例 basename** 为键 ⇒ 同 basename 的两例
+# （如 rv32i 与 rv64i 的同名用例）会共用产物目录，并行时互相覆盖 result.txt /
+# run.console.log ⇒ 可能把失败例误判成通过。故并行前硬失败（串行路径不受影响）。
+check_parallel_unique() {  # check_parallel_unique <rel...>
+    local -A seen=()
+    local -a dup=()
+    local rel name
+    for rel in "$@"; do
+        name="$(basename "$rel" .S)"
+        if [ -n "${seen[$name]:-}" ]; then
+            dup+=("$name（${seen[$name]} 与 ${rel}）")
+        else
+            seen[$name]="$rel"
+        fi
+    done
+    if [ "${#dup[@]}" -gt 0 ]; then
+        printf 'RV32_ARCH_TEST_GROUP: 并行模式拒绝执行 —— 本批存在同 basename 用例（共用 work/<名字>/，并行会互相覆盖判定）：\n' >&2
+        printf '    %s\n' "${dup[@]}" >&2
+        printf '    ⇒ 请改用 --jobs 1 串行，或用更精确的组名/glob 排除重名用例。\n' >&2
+        exit 2
+    fi
+    return 0
+}
+
+group_run_parallel() {  # group_run_parallel <jobs> <rel...>：并发池，池大小 = jobs
+    local jobs="$1"; shift
+    local -a rels=("$@")
+    local total="${#rels[@]}" idx=0 running=0
+    [ "$jobs" -gt "$total" ] && jobs="$total"
+    printf 'RV32_ARCH_TEST_GROUP: 并行模式 jobs=%d，本批 %d 例（每例独立子进程；完整输出见 work/<名字>/run.console.log）\n' \
+           "$jobs" "$total"
+    while [ "$idx" -lt "$total" ] || [ "$running" -gt 0 ]; do
+        while [ "$running" -lt "$jobs" ] && [ "$idx" -lt "$total" ]; do
+            run_one_worker "${rels[$idx]}" act &
+            running=$((running + 1)); idx=$((idx + 1))
+        done
+        if [ "$running" -gt 0 ]; then
+            wait -n || true     # 仅用于回收并发槽位；判定/rc 一律从每例产物文件读
+            running=$((running - 1))
+        fi
+    done
+    return 0
+}
+
+group_collect_parallel() {  # 父进程 join 后：按候选清单顺序回放控制台日志 + 聚合判定
+    local rel name clog rcfile rc
+    for rel in "$@"; do
+        name="$(basename "$rel" .S)"
+        clog="${WORK_DIR}/${name}/run.console.log"
+        rcfile="${WORK_DIR}/${name}/run.rc"
+        if [ -f "$clog" ]; then
+            cat "$clog"
+        else
+            printf 'RV32_ARCH_TEST_INFO: %s 无控制台日志（%s 不存在）\n' "$name" "$clog"
+        fi
+        rc="$(cat "$rcfile" 2>/dev/null || true)"
+        case "$rc" in ''|*[!0-9]*) rc=127 ;; esac      # 缺 run.rc ⇒ 非 0 ⇒ 走"未捕获"判决
+        aggregate_result "$rel" "$rc" || true
+    done
+    return 0
 }
 
 #------------------------------------------------------------------------------
@@ -584,11 +795,27 @@ case "$MODE" in
             printf 'RV32_ARCH_TEST_GROUP: 组 %s 过滤后没有可运行用例（0 pass / 0 fail / 0 skip）\n' "$GROUP"
             exit 1
         fi
-        # ---- ④ 逐例调用**同一个** run_one（超时/判据与单例模式完全一致）----
+        # ---- ④ 逐例走**同一条**判定流水线（超时/判据与单例模式完全一致）----
+        #       --jobs 1 ⇒ 原串行路径（stdout 直通，行为/输出与改造前一致）；
+        #       --jobs N>1 ⇒ 并发池跑，父进程 join 后按候选清单顺序回放 + 聚合。
         g_pass0=$N_PASS; g_fail0=$N_FAIL; g_skip0=$N_SKIP
-        for rel in "${g_run[@]}"; do
-            run_one "$rel" act || true      # 单例失败不中断本组：聚合成组结论后统一判
-        done
+        if [ "$OPT_JOBS" -le 1 ]; then
+            for rel in "${g_run[@]}"; do
+                run_one "$rel" act || true      # 单例失败不中断本组：聚合成组结论后统一判
+            done
+        else
+            check_parallel_unique "${g_run[@]}"
+            # 并发度提示（只提示、不改变判定）：jobs 超过**物理核数** ⇒ SMT 超订，
+            # 单例 vvp 的墙钟≈翻倍，可能触发 timeout_vvp_seconds（rc=124 超时 ⇒ 该例 FAIL）。
+            g_phys="$(physical_cores)"
+            case "$g_phys" in ''|*[!0-9]*) g_phys="" ;; esac
+            if [ -n "$g_phys" ] && [ "$g_phys" -gt 0 ] && [ "$OPT_JOBS" -gt "$g_phys" ]; then
+                printf 'RV32_ARCH_TEST_GROUP: 提示 —— jobs=%d 超过物理核数 %d（SMT 超订会让每例仿真墙钟≈翻倍；单例超时仍为 %ss）⇒ 若出现 rc=124 超时判失败，请改用 --jobs %d 或加大 --timeout-vvp\n' \
+                       "$OPT_JOBS" "$g_phys" "$TIMEOUT_VVP" "$g_phys" >&2
+            fi
+            group_run_parallel "$OPT_JOBS" "${g_run[@]}"
+            group_collect_parallel "${g_run[@]}"
+        fi
         g_pass=$((N_PASS - g_pass0)); g_fail=$((N_FAIL - g_fail0)); g_skip=$((N_SKIP - g_skip0))
         # ---- ⑤ 组聚合（必打一行三项计数；全绿才额外打紧凑判语）----
         printf -- '------------------------------------------------------------------------\n'

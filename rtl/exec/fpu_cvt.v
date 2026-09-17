@@ -230,14 +230,25 @@ module fpu_cvt (
     // ① 浮点 → 整数（fcvt.w[.wu].s / fcvt.w[.wu].d）
     //--------------------------------------------------------------------------
     wire f2i_uns = (fp_op == FP_FCVT_WU_S) | (fp_op == FP_FCVT_WU_D);
+    // ★ 仿真吞吐优化（2026-09-17，语义不变）：只让本次转换方向用到的舍入原语活动
+    //   （末尾按 fp_op 选结果，未选中方向的输出恒被丢弃）。iverilog 事件驱动下，
+    //   输入被钳 0 的实例不再每拍重算（D 侧含 8192 bit 域）。
+    wire en_i2s = (fp_op == FP_FCVT_S_W)  | (fp_op == FP_FCVT_S_WU);
+    wire en_i2d = (fp_op == FP_FCVT_D_W)  | (fp_op == FP_FCVT_D_WU);
+    wire en_s2d = (fp_op == FP_FCVT_D_S);
+    wire en_d2s = (fp_op == FP_FCVT_S_D);
     wire [31:0] r_f2i_s, r_f2i_d;
     wire [4:0]  fl_f2i_s, fl_f2i_d;
+    wire en_f2i_s = (fp_op == FP_FCVT_W_S)  | (fp_op == FP_FCVT_WU_S);
+    wire en_f2i_d = (fp_op == FP_FCVT_W_D)  | (fp_op == FP_FCVT_WU_D);
 
     fpu_f2i #(.W(32), .FB(23)) u_f2i_s (
-        .a (a_s), .rm (rm_eff), .is_unsigned (f2i_uns), .r (r_f2i_s), .fl (fl_f2i_s)
+        .a (en_f2i_s ? a_s : 32'd0), .rm (rm_eff), .is_unsigned (f2i_uns),
+        .r (r_f2i_s), .fl (fl_f2i_s)
     );
     fpu_f2i #(.W(64), .FB(52)) u_f2i_d (
-        .a (a),   .rm (rm_eff), .is_unsigned (f2i_uns), .r (r_f2i_d), .fl (fl_f2i_d)
+        .a (en_f2i_d ? a : 64'd0), .rm (rm_eff), .is_unsigned (f2i_uns),
+        .r (r_f2i_d), .fl (fl_f2i_d)
     );
 
     //--------------------------------------------------------------------------
@@ -250,8 +261,8 @@ module fpu_cvt (
     wire        i2f_sign = i2f_uns ? 1'b0 : x_w[31];
     wire [31:0] i2f_mag  = i2f_uns ? x_w  : x_mag_s;
 
-    wire [1023:0] i2f_sig_s = {{(1024-32){1'b0}}, i2f_mag};
-    wire [8191:0] i2f_sig_d = {{(8192-32){1'b0}}, i2f_mag};
+    wire [1023:0] i2f_sig_s = en_i2s ? {{(1024-32){1'b0}}, i2f_mag} : 1024'd0;
+    wire [8191:0] i2f_sig_d = en_i2d ? {{(8192-32){1'b0}}, i2f_mag} : 8192'd0;
     wire [31:0] r_i2s;
     wire [63:0] r_i2d;
     wire [4:0]  fl_i2s, fl_i2d;
@@ -271,7 +282,7 @@ module fpu_cvt (
     wire [23:0] s_sig = (|s_ef) ? {1'b1, s_fr} : {1'b0, s_fr};
     wire signed [13:0] s_e = (|s_ef) ? ($signed({6'b0, s_ef}) - 14'sd150)
                                      : -14'sd149;              // value = s_sig × 2^s_e
-    wire [8191:0] s_sig_x = {{(8192-24){1'b0}}, s_sig};
+    wire [8191:0] s_sig_x = en_s2d ? {{(8192-24){1'b0}}, s_sig} : 8192'd0;
     wire [63:0] r_ds_raw;
     wire [4:0]  fl_ds_raw;
 
@@ -300,7 +311,7 @@ module fpu_cvt (
                                      : -14'sd1074;             // value = d_sig × 2^d_e
     wire d_tiny = (d_e < -14'sd600);
 
-    wire [1023:0] d_sig_x = {{(1024-53){1'b0}}, d_sig};
+    wire [1023:0] d_sig_x = en_d2s ? {{(1024-53){1'b0}}, d_sig} : 1024'd0;
     wire [31:0] r_sd_raw;
     wire [4:0]  fl_sd_raw;
 

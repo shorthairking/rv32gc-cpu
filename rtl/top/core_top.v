@@ -1043,6 +1043,30 @@ module core_top (
     wire [63:0] fpu_result;
     wire [4:0]  fpu_fflags;
 
+    // ---- ★ frm（fcsr.frm）的「CSR 写 → 紧邻 FP 指令用」同拍旁路（2026-09-17 修复）----
+    //   现象（arch-test rv32i/F）：所有 `frm=dyn` 的用例整体错 1 ulp（实测
+    //   F-fadd.s-01 19 处、F-fmul/F-fdiv/F-fmadd 各若干），DUT 的结果恒等于
+    //   **RNE** 的结果，而 spike 用测试设定的 frm（如 rup）。
+    //   根因：ACT 的 dyn 用例序列是**紧邻**的
+    //       `fsrmi 3`（写 frm，W 级落盘） → `fadd.s f19,f27,f21,dyn`
+    //   两条指令相差 0 ⇒ FP 指令在 E 级组合读 `frm_r` 时，写 frm 的 CSR 指令还在
+    //   **W 级**（本拍末才落盘）⇒ 读到**旧 frm**（0=RNE）。
+    //   与 `csrr frm` 走的两级旁路（csr_em_wfr/csr_mw_wfr，见 §7.8.1）是**同一类
+    //   缺陷**：FP 指令用 frm 也必须看到 M/W 级在途 CSR 写的新值。
+    //   修法：把旁路值 `fp_frm_eff` 接到 `fpu.frm`，并与 §7.8.1 的 `csr_frm_rd`
+    //   共用同一份表达式（唯一定义处，避免两处不同步）。
+    wire        fp_em_wfr = em_valid & em_csr_we & ~em_exc_valid &
+                            ((em_csr_addr == `RV32GC_CSR_FRM) |
+                             (em_csr_addr == `RV32GC_CSR_FCSR));
+    wire        fp_mw_wfr = csr_wen_w & ((mw_csr_addr == `RV32GC_CSR_FRM) |
+                                         (mw_csr_addr == `RV32GC_CSR_FCSR));
+    wire [2:0]  fp_em_frm = (em_csr_addr == `RV32GC_CSR_FRM) ? em_csr_wdata[2:0]
+                                                             : em_csr_wdata[7:5];
+    wire [2:0]  fp_mw_frm = (mw_csr_addr == `RV32GC_CSR_FRM) ? mw_csr_wdata[2:0]
+                                                             : mw_csr_wdata[7:5];
+    wire [2:0]  fp_frm_eff = fp_em_wfr ? fp_em_frm :
+                             fp_mw_wfr ? fp_mw_frm : frm_r;
+
     fpu u_fpu (
     .clk       (aclk),
     .rst_n     (aresetn),
@@ -1051,7 +1075,7 @@ module core_top (
     .fp_op     (e_fp_op),
     .fmt       (de_insn32[26:25]),
     .rm        (de_rm),
-    .frm       (frm_r),
+    .frm       (fp_frm_eff),
     .a         (e_fpu_a),
     .b         (freg_rdata2),
     .c         (freg_rdata3),
@@ -1085,6 +1109,15 @@ module core_top (
 
     // fflags 累积（08 §5.3 ②：精确累积；fsgnj/fclass/fmv 的 fflags 恒 0）
     wire e_fflags_we = e_need_fpu & fpu_fflags_we;
+
+    // ---- 「更年轻的在途 FP 标志」（2026-09-17 修复，见 (3) 段后的修复记录）----
+    //   W 级 CSR 写 fflags/fcsr 落盘时，必须把**比它更年轻、且还没进 fflags_r** 的
+    //   FP 指令标志一并 OR 进去，否则老指令的 CSR 写会抹掉新指令刚置的 NV/NX。
+    //   · em_fflags/em_fflags_we：M 槽的 FP 指令（其 E 级累积已被同一拍的 CSR 写覆盖）
+    //   · fpu_fflags           ：E 槽的 FP 指令（与 CSR 写同拍落盘）
+    //   两者都是 sticky-OR ⇒ 重复并入幂等（不会多置位，也不会少置位）。
+    wire [4:0] e_flags_younger = (em_fflags_we ? em_fflags : 5'd0) |
+                                 (e_fflags_we  ? fpu_fflags : 5'd0);
 
     // ---- 7.7 MDU/FPU 结果选择 ----
     wire [31:0] e_mdu_val = mdu_res_v_q ? mdu_res_q : mdu_result;
@@ -1150,22 +1183,16 @@ module core_top (
     wire        csr_em_wff = em_valid & em_csr_we & ~em_exc_valid &
                              ((em_csr_addr == `RV32GC_CSR_FFLAGS) |
                               (em_csr_addr == `RV32GC_CSR_FCSR));
-    wire        csr_em_wfr = em_valid & em_csr_we & ~em_exc_valid &
-                             ((em_csr_addr == `RV32GC_CSR_FRM) |
-                              (em_csr_addr == `RV32GC_CSR_FCSR));
+    wire        csr_em_wfr = fp_em_wfr;   // 与 FPU 侧共用（唯一定义处见 §7.5 前）
     wire        csr_mw_wff = csr_wen_w & ((mw_csr_addr == `RV32GC_CSR_FFLAGS) |
                                           (mw_csr_addr == `RV32GC_CSR_FCSR));
-    wire        csr_mw_wfr = csr_wen_w & ((mw_csr_addr == `RV32GC_CSR_FRM) |
-                                          (mw_csr_addr == `RV32GC_CSR_FCSR));
+    wire        csr_mw_wfr = fp_mw_wfr;
     //   frm 新字段：写者地址决定位段（frm ⇒ [2:0]，fcsr ⇒ [7:5]）
-    wire [2:0]  csr_em_frm_v = (em_csr_addr == `RV32GC_CSR_FRM) ? em_csr_wdata[2:0]
-                                                                : em_csr_wdata[7:5];
-    wire [2:0]  csr_mw_frm_v = (mw_csr_addr == `RV32GC_CSR_FRM) ? mw_csr_wdata[2:0]
-                                                                : mw_csr_wdata[7:5];
+    wire [2:0]  csr_em_frm_v = fp_em_frm;
+    wire [2:0]  csr_mw_frm_v = fp_mw_frm;
     wire [4:0]  csr_fflags_rd = csr_em_wff ? em_csr_wdata[4:0] :
                                 csr_mw_wff ? mw_csr_wdata[4:0] : fflags_r;
-    wire [2:0]  csr_frm_rd    = csr_em_wfr ? csr_em_frm_v :
-                                csr_mw_wfr ? csr_mw_frm_v : frm_r;
+    wire [2:0]  csr_frm_rd    = fp_frm_eff;
     wire [31:0] csr_fp_byp =
         (de_csr_addr == `RV32GC_CSR_FFLAGS) ? {27'b0, csr_fflags_rd} :
         (de_csr_addr == `RV32GC_CSR_FRM)    ? {29'b0, csr_frm_rd}    :
@@ -1255,7 +1282,19 @@ module core_top (
     reg         m_exc_q;
     reg  [4:0]  m_exc_cause_q;
     reg  [31:0] m_exc_tval_q;
-    reg  [31:0] m_rd_data_q;         // L1D/MMIO/AXI 读回数据
+    reg  [31:0] m_rd_data_q;         // L1D/MMIO/AXI 读回数据（size8 时 = 低字）
+    //   ★ 2026-09-17 根因修复（D 扩展）：8 B FP 访问（fld/fsd）的**高字**。
+    //     本核的数据访问在 ROUTE_AXI 上走 MDTA（单 beat 32 bit），8 B 访问必须
+    //     **拆成两笔 4 B**（低字 pa / 高字 pa+4）—— 原实现只在 M_S_RSP 的 L1D
+    //     分支里有拆分（而该分支对 DDR3 不可达），且把 64 bit 值写进 32 bit 的
+    //     `m_rd_data_q`（静默截断）⇒ fld 的高 32 位恒 0、fsd 只写低 4 B。
+    //     详见 §12.3 的 M_S_AXI 修复注释。
+    reg  [31:0] m_rd_hi_q;           // 高字（size8 第二阶段）
+    //   ★ 生命周期与 `m_rd_data_q` **完全一致**：只在复位清 0，**不**在 M_S_IDLE /
+    //     m_kill_fsm 清 0 —— M→W 捕获可能被推迟（done 拍 pipe_adv=0 时由
+    //     `m_issued_q & M_S_IDLE` 的锁存态在后续拍补捕），若在 M_S_IDLE 就清掉，
+    //     被推迟的那次捕获会拿到 0（load 数据丢失）。陈旧值无害：两半都在
+    //     "本次 8 B 访问完成"之前被覆写，且被 kill 的访问不产生捕获。
     reg  [31:0] m_amo_wdata_q;       // AMO 写相数据（在 cs_ready 拍锁存）
     reg         m_sc_ok_q;           // SC 成功标志（同上）
     reg         m_done_q;            // 本笔访存完成（单拍脉冲）
@@ -2276,6 +2315,32 @@ module core_top (
     assign m_rf_we= em_valid & (em_wb_sel != WB_NONE) & (em_rd != 5'd0) &
                     ~m_exc_any & m_mem_done;    // ★ 只用"访存已完成"的锁存态
 
+    // ---- ★ FLW/FLD 写回浮点寄存器堆的数据（NaN-boxing 口径，2026-09-17 修复）----
+    //   现象（实测 arch-test rv32i/F）：flw 之后所有以该 f 寄存器为操作数的 FP
+    //   指令都按 S canonical NaN 参与运算 —— F-feq.s-00 的判等结果与 NV 标志整片
+    //   偏差（feq(+0,+0) 给 0 而非 1）、F-fadd.s-01 结果全是 0x7FC0_0000、
+    //   F-fcvt.w.s-00 的负溢出饱和方向"错"（其实输入被替换成了 canonical NaN ⇒
+    //   按 NaN 规则给正最大 0x7FFF_FFFF，而 spike 给 0x8000_0000）。
+    //   根因：E 级 `e_fp_wdata_sel` 对 OPT_FPLD 恒给 64'h0（注释说"写数据在 M 级取回"
+    //   —— 但 M/W 侧从来**没有**把 `m_rd_data_q` 接进 FP 写口）⇒ flw 把 0 写进
+    //   fregfile（高 32 位也不是全 1）⇒ d-st-ext.adoc:52-59 的 NaN-boxing 检查
+    //   （fpu.v §3① / fpu_cmp.v §5）判"非 boxed"、按 0x7FC0_0000 参与运算。
+    //   修复：M→W 捕获时把已完成的 load 数据接进 `mw_fp_wdata`：
+    //     · FLW（size=2）⇒ 低 32 位 = 载入字，高 32 位全 1（NaN-boxed，
+    //       d-st-ext.adoc:45-47 norm:FP_transfer_instrs_narrow_transfer_in）
+    //     · FLD（size=3）⇒ 完整 64 位 = {m_rd_hi_q, m_rd_data_q[31:0]}
+    //       （两半由 M 级 FSM 的 8 B 两阶段访问分别锁存；2026-09-17 修复）
+    //   ★ 缺陷修复记录（2026-09-17，D 扩展）：原式 `m_size8 ? m_rd_data_q : …`
+    //     把 32 bit 的 `m_rd_data_q` 零扩展成 64 bit ⇒ **fld 的高 32 位恒 0**。
+    //     后果（arch-test rv32i/D 实测 71/104 失败，全部由本缺陷派生）：
+    //       · fclass.d 的 D 操作数高字（含符号与指数高位）恒 0 ⇒ 恒判 +亚正规
+    //         （实测恒 0x20，spike 为 0x40/0x02 等）；
+    //       · 所有 D 算术的操作数被替换成"符号 0、指数 0"的极小亚正规数
+    //         ⇒ 结果错、flags 错（本该 NX 的精确和、本不该 UF 的乘积…）；
+    //       · fsd 存出的高 4 B 是垃圾（见 M_S_AXI 的另一半修复）。
+    wire [63:0] m_fp_ld_wdata = m_size8 ? {m_rd_hi_q, m_rd_data_q[31:0]}
+                                        : {32'hFFFF_FFFF, m_rd_data_q[31:0]};
+
     // load-use 停顿：M 级是对 GPR 的 load/AMO/LR/SC **且其结果尚未可用**，
     //   而紧随其后的 E 级指令要用该 rd ⇒ 本拍不推进（F/D/E 冻结）。
     //   ★ 完成即解除（~m_mem_done，而非仅 ~m_done_q）：
@@ -2366,7 +2431,8 @@ module core_top (
             m_page_fault_q <= 1'b0; m_page_cause_q <= 5'd0;
             m_hi_q <= 1'b0; m_amo_phase_q <= 1'b0;
             m_exc_q <= 1'b0; m_exc_cause_q <= 5'd0; m_exc_tval_q <= 32'h0;
-            m_rd_data_q <= 32'h0; m_amo_wdata_q <= 32'h0; m_sc_ok_q <= 1'b0;
+            m_rd_data_q <= 32'h0; m_rd_hi_q <= 32'h0;
+            m_amo_wdata_q <= 32'h0; m_sc_ok_q <= 1'b0;
             m_done_q <= 1'b0;
             m_issued_q <= 1'b0;
             m_mmio_clint_q <= 1'b0; m_mmio_plic_q <= 1'b0; m_mmio_we_q <= 1'b0;
@@ -2464,6 +2530,20 @@ module core_top (
 
             // fflags 累积（08 §5.3 ②）
             if (e_fflags_we) fflags_r <= fflags_r | fpu_fflags;
+            //   ★ 修复记录（2026-09-17）——「更年轻的 FP 标志被更老的 CSR 写抹掉」
+            //     现象（实测 arch-test rv32i/F）：F-feq.s-00 165 处 dut=0/spike=0x10
+            //     （feq.s 遇 sNaN 应置 NV）、F-fcvt.s.w-00 24 处 dut=0/spike=0x01
+            //     （fcvt.s.w 不精确应置 NX）。
+            //     根因：fflags 在本核于 **E 级**累积（上面这行），而写 fflags/fcsr 的
+            //     CSR 指令在 **W 级**落盘（下面 (7) 段）。测试序列是 `csrwi fflags,0`
+            //     紧邻 `feq.s`（相隔 1~2 条）⇒ CSR 写的落盘拍**晚于** FP 指令的累积拍，
+            //     且 (7) 段赋值在 always 块里更靠后 ⇒ 直接覆盖掉刚置的 NV/NX。
+            //     口径：fflags 是**粘滞 OR 累积**（语义上 = 按程序序依次 OR），老指令的
+            //     CSR 写不能抹掉新指令的置位。已完成指令的标志早已在 fflags_r 里；
+            //     仍**在途**（比该 CSR 写更年轻）的 FP 指令标志必须并入落盘值：
+            //       · M 槽 em_fflags（其 E 级累积在上一拍 ⇒ 被本拍 CSR 写覆盖）
+            //       · E 槽 fpu_fflags（与本次 CSR 写同拍落盘 ⇒ 被同块后赋值覆盖）
+            //     sticky-OR 幂等 ⇒ 重复并入不会多置位（见下面 (7) 段的 e_flags_younger）。
 
             // 计数器（Zicntr；csr_file 侧合成软件可写视图）
             cycle_cnt_r   <= cycle_cnt_r + 64'd1;
@@ -2543,7 +2623,10 @@ module core_top (
                 mw_wdata        <= m_wdata;
                 mw_fp_we        <= em_fp_we & ~mw_n_excv;
                 mw_fp_rd        <= em_fp_rd;
-                mw_fp_wdata     <= em_fp_wdata;
+                //   ★ FLW/FLD 的数据在 M 级访存完成时才有（见 §12.4 的修复记录）：
+                //     其余 FP 指令仍用随流水携带的 `em_fp_wdata`（E 级算好的结果）。
+                mw_fp_wdata     <= (em_mem_op == MEM_FLOAD) ? m_fp_ld_wdata
+                                                            : em_fp_wdata;
                 mw_csr_we       <= em_csr_we & ~mw_n_excv;
                 mw_csr_addr     <= em_csr_addr;
                 mw_csr_wdata    <= em_csr_wdata;
@@ -2571,12 +2654,16 @@ module core_top (
             gpr[0] <= 32'h0;
 
             // ================= (7) FP CSR + mstatus.FS =================
+            //   ★ 落盘值必须并入 `e_flags_younger`（2026-09-17 修复）：
+            //     CSR 写指令按程序序**老于**仍在 M/E 槽的 FP 指令，故它的写不能抹掉
+            //     这些年轻指令刚置的 NV/NX；sticky-OR 幂等 ⇒ 并入不会多置位。
+            //     细节与实测证据见上面 (3) 段后的「修复记录」。
             if (csr_wen_w) begin
                 case (mw_csr_addr)
-                    `RV32GC_CSR_FFLAGS: fflags_r <= mw_csr_wdata[4:0];
+                    `RV32GC_CSR_FFLAGS: fflags_r <= mw_csr_wdata[4:0] | e_flags_younger;
                     `RV32GC_CSR_FRM:    frm_r    <= mw_csr_wdata[2:0];
                     `RV32GC_CSR_FCSR:   begin
-                        fflags_r <= mw_csr_wdata[4:0];
+                        fflags_r <= mw_csr_wdata[4:0] | e_flags_younger;
                         frm_r    <= mw_csr_wdata[7:5];
                     end
                     default: ;
@@ -2776,11 +2863,11 @@ module core_top (
                                 m_state_q   <= M_S_IDLE;
                                 m_done_q    <= 1'b1;
                             end else if (m_size8 & ~m_hi_q) begin
-                                m_rd_data_q <= {l1d_cs_rdata, 32'h0};  // 低字（fld）
+                                m_rd_data_q <= l1d_cs_rdata;   // 低字（fld 第一阶段）
                                 m_hi_q      <= 1'b1;
                                 m_state_q   <= M_S_ISS;
                             end else if (m_size8 & m_hi_q) begin
-                                m_rd_data_q <= {l1d_cs_rdata, m_rd_data_q[31:0]}; // 高字
+                                m_rd_hi_q   <= l1d_cs_rdata;   // 高字（fld 第二阶段）
                                 m_state_q   <= M_S_IDLE;
                                 m_done_q    <= 1'b1;
                             end else begin
@@ -2837,9 +2924,30 @@ module core_top (
                         if (axi_done_q & (axi_done_owner_q == AXO_MDTA)) begin
                             // ★ 2026-09-15 修复：整数 load 走 `m_axi_ld_data`
                             //   （已按 VA[1:0]/尺寸抽取 + 符号扩展），不再直取整字。
-                            if (~axi_done_wr_q) m_rd_data_q <= m_axi_ld_data;
-                            m_state_q   <= M_S_IDLE;
-                            m_done_q    <= 1'b1;
+                            // ★ 2026-09-17 根因修复（D 扩展 fld/fsd 的 8 B 两阶段）：
+                            //   MDTA 一笔 = 单 beat 32 bit，而 fld/fsd 是 8 B
+                            //   ⇒ 必须拆成**两笔**（低字 pa / 高字 pa+4），与 M_S_RSP
+                            //   的 L1D 分支同口径（`m_hi_q` 表示"正在做高字"，
+                            //   `m_pa_eff = m_pa_q + (m_hi_q ? 4 : 0)` 已按此派生）。
+                            //   原实现在 ROUTE_AXI 上只发一笔就完成 ⇒ fld 高字恒 0、
+                            //   fsd 只写低 4 B（实测 D-fsd-00：签名高字槽仍是预填
+                            //   0xdeadbeef；D 算术的操作数高字被抹成 0）。
+                            //   第二阶段重回 M_S_ISS：该拍按 m_hi_q=1 重新锁存
+                            //   `m_mmio_pa_q`=pa+4 与 `m_store_w32`=存数高字
+                            //   （fsd 写），load 则把回来的整字存进 `m_rd_hi_q`。
+                            if (m_size8 & ~m_hi_q) begin
+                                if (~axi_done_wr_q) m_rd_data_q <= m_axi_ld_data;
+                                m_hi_q    <= 1'b1;
+                                m_state_q <= M_S_ISS;
+                            end else if (m_size8 & m_hi_q) begin
+                                if (~axi_done_wr_q) m_rd_hi_q <= m_axi_ld_data;
+                                m_state_q <= M_S_IDLE;
+                                m_done_q  <= 1'b1;
+                            end else begin
+                                if (~axi_done_wr_q) m_rd_data_q <= m_axi_ld_data;
+                                m_state_q <= M_S_IDLE;
+                                m_done_q  <= 1'b1;
+                            end
                         end
                     end
 

@@ -12,12 +12,36 @@
 ./sim/arch_test/run.sh --check-exclude   # 校验 exclude.list 每条规则都命中真实用例
 ./sim/arch_test/run.sh --directed dm_smoke       # 定向程序：底座 PASS 通道自证（无 CSR 访问）
 ./sim/arch_test/run.sh --directed dm_csr_raw     # 定向程序：CSR 写后读（RAW）缺陷复现
+./sim/arch_test/run.sh --group rv32i/I --limit 5 # 组模式串行冒烟
+./sim/arch_test/run.sh --group rv32i/I --jobs 16 # 组模式多进程并行（默认 jobs=nproc；本机 16 核）
 ```
 
 判定纪律（AGENT.md §0.6「未捕获即失败」）：
 - 唯一成功文案 = `RV32_ARCH_TEST: <用例> PASS (compared=<n> lines, first_diff=none)` 与
   `RV32_ARCH_TEST_RUN: PASS (<n>/<n>)`；兜底/失败路径**不含 PASS 字样**；
 - 任一步失败（编译/参考/DUT 仿真/签名行数/逐行比对/超时）⇒ 该用例 FAIL 且脚本 rc≠0。
+
+组模式并行口径（`--jobs N`，**只对 `--group` 生效**）：
+- 候选清单 → exclude.list 过滤 → `--limit` 截断 → 分发；**每个用例一个独立子进程**，
+  该例完整 stdout/stderr 落 `work/<用例>/run.console.log`，判定落 `work/<用例>/result.txt`
+  （`<pass|fail|skip>|<用例>|<fail标签>|<compared行数>`），子进程退出码落 `work/<用例>/run.rc`；
+  父进程 join 全部子进程后按候选清单顺序**回放**控制台日志（日志形态与串行版同构）再聚合。
+- 判定与串行完全同源：只有 `result.txt` 明确记 pass **且** worker rc=0 才计通过；子进程异常退出、
+  结果文件缺失/损坏/与 rc 矛盾 ⇒ 该例计 FAIL，并打印 worker rc 与该例日志末尾（绝不静默丢失），
+  组计数自检（`pass+fail+skip = 运行例数`）再兜底。
+- `--jobs 1` 走原串行路径（stdout 直通，行为/文案与改造前一致）；`--jobs 0`/非数字/非组模式给出
+  `--jobs` 一律硬失败 rc=2（**不静默回退串行**）；本批存在同 basename 用例时并行模式拒绝执行
+  （它们共用 `work/<名字>/`，会互相覆盖判定）。
+- **并发度怎么选 / 实测口径**（本机：AMD Ryzen 9 7940H，`nproc`=16、**物理核 8**（8C/16T，
+  `lscpu -p=CORE,SOCKET`）；`timeout_vvp_seconds: 900` 是**每例墙钟**上限）。
+  I 组 39 例、**同一份 RTL**（RTL/TB 哈希 `e2da27978da639b0bc1a830479ea62a3`）实测：
+  `--jobs 1` = **432 s**、`--jobs 8` = **98 s**、`--jobs 16` = **74 s**（三档均 39/39 通过、rc=0；
+  16 路加速比 **5.8×**）。默认 `--jobs` 取 `nproc`；`jobs` 超过物理核数时脚本往 **stderr** 打一条
+  提示（只提示、不改变任何判定）。
+- ⚠ 本组用例的单例墙钟**强烈依赖当前 RTL 的仿真速度**：并行开发期间实测到过 RTL 中间态把单例 vvp
+  墙钟从 ~15 s 拉到 250~1270 s（此时 16 路 SMT 超订再乘约 2×，最重用例撞 900 s ⇒ `rc=124` 判 FAIL，
+  脚本仍 fail-closed、绝不假过）。遇到 `rc=124` 先确认 RTL 是否处于慢态/正在被改动，再决定降
+  `--jobs` 还是加大 `--timeout-vvp`。
 
 ## 2. 文件
 
@@ -71,5 +95,7 @@
 
 - 中间产物在 `sim/arch_test/work/<用例>/`（`.elf/.hex/.spike.sig/.dut.signature/两侧 dump/日志/tb.vvp`）；
   该目录属构建产物，提交前建议忽略（`.gitignore` 是否登记由母 Agent 决定）。
+- 并行模式（`--group … --jobs N>1`）额外产生 `run.console.log`（该例完整输出）、`result.txt`
+  （判定记录）、`run.rc`（子进程退出码）三件；串行模式与 `--jobs 1` 不产生这三件。
 - 本底座**不含** uv/ruby 依赖：UDB 生成物（`rvtest_config.h`/`extensions.txt`）由手工维护，
   口径与 `rv32gc-2a.yaml`/`test_config.yaml` 声明一致；将来 UDB 可用时应改为其产物。

@@ -1,7 +1,7 @@
 # NEXT_SESSION.md — RV32-GC 新项目（重启版）跨会话交接
 
 > 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/`（dev 分支；master = 旧项目冻结历史，勿动）。
-> 更新日期：2026-09-14（阶段一进行中）。
+> 更新日期：2026-09-16（阶段二 2A M2 收尾中）。
 
 ## 1. 项目状态（截至本文件更新时）
 
@@ -11,19 +11,15 @@
   - `docs/porting/01-overview.md` 02-uboot 03-linux-opensbi 04-nand-driver 05-rootfs（5 篇）
   - `docs/kb/platform-facts.md` isa-notes.md tools-and-flow.md（3 篇）
 
-## 1.5 阶段二 2A 当前状态（2026-09-15，M2 推进中）
+## 1.5 阶段二 2A 当前状态（2026-09-16，M2 收尾推进中）
 
 - **M1 已达成**：首条取指 0x1C000000 + UART 回显 PASS（D1-D9 十类缺陷修复：XIP 组合环/取指门控/carry 自锁/写通路/AxCACHE/M FSM/PC 推进/在途保护/done 重复）。
-- **M2 推进中（本轮关键成果，已全部提交）**：
-  - 单元回归 21/21、M1 cycles=464 恒稳、Verilator lint 457（UNOPTFLAT 0）。
-  - 陷阱/特权链路：kill_young 冲刷 M/E 槽、trap 电平门控、fence.i 同步窗、fpcsr 门控（ebreak mcause=3）、mret/sret 重定向、xPP 陷阱语义根因（priv_ctrl/csr_file）。
-  - CSR 旁路链：写→紧邻读（W/M 两级取写数据 M>W）→ WARL 落盘值引擎（csr_landing 单一真源，7+1 条锁步用例）。
-  - 解码修复：addi imm∈[0x400,0x41F] 误译 sub、**JAL 型无 funct3 误判非法**（arch-test 挂死根因①）。
-  - 访存修复：AXI/MMIO uncached 读补 ld_extract、MMIO 读 4B 对齐、PLIC 偏移-0x100000、PLIC 命中窗口 [0x1F10_0000,0x1F50_0000) 4MiB 显式区间。
-  - Spike 锁步底座（108/108 + 反证自测）；arch-test 底座（单例+组批量、exclude.list；I-nop-00/I-add-00 PASS）。
-- **M2 批跑（待重跑）**：上一会话的后台批跑已随会话终止、结果丢失。**新会话开工后重跑**：`cd rv32gc-cpu && { for g in I M Zicsr Zifencei Zicntr Zicbom Zca F D; do ./sim/arch_test/run.sh --group "rv32i/$g"; done; } 2>&1 | tee /tmp/m2_groups.log`（日志 /tmp/m2_groups.log；**批跑期间禁止改 RTL**）。注意：同仓同用例勿并行（work 目录互踩）；单例复跑命令 `./sim/arch_test/run.sh I-nop-00`。
-- **新会话路由已切换**（2026-09-16）：母 Agent = deepseek-official/deepseek-v4-pro；子 Agent = `provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "max"`（settings.yaml allowedModels 已由用户配置，**仅新会话生效**）。
-- **下一步（批跑后）**：① 失败用例逐个定位修复（锁步/arch-test 双工具）；② 特权子集 SvPMP；③ 待办清单：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一（区间比较）、plic.v priority/threshold 3bit WARL 与 08 §6.6"32 位"表述对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 写通路字节合并；④ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
+- **M2 已完成项（2026-09-15 提交）**：单元回归 21/21、M1 cycles=464 恒稳、Verilator lint 457（UNOPTFLAT 0）；陷阱/特权链路、CSR 旁路链（csr_landing 单一真源）、解码修复（addi 误译 sub、JAL 无 funct3）、访存修复（ld_extract、PLIC 偏移/命中窗口）、Spike 锁步底座（108/108）、arch-test 底座。
+- **M2 本轮（2026-09-16，用户指令：先并行化再修 F）**：
+  - **并行化 ✅（子 Agent 交付 + 母 Agent 部分复跑）**：`run.sh --group` 新增 `--jobs N`（默认 nproc=16），worker 每例独立三件产物（run.console.log/result.txt/run.rc）、父进程 join 后按序回放聚合；fail-closed（参数错 rc=2、worker 被杀=未捕获 FAIL、同 basename 硬失败、组计数自检保留）。实测 I 组 39/39：`--jobs 16` 74s vs `--jobs 1` 432s（5.84×）。母 Agent 已复核：bash -n、--jobs 0/abc rc=2、坏组名 rc=2、PASS 文案审计干净；I 组重负载复跑随批跑 v2 一并做。
+  - **F 扩展修复 ✅（子 Agent 交付，78/78）**：6 个 RTL 根因——① decoder wb_sel 兜底 WB_ALU 覆盖 x[rd]（签名指针被打烂）；② sel_i/sel_s 漏 is_loadfp/is_storefp（FP 访存 imm=0）；③ core_top flw 数据通路缺失（未 NaN-box，写 0）；④ fflags E 级累积 vs W 级 CSR 落盘覆盖（并入 M/E 在途标志）；⑤ frm 无 CSR 写旁路（dyn 错 1 ulp）；⑥ fpu_add UF 判据按有界指数（漏 UF）。反证链 + 黄金模型（ref_model.py 修正 UF 口径）齐备。母 Agent 复跑 `scripts/regress.sh` = 21/21 PASS ✓。
+- **M2 批跑 v2（2026-09-16 完成，结果已出）**：`{ for g in I M Zicsr Zifencei Zicntr Zicbom Zca F D; do ./sim/arch_test/run.sh --group "rv32i/$g" --jobs 16; done; } 2>&1 | tee /tmp/m2_groups_v2.log`。**I 39/39、M 8/8、Zicsr 6/6、Zifencei 1/1、Zicntr 2/2、Zicbom 3/3、F 78/78 全绿**（母 Agent 亲跑：并行 16 路 + F 修复后首轮全过；I 组并行 74s 级）；Zca 26 例按 exclude.list 全过滤（口径：2A 声明 C 本体、未按 Zc* 族分组验证）；**D 组 33/104、71 FAIL**——失败全为「签名不一致」且规律性极强：所有 .d 算术/比较/fclass + fcvt.s.d/fcvt.w.d/fcvt.wu.d + fsd 全败，同组 .s、fld、fcvt.d.*、fmv、fsgnj 全过（fld 过 fsd 败 ⇒ 双精度"写对读断"），已派 coding 修复（子 Agent 2c292a15，附证据矩阵 + 禁 git checkout 红线）。批跑期间禁止改 RTL 已解除（批跑结束）。
+- **待办清单（批跑 v2 后）**：① D 组失败逐例修复（若有）；② **FP load-use 冒险显式互锁**（F 子 Agent 遗留：m_is_load_kind 不含 MEM_FLOAD、e_use_rs2 不含 OP-FP/FMA；flw 未命中紧邻消费者会读旧值，F 组生成码留空一拍故未暴露）；③ 特权子集 SvPMP；④ 原有待办：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一（区间比较）、plic.v priority/threshold 3bit WARL 与 08 §6.6"32 位"表述对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 写通路字节合并；⑤ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
 

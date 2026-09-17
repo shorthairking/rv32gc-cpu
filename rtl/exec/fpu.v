@@ -231,35 +231,75 @@ module fpu #(
 
     //==========================================================================
     // 5. 算术子单元（S/D 双核 + fmt 选择；与 fpu_cmp.v 同风格：以面积换直白）
+    //--------------------------------------------------------------------------
+    // ★ 仿真吞吐优化（2026-09-17，**语义逐位不变**，只为让 arch-test F 组在
+    //   run.sh 的超时内跑完）：**未选中子单元的操作数输入钳到 0**。
+    //   本文件按"面积换直白"例化了 S/D 双份算术核（add/mul/fma × S/D + cvt + cmp），
+    //   但 §8 的结果选择只会用到 fp_op/fmt 选中的那一份，其余输出**恒被丢弃**。
+    //   若照常把 fregfile 的操作数接到所有子单元，iverilog 每拍都要重算全部单元
+    //   （D 侧含 8192 bit 移位域 × 6 个 fpu_round_d 实例）⇒ F 组用例跑不完。
+    //   钳零后未选中单元的输入不再跳变，事件驱动仿真不再重算它们；选中单元的
+    //   端口、位宽与位级语义一位不动。
+    //   ★ 判据只用 fp_op/fmt（E 级指令字段）——多拍/停顿期间这两个字段保持不变
+    //     （E 级被冻结），故结果与钳零前逐位相同；冲刷拍即使变化，结果也会被丢弃。
     //==========================================================================
+    wire en_add_s = (op_addsub & ~is_d);
+    wire en_add_d = (op_addsub &  is_d);
+    wire en_mul_s = (op_mul    & ~is_d);
+    wire en_mul_d = (op_mul    &  is_d);
+    wire en_fma_s = (op_fma    & ~is_d);
+    wire en_fma_d = (op_fma    &  is_d);
+    wire en_cmp   =  op_cmp;
+    wire en_cvt   =  op_cvt;
+
+    wire [63:0] a_add_s = en_add_s ? a_ar : 64'd0;
+    wire [63:0] b_add_s = en_add_s ? b_ar : 64'd0;
+    wire [63:0] a_add_d = en_add_d ? a    : 64'd0;
+    wire [63:0] b_add_d = en_add_d ? b    : 64'd0;
+    wire [63:0] a_mul_s = en_mul_s ? a_ar : 64'd0;
+    wire [63:0] b_mul_s = en_mul_s ? b_ar : 64'd0;
+    wire [63:0] a_mul_d = en_mul_d ? a    : 64'd0;
+    wire [63:0] b_mul_d = en_mul_d ? b    : 64'd0;
+    wire [63:0] a_fma_s = en_fma_s ? a_ar : 64'd0;
+    wire [63:0] b_fma_s = en_fma_s ? b_ar : 64'd0;
+    wire [63:0] c_fma_s = en_fma_s ? c_ar : 64'd0;
+    wire [63:0] a_fma_d = en_fma_d ? a    : 64'd0;
+    wire [63:0] b_fma_d = en_fma_d ? b    : 64'd0;
+    wire [63:0] c_fma_d = en_fma_d ? c    : 64'd0;
+    wire [63:0] a_cmp   = en_cmp   ? a    : 64'd0;
+    wire [63:0] b_cmp   = en_cmp   ? b    : 64'd0;
+    wire [63:0] a_cvt   = en_cvt   ? a    : 64'd0;
+
     wire [31:0] add_s_r;  wire [63:0] add_d_r;  wire [4:0] add_s_f, add_d_f;
     wire [31:0] mul_s_r;  wire [63:0] mul_d_r;  wire [4:0] mul_s_f, mul_d_f;
     wire [31:0] fma_s_r;  wire [63:0] fma_d_r;  wire [4:0] fma_s_f, fma_d_f;
 
     fpu_add_s u_add_s (
-        .a (a_ar), .b (b_ar), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
+        .a (a_add_s), .b (b_add_s), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
         .result (add_s_r), .fflags (add_s_f)
     );
     fpu_add_d u_add_d (
-        .a (a), .b (b), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
+        .a (a_add_d), .b (b_add_d), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
         .result (add_d_r), .fflags (add_d_f)
     );
     fpu_mul_s u_mul_s (
-        .a (a_ar), .b (b_ar), .rm (rm_eff),
+        .a (a_mul_s), .b (b_mul_s), .rm (rm_eff),
         .result (mul_s_r), .fflags (mul_s_f)
     );
     fpu_mul_d u_mul_d (
-        .a (a), .b (b), .rm (rm_eff),
+        .a (a_mul_d), .b (b_mul_d), .rm (rm_eff),
         .result (mul_d_r), .fflags (mul_d_f)
     );
     // FMA：fpu_fma_s/d 内是"精确积 + 精确对阶 + **一次**舍入"⇒ 单次舍入
     // （08 §5.3 ③；结构上不可能两次舍入，见 fpu_add.v 头注 §2.3）
     fpu_fma_s u_fma_s (
-        .a (a_ar), .b (b_ar), .c (c_ar), .neg_prod (op_fma_np), .neg_add (op_fma_na),
+        .a (a_fma_s), .b (b_fma_s), .c (c_fma_s),
+        .neg_prod (op_fma_np), .neg_add (op_fma_na),
         .rm (rm_eff), .result (fma_s_r), .fflags (fma_s_f)
     );
     fpu_fma_d u_fma_d (
-        .a (a), .b (b), .c (c), .neg_prod (op_fma_np), .neg_add (op_fma_na),
+        .a (a_fma_d), .b (b_fma_d), .c (c_fma_d),
+        .neg_prod (op_fma_np), .neg_add (op_fma_na),
         .rm (rm_eff), .result (fma_d_r), .fflags (fma_d_f)
     );
 
@@ -277,13 +317,13 @@ module fpu #(
     //==========================================================================
     wire [63:0] cmp_r;  wire [4:0] cmp_f;
     fpu_cmp u_cmp (
-        .fp_op (fp_op), .fmt (fmt), .a (a), .b (b),
+        .fp_op (fp_op), .fmt (fmt), .a (a_cmp), .b (b_cmp),
         .result (cmp_r), .fflags (cmp_f)
     );
 
     wire [63:0] cvt_r;  wire [4:0] cvt_f;
     fpu_cvt u_cvt (
-        .fp_op (fp_op), .fmt (fmt), .rm (rm_eff), .frm (frm), .a (a),
+        .fp_op (fp_op), .fmt (fmt), .rm (rm_eff), .frm (frm), .a (a_cvt),
         .result (cvt_r), .fflags (cvt_f)
     );
 
