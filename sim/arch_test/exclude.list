@@ -15,16 +15,38 @@
 #   M/S/U 特权级 + Sv32 + PMP16；**不含** Zb*/Zk*/Zfa*/Zfh*/Zicboz/Zicbop/Zc*
 #   子扩展声明/向量/Sstc/Smstateen/Smepmp/计数器事件选择等。
 #
-# 本轮底座（08 §8.2 的"非特权子集"第一步）**只跑 tests/rv32i/** 中已声明扩展的组，
-# 故下面 A 段把整个特权子集排除、C 段逐目录排除未实现扩展。**通过清单可追溯**：
-# 未出现在本清单里的用例 = 纳入运行范围。
+# 运行范围 = tests/rv32i/** 中已声明扩展的组 **+ 特权子集**：
+#   · 非特权：C 段逐目录排除未实现扩展、D 段排除待裁决项；
+#   · 特权（tests/priv/，test_config.yaml: include_priv_tests: True）：原先的
+#     `tests/priv/**` **整体排除已收窄为逐条排除** —— A 段排"未实现扩展/未实现门控"、
+#     E 段排"RV64 才有的 sv39/sv48/sv57 分页模式"。
+#   口径不变：**未出现在本清单里的用例 = 纳入运行范围**，逐条理由可复核。
 #==============================================================================
 
 #------------------------------------------------------------------------------
-# A. 特权子集（整体排除：2A 的 S 模式/T-SBI 特权底座未就绪，test_config.yaml 的
-#    include_priv_tests: False；打开前须先补特权底座与核内 CLINT/PLIC 的行为模型）
+# A. 特权子集（tests/priv/）：**纳入运行范围**，逐条排除本核跑不了的项。
+#    口径变化：此处原先是一条 `tests/priv/**` 整体排除（配合 include_priv_tests:
+#    False）；本轮打开特权子集后**收窄为逐条排除**，理由分三类：
+#      ① 未声明/未实现扩展：Zca/Zcb/Zcd/Zcf（Zc* 族未声明）、Zicbop、Zicboz、
+#         Svadu、Svinval、Svnapot、Svpbmt；
+#      ② 未实现门控：mstatus.TVM（satp 相关的 S 模式陷阱门控未建模）；
+#      ③ RV64 才有的分页模式 sv39/sv48/sv57 ⇒ 统一登记在 E 段（不在此重复登记）。
+#    保持 IN（**不**列于此）的：M 模式 PMP 全族（PMPF/PMPS/PMPSm/PMPU/PMPZaamo/
+#    PMPZalrsc）、Svbare，以及 **Sv32 分页族**（Sv/sv32_*、SvPMP/sv32_*、
+#    SvPMPZicbo/sv32_*、SvZicbo/sv32_zicbom_*、Svade/sv32_*）——后者属后续 P3
+#    任务范围，本轮保持 IN、暂不运行。
 #------------------------------------------------------------------------------
-tests/priv/**                                       # 特权用例整体：本轮不跑（见 A 段说明）
+tests/priv/Sv/sv_mstatus_tvm_test.S                 # mstatus.TVM 门控未实现：TVM=1 时 satp 访问/S 模式陷阱的行为未建模
+tests/priv/Svadu/**                                 # Svadu（硬件 A/D 位更新）未实现（本核按 Svade 口径只报异常）
+tests/priv/SvaduPMP/**                              # Svadu + PMP 组合：同上
+tests/priv/Svinval/**                               # Svinval（细粒度 TLB 失效）未实现（含 Svinval_mstatus_tvm.S）
+tests/priv/Svnapot/**                               # Svnapot（NAPOT PTE）未实现
+tests/priv/Svpbmt/**                                # Svpbmt（PBMT 位）未实现
+tests/priv/PMPZca/**                                # Zca：2A 声明 C 本体、未声明 Zc* 族（Zcb/Zcd/Zcf 亦未声明）
+tests/priv/PMPZicbo/**                              # Zicbop/Zicboz：未实现（本核只有 Zicbom）
+tests/priv/SvZicbo/sv32_zicbop_*                    # Zicbop（预取提示）未实现
+tests/priv/SvZicbo/sv32_zicboz_*                    # Zicboz（cbo.zero）：2A 明确不含（08 §11 R1）
+tests/priv/ExceptionsSv*                            # Sv32 页错误异常族（smode/umode/mprv + Zaamo/Zalrsc 变体）：本轮不解锁的分页异常路径；同目录族内还含 sv39_* RV64 变体（见 E 段）
 
 #------------------------------------------------------------------------------
 # B. 非 RV32（本核 MXLEN=32）
@@ -89,8 +111,11 @@ tests/rv32i/MisalignZca/**                          # 非对齐访存（Zca）�
 
 #------------------------------------------------------------------------------
 # E. Sv39/Sv48/Sv57 明确登记（RV32 只有 Sv32；这些变体在 RV64 才有意义）
-#    说明：E 段路径全部落在 A 段的 tests/priv/** 内，此处**逐条登记**是为了让
-#    "RV32 只跑 sv32_* 变体"这条纪律可被单独复核（08 §8.2 的筛选要求原文）。
+#    说明：A 段的 `tests/priv/**` 整体排除已**收窄为逐条排除**，本段承接其中
+#    "RV64 专属分页模式"那一类，逐条登记是为了让「RV32 只跑 sv32_* 变体」这条纪律
+#    可被单独复核（08 §8.2 的筛选要求原文）。既有 15 条全部保留不删；
+#    ExceptionsSv* 三条的 sv39_* 亦被 A 段 `tests/priv/ExceptionsSv*` 覆盖，但保留
+#    逐条登记（真实命中仍在，且 sv39_* 的登记不依赖族规则）。
 #------------------------------------------------------------------------------
 tests/priv/SvPMP/sv39_*                             # Sv39 分页：RV32 无此模式
 tests/priv/SvPMP/sv48_*                             # Sv48 分页：RV32 无此模式
@@ -107,5 +132,9 @@ tests/priv/Sv/sv57_*                                # Sv57 通用分页用例：
 tests/priv/ExceptionsSv/sv39_*                      # Sv39 异常用例：RV32 无此模式
 tests/priv/ExceptionsSvZaamo/sv39_*                 # Sv39 + Zaamo：RV32 无此模式
 tests/priv/ExceptionsSvZalrsc/sv39_*                # Sv39 + Zalrsc：RV32 无此模式
+tests/priv/Svade/sv39_*                             # Sv39 + Svade：RV32 无此模式
+tests/priv/Svade/sv48_*                             # Sv48 + Svade：RV32 无此模式
+tests/priv/Svade/sv57_*                             # Sv57 + Svade：RV32 无此模式
 # 说明：ExceptionsSv*/ 目录实际只含 sv32_*/sv39_* 两族（实测 ls），无 sv48_/sv57_ 文件，
 #       故不登记不存在的前缀 —— 这正是 `--check-exclude` 逐条校验要挡住的那类"空规则"。
+#       同理 Svade/ 只含 sv32_*/sv39_*/sv48_*/sv57_* 四族（实测），故四族分别登记。

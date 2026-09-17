@@ -356,8 +356,15 @@ resolve_group() {  # resolve_group <组名> → 打印 arch-test 相对路径（
 #------------------------------------------------------------------------------
 # 6. 用例属性：MARCH / FLEN（口径同 ACT4 的 parse_test_constraints.py）
 #------------------------------------------------------------------------------
-test_march() {  # 取 YAML 头里的 MARCH
-    awk -F': *' '/^# *MARCH:/ { print $2; exit }' "$1"
+test_march() {  # 取 YAML 头里的 MARCH，并把 ACT 模板变量 ${XLEN} 展开为 32
+    local m
+    m="$(awk -F': *' '/^# *MARCH:/ { print $2; exit }' "$1")"
+    # 特权用例头普遍写作 `# MARCH: rv${XLEN}i_zicsr_zifencei`（ACT 生成器的模板变量），
+    # bash 参数展开**不递归**，不显式替换就会把字面量 `rv${XLEN}i_zicsr_zifencei` 交给
+    # GCC（`-march=...` 报错）。口径同官方 ACT4 framework/src/act/toolchain.py:101 的
+    # `march = march.replace("${XLEN}", str(xlen))`，本核 MXLEN=32。
+    # ★ 替换**只作用于这里取出的这一个 MARCH 字符串**，不触碰脚本其它任何 $ 展开。
+    printf '%s' "${m//'${XLEN}'/32}"
 }
 test_flen() {  # 依据 MARCH 推导 TEST_FLEN（Q=128 / D,g=64 / F=32 / 其余 32）
     local m; m="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"

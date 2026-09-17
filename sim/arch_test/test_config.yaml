@@ -33,9 +33,11 @@ dut_include_dir: .            # 含 rvmodel_macros.h / rvtest_config.h / link.ld
 #      tohost 放到 0x800F_F000（TB 终止探测点）。
 linker_script: link.ld
 
-# ---- 特权子集：本轮底座**只跑 rv32i 非特权用例**（2A 的 T-SBI/特权底座未就绪，
-#      见 exclude.list 的逐条理由）。打开特权子集须先补特权底座与核内 CLINT/PLIC 建模。
-include_priv_tests: False
+# ---- 特权子集：**打开**（2A 特权底座已就绪：M/S/U + Sv32 + PMP16）。
+#      口径 = 「纳入运行范围但逐条筛选」：tests/priv/ 下只有 exclude.list 未列出的用例
+#      才会真跑（本轮实际解锁的是 M 模式 PMP 子集与 Svbare；Sv32 分页族保持 IN，
+#      由后续 P3 任务解锁）。排除理由逐条可复核，见 exclude.list 的 A/E 段。
+include_priv_tests: True
 
 #------------------------------------------------------------------------------
 # 以下为**本底座自用**的运行口径（ACT 的 Config 模型会忽略未知键；
