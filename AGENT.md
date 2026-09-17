@@ -242,5 +242,6 @@
 
 ## 9. 当前状态与下一步
 
-- **阶段二 2A M2 非特权部分完成并提交（`0b15b7c`）**：arch-test 非特权子集全绿（I 39/M 8/Zicsr 6/Zifencei 1/Zicntr 2/Zicbom 3/F 78/D 104 = 241 例）+ L0 回归 21/21 + 批跑并行化（--jobs）。
-- **下一步（M2 收尾→M3）**：① FP load-use 显式互锁修复（已派/进行中）；② SvPMP 特权子集（tests/priv，先确认 rv32gc-2a.yaml/test_config.yaml 入口口径）；③ 待办：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 第二阶段重翻译；④ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
+- **⏸ 已暂停（2026-09-17 用户指令）**：阶段二 2A M2 进行中状态已保存（NEXT_SESSION.md §1.5 暂停点：在途 T-D 子 Agent 4e7827ca 已被打断、5 个 RTL 文件为其半成品 md5 已登记、恢复路径=T-D 任务要点）。**等待用户指令恢复。**
+- **已达成（均已提交）**：M2 非特权子集全绿（I 39/M 8/Zicsr 6/Zifencei 1/Zicntr 2/Zicbom 3/F 78/D 104，`0b15b7c`）；FP load-use 显式互锁（`a2f5561`）；特权底座开关（`563913c`）；M 模式 PMP 63/63 + Svbare 3/3（`a69ee8c`/`113cb09`）；批跑并行化（--jobs）。
+- **下一步（恢复后）**：① T-D：sfence.vma 译码 + 取指侧 Sv32（见 NEXT_SESSION.md §1.5 暂停点）；② 待办：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 第二阶段重翻译；③ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
