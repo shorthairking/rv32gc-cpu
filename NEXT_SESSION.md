@@ -11,15 +11,16 @@
   - `docs/porting/01-overview.md` 02-uboot 03-linux-opensbi 04-nand-driver 05-rootfs（5 篇）
   - `docs/kb/platform-facts.md` isa-notes.md tools-and-flow.md（3 篇）
 
-## 1.5 阶段二 2A 当前状态（2026-09-16，M2 收尾推进中）
+## 1.5 阶段二 2A 当前状态（2026-09-16，M2 非特权全绿，已提交 0b15b7c）
 
 - **M1 已达成**：首条取指 0x1C000000 + UART 回显 PASS（D1-D9 十类缺陷修复：XIP 组合环/取指门控/carry 自锁/写通路/AxCACHE/M FSM/PC 推进/在途保护/done 重复）。
 - **M2 已完成项（2026-09-15 提交）**：单元回归 21/21、M1 cycles=464 恒稳、Verilator lint 457（UNOPTFLAT 0）；陷阱/特权链路、CSR 旁路链（csr_landing 单一真源）、解码修复（addi 误译 sub、JAL 无 funct3）、访存修复（ld_extract、PLIC 偏移/命中窗口）、Spike 锁步底座（108/108）、arch-test 底座。
-- **M2 本轮（2026-09-16，用户指令：先并行化再修 F）**：
-  - **并行化 ✅（子 Agent 交付 + 母 Agent 部分复跑）**：`run.sh --group` 新增 `--jobs N`（默认 nproc=16），worker 每例独立三件产物（run.console.log/result.txt/run.rc）、父进程 join 后按序回放聚合；fail-closed（参数错 rc=2、worker 被杀=未捕获 FAIL、同 basename 硬失败、组计数自检保留）。实测 I 组 39/39：`--jobs 16` 74s vs `--jobs 1` 432s（5.84×）。母 Agent 已复核：bash -n、--jobs 0/abc rc=2、坏组名 rc=2、PASS 文案审计干净；I 组重负载复跑随批跑 v2 一并做。
-  - **F 扩展修复 ✅（子 Agent 交付，78/78）**：6 个 RTL 根因——① decoder wb_sel 兜底 WB_ALU 覆盖 x[rd]（签名指针被打烂）；② sel_i/sel_s 漏 is_loadfp/is_storefp（FP 访存 imm=0）；③ core_top flw 数据通路缺失（未 NaN-box，写 0）；④ fflags E 级累积 vs W 级 CSR 落盘覆盖（并入 M/E 在途标志）；⑤ frm 无 CSR 写旁路（dyn 错 1 ulp）；⑥ fpu_add UF 判据按有界指数（漏 UF）。反证链 + 黄金模型（ref_model.py 修正 UF 口径）齐备。母 Agent 复跑 `scripts/regress.sh` = 21/21 PASS ✓。
-- **M2 批跑 v2（2026-09-16 完成，结果已出）**：`{ for g in I M Zicsr Zifencei Zicntr Zicbom Zca F D; do ./sim/arch_test/run.sh --group "rv32i/$g" --jobs 16; done; } 2>&1 | tee /tmp/m2_groups_v2.log`。**I 39/39、M 8/8、Zicsr 6/6、Zifencei 1/1、Zicntr 2/2、Zicbom 3/3、F 78/78 全绿**（母 Agent 亲跑：并行 16 路 + F 修复后首轮全过；I 组并行 74s 级）；Zca 26 例按 exclude.list 全过滤（口径：2A 声明 C 本体、未按 Zc* 族分组验证）；**D 组 33/104、71 FAIL**——失败全为「签名不一致」且规律性极强：所有 .d 算术/比较/fclass + fcvt.s.d/fcvt.w.d/fcvt.wu.d + fsd 全败，同组 .s、fld、fcvt.d.*、fmv、fsgnj 全过（fld 过 fsd 败 ⇒ 双精度"写对读断"），已派 coding 修复（子 Agent 2c292a15，附证据矩阵 + 禁 git checkout 红线）。批跑期间禁止改 RTL 已解除（批跑结束）。
-- **待办清单（批跑 v2 后）**：① D 组失败逐例修复（若有）；② **FP load-use 冒险显式互锁**（F 子 Agent 遗留：m_is_load_kind 不含 MEM_FLOAD、e_use_rs2 不含 OP-FP/FMA；flw 未命中紧邻消费者会读旧值，F 组生成码留空一拍故未暴露）；③ 特权子集 SvPMP；④ 原有待办：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一（区间比较）、plic.v priority/threshold 3bit WARL 与 08 §6.6"32 位"表述对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 写通路字节合并；⑤ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
+- **M2 非特权子集全绿 ✅（2026-09-16，提交 `0b15b7c`；母 Agent 亲跑验收）**：
+  - **并行化 ✅**：`run.sh --group` 新增 `--jobs N`（默认 nproc=16），每例独立三件产物 + 父进程 join 后按序回放聚合；fail-closed 全套；I 组 `--jobs 16` 74s vs 串行 432s（5.84×）。
+  - **F 扩展 ✅（6 RTL 根因，78/78）**：decoder wb_sel 兜底覆盖 x[rd]、sel_i/sel_s 漏 loadfp/storefp、flw 数据通路缺失、fflags E/W 两级覆盖、frm 无旁路、fpu_add UF 按有界指数。
+  - **D 扩展 ✅（单一根因，104/104）**：M 级访存 FSM 8B FP 访存未拆两笔 4B beat ⇒ 高 32 位抹零；新增 `m_rd_hi_q` 两阶段拆分（只复位清 0）。
+  - **母 Agent 亲跑**：D 104/104、F 78/78、I 39/39、M 8/8、Zicsr 6/6、Zifencei 1/1、Zicntr 2/2、Zicbom 3/3、L0 回归 21/21（日志 `/tmp/m2_final_v3.log`）；Zca 26 例按既定口径全 exclude。
+- **进行中/待办**：① **FP load-use 显式互锁**（coding 03f999d3 已交付：core_top §12.5 + 新 TB tb_fp_load_use；**母 Agent 裁决接受注入口径**——该洞当前取指结构下不可达，EMU_FETCH_BUFFER=1 注入=等价取指加缓冲，红/绿/变异三链已亲复跑；验收批跑 bash-47 进行中）；② **特权子集三步走**（info 调研完成，见记忆/下方）：T-A 底座开关（run.sh MARCH `${XLEN}`→32 展开 + include_priv_tests:True + exclude.list 收窄）→ T-B M 模式 PMP 63 例（零 RTL 改动）→ T-C Svbare 3 例 → T-D sfence.vma 译码 + 取指侧 Sv32（解锁 Sv* 约 40 例；tlb/ptw 单口被 M 级占用=遗留 L1，M_S FSM 12 状态改造）；③ 原有待办：axi_req_desc is_plic 口径统一、plic.v priority/threshold 3bit WARL 与文档对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 字节合并；④ D 修复遗留：L1D 分支 8B store 第二阶段门控=潜在死锁（当前不可达）、跨 4KB 页 8B 第二阶段不重翻译；⑤ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
 

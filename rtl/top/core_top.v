@@ -1029,7 +1029,9 @@ module core_top (
     // a 端口是整数操作数：fmv.w.x/fmv.d.x(15) 与 fcvt.{s,d}.{w,wu}(18/19/22/23)
     wire e_fp_a_is_int = (e_fp_op == 7'd15) | (e_fp_op == 7'd18) | (e_fp_op == 7'd19) |
                          (e_fp_op == 7'd22) | (e_fp_op == 7'd23);
-    wire [63:0] e_fpu_a = e_fp_a_is_int ? {32'h0000_0000, e_rs1_byp} : freg_rdata1;
+    //   ★ 操作数走 `e_fp_src*`（§12.5 的 FP load-use 前递）：M 槽 FP 结果 > fregfile 读口。
+    //     端口 a 的整数源（fmv.*.x / fcvt.*.w*）仍取 e_rs1_byp，与前递无关。
+    wire [63:0] e_fpu_a = e_fp_a_is_int ? {32'h0000_0000, e_rs1_byp} : e_fp_src1;
 
     wire        e_need_fpu = (de_op_type == OPT_FP);
     reg         fp_issued_q;
@@ -1037,7 +1039,9 @@ module core_top (
     reg  [63:0] fpu_res_q;
     reg  [4:0]  fpu_fflags_q;
     wire        e_fp_go = de_valid & e_need_fpu & ~fp_issued_q &
-                          ~de_ill & ~de_exc_valid & ~kill_young;
+                          ~de_ill & ~de_exc_valid & ~kill_young &
+                          ~fp_load_use_stall;   // ★ FP load-use：结果未就绪前禁止派发
+                                                //   （FPU 只在派发拍采样操作数，见 §12.5）
 
     wire        fpu_busy, fpu_done, fpu_fflags_we;
     wire [63:0] fpu_result;
@@ -1077,8 +1081,8 @@ module core_top (
     .rm        (de_rm),
     .frm       (fp_frm_eff),
     .a         (e_fpu_a),
-    .b         (freg_rdata2),
-    .c         (freg_rdata3),
+    .b         (e_fp_src2),            // ★ 前递后（§12.5）
+    .c         (e_fp_src3),            // ★ 前递后（FMA 的 fs3；§12.5）
     .busy      (fpu_busy),
     .done      (fpu_done),
     .result    (fpu_result),
@@ -2357,10 +2361,54 @@ module core_top (
                       (de_mem_op == MEM_STORE) | (de_mem_op == MEM_AMO) |
                       (de_mem_op == MEM_SC) | (de_mem_op == MEM_FSTORE) |
                       (de_op_type == OPT_BRU) | (de_op_type == OPT_JALR));
-    assign load_use_stall = em_valid & m_is_load_kind & (em_rd != 5'd0) &
-                          ~m_mem_done &
-                          ((e_use_rs1 & (de_rs1 == em_rd)) |
-                           (e_use_rs2 & (de_rs2 == em_rd)));
+    //==========================================================================
+    // 12.5 ★★ FP load-use / FP 结果前递（**M → E**，2026-09-17 新增显式互锁）
+    //--------------------------------------------------------------------------
+    // 为什么必须显式做（而不是靠 fregfile 的写优先旁路）：
+    //   fregfile 的写优先旁路只覆盖 **W 槽**（写口在 W，见 fregfile.v §11②）。
+    //   若 E 槽消费者与 M 槽生产者"紧邻"（中间无气泡），E 组合读口读到的是**旧值**：
+    //     · FP load（flw/fld）在 M 要等访存完成（8 B 还要两阶段）⇒ 结果此刻还不在
+    //       fregfile，也不在 W 写口；
+    //     · OP-FP/FMA 的结果在 M 槽的 em_fp_wdata（W 才落 fregfile）；
+    //     · FPU 是"派发拍采样操作数"的单元（fpu.v §2）⇒ 一旦带旧操作数派发，
+    //       之后再停拍也救不回来 ⇒ 必须**同时**做"停拍 + M→E 前递"。
+    //
+    // 口径（与整数 load-use 同一风格，不引入新状态机）：
+    //   ①前递源 = M 槽**会写 FP 寄存器**的指令（em_fp_we；含 FP load 与 OP-FP/FMA）；
+    //     数据 = FP load 取回值（NaN-boxing 口径见 §12.4 的 m_fp_ld_wdata）或
+    //     随流水携带的 em_fp_wdata；FP load 在 m_mem_done 之前**不算就绪**。
+    //   ②使用判定 = E 槽的 FP 源（OP-FP/FMA 的 fs1/fs2、FMA 的 fs3、FP store 的存数 fs2）
+    //     与 M 槽目的号相等。★ **f0 是普通 FP 寄存器**（与 x0 不同）⇒ 这里
+    //     **不**排除 0 号（整数侧排除 x0 是因为写 x0 无效果）。
+    //   ③未就绪（FP load 在途）⇒ `fp_load_use_stall`：冻结 E（并入门控 load_use_stall）
+    //     **且**禁止 FPU 派发（见 §7.5 的 e_fp_go）——否则 FPU 会在停拍前就带着旧
+    //     操作数发出去。就绪那拍前递与 W 写口写优先**同时**生效，二者值相同（幂等）。
+    //   ④fregfile 与 exe_ctrl 均无需改动：FP 读口只有本文件三处消费
+    //     （u_fpu 的 a/b/c、em_fp_store 捕获），此处统一改走 e_fp_src*。
+    //==========================================================================
+    wire        m_fp_prod     = em_valid & em_fp_we & ~m_exc_any;
+    wire        m_fp_prod_rdy = (em_mem_op != MEM_FLOAD) | m_mem_done;
+    wire [63:0] m_fp_fwd_data = (em_mem_op == MEM_FLOAD) ? m_fp_ld_wdata
+                                                         : em_fp_wdata;
+    // E 槽 FP 源使用判定（保守但精确到"真会用该读口"的类别）
+    wire e_fp_use1 = (de_op_type == OPT_FP) & ~e_fp_a_is_int & ~de_ill;   // fs1
+    wire e_fp_use2 = ((de_op_type == OPT_FP) | (de_mem_op == MEM_FSTORE))
+                     & ~de_ill;                                           // fs2 / 存数
+    wire e_fp_use3 = (de_op_type == OPT_FP) & (de_fp_op == FP_FMA) & ~de_ill; // fs3
+    wire e_fs1_hit = m_fp_prod & e_fp_use1 & (de_rs1 == em_fp_rd);
+    wire e_fs2_hit = m_fp_prod & e_fp_use2 & (de_rs2 == em_fp_rd);
+    wire e_fs3_hit = m_fp_prod & e_fp_use3 & (de_rs3 == em_fp_rd);
+    wire fp_load_use_stall = ~m_fp_prod_rdy & (e_fs1_hit | e_fs2_hit | e_fs3_hit);
+    // 前递后的 FP 源（fs1/fs2/fs3）：优先级 M（更年轻）> fregfile 读口（含 W 写优先）
+    wire [63:0] e_fp_src1 = e_fs1_hit ? m_fp_fwd_data : freg_rdata1;
+    wire [63:0] e_fp_src2 = e_fs2_hit ? m_fp_fwd_data : freg_rdata2;
+    wire [63:0] e_fp_src3 = e_fs3_hit ? m_fp_fwd_data : freg_rdata3;
+
+    assign load_use_stall = (em_valid & m_is_load_kind & (em_rd != 5'd0) &
+                             ~m_mem_done &
+                             ((e_use_rs1 & (de_rs1 == em_rd)) |
+                              (e_use_rs2 & (de_rs2 == em_rd))))
+                            | fp_load_use_stall;
 
     //==========================================================================
     // 13. 主时序块（流水寄存器 / GPR / FP-CSR / mstatus.FS / 计数 / M 级 FSM）
@@ -2573,7 +2621,9 @@ module core_top (
                 em_rs1_val      <= e_rs1_byp;
                 em_imm_val      <= de_imm;
                 em_store_data   <= e_rs2_byp;
-                em_fp_store     <= freg_rdata2;
+                //   ★ FP store 的存数走前递后的 fs2（§12.5）：否则"FP load → 紧邻 fsd/fsw"
+                //     会存下旧值（fregfile 写优先只覆盖 W 槽）。
+                em_fp_store     <= e_fp_src2;
                 em_amo_f5       <= de_insn32[31:27];
                 em_cbo_rs2      <= de_insn32[24:20];
                 em_cbo_downgrade<= de_cbo_downgrade;
