@@ -229,9 +229,18 @@
 - **知识库重建**：3711 文档（旧 rv32gc-project 残留已清，新 docs 已收录，rv32gc-project 源根=rv32gc-cpu/docs）。
 - **遗留**：7 项待用户裁决（见 NEXT_SESSION.md §5：chiplab dirty 处置、PLIC 源号映射、CMO block size 发现路径、mtvec Vectored、NAND 门禁 D1/D2/D5、Spike 重取、PMP 粒度 G=0）。
 
+### 阶段二 2A —— M2 非特权子集全绿（2026-09-16，提交 `0b15b7c`）
+
+- **用户指令**：先提升 arch-test 批跑并行率（大组不得逐例串行），再按 `m2_groups.log` 修复失败。
+- **并行化 ✅**：`run.sh --group` 新增 `--jobs N`（默认 nproc）；每例独立产物（console/result/rc）+ 父进程 `wait -n` join 后按候选清单顺序回放聚合；fail-closed 全套（参数错 rc=2、worker 被 kill=未捕获 FAIL、同 basename 硬失败、组计数自检保留）；实测 I 组 `--jobs 16` 74s vs 串行 432s（5.84×）。
+- **F 扩展修复 ✅（6 个 RTL 根因，78/78）**：decoder `wb_sel` 兜底把 FP 写回判成 WB_ALU 覆盖 x[rd]（签名指针被打烂→签名落到地址 0）；`sel_i/sel_s` 漏 is_loadfp/is_storefp（FP 访存 imm=0）；flw 数据通路缺失（未 NaN-box、写 0）；fflags E 级累积 vs W 级 CSR 落盘覆盖（并入 M/E 在途标志 sticky-OR）；frm 无 CSR 写旁路（dyn 错 1 ulp）；fpu_add UF 判据按有界指数（漏 UF，按 IEEE 无界指数判 tiny）。
+- **D 扩展修复 ✅（单一根因，104/104）**：M 级访存 FSM 的 8B FP 访存（fld/fsd）在 DDR3 单 beat 32bit 通路上**从未拆成两笔 4B** ⇒ 操作数高 32 位抹零，71 例失败全由此派生（fclass.d 恒 +subnormal、算术退化、fsd 高字写不进）；新增 `m_rd_hi_q` 两阶段拆分（生命周期只复位清 0——M_S_IDLE 清会让被推迟的 M→W 捕获取到 0，子 Agent 实测踩坑）。
+- **母 Agent 亲跑验收（§0.6）**：D 104/104、F 78/78、I 39/39、M 8/8、Zicsr 6/6、Zifencei 1/1、Zicntr 2/2、Zicbom 3/3、L0 回归 21/21；Zca 26 例按既定口径全 exclude（2A 声明 C 本体、未按 Zc* 族分组验证）。
+- **遗留**（NEXT_SESSION.md §1.5）：① FP load-use 未显式互锁（arch-test 掩蔽）；② L1D 分支 8B store 第二阶段门控=潜在死锁（当前不可达，未改）；③ 跨 4KB 页 8B 访存第二阶段不重翻译（与原口径一致，未暴露）；④ SvPMP 特权子集未跑。
+
 ---
 
 ## 9. 当前状态与下一步
 
-- **阶段一已完成**：15 篇文档落盘并验收、知识库已重建、台账已更新、已 git 提交。**停下，等待用户审阅阶段一产物**（`docs/design`、`docs/porting`、`docs/kb`）**并对 NEXT_SESSION.md §5 的 7 项裁决给出意见**。
-- **下一步（用户审阅通过后）**：按用户指令进入阶段二（2A 顺序 5 级基线核：RV32GC+CSR+PMP+Sv32+Cache+AXI+上板）。开工清单：读 NEXT_SESSION.md → 按 §0.2 确认子 Agent 路由 → 按 §6 阶段二关键验收拆任务派 coding/testing。
+- **阶段二 2A M2 非特权部分完成并提交（`0b15b7c`）**：arch-test 非特权子集全绿（I 39/M 8/Zicsr 6/Zifencei 1/Zicntr 2/Zicbom 3/F 78/D 104 = 241 例）+ L0 回归 21/21 + 批跑并行化（--jobs）。
+- **下一步（M2 收尾→M3）**：① FP load-use 显式互锁修复（已派/进行中）；② SvPMP 特权子集（tests/priv，先确认 rv32gc-2a.yaml/test_config.yaml 入口口径）；③ 待办：sfence.vma 译码、取指侧 Sv32 共享 PTW、axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 第二阶段重翻译；④ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
