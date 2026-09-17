@@ -48,7 +48,7 @@
 | 文件 | 作用 |
 |---|---|
 | `run.sh` | 入口：编译 → Spike 参考签名 → DUT 仿真 → 签名逐行比对 → 汇总（fail-closed） |
-| `test_config.yaml` | ACT4 DUT 配置：编译器/参考模型路径、`linker_script`、`include_priv_tests: False`、内存布局 |
+| `test_config.yaml` | ACT4 DUT 配置：编译器/参考模型路径、`linker_script`、`include_priv_tests: True`（阶段二特权子集已打开）、内存布局 |
 | `link.ld` | 链接脚本：`.boot`@0x1C00_0000（复位桩）、用例镜像@0x8000_0000（1 MiB）、`.tohost`@0x800F_F000 |
 | `boot_stub.S` | 复位跳转桩（`lui x5,0x80000; jalr`），链接进 ELF，DUT 与 Spike 入口对称 |
 | `rvmodel_macros.h` | DUT 宏：**`STANDARD_SM_SUPPORTED` + `F_SUPPORTED`**（08 §8.2.1(a) 硬要求）、UART/CLINT/PLIC 地址、tohost 终止 |

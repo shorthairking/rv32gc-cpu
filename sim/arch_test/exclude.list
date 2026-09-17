@@ -33,8 +33,10 @@
 #      ③ RV64 才有的分页模式 sv39/sv48/sv57 ⇒ 统一登记在 E 段（不在此重复登记）。
 #    保持 IN（**不**列于此）的：M 模式 PMP 全族（PMPF/PMPS/PMPSm/PMPU/PMPZaamo/
 #    PMPZalrsc）、Svbare，以及 **Sv32 分页族**（Sv/sv32_*、SvPMP/sv32_*、
-#    SvPMPZicbo/sv32_*、SvZicbo/sv32_zicbom_*、Svade/sv32_*）——后者属后续 P3
-#    任务范围，本轮保持 IN、暂不运行。
+#    SvPMPZicbo/sv32_*_zicbom_*、SvZicbo/sv32_zicbom_*、Svade/sv32_*）——后者属
+#    后续 P3 任务范围，本轮保持 IN、暂不运行。
+#    例外：SvPMPZicbo 的 **zicboz** 变体（4 条）已登记排除 —— cbo.zero（Zicboz）
+#    本核未实现（08 §11 R1），与分页无关，无论 P3 与否都跑不了；登记在 A 段。
 #------------------------------------------------------------------------------
 tests/priv/Sv/sv_mstatus_tvm_test.S                 # mstatus.TVM 门控未实现：TVM=1 时 satp 访问/S 模式陷阱的行为未建模
 tests/priv/Svadu/**                                 # Svadu（硬件 A/D 位更新）未实现（本核按 Svade 口径只报异常）
@@ -46,6 +48,7 @@ tests/priv/PMPZca/**                                # Zca：2A 声明 C 本体�
 tests/priv/PMPZicbo/**                              # Zicbop/Zicboz：未实现（本核只有 Zicbom）
 tests/priv/SvZicbo/sv32_zicbop_*                    # Zicbop（预取提示）未实现
 tests/priv/SvZicbo/sv32_zicboz_*                    # Zicboz（cbo.zero）：2A 明确不含（08 §11 R1）
+tests/priv/SvPMPZicbo/sv32_*_zicboz_*               # Zicboz（cbo.zero）+ PMP：同上（该目录 sv32 族的 zicbom 条目仍保持 IN，随 P3 的 Sv32 任务解锁）
 tests/priv/ExceptionsSv*                            # Sv32 页错误异常族（smode/umode/mprv + Zaamo/Zalrsc 变体）：本轮不解锁的分页异常路径；同目录族内还含 sv39_* RV64 变体（见 E 段）
 
 #------------------------------------------------------------------------------

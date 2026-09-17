@@ -262,27 +262,37 @@ module tb_arch_test #(
     function is_uart;   input [31:0] a; begin is_uart   = (a[31:8] == UART_BASE[31:8]); end endfunction
     function is_fault;  input [31:0] a; begin is_fault  = (a[31:24] == FAULT_BASE[31:24]); end endfunction
 
-    // 读一个字（组合；未写过的字节按 0 返回 —— 与"上电全 0"等价）
-    function [31:0] mem_read;
-        input [31:0] a;
-        reg [31:0] w;
+    // 字节 x→0 过滤（"上电全 0"口径；x 传播会让取指通路"看似有指令"）
+    function [31:0] mem_clean;
+        input [31:0] w;
         begin
-            if (is_ram(a))       w = ram[(a - RAM_BASE) >> 2];
-            else if (is_boot(a)) w = boot[(a - BOOT_BASE) >> 2];
-            else                 w = 32'h0000_0000;
-
-            if (is_uart(a)) begin
-                mem_read = (a[7:0] == 8'h05) ? 32'h0000_0020   // LSR.THRE=1（THR 空）
-                                                 : 32'h0000_0000;  // RBR/其它：0
-            end else begin
-                // 未写过的字节按 0 返回（x 传播会让取指通路"看似有指令"）
-                mem_read = { (^w[31:24] === 1'bx) ? 8'h00 : w[31:24],
-                             (^w[23:16] === 1'bx) ? 8'h00 : w[23:16],
-                             (^w[15: 8] === 1'bx) ? 8'h00 : w[15: 8],
-                             (^w[ 7: 0] === 1'bx) ? 8'h00 : w[ 7: 0] };
-            end
+            mem_clean = { (^w[31:24] === 1'bx) ? 8'h00 : w[31:24],
+                          (^w[23:16] === 1'bx) ? 8'h00 : w[23:16],
+                          (^w[15: 8] === 1'bx) ? 8'h00 : w[15: 8],
+                          (^w[ 7: 0] === 1'bx) ? 8'h00 : w[ 7: 0] };
         end
     endfunction
+
+    // 读一个字（组合；未写过的字节按 0 返回 —— 与"上电全 0"等价）
+    //   ★ 关键（2026-09-17 修复，PMPZaamo_cfg_wr-00 假失败根因）：
+    //     ram[]/boot[] 的**数组读必须出现在 assign 表达式里**，不能只藏在被调用的
+    //     function 内 —— iverilog 对「连续赋值调用 function、function 内做存储器
+    //     数组读」**不做数组写的敏感性分析**（最小复现：改 ram[] 后该 assign 不重算，
+    //     只有参数 rd_addr_q 变化才重算）。后果：同一地址连续两次读、其间该字被写
+    //     （AMO 读-改-写链、store→load 同址序列）时从设备返回**陈旧读数据**：
+    //     本任务实测 PMPZaamo_cfg_wr-00 的 AMO 链上，核发出的 AW/W（数据 0x8062）
+    //     已正确写入 ram[]，随后同址读仍回旧值 0x807a ⇒ 签名与 Spike 不一致（假失败）。
+    //     修法：读数据由下面这条 assign 直接给出（直接数组读的敏感性正确），
+    //     数组下标先夹取到合法范围，uarts/boot/未登记区域的语义与原来逐字一致。
+    wire [31:0] ram_idx_rd  = is_ram(rd_addr_q)  ? ((rd_addr_q - RAM_BASE ) >> 2) : 32'h0;
+    wire [31:0] boot_idx_rd = is_boot(rd_addr_q) ? ((rd_addr_q - BOOT_BASE) >> 2) : 32'h0;
+    wire [31:0] rd_w_raw    = is_ram(rd_addr_q)  ? ram [ram_idx_rd] :
+                              is_boot(rd_addr_q) ? boot[boot_idx_rd] :
+                                                   32'h0000_0000;
+    wire [31:0] mem_read    = is_uart(rd_addr_q)
+                              ? ((rd_addr_q[7:0] == 8'h05) ? 32'h0000_0020   // LSR.THRE=1
+                                                           : 32'h0000_0000)  // RBR/其它：0
+                              : mem_clean(rd_w_raw);
 
     // 响应：故障窗口返回 DECERR（供 access fault 类用例），其余 OKAY
     function [1:0] mem_resp;
@@ -372,7 +382,7 @@ module tb_arch_test #(
 
     assign arready = arready_r;
     assign rid     = rd_id_q;
-    assign rdata   = mem_read(rd_addr_q);
+    assign rdata   = mem_read;      // ★ 见 §4 mem_read 注释：不能再写成函数调用
     assign rresp   = mem_resp(rd_addr_q);
     assign rvalid  = rd_active;
     assign rlast   = (rd_cnt_q[3:0] == rd_len_q);

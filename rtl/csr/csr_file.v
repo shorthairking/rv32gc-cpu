@@ -478,14 +478,27 @@ module csr_file (
     endfunction
 
     // ---- PMP cfg 的四项逐项锁定：L=1 的项写入被忽略（保持现值） ----
+    //   ★ 未锁定项的 **WARL** 落地（2026-09-17 修复，PMPSm_pmpcfg_walk_02..05）：
+    //     pmpcfg 每个配置字节 = {L, 0, 0, A[1:0], X, W, R}（bit7=L、bit6=0、bit5=0、
+    //     bit[4:3]=A、bit2=X、bit1=W、bit0=R；规范图 machine.adoc「PMP configuration
+    //     register format」，norm:pmp_cfg_permissions/norm:pmp_rwx_warl）。
+    //     **bit[6:5] 是保留位，读恒为 0**（WARL：写入被丢弃）——arch-test 的
+    //     `cp_pmpcfg_walk` 逐位走 1 覆盖 bit0/2/3/5/6/7，其中 bit5/bit6 期望读回 0
+    //     （Spike 同口径，被测例 PMPSm_pmpcfg_walk_02..05 各差 8 个签名槽）。
+    //     修复前本核把整个写数据原样落地 ⇒ bit5/bit6 读回 0x20/0x40。
+    //     R=0,W=1 是「集体 WARL 保留组合」（norm:pmp_rwx_warl）：本设计按**写-only
+    //     区域**实现（不做强制转换；全部 PMP 子集用例均不写该组合，walk 也显式跳过
+    //     bit1），故此处只屏蔽保留位、不动 R/W/X 语义。
+    localparam [7:0] PMP_CFG_WARL_MSK = 8'h9F;   // 保留 bit6/bit5 清零，其余位可写
+
     function [31:0] pmp_cfg_landing;
         input [31:0] d;
         input [31:0] cur;
         begin
-            pmp_cfg_landing[ 7: 0] = cur[ 7] ? cur[ 7: 0] : d[ 7: 0];
-            pmp_cfg_landing[15: 8] = cur[15] ? cur[15: 8] : d[15: 8];
-            pmp_cfg_landing[23:16] = cur[23] ? cur[23:16] : d[23:16];
-            pmp_cfg_landing[31:24] = cur[31] ? cur[31:24] : d[31:24];
+            pmp_cfg_landing[ 7: 0] = cur[ 7] ? cur[ 7: 0] : (d[ 7: 0] & PMP_CFG_WARL_MSK);
+            pmp_cfg_landing[15: 8] = cur[15] ? cur[15: 8] : (d[15: 8] & PMP_CFG_WARL_MSK);
+            pmp_cfg_landing[23:16] = cur[23] ? cur[23:16] : (d[23:16] & PMP_CFG_WARL_MSK);
+            pmp_cfg_landing[31:24] = cur[31] ? cur[31:24] : (d[31:24] & PMP_CFG_WARL_MSK);
         end
     endfunction
 

@@ -1300,7 +1300,15 @@ module core_top (
     //     被推迟的那次捕获会拿到 0（load 数据丢失）。陈旧值无害：两半都在
     //     "本次 8 B 访问完成"之前被覆写，且被 kill 的访问不产生捕获。
     reg  [31:0] m_amo_wdata_q;       // AMO 写相数据（在 cs_ready 拍锁存）
-    reg         m_sc_ok_q;           // SC 成功标志（同上）
+    reg         m_sc_ok_q;           // SC 成功标志（读相完成拍已锁存 ⇒ 写相判据）
+    //   ★ 2026-09-17 新增（PMPZalrsc_cfg_wr-00）：SC 的**成败必须在请求拍采样**。
+    //     amo_unit 按规范在同一拍清除保留（req_ok & is_sc ⇒ rsv_valid_r<=0，
+    //     [norm:sc_reservation_invalidate]）⇒ 之后任何一拍读 lsu_sc_ok 都恒 0。
+    //     SC 的两相（读相 + 写相）跨多拍，故请求拍采样后保持：
+    //       m_sc_ok_cap_q = 本笔 SC 的成功标志；m_sc_cap_q = 已采样（每笔一次，
+    //       使 L1D 缺失重试（M_S_DRAIN → M_S_ISS）不会用"0"覆盖已采到的成功标志）。
+    reg         m_sc_ok_cap_q;
+    reg         m_sc_cap_q;
     reg         m_done_q;            // 本笔访存完成（单拍脉冲）
     reg         m_issued_q;          // ★ 本 EM 访存指令已启动（单次启动记账；
                                      //   置位：FSM 在本笔指令上启动/直接完成；
@@ -1520,6 +1528,14 @@ module core_top (
     wire [1:0]  m_lsu_size = (em_mem_size > 3'd2) ? 2'd2 : em_mem_size[1:0];
     assign m_lsu_req_valid = (m_state_q == M_S_ISS) & ~m_kill_fsm;
 
+    // ---- AMO/LR/SC 读相数据源（按路由选源；2026-09-17 修复 AMO 写相数据）----
+    //   ROUTE_AXI 的 AMO 读结果落在 `axi_rdata_q`（R 通道唯一读取点），而 L1D 通路的
+    //   读结果在 `l1d_cs_rdata`。amo_unit 的 rd_old_o/wdata_o 全部由 rdata_i 组合派生
+    //   ⇒ 两条通路必须各自喂入**本通路**的读数据，否则写相数据取自另一条通路的残留值。
+    //   （lsu_route 由 mem_pa 经 mmio_route 组合产生，不含 amo_rdata 路径 ⇒ 无组合环。）
+    wire [31:0] lsu_amo_rdata_src = (lsu_route == ROUTE_AXI) ? axi_rdata_q : l1d_cs_rdata;
+    wire        lsu_amo_rdata_vld = (lsu_route == ROUTE_AXI) ? axi_rdata_valid : l1d_cs_ready;
+
     lsu #(
     .ADDR_W      (32),
     .PMP_ENTRIES (`RV32GC_PMP_ENTRIES)
@@ -1581,9 +1597,15 @@ module core_top (
     .eff_sum_o        (lsu_eff_sum),
     .eff_mxr_o        (lsu_eff_mxr),
     .need_perm_o      (lsu_need_perm),
-        // ★ 接线要点 3：amo_unit 读相返回 = L1D 读返回（母 Agent 授权新增端口）
-    .amo_rdata_i      (l1d_cs_rdata),
-    .amo_rdata_valid_i(l1d_cs_ready)
+        // ★ 接线要点 3：amo_unit 读相返回 —— **按路由选源**（2026-09-17 修复）：
+        //   · L1D 通路（M_S_RSP）：l1d_cs_rdata / l1d_cs_ready；
+        //   · ROUTE_AXI 通路（M_S_AXI，本仿真里 DDR 走这条）：AXI 单 beat 读回的整字
+        //     axi_rdata_q —— 必须接进来，否则 amo_unit 的 `amo_apply(f5, rdata_i, rs2)`
+        //     用的是**上一次 L1D 读的残留值** ⇒ 写相数据错（见 §13 M_S_AXI 注释）。
+        //   amo_unit 是纯组合，rd_old_o/wdata_o 都只依赖 rdata_i ⇒ 该 mux 即足够；
+        //   rdata_valid 只影响未被使用的 w_req_o/busy_o，故按同源选一个等效有效位。
+    .amo_rdata_i      (lsu_amo_rdata_src),
+    .amo_rdata_valid_i(lsu_amo_rdata_vld)
     );
 
     // ---- 9.6 L1D（32 KB / 4 路 / 32 B 行；写回 + 写分配）----
@@ -1606,6 +1628,19 @@ module core_top (
                                        : st_shift(em_store_data, m_va[1:0]);
     wire [3:0]  m_store_strb = m_is_fp8 ? 4'hF : st_strb(m_va[1:0], m_lsu_size);
     wire        m_mem_wr_op  = (em_mem_op == MEM_STORE) | (em_mem_op == MEM_FSTORE);
+
+    // ---- FP 8 B 访存（fld/fsd）的**非自然对齐**检测（2026-09-17，PMPF_cfg_wr-00）----
+    //   本核把 fld/fsd 拆成两个 4 B 半笔（`m_hi_q` 两相），而 lsu 只看到自然的
+    //   4 B 访问 ⇒ lsu 的 misalign 判定（抉择 1「非对齐优先于 PMP」）对 8 B FP
+    //   访存**永不命中**：既漏报 address-misaligned，又让 PMP 的 access-fault 抢先
+    //   （实测 PMPF_cfg_wr-00：DUT cause 7/5，Spike cause 6/4，同 tval=0x80009004）。
+    //   规范口径：F/D 的 8 B 访存要求自然对齐（地址低 3 位全 0）；非对齐 ⇒
+    //   load ⇒ cause 4 / store ⇒ cause 6，且按本核抉择 1 **先于** PMP / 页错误。
+    //   tval 与其它访存异常一致 = 虚拟地址（lsu 的 mtval 口径）。
+    wire        m_fp8_misalign  = m_size8 & (m_va[2:0] != 3'b000);
+    wire [4:0]  m_fp8_mis_cause = (em_mem_op == MEM_FLOAD)
+                                  ? `RV32GC_EXC_LOAD_MISALIGNED     // 4
+                                  : `RV32GC_EXC_STORE_MISALIGNED;   // 6
     wire        m_l1d_go     = (m_state_q == M_S_ISS) & ~m_kill_fsm &
                                ~lsu_exc & ~m_page_fault_q & ~lsu_cmo_valid &
                                ~lsu_clint_plic & (lsu_route != ROUTE_AXI) &
@@ -2481,6 +2516,7 @@ module core_top (
             m_exc_q <= 1'b0; m_exc_cause_q <= 5'd0; m_exc_tval_q <= 32'h0;
             m_rd_data_q <= 32'h0; m_rd_hi_q <= 32'h0;
             m_amo_wdata_q <= 32'h0; m_sc_ok_q <= 1'b0;
+            m_sc_ok_cap_q <= 1'b0; m_sc_cap_q <= 1'b0;
             m_done_q <= 1'b0;
             m_issued_q <= 1'b0;
             m_mmio_clint_q <= 1'b0; m_mmio_plic_q <= 1'b0; m_mmio_we_q <= 1'b0;
@@ -2549,7 +2585,18 @@ module core_top (
                 de_sret         <= dec_sret;
                 de_wfi          <= dec_wfi;
                 de_ill          <= d_ill_total;
-                de_exc_tval     <= dec_tval;
+                // ★ 修复（2026-09-17，PMP 子集）：`de_exc_tval` 同时服务两条互斥路径，
+                //   必须按来源选择，不能一律取 dec_tval：
+                //     · 取指异常（fd_exc_valid=1：PMP 无 X / 取指页故障，cause 1/12）
+                //       ⇒ tval = **故障 parcel 的虚拟地址**（fetch_unit 的 fetch_exc_tval，
+                //         规范 [norm:mtvalvaddrnot_paddr]；Spike 同口径）。
+                //     · 非法指令（fd_exc_valid=0，由 E 级 e_ill_total 上报，cause 2）
+                //       ⇒ tval = dec_tval（原始指令位，T1 本设计选择）。
+                //   实测现象（修复前）：PMPS/PMPU/PMPF 的取指陷阱 tval 写成 dec_tval ⇒
+                //   若故障取指取到了数据字（如锁死区内的 nop，0x00000013）就写指令位，
+                //   若该拍无取指响应则写**上一条指令的残留位**（如 0x00e12023 = sw），
+                //   与 Spike 的「故障地址」逐行不一致（PSm_cfg_XWR_all-01-00 等 21 例）。
+                de_exc_tval     <= fd_exc_valid ? fd_exc_tval : dec_tval;
                 de_exc_valid    <= fd_exc_valid;
                 de_exc_cause    <= fd_exc_cause;
                 de_exc_pc       <= fd_exc_pc;
@@ -2771,12 +2818,14 @@ module core_top (
                 m_page_fault_q <= 1'b0;
                 m_amo_phase_q  <= 1'b0;
                 m_hi_q         <= 1'b0;
+                m_sc_cap_q     <= 1'b0;      // SC 采样记账随本笔作废
             end else begin
                 case (m_state_q)
                     //----------- 空闲：判定是否需要翻译 -----------
                     M_S_IDLE: begin
                         m_hi_q         <= 1'b0;
                         m_amo_phase_q  <= 1'b0;
+                        m_sc_cap_q     <= 1'b0;   // 新一笔访存重新采样 SC 成败
                         m_exc_q        <= 1'b0;
                         m_page_fault_q <= 1'b0;
                         // ★ 单次启动口径（修复 D6 的 `~m_done_q` 补丁）：
@@ -2872,11 +2921,26 @@ module core_top (
                         m_mmio_strb_q  <= m_store_strb;
                         m_mmio_pa_q    <= m_pa_eff;
 
-                        if (lsu_exc | m_page_fault_q) begin
+                        // ★ SC 成败必须在**请求拍**采样并保持（2026-09-17，
+                        //   PMPZalrsc_cfg_wr-00 根因）：amo_unit 在本拍按规范清除保留
+                        //   （req_ok & is_sc ⇒ rsv_valid_r<=0，[norm:sc_reservation_invalidate]），
+                        //   而 SC 的"成功标志"要在**读相返回拍**才被 FSM 取用 —— 那时
+                        //   lsu_sc_ok 已恒 0（实测 rd 被写成"失败"1，Spike 为 0）。
+                        //   故在首次进入 M_S_ISS（~m_sc_cap_q）采样；L1D 缺失重试
+                        //   （M_S_DRAIN → M_S_ISS）只重发访问、不重采样（否则覆盖成 0）。
+                        if ((em_mem_op == MEM_SC) & ~m_sc_cap_q) begin
+                            m_sc_ok_cap_q <= lsu_sc_ok;
+                            m_sc_cap_q    <= 1'b1;
+                        end
+
+                        if (m_fp8_misalign | lsu_exc | m_page_fault_q) begin
                             // 访存异常：不做存储器访问，直接完成（W 级统一入口处理）
+                            //   优先级（与 lsu 内部口径一致）：FP 8 B 非对齐 > lsu 异常
+                            //   （非对齐 > PMP，见 lsu §10）> 页错误。
                             m_exc_q       <= 1'b1;
-                            m_exc_cause_q <= m_page_fault_q ? m_page_cause_q : lsu_exc_cause;
-                            m_exc_tval_q  <= m_page_fault_q ? m_va : lsu_mtval;
+                            m_exc_cause_q <= m_fp8_misalign ? m_fp8_mis_cause :
+                                             (m_page_fault_q ? m_page_cause_q : lsu_exc_cause);
+                            m_exc_tval_q  <= (m_fp8_misalign | m_page_fault_q) ? m_va : lsu_mtval;
                             m_page_fault_q<= 1'b0;
                             m_state_q     <= M_S_IDLE;
                             m_done_q      <= 1'b1;
@@ -2902,11 +2966,21 @@ module core_top (
                                 m_amo_phase_q <= 1'b1;
                                 m_state_q     <= M_S_ISS;
                             end else if (em_mem_op == MEM_SC) begin
-                                m_sc_ok_q     <= lsu_sc_ok;
+                                // ★ 用请求拍锁存值（m_sc_ok_cap_q）而非当拍 lsu_sc_ok：
+                                //   后者在读相返回拍已被 SC 自身的"清保留"抹成 0。
+                                //   ★ 失败时**不得**回 M_S_ISS：该拍 m_amo_write=0
+                                //   （SC 且 sc_ok=0）⇒ 会重发一次**读**并再次回到本分支
+                                //   ⇒ 无限循环（与本文件 M_S_AXI 同源的写相门控缺陷）。
+                                m_sc_ok_q     <= m_sc_ok_cap_q;
                                 m_amo_wdata_q <= lsu_amo_wdata;
-                                m_rd_data_q   <= lsu_sc_ok ? 32'd0 : 32'd1;
-                                m_amo_phase_q <= 1'b1;
-                                m_state_q     <= M_S_ISS;
+                                m_rd_data_q   <= m_sc_ok_cap_q ? 32'd0 : 32'd1;
+                                if (m_sc_ok_cap_q) begin
+                                    m_amo_phase_q <= 1'b1;        // 成功 ⇒ 补写相
+                                    m_state_q     <= M_S_ISS;
+                                end else begin
+                                    m_state_q     <= M_S_IDLE;    // 失败 ⇒ 不写内存
+                                    m_done_q      <= 1'b1;
+                                end
                             end else if (em_mem_op == MEM_LR) begin
                                 m_rd_data_q <= ld_extract(l1d_cs_rdata, m_va[1:0],
                                                           m_lsu_size, em_mem_unsign);
@@ -2985,7 +3059,49 @@ module core_top (
                             //   第二阶段重回 M_S_ISS：该拍按 m_hi_q=1 重新锁存
                             //   `m_mmio_pa_q`=pa+4 与 `m_store_w32`=存数高字
                             //   （fsd 写），load 则把回来的整字存进 `m_rd_hi_q`。
-                            if (m_size8 & ~m_hi_q) begin
+                            // ★ 2026-09-17 根因修复（PMPZaamo/PMPZalrsc_cfg_wr-00）：
+                            //   ROUTE_AXI 通路**缺 AMO/SC 的写相**。原实现只按通用分支
+                            //   把读回整字写进 rd 并置 done ⇒ 对 AMO/LR/SC 有三处错：
+                            //     ① AMO：只有读相、没有写相 ⇒ 内存永不更新（实测
+                            //        PMPZaamo：同一地址上连续 9 个 AMO 全部读回初值
+                            //        0x00000013，而 Spike 读回 0x13→0x807a→0x8062→…）；
+                            //     ② SC ：rd 被写成"读回的旧值"而不是成功标志 0/1
+                            //        （实测 PMPZalrsc：rd=0x13 而 Spike=0）；
+                            //     ③ SC 成功时的写相同样缺失。
+                            //   修复 = 与 L1D 通路（M_S_RSP 的 MEM_AMO/MEM_SC 分支）
+                            //   **同口径**补两相：读相锁存 rd 与写数据，置 `m_amo_phase_q`
+                            //   后回 M_S_ISS —— 该拍 `m_amo_write=1` ⇒ `m_mmio_we_q=1`
+                            //   ⇒ 由 MDTA 写事务把 `m_amo_wdata_q` 写回。
+                            //   数据真源仍是 amo_unit：`lsu_amo_wdata`/`lsu_amo_rd_old`/
+                            //   `m_sc_ok_cap_q`（读相数据经 §9.5 的路由 mux 选自 axi_rdata_q；
+                            //   SC 成功标志在 M_S_ISS 请求拍锁存，理由见那里的注释）。
+                            if (~axi_done_wr_q & (em_mem_op == MEM_AMO)) begin
+                                m_rd_data_q   <= lsu_amo_rd_old;   // 读相：旧值
+                                m_amo_wdata_q <= lsu_amo_wdata;   // ★ 必须本拍锁存
+                                m_sc_ok_q     <= 1'b1;
+                                m_amo_phase_q <= 1'b1;
+                                m_state_q     <= M_S_ISS;         // 去发写相
+                            end else if (~axi_done_wr_q & (em_mem_op == MEM_SC)) begin
+                                m_sc_ok_q     <= m_sc_ok_cap_q;
+                                m_amo_wdata_q <= lsu_amo_wdata;   // SC 的写数据 = rs2
+                                m_rd_data_q   <= m_sc_ok_cap_q ? 32'd0 : 32'd1;
+                                if (m_sc_ok_cap_q) begin
+                                    m_amo_phase_q <= 1'b1;        // 成功 ⇒ 补写相
+                                    m_state_q     <= M_S_ISS;
+                                end else begin
+                                    m_state_q     <= M_S_IDLE;    // 失败 ⇒ 不写内存
+                                    m_done_q      <= 1'b1;
+                                end
+                            end else if (m_amo_phase_q) begin
+                                // AMO/SC 的**写相完成**（axi_done_wr_q=1）⇒ 收尾。
+                                //   ★ 必须在此显式识别：本状态对读相与写相给出同一个
+                                //     done 脉冲，若不加这一支，上面的读相分支会对同一条
+                                //     AMO 反复重入 ⇒ 写相无限重复（本修复首版实测：
+                                //     PMPZaamo_cfg_wr-00 超时未到终止点）。
+                                m_amo_phase_q <= 1'b0;
+                                m_state_q     <= M_S_IDLE;
+                                m_done_q      <= 1'b1;
+                            end else if (m_size8 & ~m_hi_q) begin
                                 if (~axi_done_wr_q) m_rd_data_q <= m_axi_ld_data;
                                 m_hi_q    <= 1'b1;
                                 m_state_q <= M_S_ISS;
