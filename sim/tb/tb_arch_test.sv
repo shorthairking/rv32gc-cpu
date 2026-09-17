@@ -30,7 +30,11 @@
 //                          —— 与 Spike 参考模型内建 UART 同址同语义
 //   0x5000_0000 + 4 KiB  : **显式返回 DECERR** 的访问故障窗口
 //                          （对应 rvmodel_macros.h 的 RVMODEL_ACCESS_FAULT_ADDRESS）
-//   其余未登记地址        : 读 0、写忽略并告警（不静默变成故障；与平台口径一致）
+//   其余未登记地址        : **同样返回 DECERR**（写数据丢弃 + 告警计数）
+//                          ★ 与 Spike 参考模型的物理映射对齐：Spike 侧未映射的 PA
+//                            （如 [0,0x1000)）访问一律报 access fault（load=5 /
+//                            store=7 / 取指=1）⇒ DUT 侧必须让核消费该错误响应，
+//                            否则核静默继续，签名与参考分叉（2026-09-17 根因）
 //
 //------------------------------------------------------------------------------
 // 三、终止与签名（**判定口径**）
@@ -294,11 +298,21 @@ module tb_arch_test #(
                                                            : 32'h0000_0000)  // RBR/其它：0
                               : mem_clean(rd_w_raw);
 
-    // 响应：故障窗口返回 DECERR（供 access fault 类用例），其余 OKAY
+    // 响应：**未登记地址一律 DECERR**（与 FAULT_BASE 故障窗口同口径）
+    //   · OKAY   ：RAM / BOOT / UART 三个**登记**窗口（从端真能服务）
+    //   · DECERR ：FAULT_BASE 窗口 + 任何未登记地址（从端"无此设备"的合法响应）
+    //   ★ 为什么未登记地址不能再回 OKAY（2026-09-17，PMPSm_cfg_A_tor_zero-00 根因）：
+    //     该例（entry0 = L|TOR|RWX 覆盖 [0,pmpaddr0)，pmpaddr0=TEST_FOR_EXECUTION>>2）
+    //     有 3 个探针落在 PA 0：sw / lw / jalr。Spike 侧 PA 0 未映射 ⇒ 分别触发
+    //     cause 7 / 5 / 1；而本 TB 原先对未登记地址"读 0、写忽略 + 回 OKAY" ⇒ 核
+    //     侧 PMP 放行后**没有任何陷阱**（jalr 到 0 取到 0x0000 反而变成非法指令
+    //     cause 2），签名差 13 行。改回 DECERR 后由核侧消费（rtl/top/core_top.v
+    //     §11.7：SLVERR/DECERR ⇒ load/store/取指 access fault），与 Spike 逐行一致。
+    //   ★ 本函数只描述"从端如何响应"，不改任何比对/判定口径（run.sh 不变）。
     function [1:0] mem_resp;
         input [31:0] a;
         begin
-            mem_resp = is_fault(a) ? RESP_DECERR : RESP_OKAY;
+            mem_resp = (is_ram(a) || is_boot(a) || is_uart(a)) ? RESP_OKAY : RESP_DECERR;
         end
     endfunction
 
@@ -351,11 +365,11 @@ module tb_arch_test #(
                 $display("[tb_arch_test] UART 写 addr=0x%08h data=0x%02h '%c'",
                          a, d[7:0], (d[7:0] > 8'h20) ? d[7:0] : 8'h2e);
             end else if (is_fault(a)) begin
-                $display("[tb_arch_test] NOTE: 对故障窗口的写（预期产生 store access fault）addr=0x%08h", a);
+                $display("[tb_arch_test] NOTE: 对故障窗口的写（从端回 DECERR ⇒ 核应报 store access fault）addr=0x%08h", a);
             end else begin
                 unknown_wr_count = unknown_wr_count + 1;
                 if (unknown_wr_count <= 8)
-                    $display("[tb_arch_test] WARN: 未登记区域写被忽略 addr=0x%08h data=0x%08h strb=%b",
+                    $display("[tb_arch_test] WARN: 未登记区域写（数据丢弃，bresp=DECERR ⇒ 核应报 store access fault）addr=0x%08h data=0x%08h strb=%b",
                              a, d, strb);
             end
         end
@@ -763,7 +777,7 @@ module tb_arch_test #(
         $display("[tb_arch_test] 拍数=%0d 提交数=%0d 首笔AR=0x%08h(seen=%b) ar=%0d aw=%0d r_beat=%0d w_beat=%0d",
                  cyc, commit_count, first_ar_addr, first_ar_seen,
                  ar_count, aw_count, r_beat_count, w_beat_count);
-        $display("[tb_arch_test] 未登记区域访问: 读=%0d 写=%0d；控制台字符=%0d",
+        $display("[tb_arch_test] 未登记区域访问（从端回 DECERR）: 读=%0d 写=%0d；控制台字符=%0d",
                  unknown_rd_count, unknown_wr_count, uart_chars);
         // AXI 握手末态（挂死定位用：哪条通道卡住一眼可见）
         $display("[tb_arch_test] AXI 末态: AR v/r=%b/%b R v/r=%b/%b | AW v/r=%b/%b W v/r=%b/%b B v/r=%b/%b",

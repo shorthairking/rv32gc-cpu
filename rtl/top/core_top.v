@@ -650,10 +650,17 @@ module core_top (
     wire        redirect_exc_v;
     wire [31:0] redirect_exc_pc;
 
+    //   ── 取指异常：`fetch_exc_*` 是**顶层合并后**的 payload（见 §5.2.1）；
+    //      `fu_exc_*` 是 fetch_unit 的原生输出（PMP 拒权 / Sv32 翻译失败）。
     wire        fetch_exc_valid;
     wire [4:0]  fetch_exc_cause;
     wire [31:0] fetch_exc_tval;
     wire [31:0] fetch_exc_pc;
+    wire        fu_exc_valid;
+    wire [4:0]  fu_exc_cause;
+    wire [31:0] fu_exc_tval;
+    wire [31:0] fu_exc_pc;
+    wire        fetch_bus_err;     // 取指通道总线错误（§11.7 赋值；按事务地址粘滞）
 
     wire [127:0] pmp_cfg_flat;
     wire [511:0] pmp_addr_flat;
@@ -735,11 +742,34 @@ module core_top (
     .fetch_insn_pa        (fu_fetch_insn_pa),
     .uncached(obs_uncached),
     .fetch_uncached_pa    (fu_fetch_uncached_pa),
-    .fetch_exc_valid      (fetch_exc_valid),
-    .fetch_exc_cause      (fetch_exc_cause),
-    .fetch_exc_tval       (fetch_exc_tval),
-    .fetch_exc_pc         (fetch_exc_pc)
+    .fetch_exc_valid      (fu_exc_valid),
+    .fetch_exc_cause      (fu_exc_cause),
+    .fetch_exc_tval       (fu_exc_tval),
+    .fetch_exc_pc         (fu_exc_pc)
     );
+
+    //==========================================================================
+    // 5.2.1 ★ 取指异常合并（**顶层唯一合并点**；§11.7 提供总线错误来源）
+    //--------------------------------------------------------------------------
+    //   两个来源：
+    //     ① fetch_unit 原生：取指 PMP 无 X 权限（cause 1）/ Sv32 翻译失败（cause 12）；
+    //     ② 取指通道总线错误：AXI 取指事务（L1I 行填充 AXO_IFIL / XIP 直连 AXO_XIPF）
+    //        收到 SLVERR/DECERR ⇒ cause 1（instruction access fault）。
+    //   ★ 优先级 ① > ②：① 在发起任何总线请求之前就已定案（PMP 拒权时 fetch_valid
+    //     被门控，不会为该 parcel 发起填充），两者同时为真的唯一情形是"前一 parcel
+    //     已发起填充、本 parcel 被 PMP 拒"——此时按 ① 报（tval = 故障 parcel 的 VA，
+    //     比"整行总线错误"更精确）。
+    //   ★ tval/mepc 口径（②）：均取**故障取指地址** `fu_fetch_pc`（正在取的
+    //     instruction/parcel 地址）。**不可**用 insn_va —— 它由 parcel_align 从取指
+    //     数据推得，而总线错误可能在填充尚未回填时就已锁存（数据无意义）。
+    //   ★ 为什么在顶层合并而不改 fetch_unit：fetch_unit 的端口表是
+    //     `sim/unit/tb_fetch_unit.sv` 的既有判据（本任务禁改）——新增输入端口会让该
+    //     单元 TB 的该端悬空为 z ⇒ 回归假失败。故取指侧 RTL 保持端口契约不变。
+    //==========================================================================
+    assign fetch_exc_valid = fu_exc_valid | fetch_bus_err;
+    assign fetch_exc_cause = fu_exc_valid ? fu_exc_cause : `RV32GC_EXC_INSN_ACCESS_FAULT;
+    assign fetch_exc_tval  = fu_exc_valid ? fu_exc_tval  : fu_fetch_pc;
+    assign fetch_exc_pc    = fu_exc_valid ? fu_exc_pc    : fu_fetch_pc;
 
     // ---- 5.3 L1I（16 KB / 2 路 / 32 B 行）----
     //   ★ fence.i 的**全阵列失效**：l1i 的 inval_all 只清"当前 cs_vaddr 索引所在组"
@@ -2264,6 +2294,75 @@ module core_top (
     end
 
     //==========================================================================
+    // 11.7 ★ 总线响应错误（SLVERR/DECERR）消费 —— 读 / 写 / 取指三通道
+    //--------------------------------------------------------------------------
+    //   背景（为什么顶层还要再锁存一道）：axi_master_ctrl 的 `resp_error` 是
+    //   "错误可见脉冲"—— r_fire/b_fire 当拍有效，并靠 err_pending_q **维持到
+    //   ST_DONE 拍**；而本文件的 `axi_done_q` 是 done 的**下一拍**（§11.6 记账）
+    //   ⇒ 两者不同龄，直接拿 `axi_done_q & axi_resp_error` 永远为假。故把错误锁存
+    //   进 `axi_err_q`，供"done 拍"的消费者判读。
+    //
+    //   三通道各自认领（互不串扰）：
+    //     · 数据读（MDTA 读：本核数据侧唯一通路，含 lb/lh/lw/fld/lr）⇒ cause 5
+    //     · 数据写（MDTA 写：含 sb/sh/sw/fsd 及 AMO/SC 的写相）      ⇒ cause 7
+    //     · 取指（L1I 行填充 AXO_IFIL / XIP 直连取指 AXO_XIPF）      ⇒ cause 1
+    //   每笔事务起点（axi_fire_req）清 axi_err_q ⇒ done 拍读到的错误必属**本笔**，
+    //   不会把上一笔（如取指填充）的错误误记到本笔数据访问上。
+    //
+    //   ★ 未覆盖（**明确记录**，不写不可达死逻辑）：L1D 行填充（AXO_DFIL）与脏行
+    //     写回（AXO_WRBK）的响应错误。2A 集成下数据侧**全部**经 MDTA
+    //     （mmio_route 把除 CLINT/PLIC/XIP 外的所有 PA 判为 ROUTE_AXI，L1D 只服务
+    //     XIP 路由），DFIL/WRBK 在本核数据通路上不可达。后续接入 D-Cache 时须补：
+    //     行填充错误 ⇒ 该行 load/store 报 access fault 并**不得装入**该行；
+    //     写回错误 ⇒ 该行中毒，后续对该行的 store 报 cause 7。
+    //==========================================================================
+    reg        axi_err_q;         // 本笔总线事务收到非 OKAY 响应（锁存至事务起点）
+    reg  [1:0] axi_err_code_q;    // 最近一次非 OKAY 的 resp 编码（诊断）
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            axi_err_q      <= 1'b0;
+            axi_err_code_q <= 2'b00;
+        end else if (axi_resp_error) begin
+            axi_err_q      <= 1'b1;
+            axi_err_code_q <= axi_resp_code;
+        end else if (axi_fire_req) begin
+            axi_err_q      <= 1'b0;   // 新事务开始 ⇒ 上一笔的错误已过"认领拍"
+        end
+    end
+
+    // ---- 数据通道：错误 ⇒ access fault 的原因码（写类恒 7；纯读恒 5）----
+    //   与 lsu/PMP 的口径一致：AMO/SC 无论读相写相都属"store/AMO access fault"
+    //   （`RV32GC_EXC_STORE_ACCESS_FAULT` 的注释即为此），LR/load 为 cause 5。
+    wire m_bus_err_is_store = m_mem_wr_op | m_amo_write |
+                              (em_mem_op == MEM_AMO) | (em_mem_op == MEM_SC);
+    wire [4:0] m_bus_err_cause = m_bus_err_is_store ? `RV32GC_EXC_STORE_ACCESS_FAULT
+                                                    : `RV32GC_EXC_LOAD_ACCESS_FAULT;
+
+    // ---- 取指通道：按"取指事务地址"锁存错误行（IFIL=行基址 / XIPF=字地址）----
+    //   ★ 为什么按地址**粘滞**而不是"一次性上报"：错误行的填充数据是垃圾，而 L1I
+    //     仍会把该行装入阵列并在此后从 Cache 命中送出 —— 若只报一次，后续落在同一
+    //     行的取指会**静默放行**（本例 jalr 到 PA 0 后若再跳一次即复现）。
+    //     比对对象 `fu_fetch_req_pa` 是**取指事务地址**（cacheable=行基址 /
+    //     uncached=字地址），由 fetch_unit 直接自 PC 派生（不受 fetch_pause 影响）
+    //     ⇒ 与 fetch_pause 之间**不构成组合环**。
+    //   ★ 粘滞槽只有 1 个（记住"最近一次出错的事务地址"）：对静态地址映射的 TB/
+    //     平台是充分的（出错地址集合固定）；后续如需多行中毒，扩成小表即可。
+    wire axi_err_ifetch = axi_resp_error & ((axi_owner_q == AXO_IFIL) |
+                                            (axi_owner_q == AXO_XIPF));
+    reg        fetch_bus_err_q;
+    reg [31:0] fetch_bus_err_pa_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            fetch_bus_err_q    <= 1'b0;
+            fetch_bus_err_pa_q <= 32'h0;
+        end else if (axi_err_ifetch) begin
+            fetch_bus_err_q    <= 1'b1;
+            fetch_bus_err_pa_q <= axi_ctrl_done_addr;   // 本笔取指事务地址（addr_q）
+        end
+    end
+    assign fetch_bus_err = fetch_bus_err_q & (fu_fetch_req_pa == fetch_bus_err_pa_q);
+
+    //==========================================================================
     // 12. E→M / M→W 的组合推进与提交（12.x 全部为 assign / function）
     //==========================================================================
     // ---- 12.0 本节的组合载荷声明（供 §13 时序块引用）----
@@ -2537,7 +2636,10 @@ module core_top (
                 fd_valid <= 1'b0;
             end else if (pipe_adv) begin
                 fd_valid     <= fu_fetch_valid | fetch_exc_inject;
-                fd_pc        <= fu_fetch_insn_va;
+                // ★ mepc 口径：取指总线错误时 fu_fetch_insn_va 由 parcel_align 从
+                //   取指数据推得（错误行的填充数据无意义，且错误可能在回填前就锁存）
+                //   ⇒ 该情形改用**故障取指地址** fu_fetch_pc（与 fetch_exc_pc 同源）。
+                fd_pc        <= fetch_bus_err ? fu_fetch_pc : fu_fetch_insn_va;
                 fd_pc_pa     <= obs_fetch_pc_pa;
                 fd_insn      <= fu_fetch_data;
                 fd_ilen32    <= fu_fetch_ilen32;
@@ -3075,7 +3177,23 @@ module core_top (
                             //   数据真源仍是 amo_unit：`lsu_amo_wdata`/`lsu_amo_rd_old`/
                             //   `m_sc_ok_cap_q`（读相数据经 §9.5 的路由 mux 选自 axi_rdata_q；
                             //   SC 成功标志在 M_S_ISS 请求拍锁存，理由见那里的注释）。
-                            if (~axi_done_wr_q & (em_mem_op == MEM_AMO)) begin
+                            // ★ 2026-09-17（PMPSm_cfg_A_tor_zero-00 收尾）：**总线响应
+                            //   错误优先于一切正常收尾** —— SLVERR/DECERR ⇒ access fault。
+                            //   本分支只可能在 M_S_ISS 的异常判定（FP 8B 非对齐 >
+                            //   lsu 异常[非对齐 > PMP] > 页错误）**全部通过**之后到达
+                            //   （能发出事务 ⇒ 前几关已过）⇒ 陷阱优先级天然排在它们
+                            //   **之后**，与物理次序一致。
+                            //   tval = 访问 VA（m_va），与 PMP/页错误同口径；cause：
+                            //   写类（store/fstore/AMO/SC 写相）恒 7、纯读恒 5（§11.7）。
+                            //   在途 AMO/SC 的写相一并作废（m_amo_phase_q 清 0）。
+                            if (axi_err_q) begin
+                                m_exc_q       <= 1'b1;
+                                m_exc_cause_q <= m_bus_err_cause;
+                                m_exc_tval_q  <= m_va;
+                                m_amo_phase_q <= 1'b0;
+                                m_state_q     <= M_S_IDLE;
+                                m_done_q      <= 1'b1;
+                            end else if (~axi_done_wr_q & (em_mem_op == MEM_AMO)) begin
                                 m_rd_data_q   <= lsu_amo_rd_old;   // 读相：旧值
                                 m_amo_wdata_q <= lsu_amo_wdata;   // ★ 必须本拍锁存
                                 m_sc_ok_q     <= 1'b1;
