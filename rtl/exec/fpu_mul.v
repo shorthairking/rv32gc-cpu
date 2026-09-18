@@ -25,8 +25,10 @@
 //
 // 位宽：S 用 24×24=48 bit 精确积；D 用 53×53=106 bit 精确积。
 //   ★ 因为乘积**完全精确**，乘法天然满足"单次舍入"（只有一个待舍入的值）。
-//   舍入交给已验证的 fpu_round_s / fpu_round_d（定义在 fpu_add.v；
-//   规格与验证见 .work_fpu/HW_ROUND_VERIFIED.md）。
+//   舍入交给已验证的窄域原语 `fpu_round_n`（定义在 fpu_add.v；窄域 + sticky
+//   重写见 fpu_add.v 头注 P1~P6；规格与验证见 .work_fpu/HW_ROUND_VERIFIED.md）。
+//   ★ 乘法通路 sticky_in 恒 0：乘积本身就是精确窗口（48/106 bit ≤ WW），
+//     没有"被压掉的低位"⇒ 与旧 1024/8192 bit 全宽实现逐位等价。
 //==============================================================================
 `include "rv32_defs.vh"
 `include "core_params.vh"
@@ -62,27 +64,29 @@ module fpu_mul_s (
     wire [23:0] b_sig = (b_exp == 0) ? {1'b0, b_frac} : {1'b1, b_frac};
 
     // 无偏指数（亚正规取 -126，配合有效数的 ×2^-23 口径）
-    wire signed [12:0] a_eunb = (a_exp == 0) ? -13'sd126 : ($signed({5'b0, a_exp}) - 13'sd127);
-    wire signed [12:0] b_eunb = (b_exp == 0) ? -13'sd126 : ($signed({5'b0, b_exp}) - 13'sd127);
+    wire signed [15:0] a_eunb = (a_exp == 0) ? -16'sd126 : ($signed({8'b0, a_exp}) - 16'sd127);
+    wire signed [15:0] b_eunb = (b_exp == 0) ? -16'sd126 : ($signed({8'b0, b_exp}) - 16'sd127);
 
     // ---- 精确乘积（无舍入）----
     // value = a_sig × b_sig × 2^(a_eunb - 23) × 2^(b_eunb - 23)
     //       = prod   × 2^(a_eunb + b_eunb - 46)
     wire        p_sign = a_sign ^ b_sign;
     wire [47:0] prod   = a_sig * b_sig;
-    wire signed [13:0] p_exp = a_eunb + b_eunb - 13'sd46;
+    wire signed [15:0] p_exp = a_eunb + b_eunb - 16'sd46;
 
-    // ---- 一次舍入 ----
+    // ---- 一次舍入（窄域 + sticky 原语；乘积 48 bit 精确值直接作为窗口，
+    //      sticky_in = 0 —— 无对阶、无截断，故舍入与旧全宽实现逐位相同）----
     wire [31:0] round_result;
     wire [4:0]  round_flags;
-    wire [1023:0] prod_x = prod;          // 零扩展到舍入原语域（无截断）
-    fpu_round_s u_round (
-        .sign   (p_sign),
-        .sig    (prod_x),
-        .exp    (p_exp[12:0]),            // S 的 p_exp ∈ [-298, 200]，13 bit 足够
-        .rm     (rm),
-        .result (round_result),
-        .fflags (round_flags)
+    fpu_round_n #(.FB(23), .WW(48), .RW(32), .EB(8),
+                  .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_round (
+        .sign      (p_sign),
+        .sig       (prod),
+        .sticky_in (1'b0),
+        .exp       (p_exp),               // S 的 p_exp ∈ [-298, 200]
+        .rm        (rm),
+        .result    (round_result),
+        .fflags    (round_flags)
     );
 
     // ---- 特殊值 ----
@@ -137,24 +141,25 @@ module fpu_mul_d (
     wire [52:0] a_sig = (a_exp == 0) ? {1'b0, a_frac} : {1'b1, a_frac};
     wire [52:0] b_sig = (b_exp == 0) ? {1'b0, b_frac} : {1'b1, b_frac};
 
-    wire signed [13:0] a_eunb = (a_exp == 0) ? -14'sd1022 : ($signed({3'b0, a_exp}) - 14'sd1023);
-    wire signed [13:0] b_eunb = (b_exp == 0) ? -14'sd1022 : ($signed({3'b0, b_exp}) - 14'sd1023);
+    wire signed [15:0] a_eunb = (a_exp == 0) ? -16'sd1022 : ($signed({5'b0, a_exp}) - 16'sd1023);
+    wire signed [15:0] b_eunb = (b_exp == 0) ? -16'sd1022 : ($signed({5'b0, b_exp}) - 16'sd1023);
 
     wire         p_sign = a_sign ^ b_sign;
     wire [105:0] prod   = a_sig * b_sig;                      // 53×53 精确积
-    wire signed [14:0] p_exp = a_eunb + b_eunb - 14'sd104;
+    wire signed [15:0] p_exp = a_eunb + b_eunb - 16'sd104;
     // value = prod × 2^(a_eunb + b_eunb - 104)
 
     wire [63:0] round_result;
     wire [4:0]  round_flags;
-    wire [8191:0] prod_x = prod;          // 零扩展（无截断）
-    fpu_round_d u_round (
-        .sign   (p_sign),
-        .sig    (prod_x),
-        .exp    (p_exp[13:0]),            // D 的 p_exp ∈ [-2148, 1942]，14 bit 足够
-        .rm     (rm),
-        .result (round_result),
-        .fflags (round_flags)
+    fpu_round_n #(.FB(52), .WW(106), .RW(64), .EB(11),
+                  .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_round (
+        .sign      (p_sign),
+        .sig       (prod),
+        .sticky_in (1'b0),
+        .exp       (p_exp),               // D 的 p_exp ∈ [-2148, 1942]
+        .rm        (rm),
+        .result    (round_result),
+        .fflags    (round_flags)
     );
 
     wire inf_zero = (a_inf & b_zero) | (a_zero & b_inf);

@@ -227,22 +227,31 @@ module fpu_div_sqrt #(
     //==========================================================================
     // 迭代结果 → 已验证的舍入原语（组合）
     //==========================================================================
-    // ★ 必须传**完整**的 sig（D 时可达 163 位），不能只取低 64 位：
-    //   quo_r 累积 STEPS_MAX 位，sig = (quo<<1)|sticky 直接落在 rem_r 上，
-    //   截断会丢掉全部有效位、结果恒为 0（实测踩到）。
+    // ★ 必须传**完整**的 sig（S 时可达 110 位）：quo_r 累积 STEPS_MAX 位，
+    //   sig = (quo<<1)|sticky 直接落在 rem_r 上，截断会丢掉全部有效位、
+    //   结果恒为 0（实测踩到）。重写后窄域原语只需 WW = 112 位窗口：
+    //   quo_r < 2^STEPS_MAX = 2^109 ⇒ (quo<<1)|sticky < 2^110 ≤ 2^112 ✓
+    //   （pack 拍 rem_r <= (quo_r<<1)|sticky 会把高位清零，故窗口外无有效位）。
     // ★ 仿真吞吐优化（2026-09-17，语义不变）：只让**当前格式**的舍入原语活动。
     //   `result_r <= r_fmt_d ? rd_res : {32'b0, rs_res}` 只取对应格式的结果，
-    //   另一格式的输出恒被丢弃 ⇒ 把它的 sig 输入钳 0（8 K bit 域不再每拍重算，
-    //   iverilog 事件驱动下该实例不再求值）。位级语义与钳零前一致。
-    wire [1023:0] sig_round_s = r_fmt_d ? 1024'd0 : rem_r[DW-1:0];
-    wire [8191:0] sig_round_d = r_fmt_d ? rem_r[DW-1:0] : 8192'd0;
+    //   另一格式的输出恒被丢弃 ⇒ 把它的 sig 输入钳 0（iverilog 事件驱动下
+    //   该实例不再求值）。位级语义与钳零前一致。
+    localparam integer RWW = 112;                  // 舍入窗口位宽（≥ 110，S/D 共用）
+    wire [RWW-1:0] sig_round_s = r_fmt_d ? {RWW{1'b0}} : rem_r[RWW-1:0];
+    wire [RWW-1:0] sig_round_d = r_fmt_d ? rem_r[RWW-1:0] : {RWW{1'b0}};
 
     wire [31:0] rs_res;  wire [4:0] rs_fl;
     wire [63:0] rd_res;  wire [4:0] rd_fl;
-    fpu_round_s u_rs (.sign(r_sign), .sig(sig_round_s), .exp(exp_r[12:0]),
-                      .rm(r_rm), .result(rs_res), .fflags(rs_fl));
-    fpu_round_d u_rd (.sign(r_sign), .sig(sig_round_d), .exp(exp_r[13:0]),
-                      .rm(r_rm), .result(rd_res), .fflags(rd_fl));
+    // sticky_in = 0：迭代末把"余数非零"已经压进 sig 的 bit0（sig = (quo<<1)|sticky），
+    // 故舍入窗口是精确值、无窗口外信息（与旧全宽实现同一 sig）。
+    fpu_round_n #(.FB(23), .WW(RWW), .RW(32), .EB(8),
+                  .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_rs (
+        .sign(r_sign), .sig(sig_round_s), .sticky_in(1'b0), .exp(exp_r),
+        .rm(r_rm), .result(rs_res), .fflags(rs_fl));
+    fpu_round_n #(.FB(52), .WW(RWW), .RW(64), .EB(11),
+                  .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_rd (
+        .sign(r_sign), .sig(sig_round_d), .sticky_in(1'b0), .exp(exp_r),
+        .rm(r_rm), .result(rd_res), .fflags(rd_fl));
 
     // 开方：打包阶段的指数 = ((E+nb+p) >>> 1) − STEPS − 1
     //   ★ 三个加数恒为偶和 ⇒ 算术右移 1 位即精确减半；

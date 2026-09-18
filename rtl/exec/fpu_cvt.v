@@ -40,9 +40,11 @@
 //      fmv.w.x 写入窄值 ⇒ 按 d-st-ext.adoc:45-47 norm:FP_transfer_instrs_narrow_transfer_in
 //      必须产生合法 NaN-boxed 值（高 32 位全 1）。
 //
-// ★ 舍入原语复用：整数→浮点方向直接把 (sign, sig=|x|, exp=0) 喂给 fpu_add.v 里的
-//   fpu_round_s / fpu_round_d（其 ulp 恰为格式 ulp）；D→S、S→D 方向把原格式的
-//   (sign, sig, exp) 喂进去（S→D 恒精确 ⇒ 0 flags）。
+// ★ 舍入原语复用：整数→浮点方向直接把 (sign, sig=|x|, exp=0, sticky=0) 喂给
+//   fpu_add.v 里的窄域原语 fpu_round_n（其 ulp 恰为格式 ulp）；D→S、S→D 方向把
+//   原格式的 (sign, sig, exp, sticky=0) 喂进去（S→D 恒精确 ⇒ 0 flags）。
+//   ★ 本模块四条转换通路都不需要 sticky 压缩：源有效数是"单操作数、无对阶"，
+//     sig 本身就是精确窗口（24/32/53 bit ≤ WW）⇒ 与旧全宽实现逐位等价。
 //   ★ 浮点→整数方向**不能**复用该原语：其舍入粒度由数值自身的自然 ulp 决定，
 //   而浮点→整数要求固定 ulp = 1（见 fpu_f2i 头注），故用同一张 rm 增量表显式实现。
 //
@@ -84,11 +86,11 @@
 
 //==============================================================================
 // fpu_f2i —— 浮点 → 32 bit 整数（参数化格式 W/FB），含饱和与 NV/NX
-//   value = (-1)^sign × sig × 2^exp2（sig 含隐藏位，口径与 fpu_round_* 一致）
+//   value = (-1)^sign × sig × 2^exp2（sig 含隐藏位，口径与 fpu_round_n 一致）
 //   舍入粒度固定 ulp = 1（**不是**数值自身的自然 ulp），故独立实现：
 //     · exp2 ≥ 0：值已是整数 ⇒ 精确，无 NX；
 //     · exp2 < 0：右移 sh=-exp2 位，round bit = 被丢最高位、sticky = 其余位，
-//       增量表与 fpu_round_s/fpu_round_d 完全一致
+//       增量表与 fpu_round_n 完全一致
 //       （RNE: rb&(st|lsb) / RMM: rb / RTZ: 0 / RUP: ~sign / RDN: sign）。
 //   越界/±∞/NaN ⇒ NV + 饱和（NaN 给正最大）；NX 仅在「未置 NV 且不精确」时置。
 //==============================================================================
@@ -232,7 +234,7 @@ module fpu_cvt (
     wire f2i_uns = (fp_op == FP_FCVT_WU_S) | (fp_op == FP_FCVT_WU_D);
     // ★ 仿真吞吐优化（2026-09-17，语义不变）：只让本次转换方向用到的舍入原语活动
     //   （末尾按 fp_op 选结果，未选中方向的输出恒被丢弃）。iverilog 事件驱动下，
-    //   输入被钳 0 的实例不再每拍重算（D 侧含 8192 bit 域）。
+    //   输入被钳 0 的实例不再每拍重算（重写后各域 ≤ 53 bit，机制保留）。
     wire en_i2s = (fp_op == FP_FCVT_S_W)  | (fp_op == FP_FCVT_S_WU);
     wire en_i2d = (fp_op == FP_FCVT_D_W)  | (fp_op == FP_FCVT_D_WU);
     wire en_s2d = (fp_op == FP_FCVT_D_S);
@@ -253,7 +255,8 @@ module fpu_cvt (
 
     //--------------------------------------------------------------------------
     // ② 整数 → 浮点（fcvt.s.w[.wu] / fcvt.d.w[.wu]）
-    //    复用 fpu_round_s / fpu_round_d：sig = |x|（≤ 2^32）、exp = 0
+    //    复用窄域舍入原语 fpu_round_n：sig = |x|（≤ 2^32，直接就是精确窗口）、
+    //    sticky_in = 0、exp = 0（值 = sig × 2^0 = |x|，无对阶、无截断）
     //--------------------------------------------------------------------------
     wire        i2f_uns  = (fp_op == FP_FCVT_S_WU) | (fp_op == FP_FCVT_D_WU);
     wire [31:0] x_w      = a[31:0];
@@ -261,34 +264,37 @@ module fpu_cvt (
     wire        i2f_sign = i2f_uns ? 1'b0 : x_w[31];
     wire [31:0] i2f_mag  = i2f_uns ? x_w  : x_mag_s;
 
-    wire [1023:0] i2f_sig_s = en_i2s ? {{(1024-32){1'b0}}, i2f_mag} : 1024'd0;
-    wire [8191:0] i2f_sig_d = en_i2d ? {{(8192-32){1'b0}}, i2f_mag} : 8192'd0;
+    wire [31:0] i2f_sig = en_i2s ? i2f_mag : 32'd0;             // 未选中 ⇒ 输入钳 0（吞吐优化）
+    wire [31:0] i2f_sig_d = en_i2d ? i2f_mag : 32'd0;
     wire [31:0] r_i2s;
     wire [63:0] r_i2d;
     wire [4:0]  fl_i2s, fl_i2d;
 
-    fpu_round_s u_i2s (
-        .sign (i2f_sign), .sig (i2f_sig_s), .exp (13'sd0), .rm (rm_eff),
-        .result (r_i2s), .fflags (fl_i2s)
+    fpu_round_n #(.FB(23), .WW(32), .RW(32), .EB(8),
+                  .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_i2s (
+        .sign (i2f_sign), .sig (i2f_sig), .sticky_in (1'b0), .exp (16'sd0),
+        .rm (rm_eff), .result (r_i2s), .fflags (fl_i2s)
     );
-    fpu_round_d u_i2d (
-        .sign (i2f_sign), .sig (i2f_sig_d), .exp (14'sd0), .rm (rm_eff),
-        .result (r_i2d), .fflags (fl_i2d)
+    fpu_round_n #(.FB(52), .WW(32), .RW(64), .EB(11),
+                  .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_i2d (
+        .sign (i2f_sign), .sig (i2f_sig_d), .sticky_in (1'b0), .exp (16'sd0),
+        .rm (rm_eff), .result (r_i2d), .fflags (fl_i2d)
     );
 
     //--------------------------------------------------------------------------
     // ③ fcvt.d.s（S → D，恒精确、不舍入、只可能置 NV）
     //--------------------------------------------------------------------------
     wire [23:0] s_sig = (|s_ef) ? {1'b1, s_fr} : {1'b0, s_fr};
-    wire signed [13:0] s_e = (|s_ef) ? ($signed({6'b0, s_ef}) - 14'sd150)
-                                     : -14'sd149;              // value = s_sig × 2^s_e
-    wire [8191:0] s_sig_x = en_s2d ? {{(8192-24){1'b0}}, s_sig} : 8192'd0;
+    wire signed [15:0] s_e = (|s_ef) ? ($signed({8'b0, s_ef}) - 16'sd150)
+                                     : -16'sd149;               // value = s_sig × 2^s_e
+    wire [23:0] s_sig_x = en_s2d ? s_sig : 24'd0;
     wire [63:0] r_ds_raw;
     wire [4:0]  fl_ds_raw;
 
-    fpu_round_d u_s2d (
-        .sign (s_sign), .sig (s_sig_x), .exp (s_e), .rm (rm_eff),
-        .result (r_ds_raw), .fflags (fl_ds_raw)
+    fpu_round_n #(.FB(52), .WW(24), .RW(64), .EB(11),
+                  .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_s2d (
+        .sign (s_sign), .sig (s_sig_x), .sticky_in (1'b0), .exp (s_e),
+        .rm (rm_eff), .result (r_ds_raw), .fflags (fl_ds_raw)
     );
 
     wire [63:0] ds_r = s_nan ? CANON_D :
@@ -300,24 +306,25 @@ module fpu_cvt (
     // ④ fcvt.s.d（D → S，按 rm 舍入，可置 NV/OF/UF/NX）
     //    ★ 极小数快速路径：本设计把 d_e < −600（即 |D 值| ≤ 2^(−600+53) = 2^-547）
     //      的输入视为"远低于 S 亚正规下限"，结果为 ±0 或 ±2^-149（UF|NX）。
-    //      走专门通路的原因：fpu_round_s 内部用 9 bit 移位索引（rsh[8:0]），当
-    //      rsh = ulp_ex − exp ≥ 512 时索引被截断、q/round_bit 失真；
-    //      d_e ≥ −600 ⇒ rsh ≤ 451 < 512，即原语始终在安全域内。
     //      本路径输出与"未被截断的舍入原语"逐位一致（round_bit=0、sticky=1）。
     //      边界两侧都已测：2^-540 走原语通路、2^-560 走本通路，结果同为 ±0 + UF|NX。
+    //      （重写后 fpu_round_n 的移位量是完整 16 bit、不再是 9 bit 索引截断，
+    //        故本快速路径已非必要；保留它是为了不改动已验收的边界行为与
+    //        节省仿真事件，语义与通用通路逐位等价。）
     //--------------------------------------------------------------------------
     wire [52:0] d_sig = (|d_ef) ? {1'b1, d_fr} : {1'b0, d_fr};
-    wire signed [13:0] d_e = (|d_ef) ? ($signed({3'b0, d_ef}) - 14'sd1075)
-                                     : -14'sd1074;             // value = d_sig × 2^d_e
-    wire d_tiny = (d_e < -14'sd600);
+    wire signed [15:0] d_e = (|d_ef) ? ($signed({5'b0, d_ef}) - 16'sd1075)
+                                     : -16'sd1074;              // value = d_sig × 2^d_e
+    wire d_tiny = (d_e < -16'sd600);
 
-    wire [1023:0] d_sig_x = en_d2s ? {{(1024-53){1'b0}}, d_sig} : 1024'd0;
+    wire [52:0] d_sig_x = en_d2s ? d_sig : 53'd0;
     wire [31:0] r_sd_raw;
     wire [4:0]  fl_sd_raw;
 
-    fpu_round_s u_d2s (
-        .sign (d_sign), .sig (d_sig_x), .exp (d_e[12:0]), .rm (rm_eff),
-        .result (r_sd_raw), .fflags (fl_sd_raw)
+    fpu_round_n #(.FB(23), .WW(53), .RW(32), .EB(8),
+                  .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_d2s (
+        .sign (d_sign), .sig (d_sig_x), .sticky_in (1'b0), .exp (d_e),
+        .rm (rm_eff), .result (r_sd_raw), .fflags (fl_sd_raw)
     );
 
     // 极小数：舍入位=0、sticky=1 ⇒ 仅 RUP/RDN 会给出最小亚正规 ±2^-149
