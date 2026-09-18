@@ -315,8 +315,22 @@ module csr_file (
                 `RV32GC_CSR_MCOUNTEREN,
                 `RV32GC_CSR_SCOUNTEREN: wr_mask = 32'h0000_0007;  // CY/TM/IR
                 // ---- menvcfg/senvcfg：FIOM(0)/CBIE(5:4)/CBCFE(6)/CBZE(7) ----
+                //   ★ 2026-09-17 修复（T-E）：掩码由 0xF1 收窄为 **0x71** ——
+                //     bit7 = CBZE（Cache Block Zero enable）**必须只读零**：
+                //       machine.adoc [norm:menvcfgcbzerdonly0]「When the Zicboz
+                //       extension is not implemented, CBZE is read-only zero.」；
+                //       supervisor.adoc 的 senvcfg 段同一句（手册锚点 [norm:senvcfg_cbze]）。
+                //     本核只实现 **Zicbom**（cbo.clean/flush/inval），**不实现 Zicboz**
+                //     （cbo.zero 无编码 ⇒ 非法指令；08 §11 R1），故 CBZE 恒读 0；
+                //     参考模型同样如此（riscv-isa-sim/csr_init.cc:242-252/353-359：
+                //     mask 里 CBZE 只在 `extension_enabled(EXT_ZICBOZ)` 时才置入，
+                //     而本底座 spike_isa 串不含 zicboz）。
+                //   ★ 对照：FIOM(0) 可写（本核有 S 模式且有分页，Spike 同口径
+                //     `fiom_writable`）；CBIE(5:4)/CBCFE(6) 因 Zicbom 已实现而可写
+                //     （实测本核 `csrs menvcfg,0x70` 读回 0x70 = Spike 一致）。
+                //   ★ 将来实现 Zicboz 时需把 bit7 重新纳入本掩码。
                 `RV32GC_CSR_MENVCFG,
-                `RV32GC_CSR_SENVCFG: wr_mask = 32'h0000_00F1;
+                `RV32GC_CSR_SENVCFG: wr_mask = 32'h0000_0071;
                 `RV32GC_CSR_MENVCFGH: wr_mask = 32'h0000_0000;   // RV32 高半，读 0
                 `RV32GC_CSR_MSTATUSH: wr_mask = 32'h0000_0000;   // 无 MBE/SBE
                 // ---- 陷阱设置（全 32 bit 可写） ----
@@ -443,8 +457,10 @@ module csr_file (
                         mode_new    = (d[1:0] <= 2'b01) ? d[1:0] : stvec_cur[1:0];
                         csr_landing = {d[31:2], 2'b00} | {30'b0, mode_new};
                     end
-                    // ---- ② menvcfg/senvcfg：FIOM/CBCFE/CBZE 取写数据；CBIE=2'b10 保留 ⇒ 保持现值 ----
+                    // ---- ② menvcfg/senvcfg：FIOM/CBCFE 取写数据；CBIE=2'b10 保留 ⇒ 保持现值 ----
                     //   ★ 按字段掩码替换（先清 [5:4] 再置入），不做位拼接以免位宽错位。
+                    //   ★ 掩码 m = 0x71（见 §1.4 wr_mask）：CBZE(bit7) 不在掩码内 ⇒
+                    //     写入被自然丢弃、读回恒 0（[norm:menvcfgcbzerdonly0]，本核无 Zicboz）。
                     `RV32GC_CSR_MENVCFG: begin
                         cbie_new    = (d[5:4] == 2'b10) ? menvcfg_cur[5:4] : d[5:4];
                         csr_landing = (d & m & ~32'h0000_0030) | ({30'b0, cbie_new} << 4);

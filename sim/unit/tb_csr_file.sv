@@ -312,17 +312,30 @@ module tb_csr_file_top;
         //======================================================================
         // H. menvcfg / senvcfg：FIOM/CBIE/CBCFE/CBZE + CBIE WARL(10 保留)
         //======================================================================
+        //   ★ 2026-09-17 期望值修订（T-E 任务，依据 = 规范条文 + 参考模型，**不是**放水）：
+        //     menvcfg.CBZE(bit7) / senvcfg.CBZE(bit7) 在本核**只读零** ——
+        //     machine.adoc [norm:menvcfgcbzerdonly0]「When the Zicboz extension is
+        //     not implemented, CBZE is read-only zero.」；senvcfg 同（supervisor.adoc
+        //     senvcfg 段同句）。本核只实现 Zicbom、**不实现 Zicboz**（cbo.zero 无编码、
+        //     08 §11 R1；spike_isa 串亦不含 zicboz），故写入的 CBZE=1 必须被丢弃、
+        //     读回为 0（Spike：csr_init.cc:242-252/353-359 只在 EXT_ZICBOZ 使能时
+        //     才把 CBZE 纳入写掩码；DUT：rtl/csr/csr_file.v 的 menvcfg/senvcfg
+        //     wr_mask = 0x71）。
+        //     本 TB 只改这两条**被该口径直接改变**的期望值，CBIE WARL(10 保留) 等
+        //     其余断言与依据均未动。
         //   ---- CBIE WARL：先写 CBIE=11（执行且做 INVAL），再写保留值 10 ⇒ 保持 11 ----
-        csr_write(`RV32GC_CSR_MENVCFG, 32'h0000_00F1);   // FIOM=1 CBIE=11 CBCFE=1 CBZE=1
-        csr_read_chk("menvcfg 全字段写入（CBIE=11）", `RV32GC_CSR_MENVCFG, 32'h0000_00F1);
+        csr_write(`RV32GC_CSR_MENVCFG, 32'h0000_00F1);   // FIOM=1 CBIE=11 CBCFE=1（CBZE=1 被丢弃）
+        csr_read_chk("menvcfg 全字段写入（CBIE=11，CBZE 只读零）",
+                     `RV32GC_CSR_MENVCFG, 32'h0000_0071);
         csr_write(`RV32GC_CSR_MENVCFG, 32'h0000_0031);   // CBIE=2'b10 保留
         csr_read_chk("menvcfg.CBIE=10 保留 ⇒ 保持旧值 11",
                      `RV32GC_CSR_MENVCFG, 32'h0000_0031);
         csr_write(`RV32GC_CSR_MENVCFG, 32'h0000_0001);   // CBIE=00, 只 FIOM
         csr_read_chk("menvcfg.CBIE=00(FIOM=1)", `RV32GC_CSR_MENVCFG, 32'h0000_0001);
 
-        csr_write(`RV32GC_CSR_SENVCFG, 32'h0000_00D1);   // CBIE=01 CBCFE=1 CBZE=1 FIOM=1
-        csr_read_chk("senvcfg 全字段写入（CBIE=01）", `RV32GC_CSR_SENVCFG, 32'h0000_00D1);
+        csr_write(`RV32GC_CSR_SENVCFG, 32'h0000_00D1);   // CBIE=01 CBCFE=1 FIOM=1（CBZE=1 被丢弃）
+        csr_read_chk("senvcfg 全字段写入（CBIE=01，CBZE 只读零）",
+                     `RV32GC_CSR_SENVCFG, 32'h0000_0051);
         csr_write(`RV32GC_CSR_SENVCFG, 32'h0000_0071);   // 先置 CBIE=11
         csr_read_chk("senvcfg CBIE=11", `RV32GC_CSR_SENVCFG, 32'h0000_0071);
         csr_write(`RV32GC_CSR_SENVCFG, 32'h0000_0061);   // CBIE=10 保留 ⇒ 保持 11

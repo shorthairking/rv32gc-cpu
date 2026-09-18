@@ -1461,6 +1461,23 @@ module core_top (
     //   ★ m_tr_src_q：本笔页表遍历的归属（0 = 数据侧 EM 槽访存，1 = 取指侧 F 级）。
     //     由 M_S_IDLE 的分派分支置位，M_S_TR 的完成分支据此选择结果去向（见 §9.4.1）。
     reg         m_tr_src_q;
+    //   ★ 2026-09-17 新增（T-E 任务：转绿 SvZicbo/sv32_zicbom_exceptions_{S,U}mode）：
+    //     · m_cmo_probe_q ：本笔 CMO 已进入 M_S_AXI 发"PMA 探测读"（1 = 探测在途）。
+    //       探测通过后清 0 并回到 M_S_CMO（原 L1D 维护扫描路径不变）。
+    //     · m_ptw_poison_q：本笔页表遍历**最近一次 PTE 读**所在行是"行填充失败"的行
+    //       （见 §11.7 的 l1d_fill_err_q）⇒ 该读不采信行内数据（回合成 PTE=0，
+    //       必判 V=0 ⇒ 故障），并由 M_S_TR / 取指侧把 cause 改写成**原访问类型**的
+    //       access fault（Spike mmu.h:484-501 `pte_load` 同口径）。
+    //       每读一次刷新（M_S_PTEW），故恒反映"当前这笔遍历"的状态。
+    reg         m_cmo_probe_q;
+    reg         m_ptw_poison_q;
+    //   CMO 的 block 对齐掩码（用户裁决口径 = 64 B，与 cmo_unit/Spike 一致）
+    localparam [31:0] M_CMO_BLOCK_MSK = ~(32'd`RV32GC_CBOM_BLOCK_SIZE - 32'd1);
+    //   ★ CMO 的"PMA 探测"判据（M_S_ISS 的发请求分支与 m_mmio_pa_q 锁存**同源**，
+    //     防两处漂移）：块地址落在走 AXI 的物理窗口（mmio_route ROUTE_AXI）才探测；
+    //     CLINT/PLIC（核内）与 XIP（直连）是已实现窗口 ⇒ 保持原路径、不发总线事务。
+    wire m_cmo_probe_go = (m_state_q == M_S_ISS) & lsu_cmo_valid &
+                          (lsu_route == ROUTE_AXI);
     //   ★ 2026-09 新增：PTW 完成脉冲的**粘滞记账**（防 M 级 FSM 在服务 PTE 读
     //     （M_S_PTEA/M_S_PTER/M_S_PTEW）期间错过只维持 1 拍的 `ptw_req_done`）。
     //     漏接的后果是**遍历被无限重启**：FSM 回到 M_S_TR 时该脉冲已消失，
@@ -1775,7 +1792,12 @@ module core_top (
             if (f_tr_walk_done) begin
                 f_tr_flt_v_q     <= ptw_fault;
                 f_tr_flt_va_q    <= f_tr_va_q;
-                f_tr_flt_cause_q <= ptw_fault_cause;
+                // ★ 2026-09-17（T-E）：取指侧的 PTE 读落在"行填充失败"的行上 ⇒
+                //   按**原访问类型**（= 取指）报 instruction access fault（cause 1），
+                //   与 Spike pte_load 的 trap_type=FETCH 一致（PTW 侧因合成 PTE=0
+                //   只会给出 page fault，故在此改写）。判据见 §11.7.1。
+                f_tr_flt_cause_q <= m_ptw_poison_q ? `RV32GC_EXC_INSN_ACCESS_FAULT
+                                                   : ptw_fault_cause;
             end
             //   satp 改写 ⇒ 旧根页表失效：故障锁存作废（放最后 ⇒ 与 walk_done 同拍时
             //   以"作废"为准；成功遍历的 TLB 填充不受影响，ISA 允许保留到 sfence）。
@@ -2601,7 +2623,10 @@ module core_top (
     //   与 lsu/PMP 的口径一致：AMO/SC 无论读相写相都属"store/AMO access fault"
     //   （`RV32GC_EXC_STORE_ACCESS_FAULT` 的注释即为此），LR/load 为 cause 5。
     wire m_bus_err_is_store = m_mem_wr_op | m_amo_write |
-                              (em_mem_op == MEM_AMO) | (em_mem_op == MEM_SC);
+                              (em_mem_op == MEM_AMO) | (em_mem_op == MEM_SC) |
+                              // ★ 2026-09-17（T-E）：cbo.* 属 store/AMO 族 ⇒ cause 7
+                              //   （cmo.adoc:395-405；用于 CMO 的 PMA 探测读报错）
+                              (em_mem_op == MEM_CBO);
     wire [4:0] m_bus_err_cause = m_bus_err_is_store ? `RV32GC_EXC_STORE_ACCESS_FAULT
                                                     : `RV32GC_EXC_LOAD_ACCESS_FAULT;
 
@@ -2628,6 +2653,44 @@ module core_top (
         end
     end
     assign fetch_bus_err = fetch_bus_err_q & (fu_fetch_req_pa == fetch_bus_err_pa_q);
+
+    // ---- ★ 11.7.1 L1D 行填充（AXO_DFIL）响应错误 —— 2026-09-17 新增（T-E）----
+    //   §11.7 上方原记录「DFIL/WRBK 在本核数据通路上不可达」，**该假设对 PTE 隐式读
+    //   不成立**：数据侧确实全部走 MDTA，但 **PTW 的 PTE 读走 L1D**（M_S_PTER，见 §9.6
+    //   与 §9.4.1）⇒ 页表所在 PA 未登记（如 RVMODEL_ACCESS_FAULT_ADDRESS = 0x5000_0000）
+    //   时，L1D 缺失 → DFIL 行填充收到 **DECERR**。
+    //   L1D 无错误端口（本模块**不改 l1d.v**：2A 的 L1D 只服务 XIP 与 PTE 读，见 §9.6
+    //   注释；加端口还要同步 tb_l1d 激励，收益为零），填充数据因此是垃圾（TB 对未登记
+    //   读回 0）⇒ 若不管：PTE 读拿到 0 ⇒ V=0 ⇒ 报 **page fault（cause 12/13/15）**。
+    //   而参考模型 Spike 报的是**原访问类型**的 access fault：
+    //     riscv-isa-sim/riscv/mmu.h:484-501 `pte_load` —— `sim->addr_to_mem(pte_paddr)`
+    //     为 null 且 `mmio_load()` 也失败 ⇒ `throw_access_exception(virt, addr, trap_type)`
+    //     （trap_type = 原访问类型：取指⇒cause 1 / load⇒5 / store·AMO·cbo⇒7）。
+    //   ⇒ 处置：把"填充失败的行"记下来（粘滞；地址映射静态、出错集合固定 ⇒ 单槽足够，
+    //     与上方取指侧 fetch_bus_err_q 同口径），由 M 级 FSM 在隐式读上以
+    //     「合成 PTE=0 + cause 改写」（M_S_PTEW / M_S_TR / §9.4.1 取指侧）报 access fault；
+    //     该行内的数据**永不**被隐式读采信（含后续再次落到同一行的读）。
+    wire axi_err_dfil = axi_resp_error & (axi_owner_q == AXO_DFIL);
+    reg        l1d_fill_err_q;
+    reg [31:0] l1d_fill_err_line_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            l1d_fill_err_q      <= 1'b0;
+            l1d_fill_err_line_q <= 32'h0;
+        end else if (axi_err_dfil) begin
+            l1d_fill_err_q      <= 1'b1;
+            // 行基址（L1D LINE_BYTES = 32 B；DFIL 事务地址本就是行基址，再掩一次防漂移）
+            l1d_fill_err_line_q <= axi_ctrl_done_addr & ~32'h0000_001F;
+        end
+    end
+    //   本拍 PTE 读地址是否落在"填充失败"的行上（行粒度 = L1D 32 B）
+    wire ptw_pte_line_err = l1d_fill_err_q &
+                            (m_ptw_pte_pa_q[31:5] == l1d_fill_err_line_q[31:5]);
+    //   隐式读（PTE 读）报 access fault 时的 cause = **原访问类型**
+    //     （数据侧：load/fld/lr ⇒ 5；store/AMO/SC/cbo ⇒ 7。取指侧恒 1，见 §9.4.1）
+    wire [4:0] m_implicit_af_cause =
+        ((em_mem_op == MEM_LOAD) | (em_mem_op == MEM_FLOAD) | (em_mem_op == MEM_LR))
+        ? `RV32GC_EXC_LOAD_ACCESS_FAULT : `RV32GC_EXC_STORE_ACCESS_FAULT;
 
     //==========================================================================
     // 12. E→M / M→W 的组合推进与提交（12.x 全部为 assign / function）
@@ -2916,6 +2979,8 @@ module core_top (
             m_ptw_pte_ready_q <= 1'b0; m_ptw_pte_pa_q <= 32'h0;
             m_ptw_pte_resp_v_q <= 1'b0; m_ptw_pte_resp_d_q <= 32'h0;
             m_ptw_ad_done_q <= 1'b0;
+            // ★ T-E 新增（CMO PMA 探测记账 / 隐式读污染标志）
+            m_cmo_probe_q <= 1'b0; m_ptw_poison_q <= 1'b0;
         end else begin
             // ================= 默认脉冲清零 =================
             m_done_q          <= 1'b0;
@@ -3256,6 +3321,8 @@ module core_top (
                         m_sc_cap_q     <= 1'b0;   // 新一笔访存重新采样 SC 成败
                         m_exc_q        <= 1'b0;
                         m_page_fault_q <= 1'b0;
+                        m_cmo_probe_q  <= 1'b0;   // ★ T-E：新一笔访存复位 CMO 探测记账
+                                                  //   （防 m_kill_fsm 中止后在下一笔误入 M_S_CMO）
                         // ★ 单次启动口径（修复 D6 的 `~m_done_q` 补丁）：
                         //   本 EM 访存指令**每笔只启动一次** —— 判据用
                         //   `~m_issued_q`（本 EM 槽这条指令是否已启动）而不是
@@ -3317,8 +3384,13 @@ module core_top (
                             end else begin
                                 m_pa_q         <= ptw_fault ? 32'h0 : ptw_pa_out;
                                 m_page_fault_q <= ptw_fault;
-                                m_page_cause_q <= m_is_cbo ? cbo_cause_fix(ptw_fault_cause)
-                                                           : ptw_fault_cause;
+                                // ★ 2026-09-17（T-E）：PTE 读落在"填充失败"的行上 ⇒
+                                //   cause 改写成**原访问类型**的 access fault（数据侧：
+                                //   load 类⇒5 / store·AMO·cbo⇒7），与 Spike pte_load 一致；
+                                //   其余情况维持原口径（cbo 用 cbo_cause_fix 折算）。
+                                m_page_cause_q <= m_ptw_poison_q ? m_implicit_af_cause :
+                                                  (m_is_cbo ? cbo_cause_fix(ptw_fault_cause)
+                                                            : ptw_fault_cause);
                                 m_state_q      <= M_S_ISS;
                             end
                         end
@@ -3333,10 +3405,19 @@ module core_top (
 
                     M_S_PTEW: begin
                         if (l1d_cs_ready) begin
+                            // ★ 2026-09-17（T-E）：本 PTE 所在行是"行填充失败"的行
+                            //   （§11.7.1）⇒ **不采信行内数据**，回一个**合成 PTE=0**：
+                            //   它必判 V=0 ⇒ PTW 一定给故障（保证遍历一定终止、绝不把
+                            //   垃圾当合法翻译），cause 再由 M_S_TR / 取指侧改写为
+                            //   **原访问类型**的 access fault（= Spike pte_load 口径）。
+                            //   同时置 m_ptw_poison_q（每次 PTE 读刷新 ⇒ 恒反映本笔遍历）。
+                            m_ptw_poison_q     <= ptw_pte_line_err;
                             m_ptw_pte_resp_v_q <= 1'b1;
-                            m_ptw_pte_resp_d_q <= l1d_cs_rdata;
+                            m_ptw_pte_resp_d_q <= ptw_pte_line_err ? 32'h0 : l1d_cs_rdata;
                             m_state_q          <= M_S_TR;
                         end else if (l1d_cs_miss) begin
+                            // 缺失 ⇒ 等行填充；若该填充失败，重试会**命中**被污染的行
+                            // ⇒ 由上面的 ptw_pte_line_err 拦下（不会用到垃圾数据）。
                             m_state_q <= M_S_DRAIN;
                             m_retry_q <= M_S_PTER;
                         end
@@ -3363,7 +3444,11 @@ module core_top (
                         m_mmio_off_q   <= m_mmio_req_addr - `RV32GC_CLINT_BASE;
                         m_mmio_wdata_q <= m_amo_phase_q ? m_amo_wdata_q : m_store_w32;
                         m_mmio_strb_q  <= m_store_strb;
-                        m_mmio_pa_q    <= m_pa_eff;
+                        // ★ 2026-09-17（T-E）：CMO 的 PMA 探测地址 = **块对齐后的物理地址**
+                        //   （64 B 块，与 cmo_unit/Spike `paddr - (va & (blocksz-1))` 同口径）；
+                        //   其余访问保持原样（m_pa_eff）。
+                        m_mmio_pa_q    <= (m_cmo_probe_go ? (m_pa_eff & M_CMO_BLOCK_MSK)
+                                                          : m_pa_eff);
 
                         // ★ SC 成败必须在**请求拍**采样并保持（2026-09-17，
                         //   PMPZalrsc_cfg_wr-00 根因）：amo_unit 在本拍按规范清除保留
@@ -3389,7 +3474,24 @@ module core_top (
                             m_state_q     <= M_S_IDLE;
                             m_done_q      <= 1'b1;
                         end else if (lsu_cmo_valid) begin
-                            m_state_q <= M_S_CMO;
+                            // ★ 2026-09-17 新增（T-E）：CMO 的 **PMA 探测**
+                            //   参考模型 Spike 的 `mmu_t::clean_inval`（mmu.h:252-265）在
+                            //   翻译后检查 `sim->reservable(paddr)`（simif.h:19 =
+                            //   "该物理地址是否真有存储器"），不满足即
+                            //   `throw trap_store_access_fault(...)`（cause 7、tval = VA）。
+                            //   本核的对等做法：块地址落在**走 AXI 的物理窗口**时，
+                            //   发一笔单 beat **读**作探测 —— 响应非 OKAY（SLVERR/DECERR）
+                            //   ⇒ 由 M_S_AXI 的错误分支报 store access fault（cause 7，
+                            //   见 §11.7 的 m_bus_err_cause 已把 cbo 计入 store 族）；
+                            //   OKAY ⇒ 继续原 L1D 维护扫描（M_S_CMO，**原行为不变**）。
+                            //   CLINT/PLIC/XIP 是核内/直连窗口（mmio_route 的 ROUTE_*），
+                            //   属"已实现地址"，不发总线事务、直接走原路径。
+                            if (m_cmo_probe_go) begin
+                                m_cmo_probe_q <= 1'b1;
+                                m_state_q     <= M_S_AXI;
+                            end else begin
+                                m_state_q <= M_S_CMO;
+                            end
                         end else if (lsu_clint_plic) begin
                             m_state_q <= M_S_MMIO;
                         end else if (lsu_route == ROUTE_AXI) begin
@@ -3533,8 +3635,16 @@ module core_top (
                                 m_exc_cause_q <= m_bus_err_cause;
                                 m_exc_tval_q  <= m_va;
                                 m_amo_phase_q <= 1'b0;
+                                m_cmo_probe_q <= 1'b0;   // ★ 探测失败：记账复位
                                 m_state_q     <= M_S_IDLE;
                                 m_done_q      <= 1'b1;
+                            end else if (m_cmo_probe_q & (em_mem_op == MEM_CBO)) begin
+                                // ★ 2026-09-17（T-E）：CMO 的 PMA 探测**通过**（响应 OKAY）
+                                //   ⇒ 回到原来的 L1D 维护扫描路径（M_S_CMO），随后按
+                                //   l1d.idle 判定完成 —— 命中缓存的 cbo 行为与修复前逐拍等价，
+                                //   只是前面多了一笔读探测。
+                                m_cmo_probe_q <= 1'b0;
+                                m_state_q     <= M_S_CMO;
                             end else if (~axi_done_wr_q & (em_mem_op == MEM_AMO)) begin
                                 m_rd_data_q   <= lsu_amo_rd_old;   // 读相：旧值
                                 m_amo_wdata_q <= lsu_amo_wdata;   // ★ 必须本拍锁存

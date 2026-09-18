@@ -15,6 +15,18 @@
 #   M/S/U 特权级 + Sv32 + PMP16；**不含** Zb*/Zk*/Zfa*/Zfh*/Zicboz/Zicbop/Zc*
 #   子扩展声明/向量/Sstc/Smstateen/Smepmp/计数器事件选择等。
 #
+# ★ 命名迁移说明（2026-09-18，T-E 任务）：riscv-arch-test 上游已更新为 act4 分支的
+#   **扁平命名**：`tests/priv/<目录>/<测试名>.S` →
+#   `tests/priv/<目录>/<目录>_<测试名>-NN.S`（NN 为变体序号）。
+#   本清单的 A/E 两段已同步迁移，**排除语义逐条不变**：用"新名→旧名"逆映射把旧
+#   规则套回新树全部 1997 个文件，判定结果与迁移后规则**逐文件一致（0 处差异）**，
+#   全局 EX=1633 / IN=364（其中 tests/priv/ IN=107）。
+#   注意：`tests/priv/ExceptionsSv{,Zaamo,Zalrsc}/` **仍用旧命名**（未扁平化），
+#   其规则保持原样；`tests/rv64i/**`、`tests/rv32i/**` 命名未变。
+#   迁移对照（旧 → 新，命中数）见交付报告；核对命令：
+#     ./sim/arch_test/run.sh --check-exclude          # 每条规则至少命中 1 例
+#     ./sim/arch_test/run.sh --list | grep -c '^  IN tests/priv'
+#
 # 运行范围 = tests/rv32i/** 中已声明扩展的组 **+ 特权子集**：
 #   · 非特权：C 段逐目录排除未实现扩展、D 段排除待裁决项；
 #   · 特权（tests/priv/，test_config.yaml: include_priv_tests: True）：原先的
@@ -32,24 +44,41 @@
 #      ② 未实现门控：mstatus.TVM（satp 相关的 S 模式陷阱门控未建模）；
 #      ③ RV64 才有的分页模式 sv39/sv48/sv57 ⇒ 统一登记在 E 段（不在此重复登记）。
 #    保持 IN（**不**列于此）的：M 模式 PMP 全族（PMPF/PMPS/PMPSm/PMPU/PMPZaamo/
-#    PMPZalrsc）、Svbare，以及 **Sv32 分页族**（Sv/sv32_*、SvPMP/sv32_*、
-#    SvPMPZicbo/sv32_*_zicbom_*、SvZicbo/sv32_zicbom_*、Svade/sv32_*）——后者属
+#    PMPZalrsc）、Svbare，以及 **Sv32 分页族**（`Sv_sv32_*`、`SvPMP_sv32_*`、
+#    `SvPMPZicbo_sv32_*_zicbom_*`、`SvZicbo_sv32_zicbom_*`、`Svade_sv32_*`）——后者属
 #    后续 P3 任务范围，本轮保持 IN、暂不运行。
 #    例外：SvPMPZicbo 的 **zicboz** 变体（4 条）已登记排除 —— cbo.zero（Zicboz）
 #    本核未实现（08 §11 R1），与分页无关，无论 P3 与否都跑不了；登记在 A 段。
 #------------------------------------------------------------------------------
-tests/priv/Sv/sv_mstatus_tvm_test.S                 # mstatus.TVM 门控未实现：TVM=1 时 satp 访问/S 模式陷阱的行为未建模
+tests/priv/Sv/Sv_sv_mstatus_tvm_test-00.S           # mstatus.TVM 门控未实现：TVM=1 时 satp 访问/S 模式陷阱的行为未建模
 tests/priv/Svadu/**                                 # Svadu（硬件 A/D 位更新）未实现（本核按 Svade 口径只报异常）
 tests/priv/SvaduPMP/**                              # Svadu + PMP 组合：同上
-tests/priv/Svinval/**                               # Svinval（细粒度 TLB 失效）未实现（含 Svinval_mstatus_tvm.S）
+tests/priv/Svinval/**                               # Svinval（细粒度 TLB 失效）未实现（含 Svinval_Svinval_mstatus_tvm-00.S）
 tests/priv/Svnapot/**                               # Svnapot（NAPOT PTE）未实现
 tests/priv/Svpbmt/**                                # Svpbmt（PBMT 位）未实现
 tests/priv/PMPZca/**                                # Zca：2A 声明 C 本体、未声明 Zc* 族（Zcb/Zcd/Zcf 亦未声明）
 tests/priv/PMPZicbo/**                              # Zicbop/Zicboz：未实现（本核只有 Zicbom）
-tests/priv/SvZicbo/sv32_zicbop_*                    # Zicbop（预取提示）未实现
-tests/priv/SvZicbo/sv32_zicboz_*                    # Zicboz（cbo.zero）：2A 明确不含（08 §11 R1）
-tests/priv/SvPMPZicbo/sv32_*_zicboz_*               # Zicboz（cbo.zero）+ PMP：同上（该目录 sv32 族的 zicbom 条目仍保持 IN，随 P3 的 Sv32 任务解锁）
-tests/priv/ExceptionsSv*                            # Sv32 页错误异常族（smode/umode/mprv + Zaamo/Zalrsc 变体）：本轮不解锁的分页异常路径；同目录族内还含 sv39_* RV64 变体（见 E 段）
+tests/priv/SvZicbo/SvZicbo_sv32_zicbop_*            # Zicbop（预取提示）未实现
+tests/priv/SvZicbo/SvZicbo_sv32_zicboz_*            # Zicboz（cbo.zero）：2A 明确不含（08 §11 R1）
+tests/priv/SvPMPZicbo/SvPMPZicbo_sv32_*_zicboz_*    # Zicboz（cbo.zero）+ PMP：同上（该目录 sv32 族的 zicbom 条目仍保持 IN，随 P3 的 Sv32 任务解锁）
+tests/priv/ExceptionsSv*                            # Sv32 页错误异常族（smode/umode/mprv + Zaamo/Zalrsc 变体）：本轮不解锁的分页异常路径；同目录族内还含 sv39_* RV64 变体（见 E 段；该三目录上游未扁平化，命名保持 sv39_*.S）
+
+#------------------------------------------------------------------------------
+# A2. ④ **上游标记 NORUN + 参考模型自身失败**（T-E，2026-09-17；仅 sv32 两条）
+#    口径：这类用例**无可比参考**，既不是 DUT 缺陷、也不能计入"通过"：
+#      · 上游测试头自带 `REQUIRED_EXTENSIONS: [I, Sv32, NORUN]`（testgen 的 NORUN
+#        标记），文件内注释原文：「Remove NORUN once Sail supports Big Endian」
+#        ⇒ 上游自己声明该用例在参考模型（Sail）支持 Big Endian 前**不运行**；
+#      · 实测把这两条放进运行范围时，**Spike 参考自己**在 7.3 步即失败：
+#        run.sh 判 `fail|<名>|<名>(spike)|0`，`work/<名>/<名>.spike.log` 只有一行
+#        `*** FAILED *** (tohost = 1)`（程序自报失败、rc≠0）⇒ DUT 根本没跑，
+#        逐行比对无从谈起。
+#     ⇒ 按"上游 NORUN 语义 + 参考不可用"登记排除；**不含**任何"跑不过就排除"的
+#       成分（DUT 侧从未产生过签名）。证据留档：sim/arch_test/work/<名>/result.txt
+#       与 <名>.spike.log（本清单登记时的实测产物）。
+#     ★ 未来若更换参考模型（Sail 支持 Big Endian）或上游移除 NORUN，应删除本段。
+tests/priv/Sv/Sv_sv32_mstatus_sbe_set_Smode-00.S    # 上游 REQUIRED_EXTENSIONS 含 NORUN（"Remove NORUN once Sail supports Big Endian"）+ Spike 参考实测 *** FAILED *** (tohost=1)
+tests/priv/Sv/Sv_sv32_mstatus_sbe_and_sum_set_Smode-00.S  # 同上（mstatus.SBE + SUM 变体；上游 NORUN + Spike 参考实测 *** FAILED *** (tohost=1)）
 
 #------------------------------------------------------------------------------
 # B. 非 RV32（本核 MXLEN=32）
@@ -116,28 +145,29 @@ tests/rv32i/MisalignZca/**                          # 非对齐访存（Zca）�
 # E. Sv39/Sv48/Sv57 明确登记（RV32 只有 Sv32；这些变体在 RV64 才有意义）
 #    说明：A 段的 `tests/priv/**` 整体排除已**收窄为逐条排除**，本段承接其中
 #    "RV64 专属分页模式"那一类，逐条登记是为了让「RV32 只跑 sv32_* 变体」这条纪律
-#    可被单独复核（08 §8.2 的筛选要求原文）。既有 15 条全部保留不删；
+#    可被单独复核（08 §8.2 的筛选要求原文）。既有 15 条全部保留不删（**只做命名迁移**：
+#    `<目录>/sv3x_*` → `<目录>/<目录>_sv3x_*`，命中集合不变）；
 #    ExceptionsSv* 三条的 sv39_* 亦被 A 段 `tests/priv/ExceptionsSv*` 覆盖，但保留
-#    逐条登记（真实命中仍在，且 sv39_* 的登记不依赖族规则）。
+#    逐条登记（真实命中仍在，且 sv39_* 的登记不依赖族规则；该三目录未扁平化，规则原样）。
 #------------------------------------------------------------------------------
-tests/priv/SvPMP/sv39_*                             # Sv39 分页：RV32 无此模式
-tests/priv/SvPMP/sv48_*                             # Sv48 分页：RV32 无此模式
-tests/priv/SvPMP/sv57_*                             # Sv57 分页：RV32 无此模式
-tests/priv/SvPMPZicbo/sv39_*                        # Sv39 + Zicbo：RV32 无此模式
-tests/priv/SvPMPZicbo/sv48_*                        # Sv48 + Zicbo：RV32 无此模式
-tests/priv/SvPMPZicbo/sv57_*                        # Sv57 + Zicbo：RV32 无此模式
-tests/priv/SvZicbo/sv39_*                           # Sv39 + Zicbo：RV32 无此模式
-tests/priv/SvZicbo/sv48_*                           # Sv48 + Zicbo：RV32 无此模式
-tests/priv/SvZicbo/sv57_*                           # Sv57 + Zicbo：RV32 无此模式
-tests/priv/Sv/sv39_*                                # Sv39 通用分页用例：RV32 无此模式
-tests/priv/Sv/sv48_*                                # Sv48 通用分页用例：RV32 无此模式
-tests/priv/Sv/sv57_*                                # Sv57 通用分页用例：RV32 无此模式
-tests/priv/ExceptionsSv/sv39_*                      # Sv39 异常用例：RV32 无此模式
-tests/priv/ExceptionsSvZaamo/sv39_*                 # Sv39 + Zaamo：RV32 无此模式
-tests/priv/ExceptionsSvZalrsc/sv39_*                # Sv39 + Zalrsc：RV32 无此模式
-tests/priv/Svade/sv39_*                             # Sv39 + Svade：RV32 无此模式
-tests/priv/Svade/sv48_*                             # Sv48 + Svade：RV32 无此模式
-tests/priv/Svade/sv57_*                             # Sv57 + Svade：RV32 无此模式
+tests/priv/SvPMP/SvPMP_sv39_*                       # Sv39 分页：RV32 无此模式
+tests/priv/SvPMP/SvPMP_sv48_*                       # Sv48 分页：RV32 无此模式
+tests/priv/SvPMP/SvPMP_sv57_*                       # Sv57 分页：RV32 无此模式
+tests/priv/SvPMPZicbo/SvPMPZicbo_sv39_*             # Sv39 + Zicbo：RV32 无此模式
+tests/priv/SvPMPZicbo/SvPMPZicbo_sv48_*             # Sv48 + Zicbo：RV32 无此模式
+tests/priv/SvPMPZicbo/SvPMPZicbo_sv57_*             # Sv57 + Zicbo：RV32 无此模式
+tests/priv/SvZicbo/SvZicbo_sv39_*                   # Sv39 + Zicbo：RV32 无此模式
+tests/priv/SvZicbo/SvZicbo_sv48_*                   # Sv48 + Zicbo：RV32 无此模式
+tests/priv/SvZicbo/SvZicbo_sv57_*                   # Sv57 + Zicbo：RV32 无此模式
+tests/priv/Sv/Sv_sv39_*                             # Sv39 通用分页用例：RV32 无此模式
+tests/priv/Sv/Sv_sv48_*                             # Sv48 通用分页用例：RV32 无此模式
+tests/priv/Sv/Sv_sv57_*                             # Sv57 通用分页用例：RV32 无此模式
+tests/priv/ExceptionsSv/sv39_*                      # Sv39 异常用例：RV32 无此模式（该目录未扁平化）
+tests/priv/ExceptionsSvZaamo/sv39_*                 # Sv39 + Zaamo：RV32 无此模式（同上）
+tests/priv/ExceptionsSvZalrsc/sv39_*                # Sv39 + Zalrsc：RV32 无此模式（同上）
+tests/priv/Svade/Svade_sv39_*                       # Sv39 + Svade：RV32 无此模式
+tests/priv/Svade/Svade_sv48_*                       # Sv48 + Svade：RV32 无此模式
+tests/priv/Svade/Svade_sv57_*                       # Sv57 + Svade：RV32 无此模式
 # 说明：ExceptionsSv*/ 目录实际只含 sv32_*/sv39_* 两族（实测 ls），无 sv48_/sv57_ 文件，
 #       故不登记不存在的前缀 —— 这正是 `--check-exclude` 逐条校验要挡住的那类"空规则"。
 #       同理 Svade/ 只含 sv32_*/sv39_*/sv48_*/sv57_* 四族（实测），故四族分别登记。

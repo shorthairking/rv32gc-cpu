@@ -17,6 +17,9 @@
 //      「页表隐式访存过 PMP 被拒 ⇒ access-fault」用例必须 FAIL。
 //      实现方式：每次 PTE 读都产生 pmp_req（含 PTE 物理地址 + 访问类型），
 //      由外层 pmp_check 回 pmp_resp_ok；本模块不做 PMP 匹配（单一真源）。
+//      ★ 权限口径 = **LOAD**（2026-09-17 修订）：PTE 读是隐式数据读，Spike 用
+//        LOAD 判 PMP（riscv-isa-sim/riscv/mmu.h:490），只有 cause 随原访问类型。
+//        见 §7 `pmp_req_acc` 处的完整依据与实测。
 //  W2. **非对齐优先于 PMP**（T3，本设计选择）：本模块只对**翻译后的物理地址**
 //      做 PMP 检查，非对齐判定在 lsu 侧先于 PTW 触发（见 tb_ptw 的判据）。
 //      本模块内部保证：PTE 地址恒 4 B 对齐（PTESIZE=4），故 PTE 访问本身不会非对齐。
@@ -100,7 +103,7 @@ module ptw #(
     //--------------------------------------------------------------------------
     output wire        pmp_req_valid,
     output wire [31:0] pmp_req_addr,
-    output wire [1:0]  pmp_req_acc,    // 同 req_acc 的编码
+    output wire [1:0]  pmp_req_acc,    // ★ 恒 = ACC_LOAD（2'b01）：PTE 读按**读**权限判 PMP
     output wire [1:0]  pmp_req_priv,   // 页表遍历恒按**有效特权级**做 PMP 检查
     input  wire        pmp_resp_ok,    // 0 = 该 PTE 访问违反 PMP ⇒ access-fault
 
@@ -177,9 +180,19 @@ module ptw #(
     // 2. Sv32 地址切分
     // =========================================================================
     //   VA = VPN[1](10) | VPN[0](10) | OFFSET(12)
-    wire [9:0]  va_vpn1   = req_va[31:22];
-    wire [9:0]  va_vpn0   = req_va[21:12];
-    wire [11:0] va_offset = req_va[11:0];
+    //   ★ 2026-09-17 根因修复（SvPMP/sv32_pmp_on_pte_{S,U}mode 的"后续分叉"）：
+    //     切分必须取自**已锁存的 va_r**，不能取输入端口 req_va。
+    //     理由：本模块在 S_L1/S_L0 等 `pte_req_ready` 期间可能停多拍，而 `req_va`
+    //     是**组合输入**——外层（core_top 的取指/数据双侧仲裁）在这期间会把**下一笔**
+    //     请求的 VA 摆到端口上 ⇒ 用 req_va 会让"当前这笔"用**别人的 VA** 算
+    //     PTE 地址：PMP 检查地址与 PTE 物理读地址双双错位（实测：VA 0x9000_0304 的
+    //     一级 PTE 该读 0x8000_c900，却因端口上来了 VA 0x810 而变成 0x8000_c000 ⇒
+    //     PMP 命中"仅 X"的项 ⇒ 取指翻译被误拒 cause 1；反之也会读到**错误的 PTE**
+    //     而"碰巧通过"，把真实缺陷掩蔽掉）。
+    //     `pa_4m` 早已用 va_r（见下），本处是同一根因的残留。
+    wire [9:0]  va_vpn1   = va_r[31:22];
+    wire [9:0]  va_vpn0   = va_r[21:12];
+    wire [11:0] va_offset = va_r[11:0];
 
     //==========================================================================
     // 3. PTE 字段抽取（W3/W4）
@@ -528,22 +541,22 @@ module ptw #(
     assign pte_req_valid = ((st == S_L1) | (st == S_L0)) & ~pmp_block;
     assign pte_req_pa    = cur_pte_pa;
 
-    // ---- ★ W1：PMP 检查请求（每次 PTE 读都发，且用**原访问类型**） ----
-    //   地址 = PTE 物理地址；类型 = 原访问类型（取指⇒1、load⇒5、store/AMO⇒7）；
-    //   特权级 = 有效特权级（页表遍历属数据访问语义，但**权限口径**跟随原访问类型）。
+    // ---- ★ W1：PMP 检查请求（每次 PTE 读都发；**权限口径恒为 LOAD**） ----
+    //   地址 = PTE 物理地址；**权限口径 = LOAD（R）**；特权级 = 有效特权级。
+    //   ★ 为什么权限恒按 LOAD（2026-09-17 修订，转绿 SvPMP/sv32_pmp_on_pte_{S,U}mode）：
+    //     PTE 读是**隐式数据读**，参考模型 Spike 对页表遍历的 PMP 检查固定用 LOAD
+    //     （riscv-isa-sim/riscv/mmu.h:490：
+    //      `pmp_ok(pte_paddr, ptesize, LOAD, PRV_S, false)`），
+    //     只有**上报的异常类型**才跟随原访问类型（取指⇒cause 1 / load⇒5 / store/AMO⇒7，
+    //     由下面的 af_cause(acc_r) 给出）。
+    //     原实现用 `acc_r`（原访问类型）判权限 ⇒ 在"页表所在页的 PMP 仅 X 不可 R +
+    //     取指翻译"这一组合下**放行**，而 Spike 拒（LOAD 无 R）⇒ 实测该两例在
+    //     "取指"一项各少一条 instruction access fault（DUT 少记 1 条 trap 签名，
+    //     其后所有签名整体偏移）。
     //   ★ SUM/MXR **不进 PMP 路径**（06 §3.1 末段）⇒ 这两个信号不出现在本端口。
     assign pmp_req_valid = (st == S_L1) | (st == S_L0);
     assign pmp_req_addr  = cur_pte_pa;
-    //   ★ 权限口径（08 §5.5 / 本文件 W1 的项目选择）：**按原访问类型**判这次 PTE 访问
-    //     （取指 ⇒ X、load ⇒ R、store/AMO ⇒ W），而上报的 cause 同样跟随原访问类型。
-    //   ★ 已知口径差异（本任务遗留 L-1，见交付报告）：参考模型 Spike 用 **LOAD**
-    //     权限判 PTE 读（riscv-isa-sim/riscv/mmu.h:490），只把**异常类型**取原访问类型。
-    //     两者在"页表仅 X 权限、取指访问"这一组合下结论相反 ⇒ SvPMP 的
-    //     sv32_pmp_on_pte_{S,U}mode 两例不过（其余 38 例不受影响，因为它们不构造
-    //     "页表可 X 不可 R"的 PMP 组合）。
-    //     试改 ACC_LOAD 可让该两例的**首个**差异消失，但测试随后仍在别处分歧
-    //     （详见交付报告"遗留/风险"），故本轮保持项目原口径不动。
-    assign pmp_req_acc   = acc_r;
+    assign pmp_req_acc   = ACC_LOAD;   // ★ 固定 LOAD（Spike 同口径；cause 仍随 acc_r）
     assign pmp_req_priv  = priv_r;
 
     // ---- A/D 更新请求（仅 SVADE=0 的硬件更新通路会拉高；默认口径恒 0）----
