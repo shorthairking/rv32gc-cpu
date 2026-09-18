@@ -59,16 +59,19 @@
 /*------------------------------------------------------------------------------
  * 5. ISA 扩展 / 特权模式（本核 2A 的真实能力，core_params.vh §1/§10）
  *    · I/M/A/F/D/C + Zicsr/Zifencei/Zicntr/Zicbom；
- *    · M/S/U 特权级；
- *    · **Sv32 暂不声明**（见下"不声明"说明）——不是 DUT 没有 Sv32 部件，
- *      而是 Sv32 被 ACT 框架使用的前提 `sfence.vma` 尚未译码：
- *        · tests/env/utils.h:64-69 `RVTEST_SFENCE_VMA_IF_SUPPORTED` 在
- *          `SV32_SUPPORTED` 被定义时会**无条件插入 `sfence.vma`**；
- *        · rtl 侧该指令未译码（core_top.v 头注「已知遗留 L2：sfence.vma 未译码」，
- *          tlb.v 头注 L3/L4 同口径）⇒ 一执行就非法指令陷入，与参考模型分歧；
- *        · 故"声明 Sv32 支持"会**超出 DUT 实际可依赖的能力**（over-declare）。
- *      待 M2 补齐 sfence.vma（含取指侧翻译，core_top.v 遗留 L1）后，
- *      在本文件与 rv32gc-2a.yaml 同步恢复 `SV32_SUPPORTED` 即可。
+ *    · M/S/U 特权级；Sv32（satp.MODE=1 / 两级页表 / 4 MiB 超级页 / ASID 9 bit）。
+ *    · **Sv32 已声明**（2026-09 恢复）—— 声明前提已全部达成：
+ *        ① `sfence.vma` 已译码（decoder.v §4.9；rs1=VA、rs2=ASID，rd≠0 ⇒ 非法）；
+ *        ② W 级提交拍执行冲刷：TLB 粒度失效（tlb.v L3）+ L1D 全阵列失效
+ *           + L1I 全阵列失效 + 年轻指令作废与取指重定向（core_top.v §9.3/§12.3.1）；
+ *        ③ 取指侧 Sv32 翻译已接通（tlb.v 第二查询口；PTW 由 M 级引擎串行复用，
+ *           见 core_top.v §9.4.1）；
+ *        ④ PTE A/D 位 = **Svade 口径**（软件管理，硬件不置位）——与参考模型 Spike
+ *           在 menvcfg.ADUE=0（本核 spike_isa 串未含 svadu）下的行为一致。
+ *    · 声明后的影响（务必整组重跑，不可只跑增量）：
+ *        tests/env/utils.h:64-69 的 `RVTEST_SFENCE_VMA_IF_SUPPORTED` 会在**每个**用例
+ *        的启动码里插入 `sfence.vma`（rvtest_setup.h:1181 的 `csrw satp,zero; sfence.vma`
+ *        与 rvtest_pmp_macros.h:68 的 PMP 背景区 sfence.vma）⇒ 所有用例的二进制都变。
  *    · F/D 相关宏（F_SUPPORTED）按任务书要求写在 rvmodel_macros.h 里。
  *----------------------------------------------------------------------------*/
 #define ZICSR_SUPPORTED
@@ -76,7 +79,7 @@
 #define ZICBOM_SUPPORTED
 #define S_SUPPORTED
 #define U_SUPPORTED
-/* #define SV32_SUPPORTED */   /* ← 见上：待 sfence.vma 译码后恢复（当前会引入非法指令） */
+#define SV32_SUPPORTED
 
 /*------------------------------------------------------------------------------
  * 6. 明确**不**支持（保持未定义即可；在此登记以免后人"顺手加宏"）

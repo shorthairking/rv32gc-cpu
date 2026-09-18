@@ -348,8 +348,17 @@ module fetch_unit #(
 
     wire [15:0] check_parcel_lo = fetch_word[15:0];
     wire [15:0] check_parcel_hi = fetch_word[31:16];
-    wire [31:0] check_va_lo     = insn_pa_base;              // 起始 parcel 的地址
-    wire [31:0] check_va_hi     = insn_pa_base + 32'd2;      // +2 parcel 的地址
+    //   ★ 2026-09 修复（SvPMP/sv32_pmp_on_pa_* 实测）：「**检查地址**」与
+    //     「**上报地址（mtval）**」是两个口径，必须分开：
+    //       · PMP 匹配用**翻译后的物理地址**（check_va_lo/hi，翻译开启时 = PA）；
+    //       · mtval 恒写**虚拟地址**（norm:mtvalvaddrnot_paddr；Spike 同口径）。
+    //     原实现把同一个信号既当 PMP 地址又当 mtval ⇒ 翻译开启时 mtval 报出 PA
+    //     （实测 dut=0x80009000 / spike=0x90409000，SvPMP 4 例全红）。
+    //     Bare 模式（sv32_translate_en=0）下 PA==VA ⇒ 两者逐位相同，行为不变。
+    wire [31:0] check_va_lo     = insn_pa_base;              // PMP 检查地址（翻译后 PA）
+    wire [31:0] check_va_hi     = insn_pa_base + 32'd2;      // 同上（+2 parcel）
+    wire [31:0] pmp_tval_lo     = insn_va;                   // mtval 口径：起始 parcel 的 VA
+    wire [31:0] pmp_tval_hi     = insn_va + 32'd2;           // +2 parcel 的 VA
 
     // ---- PMP 检查：**例化 rtl/mem/pmp_check.v**（消重，2026-09-14 集成改动）----
     //   口径（与内联实现逐条一致，仅"由谁实现匹配"改变）：
@@ -404,7 +413,7 @@ module fetch_unit #(
 
     // 第一个故障 parcel 决定 tval（低地址优先，与「逐 parcel 顺序检查」一致）
     wire        pmp_fault      = ~pmp_ok_lo | (~pmp_ok_hi & ilen32);
-    wire [31:0] pmp_fault_va   = ~pmp_ok_lo ? check_va_lo : check_va_hi;
+    wire [31:0] pmp_fault_va   = ~pmp_ok_lo ? pmp_tval_lo : pmp_tval_hi;   // ★ 恒 VA
     wire [15:0] pmp_fault_parcel = ~pmp_ok_lo ? check_parcel_lo : check_parcel_hi;
 
     // 保留：故障 parcel 位（供 TB/波形诊断核对 mtval 与 parcel 的对应关系）

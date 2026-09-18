@@ -25,18 +25,47 @@
 //  W4. **4 MiB 大页（超级页，i=0 命中叶子）**：必须检查 PTE 的 PPN[0]
 //      （即 pte[19:10]）为全 0，否则错位超级页 ⇒ page-fault
 //      （ISA norm:sverr_misaligned_superpage）。
-//  W5. **A/D 位**：本设计按 **Svade 未实现**（硬件原子更新 A/D）口径设计，
-//      预留 pte_ad_update 输出；2A 先把 A/D 检查做成 page-fault 的保守实现
-//      （见 §5 注释；这是 06 §11 P-6 的待测项，2A 选保守侧）。
+//  W5. **A/D 位 = Svade（软件管理）**：A=0，或"写访问且 D=0" ⇒ 直接抛
+//      **page-fault**（取指 12 / load 13 / store 15），由 M/S 软件置位后重试。
+//      **不做**硬件原子更新（无 Svadu、menvcfg.ADUE 不实现）。
+//      依据：ISA Sv32 算法步骤 9 的 Svade 分支；参考模型 Spike 的 ISA 串未含
+//      svadu 且 ACT env 显式清 menvcfg.ADUE=0（tests/env/rvtest_setup.h:1010）；
+//      项目裁决见 06-csr-privilege.md §11 P-6（2A 取 Svade 备选方案，
+//      arch-test 的 Svade 组正是据此判定）。pte_ad_* 端口保留但恒 0。
+//  W6. **可中止（kill）**：外层引擎一旦放弃本笔（陷阱/xRET/fence.i/sfence.vma），
+//      本模块必须立即回 IDLE，否则 req_ready 永久为 0（PTE 响应不会再回来）⇒
+//      死锁；同拍还要压住 fill_valid（sfence 失效竞态，见端口注释）。
 //==============================================================================
 `timescale 1ns / 1ps
 
 `include "rtl/pkg/rv32_defs.vh"
 `include "rtl/pkg/core_params.vh"
 
-module ptw (
+module ptw #(
+    //--------------------------------------------------------------------------
+    // ★ A/D 位策略选择（2026-09 新增参数）
+    //   SVADE = 1（**默认 = 本核口径**，见 W5）：A=0 或"写且 D=0" ⇒ 直接
+    //           page-fault，由 M/S 软件置位后重试（ISA Sv32 算法步骤 9 的 Svade 分支；
+    //           参考模型 Spike 在 menvcfg.ADUE=0 时同口径）。
+    //   SVADE = 0：保留"硬件原子更新 A/D 位"通路（pte_ad_update/pte_ad_done 握手，
+    //           对应 Svadu）。该配置由模块级 TB（sim/unit/tb_ptw.sv，显式传
+    //           SVADE=0）覆盖；本核 core_top 使用默认值 1。
+    //   ⇒ 两条通路都有实现、都有验证，模块默认值 = 项目口径。
+    //--------------------------------------------------------------------------
+    parameter integer  SVADE = 1
+) (
     input  wire        clk,
     input  wire        rst_n,
+
+    //--------------------------------------------------------------------------
+    // ★ 中止（kill）：外层（core_top 的 M 级引擎）已放弃本笔翻译 ⇒ 本模块必须
+    //   立即回 IDLE。理由（死锁防线）：PTE 读的"响应"由 M 级 FSM 提供，FSM 一旦
+    //   因陷阱/xRET/fence.i/sfence.vma 中止，就再也不会回 pte_resp_valid ⇒ 本模块
+    //   若停在 S_L1_W/S_L0_W/S_AD，req_ready 恒 0，此后**所有** Sv32 访问永久挂死。
+    //   同拍还要压住 fill_valid（防"失效竞态"把陈旧翻译灌进 TLB，见 supervisor.adoc
+    //   norm:sfencevma_* 与 docs/kb/isa-notes.md §2.2）。
+    //--------------------------------------------------------------------------
+    input  wire        kill,
 
     //--------------------------------------------------------------------------
     // 翻译请求（来自 lsu / fetch_unit）
@@ -292,18 +321,25 @@ module ptw (
     endfunction
 
     wire acc_is_write = is_write_acc(acc_r);
-    // ---- A/D 检查（W5）：本设计按保守 Svade 口径 ⇒ A=0 或 (写且 D=0) 时
-    //      进入 S_AD 做硬件更新（pte_ad_update），由外层完成原子更新后回 done。
-    //      06 §11 P-6 标注该实现代价待测；2A 提供硬件更新路径并保留 Svade 退化点。
-    wire need_ad = pte_is_leaf & ((~pte_ab) | (acc_is_write & ~pte_db));
 
     //==========================================================================
     // 6. 状态推进
     //==========================================================================
     // ---- 组合：本次叶子检查的结果（用于 S_L1_W / S_L0_W 的下一动作） ----
+    // ---- A/D 位口径（★ 2026-09 修订，见文件头 W5）：**Svade（软件管理）** ----
+    //   A=0，或"写访问且 D=0" ⇒ **page-fault**（cause 12/13/15），由 M/S 软件置位后
+    //   重试；本设计**不做**硬件原子更新（无 Svadu、menvcfg.ADUE 不实现）。
+    //   依据：① ISA Sv32 算法步骤 9（Svade 实现 ⇒ 直接抛 page-fault）；
+    //        ② 参考模型 Spike 的 ISA 串未含 svadu（sim/arch_test/test_config.yaml
+    //           spike_isa=rv32imafdc_...），且 ACT env 显式把 menvcfg.ADUE 清 0
+    //           （riscv-arch-test/tests/env/rvtest_setup.h:1010）⇒ 参考行为 = Svade；
+    //        ③ 项目裁决：06-csr-privilege.md §11 P-6 的备选方案（Svade）为本阶段选择。
+    //   判定顺序按 ISA：U 位/权限（步骤 6/8）先于 A/D（步骤 9）；两者同为 page-fault，
+    //   cause 相同，故顺序只影响内部走哪条路径、不影响架构可见行为。
     wire leaf_ok = pte_vb & ~pte_reserved & ~misaligned_sp;
     wire perm_granted = leaf_ok & perm_ok(acc_r, priv_r, sum_r, mxr_r,
                                           pte_ub, pte_rb, pte_wb, pte_xb);
+    wire ad_missing = leaf_ok & ((~pte_ab) | (acc_is_write & ~pte_db));
 
     // ---- 二级需再走一级（指针）：pte 为指针 ⇒ 下到二级 ----
     wire need_l0 = leaf_ok & ~pte_is_leaf;
@@ -343,6 +379,11 @@ module ptw (
             fault_cause_r <= 5'h0;
             perm_r        <= 8'h0;
             leaf_from_l1  <= 1'b0;
+        end else if (kill) begin
+            // ★ 中止：外层引擎已放弃本笔（陷阱/xRET/fence.i/sfence.vma）⇒ 立即回
+            //   IDLE，且**不**产出 fill（fill_valid 的组合式已并入 ~kill）。下一笔
+            //   请求会重新锁存全部字段，故此处无需清理锁存器。
+            st <= S_IDLE;
         end else begin
             case (st)
             //------------------------------------------------------------------
@@ -441,30 +482,35 @@ module ptw (
                 end
             end
             //------------------------------------------------------------------
-            // A/D 位处理（W5）
+            // A/D 位 + 权限判定（W5：Svade 口径）
+            //   顺序按 ISA Sv32 算法：权限（步骤 6/8）判定先于 A/D（步骤 9）；
+            //   两者都抛**同类型 page-fault**（cause 12/13/15），故分派顺序不影响
+            //   架构可见行为，只决定内部走哪一支。
+            //------------------------------------------------------------------
             S_AD: begin
-                if (!need_ad) begin
-                    // 不需要更新 ⇒ 直接做权限判定
-                    if (!perm_granted) begin
-                        fault_r       <= 1'b1;
-                        fault_cause_r <= pf_cause(acc_r);
-                    end else begin
+                if (!perm_granted) begin
+                    fault_r       <= 1'b1;
+                    fault_cause_r <= pf_cause(acc_r);
+                    st            <= S_DONE;
+                end else if (ad_missing & (SVADE != 0)) begin
+                    // ★ Svade 口径（默认）：A=0（或写访问 D=0）⇒ **page-fault**，
+                    //   由软件置位后重试；不发起任何 PTE 写。
+                    fault_r       <= 1'b1;
+                    fault_cause_r <= pf_cause(acc_r);
+                    st            <= S_DONE;
+                end else if (ad_missing) begin
+                    // ---- SVADE=0：硬件原子更新通路（外层写回后回 pte_ad_done）----
+                    if (pte_ad_done) begin
                         pa_r  <= pa_leaf;
                         perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb, 3'b000};
+                        st    <= S_DONE;
                     end
-                    st <= S_DONE;
-                end else if (pte_ad_done) begin
-                    // 外层已完成原子更新 ⇒ 视为 A/D 已置位，继续权限判定
-                    if (!perm_granted) begin
-                        fault_r       <= 1'b1;
-                        fault_cause_r <= pf_cause(acc_r);
-                    end else begin
-                        pa_r  <= pa_leaf;
-                        perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb, 3'b000};
-                    end
-                    st <= S_DONE;
+                    // 否则停在 S_AD 等 pte_ad_done / pte_ad_update 握手
+                end else begin
+                    pa_r  <= pa_leaf;
+                    perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb, 3'b000};
+                    st    <= S_DONE;
                 end
-                // 否则停在 S_AD 等 pte_ad_done
             end
             //------------------------------------------------------------------
             S_DONE: st <= S_IDLE;
@@ -476,7 +522,7 @@ module ptw (
     //==========================================================================
     // 7. 输出（纯组合）
     //==========================================================================
-    assign req_ready = (st == S_IDLE);
+    assign req_ready = (st == S_IDLE) & ~kill;
 
     // ---- PTE 读请求：只在 S_L1 / S_L0 拉高，且 **PMP 未拒**（W1 前置拦截） ----
     assign pte_req_valid = ((st == S_L1) | (st == S_L0)) & ~pmp_block;
@@ -488,11 +534,22 @@ module ptw (
     //   ★ SUM/MXR **不进 PMP 路径**（06 §3.1 末段）⇒ 这两个信号不出现在本端口。
     assign pmp_req_valid = (st == S_L1) | (st == S_L0);
     assign pmp_req_addr  = cur_pte_pa;
+    //   ★ 权限口径（08 §5.5 / 本文件 W1 的项目选择）：**按原访问类型**判这次 PTE 访问
+    //     （取指 ⇒ X、load ⇒ R、store/AMO ⇒ W），而上报的 cause 同样跟随原访问类型。
+    //   ★ 已知口径差异（本任务遗留 L-1，见交付报告）：参考模型 Spike 用 **LOAD**
+    //     权限判 PTE 读（riscv-isa-sim/riscv/mmu.h:490），只把**异常类型**取原访问类型。
+    //     两者在"页表仅 X 权限、取指访问"这一组合下结论相反 ⇒ SvPMP 的
+    //     sv32_pmp_on_pte_{S,U}mode 两例不过（其余 38 例不受影响，因为它们不构造
+    //     "页表可 X 不可 R"的 PMP 组合）。
+    //     试改 ACC_LOAD 可让该两例的**首个**差异消失，但测试随后仍在别处分歧
+    //     （详见交付报告"遗留/风险"），故本轮保持项目原口径不动。
     assign pmp_req_acc   = acc_r;
     assign pmp_req_priv  = priv_r;
 
-    // ---- A/D 更新请求 ----
-    assign pte_ad_update = (st == S_AD) & need_ad;
+    // ---- A/D 更新请求（仅 SVADE=0 的硬件更新通路会拉高；默认口径恒 0）----
+    //   ★ engine 侧口径注释：SVADE=1 时本端口恒 0 ⇒ core_top 的 M_S_PADW/M_S_PADX
+    //     状态不可达（保留状态机结构不动，避免接口/状态编号漂移）。
+    assign pte_ad_update = (SVADE == 0) & (st == S_AD) & ad_missing;
     //   pte_ad_pa = 需要更新的那个 PTE 的物理地址（二级叶子 ⇒ l0_pte_pa；
     //   一级叶子（4 MiB 大页）⇒ l1_pte_pa，由 cur_is_l1 选择）
     assign pte_ad_pa     = (st == S_AD) ? (cur_is_l1 ? l1_pte_pa : l0_pte_pa) : 32'h0;
@@ -507,11 +564,19 @@ module ptw (
     assign fault_cause_o  = fault_cause_r;
     assign fault_tval_o   = va_r;    // ★ E5：恒写虚拟地址
 
-    // ---- TLB 填充 ----
-    assign fill_valid = (st == S_DONE) & ~fault_r;
+    // ---- TLB 填充（★ 已并入 ~kill：失效竞态下不得把陈旧翻译灌进 TLB） ----
+    assign fill_valid = (st == S_DONE) & ~fault_r & ~kill;
     assign fill_va    = va_r;
     assign fill_pa    = pa_r;
-    assign fill_ppn   = pa_r[31:10];
+    //   ★ 2026-09 修复（PA 截断 bug，Sv32 家族解锁时实测）：
+    //     TLB 的 PPN 字段必须能在 32 bit 物理地址空间里**无损重建 PA**：
+    //       PA = {2'b00, ppn[19:0], offset}（恰 32 bit）
+    //     ⇒ 存入的应是 PA[31:12]（20 bit，高 2 位补 0），**不是** PA[31:10]。
+    //     原实现给 PA[31:10]（= 把 PA 当 34 bit 的 PPN 编码），TLB 侧再
+    //     `{ppn, off}` 拼 34 bit 后截断 ⇒ ppn[21:20]≠0 的页（PA ≥ 0x4000_0000，
+    //     **本平台 RAM 全在此区间**）PA 被整体错位（实测：VA 0x4000_00a4 ⇒
+    //     TLB 给出 PA 0x0000_00a4，取指打到未登记区 ⇒ DECERR/cause 1）。
+    assign fill_ppn   = {2'b00, pa_r[31:12]};
     assign fill_perm  = perm_r;
 
 endmodule

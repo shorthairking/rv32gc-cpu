@@ -161,6 +161,19 @@
 `define RV32GC_INSN_SRET     32'h1020_0073   // [ENC:MATCH_SRET=0x10200073 MASK=0xffffffff]
 `define RV32GC_INSN_MRET     32'h3020_0073   // [ENC:MATCH_MRET=0x30200073 MASK=0xffffffff]
 `define RV32GC_INSN_WFI      32'h1050_0073   // [ENC:MATCH_WFI=0x10500073 MASK=0xffffffff]
+// sfence.vma（S 模式 TLB 失效指令；M/S 均可执行；M 模式 TVM 门控本阶段不实现）
+//   编码：funct7=0001001、funct3=000、rd=00000、opcode=1110011；
+//         rs1 = 虚拟地址操作数（**字段**=x0 ⇒ 全地址范围；否则用其值的 VPN）；
+//         rs2 = ASID 操作数（**字段**=x0 ⇒ 全 ASID；否则用其值 [8:0]）。
+//   ★ MASK 只放开 rs1/rs2 ⇒ **rd≠0 不匹配**（架构保留编码）⇒ 落非法指令；
+//     与 binutils 的 MASK_SFENCE_VMA=0xfe007fff 逐位一致。
+//   ★ rs2≠x0 不是保留编码：它选择 ASID（部分冲刷时 G=1 项保留，见 tlb.v L3）。
+//   [ISA:riscv-isa-manual/src/priv/supervisor.adoc §Supervisor Memory-Management
+//        Fence Instruction（norm:sfence_vma_asid_only / _va_asid）；
+//    ENC:MATCH_SFENCE_VMA=0x12000073 MASK=0xfe007fff] ----
+`define RV32GC_F7_SFENCE_VMA         7'b0001001
+`define RV32GC_INSN_SFENCE_VMA_MATCH 32'h1200_0073   // [ENC:MATCH_SFENCE_VMA=0x12000073]
+`define RV32GC_INSN_SFENCE_VMA_MASK  32'hFE00_7FFF   // funct7/funct3/rd/opcode 固定
 
 // ---- 3.10 MISC-MEM（opcode=0001111）[ENC:FENCE=0xf MASK=0x707f；FENCE_I=0x100f
 //      MASK=0x707f ⇒ f3=000 fence / f3=001 fence.i] ----

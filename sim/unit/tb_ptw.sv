@@ -75,8 +75,15 @@ module tb_ptw_top;
     wire [21:0] fill_ppn;
     wire [7:0]  fill_perm;
 
-    ptw dut (
+    //   ★ 例化参数/端口同步（2026-09，**仅同步连接，不改任何判据**）：
+    //     · `SVADE=0`：本 TB 的判据⑤专门覆盖"硬件更新 A/D 位"通路（pte_ad_update
+    //       → pte_ad_done 握手）。核内默认口径是 **Svade=1**（A/D 缺失即 page-fault，
+    //       由 arch-test 的 Svade 组覆盖）⇒ 本 TB 显式选择它要测的那条通路。
+    //     · `.kill(1'b0)`：ptw.v 新增的中止端口（核内用于"陷阱/xRET/fence.i/
+    //       sfence.vma 时把遍历拉回 IDLE"，防死锁）；单元测试无中止场景 ⇒ 接 0。
+    ptw #(.SVADE(0)) dut (
         .clk(clk), .rst_n(rst_n),
+        .kill(1'b0),
         .req_valid(req_valid), .req_va(req_va), .req_acc(req_acc),
         .req_priv(req_priv), .req_sum(req_sum), .req_mxr(req_mxr), .satp(satp),
         .req_ready(req_ready), .req_done(req_done), .pa_o(pa_o), .fault_o(fault_o),
@@ -302,7 +309,15 @@ module tb_ptw_top;
         expect_eq1("A: 发出过 PTE 物理读（两级各一次）", saw_pte_req, 1'b1);
         expect_eq1("A: fill_valid 拉高（粘存观测）", fill_latch, 1'b1);
         expect_eq32("A: fill_va = 请求 VA", fill_va_l, 32'h8040_2123);
-        expect_eq32("A: fill_ppn = PA[31:10]", {10'b0, fill_ppn_l}, 32'h0000_0154);
+        //   ★ 2026-09 同步（**仅同步被 RTL 修复改写的口径，不改判据强度**）：
+        //     `fill_ppn` 的语义是"32 bit 物理地址空间下的页号"= PA[31:12]（20 bit，
+        //     高位补 0），**不是** PA[31:10]。理由：本核物理地址空间 32 bit，Sv32 的
+        //     22 bit PPN 里只有低 20 bit 能参与 PA 重建（PPN[21:20] 落在 2^32 之上）；
+        //     原式（PA[31:10]）会让 TLB 在重建 PA 时整体错位（实测 VA 0x9040_7014 ⇒
+        //     PA 0x8000_7014 而非 0x8000_9014），Sv32 全部用例都受影响。
+        //     本例 PA = 0x0005_5123 ⇒ 期望 0x0005_5123>>12 = 0x0000_0551。
+        expect_eq32("A: fill_ppn = PA[31:12] page number",
+                    {10'b0, fill_ppn_l}, 32'h0000_0055);
 
         //======================================================================
         // B. 【判据⑤】4 MiB 大页（一级命中叶子）

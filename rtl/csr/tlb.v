@@ -56,6 +56,27 @@ module tlb #(
     output wire [31:0] pa_o,             // 翻译结果（hit_o=1 时有效）
 
     //--------------------------------------------------------------------------
+    // 第二查询端口（★ 取指侧；只读，与第一端口共享同一份表项，纯组合）
+    //   为什么加端口而不是"仲裁第一端口"：第一端口的输入是 M 级访存的组合函数，
+    //   仲裁会让数据侧行为依赖取指侧状态（本任务要求"数据侧行为不变"）；
+    //   全相联表项的匹配本来就是并行比较，复制一套比较器不改变任何既有语义。
+    //   命中/权限/PA 的口径与第一端口**逐条相同**（同一 function `tlb_perm_ok`）。
+    //   ★ 不参与 hit_count/miss_count 探针计数（那两个探针是第一端口专用的既有
+    //     判据，见本文件 §7；取指侧另有 core_top 的翻译状态可观测）。
+    //--------------------------------------------------------------------------
+    input  wire        lookup2_valid,
+    input  wire [31:0] lookup2_va,
+    input  wire [8:0]  lookup2_asid,
+    input  wire [1:0]  lookup2_acc,      // 取指口径恒 00
+    input  wire [1:0]  lookup2_priv,
+    input  wire        lookup2_sum,
+    input  wire        lookup2_mxr,
+
+    output wire        hit2_o,
+    output wire        perm_fault2_o,
+    output wire [31:0] pa2_o,
+
+    //--------------------------------------------------------------------------
     // 填充端口（来自 PTW）
     //--------------------------------------------------------------------------
     input  wire        fill_valid,
@@ -226,7 +247,57 @@ module tlb #(
 
     assign hit_o        = hit_w;
     assign perm_fault_o = perm_bad_w;
-    assign pa_o         = {ppn_sel, lookup_off};
+    //   ★ PA 重建口径（2026-09 修复）：本核物理地址空间 = 32 bit ⇒ Sv32 的 22 bit
+    //     PPN 里只有低 20 bit 能参与 32 bit PA（PPN[21:20] 落在 2^32 之上被截断）。
+    //     故 pa = {2'b00, ppn[19:0], offset}（拼出来**恰好** 32 bit）。
+    //     原式 `{ppn_sel, lookup_off}` 是 34 bit 拼接再截断 ⇒ 当 ppn[21:20]≠0 时
+    //     PA 错位（本平台 RAM 在 0x8000_0000 起，全部命中该缺陷）。
+    assign pa_o         = {ppn_sel[19:0], lookup_off};   // 20+12 = 32 bit（恰位宽）
+
+    //==========================================================================
+    // 4.1 第二查询端口（取指侧）—— 与 §3/§4 逐条同构，独立比较器组
+    //==========================================================================
+    wire [19:0] lookup2_vpn = lookup2_va[31:12];
+    wire [11:0] lookup2_off = lookup2_va[11:0];
+
+    wire [ENTRIES-1:0] way_match2;
+    generate
+        for (gw = 0; gw < ENTRIES; gw = gw + 1) begin : g_match2
+            assign way_match2[gw] = v_bit[gw] &&
+                                    (vpn[gw] == lookup2_vpn) &&
+                                    (g_bit[gw] | (asid_i[gw] == lookup2_asid));
+        end
+    endgenerate
+
+    wire             any_match2 = |way_match2;
+    wire [21:0]      ppn_way2  [0:ENTRIES-1];
+    wire [4:0]       perm_way2 [0:ENTRIES-1];
+    generate
+        for (gw = 0; gw < ENTRIES; gw = gw + 1) begin : g_sel2
+            assign ppn_way2[gw]  = way_match2[gw] ? ppn[gw]    : 22'h0;
+            assign perm_way2[gw] = way_match2[gw] ? perm_i[gw] : 5'h0;
+        end
+    endgenerate
+
+    //   理由同 §3：数组元素各自由独立 assign 驱动，再用显式 OR 归约合并
+    //   （同一 wire 多次 assign 会触发线网多驱动解析）。
+    reg [21:0] ppn_sel2;
+    reg [4:0]  perm_sel2;
+    integer    si2;
+    always @(*) begin
+        ppn_sel2  = 22'h0;
+        perm_sel2 = 5'h0;
+        for (si2 = 0; si2 < ENTRIES; si2 = si2 + 1) begin
+            ppn_sel2  = ppn_sel2  | ppn_way2[si2];
+            perm_sel2 = perm_sel2 | perm_way2[si2];
+        end
+    end
+
+    wire perm_ok_w2  = tlb_perm_ok(lookup2_acc, lookup2_priv, lookup2_sum, lookup2_mxr,
+                                   perm_sel2[4], perm_sel2[1], perm_sel2[2], perm_sel2[3]);
+    assign hit2_o        = lookup2_valid & any_match2 & perm_ok_w2;
+    assign perm_fault2_o = lookup2_valid & any_match2 & ~perm_ok_w2;
+    assign pa2_o         = {ppn_sel2[19:0], lookup2_off};  // 口径同 pa_o（恰 32 bit）
 
     //==========================================================================
     // 5. sfence.vma 失效判定（L3）—— 纯组合 function，逐路算"是否失效"

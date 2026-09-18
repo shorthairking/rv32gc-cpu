@@ -323,6 +323,26 @@ module core_top (
     wire [31:0] csr_satp, csr_menvcfg, csr_senvcfg;
     wire        csr_tsr, csr_tw, satp_sv32;
 
+    // ---- 取指侧 Sv32 翻译（2026-09 新增，解锁 Sv32 家族）跨节前向声明 ----
+    //   为什么集中声明：F 级（§5）要消费这些信号，而资源（TLB 第二口 / M 级翻译
+    //   引擎）在 §9 才例化；Verilog 允许"先声明后驱动"，避免隐式 1 bit 线网。
+    wire        sv32_translate_en;      // 取指需要翻译（satp.MODE=Sv32 且当前非 M）
+    wire        sv32_translate_done;    // 当前取指 VA 的翻译结果已就绪
+    wire        sv32_translate_fault;   // 就绪且失败（cause 12，或 PTE 访问违反 PMP）
+    wire [31:0] sv32_translate_paddr;   // 翻译后物理地址（done 时有效）
+    wire        f_tlb_hit, f_tlb_perm_fault;
+    wire [31:0] f_tlb_pa;
+    reg         f_tr_flt_v_q;           // "当前取指 VA 已判定故障"锁存（故障不写 TLB）
+    reg  [31:0] f_tr_flt_va_q;
+    reg  [4:0]  f_tr_flt_cause_q;
+    reg  [31:0] f_tr_va_q;              // 本次取指页表遍历的 VA（发起时锁存）
+    wire        f_tr_need, f_tr_tlb_any, f_tr_flt_hit, f_tr_ready, f_tr_pending;
+    wire        f_tr_hold, f_tr_fault, f_tr_fault_is_af;
+    wire        f_tr_walk_start, f_tr_walk_done;
+    wire        m_data_want, m_data_exc;
+    wire        ptw_done_any;           // PTW 完成（含粘滞记账；见 §9.2 的 ptw_done_q）
+    wire [4:0]  ptw_fault_cause;        // PTW 故障 cause（§9.4 驱动，此处提前声明）
+
     //--------------------------------------------------------------------------
 
     //--------------------------------------------------------------------------
@@ -433,6 +453,18 @@ module core_top (
                 2'b10:   pmp_acc_xlat = 2'd1;
                 default: pmp_acc_xlat = 2'd3;
             endcase
+        end
+    endfunction
+
+    // cbo.* 的 cause 折算（Spike 口径：权限按 LOAD 判、异常按 STORE 报）
+    //   13（load page fault）→ 15（store page fault）；5（load access fault）→ 7。
+    //   仅对 cbo 访存生效（其它访存原样返回）。
+    function [4:0] cbo_cause_fix;
+        input [4:0] c;
+        begin
+            if      (c == `RV32GC_EXC_LOAD_PAGE_FAULT)    cbo_cause_fix = `RV32GC_EXC_STORE_PAGE_FAULT;
+            else if (c == `RV32GC_EXC_LOAD_ACCESS_FAULT)  cbo_cause_fix = `RV32GC_EXC_STORE_ACCESS_FAULT;
+            else                                          cbo_cause_fix = c;
         end
     endfunction
 
@@ -571,6 +603,7 @@ module core_top (
     reg         de_mret;
     reg         de_sret;
     reg         de_wfi;
+    reg         de_sfence_vma;    // ★ sfence.vma（W 级冲刷 TLB + L1I + 取指重定向）
     reg         de_ill;
     reg  [31:0] de_exc_tval;
     reg         de_exc_valid;
@@ -591,11 +624,18 @@ module core_top (
     reg  [31:0] em_rs1_val;
     reg  [31:0] em_imm_val;
     reg  [31:0] em_store_data;
+    //   ★ em_rs2_asid：rs2 的**值**低 9 位（= ASID；前递后）。sfence.vma 的 rs2
+    //     即 ASID 操作数（SV32 的 ASIDMAX=9），需要随流水带到 W 级；与 em_rs1_val
+    //     同源同拍锁存（e_rs2_byp[8:0]）。只存 9 位：高位是规范保留位（实现忽略）。
+    reg  [8:0]  em_rs2_asid;
     reg  [63:0] em_fp_store;
     reg  [4:0]  em_amo_f5;
     reg  [4:0]  em_cbo_rs2;
     reg         em_cbo_downgrade;
     reg         em_fence_i;
+    reg         em_sfence_vma;
+    reg         em_sfence_rs1_x0;   // sfence.vma 的 rs1 **字段** == x0（⇒ 全地址范围）
+    reg         em_sfence_rs2_x0;   // sfence.vma 的 rs2 **字段** == x0（⇒ 全 ASID）
     reg         em_fp_we;
     reg  [4:0]  em_fp_rd;
     reg  [63:0] em_fp_wdata;
@@ -629,6 +669,14 @@ module core_top (
     reg         mw_xret_valid;
     reg  [1:0]  mw_xret_kind;
     reg         mw_fence_i;
+    //   ★ sfence.vma 的 W 级冲刷记录（本次任务新增）：判据是 rs1/rs2 的**字段**是否
+    //     为 x0（决定"全范围/全 ASID"）与它们的**值**（VA / ASID），两者都必须随
+    //     流水带到 W 级（TLB 冲刷在 W 级提交拍执行，见 §9.3）。
+    reg         mw_sfence_vma;
+    reg         mw_sfence_rs1_x0;
+    reg         mw_sfence_rs2_x0;
+    reg  [31:0] mw_sfence_va;
+    reg  [8:0]  mw_sfence_asid;
     reg         mw_is_fp_instr;
     reg         mw_is_fp_wr;
     reg         mw_is_fpcsr_wr;
@@ -682,8 +730,10 @@ module core_top (
     reg  fetch_exc_done_q;
     wire fetch_exc_pending = fetch_exc_valid & ~fetch_exc_done_q;
     wire fetch_exc_inject  = fetch_exc_pending & pipe_adv;
+    //   ⑥ 取指侧 Sv32 翻译未就绪（f_tr_hold）：此时 fetch_pc_pa 无意义（TLB 未命中
+    //      ⇒ pa2_o 是 0 基址），必须冻结 F，否则会用错地址发取指请求。
     wire fetch_pause       = ~pipe_adv | fetch_exc_pending | break_point |
-                             fencei_busy | xip_fetch_busy;
+                             fencei_busy | xip_fetch_busy | f_tr_hold;
 
     wire [31:0] fu_fetch_req_pa;
     wire        fu_fetch_req_valid;
@@ -714,10 +764,10 @@ module core_top (
     .break_point          (break_point),
     .fetch_pause          (fetch_pause),
     .insn_accept          (pipe_adv),
-    .sv32_translate_en    (1'b0),      // ★ 遗留 L1：取指侧 Sv32 未接
-    .sv32_translate_done  (1'b0),
-    .sv32_translate_fault (1'b0),
-    .sv32_translate_paddr (32'h0000_0000),
+    .sv32_translate_en    (sv32_translate_en),     // ★ 遗留 L1 已解（见 §5.2.2/§9.4.1）
+    .sv32_translate_done  (sv32_translate_done),
+    .sv32_translate_fault (sv32_translate_fault),
+    .sv32_translate_paddr (sv32_translate_paddr),
     .priv                 (csr_priv_2),
     .pmpcfg_i             (pmp_cfg_flat),
     .pmpaddr_i            (pmp_addr_flat),
@@ -766,18 +816,45 @@ module core_top (
     //     `sim/unit/tb_fetch_unit.sv` 的既有判据（本任务禁改）——新增输入端口会让该
     //     单元 TB 的该端悬空为 z ⇒ 回归假失败。故取指侧 RTL 保持端口契约不变。
     //==========================================================================
-    assign fetch_exc_valid = fu_exc_valid | fetch_bus_err;
-    assign fetch_exc_cause = fu_exc_valid ? fu_exc_cause : `RV32GC_EXC_INSN_ACCESS_FAULT;
-    assign fetch_exc_tval  = fu_exc_valid ? fu_exc_tval  : fu_fetch_pc;
-    assign fetch_exc_pc    = fu_exc_valid ? fu_exc_pc    : fu_fetch_pc;
+    //   ★ 取指翻译（2026-09 新增）给本合并点带来两条口径：
+    //     ① **翻译未就绪期间的一切 fetch_unit 原生异常必须压制**：f_tr_hold=1 时
+    //        `fetch_pc_pa` 是"TLB 未命中"的无效值（pa2_o = 0 基址），拿它做取指 PMP
+    //        检查会凭空产生 access-fault（且 fetch_unit 内部无法区分）；同拍取指
+    //        总线错误也不该报（此时 PC 正在重译，上一笔早已交付）。
+    //     ② **cause 改写**：PTE 隐式访存违反 PMP 时 PTW 抛的是"原访问类型"的
+    //        access-fault（取指 ⇒ cause 1），而 fetch_unit 对"翻译失败"统一写 12
+    //        ⇒ 顶层按锁存的 PTW cause 改写（SvPMP/sv32_pmp_on_pte_* 正是测这一条）。
+    wire fu_exc_gated = fu_exc_valid & (~f_tr_need | f_tr_ready);
+    wire fexc_bus_gated = fetch_bus_err & (~f_tr_need | f_tr_ready);
+    assign fetch_exc_valid = fu_exc_gated | fexc_bus_gated;
+    assign fetch_exc_cause = fu_exc_gated ?
+                             (f_tr_fault_is_af ? `RV32GC_EXC_INSN_ACCESS_FAULT : fu_exc_cause) :
+                             `RV32GC_EXC_INSN_ACCESS_FAULT;
+    assign fetch_exc_tval  = fu_exc_gated ? fu_exc_tval  : fu_fetch_pc;
+    assign fetch_exc_pc    = fu_exc_gated ? fu_exc_pc    : fu_fetch_pc;
 
     // ---- 5.3 L1I（16 KB / 2 路 / 32 B 行）----
     //   ★ fence.i 的**全阵列失效**：l1i 的 inval_all 只清"当前 cs_vaddr 索引所在组"
     //     （l1i.v:150-154 的 wr_addr = va_index）⇒ 必须由 core_top 扫 256 个组，
     //     否则 fence.i 后旧 tag 仍命中（陈旧指令，静默错）。
     reg  [7:0]  fencei_idx_q;
+    //   ★ 2026-09 修复（Sv32 取指解锁时的关键口径）：L1I 的**查询地址**必须与
+    //     填充地址同口径 —— l1i.v 的读路径用 `cs_vaddr`（索引 [12:5] / tag [31:19] /
+    //     字偏移 [4:2]），而填充写路径用的是 `cs_paddr` 派生的行基址
+    //     （fill_idx = fill_line_q[12:5]、fill_tag = fill_line_q[31:19]）。
+    //     ⇒ 若查询喂 VA、填充喂 PA，则"VA[12:5]/VA[31:19] ≠ PA 同字段"时
+    //       （**任何非恒等映射**，Sv32 的全部用例都属此列）读地址与写地址不一致：
+    //       实测表现为"每拍都 miss ⇒ 反复发起行填充"的活锁（VA 0x4000_00a4 ⇒
+    //       PA 0x8000_00a0 时 tag 比较 0x800 vs 写入 0x1000 永不相等）。
+    //     ⇒ 本核把查询地址也切成**物理地址**（翻译开启时）：L1I 于是成为
+    //       **PIPT**（物理索引 + 物理 tag），读写两侧天然自洽；指令 VA 不受影响
+    //       （fetch_unit 用 `fetch_rsp_va`（VA）拼指令与算 mepc）。
+    //     · 未翻译（Bare/M 模式）时 PA==VA ⇒ 行为与原先逐位相同。
+    //     · 翻译未就绪期间 fetch_req_valid=0（fetch_pause）⇒ 不会用无效 PA 查表。
+    //     · fence.i / sfence.vma 的全阵列扫描只依赖"索引"（256 组全扫）⇒ 不受影响。
+    wire [31:0] l1i_lookup_pa = obs_fetch_pc_pa;
     wire [31:0] l1i_cs_vaddr = fencei_busy ? {19'b0, fencei_idx_q, 5'b00000}
-                                           : fu_fetch_pc;
+                                           : l1i_lookup_pa;
     wire        l1i_maint_inval = fencei_busy;
 
     wire        l1i_cs_ready;
@@ -790,12 +867,15 @@ module core_top (
     wire [4:0]  l1i_fill_beats;
     wire        l1i_idle;
 
+    //   cs_req 单点定义（响应归属校验 l1i_rsp_own 也要用同一条件，禁止两处各写一遍）
+    wire l1i_cs_req = fu_fetch_req_valid & fu_fetch_req_cacheable & ~fencei_busy;
+
     l1i #(
     .OWNER_I_FILL (2'd0)
     ) u_l1i (
     .clk            (aclk),
     .rst_n          (aresetn),
-    .cs_req         (fu_fetch_req_valid & fu_fetch_req_cacheable & ~fencei_busy),
+    .cs_req         (l1i_cs_req),
     .cs_paddr       (fu_fetch_req_pa),
     .cs_vaddr       (l1i_cs_vaddr),
     .cs_ready       (l1i_cs_ready),
@@ -839,9 +919,31 @@ module core_top (
     //     0x0000_0000 当指令交给 D 级（实测：loop 首圈后 PC 落到 0 号陷阱向量）。
     assign xip_fetch_busy = xip_req_pend_q | (xip_word_vld_q & ~xip_hit_held);
 
+    //--------------------------------------------------------------------------
+    // ★ 2026-09 修复：「陈旧取指响应」竞态（Sv32 家族解锁时暴露）
+    //   l1i 的响应是"**上一拍被接受的那笔请求**"的数据（l1i.v 的 acc_q 打拍），
+    //   而本核 `fetch_rsp_va = {fu_fetch_pc[31:2],2'b00}` **假定**响应属于当前 PC。
+    //   当 PC 在"请求被接受"与"响应到达"之间发生跳变（陷阱 / xRET / 分支重定向 /
+    //   fence.i / sfence.vma），该假定不成立 ⇒ 会把**旧地址处的指令字**当成新 PC
+    //   的指令交给 D 级（PC 书签却是新的）。
+    //   实测（Sv/sv32_misaligned_page_Smode）：第二个陷阱（load page fault）后
+    //   PC=mtvec=0x80000940，却被塞进旧取指地址 0x3000025c 处的 `nop` ⇒ 顺序落到
+    //   0x80000944（spreader 里"cause 1"的那一格）⇒ 处理程序算出的向量号差 1 ⇒
+    //   签名第 21 字 dut=0d000393 / spike=0d000353（其余 47 字全同）。
+    //   修法：为缓存口径的取指请求记一笔"请求时的 PC"；响应只在
+    //   `请求PC == 当前PC` 时才算数，不等即**丢弃本拍响应**。丢弃后
+    //   `fetch_req_need = ~fetch_rsp_valid` 会自动重发当前 PC 的请求。
+    //   XIP 直连通路本就有地址比对（`xip_hit_held` 比 fu_fetch_req_pa），不受影响。
+    //   正常流程（PC 未变）判据恒真 ⇒ 行为与原先逐拍一致。
+    //--------------------------------------------------------------------------
+    reg         l1i_req_pend_q;
+    reg  [31:0] l1i_req_pc_q;
+    wire        l1i_rsp_own = l1i_req_pend_q & (l1i_req_pc_q == fu_fetch_pc);
+
     assign fetch_rsp_data  = obs_uncached ? xip_word_data_q : l1i_cs_rdata;
     assign fetch_rsp_va    = {fu_fetch_pc[31:2], 2'b00};
-    assign fetch_rsp_valid = obs_uncached ? xip_hit_held : l1i_cs_ready;
+    assign fetch_rsp_valid = obs_uncached ? xip_hit_held
+                                          : (l1i_cs_ready & l1i_rsp_own);
     assign fetch_rsp_ready = ~fetch_pause;
 
     //==========================================================================
@@ -862,7 +964,7 @@ module core_top (
     wire        dec_csr_ill, dec_csr_zimm;
     wire        dec_cbo_valid, dec_cbo_gate_ill, dec_cbo_downgrade;
     wire [4:0]  dec_cbo_kind;
-    wire        dec_fence_i, dec_fence, dec_ebreak, dec_ecall;
+    wire        dec_fence_i, dec_fence, dec_ebreak, dec_ecall, dec_sfence_vma;
     wire        dec_mret, dec_sret, dec_wfi;
 
     wire        csr_chk_illegal, csr_chk_ro_write;
@@ -953,7 +1055,8 @@ module core_top (
     .ecall_o           (dec_ecall),
     .mret_o            (dec_mret),
     .sret_o            (dec_sret),
-    .wfi_o             (dec_wfi)
+    .wfi_o             (dec_wfi),
+    .sfence_vma_o      (dec_sfence_vma)
     );
 
     //==========================================================================
@@ -1247,9 +1350,12 @@ module core_top (
     wire [1:0] e_xret_kind = de_mret ? 2'b01 : 2'b00;
     //   mret：仅 M；sret：M/S 可用，U ⇒ 非法；S 且 mstatus.TSR=1 ⇒ 非法；
     //   wfi ：< M 且 mstatus.TW=1 ⇒ 非法（08 §6.2 TVM/TW/TSR 均实现）
+    //   sfence.vma：S/M 可用；**U 模式 ⇒ 非法指令**（它是 S 模式指令，Spike 同口径
+    //   `require_privilege(PRV_S)`）。mstatus.TVM 门控本阶段不实现（见交付说明）。
     wire e_priv_ill = (de_mret & (csr_priv_2 != PRIV_M)) |
                       (de_sret & ((csr_priv_2 == PRIV_U) | csr_tsr)) |
-                      (de_wfi  & (csr_priv_2 != PRIV_M) & csr_tw);
+                      (de_wfi  & (csr_priv_2 != PRIV_M) & csr_tw) |
+                      (de_sfence_vma & (csr_priv_2 == PRIV_U));
     wire e_ecall_ill = 1'b0;
     wire e_ill_total = de_ill | e_priv_ill;
     //   ecall 的 cause：U=8 / S=9 / M=11
@@ -1352,6 +1458,16 @@ module core_top (
     reg         m_ptw_pte_resp_v_q;
     reg  [31:0] m_ptw_pte_resp_d_q;
     reg         m_ptw_ad_done_q;
+    //   ★ m_tr_src_q：本笔页表遍历的归属（0 = 数据侧 EM 槽访存，1 = 取指侧 F 级）。
+    //     由 M_S_IDLE 的分派分支置位，M_S_TR 的完成分支据此选择结果去向（见 §9.4.1）。
+    reg         m_tr_src_q;
+    //   ★ 2026-09 新增：PTW 完成脉冲的**粘滞记账**（防 M 级 FSM 在服务 PTE 读
+    //     （M_S_PTEA/M_S_PTER/M_S_PTEW）期间错过只维持 1 拍的 `ptw_req_done`）。
+    //     漏接的后果是**遍历被无限重启**：FSM 回到 M_S_TR 时该脉冲已消失，
+    //     而 `m_ptw_req_valid` 仍为 1 ⇒ PTW（已回 IDLE）重复受理同一请求
+    //     ⇒ 每轮 ~10 拍、零提交的死循环（§9.4 的死锁防线之二）。
+    //     口径：`ptw_done_q` = "有一次 PTW 完成尚未被 FSM 消费"。
+    reg         ptw_done_q;
 
     // ---- 9.2 M 级组合视图 ----
     wire [31:0] m_va      = em_rs1_val + em_imm_val;     // 访存虚拟地址（mtval 口径）
@@ -1360,8 +1476,19 @@ module core_top (
     wire        m_size8   = m_is_fp8 & (em_mem_size == 3'd3);   // fld/fsd = 8 B
     wire        m_eff_is_m= (csr_eff_priv == PRIV_M);
     wire        m_need_tr = satp_sv32 & ~m_eff_is_m & ~m_hi_q;
+    //   ★ 2026-09 修订（SvZicbo/sv32_zicbom_exceptions_* 口径对齐参考模型）：
+    //     **cbo.clean/flush/inval 的翻译权限按"读"判**（不是写）。
+    //     依据：① ISA Zicbom —— cbo.clean/flush/inval 不写内存数据，只需该地址**可读**；
+    //              cbo.zero（Zicboz，本核未实现）才需可写；
+    //           ② 参考模型 Spike：`clean_inval()` 用 `generate_access_info(addr, LOAD, ...)`
+    //              做翻译/PMP 检查，再用 `convert_load_traps_to_store_traps()`
+    //              把**异常类型**折算成 store 类（riscv-isa-sim/riscv/mmu.h:253-259）
+    //              ⇒ 权限 = R、cause = 15（页故障）/ 7（access fault）。
+    //     ⇒ 本核：翻译口径用 2'b01（load，见本 wire），cause 用 `cbo_cause_fix()` 折算。
+    wire        m_is_cbo  = (em_mem_op == MEM_CBO);
     wire [1:0]  m_tlb_acc = (em_mem_op == MEM_STORE) | (em_mem_op == MEM_AMO) |
-                            (em_mem_op == MEM_SC) | (em_mem_op == MEM_CBO) ? 2'b10 : 2'b01;
+                            (em_mem_op == MEM_SC) ? 2'b10 :
+                            m_is_cbo ? 2'b01 : 2'b01;
     wire [31:0] m_pa_eff = m_pa_q + (m_hi_q ? 32'd4 : 32'd0);   // ★ 物理地址唯一赋值点派生
 
     // -------------------------------------------------------------------------
@@ -1421,7 +1548,10 @@ module core_top (
     wire [31:0] xret_epc_pc   = csr_rdata_raw;   // = {*epc[31:1],1'b0}（csr_file 读口）
     wire [11:0] csr_raddr_mux = xret_redirect ? xret_epc_addr : de_csr_addr;
 
-    assign kill_young = trap_valid | xret_redirect | fencei_busy;
+    //   ★ sfence.vma（2026-09 新增）：它在 W 提交，比它**更年轻**的 M/E/D 槽指令是
+    //     用**旧翻译**取来的（页表可能刚被软件改写）⇒ 必须与陷阱/fence.i 同口径冲刷；
+    //     同时把 F 重定向到 `sfence 的下一条`（复用 fence.i 的同步机制，见 §12.3.1）。
+    assign kill_young = trap_valid | xret_redirect | fencei_busy | sfence_sync_pending;
 
     // ---- 9.3 TLB ----
     wire        tlb_hit, tlb_perm_fault;
@@ -1451,11 +1581,25 @@ module core_top (
     .fill_ppn         (ptw_fill_ppn),
     .fill_perm        (ptw_fill_perm),
     .fill_asid        (csr_satp[30:22]),
-    .sfence_valid     (1'b0),        // ★ 遗留 L2：sfence.vma 未译码
-    .sfence_va        (32'h0),
-    .sfence_asid      (9'h0),
-    .sfence_all_va    (1'b0),
-    .sfence_all_asid  (1'b0),
+    // ---- 第二查询口 = 取指侧（组合；见 §5.2.2 与 §9.4.1）----
+    .lookup2_valid    (f_tr_need),
+    .lookup2_va       (fu_fetch_pc),
+    .lookup2_asid     (csr_satp[30:22]),
+    .lookup2_acc      (2'b00),          // 取指（X 权限）
+    .lookup2_priv     (csr_priv_2),     // 取指特权级：MPRV 不影响取指
+    .lookup2_sum      (csr_sum),        // 取指判定与 SUM 无关（tlb_perm_ok 已固化）
+    .lookup2_mxr      (csr_mxr),
+    .hit2_o           (f_tlb_hit),
+    .perm_fault2_o    (f_tlb_perm_fault),
+    .pa2_o            (f_tlb_pa),
+    // ---- sfence.vma（W 级提交拍；★ 遗留 L2 已解）----
+    //   判据口径（ISA norm:sfence_vma_*）：all_va = rs1 **字段**为 x0（全地址范围）；
+    //   all_asid = rs2 **字段**为 x0（全 ASID）；否则用寄存器**值**过滤。
+    .sfence_valid     (sfence_sync_pending),
+    .sfence_va        (mw_sfence_va),
+    .sfence_asid      (mw_sfence_asid),
+    .sfence_all_va    (mw_sfence_rs1_x0),
+    .sfence_all_asid  (mw_sfence_rs2_x0),
     .satp_we          (satp_wr_pulse),
     .satp_asid_new    (csr_satp[30:22]),
     .hit_count_o(obs_hit_count_o),
@@ -1466,7 +1610,6 @@ module core_top (
     // ---- 9.4 PTW ----
     wire        ptw_req_done, ptw_fault;
     wire [31:0] ptw_pa_out;
-    wire [4:0]  ptw_fault_cause;
     wire [31:0] ptw_fault_tval;
     wire        ptw_pte_req_valid;
     wire [31:0] ptw_pte_req_pa;
@@ -1475,16 +1618,30 @@ module core_top (
     wire [1:0]  ptw_pmp_req_acc, ptw_pmp_req_priv;
     wire        ptw_pte_ad_update;
     wire [31:0] ptw_pte_ad_pa, ptw_pte_ad_data;
+    //   ---- 翻译请求源仲裁（★ 本任务核心改动）----
+    //   tlb.v/ptw.v 各只有一个请求口，数据侧（M 级访存）已占用 ⇒ 取指侧**串行**复用：
+    //   M 级引擎（M_S_TR 系列状态）在数据侧无事可做时，代取指侧跑一次页表遍历，
+    //   结果经 f_tr_* 交回 F 级（详见 §9.4.1）。`m_tr_src_q` 记录本笔遍历的归属。
+    wire        m_tr_is_fetch = m_tr_src_q & (m_state_q == M_S_TR);
+    wire [31:0] m_ptw_req_va  = m_tr_is_fetch ? f_tr_va_q   : m_va;
+    wire [1:0]  m_ptw_req_acc = m_tr_is_fetch ? 2'b00       : m_tlb_acc;
+    wire [1:0]  m_ptw_req_priv= m_tr_is_fetch ? csr_priv_2  : csr_eff_priv;
     assign m_ptw_req_valid = (m_state_q == M_S_TR) & ~m_kill_fsm;
-    assign m_kill_fsm      = trap_valid | xret_redirect | fencei_busy;
+    assign m_kill_fsm      = trap_valid | xret_redirect | fencei_busy |
+                             sfence_sync_pending;
 
     ptw u_ptw (
     .clk            (aclk),
     .rst_n          (aresetn),
+    //   ★ kill：M 级引擎放弃本笔（陷阱/xRET/fence.i/sfence.vma）⇒ PTW 立即回 IDLE。
+    //     不加这条会死锁：PTE 响应由 M 级 FSM 提供，FSM 中止后响应永不再来，
+    //     PTW 停在 S_L1_W/S_L0_W ⇒ req_ready 恒 0 ⇒ 之后所有 Sv32 访问永久挂死。
+    //     同拍压 fill_valid（stale fill 禁令，见 ptw.v W6）。
+    .kill           (m_kill_fsm),
     .req_valid      (m_ptw_req_valid),
-    .req_va         (m_va),
-    .req_acc        (m_tlb_acc),
-    .req_priv       (csr_eff_priv),
+    .req_va         (m_ptw_req_va),
+    .req_acc        (m_ptw_req_acc),
+    .req_priv       (m_ptw_req_priv),
     .req_sum        (csr_sum),
     .req_mxr        (csr_mxr),
     .satp           (csr_satp),
@@ -1534,6 +1691,97 @@ module core_top (
     .hit_idx_o(obs_hit_idx_o),
     .denied_by_full_o(obs_denied_by_full_o)
     );
+
+
+    //==========================================================================
+    // 9.4.1 ★ 取指侧 Sv32 翻译控制器（2026-09 新增；解锁 Sv32 家族）
+    //--------------------------------------------------------------------------
+    //   职责：把 F 级当前 PC（VA）翻译成 PA，驱动 fetch_unit 的
+    //   `sv32_translate_{en,done,fault,paddr}` 四个端口。
+    //
+    //   【与数据侧共享资源的仲裁方案（本任务方案选型）】
+    //     · TLB：**不动第一端口**，给 tlb.v 加**第二查询口**（lookup2_*），纯组合、
+    //       与第一口共享表项 ⇒ 数据侧输入输出逐位不变（满足"m_need_tr 数据侧行为
+    //       不变"），取指侧命中零等待。
+    //     · PTW：只有一套请求口，采用**串行复用 + 数据侧优先**：
+    //         ① M_S_IDLE 数据侧分支优先（`em_valid & m_is_mem ...`）；
+    //         ② 数据侧无事可做且取指侧有待翻译 VA（f_tr_pending）时，M 级引擎
+    //            （复用 M_S_TR/M_S_PTEA/M_S_PTER/M_S_PTEW 系列状态）代跑一次遍历，
+    //            请求源经 m_tr_src_q 选择；
+    //         ③ 遍历期间 M 级 FSM 非 IDLE ⇒ m_busy=1 ⇒ pipe_adv=0 ⇒ 前端冻结，
+    //            且 F 本身已被 f_tr_hold 冻结 ⇒ **不存在两面并发**，也就没有
+    //            "PTW 在途 vs 数据侧在途"的相互等待；
+    //         ④ 任一方被冲刷（陷阱/xRET/fence.i/sfence.vma）⇒ m_kill_fsm 同时
+    //            中止 FSM 与 PTW（ptw.v 的 kill 端口）⇒ 不可能停在"等一个永远
+    //            不会来的响应"上（死锁防线）。
+    //
+    //   【结果口径】
+    //     · 成功 ⇒ **不本地锁存**：PTW 在 S_DONE 同拍把条目 fill 进 TLB，下一拍
+    //       第二查询口即命中（且每次命中都按当前特权级重做权限判定 ⇒ 特权级切换
+    //       不会用到越权的旧结果）。
+    //     · 失败（page-fault / PTE 访问违反 PMP）⇒ 不写 TLB，必须锁存：
+    //       否则故障只维持 1 拍（那一拍 pipe_adv 可能为 0 ⇒ 异常丢失），且会反复
+    //       重走页表。锁存项按 VA 匹配，并在 m_kill_fsm（trap/xRET/fence.i/sfence）
+    //       与 satp 写时清除 —— 软件改完页表必须 sfence.vma，之后才允许重译。
+    //     · 故障期间同样冻结 F（f_tr_hold）：此时 PA 无意义（TLB 未命中 ⇒ pa2_o
+    //       是 0 基址），绝不能拿它去发取指请求或做取指 PMP 检查。
+    //
+    //   【为什么不用"给 PTW 加第二请求口"】那要在 ptw.v 内做两份遍历状态 +
+    //   两个 PTE 读通道，而 PTE 读通道由 M 级 FSM 实现（单份）——复杂度更高且
+    //   仍要串行化，收益为零。
+    //==========================================================================
+    assign f_tr_need    = satp_sv32 & (csr_priv_2 != PRIV_M);
+    assign f_tr_tlb_any = f_tlb_hit | f_tlb_perm_fault;
+    assign f_tr_flt_hit = f_tr_flt_v_q & (f_tr_flt_va_q == fu_fetch_pc);
+    assign f_tr_ready   = f_tr_tlb_any | f_tr_flt_hit;
+    assign f_tr_pending = f_tr_need & ~f_tr_ready;
+    //   冻结 F 的判据：需要翻译但**没有可用结果**（TLB 未命中，或已判故障）
+    assign f_tr_hold    = f_tr_need & ~f_tlb_hit;
+    //   上报给 fetch_unit 的翻译结果
+    assign f_tr_fault   = f_tr_need & (f_tlb_perm_fault | f_tr_flt_hit);
+    //   PTE 访问违反 PMP ⇒ cause 1（不是 12）：顶层取指异常合并点据此改写 cause
+    assign f_tr_fault_is_af = f_tr_need & f_tr_flt_hit &
+                              (f_tr_flt_cause_q != `RV32GC_EXC_INSN_PAGE_FAULT);
+
+    assign sv32_translate_en    = f_tr_need;
+    assign sv32_translate_done  = f_tr_need & f_tr_ready;
+    assign sv32_translate_fault = f_tr_fault;
+    assign sv32_translate_paddr = f_tlb_pa;
+
+    // ---- 遍历发起/完成握手（与 M 级 FSM 的接口；FSM 侧见 §13(10)）----
+    //   发起条件与 M_S_IDLE 的取指分支**逐字一致**（同名 wire 两处共用，防漂移）：
+    //   数据侧两支都不成立、且取指侧确有未决翻译。
+    assign m_data_want  = em_valid & m_is_mem & ~em_exc_valid & ~m_issued_q;
+    assign m_data_exc   = em_valid & m_is_mem &  em_exc_valid & ~m_issued_q;
+    assign f_tr_walk_start = (m_state_q == M_S_IDLE) & ~m_data_want & ~m_data_exc &
+                             f_tr_pending & ~m_kill_fsm & ~satp_wr_pulse;
+    assign ptw_done_any    = ptw_req_done | ptw_done_q;
+    assign f_tr_walk_done  = (m_state_q == M_S_TR) & m_tr_src_q & ptw_done_any;
+
+    //   理由：两个锁存都是"跨多拍的状态"（遍历 VA / 故障结果），必须用寄存器 ⇒
+    //   always 块不可省（AGENT.md §4 红线 3 要求注释理由）。块内无组合译码。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            f_tr_va_q        <= 32'h0;
+            f_tr_flt_v_q     <= 1'b0;
+            f_tr_flt_va_q    <= 32'h0;
+            f_tr_flt_cause_q <= 5'd0;
+        end else if (m_kill_fsm) begin
+            // 冲刷拍（trap/xRET/fence.i/sfence.vma）：在途遍历已由 kill 中止
+            // ⇒ 丢弃其结果，故障锁存一并作废（必须重译）。
+            f_tr_flt_v_q <= 1'b0;
+        end else begin
+            if (f_tr_walk_start) f_tr_va_q <= fu_fetch_pc;
+            if (f_tr_walk_done) begin
+                f_tr_flt_v_q     <= ptw_fault;
+                f_tr_flt_va_q    <= f_tr_va_q;
+                f_tr_flt_cause_q <= ptw_fault_cause;
+            end
+            //   satp 改写 ⇒ 旧根页表失效：故障锁存作废（放最后 ⇒ 与 walk_done 同拍时
+            //   以"作废"为准；成功遍历的 TLB 填充不受影响，ISA 允许保留到 sfence）。
+            if (satp_wr_pulse) f_tr_flt_v_q <= 1'b0;
+        end
+    end
 
     // ---- 9.5 lsu（内含 pmp_check×2 / mmio_route / amo_unit / cmo_unit）----
     wire [31:0] lsu_mem_va, lsu_mem_pa, lsu_mem_addr, lsu_mtval;
@@ -1645,10 +1893,24 @@ module core_top (
     wire [4:0]  l1d_fill_beats, l1d_wb_beats;
 
     // CMO 维护（08 §7.2：clean/inval 为 256 拍逐组扫描，以 idle 判定完成）
-    wire l1d_maint_inval = (m_state_q == M_S_ISS) & lsu_cmo_valid &
-                           (lsu_cmo_action == 2'd3) & ~m_kill_fsm;
+    wire l1d_cmo_inval = (m_state_q == M_S_ISS) & lsu_cmo_valid &
+                         (lsu_cmo_action == 2'd3) & ~m_kill_fsm;
     wire l1d_maint_clean = (m_state_q == M_S_ISS) & lsu_cmo_valid &
                            ((lsu_cmo_action == 2'd1) | (lsu_cmo_action == 2'd2)) & ~m_kill_fsm;
+    //   ★ 2026-09 新增（Sv32 解锁必需，见 §9.3 sfence 注释）：**sfence.vma 必须让
+    //     L1D 全阵列失效**。理由：页表隐式读（PTW 的 PTE 读）走 L1D（M_S_PTER），
+    //     而软件的 PTE 写是普通 store ⇒ 走 AXI **旁路 L1D**（mmio_route 把 RAM 全部
+    //     判为 ROUTE_AXI，L1D 只服务 XIP 与 PTE 读）⇒ L1D 里的 PTE 行**陈旧**。
+    //     ISA 要求"sfence.vma 之后隐式读必须看到之前的显式写"，本核的隐式读既然
+    //     过 L1D，就必须在 sfence.vma 时把 L1D 失效（架构上完全允许：允许 over-fence）。
+    //     实测（sv32_global_pte_Smode）：L1D 保留了旧的 4 MiB 大页 PTE 行 ⇒ 改写成
+    //     页表指针 PTE + sfence.vma 后仍走旧翻译（VA 0x9040_7014 ⇒ PA 0x8000_7014，
+    //     应为 0x8000_9014）⇒ 取指拿到 0 ⇒ 非法指令（cause 2）。
+    //   · inval_all 只需单拍脉冲：l1d 内部有 maint_q 逐组扫描（完成后 idle=1）。
+    //   · 与 l1i 的全阵列扫描（fencei_busy）同拍启动，两者互不依赖。
+    //   · 安全性：L1D 内**不可能有脏行**（数据存取全走 AXI；唯一经 L1D 的写是
+    //     M_S_PADW 的 A/D 更新，而 Svade 口径下该状态不可达）⇒ 丢弃行无数据损失。
+    wire l1d_maint_inval = l1d_cmo_inval | sfence_sync_pending;
 
     // L1D 访问时序（★ l1d 口径：cs_req 是"本拍发出的访问"，会被寄存后复用 ⇒
     //   必须**单拍脉冲**，结果在下一拍由 cs_ready/cs_wr_done/cs_miss 给出）
@@ -1974,12 +2236,17 @@ module core_top (
     .redirect_pc   (trap_redirect_pc)
     );
 
-    assign redirect_exc_v  = trap_valid | xret_redirect | fencei_busy;
+    assign redirect_exc_v  = trap_valid | xret_redirect | fencei_busy |
+                             sfence_sync_pending;
     //   优先级：trap > xRET > fence.i（三者合并走 pc_gen 的异常/中断入口，
     //   该入口在 pc_gen 内高于 BRU 与断点 ⇒ 全局次序 trap > xRET > fence.i > BRU > 断点）。
-    assign redirect_exc_pc = trap_valid    ? trap_redirect_pc :
-                             xret_redirect ? xret_epc_pc      :
-                                             fencei_pc_q;
+    //   ★ sfence.vma 的重定向目标是**本拍 W 槽的下一条 PC**（mw_pc_next）：它必须
+    //     当拍可用，不能走 fencei_pc_q —— 那个寄存器要到本拍时钟沿才被写入
+    //     （见 §13(9)），当拍读到的是**上一次**同步的旧目标（实测会跳错路径）。
+    assign redirect_exc_pc = trap_valid          ? trap_redirect_pc :
+                             xret_redirect       ? xret_epc_pc      :
+                             sfence_sync_pending ? mw_pc_next      :
+                                                   fencei_pc_q;
 
     //==========================================================================
     // 10.1 xPP（xPP/xPIE/xIE）陷阱语义 —— 根因已在子模块修复，顶层**无**纠正层
@@ -2434,12 +2701,26 @@ module core_top (
     wire fencei_sync_pending =
         mw_valid & mw_fence_i & ~mw_exc_valid & ~trap_exc & ~fencei_busy;
 
+    //   `sfence_sync_pending` = 本拍 W 槽正是 **sfence.vma**（2026-09 新增）：
+    //   · TLB 冲刷就在本拍（tlb.sfence_valid，见 §9.3）；
+    //   · 比它年轻的 M/E/D 槽指令由 `kill_young` 作废、F 由 fence.i 的同一套
+    //     同步机制重定向到 `mw_pc_next`（见 §13(9)：L1I 全阵列失效 + F 冻结）；
+    //   · 为什么把 L1I 也失效：L1I 是 **VA 索引/tag** 的 Cache，sfence.vma 之后
+    //     同一 VA 可能映射到不同 PA（软件改页表），VA-tag 命中会取到旧指令 ⇒
+    //     与"取指必须看到新翻译"冲突（ISA：翻译缓存对外必须表现为已被失效）。
+    //     复用 fence.i 的 256 组扫描（代价 ~256 拍/条，Sv32 用例可接受）。
+    //   · 不并入 fencei_sync_pending 的 `~fencei_busy` 项：sfence 可能在扫描期间
+    //     到达（两者都是 W 提交拍，互斥于 mw_valid 的单拍语义），此处按同一拍判定。
+    wire sfence_sync_pending =
+        mw_valid & mw_sfence_vma & ~mw_exc_valid & ~trap_exc;
+    wire stream_sync_pending = fencei_sync_pending | sfence_sync_pending;
+
     // M→W 放行：M 槽指令已完成，且本拍**不是**冲刷拍（kill_young）也不是
     // fence.i 同步启动拍 —— 这两种情况下 M 槽持的都是"比陷阱指令/fence.i 更年轻"
     // 的指令，绝不允许进入 W（否则下一拍被提交：instret/CSR/FP 副作用越界）。
     //   ★ 不再含 `~bru_redirect`：分支在 E 解析时 M 槽持**更老**指令，必须照常提交
     //     （见文件头 §2b/§2j；旧式把更老提交一并丢掉）。
-    assign mw_cap = mw_go & ~kill_young & ~fencei_sync_pending;
+    assign mw_cap = mw_go & ~kill_young & ~stream_sync_pending;
 
     // ---- 12.4 M 级的读回/写回数据与旁路 ----
     assign m_wdata =
@@ -2491,7 +2772,11 @@ module core_top (
                           (em_mem_op == MEM_LR)   | (em_mem_op == MEM_SC);
     wire e_use_rs1 = (de_rs1 != 5'd0) & (~de_ill);
     wire e_use_rs2 = (de_rs2 != 5'd0) & (~de_ill) &
-                     ((de_insn32[6:0] == `RV32GC_OP_OP) |
+                     //   ★ sfence.vma 的 rs2 是 ASID 操作数（会被 W 级冲刷使用）
+                     //     ⇒ 必须计入"E 级消费 M 槽 load 结果"的互锁集合，否则
+                     //     `lw t0,..; sfence.vma x0,t0` 会读到未完成的旧值。
+                     (de_sfence_vma |
+                      (de_insn32[6:0] == `RV32GC_OP_OP) |
                       (de_mem_op == MEM_STORE) | (de_mem_op == MEM_AMO) |
                       (de_mem_op == MEM_SC) | (de_mem_op == MEM_FSTORE) |
                       (de_op_type == OPT_BRU) | (de_op_type == OPT_JALR));
@@ -2569,6 +2854,7 @@ module core_top (
             de_fp_ldst <= 1'b0; de_rm <= 3'd0; de_csr_addr <= 12'h0; de_csr_zimm <= 1'b0;
             de_cbo_kind <= 5'd0; de_cbo_valid <= 1'b0; de_cbo_downgrade <= 1'b0;
             de_fence_i <= 1'b0; de_ebreak <= 1'b0; de_ecall <= 1'b0;
+            de_sfence_vma <= 1'b0;
             de_mret <= 1'b0; de_sret <= 1'b0; de_wfi <= 1'b0;
             de_ill <= 1'b0; de_exc_tval <= 32'h0; de_exc_valid <= 1'b0;
             de_exc_cause <= 5'd0; de_exc_pc <= 32'h0; de_exc_is_fetch <= 1'b0;
@@ -2577,9 +2863,11 @@ module core_top (
             em_insn_raw <= 32'h0000_0013; em_rd <= 5'd0; em_wb_sel <= WB_NONE;
             em_result <= 32'h0; em_mem_op <= MEM_NONE; em_mem_size <= 3'd0;
             em_mem_unsign <= 1'b0; em_rs1_val <= 32'h0; em_imm_val <= 32'h0;
-            em_store_data <= 32'h0; em_fp_store <= 64'h0;
+            em_store_data <= 32'h0; em_rs2_asid <= 9'h0; em_fp_store <= 64'h0;
             em_amo_f5 <= 5'd0; em_cbo_rs2 <= 5'd0; em_cbo_downgrade <= 1'b0;
             em_fence_i <= 1'b0;
+            em_sfence_vma <= 1'b0;
+            em_sfence_rs1_x0 <= 1'b0; em_sfence_rs2_x0 <= 1'b0;
             em_fp_we <= 1'b0; em_fp_rd <= 5'd0; em_fp_wdata <= 64'h0;
             em_fflags <= 5'd0; em_fflags_we <= 1'b0;
             em_csr_we <= 1'b0; em_csr_addr <= 12'h0; em_csr_wdata <= 32'h0;
@@ -2592,6 +2880,8 @@ module core_top (
             mw_wdata <= 32'h0; mw_fp_we <= 1'b0; mw_fp_rd <= 5'd0; mw_fp_wdata <= 64'h0;
             mw_csr_we <= 1'b0; mw_csr_addr <= 12'h0; mw_csr_wdata <= 32'h0;
             mw_xret_valid <= 1'b0; mw_xret_kind <= 2'd0; mw_fence_i <= 1'b0;
+            mw_sfence_vma <= 1'b0; mw_sfence_rs1_x0 <= 1'b0; mw_sfence_rs2_x0 <= 1'b0;
+            mw_sfence_va <= 32'h0; mw_sfence_asid <= 9'h0;
             mw_is_fp_instr <= 1'b0; mw_is_fp_wr <= 1'b0; mw_is_fpcsr_wr <= 1'b0;
             mw_exc_valid <= 1'b0; mw_exc_cause <= 5'd0; mw_exc_tval <= 32'h0;
             mw_exc_pc <= 32'h0; mw_exc_is_fetch <= 1'b0;
@@ -2605,11 +2895,13 @@ module core_top (
             fpu_fflags_q <= 5'd0;
             //------------------------ F 级辅助 ------------------------
             fetch_exc_done_q <= 1'b0;
+            l1i_req_pend_q <= 1'b0; l1i_req_pc_q <= 32'h0;
             xip_word_pa_q <= 32'h0; xip_word_data_q <= 32'h0; xip_word_vld_q <= 1'b0;
             xip_req_pend_q <= 1'b0;
             fencei_busy <= 1'b0; fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
             //------------------------ M 级 FSM ------------------------
             m_state_q <= M_S_IDLE; m_retry_q <= M_S_ISS; m_pa_q <= 32'h0;
+            m_tr_src_q <= 1'b0; ptw_done_q <= 1'b0;
             m_page_fault_q <= 1'b0; m_page_cause_q <= 5'd0;
             m_hi_q <= 1'b0; m_amo_phase_q <= 1'b0;
             m_exc_q <= 1'b0; m_exc_cause_q <= 5'd0; m_exc_tval_q <= 32'h0;
@@ -2686,6 +2978,7 @@ module core_top (
                 de_mret         <= dec_mret;
                 de_sret         <= dec_sret;
                 de_wfi          <= dec_wfi;
+                de_sfence_vma   <= dec_sfence_vma;
                 de_ill          <= d_ill_total;
                 // ★ 修复（2026-09-17，PMP 子集）：`de_exc_tval` 同时服务两条互斥路径，
                 //   必须按来源选择，不能一律取 dec_tval：
@@ -2770,6 +3063,7 @@ module core_top (
                 em_rs1_val      <= e_rs1_byp;
                 em_imm_val      <= de_imm;
                 em_store_data   <= e_rs2_byp;
+                em_rs2_asid     <= e_rs2_byp[8:0];
                 //   ★ FP store 的存数走前递后的 fs2（§12.5）：否则"FP load → 紧邻 fsd/fsw"
                 //     会存下旧值（fregfile 写优先只覆盖 W 槽）。
                 em_fp_store     <= e_fp_src2;
@@ -2777,6 +3071,14 @@ module core_top (
                 em_cbo_rs2      <= de_insn32[24:20];
                 em_cbo_downgrade<= de_cbo_downgrade;
                 em_fence_i      <= de_fence_i;
+                em_sfence_vma   <= de_sfence_vma;
+                //   ★ "全范围/全 ASID"判据取**寄存器号字段**是否为 x0（不是值）：
+                //     `sfence.vma x0, t0` 在 t0=0 时仍是"按 ASID=0 冲刷"（G 项保留），
+                //     与 `sfence.vma`（rs2=x0 字段 ⇒ 全 ASID，含 G 项）语义不同。
+                //     依据：ISA norm:sfence_vma_asid_only / _all_asid_va；
+                //     实测用例 Sv/sv32_global_pte_Smode.S 用 `sfence.vma x0, t0`。
+                em_sfence_rs1_x0 <= (de_rs1 == 5'd0);
+                em_sfence_rs2_x0 <= (de_rs2 == 5'd0);
                 em_fp_we        <= de_fp_we & ~e_ill_total & ~de_exc_valid;
                 em_fp_rd        <= de_rd;
                 em_fp_wdata     <= em_n_fpwdata;
@@ -2832,6 +3134,11 @@ module core_top (
                 mw_xret_valid   <= em_xret_valid & ~mw_n_excv;
                 mw_xret_kind    <= em_xret_kind;
                 mw_fence_i      <= em_fence_i;    // fence.i（Zifencei）标记随流水携带到 W
+                mw_sfence_vma   <= em_sfence_vma;
+                mw_sfence_rs1_x0<= em_sfence_rs1_x0;
+                mw_sfence_rs2_x0<= em_sfence_rs2_x0;
+                mw_sfence_va    <= em_rs1_val;      // rs1 值（VA；rs1=x0 时为 0）
+                mw_sfence_asid  <= em_rs2_asid;     // rs2 值低 9 位（ASIDMAX-1:0）
                 mw_is_fp_instr  <= (em_mem_op == MEM_FLOAD) | (em_mem_op == MEM_FSTORE) |
                                    em_fp_we | em_fflags_we;
                 mw_is_fp_wr     <= em_fp_we | em_fflags_we;
@@ -2882,6 +3189,11 @@ module core_top (
             if (fetch_exc_inject)      fetch_exc_done_q <= 1'b1;
             else if (~fetch_exc_valid) fetch_exc_done_q <= 1'b0;
 
+            // ---- 取指请求记账（响应归属校验用，见 §5.4 的"陈旧响应"修复）----
+            //   与 l1i 的 cs_req 同条件（同一拍被 l1i 接受的请求）⇒ 其响应在下一拍。
+            l1i_req_pend_q <= l1i_cs_req;
+            l1i_req_pc_q   <= fu_fetch_pc;
+
             // ---- XIP 取指：地址锁存 / 在途记账 / 数据保持（§5.4）----
             //   在途记账：请求被控制器接受时置位，数据回来（vld 置位）时清位。
             //   它保证 xip_word_pa_q 与随后回来的数据**严格一一对应**（见 §5.4 的
@@ -2904,7 +3216,9 @@ module core_top (
             // ================= (9) fence.i 全阵列失效扫描 =================
             //   ★ l1i 的 inval_all 只清"当前 cs_vaddr 索引所在组"（l1i.v:150-154）
             //     ⇒ 必须由 core_top 扫 256 组；期间冻结 F 并重定向到 fence.i 之后。
-            if (fencei_sync_pending) begin
+            if (stream_sync_pending) begin
+                // fence.i 与 sfence.vma 共用本扫描：两者都要求"作废更年轻指令 +
+                // 冻结 F + 重定向到本指令之后 + L1I 全阵列失效"（见 §12.3.1）。
                 fencei_busy  <= 1'b1;
                 fencei_idx_q <= 8'd0;
                 fencei_pc_q  <= mw_pc_next;
@@ -2916,12 +3230,24 @@ module core_top (
             // ================= (10) M 级 FSM =================
             if (m_kill_fsm) begin
                 // 异常 / fence.i 同步：放弃在途访存（副作用由 l1d_cs_req 的门控阻断）
+                ptw_done_q     <= 1'b0;
                 m_state_q      <= M_S_IDLE;
                 m_page_fault_q <= 1'b0;
                 m_amo_phase_q  <= 1'b0;
                 m_hi_q         <= 1'b0;
                 m_sc_cap_q     <= 1'b0;      // SC 采样记账随本笔作废
             end else begin
+                // ---- PTW 完成脉冲粘滞记账（见 §9.2 的 ptw_done_q 声明）----
+                //   在 M_S_TR 拍到即"已消费"（同拍无新 done 脉冲 ⇒ 清零）。
+                //   ★ 优先级：**先判"本拍消费"**。M_S_TR 拍 = 完成被取用的那一拍
+                //     （含 `ptw_req_done` 与 M_S_TR 同拍的常见情形）⇒ 清零；
+                //     非 M_S_TR 拍收到 done ⇒ 记账等 FSM 回来取。
+                //     （反例：若先判 done，同拍"置位 + 消费"会让粘滞位残留到下一笔
+                //       遍历，使新遍历一进 M_S_TR 就被误判为"已完成"——实测 SvPMP
+                //       由 2 过变 0 过。）
+                if (m_state_q == M_S_TR)       ptw_done_q <= 1'b0;
+                else if (ptw_req_done)         ptw_done_q <= 1'b1;
+
                 case (m_state_q)
                     //----------- 空闲：判定是否需要翻译 -----------
                     M_S_IDLE: begin
@@ -2939,14 +3265,17 @@ module core_top (
                         //   已完成的访存指令、而 m_done_q 已清零。若只看 ~m_done_q，
                         //   FSM 会对同一条指令再走一遍 IDLE→ISS→AXI：store 重复发
                         //   AW（UART 同一字符写两遍）、AMO 重复读改写（副作用翻倍）。
-                        if (em_valid & m_is_mem & ~em_exc_valid & ~m_issued_q) begin
+                        if (m_data_want) begin
                             m_issued_q <= 1'b1;
+                            m_tr_src_q <= 1'b0;      // 本笔遍历归数据侧
                             if (m_need_tr & tlb_perm_fault) begin
                                 m_pa_q         <= 32'h0;
                                 m_page_fault_q <= 1'b1;
-                                m_page_cause_q <= (m_tlb_acc == 2'b01)
-                                                  ? `RV32GC_EXC_LOAD_PAGE_FAULT
-                                                  : `RV32GC_EXC_STORE_PAGE_FAULT;
+                                m_page_cause_q <= m_is_cbo
+                                                  ? `RV32GC_EXC_STORE_PAGE_FAULT
+                                                  : ((m_tlb_acc == 2'b01)
+                                                     ? `RV32GC_EXC_LOAD_PAGE_FAULT
+                                                     : `RV32GC_EXC_STORE_PAGE_FAULT);
                                 m_state_q      <= M_S_ISS;
                             end else if (m_need_tr & ~tlb_hit) begin
                                 m_state_q <= M_S_TR;
@@ -2954,7 +3283,7 @@ module core_top (
                                 m_pa_q    <= m_need_tr ? tlb_pa : m_va;
                                 m_state_q <= M_S_ISS;
                             end
-                        end else if (em_valid & m_is_mem & em_exc_valid & ~m_issued_q) begin
+                        end else if (m_data_exc) begin
                             // 取指/译码异常随指令携带 ⇒ 不做访存，直接完成
                             //   （同样只走一次：异常完成也不需要存储器访问）
                             m_issued_q    <= 1'b1;
@@ -2962,6 +3291,12 @@ module core_top (
                             m_exc_cause_q <= em_exc_cause;
                             m_exc_tval_q  <= em_exc_tval;
                             m_done_q      <= 1'b1;
+                        end else if (f_tr_walk_start) begin
+                            // ★ 取指侧翻译（2026-09 新增）：数据侧无事可做 ⇒ 代跑一次
+                            //   页表遍历；请求源由 m_tr_src_q=1 选择（§9.4.1）。
+                            //   发起条件与本文件的 f_tr_walk_start 唯一定义处共用。
+                            m_tr_src_q <= 1'b1;
+                            m_state_q  <= M_S_TR;
                         end
                     end
 
@@ -2974,11 +3309,18 @@ module core_top (
                         end else if (ptw_pte_req_valid) begin
                             m_ptw_pte_pa_q <= ptw_pte_req_pa;
                             m_state_q      <= M_S_PTEA;
-                        end else if (ptw_req_done) begin
-                            m_pa_q         <= ptw_fault ? 32'h0 : ptw_pa_out;
-                            m_page_fault_q <= ptw_fault;
-                            m_page_cause_q <= ptw_fault_cause;
-                            m_state_q      <= M_S_ISS;
+                        end else if (ptw_done_any) begin
+                            if (m_tr_src_q) begin
+                                // ---- 取指侧：结果交回 §9.4.1 的控制器（f_tr_walk_done
+                                //      同拍有效，故障在那边锁存；成功已 fill 进 TLB）
+                                m_state_q <= M_S_IDLE;
+                            end else begin
+                                m_pa_q         <= ptw_fault ? 32'h0 : ptw_pa_out;
+                                m_page_fault_q <= ptw_fault;
+                                m_page_cause_q <= m_is_cbo ? cbo_cause_fix(ptw_fault_cause)
+                                                           : ptw_fault_cause;
+                                m_state_q      <= M_S_ISS;
+                            end
                         end
                     end
 

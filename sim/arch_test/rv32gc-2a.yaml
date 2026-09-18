@@ -20,10 +20,14 @@ kind: architecture configuration
 type: fully configured
 name: rv32gc-2a
 description: >
-  RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom，M/S/U + PMP16（阶段二 2A 单发射顺序 5 级基线核）。
-  注：Sv32 **暂不声明** —— ACT 框架只要声明 Sv32 就会无条件插入 sfence.vma
-  （tests/env/utils.h:64-69），而本核该指令尚未译码（core_top.v 已知遗留 L2）
-  ⇒ 会引入非法指令。待 M2 补齐 sfence.vma 后恢复。
+  RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom，M/S/U + Sv32 + PMP16
+  （阶段二 2A 单发射顺序 5 级基线核）。
+  注：**Sv32 已声明**（2026-09）—— 前提条件已达成：sfence.vma 已译码并由 W 级冲刷
+  TLB/L1D/L1I 并重定向取指（core_top.v §9.3/§12.3.1），取指侧 Sv32 翻译亦已接通
+  （tlb.v 第二查询口 + 复用 M 级引擎串行跑 PTW，见 §9.4.1）。
+  声明后 ACT env 会在**所有**用例的启动码里插入 `csrw satp,zero + sfence.vma`
+  （tests/env/utils.h:64-69、rvtest_setup.h:1181）以及 PMP 背景区设置后的 sfence.vma
+  （rvtest_pmp_macros.h:68）⇒ 全量用例二进制都变，回归须整组重跑（见交付说明）。
   Hand-maintained declaration (UDB unavailable in this environment); keep in sync with
   sim/arch_test/rvtest_config.h.
 
@@ -41,6 +45,10 @@ implemented_extensions:
   - { name: Zicntr, version: "= 2.0" }
   - { name: Zicbom, version: "= 1.0.0" }
   - { name: S, version: "= 1.13.0" }
+  # --- Sv32（S 模式分页）：satp.MODE=1、两级页表、4 MiB 超级页、ASID 9 bit ---
+  #     实现真源：rtl/csr/ptw.v（遍历）+ tlb.v（缓存/冲刷）+ core_top.v（M 级引擎 /
+  #     取指侧翻译）。A/D 位为 **Svade 口径**（软件管理，硬件不置位）。
+  - { name: Sv32, version: "= 1.12.0" }
   - { name: U, version: "= 1.0.0" }
   - { name: Sm, version: "= 1.13.0" }
 
@@ -59,9 +67,6 @@ params:
   # --- Zicntr：time CSR 由核内实现（不需要 RVTEST_EMULATE_TIME_CSR 模拟路径）---
   TIME_CSR_IMPLEMENTED: true
   # --- S 模式分页：satp.ASID = 9 bit（rv32_defs.vh §6.2 口径）---
-  #     ★ Sv32 本体（satp/PTW/TLB）已在 RTL 中，但 ACT 框架"声明 Sv32 ⇒ 启动码插入
-  #       sfence.vma"（tests/env/utils.h:64-69），而 sfence.vma 未译码 ⇒ 暂不声明；
-  #       恢复条件：RTL 译码 sfence.vma（core_top.v 已知遗留 L2）。
   ASID_WIDTH: 9
   SXLEN: [32]
   UXLEN: [32]
@@ -79,4 +84,7 @@ params:
   #     · WRITABLE_HPM_COUNTERS / mhpmevent 事件选择：2A 为吞写读 0（csr_file.v:328-337），
   #       对应 tests/rv32i/Zihpm 已排除。
   #     · Zicboz（cbo.zero）：2A 不含（08 §11 R1）；Zicbop 未实现。
+  #     · mstatus.TVM：satp 访问 / sfence.vma 的 S 模式门控未实现（sv_mstatus_tvm_test
+  #       仍登记在 exclude.list）；mstatus.SBE 不实现（Sv/sv32_mstatus_sbe_* 两例为
+  #       上游 NORUN 用例，参考模型 Spike 自身即判失败）。
   #     · Smstateen / Sstc / Smepmp / Ssdbltrp / Sscofpmf 等 1P12+/1P13 特性未实现。

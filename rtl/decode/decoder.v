@@ -101,7 +101,8 @@ module decoder (
     output wire        ecall_o,       // ecall（cause 8/9/11 视 priv）
     output wire        mret_o,
     output wire        sret_o,
-    output wire        wfi_o
+    output wire        wfi_o,
+    output wire        sfence_vma_o  // sfence.vma（Sv32 TLB 失效；rs1/rs2 域即操作数）
 );
 
     //==========================================================================
@@ -398,10 +399,20 @@ module decoder (
     wire is_sret   = (insn == `RV32GC_INSN_SRET);
     wire is_mret   = (insn == `RV32GC_INSN_MRET);
     wire is_wfi    = (insn == `RV32GC_INSN_WFI);
-    wire sys_priv_ok = is_ecall | is_ebreak | is_uret | is_sret | is_mret | is_wfi;
+    // ---- sfence.vma（Sv32 TLB 失效）：MASK/MATCH 比较（真源 §3.9）----
+    //   为什么用 MASK 而不是 32 位全等：rs1/rs2 是**操作数**（rs1=VA、rs2=ASID），
+    //   取值任意；只有 funct7/funct3/rd/opcode 固定（rd≠0 ⇒ 不匹配 ⇒ 非法）。
+    //   本设计把它归入 sys_priv_impl：op_type=OPT_SYS、wb_sel=WB_NONE、
+    //   csr_op=CSRN_PRIV（⇒ e_csr_we=0，**不会**写任何 CSR）。
+    wire is_sfence_vma = is_system & (f3 == `RV32GC_F3_PRIV) &
+                         ((insn & `RV32GC_INSN_SFENCE_VMA_MASK) ==
+                          `RV32GC_INSN_SFENCE_VMA_MATCH);
+    wire sys_priv_ok = is_ecall | is_ebreak | is_uret | is_sret | is_mret | is_wfi |
+                       is_sfence_vma;
     //   ★ 本设计 2A 不实现 U 模式返回（uret 属 N 扩展/U 模式陷阱处理，2A 不落地
     //     U 模式 CSR ⇒ 与 08 §6.2 裁决一致）⇒ uret 按非法指令处理。
-    wire sys_priv_impl = is_ecall | is_ebreak | is_sret | is_mret | is_wfi;
+    wire sys_priv_impl = is_ecall | is_ebreak | is_sret | is_mret | is_wfi |
+                         is_sfence_vma;
 
     //--------------------------------------------------------------------------
     // 4.10 LOAD-FP / STORE-FP：flw/fld（f3=010/011）、fsw/fsd（f3=010/011）
@@ -735,6 +746,7 @@ module decoder (
     assign mret_o    = is_mret;
     assign sret_o    = is_sret;
     assign wfi_o     = is_wfi;
+    assign sfence_vma_o = is_sfence_vma;
 
     // ---- 浮点 ----
     assign rm_o     = f3;   // OP-FP 与 FMA 族：rm 均在 funct3
