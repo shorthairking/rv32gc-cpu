@@ -249,5 +249,6 @@
 
 ## 9. 当前状态与下一步
 
-- **M2 已收口（2026-09-17，提交至 `188fa00`）**：arch-test 在 act4 新树上全绿——非特权 245 例（I 39/M 8/F 80/D 106/Zicsr 6/Zicntr 2/Zicbom 3/Zifencei 1）+ PMP 63/63 + Sv32 家族全绿（Sv 29/SvPMP 4/SvPMPZicbo 4/SvZicbo 2/Svade 2/Svbare 3）+ L0 回归 22/22；sbe 2 例按上游 NORUN 排除。
-- **下一步**：① **M3**：DDR3 裸机内存测试（`sim/unit/tb_m3_ddr3` + `ddr3_memtest.S`，§8.4 模式遍历 + §8.5 反证：MMIO 截获关掉必红、XIP 旁路反证）+ M1/M2 回归不退化；② 待办：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译；③ M4 Vivado 综合/时序 ≥60 MHz → M5 上板串口输出。
+- **⏸ 已暂停（2026-09-17 用户指令「暂停当前任务并保存现场，等待命令再恢复」）**：现场已保存（NEXT_SESSION.md §1.6：T2 子 Agent `c22f07c9` 被打断、其半成品 core_top.v/csr_file.v 的 md5 已登记、恢复路径与 T2 任务要点、恢复后顺序）。**等待用户命令恢复。**
+- **已达成（均已提交）**：M2 收口（act4 新树全量基线全绿，`188fa00`）；M3 DDR3 裸机内存测试（`13a80ab`）；M4 流程全通+双阻塞如实登记（`f6115f5`）；**T1 FPU 窄域+sticky 重写（`48ca2eb`：546 223→21 967 LUT，三重等价证明）**。
+- **下一步（恢复后）**：① 复跑 T1 验收；② T2 续做（非 FPU 时序流水化 + 隐式声明清零）→ 复跑验收 → 提交；③ T3 全核 60/100 MHz synth+impl 收口 M4；④ M5 上板串口输出。

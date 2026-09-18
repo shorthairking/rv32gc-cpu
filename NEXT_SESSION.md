@@ -15,13 +15,15 @@
 
 - **M2 收口（act4 新树全量基线，母 Agent 亲跑，日志 /tmp/newtree_accept.log）**：非特权 I 39/M 8/F 80/D 106/Zicsr 6/Zicntr 2/Zicbom 3/Zifencei 1 + PMP* 63/63 + Sv 29/29、SvPMP 4/4、SvPMPZicbo 4/4、SvZicbo 2/2、Svade 2/2、Svbare 3/3 + L0 回归 22/22 + check-exclude PASS（80 条）；sbe 2 例按上游 NORUN 排除。关键提交：`0b15b7c`（非特权+并行化）→`a2f5561`（FP 互锁）→`563913c`（底座开关）→`a69ee8c`/`113cb09`（PMP+DECERR）→`e799328`（sfence.vma+取指 Sv32）→`188fa00`（Sv32 收口+exclude 迁移）。
 - **环境**：riscv-arch-test 已迁移到 act4（HEAD `92c31f71`，扁平命名 `<目录>_<名>-00.S`）；新树各组成绩见上；旧树日志路径作废。
-- **下一步 M3（DDR3 裸机内存测试）**：按 docs/design/08 §8.4/§8.5——`sim/unit/tb_m3_ddr3.sv` + `sim/unit/prog/ddr3_memtest.S`（自包含 core_top 级 TB，仿 tb_fp_load_use 形态；DDR3 区 0x0 起，仿真用缩减窗口+同模式集，板级 128 MiB 全遍历留 M5；模式 0x00/0xFF/0x55/0xAA + 地址相关 + 4KB 页首/尾，显式计数）；反证：关核内 MMIO 截获 ⇒ 「写 CLINT 前后 DDR3 内容不变」必红；回归不退化。
-- **待办**：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译、CMO PMA 对 MMIO 窗口残余口径（core_top 注释已登记）、DFIL 错误行 l1d poison 升级；→ M4 综合 → M5 上板。
-- **⏸ 暂停点（2026-09-17 用户指令「中断任务、保存进度、暂停」）**：**已于同日用户指令「请继续」恢复**——T-D 子 Agent `4e7827ca` 已通过 send_message 续做（其上下文与半成品均保留）。
-  - **在途**：T-D（sfence.vma 译码 + 取指侧 Sv32）coding 子 Agent `4e7827ca` 已被母 Agent 打断，**其完整任务书与已读证据保留在它的子 Agent 会话上下文里**；恢复时优先 `send_message` 让它继续（别重新派发、别另建 Agent——重派会丢它的分析）。若其上下文不可用，按下方「T-D 任务要点」重新派发。
-  - **工作区 = T-D 半成品（未提交、可能不可编译，恢复时由 4e7827ca 续做）**：`rtl/csr/ptw.v 8bb28d0e`、`rtl/csr/tlb.v 97dbad3b`、`rtl/decode/decoder.v d9b28f1d`、`rtl/pkg/rv32_defs.vh 46b9b74b`、`rtl/top/core_top.v 4fbe8111`；NEXT_SESSION.md 6ac0633c。**不要 git checkout/stash/reset 这些文件**。恢复后必须先跑 `bash -n`/iverilog 编译确认当前中间态能否编译，不能编译就让子 Agent 先修到能编译再继续。
-  - **T-D 任务要点**（重新派发时用）：① decoder.v 补 sfence.vma 译码（funct7=0001001、rs2=x0；rs2≠0 非法）；② core_top `tlb.sfence_valid` 接线（现硬接 1'b0；tlb.v 冲刷逻辑已备）；③ 取指侧 Sv32：core_top:710-713 现硬接 0，fetch_unit 接口已备；tlb/ptw 单请求口被 M 级数据侧占用 ⇒ 仲裁或第二口（防死锁，M_S FSM 12 状态）；取指 PMP 用翻译后 PA；超级页 4MiB；PTE A/D 软件管理（Svade 口径）；16-bit parcel 跨页取指；④ **顺序**：先 sfence.vma 译码+接线做通 → 再取指翻译 → 最后才打开 `rvtest_config.h` 的 SV32_SUPPORTED（+rv32gc-2a.yaml 声明 Sv32）——否则全量用例被插 sfence 而核不认识；⑤ 验收：SvPMP 4 + SvPMPZicbo 4 + SvZicbo 2 + Sv 28 + Svade 2 全绿；sfence→no-op 反证必红；**取指翻译直证**（防"物理地址假通过"：探针打印取指 AXI 地址=翻译后 PA，或关翻译必红）；全量回归（SV32_SUPPORTED 打开后所有二进制都变，I/F/D/M/Zicsr/Zicntr/Zicbom/Zifencei/Zaamo/Zalrsc/PMP*/Svbare + regress 22/22 全绿）；TVM 门控不实现，`*tvm*` 用例保持排除。
-- **进行中/待办**：① **特权子集：M 模式 PMP 63/63 ✅ + Svbare 3/3 ✅**（commit 113cb09；修复 6 项 + DECERR 口径见长期记忆；FP load-use 互锁亦已提交 a2f5561）；② **T-D：sfence.vma 译码 + 取指侧 Sv32**（见上方暂停点）；③ 原有待办：axi_req_desc is_plic 口径统一、plic.v priority/threshold 3bit WARL 与文档对齐、锁步探针扩展访存/CSR 比对、M_S_MMIO 字节合并；④ D 修复遗留：L1D 分支 8B store 第二阶段门控=潜在死锁（当前不可达）、跨 4KB 页 8B 第二阶段不重翻译；⑤ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
+- **M4 推进状态（提交至 `48ca2eb`，T1 已完成）**：M3 ✅（`13a80ab`）；M4 流程全通但面积/时序双阻塞（`f6115f5`：FPU 405.81%、非 FPU 44.49 MHz）。**T1 ✅（`48ca2eb`）**：FPU 窄域+sticky 重写，546 223→21 967 LUT(16.32%)，56 569 例差分 0 差异 + F 80/D 106 + regress 23/23（母 Agent 未及复跑，恢复后补）。**T2（非 FPU 时序流水化 + 隐式声明修复）被打断**（见下方暂停点）。之后 T3 重跑 synth/impl 收口 M4。
+- **待办**：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译、CMO PMA 对 MMIO 窗口残余口径、DFIL 错误行 l1d poison 升级；→ M4 收口 → M5 上板。
+
+## 1.6 ⏸ 暂停点（2026-09-17 用户指令「暂停当前任务并保存现场，等待命令再恢复」）
+
+- **在途**：T2 coding 子 Agent `c22f07c9`（非 FPU 关键路径流水化：satp/PMP/翻译出口 + PLIC eip 出口各加一级寄存 + core_top 13 处隐式声明前移，目标布线 WNS≥0@60MHz）已被母 Agent 打断；**其完整任务书与已读证据在其会话上下文里**，恢复时 `send_message` 让它继续（别重派）。若其上下文不可用，按下方「T2 任务要点」重派。
+- **工作区 = T2 半成品（未提交、可能不可编译，恢复时由 c22f07c9 续做）**：`rtl/top/core_top.v` md5 `e1c33f9714559e198449f9992285d213`、`rtl/csr/csr_file.v` md5 `bbd4b4d14c0b9c3e89f942f3d395551b`。**不要 git checkout/stash/reset 这些文件**；恢复后先确认 iverilog 编译通过再继续。散落的 `clockInfo.txt` 已清。
+- **T2 任务要点**（重派时用）：① 关键路径 A `plic/threshold_r → L1D BRAM ENBWREN`（37 级）与链 B `satp_r → axi len_q/pc_r`（22.48 ns）提前一拍寄存（只加时序寄存、不改功能语义）；② core_top.v 13 处 `[Synth 8-8895]` 隐式声明清零（声明前移/显式 wire，位宽正确）；③ 验收：`fpga/scratch/nofpu_synth.tcl 16.667` + `nofpu_impl.tcl 16.667` 布线后 WNS≥0@60MHz、隐式声明数=0、regress 23/23 + I 39/39 + PMP* 63/63 + Sv 29/29、反证链（寄存级 bypass⇒时序回退）；④ 禁改 fpu*.v/fregfile/sim/unit 判据/sim/arch_test/fpga/tcl 既有脚本；Vivado 只经 run_vivado_batch.sh。
+- **恢复后顺序**：① 复跑 T1 验收（F 80/D 106/regress/`fpu_area.tcl`≤45k LUT）并确认提交；② send_message 让 T2 续做 → 复跑 T2 验收 → 提交；③ 派 T3（全核 60/100 MHz synth+impl 收口 M4）；④ M5 上板。
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
 
