@@ -238,10 +238,16 @@
 - **母 Agent 亲跑验收（§0.6）**：D 104/104、F 78/78、I 39/39、M 8/8、Zicsr 6/6、Zifencei 1/1、Zicntr 2/2、Zicbom 3/3、L0 回归 21/21；Zca 26 例按既定口径全 exclude（2A 声明 C 本体、未按 Zc* 族分组验证）。
 - **遗留**（NEXT_SESSION.md §1.5）：① FP load-use 未显式互锁（arch-test 掩蔽）；② L1D 分支 8B store 第二阶段门控=潜在死锁（当前不可达，未改）；③ 跨 4KB 页 8B 访存第二阶段不重翻译（与原口径一致，未暴露）；④ SvPMP 特权子集未跑。
 
+### 阶段二 2A —— M2 特权子集收口（2026-09-17，提交 `188fa00`）
+
+- **M 模式 PMP 63/63 + Svbare 3/3**（`a69ee8c`/`113cb09`）：PMP 修复 6 项（取指异常 tval 按来源、pmpcfg WARL 保留位、ROUTE_AXI AMO/SC 写相、FP 8B 非对齐优先、TB 读敏感性、TB 未登记区 DECERR + 核消费 SLVERR cause 5/7/1）。
+- **Sv32 家族全绿**（`e799328`/`188fa00`）：sfence.vma 译码（rs2=ASID 按 ISA）+ W 级 TLB/L1D/L1I 全失效；取指侧 Sv32（tlb 第二查询口 + PTW 串行复用 + 陈旧响应校验）；PTE-PMP 恒 LOAD + **va_r 锁存真根因**（PTE 地址切分原用活输入 req_va，等 ready 停拍被下一笔 VA 污染）；CMO PMA 探测 + DFIL 行填充错误接通（SvZicbo 2 例）；menvcfg CBZE 只读零；sbe 2 例上游 NORUN 排除。
+- **环境变更**：riscv-arch-test 2026-09-17 13:56 被外部 re-clone + pull act4（HEAD `92c31f71`），命名迁移为扁平 `<目录>_<名>-00.S`；exclude.list 21 条随迁（逆映射机器证明 0 差异）；新树新增 F-fmax/fmin.s-01、D-fmax/fmin.d-01 4 例全过。
+- **新树全量基线（母 Agent 亲跑）**：Sv 29/29、SvPMP 4/4、SvPMPZicbo 4/4、SvZicbo 2/2、Svade 2/2、Svbare 3/3、PMP* 63/63、I 39、F 80、D 106、M 8、Zicsr 6、Zicntr 2、Zicbom 3、Zifencei 1、Zaamo 9、Zalrsc 2、L0 回归 22/22、check-exclude PASS。
+
 ---
 
 ## 9. 当前状态与下一步
 
-- **⏸ 已暂停（2026-09-17 用户指令）**：阶段二 2A M2 进行中状态已保存（NEXT_SESSION.md §1.5 暂停点：在途 T-D 子 Agent 4e7827ca 已被打断、5 个 RTL 文件为其半成品 md5 已登记、恢复路径=T-D 任务要点）。**等待用户指令恢复。**
-- **已达成（均已提交）**：M2 非特权子集全绿（I 39/M 8/Zicsr 6/Zifencei 1/Zicntr 2/Zicbom 3/F 78/D 104，`0b15b7c`）；FP load-use 显式互锁（`a2f5561`）；特权底座开关（`563913c`）；M 模式 PMP 63/63 + Svbare 3/3（`a69ee8c`/`113cb09`）；批跑并行化（--jobs）。
-- **下一步（恢复后）**：① T-D：sfence.vma 译码 + 取指侧 Sv32（见 NEXT_SESSION.md §1.5 暂停点）；② 待办：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 第二阶段重翻译；③ M3 DDR3 裸机内存测试 → M4 综合 → M5 上板。
+- **M2 已收口（2026-09-17，提交至 `188fa00`）**：arch-test 在 act4 新树上全绿——非特权 245 例（I 39/M 8/F 80/D 106/Zicsr 6/Zicntr 2/Zicbom 3/Zifencei 1）+ PMP 63/63 + Sv32 家族全绿（Sv 29/SvPMP 4/SvPMPZicbo 4/SvZicbo 2/Svade 2/Svbare 3）+ L0 回归 22/22；sbe 2 例按上游 NORUN 排除。
+- **下一步**：① **M3**：DDR3 裸机内存测试（`sim/unit/tb_m3_ddr3` + `ddr3_memtest.S`，§8.4 模式遍历 + §8.5 反证：MMIO 截获关掉必红、XIP 旁路反证）+ M1/M2 回归不退化；② 待办：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译；③ M4 Vivado 综合/时序 ≥60 MHz → M5 上板串口输出。

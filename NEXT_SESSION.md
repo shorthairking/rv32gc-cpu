@@ -11,16 +11,13 @@
   - `docs/porting/01-overview.md` 02-uboot 03-linux-opensbi 04-nand-driver 05-rootfs（5 篇）
   - `docs/kb/platform-facts.md` isa-notes.md tools-and-flow.md（3 篇）
 
-## 1.5 阶段二 2A 当前状态（2026-09-16，M2 非特权全绿，已提交 0b15b7c）
+## 1.5 阶段二 2A 当前状态（2026-09-17，M2 已收口，提交至 188fa00；下一里程碑 M3）
 
-- **M1 已达成**：首条取指 0x1C000000 + UART 回显 PASS（D1-D9 十类缺陷修复：XIP 组合环/取指门控/carry 自锁/写通路/AxCACHE/M FSM/PC 推进/在途保护/done 重复）。
-- **M2 已完成项（2026-09-15 提交）**：单元回归 21/21、M1 cycles=464 恒稳、Verilator lint 457（UNOPTFLAT 0）；陷阱/特权链路、CSR 旁路链（csr_landing 单一真源）、解码修复（addi 误译 sub、JAL 无 funct3）、访存修复（ld_extract、PLIC 偏移/命中窗口）、Spike 锁步底座（108/108）、arch-test 底座。
-- **M2 非特权子集全绿 ✅（2026-09-16，提交 `0b15b7c`；母 Agent 亲跑验收）**：
-  - **并行化 ✅**：`run.sh --group` 新增 `--jobs N`（默认 nproc=16），每例独立三件产物 + 父进程 join 后按序回放聚合；fail-closed 全套；I 组 `--jobs 16` 74s vs 串行 432s（5.84×）。
-  - **F 扩展 ✅（6 RTL 根因，78/78）**：decoder wb_sel 兜底覆盖 x[rd]、sel_i/sel_s 漏 loadfp/storefp、flw 数据通路缺失、fflags E/W 两级覆盖、frm 无旁路、fpu_add UF 按有界指数。
-  - **D 扩展 ✅（单一根因，104/104）**：M 级访存 FSM 8B FP 访存未拆两笔 4B beat ⇒ 高 32 位抹零；新增 `m_rd_hi_q` 两阶段拆分（只复位清 0）。
-  - **母 Agent 亲跑**：D 104/104、F 78/78、I 39/39、M 8/8、Zicsr 6/6、Zifencei 1/1、Zicntr 2/2、Zicbom 3/3、L0 回归 21/21（日志 `/tmp/m2_final_v3.log`）；Zca 26 例按既定口径全 exclude。
-- **⏸ 暂停点（2026-09-17 用户指令「中断任务、保存进度、暂停」）**：
+- **M2 收口（act4 新树全量基线，母 Agent 亲跑，日志 /tmp/newtree_accept.log）**：非特权 I 39/M 8/F 80/D 106/Zicsr 6/Zicntr 2/Zicbom 3/Zifencei 1 + PMP* 63/63 + Sv 29/29、SvPMP 4/4、SvPMPZicbo 4/4、SvZicbo 2/2、Svade 2/2、Svbare 3/3 + L0 回归 22/22 + check-exclude PASS（80 条）；sbe 2 例按上游 NORUN 排除。关键提交：`0b15b7c`（非特权+并行化）→`a2f5561`（FP 互锁）→`563913c`（底座开关）→`a69ee8c`/`113cb09`（PMP+DECERR）→`e799328`（sfence.vma+取指 Sv32）→`188fa00`（Sv32 收口+exclude 迁移）。
+- **环境**：riscv-arch-test 已迁移到 act4（HEAD `92c31f71`，扁平命名 `<目录>_<名>-00.S`）；新树各组成绩见上；旧树日志路径作废。
+- **下一步 M3（DDR3 裸机内存测试）**：按 docs/design/08 §8.4/§8.5——`sim/unit/tb_m3_ddr3.sv` + `sim/unit/prog/ddr3_memtest.S`（自包含 core_top 级 TB，仿 tb_fp_load_use 形态；DDR3 区 0x0 起，仿真用缩减窗口+同模式集，板级 128 MiB 全遍历留 M5；模式 0x00/0xFF/0x55/0xAA + 地址相关 + 4KB 页首/尾，显式计数）；反证：关核内 MMIO 截获 ⇒ 「写 CLINT 前后 DDR3 内容不变」必红；回归不退化。
+- **待办**：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译、CMO PMA 对 MMIO 窗口残余口径（core_top 注释已登记）、DFIL 错误行 l1d poison 升级；→ M4 综合 → M5 上板。
+- **⏸ 暂停点（2026-09-17 用户指令「中断任务、保存进度、暂停」）**：**已于同日用户指令「请继续」恢复**——T-D 子 Agent `4e7827ca` 已通过 send_message 续做（其上下文与半成品均保留）。
   - **在途**：T-D（sfence.vma 译码 + 取指侧 Sv32）coding 子 Agent `4e7827ca` 已被母 Agent 打断，**其完整任务书与已读证据保留在它的子 Agent 会话上下文里**；恢复时优先 `send_message` 让它继续（别重新派发、别另建 Agent——重派会丢它的分析）。若其上下文不可用，按下方「T-D 任务要点」重新派发。
   - **工作区 = T-D 半成品（未提交、可能不可编译，恢复时由 4e7827ca 续做）**：`rtl/csr/ptw.v 8bb28d0e`、`rtl/csr/tlb.v 97dbad3b`、`rtl/decode/decoder.v d9b28f1d`、`rtl/pkg/rv32_defs.vh 46b9b74b`、`rtl/top/core_top.v 4fbe8111`；NEXT_SESSION.md 6ac0633c。**不要 git checkout/stash/reset 这些文件**。恢复后必须先跑 `bash -n`/iverilog 编译确认当前中间态能否编译，不能编译就让子 Agent 先修到能编译再继续。
   - **T-D 任务要点**（重新派发时用）：① decoder.v 补 sfence.vma 译码（funct7=0001001、rs2=x0；rs2≠0 非法）；② core_top `tlb.sfence_valid` 接线（现硬接 1'b0；tlb.v 冲刷逻辑已备）；③ 取指侧 Sv32：core_top:710-713 现硬接 0，fetch_unit 接口已备；tlb/ptw 单请求口被 M 级数据侧占用 ⇒ 仲裁或第二口（防死锁，M_S FSM 12 状态）；取指 PMP 用翻译后 PA；超级页 4MiB；PTE A/D 软件管理（Svade 口径）；16-bit parcel 跨页取指；④ **顺序**：先 sfence.vma 译码+接线做通 → 再取指翻译 → 最后才打开 `rvtest_config.h` 的 SV32_SUPPORTED（+rv32gc-2a.yaml 声明 Sv32）——否则全量用例被插 sfence 而核不认识；⑤ 验收：SvPMP 4 + SvPMPZicbo 4 + SvZicbo 2 + Sv 28 + Svade 2 全绿；sfence→no-op 反证必红；**取指翻译直证**（防"物理地址假通过"：探针打印取指 AXI 地址=翻译后 PA，或关翻译必红）；全量回归（SV32_SUPPORTED 打开后所有二进制都变，I/F/D/M/Zicsr/Zicntr/Zicbom/Zifencei/Zaamo/Zalrsc/PMP*/Svbare + regress 22/22 全绿）；TVM 门控不实现，`*tvm*` 用例保持排除。
