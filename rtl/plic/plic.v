@@ -159,8 +159,14 @@ module plic #(
     //     再排除源 0（保留）即完成「源 n 的地址 = +4n，n ∈ [SOURCE_MIN, SOURCE_MAX]」判定。
     wire [4:0]  prio_off_word  = prio_off_delta[6:2];   // 字 index（5 bit 足够：≤ NSRC）
     wire        prio_aligned   = (prio_off_delta[1:0] == 2'b00);
-    wire        prio_id_ok     = (prio_off_word >= 5'(SOURCE_MIN)) &&
-                                 (prio_off_word <= 5'(SOURCE_MAX));
+    //     ★ M4 综合口径（2026-09-18）：原文用 SystemVerilog 定宽转换 `5'(SOURCE_MIN)`
+    //       —— Vivado 的 Verilog（非 -sv）模式**不认**该语法，报
+    //       `ERROR: [Synth 8-2716] syntax error near ''' 导致整核无法综合；
+    //       本设计是 Verilog-2001 口径（不启用 -sv），故去掉转换直接比较：
+    //       SOURCE_MIN/MAX 是 ≤31 的整型参数、prio_off_word 为 5 bit 无符号，
+    //       比较结果与转换写法**逐位等价**（无符号零扩展），iverilog/Verilator 不变。
+    wire        prio_id_ok     = (prio_off_word >= SOURCE_MIN) &&
+                                 (prio_off_word <= SOURCE_MAX);
     /* verilator lint_on UNUSEDSIGNAL */
     /* verilator lint_on UNSIGNED */
     wire        sel_priority   = prio_region & prio_aligned & prio_id_ok;
@@ -409,15 +415,16 @@ module plic #(
 
             // ---- 7.3 complete（写 claim 同址）：若源电平仍高则重挂 pending ----
             //     注：complete_id 取 req_wdata[4:0] 并做范围校验（源 0 保留 ⇒ 忽略）。
+            //     ★ M4：同 §2.1，去掉 Vivado 不认的 `5'(...)` 定宽转换（等价比较）。
             if (wr_claim) begin
-                if (sel_claim_0 && (comp_id >= 5'(SOURCE_MIN)) &&
-                    (comp_id <= 5'(SOURCE_MAX))) begin
+                if (sel_claim_0 && (comp_id >= SOURCE_MIN) &&
+                    (comp_id <= SOURCE_MAX)) begin
                     if (src_level[comp_id[2:0]]) begin
                         pending_r[0][comp_id] <= 1'b1;   // 电平仍高 ⇒ 重挂
                     end
                 end
-                if (sel_claim_1 && (comp_id >= 5'(SOURCE_MIN)) &&
-                    (comp_id <= 5'(SOURCE_MAX))) begin
+                if (sel_claim_1 && (comp_id >= SOURCE_MIN) &&
+                    (comp_id <= SOURCE_MAX)) begin
                     if (src_level[comp_id[2:0]]) begin
                         pending_r[0][comp_id] <= 1'b1;   // 电平仍高 ⇒ 重挂
                     end

@@ -61,30 +61,45 @@ module cache_array_bram #(
     localparam integer WORDS      = LINE_BYTES / (DW / 8);    // 每行字数
 
     //--------------------------------------------------------------------------
-    // 综合分支：Vivado Block Memory Generator（True Dual Port RAM）
-    //   宏 `RV32GC_USE_VIVADO_IP 由 fpga/tcl/synth.tcl 定义；回归从不定义。
+    // 综合分支（宏 `RV32GC_USE_VIVADO_IP 由 fpga/tcl/synth.tcl 定义）：
+    //   Vivado **Block Memory Generator** IP（Simple Dual Port RAM，
+    //   `blk_mem_gen_cache_data`，由 fpga/tcl/create_ip.tcl 生成）。
+    //   ★ 无任何 FPGA 原语（RAMB36E1/... 一律不出现，红线 1）。
+    //
+    // 规格固定（xci 是固定配置，不可参数化）：32 bit 宽 × 2048 深 × 4 bit 字节
+    // 使能 —— 恰为 L1I/L1D **单路**数据阵列（256 组 × 8 字/行），故 l1i 例化 2 次、
+    // l1d 例化 4 次（见 rtl/cache/l1i.v / l1d.v 的 generate 循环）。
+    //   ⇒ 若将来 DEPTH/DW 与此不符（例如新增 L2 阵列），**必须**新建一个 xci，
+    //     不能复用本 IP；下面 initial 段做 elaboration 自检（fail-closed）。
+    //
+    // 端口口径（BMG Simple Dual Port）：A 口 = 只写（ena/wea/addra/dina），
+    // B 口 = 只读（enb/addrb/doutb，读延迟 1 拍）。四个语义对齐点
+    // （1 拍读延迟 / READ_FIRST 读旧值 / 字节使能 / en 门控）见 create_ip.tcl
+    // 的 `## blk_mem_gen` 分节，并有 xsim 双分支对拍证据。
+    //
+    // ★ a_dout_r：SDP 的写口没有读通路 ⇒ 综合分支恒 0。全设计**无消费者**
+    //   （l1i.v / l1d.v 例化本模块时均写 `.a_dout_r ()`），故不影响功能；
+    //   若要保留 A 口读数据，必须改用 True Dual Port（每路 4 个 BRAM36 而非 2 个），
+    //   而设计上没有任何地方需要它 —— 故不为此付面积代价。
     //--------------------------------------------------------------------------
 `ifdef RV32GC_USE_VIVADO_IP
-    // ---- 勿开 Output Register：读延迟必须保持 1 拍（与行为模型等价） ----
-    // blk_mem_gen_cache_array u_cache_array (
-    //     .clka  (clk),       // A 口时钟
-    //     .ena   (a_en),      // A 口使能
-    //     .wea   (a_we),      // A 口字节写使能 [STRB_W-1:0]
-    //     .addra (a_addr),    // A 口地址（深度 DEPTH）
-    //     .dina  (a_din),     // A 口写数据（宽 DW）
-    //     .douta (),          // A 口读数据（本设计不用，见下 b_dout_r 旁路）
-    //     .clkb  (clk),       // B 口时钟（同域）
-    //     .enb   (b_en),      // B 口使能
-    //     .web   ({STRB_W{1'b0}}),  // B 口只读 ⇒ 写使能恒 0
-    //     .addrb (b_addr),    // B 口地址
-    //     .dinb  ({DW{1'b0}}),// B 口写数据恒 0（只读）
-    //     .doutb ()           // B 口读数据
-    // );
-    //
-    // ※ 例化主体由 create_ip.tcl 生成（记忆体文件 blk_mem_gen_cache_array.xci）；
-    //   端口名/位宽与下方行为模型逐字对齐，A/B 两口数据均不得在综合分支被使用
-    //   —— 综合分支的读写统一走行为模型同一接口（见下 "统一端口映射" 段），
-    //   以免两条分支出现语义漂移。真正接线的例化行在 M4 生成 xci 后解注释。
+    blk_mem_gen_cache_data u_cache_array (
+        .clka  (clk),        // A 口（写）时钟：与核同域，无 CDC
+        .ena   (a_en),       // A 口写使能
+        .wea   (a_we),       // A 口字节写使能 [3:0]
+        .addra (a_addr),     // A 口写地址（11 bit = 2048 深）
+        .dina  (a_din),      // A 口写数据（32 bit）
+        .clkb  (clk),        // B 口（读）时钟：同域
+        .enb   (b_en),       // B 口读使能
+        .addrb (b_addr),     // B 口读地址（11 bit）
+        .doutb (b_dout_r)    // B 口同步读数据（读延迟 1 拍，READ_FIRST ⇒ 同址同拍读旧值）
+    );
+
+    assign a_dout_r = {DW{1'b0}};   // 无消费者（见上注）；SDP 写口无读通路
+
+    // ---- elaboration 自检：本 IP 只对 32 bit × 2048 深规格成立（fail-closed） ----
+    //   综合器会忽略 initial 段（仅仿真生效），故同时用 `ifdef 内的 localparam 断言
+    //   在下面的参数检查里显式列出"IP 规格常量"，任何不一致都会在仿真里 $fatal。
 `endif
 
     //--------------------------------------------------------------------------
@@ -148,6 +163,17 @@ module cache_array_bram #(
             $display("CACHE_ARRAY_BRAM FAIL: 每行字数非法"); 
             $fatal(1, "CACHE_ARRAY_BRAM PARAM FAIL");
         end
+`ifdef RV32GC_USE_VIVADO_IP
+        // ---- IP 规格一致性自检（综合分支专用，fail-closed） ----
+        //   `blk_mem_gen_cache_data` 是固定配置的 xci：32 bit × 2048 深 × 4 bit 字节
+        //   使能（见 fpga/tcl/create_ip.tcl 的 `## blk_mem_gen` 分节断言）。
+        //   本模块的参数若与之不符，综合分支会静默截断/错址 ⇒ 此处 $fatal 挡住。
+        if (DW != 32 || STRB_W != 4 || DEPTH != 2048 || ADDR_W != 11) begin
+            $display("CACHE_ARRAY_BRAM FAIL: 参数 DW=%0d STRB_W=%0d DEPTH=%0d ADDR_W=%0d 与 IP 规格(32/4/2048/11)不符",
+                     DW, STRB_W, DEPTH, ADDR_W);
+            $fatal(1, "CACHE_ARRAY_BRAM IP SPEC MISMATCH");
+        end
+`endif
     end
 
 endmodule

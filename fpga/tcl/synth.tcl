@@ -74,9 +74,27 @@ proc rv32_glob_rec {dir pattern} {
 # 2. 读入设计（RTL + IP；被 impl.tcl 复用）
 #------------------------------------------------------------------------------
 proc rv32_read_design {} {
-    global RTL_DIR PKG_DIR PROJ_ROOT OUT_DIR IP_MACRO
+    global RTL_DIR PKG_DIR PROJ_ROOT OUT_DIR IP_MACRO PART
 
     file mkdir $OUT_DIR
+
+    # ---- 2.0 坑⑧（M4 实测 2026-09-18）：非工程模式的**隐式工程**默认 part 是
+    #   xc7k70tfbv676-1（Kintex-7）。IP 是按 xc7a200tfbg676-2 定制的 ⇒
+    #   generate_target 会以 "IP file is locked: Current project part
+    #   'xc7k70tfbv676-1' and the part 'xc7a200tfbg676-2' used to customize the IP
+    #   do not match" 拒绝生成（CRITICAL WARNING [filemgmt 20-1365]），
+    #   随后 synth_design 报 `module '<ip>' not found`。
+    #   ⇒ 读入设计前先把工程 part 对齐到本次 $PART。
+    if {[catch {current_project -quiet} _cp] || $_cp eq ""} {
+        create_project -in_memory -part $PART
+        puts "== synth.tcl: 无工程 ⇒ create_project -in_memory -part $PART（坑⑧）"
+    } else {
+        if {[catch {set_property part $PART [current_project]} _e]} {
+            puts "WARN: 无法把工程 part 设为 $PART（$_e）"
+        } else {
+            puts "== synth.tcl: 工程 part ⇒ $PART（坑⑧：IP 与工程 part 必须一致）"
+        }
+    }
 
     # ---- 2.1 rtl/pkg/*.vh（唯一真源：位宽/参数/宏）----
     # 真源纪律（08 §3.3 第 1 条）：宏只在 rtl/pkg/*.vh 定义，改动先改真源再全量同步。
@@ -93,17 +111,24 @@ proc rv32_read_design {} {
     # ---- 2.3 include 顺序处理 ----
     # RTL 里两种写法混用：`` `include "rv32_defs.vh" ``（裸名）与
     # `` `include "rtl/pkg/rv32_defs.vh" ``（仓库根相对）。两条路径都要能解析：
-    #   -include_dirs 同时给 rtl/pkg、rtl、仓库根 ⇒ 两种写法都能命中；
-    #   再把 *.vh **先读**（宏真源在任何 RTL 之前进入定义表），两条机制互为兜底。
+    #   把 *.vh **先读**（宏真源在任何 RTL 之前进入定义表）+ 在 synth_design 上
+    #   传 -include_dirs（同时给 rtl/pkg、rtl、仓库根）⇒ 两种写法都能命中。
     #   （所有 .vh 都有 `ifndef 守卫 ⇒ 与文件内 `` `include `` 重复读入不会重定义。）
-    set inc_dirs [list $PKG_DIR $RTL_DIR $PROJ_ROOT]
+    #
+    # ★ 坑④（实测 2026-09-18，Vivado 2023.2 batch/非工程模式）：
+    #   `read_verilog` **不接受** -include_dirs / -incdir（报
+    #   `ERROR: [Common 17-170] Unknown option '-include_dirs'`；该命令在
+    #   batch 非工程模式下只有 [-library] [-sv] [-quiet] [-verbose]）。
+    #   ⇒ include 搜索目录必须交给 `synth_design -include_dirs`（真源见
+    #     ::RV32_INC_DIRS，由本 proc 设置、synth/impl 两处 synth_design 共用）。
+    set ::RV32_INC_DIRS [list $PKG_DIR $RTL_DIR $PROJ_ROOT]
     puts "== synth.tcl: 读入 rtl/pkg/*.vh ×[llength $pkg_files]（宏真源，先读）"
-    if {[catch { read_verilog -include_dirs $inc_dirs $pkg_files } err]} {
-        # 头文件单独 read 失败不致命：文件内的 `` `include `` + -include_dirs 仍是有效路径
-        puts "WARN: 单独 read_verilog rtl/pkg/*.vh 失败（$err）⇒ 依赖各 RTL 内的 \`include + -include_dirs"
+    if {[catch { read_verilog $pkg_files } err]} {
+        # 头文件单独 read 失败不致命：文件内的 `` `include `` + synth_design -include_dirs 仍是有效路径
+        puts "WARN: 单独 read_verilog rtl/pkg/*.vh 失败（$err）⇒ 依赖各 RTL 内的 \`include + synth_design -include_dirs"
     }
     puts "== synth.tcl: 读入 rtl/**/*.v ×[llength $rtl_files]"
-    read_verilog -include_dirs $inc_dirs $rtl_files
+    read_verilog $rtl_files
 
     # ---- 2.4 综合侧 IP（红线 1：用 IP，不用原语）----
     # 约定：create_ip.tcl 把 IP 生成到 <repo>/fpga/ip/<module_name>/<module_name>.xci
@@ -116,6 +141,32 @@ proc rv32_read_design {} {
     } else {
         foreach xci $xci_files { puts "== synth.tcl: read_ip $xci" }
         read_ip $xci_files
+        # ---- 坑⑥（实测 2026-09-18）：read_ip **不等于**产出综合用源码 ----
+        #   非工程模式下 `read_ip <xci>` 只把 IP 登记进内存工程；IP 的
+        #   'Synthesis' 输出（`<ip>/synth/<ip>.v`，blk_mem_gen 则是
+        #   `<ip>/synth/<ip>.vhd`）**不会**自动生成 ⇒ synth_design 报
+        #     ERROR: [Synth 8-439] module 'blk_mem_gen_cache_data' not found
+        #     WARNING: [Vivado_Tcl 4-393] The 'Synthesis' target ... are stale
+        #   ⇒ 必须在 synth_design **之前**显式 generate_target {synthesis}。
+        #   （create_ip.tcl 里的 generate_target all 只对**它自己会话内**
+        #     create_ip 出来的 IP 生效；跨会话 read_ip 复用时仍要再生成一次。）
+        if {[catch {set _ips [get_ips -quiet]}]} { set _ips {} }
+        if {[llength $_ips] > 0} {
+            if {[catch {current_project -quiet} _p] == 0 && $_p ne ""} {
+                catch {set_property target_language Verilog [current_project]}
+            }
+            puts "== synth.tcl: generate_target {synthesis} ×[llength $_ips]（坑⑥）"
+            generate_target {synthesis} $_ips
+            # ---- 坑⑥ 的后半段（实测 2026-09-18）：generate_target 只把 IP 的综合
+            #   源码写到 <ip>/synth/（本项目 5 个 IP 全是 VHDL 参考源），**不会**把它
+            #   挂进内存工程的编译序 ⇒ synth_design 仍报 `module '<ip>' not found`。
+            #   非工程模式的正解是 `synth_ip`：对每个 IP 做 OOC 综合、产出 DCP 并挂到
+            #   工程 netlist 源，顶层 synth_design 以黑盒链接之。
+            #   证据：fpga/scratch/ip_flow2.tcl 模式 D（read_ip+generate_target+synth_ip）
+            #   → `RESULT_D: SYNTH_OK`；不加 synth_ip 时 8-439 module not found（9 error）。
+            puts "== synth.tcl: synth_ip [get_ips]（OOC 综合，坑⑥ 后半段）"
+            synth_ip $_ips
+        }
         # 备选（仅在 OOC 综合出问题时启用，保持默认流程不额外投机）：
         #   set_property GENERATE_SYNTH_CHECKPOINT true [get_files -quiet -filter {FILE_TYPE == IP}]
     }
@@ -123,32 +174,54 @@ proc rv32_read_design {} {
 }
 
 #------------------------------------------------------------------------------
-# 3. 约束（可选 XDC + 时钟兜底）
-#    fpga/soc_up.xdc 是 08 §3.2 约定的"平台约束本地只读拷贝"（尚未落盘；禁止改 chiplab）。
-#    它在非工程模式下于 synth_design **之后**读入：引脚/时序约束在实现阶段生效，
-#    而 create_clock 后 report_timing_summary 才能给出有意义的 WNS（M4 判据②）。
+# 3. 约束（平台口径 XDC + 时钟兜底）
+#    fpga/soc_up.xdc = 08 §3.2 约定的"平台约束本地只读拷贝"（来源 chiplab loongson
+#    soc_up.xdc 的时钟口径；引脚约束不拷贝——core_top 是内部模块，不落引脚）。
+#
+#  ★ 坑⑦（M4 实测 2026-09-18）：非工程模式下 create_clock **必须在 synth_design
+#    之前**生效，否则综合阶段"无时钟"⇒ 不做时序驱动优化，WNS 明显偏差。
+#    → rv32_stage_xdc（synth 前）：把 XDC 的 __CLK_PERIOD_NS__ 占位符替换成本次
+#      请求的周期，落到 fpga/out/soc_up_<period>ns.xdc 再 read_xdc。
+#    → rv32_apply_constraints（synth 后）：只做幂等校验/兜底（缺时钟才补）。
 #------------------------------------------------------------------------------
+proc rv32_stage_xdc {} {
+    global PROJ_ROOT OUT_DIR CLK_PERIOD_NS
+
+    set src [file join $PROJ_ROOT fpga soc_up.xdc]
+    if {![file exists $src]} {
+        puts "WARN: 未找到 fpga/soc_up.xdc（08 §3.2 约定的平台约束只读拷贝）⇒ 综合将无时钟约束"
+        return ""
+    }
+    set fh [open $src r]; set txt [read $fh]; close $fh
+    # 占位符替换：XDC 真源只写 __CLK_PERIOD_NS__，具体周期由本脚本的 tclarg 决定
+    set txt [string map [list "__CLK_PERIOD_NS__" $CLK_PERIOD_NS] $txt]
+    if {[string match "*__CLK_PERIOD_NS__*" $txt]} {
+        error "fpga/soc_up.xdc 里的 __CLK_PERIOD_NS__ 占位符未被替换（检查字符串替换）"
+    }
+    file mkdir $OUT_DIR
+    set dst [file join $OUT_DIR [format "soc_up_%sns.xdc" $CLK_PERIOD_NS]]
+    set fh [open $dst w]; puts $fh $txt; close $fh
+    puts "== synth.tcl: 约束（平台口径 + 本次周期）⇒ read_xdc $dst（synth_design **之前**，时序驱动综合）"
+    read_xdc $dst
+    return $dst
+}
+
 proc rv32_apply_constraints {} {
     global PROJ_ROOT CLK_PERIOD_NS
-
-    set xdc [file join $PROJ_ROOT fpga soc_up.xdc]
-    if {[file exists $xdc]} {
-        puts "== synth.tcl: read_xdc $xdc（平台约束只读拷贝，08 §3.2）"
-        read_xdc $xdc
-    } else {
-        puts "WARN: 未找到 fpga/soc_up.xdc（08 §3.2 约定的平台约束只读拷贝尚未落盘）⇒ 跳过 read_xdc"
-    }
 
     if {[llength [get_clocks -quiet]] == 0} {
         if {[llength [get_ports -quiet aclk]] > 0} {
             create_clock -period $CLK_PERIOD_NS -name aclk [get_ports aclk]
-            puts "WARN: 约束中无时钟定义 ⇒ 临时 create_clock aclk -period ${CLK_PERIOD_NS}ns"
-            puts "WARN:   （占位，仅让时序报告可判读；fpga/soc_up.xdc 到位后本条应由平台约束提供）"
+            puts "WARN: 约束中无时钟定义 ⇒ 兜底 create_clock aclk -period ${CLK_PERIOD_NS}ns（仅让时序报告可判读）"
         } else {
             puts "WARN: 既无时钟约束、顶层也没有 aclk 端口（core_top 尚未落盘？）⇒ 时序报告不含时钟"
         }
     } else {
+        set clks [get_clocks -quiet]
         puts "== synth.tcl: 已有时钟约束：[get_clocks -quiet]"
+        foreach c $clks {
+            puts "   * $c period = [get_property PERIOD $c] ns"
+        }
     }
 }
 
@@ -179,11 +252,13 @@ proc rv32_report {tag} {
 if {![info exists ::RV32_SYNTH_DEFS_ONLY]} {
     if {[catch {
         rv32_read_design
+        rv32_stage_xdc
         # 综合：-top core_top（平台例化名，08 §4）。$IP_MACRO 的默认值就是宏名字面量
         # RV32GC_USE_VIVADO_IP（见 §0），故下面一行逐字等价于任务口径：
         #     synth_design -top core_top -part xc7a200tfbg676-2 -verilog_define RV32GC_USE_VIVADO_IP
-        puts "== synth.tcl: synth_design -top $TOP -part $PART -verilog_define $IP_MACRO"
-        synth_design -top $TOP -part $PART -verilog_define $IP_MACRO
+        # （约束已在上面 read_xdc ⇒ 时序驱动综合；见 §3 坑⑦）
+        puts "== synth.tcl: synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS"
+        synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS
         puts "== synth.tcl: 宏 $IP_MACRO 已定义（综合走 Vivado IP 分支；仿真回归从不定义该宏）"
         rv32_apply_constraints
         rv32_report synth

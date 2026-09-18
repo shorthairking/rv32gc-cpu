@@ -104,10 +104,30 @@ proc resolve_ip_version {ipname pinned} {
     return $newest
 }
 
-# 创建 IP（幂等：已存在则跳过创建，只保留后续 set_property / generate_target 刷新）
-# ★ 各 IP 的 `create_ip` 调用**逐个写在本文件里、IP 名与行内**（不封装成通用 proc），
-#   目的是让"用了哪个 IP"在脚本里可直接 grep 审查（红线 1 证据可检索）：
-#     grep -n "create_ip -name" fpga/tcl/create_ip.tcl
+# 创建/复用 IP —— ★ 幂等口径（M4 实测 2026-09-18 踩坑后定稿）：
+#   `create_ip` 在"目录里已有 <module>/<module>.xci"时会**新建** <module>_1 目录
+#   （每个新 Vivado 会话的 get_ips 都是空的，所以"先查 get_ips"挡不住重复运行）。
+#   实测后果：重复跑本脚本后 fpga/ip 下多出 5 个 *_1 目录，synth.tcl 的
+#   `glob fpga/ip/*/*.xci` 会把重复 xci 一起 read_ip ⇒
+#   `CRITICAL WARNING: [IP_Flow 19-3389] Failed to import IP file ... IP name
+#    'rv32_div' is already in use in this project`。
+#   ⇒ 统一用下面的 ensure_ip：**磁盘上已有 xci 就 read_ip 复用**，否则才 create_ip。
+# ★ "用了哪个 IP"仍可一行命令审查（红线 1 证据可检索）：
+#     grep -n "^ensure_ip" fpga/tcl/create_ip.tcl
+#   每个 IP 一行 `ensure_ip <IP 家族> <vendor> <lib> <版本> <模块名>`。
+proc ensure_ip {ipname vendor library version module} {
+    global IP_DIR
+    set xci [file join $IP_DIR $module "${module}.xci"]
+    if {[file exists $xci]} {
+        read_ip $xci
+        puts "== 复用已有 IP（幂等，未重复 create）：$xci"
+    } else {
+        create_ip -name $ipname -vendor $vendor -library $library \
+                  -version $version -module_name $module -dir $IP_DIR
+    }
+    return [get_ips $module]
+}
+
 # 配置断言：不满足即 error（fail-closed；防止脚本"看起来跑完了"却配错）
 proc assert_cfg {modname prop expect} {
     set got [get_property CONFIG.$prop [get_ips $modname]]
@@ -134,10 +154,7 @@ proc assert_cfg {modname prop expect} {
 #   而"每条指令对应一个 signedness 精确匹配的 IP"可审查性最好 ⇒ 采用 3 实例。
 set V_MULT [resolve_ip_version mult_gen 12.0]
 
-if {[llength [get_ips -quiet rv32_mult_signed]] == 0} {
-    create_ip -name mult_gen -vendor xilinx.com -library ip \
-              -version $V_MULT -module_name rv32_mult_signed -dir $IP_DIR
-} else { puts "== 已存在，刷新配置：rv32_mult_signed" }
+ensure_ip mult_gen xilinx.com ip $V_MULT rv32_mult_signed
 set_property -dict [list \
     CONFIG.MultType                 {Parallel_Multiplier} \
     CONFIG.PortAType                {Signed}   \
@@ -150,10 +167,7 @@ set_property -dict [list \
     CONFIG.PipeStages               {0}        \
 ] [get_ips rv32_mult_signed]
 
-if {[llength [get_ips -quiet rv32_mult_su]] == 0} {
-    create_ip -name mult_gen -vendor xilinx.com -library ip \
-              -version $V_MULT -module_name rv32_mult_su -dir $IP_DIR
-} else { puts "== 已存在，刷新配置：rv32_mult_su" }
+ensure_ip mult_gen xilinx.com ip $V_MULT rv32_mult_su
 set_property -dict [list \
     CONFIG.MultType                 {Parallel_Multiplier} \
     CONFIG.PortAType                {Signed}   \
@@ -166,10 +180,7 @@ set_property -dict [list \
     CONFIG.PipeStages               {0}        \
 ] [get_ips rv32_mult_su]
 
-if {[llength [get_ips -quiet rv32_mult_unsigned]] == 0} {
-    create_ip -name mult_gen -vendor xilinx.com -library ip \
-              -version $V_MULT -module_name rv32_mult_unsigned -dir $IP_DIR
-} else { puts "== 已存在，刷新配置：rv32_mult_unsigned" }
+ensure_ip mult_gen xilinx.com ip $V_MULT rv32_mult_unsigned
 set_property -dict [list \
     CONFIG.MultType                 {Parallel_Multiplier} \
     CONFIG.PortAType                {Unsigned} \
@@ -219,10 +230,7 @@ generate_target all [get_ips rv32_mult_unsigned]
 #   ARESETN=1：供 `flush` 冲刷时清空在途除法（RTL 侧接 aresetn & ~flush）。
 set V_DIV [resolve_ip_version div_gen 5.1]
 
-if {[llength [get_ips -quiet rv32_div]] == 0} {
-    create_ip -name div_gen -vendor xilinx.com -library ip \
-              -version $V_DIV -module_name rv32_div -dir $IP_DIR
-} else { puts "== 已存在，刷新配置：rv32_div" }
+ensure_ip div_gen xilinx.com ip $V_DIV rv32_div
 set_property -dict [list \
     CONFIG.algorithm_type                {Radix2} \
     CONFIG.dividend_and_quotient_width   {32}      \
@@ -250,22 +258,81 @@ puts "== div_gen 实测延迟（latency 参数，输入握手→输出握手）�
 puts "== div_gen 输出 tdata 位宽：[expr {[get_property CONFIG.dividend_and_quotient_width [get_ips rv32_div]] + [get_property CONFIG.fractional_width [get_ips rv32_div]]}]（高半部=余数，低半部=商）"
 
 #==============================================================================
-## blk_mem_gen —— Cache 数据/标签阵列（08 §7.3；集成阶段追加）
+## blk_mem_gen —— Cache 数据阵列（Block Memory Generator, PG058）
 #==============================================================================
-#   预留分节：L1I/L1D/L2 的存储阵列 IP（True Dual Port RAM，勿开 Output Register）
-#   由集成阶段按 rtl/cache/cache_array_bram.v / cache_tag_array.v 的例化模板追加。
-#   —— 截至本任务（2026-09-14）尚未追加。
+# 用途：L1I/L1D 的**数据阵列**（AGENT.md §3.3「Cache 数据阵列用 Vivado
+#       Block Memory Generator IP」+ 08 §7.3）。RTL 例化点：
+#       rtl/cache/cache_array_bram.v 的 `ifdef RV32GC_USE_VIVADO_IP 分支。
+#
+# 规格推导（真源 rtl/pkg/core_params.vh，改参数必须同步改本节 + RTL）：
+#   L1I：2 路 × 256 组 × 8 字/行（32 B 行）= **每路 2048 字 × 32 bit**
+#   L1D：4 路 × 256 组 × 8 字/行（32 B 行）= **每路 2048 字 × 32 bit**
+#   ⇒ 两 L1 的**每路**阵列同规格 ⇒ 一个 IP 在 RTL 里例化 6 次（2+4 路）。
+#   （Vivado IP 的 .xci 是固定配置、不可参数化；路数由 RTL 的 generate 循环
+#     例化同一模块解决，故只按"每路"规格生成一个 IP。）
+#
+# 为什么选 Simple Dual Port（SDP）而不是 True Dual Port（TDP）：
+#   RTL 的真实用法就是「A 口只写（填充写/写回字节使能）、B 口只读（访问读）」，
+#   SDP 是 BMG 对该用法的标准映射，BRAM36 用量最小（每路 2 个 ⇒ 全核 12 个，
+#   器件共 365 个）。TDP 每路要 4 个 BRAM36 且功能上无任何收益
+#   （A 口读数据 a_dout_r 全设计**无消费者**：l1i/l1d 例化时均接空端口）。
+#
+# ★ 语义对齐（与 rtl/cache/cache_array_bram.v 行为模型逐条对齐，M4 硬门禁）：
+#   1) **读延迟 1 拍**：Register_PortB_Output_of_Memory_{Core,Primitives}=false
+#      ⇒ 访问拍发地址、下一拍 B 口数据有效（模型：b_dout_r <= mem_q[b_addr]）。
+#   2) **同址同拍「写+读」读出旧值**：Operating_Mode_A = READ_FIRST
+#      （BMG：写口命中时读口输出**写前**数据；模型用非阻塞赋值天然读旧值）。
+#   3) **字节使能**：Use_Byte_Write_Enable=true + Byte_Size=8 ⇒ wea[3:0]。
+#   4) **使能门控**：Enable_A/B = Use_*_PIN ⇒ ena 门控写、enb 门控读。
+#   等价性证据：xsim 双分支对拍（同一激励同时打 IP 与 RTL 行为模型，逐拍比对），
+#   脚本与日志见 fpga/scratch/bram_equiv/（M4 报告 §证据）。
+set V_BMG [resolve_ip_version blk_mem_gen 8.4]
+
+ensure_ip blk_mem_gen xilinx.com ip $V_BMG blk_mem_gen_cache_data
+set_property -dict [list \
+    CONFIG.Memory_Type                                 {Simple_Dual_Port_RAM} \
+    CONFIG.Write_Width_A                               {32}   \
+    CONFIG.Write_Depth_A                               {2048} \
+    CONFIG.Read_Width_B                                {32}   \
+    CONFIG.Use_Byte_Write_Enable                       {true} \
+    CONFIG.Byte_Size                                   {8}    \
+    CONFIG.Enable_A                                    {Use_ENA_Pin} \
+    CONFIG.Enable_B                                    {Use_ENB_Pin} \
+    CONFIG.Operating_Mode_A                            {READ_FIRST} \
+    CONFIG.Register_PortB_Output_of_Memory_Core        {false} \
+    CONFIG.Register_PortB_Output_of_Memory_Primitives  {false} \
+    CONFIG.Pipeline_Stages                             {0}    \
+    CONFIG.PRIM_type_to_Implement                      {BRAM} \
+] [get_ips blk_mem_gen_cache_data]
+
+assert_cfg blk_mem_gen_cache_data Memory_Type                                Simple_Dual_Port_RAM
+assert_cfg blk_mem_gen_cache_data Write_Width_A                              32
+assert_cfg blk_mem_gen_cache_data Write_Depth_A                              2048
+assert_cfg blk_mem_gen_cache_data Read_Width_B                               32
+assert_cfg blk_mem_gen_cache_data Use_Byte_Write_Enable                      true
+assert_cfg blk_mem_gen_cache_data Byte_Size                                  8
+assert_cfg blk_mem_gen_cache_data Enable_A                                   Use_ENA_Pin
+assert_cfg blk_mem_gen_cache_data Enable_B                                   Use_ENB_Pin
+assert_cfg blk_mem_gen_cache_data Operating_Mode_A                           READ_FIRST
+assert_cfg blk_mem_gen_cache_data Register_PortB_Output_of_Memory_Core       false
+assert_cfg blk_mem_gen_cache_data Register_PortB_Output_of_Memory_Primitives false
+assert_cfg blk_mem_gen_cache_data PRIM_type_to_Implement                     BRAM
+
+generate_target all [get_ips blk_mem_gen_cache_data]
 
 #==============================================================================
-## 其他 IP（FPU 等；集成阶段追加）
+## 其他 IP（Clocking Wizard 等；集成阶段追加）
 #==============================================================================
-#   预留分节：后续若引入浮点 IP / FIFO / Clocking Wizard 等，同样追加在此。
+#   预留分节：上板时钟方案若确定走 MMCM/Clock Wizard（08 §3 / M5 口径），
+#   在此追加 clk_wiz 分节（**禁止手写 MMCME2/BUFG 等原语**，红线 1）。
+#   —— 截至本次 M4（2026-09-18）未追加：synth/impl 只约束核内逻辑，
+#      板级时钟由平台 soc_top.v 的 PLL 提供（08 §3「33 MHz 同域」口径）。
 
 #------------------------------------------------------------------------------
 # 9. 结束小结（列出本次生成/刷新的 IP 与关键属性，便于日志审查）
 #------------------------------------------------------------------------------
 puts "== create_ip.tcl 完成：IP_DIR = $IP_DIR"
-foreach m {rv32_mult_signed rv32_mult_su rv32_mult_unsigned rv32_div} {
+foreach m {rv32_mult_signed rv32_mult_su rv32_mult_unsigned rv32_div blk_mem_gen_cache_data} {
     puts "   * [format %-20s $m] VLNV=[get_property IPDEF [get_ips $m]]  dir=[get_property IP_DIR [get_ips $m]]"
 }
 puts "== 提醒：综合脚本（synth.tcl）需 read_ip/read_xci 上述 .xci 并定义 RV32GC_USE_VIVADO_IP"

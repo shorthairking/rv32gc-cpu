@@ -76,11 +76,116 @@
 - 强度：**[旧项目转述]**（行为级）。
 - **旁证**：[环境实测] 工作区根目录已存在 `.Xil/`（Vivado 状态目录）——说明历史上确实在默认 HOME 下写过状态。
 
-### 三坑统一入口（**待建**）
+### 坑④ 非工程模式 `read_verilog` **不接受** `-include_dirs`（M4 实测，2026-09-18）
+
+- 现象：`read_verilog -include_dirs {rtl/pkg rtl .} <files>` 直接报
+  `ERROR: [Common 17-170] Unknown option '-include_dirs'`；`-incdir` 同样不认。
+  batch/非工程模式下 `read_verilog` 只支持 `[-library] [-sv] [-quiet] [-verbose]`
+  （`read_verilog -help` 实测输出）。
+- **后果**：RTL 内混用两种 `` `include `` 写法（裸名 `"rv32_defs.vh"` 与仓库根相对
+  `"rtl/pkg/rv32_defs.vh"`）时，include 搜索路径无处可传 ⇒ 综合在编译期失败。
+- **绕过**：把搜索目录交给 **`synth_design -include_dirs`**：
+  ```tcl
+  set ::RV32_INC_DIRS [list $PKG_DIR $RTL_DIR $PROJ_ROOT]
+  read_verilog $pkg_files       ;# *.vh 先读（宏真源进定义表；.vh 有 ifndef 守卫，重复读安全）
+  read_verilog $rtl_files
+  synth_design -top core_top -part $xc7a200tfbg676-2 \
+               -verilog_define RV32GC_USE_VIVADO_IP -include_dirs $::RV32_INC_DIRS
+  ```
+- 强度：**[环境实测]**（命令 + 报错原文 + 修复后 rc=0，见 `fpga/tcl/synth.tcl` §2.3 注释）。
+
+### 坑⑤ RTL 里的 SystemVerilog 定宽转换 `N'(expr)` 会让 Vivado 编译失败
+
+- 现象：`rtl/plic/plic.v` 原写 `5'(SOURCE_MIN)`（定宽转换，SystemVerilog 语法），
+  Vivado 的 Verilog（非 `-sv`）模式报
+  `ERROR: [Synth 8-2716] syntax error near '''`，**整核无法综合**（9 个 error）。
+  iverilog（`-g2012`）能编过 ⇒ 该缺陷只在综合侧暴露，回归发现不了。
+- **口径**：本项目 RTL 是 **Verilog-2001**（综合侧不启用 `-sv`：全量文件按 SV 编译会
+  引入标识符与保留字冲突风险）。RTL 内禁止使用 `N'(expr)`、`always_ff`、`logic` 等
+  SV-only 构造；定宽比较直接写 `(a >= CONST)`（常量 ≤ 位宽时逐位等价）。
+- 强度：**[环境实测]**（M4：修复前 9 error / 修复后 0 error；`./scripts/regress.sh`
+  23/23 不变 ⇒ 语义等价）。
+
+### 坑⑥ `read_ip` 之后必须 `generate_target {synthesis}` + `synth_ip`
+
+- 现象（非工程模式，M4 实测 2026-09-18）：只 `read_ip <xci>` 就 `synth_design`，
+  报 `ERROR: [Synth 8-439] module 'blk_mem_gen_cache_data' not found`；
+  只补 `generate_target {synthesis} [get_ips]` **仍然报同样的错**（它只把 IP 综合源码
+  写到 `<ip>/synth/`，本项目 5 个 IP 产出的都是 **VHDL 参考源**，并未挂进内存工程的编译序）。
+- **正解**（顺序不能少）：
+  ```tcl
+  create_project -in_memory -part xc7a200tfbg676-2   ;# 见坑⑧
+  read_ip $xci_files
+  generate_target {synthesis} [get_ips]
+  synth_ip [get_ips]                                  ;# ★ 关键：OOC 综合出 DCP 并挂进工程
+  synth_design -top core_top -part ... -verilog_define RV32GC_USE_VIVADO_IP
+  ```
+- 强度：**[环境实测]** 对照实验 `fpga/scratch/ip_flow2.tcl`：模式 D（含 `synth_ip`）
+  `RESULT_D: SYNTH_OK`；不含 `synth_ip` 时 9 个 error（module not found）。
+- 代价：`synth_ip` 会对每个 IP 跑一次 OOC 综合（本项目 5 个 IP 约 2–4 min，其后
+  顶层综合以黑盒链接 DCP）。
+
+### 坑⑦ 非工程模式的时钟约束必须**早于** `synth_design`（否则综合不是时序驱动）
+
+- 现象：把 `create_clock` 放在 `synth_design` **之后**，综合阶段"无时钟"⇒ Vivado
+  不做时序驱动优化（不按路径延时重构/复制/平衡），WNS 与最终可实现频率都明显偏差。
+- **正解**：把约束写进 XDC，在 `synth_design` **之前** `read_xdc`（Vivado 在细化后、
+  综合优化前施加约束；引脚级约束可留给实现阶段）。
+  本项目：`fpga/soc_up.xdc`（平台时钟口径的本地只读拷贝，周期用占位符
+  `__CLK_PERIOD_NS__`）由 `synth.tcl` 替换成本次 tclarg 的周期后落到
+  `fpga/out/soc_up_<period>ns.xdc`，再 `read_xdc` —— 60 MHz 与 100 MHz 两种跑法
+  共用**同一份**约束真源。
+- 强度：**[环境实测]**（`fpga/tcl/synth.tcl` §3 的 `rv32_stage_xdc`）。
+
+### 坑⑧ 非工程模式的隐式工程默认 part 是 `xc7k70tfbv676-1`
+
+- 现象：不 `create_project` 直接 `read_ip` + `generate_target`，报
+  `CRITICAL WARNING: [filemgmt 20-1365] Unable to generate target(s) ... IP file is locked`
+  `Locked reason: Current project part 'xc7k70tfbv676-1' and the part 'xc7a200tfbg676-2'
+  used to customize the IP do not match` ⇒ IP 综合产物生成不出来。
+- **正解**：读入 IP 之前 `create_project -in_memory -part $PART`（或
+  `set_property part $PART [current_project]`），保证工程 part 与 IP 定制 part 一致。
+- 强度：**[环境实测]**（M4 首次全核综合失败即此因）。
+
+### 坑⑨ 综合脚本必须**幂等**：`create_ip` 重复运行会新建 `<ip>_1` 目录
+
+- 现象：重复跑 `create_ip.tcl` 后 `fpga/ip/` 下出现 `rv32_div_1/`、`rv32_mult_signed_1/`
+  …（每个新 Vivado 会话 `get_ips` 都是空的，"先查 get_ips 再 create"挡不住重复创建）。
+  随后 `synth.tcl` 的 `glob fpga/ip/*/*.xci` 会把重复 xci 一起 `read_ip` ⇒
+  `CRITICAL WARNING: [IP_Flow 19-3389] Failed to import IP file ... IP name '<ip>' is
+  already in use in this project`。
+- **正解**：`create_ip.tcl` 里统一走 `ensure_ip`：**磁盘上已有 `<ip>/<ip>.xci` 就
+  `read_ip` 复用**，否则才 `create_ip`（`grep -n "^ensure_ip" fpga/tcl/create_ip.tcl`
+  仍是"用了哪些 IP"的可审查入口）。
+- 强度：**[环境实测]**（M4 实测踩坑 → 修复后重复运行 rc=0 且不再产生 `_1` 目录）。
+
+### 坑⑩ Vivado RAM 推断**只支持单写口**：多写口阵列会退化成"寄存器 + 大 mux"
+
+- 现象（M4 实测，2026-09-18）：`cache_tag_array` 把 `{tag,dirty,valid}` 打包成一个阵列、
+  且有**两个写口**（`if (wr_en) mem[a]<=…` 与 `if (dirty_clr_en) mem[b][k]<=0` 并存）
+  ⇒ Vivado **完全不推断 RAM**（`LUT as Distributed RAM = 0`），改建成寄存器堆 + 256:1 读 mux：
+  6 路 Tag 阵列吃掉 **75 119 LUT + 31 872 FF**（占非 FPU 全核 LUT 的 **64 %**，
+  其中 `u_l1d` 一个模块 70 258 LUT）。
+- **口径**：一个 `reg [W-1:0] mem [0:D-1]` 只有**一个写口**才能推断 RAM（LUTRAM/BRAM）；
+  需要"第二个写口"时，要么把被写字段**拆成独立阵列**（各自单写口），要么让第二路写与
+  第一路**互斥**后用 `if / else if` 合并为一路（并在 RTL 加契约自检，违反即 `$fatal`）。
+  另外：小容量、随机寻址的阵列建议显式写 `(* ram_style = "distributed" *)`
+  （综合**属性**、不是原语，红线 1 允许），让推断结果确定、可复现。
+- **收益实测**（同一脚本、同一周期、同一激励）：LUT 116 785 → **37 382（-68 %）**，
+  FF 47 190 → 15 412，综合后 WNS -4.329 ns → **-2.783 ns**；
+  `REGRESS: 23/23 PASS` + arch-test I/Zicbom/SvZicbo/SvPMPZicbo/Sv 全绿（语义不变）。
+- 强度：**[环境实测]**（对照报告 `fpga/out/scratch_nofpu_utilization_hier.rpt` 前后两版 +
+  `fpga/M4-report.md` §5 改动 4）。
+
+### 三坑统一入口（**已落地**）
 
 - **目标**：`fpga/run_vivado_batch.sh <tcl>`，在脚本内一次性设置 坑① 的 `LD_LIBRARY_PATH`、坑③ 的 `HOME`、并以非交互批处理方式跑 Tcl。
-- **现状**：**`rv32gc-cpu/fpga/` 目录尚不存在**，脚本**未创建**。[环境实测] `ls rv32gc-cpu/fpga` → `No such file or directory`
-- **[工程约定]** 在 `run_vivado_batch.sh` 落地前，**不允许**任何人手工散落 `vivado -mode batch` 调用——否则三坑会被逐个重新踩一遍。
+- **现状（2026-09-18 更新）**：**已落地** `fpga/run_vivado_batch.sh`（三坑封装 +
+  `--dry-run` 自检 + 日志落 `fpga/out/<tcl>.vivado.log`）；配套 Tcl 为
+  `fpga/tcl/{create_ip,synth,impl}.tcl`（**非工程模式**，坑② 不适用）。
+  原先"`fpga/` 目录尚不存在"的记录已过时。
+- **[工程约定]** 所有 Vivado 调用一律经该入口，**禁止**散落 `vivado -mode batch`——
+  否则三坑（及坑④）会被逐个重新踩一遍。
 
 ---
 

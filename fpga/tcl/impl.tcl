@@ -61,8 +61,9 @@ if {[catch {
     } else {
         puts "WARN: 未找到 $POST_SYNTH_DCP ⇒ 本脚本自行读设计 + synth_design（与 synth.tcl 同一逻辑）"
         rv32_read_design
-        puts "== impl.tcl: synth_design -top $TOP -part $PART -verilog_define $IP_MACRO"
-        synth_design -top $TOP -part $PART -verilog_define $IP_MACRO
+        rv32_stage_xdc
+        puts "== impl.tcl: synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS"
+        synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS
         rv32_apply_constraints
     }
 

@@ -57,3 +57,5 @@ a.out
 .work_fpu/
 __pycache__/
 *.pyc
+fpga/ip/
+fpga/scratch/
