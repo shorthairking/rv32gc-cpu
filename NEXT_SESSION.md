@@ -18,12 +18,12 @@
 - **M4 推进状态（提交至 `48ca2eb`，T1 已完成）**：M3 ✅（`13a80ab`）；M4 流程全通但面积/时序双阻塞（`f6115f5`：FPU 405.81%、非 FPU 44.49 MHz）。**T1 ✅（`48ca2eb`）**：FPU 窄域+sticky 重写，546 223→21 967 LUT(16.32%)，56 569 例差分 0 差异 + F 80/D 106 + regress 23/23（母 Agent 未及复跑，恢复后补）。**T2（非 FPU 时序流水化 + 隐式声明修复）被打断**（见下方暂停点）。之后 T3 重跑 synth/impl 收口 M4。
 - **待办**：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译、CMO PMA 对 MMIO 窗口残余口径、DFIL 错误行 l1d poison 升级；→ M4 收口 → M5 上板。
 
-## 1.6 ⏸ 暂停点（2026-09-17 用户指令「暂停当前任务并保存现场，等待命令再恢复」）
+## 1.6 ⏸ 暂停点（2026-09-17 用户指令「暂停任务，等指令再恢复」；上一暂停点已消化：T2 完成并提交 011fb28）
 
-- **在途**：T2 coding 子 Agent `c22f07c9`（非 FPU 关键路径流水化：satp/PMP/翻译出口 + PLIC eip 出口各加一级寄存 + core_top 13 处隐式声明前移，目标布线 WNS≥0@60MHz）已被母 Agent 打断；**其完整任务书与已读证据在其会话上下文里**，恢复时 `send_message` 让它继续（别重派）。若其上下文不可用，按下方「T2 任务要点」重派。
-- **工作区 = T2 半成品（未提交、可能不可编译，恢复时由 c22f07c9 续做）**：`rtl/top/core_top.v` md5 `e1c33f9714559e198449f9992285d213`、`rtl/csr/csr_file.v` md5 `bbd4b4d14c0b9c3e89f942f3d395551b`。**不要 git checkout/stash/reset 这些文件**；恢复后先确认 iverilog 编译通过再继续。散落的 `clockInfo.txt` 已清。
-- **T2 任务要点**（重派时用）：① 关键路径 A `plic/threshold_r → L1D BRAM ENBWREN`（37 级）与链 B `satp_r → axi len_q/pc_r`（22.48 ns）提前一拍寄存（只加时序寄存、不改功能语义）；② core_top.v 13 处 `[Synth 8-8895]` 隐式声明清零（声明前移/显式 wire，位宽正确）；③ 验收：`fpga/scratch/nofpu_synth.tcl 16.667` + `nofpu_impl.tcl 16.667` 布线后 WNS≥0@60MHz、隐式声明数=0、regress 23/23 + I 39/39 + PMP* 63/63 + Sv 29/29、反证链（寄存级 bypass⇒时序回退）；④ 禁改 fpu*.v/fregfile/sim/unit 判据/sim/arch_test/fpga/tcl 既有脚本；Vivado 只经 run_vivado_batch.sh。
-- **恢复后顺序**：① 复跑 T1 验收（F 80/D 106/regress/`fpu_area.tcl`≤45k LUT）并确认提交；② send_message 让 T2 续做 → 复跑 T2 验收 → 提交；③ 派 T3（全核 60/100 MHz synth+impl 收口 M4）；④ M5 上板。
+- **在途**：T3 coding 子 Agent `95efb630`（全核 60/100 MHz synth+impl 收口 M4，RTL 零改动）已被母 Agent 打断；**其任务书与已读证据在其会话上下文里**，恢复时 `send_message` 让它继续（别重派）。
+- **T3 已获证据（被打断前，写在它发出的中途汇报里）**：create_ip 幂等 ✅；全核 60 MHz 综合 ✅ 无 OOM（966 s / 峰值 4.09 GB）：**60 418 LUT(44.89%) / 16 552 FF / 12 BRAM / 34 DSP**，报告 `fpga/out/synth_16.667ns_*.rpt`、检查点 `fpga/out/post_synth_16.667ns.dcp`；**红灯：综合后 WNS −52.882 ns（TNS −9795.6，238 失败端点），Fmax≈14.4 MHz**——最差路径 `de_fp_op_reg[1] → u_fpu/u_fma_d（fsqrt 域）→ em_fp_wdata_reg[51]`，**166 级组合（CARRY4=93 + DSP48E1=3）≈ 69.4 ns**。即 T1 面积重写后，FPU 单个 fsqrt/fma 组合域仍是全核时序瓶颈（与 T2 的"非 FPU 归因"口径不同）。
+- **工作区（T3 半成品，恢复时由其续做）**：`fpga/tcl/synth.tcl`、`fpga/tcl/impl.tcl` 已改（周期参数化/策略）、`fpga/T3-report.md` 部分写出（未跟踪）。**不要 git checkout/stash/reset**。
+- **恢复后顺序**：① send_message 让 T3 续跑完 impl/100 MHz 证据并交付（含 FPU 关键路径"余量任务清单"）→ 提交 T3 的 tcl/报告；② **派新任务 T4：FPU 内部分级流水**（fsqrt/fma 对阶域切级，`rtl/exec/fpu*.v` 内改、fpu.v 端口契约不变、F 80/D 106 全绿回归网 + fpu_area 面积不暴涨 + 综合 WNS 收敛到 ≥0@60MHz）；③ T3/T4 后再跑全核 60/100 MHz 收口 M4；④ M5 上板。
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
 
