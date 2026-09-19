@@ -59,3 +59,5 @@ __pycache__/
 *.pyc
 fpga/ip/
 fpga/scratch/
+clockInfo.txt
+tight_setup_hold_pins.txt

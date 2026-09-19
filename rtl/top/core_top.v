@@ -303,6 +303,13 @@ module core_top (
     wire        xip_fetch_busy;
     reg         fencei_busy;
     reg  [31:0] fencei_pc_q;
+    //   ★ T2：`fencei_hold` = 扫描期 + **后一拍**（见 §13(9) 的说明）：
+    //     sfence.vma 触发的 L1D 全阵列失效被 T2 寄存一拍（见 §9.6 的维护脉冲寄存），
+    //     故 L1I 扫描（fencei_busy）比 L1D 扫描早结束 1 拍 ⇒ 前端必须多冻结 1 拍，
+    //     否则出现"L1D 仍在 maint_q 而前端已恢复取指"的窗口（L1D 在 maint 拍不登记
+    //     访问 ⇒ 该拍发出的 PTE 读会被静默丢弃、FSM 悬挂）。多冻结 1 拍无副作用。
+    reg         fencei_busy_q;
+    wire        fencei_hold = fencei_busy | fencei_busy_q;
 
     wire        l1d_cs_ready, l1d_cs_miss, l1d_cs_stall, l1d_cs_wr_done;
     wire [31:0] l1d_cs_rdata;
@@ -338,6 +345,12 @@ module core_top (
     reg  [31:0] f_tr_va_q;              // 本次取指页表遍历的 VA（发起时锁存）
     wire        f_tr_need, f_tr_tlb_any, f_tr_flt_hit, f_tr_ready, f_tr_pending;
     wire        f_tr_hold, f_tr_fault, f_tr_fault_is_af;
+    //   ★ T2 隐式声明修复：以下线网在文件中**多处先用后声明**（Verilog 会建 1 bit
+    //     隐式网，位宽/功能都不可控），故统一前置声明到此；赋值仍在各自原处。
+    //       · sfence_sync_pending ：kill_young / 重定向 / TLB 冲刷 / L1D 失效（§9 多处）
+    wire        sfence_sync_pending;
+    //   ★ T2（取指翻译结果寄存，见 §9.4.1）：声明前置。
+    wire        f_tr_res_v, f_tr_use;
     wire        f_tr_walk_start, f_tr_walk_done;
     wire        m_data_want, m_data_exc;
     wire        ptw_done_any;           // PTW 完成（含粘滞记账；见 §9.2 的 ptw_done_q）
@@ -730,10 +743,31 @@ module core_top (
     reg  fetch_exc_done_q;
     wire fetch_exc_pending = fetch_exc_valid & ~fetch_exc_done_q;
     wire fetch_exc_inject  = fetch_exc_pending & pipe_adv;
+    //--------------------------------------------------------------------------
+    //   ★ T2（2026-09-18，时序，不改语义）：冻结 F 用的取指异常标志**寄存一拍**
+    //--------------------------------------------------------------------------
+    //   归因（本轮综合最差路径的末端）：`取指 PMP 判定 → fetch_exc_valid →
+    //   fetch_exc_pending → fetch_pause → fu_fetch_req_valid → l1i_cs_req →
+    //   L1I 阵列读使能`（同一拍内从 PMP 进位链一路串到 BRAM 使能脚）。
+    //   这里把 **`fetch_pause` 用的那一份**改为寄存值（`fetch_exc_pending_q`），
+    //   从而把该反馈链打一拍：PMP 侧只需驱动一个寄存器 D 端。
+    //   异常**注入**仍用当拍的 `fetch_exc_pending`（见上 `fetch_exc_inject`），
+    //   故"异常挂到哪条指令、tval/mepc 取什么"逐位不变；被推迟的只是
+    //   "F 停止推进"的时刻（晚 1 拍）。
+    //   为什么安全：故障取指本身不会交付指令 —— `fetch_valid` 在 fetch_unit 内
+    //   已被 `~pmp_fault & ~fetch_ext_fault` 门控 ⇒ 那 1 拍最多多发一次
+    //   **幂等**取指读（l1i/l1d 侧不会重复发起填充：fill_active_q/fill_taken_q 守着），
+    //   且响应若在 pause 拍回来会被 `~fetch_busy` 丢掉、下一拍自动重发（同改前口径）。
+    //   代价：仅在**取指异常**发生时多 1~2 拍（正常路径零代价）。
+    reg fetch_exc_pending_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) fetch_exc_pending_q <= 1'b0;
+        else          fetch_exc_pending_q <= fetch_exc_pending;
+    end
     //   ⑥ 取指侧 Sv32 翻译未就绪（f_tr_hold）：此时 fetch_pc_pa 无意义（TLB 未命中
     //      ⇒ pa2_o 是 0 基址），必须冻结 F，否则会用错地址发取指请求。
-    wire fetch_pause       = ~pipe_adv | fetch_exc_pending | break_point |
-                             fencei_busy | xip_fetch_busy | f_tr_hold;
+    wire fetch_pause       = ~pipe_adv | fetch_exc_pending_q | break_point |
+                             fencei_hold | xip_fetch_busy | f_tr_hold;
 
     wire [31:0] fu_fetch_req_pa;
     wire        fu_fetch_req_valid;
@@ -824,8 +858,8 @@ module core_top (
     //     ② **cause 改写**：PTE 隐式访存违反 PMP 时 PTW 抛的是"原访问类型"的
     //        access-fault（取指 ⇒ cause 1），而 fetch_unit 对"翻译失败"统一写 12
     //        ⇒ 顶层按锁存的 PTW cause 改写（SvPMP/sv32_pmp_on_pte_* 正是测这一条）。
-    wire fu_exc_gated = fu_exc_valid & (~f_tr_need | f_tr_ready);
-    wire fexc_bus_gated = fetch_bus_err & (~f_tr_need | f_tr_ready);
+    wire fu_exc_gated = fu_exc_valid & (~f_tr_need | f_tr_use);
+    wire fexc_bus_gated = fetch_bus_err & (~f_tr_need | f_tr_use);
     assign fetch_exc_valid = fu_exc_gated | fexc_bus_gated;
     assign fetch_exc_cause = fu_exc_gated ?
                              (f_tr_fault_is_af ? `RV32GC_EXC_INSN_ACCESS_FAULT : fu_exc_cause) :
@@ -868,6 +902,16 @@ module core_top (
     wire        l1i_idle;
 
     //   cs_req 单点定义（响应归属校验 l1i_rsp_own 也要用同一条件，禁止两处各写一遍）
+    //--------------------------------------------------------------------------
+    //   ★ T2（2026-09-18，时序）：本请求的"长链入口"已在上游被切断，这里保持组合。
+    //     曾经试过把 `l1i_cs_req` 直接寄存一拍（最直观的切法），实测代价过大：
+    //     tb_m3_ddr3 拍数 853157 → 1103715（+29%，逼近该 TB 的 1.2M 拍超时上限），
+    //     且 AXI AR 笔数 22415 → 27788（多出的是"响应被丢弃后重发"的冗余取指）。
+    //     根因：L1I 是**每拍都要访问**的通路（不像 L1D/MDTA 是稀疏事件），
+    //     在它前面插寄存器等于给每条取指都加一拍。
+    //     改用上游切法（见 `fetch_pause` 处的 `fetch_exc_pending_q`）：只把
+    //     "取指异常 → 冻结 F"这条反馈链打一拍，取指正常路径一拍不加。
+    //--------------------------------------------------------------------------
     wire l1i_cs_req = fu_fetch_req_valid & fu_fetch_req_cacheable & ~fencei_busy;
 
     l1i #(
@@ -1204,6 +1248,17 @@ module core_top (
     wire [2:0]  fp_frm_eff = fp_em_wfr ? fp_em_frm :
                              fp_mw_wfr ? fp_mw_frm : frm_r;
 
+    //   ★ T2（2026-09-18）隐式声明修复（M4 遗留 T4，Vivado `[Synth 8-8895]` 13 处）：
+    //     Verilog 规定"先使用后声明"会创建 **1 bit 隐式网**，随后显式声明会被工具
+    //     判为"already implicitly declared"并**可能与隐式网冲突**（位宽静默截断）。
+    //     下面这些线网原先在本文件后面的声明区才声明，故在此**前置声明**（位宽与
+    //     使用处逐条核对一致），后面的重复声明一并删除。
+    //     · e_fp_src2/e_fp_src3：FPU 的 b/c 端口是 **64 bit**（见下方 fpu 例化），
+    //       若被隐式 1 bit 网截断，源操作数只有最低位 —— 故此处显式声明 64 bit，
+    //       赋值（前递 mux）仍在 §12.5 的原处，改为 assign 以免二次声明。
+    wire [63:0] e_fp_src2;
+    wire [63:0] e_fp_src3;
+
     fpu u_fpu (
     .clk       (aclk),
     .rst_n     (aresetn),
@@ -1408,6 +1463,49 @@ module core_top (
     .seip_o        (plic_seip)
     );
 
+    //--------------------------------------------------------------------------
+    // 8.1 ★ T2（2026-09-18，时序，不改语义）：中断源判决输出**寄存一拍**
+    //--------------------------------------------------------------------------
+    //   问题（M4 时序归因，post-synth 报告）：非 FPU 核最差一族路径的**唯一源**
+    //   就是 `u_plic/threshold_r`（1386/1449 个失败端点），链路为
+    //     PLIC 阈值/优先级/仲裁组合判定（阈值比较 + 32 源优先级树 + 仲裁）
+    //       → plic_meip/seip → csr_file 的 mip 组合视图 → trap_ctrl 的中断判定
+    //       → trap_valid / m_kill_fsm → M 级访存路由与 L1D 阵列使能/写使能
+    //   即"**PLIC 的 eip/优先级判定**与**M 级访存路由/写使能判定**同拍级联"，
+    //   实测该链 37 级逻辑、布线后 22.8 ns（route 占 77%）。
+    //
+    //   修法：把**中断判决输出**（PLIC 的 meip/seip、CLINT 的 msip/mtip）在进入
+    //   csr_file 的 mip 视图**之前**寄存一拍，把上述链一刀切在 PLIC 出口。
+    //
+    //   为什么语义不变（逐条）：
+    //     · 中断源（PLIC/CLINT 输出）是**异步外部事件**，ISA 不规定"源拉高→mip
+    //       可见"的精确拍数；寄存器化只相当于中断线路上多一级同步，属于规范允许的
+    //       实现自由度（[norm:plic/pending] 只要求 pending/priority 语义，未约束拍数）。
+    //     · 中断**不会丢**：源电平保持 ⇒ 寄存后仍持续可见（本处为电平寄存，非沿采样）。
+    //     · `mip` 的**软件可写位**（SEIP/STIP/SSIP）不经此处（在 csr_file 内部），
+    //       故 CSR 读写语义、WARL、同拍旁路一概不变。
+    //     · 唯一的可观测差异：中断被"看到"的时刻晚 1 拍（陷阱入口晚 1 拍）。
+    //       arch-test 只比对签名，不看拍数；CLINT/PLIC 单测（tb_plic/tb_clint）
+    //       测的是模块自身端口，不受顶层接线影响。
+    //   ★ 不写进 plic.v/clint.v：那两个模块的单元 TB（tb_plic/tb_clint）在 MMIO 写
+    //     之后**同拍**检查 meip_o/seip_o（如 tb_plic `CK(meip_o === 1'b1,…)`），
+    //     在模块内加寄存器会直接打破既有判据（本任务禁改 sim/unit 判据）。
+    reg         plic_meip_sync_q, plic_seip_sync_q;
+    reg         clint_msip_sync_q, clint_mtip_sync_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            plic_meip_sync_q  <= 1'b0;
+            plic_seip_sync_q  <= 1'b0;
+            clint_msip_sync_q <= 1'b0;
+            clint_mtip_sync_q <= 1'b0;
+        end else begin
+            plic_meip_sync_q  <= plic_meip;
+            plic_seip_sync_q  <= plic_seip;
+            clint_msip_sync_q <= clint_msip;
+            clint_mtip_sync_q <= clint_mtip;
+        end
+    end
+
     //==========================================================================
     // 9. M 级：lsu + L1D + TLB/PTW（Sv32）+ AMO/CMO 时序
     //==========================================================================
@@ -1562,13 +1660,26 @@ module core_top (
     wire        xret_redirect = mw_xret_valid & mw_valid & ~mw_exc_valid & ~trap_exc;
     wire [11:0] xret_epc_addr = (mw_xret_kind == 2'b01) ? `RV32GC_CSR_MEPC
                                                         : `RV32GC_CSR_SEPC;
-    wire [31:0] xret_epc_pc   = csr_rdata_raw;   // = {*epc[31:1],1'b0}（csr_file 读口）
+    //   ★ T2（2026-09-18，时序，不改语义）：xRET 重定向目标改用 csr_file 的
+    //     **专用 *epc 出口**（寄存器直出、取值口径与读口逐位相同：`{*epc[31:1],0}`），
+    //     不再借用唯一组合读口 `csr_rdata_raw`。
+    //     理由：`csr_rdata_raw` 是「全部 CSR 寄存器 → 地址译码 → 大 mux」的输出
+    //     （实测 37 级逻辑的入口），它 → `redirect_exc_pc` → `pc_gen` → `pc_r/D`
+    //     构成超长组合链；而 csr_file 里 `mepc_r/sepc_r` 本身就是寄存器，
+    //     单独引出口只经过一级 mux ⇒ 该链被整段削掉。
+    //     语义等价性：`{mepc_r[31:1],1'b0}` 与读口对 `RV32GC_CSR_MEPC` 的分支
+    //     逐位相同（csr_file.v §5 `rdata_r` 的对应 case）；且本拍 D/E/M 槽已被
+    //     kill_young 冲刷，"借读"读口不再承担任何功能（原实现的唯一用途就是本处）。
+    //     `csr_raddr_mux` 保持不变（仍为 de_csr_addr/de_csr 口径），以免动到
+    //     D 级 CSR 读通路（`csr_rdata_raw` 还供 §9 的 csr_base_rd 与 mstatus 视图）。
+    wire [31:0] csr_mepc_o, csr_sepc_o;
+    wire [31:0] xret_epc_pc   = (mw_xret_kind == 2'b01) ? csr_mepc_o : csr_sepc_o;
     wire [11:0] csr_raddr_mux = xret_redirect ? xret_epc_addr : de_csr_addr;
 
     //   ★ sfence.vma（2026-09 新增）：它在 W 提交，比它**更年轻**的 M/E/D 槽指令是
     //     用**旧翻译**取来的（页表可能刚被软件改写）⇒ 必须与陷阱/fence.i 同口径冲刷；
     //     同时把 F 重定向到 `sfence 的下一条`（复用 fence.i 的同步机制，见 §12.3.1）。
-    assign kill_young = trap_valid | xret_redirect | fencei_busy | sfence_sync_pending;
+    assign kill_young = trap_valid | xret_redirect | fencei_hold | sfence_sync_pending;
 
     // ---- 9.3 TLB ----
     wire        tlb_hit, tlb_perm_fault;
@@ -1639,12 +1750,19 @@ module core_top (
     //   tlb.v/ptw.v 各只有一个请求口，数据侧（M 级访存）已占用 ⇒ 取指侧**串行**复用：
     //   M 级引擎（M_S_TR 系列状态）在数据侧无事可做时，代取指侧跑一次页表遍历，
     //   结果经 f_tr_* 交回 F 级（详见 §9.4.1）。`m_tr_src_q` 记录本笔遍历的归属。
+    //   ★ T2 隐式声明修复：`ptw_pmp_ok` 是 ptw 例化的输入（见下方 `.pmp_resp_ok`），
+    //     必须先声明（1 bit，由 u_pmp_pte 的 allow_o 驱动）。
+    wire        ptw_pmp_ok;
+    //   ★ T2 隐式声明修复：M 级访存/翻译请求有效位（1 bit，赋值见 §9.4/§9.5）。
+    wire        m_ptw_req_valid;
+    wire        m_lsu_req_valid;
+
     wire        m_tr_is_fetch = m_tr_src_q & (m_state_q == M_S_TR);
     wire [31:0] m_ptw_req_va  = m_tr_is_fetch ? f_tr_va_q   : m_va;
     wire [1:0]  m_ptw_req_acc = m_tr_is_fetch ? 2'b00       : m_tlb_acc;
     wire [1:0]  m_ptw_req_priv= m_tr_is_fetch ? csr_priv_2  : csr_eff_priv;
     assign m_ptw_req_valid = (m_state_q == M_S_TR) & ~m_kill_fsm;
-    assign m_kill_fsm      = trap_valid | xret_redirect | fencei_busy |
+    assign m_kill_fsm      = trap_valid | xret_redirect | fencei_hold |
                              sfence_sync_pending;
 
     ptw u_ptw (
@@ -1690,7 +1808,7 @@ module core_top (
     );
 
     // PTE 隐式访存的 PMP 检查（08 §5.4 ④：PTE 取也要过 PMP，违反 ⇒ access-fault）
-    wire ptw_pmp_ok;
+    //   ★ T2：`ptw_pmp_ok` 的声明已前置（见 §9.4 前的隐式声明修复块）。
     pmp_check #(
     .PMP_ENTRIES (`RV32GC_PMP_ENTRIES)
     ) u_pmp_pte (
@@ -1750,20 +1868,81 @@ module core_top (
     assign f_tr_need    = satp_sv32 & (csr_priv_2 != PRIV_M);
     assign f_tr_tlb_any = f_tlb_hit | f_tlb_perm_fault;
     assign f_tr_flt_hit = f_tr_flt_v_q & (f_tr_flt_va_q == fu_fetch_pc);
+
+    //--------------------------------------------------------------------------
+    // ★ T2（2026-09-19，时序，不改语义）：取指侧**翻译结果寄存一拍**
+    //--------------------------------------------------------------------------
+    //   归因（布线后最差一族之一，17.86 ns、24 级、route 占 72%）：
+    //     `u_fetch_unit/u_pc_gen/pc_r[*]` →（TLB 各表项 VPN/ASID 比较 + 命中优先级
+    //     mux）→ `f_tlb_pa` → fetch_unit `fetch_pc_pa` → 取指 PMP 检查 →
+    //     `fetch_valid` → F→D 载荷寄存器 `fd_valid`。
+    //   修法：把 **TLB 第二查询口（取指侧）的结果**打一拍后再交给 fetch_unit
+    //     （PA + 有效位 + 权限故障 + 该结果对应的 PC）。
+    //
+    //   语义保证（逐条；已用 I/PMP/Sv/SvPMP/Svade/Svbare arch-test 复跑自证）：
+    //     · **只在"需要翻译"时多花 1 拍**：Bare/M 模式 `f_tr_need=0` ⇒ 本寄存器
+    //       完全不参与（`fetch_pc_pa = fetch_pc` 直通，逐拍与改前相同）⇒
+    //       非 Sv 用例**零拍数变化**；Sv 用例每次 PC 变化多 1 拍（F 冻结 1 拍等结果）。
+    //     · **结果必须对应当前 PC**：寄存器同时记下取指 PC（`f_tr_pc_q`），使用判据
+    //       `f_tr_res_v = f_tr_pa_v_q & (f_tr_pc_q == fu_fetch_pc)`；任何重定向改 PC
+    //       ⇒ 判据立刻为 0 ⇒ 退回"未就绪"（F 冻结、异常压制），下一拍重查。
+    //       **绝不**把上一拍 PC 的 PA 当作当前 PC 的 PA 使用。
+    //     · **作废条件 `m_kill_fsm | satp_wr_pulse`**（关键）：陷阱/xRET 会改变
+    //       特权级 ⇒ `f_tr_need` 变 0，此后本寄存器**停止刷新**却仍保留旧"命中"
+    //       结果；若 mret 返回**同一 VA**（陷阱返回地址就是故障 VA，属常态），旧 PA
+    //       会被当成新翻译使用 —— 软件改过页表/执行过 sfence 时即**错翻译**。
+    //       故必须在冲刷/改 satp 时显式作废。
+    //     · **不改"是否要遍历页表"**：`f_tr_ready`（→ `f_tr_pending` → 发起遍历）
+    //       仍用**组合** TLB 命中/权限故障 ⇒ 命中时绝不误发遍历。
+    //     · **F 冻结口径**：`f_tr_hold` 由"TLB 未命中"推广为"当前 PC 的结果尚未就绪"
+    //       （`~(f_tlb_hit & f_tr_res_v)`）⇒ 命中但未打拍那一拍同样冻结 F，绝不会用
+    //       陈旧 PA 发取指请求/做 PMP 检查。
+    //     · **异常压制口径**：`fu_exc_gated/fexc_bus_gated` 的限定由 `f_tr_ready`
+    //       （组合）改为 `f_tr_use = f_tr_res_v | f_tr_flt_hit`（结果确属当前 PC，
+    //       或本 PC 已有锁存故障）⇒ 陈旧 PA 上算出的 PMP/总线异常不可能被上报。
+    //     · **故障路径**：权限故障与遍历失败锁存（本身是寄存器、按 VA 匹配）不受
+    //       影响；tval=VA、cause 改写口径不变（仅晚 1 拍生效）。
+    //--------------------------------------------------------------------------
+    reg         f_tr_pa_v_q;     // 寄存结果有效（TLB 命中 或 权限故障）
+    reg         f_tr_pa_flt_q;   // 寄存结果是**权限故障**（而非成功翻译）
+    reg  [31:0] f_tr_pa_q;       // 寄存的翻译结果（PA）
+    reg  [31:0] f_tr_pc_q;       // 该结果对应的取指 PC（VA）
+    //   理由（AGENT.md §4 红线 3）：一级流水寄存器（时序元件），无组合译码。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            f_tr_pa_v_q   <= 1'b0;
+            f_tr_pa_flt_q <= 1'b0;
+            f_tr_pa_q     <= 32'h0;
+            f_tr_pc_q     <= 32'h0;
+        end else begin
+            //   ★ 清零必须写在 reset 的 `else` 分支**内**（同步清零）：写成块内
+            //     独立 `if` 会被 Vivado 当成第二个异步复位源 ⇒ [Synth 8-91]（实测）。
+            if (m_kill_fsm | satp_wr_pulse) begin
+                f_tr_pa_v_q <= 1'b0;
+            end else if (f_tr_need) begin
+                f_tr_pa_v_q   <= f_tlb_hit | f_tlb_perm_fault;
+                f_tr_pa_flt_q <= f_tlb_perm_fault;
+                f_tr_pa_q     <= f_tlb_pa;
+                f_tr_pc_q     <= fu_fetch_pc;
+            end
+        end
+    end
+    assign f_tr_res_v = f_tr_pa_v_q & (f_tr_pc_q == fu_fetch_pc);
+    assign f_tr_use   = f_tr_res_v | f_tr_flt_hit;
     assign f_tr_ready   = f_tr_tlb_any | f_tr_flt_hit;
     assign f_tr_pending = f_tr_need & ~f_tr_ready;
-    //   冻结 F 的判据：需要翻译但**没有可用结果**（TLB 未命中，或已判故障）
-    assign f_tr_hold    = f_tr_need & ~f_tlb_hit;
-    //   上报给 fetch_unit 的翻译结果
-    assign f_tr_fault   = f_tr_need & (f_tlb_perm_fault | f_tr_flt_hit);
+    //   冻结 F 的判据：需要翻译但**当前 PC 的结果尚不可用**（见上 ★ 说明）
+    assign f_tr_hold    = f_tr_need & ~(f_tlb_hit & f_tr_res_v);
+    //   上报给 fetch_unit 的翻译结果（寄存值；仅在 f_tr_use 成立时有意义）
+    assign f_tr_fault   = f_tr_need & ((f_tr_res_v & f_tr_pa_flt_q) | f_tr_flt_hit);
     //   PTE 访问违反 PMP ⇒ cause 1（不是 12）：顶层取指异常合并点据此改写 cause
     assign f_tr_fault_is_af = f_tr_need & f_tr_flt_hit &
                               (f_tr_flt_cause_q != `RV32GC_EXC_INSN_PAGE_FAULT);
 
     assign sv32_translate_en    = f_tr_need;
-    assign sv32_translate_done  = f_tr_need & f_tr_ready;
+    assign sv32_translate_done  = f_tr_need & f_tr_use;
     assign sv32_translate_fault = f_tr_fault;
-    assign sv32_translate_paddr = f_tlb_pa;
+    assign sv32_translate_paddr = f_tr_pa_q;
 
     // ---- 遍历发起/完成握手（与 M 级 FSM 的接口；FSM 侧见 §13(10)）----
     //   发起条件与 M_S_IDLE 的取指分支**逐字一致**（同名 wire 两处共用，防漂移）：
@@ -1915,10 +2094,10 @@ module core_top (
     wire [4:0]  l1d_fill_beats, l1d_wb_beats;
 
     // CMO 维护（08 §7.2：clean/inval 为 256 拍逐组扫描，以 idle 判定完成）
-    wire l1d_cmo_inval = (m_state_q == M_S_ISS) & lsu_cmo_valid &
-                         (lsu_cmo_action == 2'd3) & ~m_kill_fsm;
-    wire l1d_maint_clean = (m_state_q == M_S_ISS) & lsu_cmo_valid &
-                           ((lsu_cmo_action == 2'd1) | (lsu_cmo_action == 2'd2)) & ~m_kill_fsm;
+    wire l1d_cmo_inval_d = (m_state_q == M_S_ISS) & lsu_cmo_valid &
+                           (lsu_cmo_action == 2'd3) & ~m_kill_fsm;
+    wire l1d_maint_clean_d = (m_state_q == M_S_ISS) & lsu_cmo_valid &
+                             ((lsu_cmo_action == 2'd1) | (lsu_cmo_action == 2'd2)) & ~m_kill_fsm;
     //   ★ 2026-09 新增（Sv32 解锁必需，见 §9.3 sfence 注释）：**sfence.vma 必须让
     //     L1D 全阵列失效**。理由：页表隐式读（PTW 的 PTE 读）走 L1D（M_S_PTER），
     //     而软件的 PTE 写是普通 store ⇒ 走 AXI **旁路 L1D**（mmio_route 把 RAM 全部
@@ -1929,10 +2108,45 @@ module core_top (
     //     页表指针 PTE + sfence.vma 后仍走旧翻译（VA 0x9040_7014 ⇒ PA 0x8000_7014，
     //     应为 0x8000_9014）⇒ 取指拿到 0 ⇒ 非法指令（cause 2）。
     //   · inval_all 只需单拍脉冲：l1d 内部有 maint_q 逐组扫描（完成后 idle=1）。
-    //   · 与 l1i 的全阵列扫描（fencei_busy）同拍启动，两者互不依赖。
     //   · 安全性：L1D 内**不可能有脏行**（数据存取全走 AXI；唯一经 L1D 的写是
     //     M_S_PADW 的 A/D 更新，而 Svade 口径下该状态不可达）⇒ 丢弃行无数据损失。
-    wire l1d_maint_inval = l1d_cmo_inval | sfence_sync_pending;
+    //
+    //--------------------------------------------------------------------------
+    //   ★ T2（2026-09-18，时序，不改语义）：维护启动脉冲**寄存一拍**
+    //--------------------------------------------------------------------------
+    //   归因：post-synth 失败端点里最差一族（plru_*×768 / wb_buf×224 / FSM R,S 脚）
+    //   的**链路尾部**就是 `(inval_all|clean_all) & ~maint_q → L1D 内部 FSM 的
+    //   S/R 脚`，而 `inval_all` 由 `sfence_sync_pending`（含 `~trap_exc`）与
+    //   `l1d_cmo_inval`（含 `~m_kill_fsm`）组合而来 ⇒ 又把 PLIC→trap 长链拉进 L1D。
+    //   寄存一拍后这两个触发信号由寄存器直出，与上游解耦。
+    //
+    //   语义保证：
+    //     · 只是**晚 1 拍启动**扫描：`maint_q` 的 256 拍时长与"完成后 idle=1"口径不变；
+    //     · M 级 FSM 的 CMO 完成判定加 `~l1d_maint_go_q` 守卫（见 M_S_CMO）：
+    //       防止"扫描尚未真正启动（maint_q 仍 0、idle 仍 1）"那一拍被误判为已完成；
+    //     · **sfence 情形**：L1D 扫描相对 L1I 的 256 拍全阵列扫描（fencei_busy）
+    //       整体后移 1 拍 ⇒ fencei 侧同步延长 1 拍（`fencei_hold`，见 §13(9)），
+    //       保证"前端恢复取指时 L1D 扫描一定已结束"，不会出现
+    //       "扫描中途被访问（L1D 在 maint_q 拍不登记访问）"的悬挂。
+    //     · 多失效一次无害（ISA 允许 over-fence；L1D 无脏行）。
+    wire l1d_maint_inval_d = l1d_cmo_inval_d | sfence_sync_pending;
+
+    reg l1d_maint_inval_q, l1d_maint_clean_q;
+    //   理由（AGENT.md §4 红线 3）：一级流水/触发寄存器（时序元件），无组合译码。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            l1d_maint_inval_q <= 1'b0;
+            l1d_maint_clean_q <= 1'b0;
+        end else begin
+            l1d_maint_inval_q <= l1d_maint_inval_d;
+            l1d_maint_clean_q <= l1d_maint_clean_d;
+        end
+    end
+    //   `l1d_maint_go_q`：维护已下发（单拍）⇒ M_S_CMO 的完成判定守卫。
+    wire l1d_maint_go = l1d_maint_inval_q | l1d_maint_clean_q;
+
+    wire l1d_maint_inval = l1d_maint_inval_q;
+    wire l1d_maint_clean = l1d_maint_clean_q;
 
     // L1D 访问时序（★ l1d 口径：cs_req 是"本拍发出的访问"，会被寄存后复用 ⇒
     //   必须**单拍脉冲**，结果在下一拍由 cs_ready/cs_wr_done/cs_miss 给出）
@@ -1994,17 +2208,81 @@ module core_top (
     wire [31:0] m_mmio_req_addr = (m_mem_wr_op | m_amo_write)
                                   ? m_pa_eff : {m_pa_eff[31:2], 2'b00};
 
-    wire        l1d_cs_req  = (m_l1d_go | (m_state_q == M_S_PTER) |
-                               (m_state_q == M_S_PADW)) & ~m_kill_fsm;
-    wire        l1d_cs_we   = (m_state_q == M_S_PADW) ? 1'b1 :
+    //--------------------------------------------------------------------------
+    // ★ T2（2026-09-18，时序，不改语义）：M 级访存请求判决**寄存一拍**后送 L1D
+    //--------------------------------------------------------------------------
+    //   问题（M4 时序归因）：默认流程（phys_opt 前）的最差路径是
+    //     `u_plic/threshold_r → L1D 数据阵列 BRAM 的 ENBWREN`（37 级、22.8 ns、
+    //      route 77%）；post-synth 归因显示失败端点绝大多数是 **L1D 内部寄存器的
+    //     CE/S/R 脚**（plru_l0/l1a/l1b 共 768、wb_buf 224、acc_* 等），
+    //     而它们的共同驱动就是 `access = cs_req & …`（L1D 内部由 cs_req 组合派生）。
+    //     ⇒ 只要 `l1d_cs_req` 还是"PLIC 中断判定 / LSU PMP / M 级路由"的长组合链
+    //     的直出，这些端点就全部挂在同一条 22 ns 链上。
+    //
+    //   修法：把**判决**（req/we/paddr/vaddr/strb/wdata）打一拍再送 L1D，
+    //     即"M 级路由/写使能判定"与"L1D 阵列访问"之间插一级流水寄存器。
+    //     L1D 的 `cs_req` 从此由寄存器直出 ⇒ 其内部全部 CE/D/使能锥体的路径长度
+    //     与上游（PLIC/PMP/CSR）**彻底解耦**。
+    //
+    //   时序语义（逐条保证与改前逐位一致）：
+    //     · `l1d_cs_req` 仍是**单拍脉冲**（源 `m_l1d_go | PTER | PADW` 本身是
+    //       单拍状态量；M_S_ISS/M_S_PTER/M_S_PADW 都是 1 拍态），只是**晚 1 拍**；
+    //     · L1D 的响应（cs_ready/cs_wr_done/cs_miss）相应地晚 1 拍，
+    //       而 M 级 FSM 在这些状态（M_S_RSP/M_S_PTEW/M_S_PADX/M_S_DRAIN）里
+    //       **等的就是这些电平**（不是固定拍数）⇒ 只多等 1 拍，语义不变；
+    //     · **kill（冲刷）门控仍然当拍生效**：寄存器 D 端与最终输出都带
+    //       `~m_kill_fsm`（与原式逐字相同），故"陷阱/xRET/fence.i/sfence 拍不得
+    //       发出访存"这一条**没有丝毫放松**（错路径 store 依旧不可能落到阵列）；
+    //     · 相邻两笔 L1D 访问之间至少隔 1 个非请求态（ISS→RSP/MMIO/AXI、
+    //       PTER→PTEW、PADW→PADX），故单级寄存器不会丢请求；
+    //     · 访存**次数**不变（不新增、不重复请求）⇒ tb_m3_ddr3 的"软硬件计数
+    //       逐项相等"判据不受影响。
+    //   代价：每笔 L1D 访问多 1 拍（arch-test 只看签名，不看拍数）。
+    wire        l1d_req_d   = m_l1d_go | (m_state_q == M_S_PTER) |
+                              (m_state_q == M_S_PADW);
+    wire        l1d_we_d    = (m_state_q == M_S_PADW) ? 1'b1 :
                               ((m_state_q == M_S_PTER) ? 1'b0 : (m_mem_wr_op | m_amo_write));
-    wire [31:0] l1d_cs_paddr= ((m_state_q == M_S_PTER) | (m_state_q == M_S_PADW))
+    wire [31:0] l1d_paddr_d = ((m_state_q == M_S_PTER) | (m_state_q == M_S_PADW))
                               ? m_ptw_pte_pa_q : m_pa_eff;
-    wire [31:0] l1d_cs_vaddr= ((m_state_q == M_S_PTER) | (m_state_q == M_S_PADW))
+    wire [31:0] l1d_vaddr_d = ((m_state_q == M_S_PTER) | (m_state_q == M_S_PADW))
                               ? m_ptw_pte_pa_q : m_va;
-    wire [3:0]  l1d_cs_strb = (m_state_q == M_S_PADW) ? 4'hF : m_store_strb;
-    wire [31:0] l1d_cs_wdata= (m_state_q == M_S_PADW) ? m_ptw_pte_resp_d_q :
+    wire [3:0]  l1d_strb_d  = (m_state_q == M_S_PADW) ? 4'hF : m_store_strb;
+    wire [31:0] l1d_wdata_d = (m_state_q == M_S_PADW) ? m_ptw_pte_resp_d_q :
                               (m_amo_phase_q ? m_amo_wdata_q : m_store_w32);
+    reg         l1d_req_q, l1d_we_q;
+    reg  [31:0] l1d_paddr_q, l1d_vaddr_q, l1d_wdata_q;
+    reg  [3:0]  l1d_strb_q;
+    //   ★ 输出侧仍带 `~m_kill_fsm`（与改前逐字同式）：保证冲刷拍不产生访问。
+    //     （寄存器声明必须在 `l1d_req_go` **之前** —— 否则 Verilog 隐式建 1 bit
+    //      网，Vivado 报 `[Synth 8-6901] identifier 'l1d_req_q' is used before its
+    //      declaration`，功能上会丢掉位宽/驱动关系。）
+    wire        l1d_req_go  = l1d_req_q & ~m_kill_fsm;
+    //   理由（AGENT.md §4 红线 3）：这是一级**流水寄存器**（时序元件），
+    //   块内只有寄存器更新、无组合译码。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            l1d_req_q   <= 1'b0;
+            l1d_we_q    <= 1'b0;
+            l1d_paddr_q <= 32'h0;
+            l1d_vaddr_q <= 32'h0;
+            l1d_strb_q  <= 4'h0;
+            l1d_wdata_q <= 32'h0;
+        end else begin
+            l1d_req_q   <= l1d_req_d & ~m_kill_fsm;
+            l1d_we_q    <= l1d_we_d;
+            l1d_paddr_q <= l1d_paddr_d;
+            l1d_vaddr_q <= l1d_vaddr_d;
+            l1d_strb_q  <= l1d_strb_d;
+            l1d_wdata_q <= l1d_wdata_d;
+        end
+    end
+
+    wire        l1d_cs_req  = l1d_req_go;
+    wire        l1d_cs_we   = l1d_we_q;
+    wire [31:0] l1d_cs_paddr= l1d_paddr_q;
+    wire [31:0] l1d_cs_vaddr= l1d_vaddr_q;
+    wire [3:0]  l1d_cs_strb = l1d_strb_q;
+    wire [31:0] l1d_cs_wdata= l1d_wdata_q;
 
     l1d #(
     .OWNER_D_FILL (2'd1),
@@ -2113,6 +2391,21 @@ module core_top (
     assign csr_wen_w = mw_valid & mw_csr_we & ~mw_exc_valid & ~trap_exc;
     assign satp_wr_pulse = csr_wen_w & (mw_csr_addr == `RV32GC_CSR_SATP);
 
+    //   ★ T2 隐式声明修复：trap_ctrl 的握手线网原先在 §10 末尾（trap_ctrl 例化之后）
+    //     才声明，而 csr_file / priv_ctrl 例化处（下方）**先使用** ⇒ 被 Verilog 隐式
+    //     声明成 1 bit 网 ⇒ `trap_epc_i/trap_cause_i/trap_tval_i`（32 bit）与
+    //     `trap_target`（2 bit）/`trap_we`（4 bit）全部**静默截断**（Vivado 8-8895）。
+    //     这里前置声明，位宽与各使用处逐条核对：
+    //       · trap_we      ：csr_file.trap_we      = [3:0]（4 bit）✓
+    //       · trap_epc_i   ：csr_file.trap_epc_i   = [31:0] ✓
+    //       · trap_cause_i ：csr_file.trap_cause_i = [31:0] ✓
+    //       · trap_tval_i  ：csr_file.trap_tval_i  = [31:0] ✓
+    //       · trap_data_i  ：csr_file.trap_data_i  = [31:0]（本设计恒接 0）✓
+    //       · trap_target  ：priv_ctrl.trap_target = [1:0] ✓
+    wire [1:0]  trap_target;
+    wire [3:0]  trap_we;
+    wire [31:0] trap_epc_i, trap_cause_i, trap_tval_i, trap_data_i;
+
     csr_file u_csr_file (
     .clk         (aclk),
     .rst_n       (aresetn),
@@ -2142,11 +2435,11 @@ module core_top (
     .trap_cause_i(trap_cause_i),
     .trap_tval_i (trap_tval_i),
     .trap_data_i (32'h0000_0000),
-    .irq_msip    (clint_msip),
-    .irq_mtip    (clint_mtip),
-    .irq_meip    (plic_meip),
+    .irq_msip    (clint_msip_sync_q),
+    .irq_mtip    (clint_mtip_sync_q),
+    .irq_meip    (plic_meip_sync_q),
     .irq_stip    (1'b0),      // 核内无 S 级定时器源（08 §6.6）
-    .irq_seip    (plic_seip),
+    .irq_seip    (plic_seip_sync_q),
     .cycle_i     ({32'h0, cycle_cnt}),
     .instret_i   ({32'h0, instret_cnt}),
     .pmp_cfg_o   (pmp_cfg_o),
@@ -2161,7 +2454,10 @@ module core_top (
     .medeleg_o   (csr_medeleg),
     .mideleg_o   (csr_mideleg),
     .mie_o       (csr_mie),
-    .mip_o       (csr_mip)
+    .mip_o       (csr_mip),
+    //   ★ T2：xRET 重定向专用 *epc 出口（见 §9 的 R2/T2 说明）
+    .mepc_o      (csr_mepc_o),
+    .sepc_o      (csr_sepc_o)
     );
 
     assign pmp_cfg_flat  = pmp_cfg_o;
@@ -2209,10 +2505,9 @@ module core_top (
     );
     assign csr_priv = csr_priv_2[0];
 
-    wire [1:0]  trap_target;
+    //   ★ T2：`trap_target/trap_we/trap_epc_i/trap_cause_i/trap_tval_i/trap_data_i`
+    //     的声明已前置到 §10 的 csr_file 例化之前（隐式声明修复），此处不再重复。
     wire [31:0] trap_cause, trap_tval, trap_epc, trap_pc, trap_redirect_pc;
-    wire [3:0]  trap_we;
-    wire [31:0] trap_epc_i, trap_cause_i, trap_tval_i, trap_data_i;
 
     trap_ctrl u_trap_ctrl (
     .commit_valid  (mw_valid),
@@ -2308,6 +2603,10 @@ module core_top (
     //     故 want 必须排除 done 拍（M_S_AXI 收到 done 当拍就完成并转 IDLE）。
     //   ★ 冲刷拍（m_kill_fsm=kill_young）同样必须排除：该拍 M 槽指令已被判定作废，
     //     不得再为它发起新的 MDTA 请求（在途记账兜底，见文件头 §2j）。
+    //   ★ T2：CMO 探测笔的块对齐地址（由**寄存器** `m_cmo_probe_q` 选择；
+    //     见 §13 M_S_ISS 的 `m_mmio_pa_q` 锁存处说明）。
+    wire [31:0] m_mmio_pa_eff = m_cmo_probe_q ? (m_mmio_pa_q & M_CMO_BLOCK_MSK)
+                                              : m_mmio_pa_q;
     wire m_axi_want   = (m_state_q == M_S_AXI) & ~axi_done_q & ~m_kill_fsm;
     wire axi_free     = (axi_owner_q == AXO_NONE) & ~axi_busy;
     wire grant_wrbk   = axi_free &  l1d_wb_req;
@@ -2316,22 +2615,22 @@ module core_top (
     wire grant_xipf   = axi_free & ~l1d_wb_req & ~l1d_fill_req & ~m_axi_want & xip_req_go;
     wire grant_ifil   = axi_free & ~l1d_wb_req & ~l1d_fill_req & ~m_axi_want &
                         ~xip_req_go & l1i_fill_req;
-    wire axi_req_go   = grant_wrbk | grant_dfil | grant_mdta | grant_xipf | grant_ifil;
+    wire axi_req_go_raw   = grant_wrbk | grant_dfil | grant_mdta | grant_xipf | grant_ifil;
 
-    wire [2:0]  axi_owner_sel = grant_wrbk ? AXO_WRBK :
+    wire [2:0]  axi_owner_raw = grant_wrbk ? AXO_WRBK :
                                 grant_dfil ? AXO_DFIL :
                                 grant_mdta ? AXO_MDTA :
                                 grant_xipf ? AXO_XIPF : AXO_IFIL;
-    wire [31:0] axi_req_addr_sel = grant_wrbk ? l1d_wb_paddr :
-                                   grant_dfil ? l1d_fill_paddr :
-                                   grant_mdta ? m_mmio_pa_q :
-                                   grant_xipf ? fu_fetch_req_pa :
-                                                l1i_fill_paddr;
-    wire [4:0]  axi_req_beats_sel = grant_wrbk ? (l1d_wb_beats + 5'd1) :
-                                    grant_dfil ? (l1d_fill_beats + 5'd1) :
-                                    grant_mdta ? 5'd1 :
-                                    grant_xipf ? 5'd1 :
-                                                 (l1i_fill_beats + 5'd1);
+    wire [31:0] axi_addr_raw = grant_wrbk ? l1d_wb_paddr :
+                               grant_dfil ? l1d_fill_paddr :
+                               grant_mdta ? m_mmio_pa_eff :
+                               grant_xipf ? fu_fetch_req_pa :
+                                            l1i_fill_paddr;
+    wire [4:0]  axi_beats_raw = grant_wrbk ? (l1d_wb_beats + 5'd1) :
+                                grant_dfil ? (l1d_fill_beats + 5'd1) :
+                                grant_mdta ? 5'd1 :
+                                grant_xipf ? 5'd1 :
+                                             (l1i_fill_beats + 5'd1);
     // ---- 11.1.1 ★ D4 修复：MDTA（M 级平台 MMIO/XIP 数据访问）的**写支持** ----
     //   原实现只把 `grant_wrbk`（L1D 脏行写回）认成写：
     //     · axi_req_iswr_sel = grant_wrbk ⇒ 对 UART 的 sb 被当**读**发出（AR）；
@@ -2344,13 +2643,96 @@ module core_top (
     //       MDTA 写取 M 级锁存的 store 数据/字节使能（m_mmio_wdata_q/m_mmio_strb_q）
     //       —— 同一 mux 覆盖"在途写事务"的整个 ST_AW/ST_W 阶段；
     //     · 完成：等 B 响应后的 done（见 §11.6 的 done owner 记账）。
-    wire axi_mdta_wr      = (axi_owner_q == AXO_MDTA) & axi_is_wr_q;   // 在途 MDTA 写
-    wire axi_wdata_is_l1d = grant_wrbk | ((axi_owner_q == AXO_WRBK) & axi_is_wr_q);
-    wire axi_wdata_valid_sel = axi_wdata_is_l1d ? l1d_wb_ready : axi_mdta_wr;
+    wire axi_iswr_raw = grant_wrbk | (grant_mdta & m_mmio_we_q);
+
+    //--------------------------------------------------------------------------
+    // ★ T2（2026-09-18，时序，不改语义）：AXI 请求仲裁结果**寄存一拍**
+    //--------------------------------------------------------------------------
+    //   归因（post-route）：`u_csr_file/satp_r[24] → u_axi_master_ctrl/len_q[3]/D`
+    //   是非 FPU 核的最差路径（22.48 ns，含"翻译后的取指 PA → XIP 判定 →
+    //   `axi_req_*_sel` 5 选 1 大 mux → axi_req_desc 的 4 K 边界/beat 计算 →
+    //   `len_q <= req_beats_1 - 1`"的整条控制链，其中 route 占 72%）。
+    //   修法：把仲裁结果（valid/owner/addr/beats/is_write）在送
+    //   axi_req_desc + axi_master_ctrl **之前**打一拍 ⇒ 描述符与
+    //   `len_q/beats_q/first_beats_q/split_req_q` 的输入与上游翻译/路由链解耦。
+    //
+    //   语义保证（逐条）：
+    //     · **单笔在途不破**：控制器 `req_ready = ~busy & ~split_pending`；
+    //       本寄存器只在 `req_ready=1`（控制器空闲）时装载，且"已有登记未交接"时
+    //       优先交接（清登记），故任一时刻最多一笔在途（与原口径一致）；
+    //     · **不丢请求**：各请求源（l1d_wb_req / l1d_fill_req / l1i_fill_req /
+    //       xip_req_go / m_axi_want）都**保持到被接受**（cache 侧 fill_taken/wb_taken、
+    //       XIP 侧 xip_req_pend_q、M 侧 M_S_AXI 状态），故晚 1 拍交接不会丢；
+    //     · **冲刷仍当拍生效**：装载与交接两处都带 `~m_kill_fsm`（错路径不得发总线
+    //       事务，尤其 MMIO 写）；被冲刷的那笔登记直接作废（其请求源本身也被冲刷）；
+    //     · **地址归属**：XIP 的地址标签 `xip_word_pa_q` 改为在**交接拍**取自
+    //       寄存后的地址（`axi_addr_sel`），与真正发出的地址严格同源（防"PC 在
+    //       登记与交接之间被重定向"导致标签错位 —— 见 §5.4 的 ★ 说明）；
+    //     · **事务笔数不变**（不新增、不重复）⇒ tb_m3_ddr3 的软/硬件计数判据不变。
+    //   代价：每笔 AXI 事务的**发起**晚 1 拍（事务本身的拍数不变）。
+    reg         axi_rq_v_q;
+    reg  [2:0]  axi_rq_owner_q;
+    reg  [31:0] axi_rq_addr_q;
+    reg  [4:0]  axi_rq_beats_q;
+    reg         axi_rq_iswr_q;
+    //   理由（AGENT.md §4 红线 3）：一级请求寄存器（时序元件），无组合译码。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            axi_rq_v_q     <= 1'b0;
+            axi_rq_owner_q <= AXO_NONE;
+            axi_rq_addr_q  <= 32'h0;
+            axi_rq_beats_q <= 5'd0;
+            axi_rq_iswr_q  <= 1'b0;
+        end else if (axi_req_ready) begin
+            //   控制器空闲：① 若已有登记 ⇒ 本拍交接（清登记）；
+            //                ② 否则登记本拍的组合仲裁结果。
+            //   ★ 装载**不再叠加** `~m_kill_fsm`：MDTA（M 级访存）的冲刷门控本来就在
+            //     `m_axi_want` 里（与原设计逐字一致），而填充/写回**必须**能在任意拍
+            //     被登记 —— 见下方交接处的 ★★ 说明。
+            axi_rq_v_q <= axi_rq_v_q ? 1'b0 : axi_req_go_raw;
+            if (!axi_rq_v_q) begin
+                axi_rq_owner_q <= axi_owner_raw;
+                axi_rq_addr_q  <= axi_addr_raw;
+                axi_rq_beats_q <= axi_beats_raw;
+                axi_rq_iswr_q  <= axi_iswr_raw;
+            end
+        end
+    end
+
+    //   ---- 送描述符/控制器的请求（= 寄存后的仲裁结果）----
+    //   ★★ 冲刷门控**只对 MDTA**（2026-09-19 实测根因修复，务必保留此形式）：
+    //     现象：Sv 组 8 例由"与基线同集失败"变成"另一集失败/挂死"，定位到本寄存级：
+    //       取指请求 `fu_req_v=1`、`fetch_pause=0`，但 AXI 上**无 AR 在途**，
+    //       1500000 拍超时（L1I 永远等不到行填充）。
+    //     根因：L1I/L1D 的 `fill_req` **不是无条件保持**的电平 —— L1I 侧
+    //       `fill_req = new_miss & ~fill_taken_q`、`new_miss = acc_q & ~any_hit & ~fill_active_q`，
+    //       而 `acc_q <= access = cs_req & ~…`；`cs_req` 又受 `~fencei_busy` 门控
+    //       ⇒ **冲刷拍（陷阱/xRET/fence.i/sfence）一到，`fill_req` 会随取指请求一起
+    //       撤销**。原设计里"授予 == 同拍接受"（`axi_free` 与 `req_ready` 同拍）
+    //       ⇒ 被授予的填充绝不会丢；本寄存级一旦在交接拍叠加 `~m_kill_fsm`，
+    //       就会把"已登记但尚未交接"的填充**静默丢弃**，且请求方已不再拉高
+    //       ⇒ L1I `miss_q=1`、`fill_active_q=0`、无在途填充 ⇒ 永久等响应（死锁）。
+    //     修法（= 回到原设计的**逐条**语义）：`grant_wrbk/grant_dfil/grant_ifil`
+    //       在原设计里**没有**冲刷门控，只有 MDTA 有（`m_axi_want` 的 `~m_kill_fsm`）
+    //       ⇒ 交接拍也只对 MDTA 取消。填充是幂等读、写回写的是已缓存行数据，
+    //       在冲刷拍放行都是安全的；而 MDTA 可能是错路径 store（尤其 MMIO 写），
+    //       必须当拍取消（取消失败的登记直接丢弃 —— 其请求方（M 级 FSM）同拍被冲刷，
+    //       不会有任何一方在等它）。
+    wire        axi_rq_is_mdta = (axi_rq_owner_q == AXO_MDTA);
+    wire        axi_req_go    = axi_rq_v_q & (~axi_rq_is_mdta | ~m_kill_fsm);
+    wire [2:0]  axi_owner_sel = axi_rq_owner_q;
+    wire [31:0] axi_req_addr_sel  = axi_rq_addr_q;
+    wire [4:0]  axi_req_beats_sel = axi_rq_beats_q;
+    wire        axi_req_iswr_sel  = axi_rq_iswr_q;
+
+    //   ---- "本拍生效的归属"：交接拍 = 登记值，在途期 = 控制器锁存值 ----
+    wire [2:0]  axi_own_eff   = axi_rq_v_q ? axi_rq_owner_q : axi_owner_q;
+    wire        axi_iswr_eff  = axi_rq_v_q ? axi_rq_iswr_q  : axi_is_wr_q;
+    wire        axi_mdta_wr      = (axi_own_eff == AXO_MDTA) & axi_iswr_eff;  // 在途/交接 MDTA 写
+    wire        axi_wdata_is_l1d = (axi_own_eff == AXO_WRBK);
+    wire        axi_wdata_valid_sel = axi_wdata_is_l1d ? l1d_wb_ready : axi_mdta_wr;
     wire [31:0] axi_wdata_data_sel = axi_wdata_is_l1d ? l1d_wb_data : m_mmio_wdata_q;
     wire [3:0]  axi_wstrb_sel      = axi_wdata_is_l1d ? 4'hF : m_mmio_strb_q;
-
-    wire axi_req_iswr_sel = grant_wrbk | (grant_mdta & m_mmio_we_q);
 
     // ---- 11.2 axi_req_desc：PMA 译码 + 4 K 拆分描述符（地址窗口唯一实现处）----
     wire        desc_valid_t, desc_split_t, desc_legal_t;
@@ -2403,6 +2785,10 @@ module core_top (
     //   ② MMIO/XIP 单 beat。⇒ desc_split 恒 0、第二笔恒 0；公式仍按规格完整实现。
     wire [4:0] axi_beats_1 = (desc_to_4k_t < desc_beats_t) ? desc_to_4k_t : desc_beats_t;
     wire [4:0] axi_beats_2 = axi_req_beats_sel - axi_beats_1;
+
+    //   ★ T2 隐式声明修复：axi_master_ctrl 的 m_awlock/m_arlock 输出（3 bit）
+    //     原先在该例化**之后**才声明 ⇒ 隐式 1 bit 网截断。这里前置声明（3 bit）。
+    wire [2:0] awlock_raw, arlock_raw;
 
     axi_master_ctrl #(
     .ADDR_W (32), .DATA_W (32), .STRB_W (4), .ID_W (4), .LEN_W (4),
@@ -2480,7 +2866,9 @@ module core_top (
     );
 
     // ★ awlock/arlock：高位显式置 0（08 §4.2 规则 2；平台只接 [0:0]）
-    wire [2:0] awlock_raw, arlock_raw;
+    //   ★ T2 隐式声明修复：这两个线网是 axi_master_ctrl 例化（上方）的**输出连接**，
+    //     原先在本行才声明 ⇒ 被隐式 1 bit 网截断（3 bit 端口的 [2:1] 悬空）。
+    //     声明已前置到 §11.2 的 axi_master_ctrl 例化之前（见该处）。
     assign awlock = {1'b0, awlock_raw[0]};
     assign arlock = {1'b0, arlock_raw[0]};
     assign wid    = `RV32GC_AXI_ID_I_FILL;      // 2A 单笔在途只发 ID 0
@@ -2698,8 +3086,8 @@ module core_top (
     // ---- 12.0 本节的组合载荷声明（供 §13 时序块引用）----
     wire        em_go, mw_go, mw_cap;
     wire        m_exc_any, mw_n_excv;
-    wire        m_ptw_req_valid;
-    wire        m_lsu_req_valid;
+    //   ★ T2：`m_ptw_req_valid` / `m_lsu_req_valid` 的声明已前置到 §9.4 之前
+    //     （隐式声明修复），此处不再重复声明。
     // ---- 12.1 E 级异常汇总（D 级非法 + E 级特权违规 + ecall/ebreak）----
     //   优先级：携带异常（取指）> 非法指令 > ecall/ebreak（同一条指令最多一个）
     wire [4:0] e_exc_cause =
@@ -2774,7 +3162,8 @@ module core_top (
     //     复用 fence.i 的 256 组扫描（代价 ~256 拍/条，Sv32 用例可接受）。
     //   · 不并入 fencei_sync_pending 的 `~fencei_busy` 项：sfence 可能在扫描期间
     //     到达（两者都是 W 提交拍，互斥于 mw_valid 的单拍语义），此处按同一拍判定。
-    wire sfence_sync_pending =
+    //   ★ T2：声明已前置（见 §9.4 前的隐式声明修复块），此处只赋值。
+    assign sfence_sync_pending =
         mw_valid & mw_sfence_vma & ~mw_exc_valid & ~trap_exc;
     wire stream_sync_pending = fencei_sync_pending | sfence_sync_pending;
 
@@ -2883,8 +3272,10 @@ module core_top (
     wire fp_load_use_stall = ~m_fp_prod_rdy & (e_fs1_hit | e_fs2_hit | e_fs3_hit);
     // 前递后的 FP 源（fs1/fs2/fs3）：优先级 M（更年轻）> fregfile 读口（含 W 写优先）
     wire [63:0] e_fp_src1 = e_fs1_hit ? m_fp_fwd_data : freg_rdata1;
-    wire [63:0] e_fp_src2 = e_fs2_hit ? m_fp_fwd_data : freg_rdata2;
-    wire [63:0] e_fp_src3 = e_fs3_hit ? m_fp_fwd_data : freg_rdata3;
+    //   ★ T2：`e_fp_src2/e_fp_src3` 的**声明已前置**（见 §7 FPU 例化前的隐式声明修复块），
+    //     此处只做赋值（若仍写成 `wire … = …` 会与前置声明重复 ⇒ 又一处 8-8895）。
+    assign e_fp_src2 = e_fs2_hit ? m_fp_fwd_data : freg_rdata2;
+    assign e_fp_src3 = e_fs3_hit ? m_fp_fwd_data : freg_rdata3;
 
     assign load_use_stall = (em_valid & m_is_load_kind & (em_rd != 5'd0) &
                              ~m_mem_done &
@@ -2962,6 +3353,7 @@ module core_top (
             xip_word_pa_q <= 32'h0; xip_word_data_q <= 32'h0; xip_word_vld_q <= 1'b0;
             xip_req_pend_q <= 1'b0;
             fencei_busy <= 1'b0; fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
+            fencei_busy_q <= 1'b0;
             //------------------------ M 级 FSM ------------------------
             m_state_q <= M_S_IDLE; m_retry_q <= M_S_ISS; m_pa_q <= 32'h0;
             m_tr_src_q <= 1'b0; ptw_done_q <= 1'b0;
@@ -3268,8 +3660,11 @@ module core_top (
             end else if (axi_fire_req & (axi_owner_sel == AXO_XIPF)) begin
                 xip_req_pend_q <= 1'b1;
             end
-            if (xip_req_go) begin
-                xip_word_pa_q <= fu_fetch_req_pa;
+            if (axi_fire_req & (axi_owner_sel == AXO_XIPF)) begin
+                //   ★ T2：XIP 地址标签在**交接拍**取寄存后的请求地址（与真正发出的
+                //     地址严格同源；原实现取 `xip_req_go` 当拍的组合地址，在请求被
+                //     寄存一拍后可能与实际发出地址错位）。
+                xip_word_pa_q <= axi_req_addr_sel;
             end
             if ((axi_owner_q == AXO_XIPF) & axi_rdata_valid) begin
                 xip_word_data_q <= axi_rdata_data;
@@ -3279,6 +3674,9 @@ module core_top (
             end
 
             // ================= (9) fence.i 全阵列失效扫描 =================
+            //   ★ T2：`fencei_busy_q` = 扫描标志的 1 拍延迟副本 ⇒ `fencei_hold`
+            //     把前端冻结延伸 1 拍，覆盖 L1D 侧被寄存一拍的维护扫描（见 §2 fencei_hold）。
+            fencei_busy_q <= fencei_busy;
             //   ★ l1i 的 inval_all 只清"当前 cs_vaddr 索引所在组"（l1i.v:150-154）
             //     ⇒ 必须由 core_top 扫 256 组；期间冻结 F 并重定向到 fence.i 之后。
             if (stream_sync_pending) begin
@@ -3447,8 +3845,19 @@ module core_top (
                         // ★ 2026-09-17（T-E）：CMO 的 PMA 探测地址 = **块对齐后的物理地址**
                         //   （64 B 块，与 cmo_unit/Spike `paddr - (va & (blocksz-1))` 同口径）；
                         //   其余访问保持原样（m_pa_eff）。
-                        m_mmio_pa_q    <= (m_cmo_probe_go ? (m_pa_eff & M_CMO_BLOCK_MSK)
-                                                          : m_pa_eff);
+                        //   ★ T2（2026-09-19，时序，不改语义）：这里**不再**用
+                        //     `m_cmo_probe_go` 做组合选择 —— 它是 lsu 的组合输出
+                        //     （`lsu_cmo_valid & lsu_route==ROUTE_AXI`，深锥体），
+                        //     与本寄存器的 D 端同拍级联，实测构成 16.0 ns 的最差路径
+                        //     （`em_rs1_val → amo/PMP → m_cmo_probe_go → 本寄存器 D`）。
+                        //     改为**无条件锁存 m_pa_eff**，块对齐掩码挪到使用处
+                        //     （`m_mmio_pa_eff`，由**寄存器** `m_cmo_probe_q` 选择）
+                        //     ⇒ 对本寄存器而言 D 端只剩寄存器值，路径被切断。
+                        //     语义等价：`m_mmio_pa_q` 的唯一使用处就是 MDTA 请求地址
+                        //     （§11 的 `axi_req_addr_sel`），而 CMO 探测态由
+                        //     `m_cmo_probe_q`（寄存器，探测期间恒 1）表征 ⇒ 两种写法
+                        //     在探测拍给出**逐位相同**的地址。
+                        m_mmio_pa_q    <= m_pa_eff;
 
                         // ★ SC 成败必须在**请求拍**采样并保持（2026-09-17，
                         //   PMPZalrsc_cfg_wr-00 根因）：amo_unit 在本拍按规范清除保留
@@ -3689,7 +4098,12 @@ module core_top (
 
                     //----------- CMO 维护扫描等待（以 l1d.idle 判定完成）-----------
                     M_S_CMO: begin
-                        if (l1d_idle) begin
+                        //   ★ T2：维护启动脉冲被寄存一拍 ⇒ 进入本状态的**首拍**
+                        //     L1D 的 maint_q 尚未拉高（idle 仍为 1），若不设守卫会
+                        //     把"扫描还没开始"误判成"扫描已完成"（CMO 提前提交）。
+                        //     守卫 `~l1d_maint_go`：本拍正是下发脉冲那一拍 ⇒ 必须再等；
+                        //     下一拍起 maint_q=1 ⇒ idle=0 ⇒ 等扫描结束（原口径不变）。
+                        if (l1d_idle & ~l1d_maint_go) begin
                             m_state_q <= M_S_IDLE;
                             m_done_q  <= 1'b1;
                         end
