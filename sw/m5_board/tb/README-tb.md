@@ -72,8 +72,8 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_selftest.hex RUN_TAG=ctl_a_nosticky R_STICKY
 |---|---|---|
 | `ctl_a` | 控制实验 A（自检） | **PASS**（C0–C5；回读 LED `0x00001234`、数码管 `0x00001234`、switch `0x000000A5`、TIMER 增量 `0x141D`、FREQ `0x01F78A40`） |
 | `ctl_c` | 控制实验 C | `ticks = 0x0001CD21 = 118 049`（2 000 轮）⇒ **59.02 拍/轮**（9 条指令 ⇒ 6.56 拍/指令） |
-| `ctl_b_final2` | **冻结版** `m5_board.S` md5 `b824c9f0…` / hex `43758f32…` 的缩放副本 | **PASS**：C0–C5 全过；串口末行 `step4 timer delta ticks = 118043, cycles/iter = 59, expected ticks = 118000` / `step5 FREQ = 0x01F78A40 (div1e6 = 33 MHz)` / `RESULT: RV32GC-M5-OK`；判定于 **≈2.0–2.8e6 拍**完成（结果行前缀 + 4 字节宽限提前收尾） |
-| `verify_final_b824c9f0` | 同上（父 Agent 用本 TB 独立复跑） | **PASS**（同口径；日志 `out/verify_final_b824c9f0.log`） |
+| `ctl_b_final2` | **冻结版** `m5_board.S` md5 `b824c9f0…` / hex `43758f32…` 的缩放副本 | **PASS**：C0–C5 全过；串口 568 字节，末行 `step4 timer delta ticks = 118043, cycles/iter = 59, expected ticks = 118000` / `step5 FREQ = 0x01F78A40 (div1e6 = 33 MHz)` / `RESULT: RV32GC-M5-OK`；判定于 **2 754 131 拍**完成（结果行前缀 + 4 字节宽限提前收尾），rc=0 |
+| `verify_final_b824c9f0` | 同上（父 Agent 用本 TB 独立复跑） | **PASS**（同口径；日志 `out/verify_final_b824c9f0.log`，唯一 PASS 锚点 1 行） |
 | `ctl_b_v4` / `ctl_b_v5` / `ctl_b_v6` | 中间版本 | FAIL→PASS 演进，见 §5 缺陷清单（每个缺陷都是一次实测定位） |
 | `spec4m` / `frozen3m` | 冻结程序完整版 | **预算不足**（§5.6）：4M 拍只到横幅第 ~24 字节 |
 
