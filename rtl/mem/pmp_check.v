@@ -169,32 +169,27 @@ module pmp_check #(
     //
     //   ★ 关键易错点：**不能**去数尾随 0 个数（地址高位全 0 时会把整个空间算成一个块）。
     //     唯一正确的量是低位「连续 1」的个数；全 1 编码表示最大块。
-    function integer napot_ones;
-        input [ADDR_W-1:0] a;        // pmpaddr（字地址口径）
-        integer k;                   // 低位连续 1 的个数
-        begin
-            k = 0;
-            // 从最低位起数连续 1（NAPOT 编码的核心量）
-            while ((k < NAPOT_FIELD_W) && (a[k] == 1'b1)) begin
-                k = k + 1;
-            end
-            napot_ones = k;
-        end
-    endfunction
-
-    // 返回「块内字地址掩码」（低 n+1 位全 1）。
-    // n = ADDR_W-1（全 1 编码）⇒ n+1 = ADDR_W ⇒ 掩码全 1（块取最大，覆盖整个地址空间）；
-    // 移位需防越界。
+    //
+    //   ★ T5（2026-09-20，时序，**语义逐位不变**）：掩码改用恒等式
+    //        napot_wordmask(a) = a ^ (a + 1)
+    //     取代原先的「数低位连续 1 的个数 n（napot_ones 优先编码）→ 变长移位
+    //     生成低 n+1 位掩码」两步写法。等价性证明：
+    //       设 a 的低位形如 …yyy0 1^n（n = 低位连续 1 的个数，0 ≤ n ≤ ADDR_W；
+    //       a 全 1 ⇒ n = ADDR_W），则 a + 1 = …yyy1 0^n
+    //       ⇒ a ^ (a+1) = 低 (n+1) 位全 1、其余位 0 —— 正是本函数要求的「低 n+1 位
+    //         掩码」；n+1 ≥ ADDR_W 时（含 a 全 1 与 a = 2^(ADDR_W-1)-1 两个边界）
+    //         逐位展开同样得到全 1 掩码，与原 `napot_ones + 特判` 逐位相同。
+    //     收益（M4/T5 时序归因，`fpga/out/t5_s60_synthpaths.rpt` / 布线失败端点）：
+    //       该解码原为「32 位优先编码 + 桶形移位」≈6 级 LUT，且因 5 个 pmp_check
+    //       实例共享而被复制到全网、跨模块长线（实测 pmp_addr_r → fd_exc_valid
+    //       路径的 4.77 ns 头段全部是它）；改为「1 条 32 位增量进位链 + 1 级异或」
+    //       后进位链落在单个 CARRY4 列内，几乎不产生跨模块长线。
+    //     注：原 `napot_ones` 函数随本次改写删除（已无调用者；其语义与编码表
+    //       仍由本节注释与 docs/kb/isa-notes.md 承载）。
     function [ADDR_W-1:0] napot_wordmask;
         input [ADDR_W-1:0] a;
-        integer n;
         begin
-            n = napot_ones(a);
-            if ((n + 1) >= ADDR_W) begin
-                napot_wordmask = {ADDR_W{1'b1}};
-            end else begin
-                napot_wordmask = ({{(ADDR_W-1){1'b0}}, 1'b1} << (n + 1)) - 1'b1;
-            end
+            napot_wordmask = a ^ (a + {{(ADDR_W-1){1'b0}}, 1'b1});
         end
     endfunction
 
@@ -385,15 +380,33 @@ module pmp_check #(
         end
     endgenerate
 
-    wire [PMP_ENTRIES-1:0] no_prior_hit;   // 第 i 位 = 项 0..i-1 全未命中
-    assign no_prior_hit[0] = 1'b1;
-    genvar gj;
+    //   ★ T5（2026-09-20，时序，**语义逐位不变**）：前缀或改成**显式共享的
+    //     Hillis-Steele 前缀树**（⌈log2 N⌉ = 4 级，N=16）。
+    //     原写法 `assign no_prior_hit[gj] = ~|any_flat[gj-1:0];` 是 15 条**宽度各异**
+    //     的独立归约；综合/实现阶段工具会为每条归约各自重建前缀逻辑（布线后网表里
+    //     出现大量 `*_rewire_rewire` / `*_replica_*` 副本），实测这 10 级优先级/
+    //     选择网络的 route 占 5.4 ns（占整条失败路径的 32%）。
+    //     树形写法的每一级中间结果都是**唯一真源**（`pr[k]` 只由 `pr[k-1]` 推得），
+    //     工具无需也无法为 16 个不同宽度各建一份。
+    //     等价性：`pr[0] = any_flat`，第 k 级取 `pr[k][i] = pr[k-1][i] | pr[k-1][i-2^(k-1)]`
+    //     （左移补 0）⇒ 归纳得 `pr[k][i] = |any_flat[i-(2^k - 1) .. i]`（越界位视作 0）。
+    //     ⌈log2 N⌉ 级后覆盖 2^⌈log2 N⌉ - 1 ≥ N-1 项 ⇒
+    //       prior_any[i] = pr[PRIO_LV][i-1] = |any_flat[0 .. i-1]（i=0 ⇒ 0）
+    //     ⇒ no_prior_hit = ~prior_any 与原逐位归约完全一致（i=0 仍恒 1）。
+    //     仍为纯 assign + generate（无 always，符合本文件风格纪律；无信号自引用，
+    //     Verilator UNOPTFLAT 约束同样满足）。
+    localparam integer PRIO_LV = $clog2(PMP_ENTRIES);   // 前缀或级数（N=16 ⇒ 4）
+    wire [PMP_ENTRIES-1:0] pr [0:PRIO_LV];
+    assign pr[0] = any_flat;
+    genvar gq;
     generate
-        for (gj = 1; gj < PMP_ENTRIES; gj = gj + 1) begin : G_PRIO
-            // 等价式（不读自身）：no_prior_hit[i] = ~|any_flat[i-1:0]
-            assign no_prior_hit[gj] = ~|any_flat[gj-1:0];
+        for (gq = 1; gq <= PRIO_LV; gq = gq + 1) begin : G_PREFIX_OR
+            assign pr[gq] = pr[gq-1] | (pr[gq-1] << (1 << (gq-1)));
         end
     endgenerate
+
+    wire [PMP_ENTRIES-1:0] prior_any   = pr[PRIO_LV] << 1;   // 更低编号项里是否有命中
+    wire [PMP_ENTRIES-1:0] no_prior_hit = ~prior_any;        // 第 i 位 = 项 0..i-1 全未命中
 
     genvar gk;
     generate

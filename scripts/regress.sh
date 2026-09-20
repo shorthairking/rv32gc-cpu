@@ -64,6 +64,24 @@ SIM_UNIT_DIR="${RV32_SIM_UNIT_DIR:-${REPO_ROOT}/sim/unit}"
 command -v timeout >/dev/null 2>&1 || die "未找到 timeout（coreutils）；08 §8.1 要求每条测试加超时兜底"
 
 TB_TIMEOUT="${TB_TIMEOUT:-300}"                 ;# 单个 TB 运行超时（秒）
+#   ★ T5（2026-09-20，**只放宽墙钟兜底，不放松任何判据**）：
+#     `tb_m3_ddr3` 是**集成级** TB（DDR3 全遍历 7 模式 + XIP 可变指令 + CLINT/AXI 判定），
+#     它自带 `TIMEOUT_CYCLES = 1 200 000` 拍的**自身**预算（挂死即在 ~1 350 s 落到
+#     `$fatal`，与本变量无关 ⇒ fail-closed 语义不变）。而 T4（FPU 内部 8 级流水，
+#     +6 687 FF）把 iverilog 的仿真吞吐从 ≈2 185 拍/s 压到 ≈890 拍/s ⇒ 该 TB 在通用
+#     300 s 墙钟下**必然**被 kill（实测为"非功能失败"：0 行 FAIL、进度/计数/结果区
+#     观测全部符合预期，只是没跑完）。
+#     故**按 TB 名**只给这一个 TB 单独的墙钟兜底；其余 22 个 TB 仍守 `TB_TIMEOUT`
+#     （300 s）——保持"多数 TB 挂死能快速暴露"的纪律。
+#     两个值都可用环境变量覆盖（TB_TIMEOUT / TB_TIMEOUT_TB_M3_DDR3）。
+TB_TIMEOUT_TB_M3_DDR3="${TB_TIMEOUT_TB_M3_DDR3:-1800}"
+#   按 TB 名取墙钟兜底（默认 TB_TIMEOUT；tb_m3_ddr3 用放宽容口）。
+tb_timeout_for() {
+    case "$1" in
+        tb_m3_ddr3) printf '%s' "$TB_TIMEOUT_TB_M3_DDR3" ;;
+        *)          printf '%s' "$TB_TIMEOUT" ;;
+    esac
+}
 STRICT_SKIP="${RV32_REGRESS_STRICT_SKIP:-0}"    ;# 1 = 有跳过即判失败
 # 显式依赖表（仅用于"依赖尚未落盘 ⇒ 跳过并 WARN"的显式降级），形如：
 #     RV32_REGRESS_EXTRA_DEPS="tb_core_top:rtl/top/core_top.v tb_x:tests/x.svh"
@@ -102,7 +120,8 @@ printf '== regress.sh：REPO_ROOT=%s\n' "$REPO_ROOT"
 printf '== regress.sh：TB 目录=%s（发现 %d 个 tb_*.sv）\n' "$SIM_UNIT_DIR" "${#tbs[@]}"
 printf '== regress.sh：RTL 源=%d 个 rtl/**/*.v；iverilog=%s\n' "${#rtl_srcs[@]}" "$IV"
 printf '== regress.sh：iverilog 版本=%s\n' "$( { "$IV" -V 2>&1 || true; } | sed -n '1p' )"
-printf '== regress.sh：单 TB 超时=%ss；日志目录=%s\n' "$TB_TIMEOUT" "$LOG_DIR"
+printf '== regress.sh：单 TB 超时=%ss（★ T5：tb_m3_ddr3 用放宽档 %ss，其余守默认）；日志目录=%s\n' \
+       "$TB_TIMEOUT" "$TB_TIMEOUT_TB_M3_DDR3" "$LOG_DIR"
 
 #------------------------------------------------------------------------------
 # 2. 逐 TB：取顶层/锚点 → 编译 → 运行 → 判据
@@ -220,8 +239,11 @@ for tb in "${tbs[@]}"; do
     fi
 
     # ---- 2.5 运行（timeout 兜底；rc 用 `|| rc=$?` 取，避免 set -e 抢跑）----
+    #   ★ T5：兜底秒数**按 TB 名**取（tb_m3_ddr3 用放宽档，其余 300 s），
+    #     并把实际生效值打进 FAIL 诊断，避免"看到 124 却不知超时档是多少"。
+    tb_to="$(tb_timeout_for "$stem")"
     rc=0
-    timeout "$TB_TIMEOUT" "$VVP" "$vvp_out" >"$rlog" 2>&1 || rc=$?
+    timeout "$tb_to" "$VVP" "$vvp_out" >"$rlog" 2>&1 || rc=$?
     n_run=$((n_run + 1))
 
     n_anchor_line="$(grep -cxF "$anchor_line" "$rlog" || true)"            ;# 整行精确命中次数
@@ -232,7 +254,7 @@ for tb in "${tbs[@]}"; do
 
     reason=""
     if [ "$rc" -ne 0 ]; then
-        reason="运行退出码=${rc}（期望 0；124 = 超时 ${TB_TIMEOUT}s）"
+        reason="运行退出码=${rc}（期望 0；124 = 超时 ${tb_to}s）"
     elif [ "$n_anchor_line" -ne 1 ]; then
         reason="锚点 ${anchor_key} 整行命中 ${n_anchor_line} 次（期望 1）"
     elif [ "$n_mark_occ" -ne 1 ]; then

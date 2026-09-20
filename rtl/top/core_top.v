@@ -1513,6 +1513,26 @@ module core_top (
     reg  [3:0]  m_state_q;
     reg  [3:0]  m_retry_q;
     reg  [31:0] m_pa_q;
+    //   ★ T5（2026-09-20，时序，**不改功能语义**）：访存虚拟地址的**寄存副本**。
+    //     在 M_S_IDLE 拍（本笔访存首次被分派那一拍）锁存 `m_va`，专供 lsu 的
+    //     地址入口使用（见 §9.5 例化的接线说明）。理由：
+    //       lsu 是**纯组合**模块，其 `mem_va = rs1_i + imm_i` 及下游全部地址派生
+    //       （hi_addr/拆笔/beat 地址）、PMP 比较、异常/`mtval` 出口都挂在
+    //       `em_rs1_val + em_imm_val` 这条组合链上；M4 布线后 90 个失败端点中
+    //       51 条（`m_exc_tval_q*` 32 + `m_state_q*` 14 + `m_exc_q`/`m_exc_cause_q*`/
+    //       `m_rd_data_q`/`m_done_q`/`m_cmo_probe_q`/`m_page_fault_q`/`l1d_maint_*`）
+    //       的起点就是 `em_imm_val_reg[1]_replica`（最差 17.049 ns，34 级）。
+    //     语义等价性（**逐位**）：
+    //       · lsu 的全部输出只在 `m_state_q == M_S_ISS` 拍被消费（§9.6 的 m_l1d_go、
+    //         §9.7 的 m_cmo_probe_go/l1d_maint_*_d、M_S_ISS 分支的 m_mmio_*/AMO/CMO
+    //         判决——已逐条 grep 核对，无 ISS 之外的消费者）；
+    //       · 进入 M_S_ISS 的必要条件是本 EM 槽在 M_S_IDLE 拍 `m_data_want=1`
+    //         （该拍置 `m_issued_q`，此后 M 级忙 ⇒ `pipe_adv=0` ⇒ E/EM 全程冻结）；
+    //       · ⇒ 在**所有** M_S_ISS 拍上 `em_rs1_val/em_imm_val` 与锁存拍逐位相同
+    //         ⇒ `m_lsu_va_q` 与组合式 `em_rs1_val + em_imm_val` 逐位相同。
+    //     复位口径：与其它 M 级数据寄存器一致，仅异步复位清 0（陈旧值无害：
+    //       它在每个进入 ISS 的访存起点都被重写，且 ISS 之外无人消费）。
+    reg  [31:0] m_lsu_va_q;
     reg         m_page_fault_q;
     reg  [4:0]  m_page_cause_q;
     reg         m_hi_q;              // 8 B 访问的第二半
@@ -2022,8 +2042,20 @@ module core_top (
     .clk              (aclk),
     .rst_n            (aresetn),
     .req_valid_i      (m_lsu_req_valid),
-    .rs1_i            (em_rs1_val),
-    .imm_i            (em_imm_val),
+    // ---- ★ T5（2026-09-20，时序，不改语义）：lsu 的地址入口 = **寄存副本** ----
+    //   lsu 内部 `wire [31:0] mem_va = rs1_i + imm_i;`（并由此派生 hi_addr/拆笔/
+    //   beat 地址/`mtval`/AMO·CMO 地址）。改接「M_S_IDLE 拍锁存的 VA」+ 立即数 0：
+    //     · `m_lsu_va_q + 32'd0` 在综合时被常量折叠为 `m_lsu_va_q`（加法器消失），
+    //       ⇒ lsu 的全部组合锥改由**寄存器**起步，`em_rs1_val/em_imm_val` 不再是
+    //       这条 17 ns 链的源头（M4 归因：90 个失败端点中 51 条的起点）；
+    //     · 取值与 `em_rs1_val + em_imm_val` **逐位相同**（见 m_lsu_va_q 声明的
+    //       等价性论证：lsu 输出只在 M_S_ISS 拍被消费，而该拍 E/EM 必已冻结）；
+    //     · **模块端口契约不变**（lsu.v 未改一行，`rs1_i`/`imm_i` 语义仍是
+    //       「基址 + 立即数」；`sim/unit/tb_lsu.sv` 仍按原契约驱动两个端口）。
+    //   ⚠ 维护约定：若将来新增「M_S_ISS 之外的 lsu 输出消费者」，必须同时把该
+    //     消费者改用 `m_va`（组合式）或把 `m_lsu_va_q` 的锁存点前移。
+    .rs1_i            (m_lsu_va_q),
+    .imm_i            (32'd0),
     .mem_kind_i       (lsu_kind(em_mem_op)),
     .size_i           (m_lsu_size),
     .unsigned_i       (em_mem_unsign),
@@ -3356,6 +3388,7 @@ module core_top (
             fencei_busy_q <= 1'b0;
             //------------------------ M 级 FSM ------------------------
             m_state_q <= M_S_IDLE; m_retry_q <= M_S_ISS; m_pa_q <= 32'h0;
+            m_lsu_va_q <= 32'h0;                    // ★ T5：lsu 地址入口寄存副本
             m_tr_src_q <= 1'b0; ptw_done_q <= 1'b0;
             m_page_fault_q <= 1'b0; m_page_cause_q <= 5'd0;
             m_hi_q <= 1'b0; m_amo_phase_q <= 1'b0;
@@ -3733,6 +3766,10 @@ module core_top (
                         if (m_data_want) begin
                             m_issued_q <= 1'b1;
                             m_tr_src_q <= 1'b0;      // 本笔遍历归数据侧
+                            //   ★ T5：本笔访存的 VA 寄存副本（lsu 的地址入口真源，
+                            //     见 §9.1 的 m_lsu_va_q 声明）。放在三个子分支之前，
+                            //     保证 IDLE→ISS 与 IDLE→TR 两条路径都锁存。
+                            m_lsu_va_q <= m_va;
                             if (m_need_tr & tlb_perm_fault) begin
                                 m_pa_q         <= 32'h0;
                                 m_page_fault_q <= 1'b1;
