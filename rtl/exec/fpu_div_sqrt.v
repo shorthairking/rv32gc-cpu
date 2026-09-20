@@ -87,6 +87,16 @@
 //
 // ★ 位宽：S 需 24+STEPS ≤ 75 位；D 需 53+STEPS ≤ 162 位 ⇒ 统一 256 bit 域。
 //   以位宽换 RTL 简洁（S/D 共用一套 FSM），2A 面积非门禁。
+//
+// ★ T4（2026-09-20）：收尾舍入改走**3 级流水原语** `fpu_round_pipe`
+//   T3 综合实测：本模块失败路径 = `rem_r_reg → (组合 fpu_round_n, WW=112) →
+//   result_r_reg`，31.4 ns（−14.755 ns slack），是全核第二簇。
+//   修法：把收尾舍入换成 fpu_add.v 的 `fpu_round_pipe`（级A/pre/mid + 组合 post，
+//   同一份 pre/mid/post 逻辑，见 fpu_add.v 头注「T4 原语的三段拆分」）。
+//   ⇒ 收尾由"pack 1 拍 + 组合舍入 1 拍"变成"pack 1 拍 + 舍入 3 级"，
+//     `busy` 在迭代结束后多持续 2 拍（**数值结果逐位不变**：拍数与数值无关，
+//     见上「拍数参数真源」；done 仍是单拍脉冲，busy 落低与 done 同拍）。
+//   时序契约（fpu.v §2）不变：busy 拍数完全由本模块决定，上游按 busy/done 消费。
 //==============================================================================
 `include "rv32_defs.vh"
 `include "core_params.vh"
@@ -222,7 +232,12 @@ module fpu_div_sqrt #(
     reg [4:0]         fflags_r;
     reg               sqrt_p_r;    // 锁存的开方位流偏移（1 = 多消费一个前导 0）
     reg               pack_r;      // 1 = 下一拍打包 sig/exp
-    reg               pend_r;      // 1 = sig/exp 已稳定，本拍锁存舍入结果
+    // ★ T4：收尾舍入的 4 拍移位链（代替原 pend_r 单拍）
+    //   rnd_v = 0001 在 pack 拍置起 ⇒ 其后 4 拍依次推进：
+    //     第 1 拍末：fpu_round_pipe 级 A 采样（sig/exp 已稳定）
+    //     第 2 拍末：级 B（pre）｜ 第 3 拍末：级 C（mid）
+    //     第 4 拍：末级 post 组合有效 ⇒ rnd_v[3]=1 的当拍锁存结果 + 发 done
+    reg  [3:0]        rnd_v;
 
     //==========================================================================
     // 迭代结果 → 已验证的舍入原语（组合）
@@ -244,13 +259,13 @@ module fpu_div_sqrt #(
     wire [63:0] rd_res;  wire [4:0] rd_fl;
     // sticky_in = 0：迭代末把"余数非零"已经压进 sig 的 bit0（sig = (quo<<1)|sticky），
     // 故舍入窗口是精确值、无窗口外信息（与旧全宽实现同一 sig）。
-    fpu_round_n #(.FB(23), .WW(RWW), .RW(32), .EB(8),
-                  .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_rs (
-        .sign(r_sign), .sig(sig_round_s), .sticky_in(1'b0), .exp(exp_r),
+    fpu_round_pipe #(.FB(23), .WW(RWW), .RW(32), .EB(8),
+                     .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_rs (
+        .clk(clk), .sign(r_sign), .sig(sig_round_s), .sticky_in(1'b0), .exp(exp_r),
         .rm(r_rm), .result(rs_res), .fflags(rs_fl));
-    fpu_round_n #(.FB(52), .WW(RWW), .RW(64), .EB(11),
-                  .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_rd (
-        .sign(r_sign), .sig(sig_round_d), .sticky_in(1'b0), .exp(exp_r),
+    fpu_round_pipe #(.FB(52), .WW(RWW), .RW(64), .EB(11),
+                     .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_rd (
+        .clk(clk), .sign(r_sign), .sig(sig_round_d), .sticky_in(1'b0), .exp(exp_r),
         .rm(r_rm), .result(rd_res), .fflags(rd_fl));
 
     // 开方：打包阶段的指数 = ((E+nb+p) >>> 1) − STEPS − 1
@@ -327,20 +342,23 @@ module fpu_div_sqrt #(
             a_sig_bits <= 7'd1;
             sqrt_p_r <= 1'b0;
             pack_r   <= 1'b0;
-            pend_r   <= 1'b0;
+            rnd_v    <= 4'd0;
         end else if (flush) begin
             busy_r <= 1'b0;
             cnt    <= 16'd0;
             done_r <= 1'b0;
             pack_r <= 1'b0;
-            pend_r <= 1'b0;
+            rnd_v  <= 4'd0;
         end else begin
             done_r <= 1'b0;
+
+            // ---- 收尾舍入移位链（T4）：非 pack 拍逐拍右移 ----
+            if (rnd_v != 4'd0) rnd_v <= {rnd_v[2:0], 1'b0};
 
             // ---- 阶段 B：打包 sig/exp（quo_r/rem_r 已稳定为终值） ----
             if (pack_r) begin
                 pack_r <= 1'b0;
-                pend_r <= 1'b1;
+                rnd_v  <= 4'd1;          // ★ T4：进入收尾舍入的 4 拍链
                 // sig = (quo<<1) | sticky
                 rem_r <= (quo_r << 1) | ((rem_r != 0) ? 1'b1 : 1'b0);
                 if (r_sqrt) begin
@@ -355,9 +373,9 @@ module fpu_div_sqrt #(
                 end
             end
 
-            // ---- 阶段 C：sig/exp 已稳定，锁存组合舍入结果 ----
-            if (pend_r) begin
-                pend_r   <= 1'b0;
+            // ---- 阶段 C（T4：3 级流水舍入的末级）：sig/exp 已稳定，
+            //      本拍 post 组合输出有效 ⇒ 锁存结果 + 单拍 done ----
+            if (rnd_v[3]) begin
                 busy_r   <= 1'b0;
                 done_r   <= 1'b1;
                 result_r <= r_fmt_d ? rd_res : {32'b0, rs_res};
@@ -465,7 +483,7 @@ module fpu_div_sqrt #(
                         busy_r <= 1'b1;
                     end
                 end
-            end else if (busy_r && !pack_r && !pend_r) begin
+            end else if (busy_r && !pack_r && (rnd_v == 4'd0)) begin
                 //------------------------------------------------------------
                 // 迭代推进（每拍 SPC 步）
                 // ★ 关键：最后一拍**必须**照常执行迭代步，否则最后一个商位
@@ -481,7 +499,7 @@ module fpu_div_sqrt #(
                 //------------------------------------------------------------
                 for (k = 0; k < SPC_DIV; k = k + 1) begin
                     // ★ 只在真正处于迭代阶段时推进一步（belt & braces）
-                    if (!pack_r && !pend_r && (cnt != 16'd0)) begin
+                    if (!pack_r && (rnd_v == 4'd0) && (cnt != 16'd0)) begin
                     if (r_sqrt) begin
                         // 开方：每步消费 2 位；root 左移 1 位
                         if (sq_ge) begin

@@ -21,8 +21,13 @@
 //               64 位真实值、不补高 32 位 1**，由 result 全 64 位逐位相等断言覆盖
 //               （例如 fcvt.d.s(1.0) 必须恰为 0x3FF0_0000_0000_0000）。
 // 顶层    : tb_fpu_cmp_cvt（验收命令用 -s tb_fpu_cmp_cvt）
-// 说明    : 两个 DUT 均为**纯组合**，故每条向量 = 设激励 + #1 后逐位比对
-//           （result 全 64 位 + fflags 全 5 位；不是「打印看看」）。
+// 时钟    : 本 TB 自带 10 ns 周期时钟（T4 起 DUT 为流水单元）
+// 说明    : ★ T4（2026-09-20）后两个 DUT 均为 **8 拍固定潜伏期的流水单元**
+//           （rtl/exec/fpu.v §2「T4 契约变更」；cmp = 组合核心 + 8 级 fpu_delay，
+//            cvt = decode/prep/round×3/dispatch + pad）⇒ 每条向量 = 设激励 →
+//           **等 SC_LAT = 8 个时钟沿** → 在结果拍逐位比对（result 全 64 位 +
+//           fflags 全 5 位；不是「打印看看」）。断言强度与覆盖**不降**：
+//           向量表、比较位宽、fail-closed 计数逻辑一字未动，只改采样时刻。
 //           ★ 本 TB 的期望值不是手抄的：由独立 Python 黄金模型（精确有理数实现，
 //             其 RNE 通路已与 Python 原生浮点转换 8 万例交叉验证）算出后固化在此，
 //             TB 本身自包含、不依赖任何外部文件。
@@ -35,8 +40,14 @@
 module tb_fpu_cmp_cvt;
 
     //--------------------------------------------------------------------------
-    // 0. 检查计数器（fail-closed：只有走完全部检查且 0 错误才可能 PASS）
+    // 0. 时钟 + 检查计数器（fail-closed：只有走完全部检查且 0 错误才可能 PASS）
     //--------------------------------------------------------------------------
+    // ★ T4：DUT 为 8 拍固定潜伏期的流水单元 ⇒ 自带时钟；
+    //   SC_LAT **必须**与 rtl/exec/fpu.v 的 FPU_SC_LAT（8）一致。
+    localparam integer SC_LAT = 8;
+    reg clk = 1'b0;
+    always #5 clk = ~clk;
+
     integer chk_cnt = 0;    // 已执行检查条数
     integer err_cnt = 0;    // 失败条数
 
@@ -50,6 +61,7 @@ module tb_fpu_cmp_cvt;
     wire [4:0]  c_fl;
 
     fpu_cmp u_cmp (
+        .clk    (clk),
         .fp_op  (c_op),
         .fmt    (c_fmt),
         .a      (c_a),
@@ -66,6 +78,8 @@ module tb_fpu_cmp_cvt;
     wire [4:0]  v_fl;
 
     fpu_cvt u_cvt (
+        .clk    (clk),
+        .spec_gate (1'b1),          // ★ T4：单元 TB 直连 DUT ⇒ 门控恒开
         .fp_op  (v_op),
         .fmt    (v_fmt),
         .rm     (v_rm),
@@ -103,7 +117,9 @@ module tb_fpu_cmp_cvt;
         input [4:0]   ef;
         begin
             c_op = op; c_fmt = fmt; c_a = a; c_b = b;
-            #1;                                  // 组合传播
+            // ★ T4：等固定潜伏期（激励在下一个时钟沿被采样；结果在第 SC_LAT 拍）
+            repeat (SC_LAT) @(posedge clk);
+            #1;                                  // 结果拍中部采样
             chk_cnt = chk_cnt + 1;
             if (c_r !== er || c_fl !== ef) begin
                 err_cnt = err_cnt + 1;
@@ -124,6 +140,8 @@ module tb_fpu_cmp_cvt;
         input [4:0]   ef;
         begin
             v_op = op; v_fmt = fmt; v_rm = rm; v_frm = frm; v_a = a;
+            // ★ T4：等固定潜伏期（同 chk_cmp）
+            repeat (SC_LAT) @(posedge clk);
             #1;
             chk_cnt = chk_cnt + 1;
             if (v_r !== er || v_fl !== ef) begin

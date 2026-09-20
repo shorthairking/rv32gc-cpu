@@ -16,10 +16,10 @@
 //   ┌─ 算术（例化 fpu_add.v / fpu_mul.v / fpu_div_sqrt.v）────────────────────┐
 //   │  0 FADD   1 FSUB   2 FMUL   3 FDIV   4 FSQRT                          │
 //   │ 26 FMADD 27 FMSUB 28 FNMSUB 29 FNMADD  ← 本文件定义的扩展编码（见 ★） │
-//   ├─ 比较 / 符号注入 / 分类（例化 fpu_cmp.v，纯组合）──────────────────────┤
+//   ├─ 比较 / 符号注入 / 分类（例化 fpu_cmp.v）──────────────────────────────┤
 //   │  5 FSGNJ   6 FSGNJN  7 FSGNJX  8 FMIN   9 FMAX                        │
 //   │ 10 FEQ    11 FLT    12 FLE    13 FCLASS                              │
-//   ├─ 转换 / 搬移（例化 fpu_cvt.v，纯组合）────────────────────────────────┤
+//   ├─ 转换 / 搬移（例化 fpu_cvt.v）───────────────────────────────────────┤
 //   │ 14 FMV_X_W / FMV_X_D（fmt=00 / 01）  15 FMV_W_X / FMV_D_X（fmt=00/01）│
 //   │ 16 FCVT_W_S   17 FCVT_WU_S   18 FCVT_S_W   19 FCVT_S_WU               │
 //   │ 20 FCVT_W_D   21 FCVT_WU_D   22 FCVT_D_W   23 FCVT_D_WU               │
@@ -43,11 +43,18 @@
 // 2. 时序契约（tb_fpu.sv 按此断言；E 级/hazard **必须按 busy/done 消费**，
 //             禁止把任何完成拍数硬编码）
 //------------------------------------------------------------------------------
-//   设 req_valid 与各字段在时钟沿 E0 被采样（须满足 E0 拍 busy==0 且无在途
-//   div/sqrt 结果，见第 4 条）：
-//     · 单拍类（除 FDIV/FSQRT 外的全部）：结果**纯组合**给出 ⇒ E0 拍
-//       done=1（与 req_valid 同拍）、result/fflags 有效；req_valid 收回后
-//       done 立即为 0 ⇒ 单拍脉冲。busy 恒 0。
+//   ★ T4（2026-09-20）**契约变更**：为满足 60 MHz（全核 WNS ≥ 0），FPU 内部
+//     全面流水化（见各子单元头注「T4」段与 fpga/T4-report.md）。非 div/sqrt 类
+//     不再是"被接收同拍给 done"的单拍组合类，而是 **固定潜伏期 多拍类**：
+//   设 req_valid 与各字段在时钟沿 E0 被采样（须满足 E0 拍 ds_can_disp=1）：
+//     · **非 div/sqrt 类**（算术 / 比较 / 转换 / 搬移，即 op 0..29 除 3/4）：
+//       固定潜伏期 **`FPU_SC_LAT = 8` 拍**：
+//         - E0 拍：接收（busy 在 E0 拍为 0，E0+1 拍起为 1，因本条已在途）；
+//         - E0+8 拍：`done=1`（**单拍脉冲**）、result/fflags/fflags_we 与 done
+//           **同拍组合有效**；done 拍 busy=0（若其后无更年轻的在途运算）；
+//         - req_valid 收回后 done 立即为 0；不允许重复 done。
+//       ★ **背靠背允许**：本模块对非 div/sqrt 类是**流水线**，req_valid 连续
+//         拉高时每拍接收一条、每拍也给出一条 done（同一 op 间隔 8 拍）。
 //     · div/sqrt：E0 拍把单拍 start 送给 fpu_div_sqrt；**busy/done 透传**：
 //         - 特殊值路径（0/0、1/0、√(−1)…）：done 出现在 E0+1 拍，busy 未拉高；
 //         - 迭代路径：busy 在 E0+1 拍拉高，done 与 busy 落低**同拍**
@@ -59,10 +66,14 @@
 //     · div/sqrt 结果尚未被 done 报出期间（内部 divsqrt_pend=1）本模块拒绝
 //       新派发（done=0、不产生 start）⇒ 新指令最早可在 done 的**下一拍**派发
 //       （done 拍不接收新指令，避免与在途 result 混淆——已写入本契约）。
-//     · flush=1：立即撤销在途 div/sqrt（busy 下一拍落 0）、**不**产生 done；
-//       单拍类在 flush 拍也不产生 done（该指令被冲刷）。
+//     · flush=1：立即撤销在途 div/sqrt（busy 下一拍落 0）、**并清空非 div/sqrt
+//       类的有效位链**（在途结果全部作废）、**不**产生 done。
 //     · 单拍类与 div/sqrt **背靠背**：div/sqrt 在 busy=1 期间占住本模块，
-//       单拍类在 div/sqrt 的 done 拍之后即可派发，互不干扰。
+//       非 div/sqrt 类在 div/sqrt 的 done 拍之后即可派发，互不干扰。
+//   ★ 上游（core_top.v §7.5/§7.6）**已经是**按 done 消费的多拍握手
+//     （e_stall 由 `e_multi_done_pulse` 解除），故本次契约变更不需要改
+//     core_top 的握手结构；fflags 的"更年轻在途合并"（core_top §7.6）走 done 拍
+//     的 `fpu_fflags`，语义不变（fpu_fflags_we = done）。
 //
 //------------------------------------------------------------------------------
 // 3. NaN-boxing / canonical NaN / 保留舍入模式（口径与 INTERFACE.md 一致）
@@ -94,7 +105,7 @@
 //   （{NV,DZ,OF,UF,NX}，与 rv32_defs.vh 的 csr_file fflags 位序一致）。
 //   fsgnj*/fclass/fmv.* 的 fflags 恒为 0（规范不允许这些指令置位）
 //   ⇒ we=1+0 与 we=0 等价，CSR 侧无条件按 we 累积即可（不会多置位）。
-//   fflags 精确性由子单元保证（fpu_add.v 的舍入原语已逐位验证）。
+//   fflags 精确性由子单元保证（舍入原语已逐位验证）。
 //
 //------------------------------------------------------------------------------
 // 5. 参数透传 / 综合分支（红线 1、2）
@@ -110,16 +121,19 @@
 //   ⇒ 该分支下 FDIV_CYCLES/FSQRT_CYCLES 只是"占位参数"（端口与参数表
 //   必须与仿真分支完全一致），本文件据此把默认值置 1；仿真分支保持 pkg
 //   默认（32/32）。两分支端口、参数表、握手契约**逐字相同**。
-//   ★ 本文件不含任何 FPGA 原语、也不例化 IP（纯位级选通/打包 + 一个 2 bit
-//     状态锁存），满足红线 1；算术硬核（DSP/乘除 IP）全部在子单元内。
+//   ★ 本文件不含任何 FPGA 原语、也不例化 IP（纯位级选通/打包 + 有效位/类别
+//     移位链 + 一个 2 bit 状态锁存），满足红线 1；算术硬核（DSP/乘除 IP）
+//     全部在子单元内。
 //
 //------------------------------------------------------------------------------
 // 6. 实现纪律（红线 3）
 //------------------------------------------------------------------------------
-//   全部为 `assign` / 条件表达式 / `function`；唯一的 always 块是"在途
-//   div/sqrt 结果寄存"的 2 bit 时序锁存（见 §7，理由已就地注释）——
-//   它必须跨多拍记住"最近一次派发的是 div/sqrt + 其格式"，否则 done 拍
-//   上游可能已把 fp_op/fmt 换成下一条指令，结果的 NaN-boxing 与选通就会错。
+//   全部为 `assign` / 条件表达式 / `function`；always 块只有三处，全部是
+//   **时序寄存器**（无 always @(*)）：
+//     ① 在途 div/sqrt 结果寄存（2 bit；理由见 §4.5）；
+//     ② 非 div/sqrt 类的**有效位 + 类别元数据移位链**（FPU_SC_LAT 级；
+//        理由：流水化后"哪条指令的结果在第 8 拍有效"必须跨拍记住，
+//        无法用连续赋值表达）。
 //==============================================================================
 `include "rv32_defs.vh"
 `include "core_params.vh"
@@ -147,7 +161,7 @@ module fpu #(
     input  wire [2:0]  frm,          // fcsr.frm（本模块用于解析 DYN）
     input  wire [63:0] a, b, c,      // 操作数（c=rs3，仅 FMA 用）
     // ---- 结果与握手 ----
-    output wire        busy,         // 多拍冻结前端（div/sqrt 在途）
+    output wire        busy,         // 多拍冻结前端（有在途运算；done 拍为 0）
     output wire        done,         // 结果有效（单拍脉冲）
     output wire [63:0] result,       // 写回值（S 结果高 32 位全 1，NaN-boxed）
     output wire        fflags_we,    // = done（见 §4）
@@ -188,6 +202,13 @@ module fpu #(
     localparam [6:0] FP_FMSUB    = 7'd27;
     localparam [6:0] FP_FNMSUB   = 7'd28;
     localparam [6:0] FP_FNMADD   = 7'd29;
+
+    // ---- T4：非 div/sqrt 类的统一潜伏期（拍）----
+    //   ★ 必须与各子单元内部的 `localparam integer LAT` 一致：
+    //        fpu_add_s/d、fpu_fma_s/d、fpu_mul_s/d、fpu_cvt、fpu_cmp = 8
+    //   口径：req_valid 在 E0 拍被采样 ⇒ result/fflags 在 E0+8 拍组合有效、
+    //         done 在 E0+8 拍为 1（见头注 §2）。
+    localparam integer FPU_SC_LAT = 8;
 
     //==========================================================================
     // 2. 类别译码（互斥；一张表一处定义）
@@ -230,114 +251,17 @@ module fpu #(
     wire [63:0] c_ar = is_d ? c : box_chk(c);       // FMA 的 rs3
 
     //==========================================================================
-    // 5. 算术子单元（S/D 双核 + fmt 选择；与 fpu_cmp.v 同风格：以面积换直白）
+    // 4.5 div/sqrt（多拍类）与**派发判据**（前置：§5 的子单元输入钳零门控要用到）
     //--------------------------------------------------------------------------
-    // ★ 仿真吞吐优化（2026-09-17，**语义逐位不变**，只为让 arch-test F 组在
-    //   run.sh 的超时内跑完）：**未选中子单元的操作数输入钳到 0**。
-    //   本文件按"面积换直白"例化了 S/D 双份算术核（add/mul/fma × S/D + cvt + cmp），
-    //   但 §8 的结果选择只会用到 fp_op/fmt 选中的那一份，其余输出**恒被丢弃**。
-    //   若照常把 fregfile 的操作数接到所有子单元，iverilog 每拍都要重算全部单元
-    //   （D 侧含 8192 bit 移位域 × 6 个舍入原语实例）⇒ F 组用例跑不完。
-    //   ★ 2026-09-18 窄域 + sticky 重写后，算术子单元内部域已降到 ≤ 112 bit
-    //     （见 fpu_add.v 头注 P1~P6），本文件的钳零机制**保留**：它仍然避免
-    //     未选中格式的子单元在 iverilog 事件驱动下被重算。
-    //   钳零后未选中单元的输入不再跳变，事件驱动仿真不再重算它们；选中单元的
-    //   端口、位宽与位级语义一位不动。
-    //   ★ 判据只用 fp_op/fmt（E 级指令字段）——多拍/停顿期间这两个字段保持不变
-    //     （E 级被冻结），故结果与钳零前逐位相同；冲刷拍即使变化，结果也会被丢弃。
-    //==========================================================================
-    wire en_add_s = (op_addsub & ~is_d);
-    wire en_add_d = (op_addsub &  is_d);
-    wire en_mul_s = (op_mul    & ~is_d);
-    wire en_mul_d = (op_mul    &  is_d);
-    wire en_fma_s = (op_fma    & ~is_d);
-    wire en_fma_d = (op_fma    &  is_d);
-    wire en_cmp   =  op_cmp;
-    wire en_cvt   =  op_cvt;
-
-    wire [63:0] a_add_s = en_add_s ? a_ar : 64'd0;
-    wire [63:0] b_add_s = en_add_s ? b_ar : 64'd0;
-    wire [63:0] a_add_d = en_add_d ? a    : 64'd0;
-    wire [63:0] b_add_d = en_add_d ? b    : 64'd0;
-    wire [63:0] a_mul_s = en_mul_s ? a_ar : 64'd0;
-    wire [63:0] b_mul_s = en_mul_s ? b_ar : 64'd0;
-    wire [63:0] a_mul_d = en_mul_d ? a    : 64'd0;
-    wire [63:0] b_mul_d = en_mul_d ? b    : 64'd0;
-    wire [63:0] a_fma_s = en_fma_s ? a_ar : 64'd0;
-    wire [63:0] b_fma_s = en_fma_s ? b_ar : 64'd0;
-    wire [63:0] c_fma_s = en_fma_s ? c_ar : 64'd0;
-    wire [63:0] a_fma_d = en_fma_d ? a    : 64'd0;
-    wire [63:0] b_fma_d = en_fma_d ? b    : 64'd0;
-    wire [63:0] c_fma_d = en_fma_d ? c    : 64'd0;
-    wire [63:0] a_cmp   = en_cmp   ? a    : 64'd0;
-    wire [63:0] b_cmp   = en_cmp   ? b    : 64'd0;
-    wire [63:0] a_cvt   = en_cvt   ? a    : 64'd0;
-
-    wire [31:0] add_s_r;  wire [63:0] add_d_r;  wire [4:0] add_s_f, add_d_f;
-    wire [31:0] mul_s_r;  wire [63:0] mul_d_r;  wire [4:0] mul_s_f, mul_d_f;
-    wire [31:0] fma_s_r;  wire [63:0] fma_d_r;  wire [4:0] fma_s_f, fma_d_f;
-
-    fpu_add_s u_add_s (
-        .a (a_add_s), .b (b_add_s), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
-        .result (add_s_r), .fflags (add_s_f)
-    );
-    fpu_add_d u_add_d (
-        .a (a_add_d), .b (b_add_d), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
-        .result (add_d_r), .fflags (add_d_f)
-    );
-    fpu_mul_s u_mul_s (
-        .a (a_mul_s), .b (b_mul_s), .rm (rm_eff),
-        .result (mul_s_r), .fflags (mul_s_f)
-    );
-    fpu_mul_d u_mul_d (
-        .a (a_mul_d), .b (b_mul_d), .rm (rm_eff),
-        .result (mul_d_r), .fflags (mul_d_f)
-    );
-    // FMA：fpu_fma_s/d 内是"精确积 + 精确对阶 + **一次**舍入"⇒ 单次舍入
-    // （08 §5.3 ③；结构上不可能两次舍入，见 fpu_add.v 头注 §2.3）
-    fpu_fma_s u_fma_s (
-        .a (a_fma_s), .b (b_fma_s), .c (c_fma_s),
-        .neg_prod (op_fma_np), .neg_add (op_fma_na),
-        .rm (rm_eff), .result (fma_s_r), .fflags (fma_s_f)
-    );
-    fpu_fma_d u_fma_d (
-        .a (a_fma_d), .b (b_fma_d), .c (c_fma_d),
-        .neg_prod (op_fma_np), .neg_add (op_fma_na),
-        .rm (rm_eff), .result (fma_d_r), .fflags (fma_d_f)
-    );
-
-    // ---- 算术结果打包：S 输出补高 32 位 1（NaN-boxing），D 输出完整 64 位 ----
-    wire [63:0] arith_r = op_mul ? (is_d ? mul_d_r : {BOX_HI, mul_s_r}) :
-                          op_fma ? (is_d ? fma_d_r : {BOX_HI, fma_s_r}) :
-                                   (is_d ? add_d_r : {BOX_HI, add_s_r});
-    wire [4:0]  arith_f = op_mul ? (is_d ? mul_d_f : mul_s_f) :
-                          op_fma ? (is_d ? fma_d_f : fma_s_f) :
-                                   (is_d ? add_d_f : add_s_f);
-
-    //==========================================================================
-    // 6. 比较/分类（fpu_cmp）与转换/搬移（fpu_cvt）：纯组合，原样透传其 result
-    //    （两者的结果定向/NaN-boxing 已在其头注与实现内完成）
-    //==========================================================================
-    wire [63:0] cmp_r;  wire [4:0] cmp_f;
-    fpu_cmp u_cmp (
-        .fp_op (fp_op), .fmt (fmt), .a (a_cmp), .b (b_cmp),
-        .result (cmp_r), .fflags (cmp_f)
-    );
-
-    wire [63:0] cvt_r;  wire [4:0] cvt_f;
-    fpu_cvt u_cvt (
-        .fp_op (fp_op), .fmt (fmt), .rm (rm_eff), .frm (frm), .a (a_cvt),
-        .result (cvt_r), .fflags (cvt_f)
-    );
-
-    //==========================================================================
-    // 7. div/sqrt：busy/done **透传**（参数原样透传给 fpu_div_sqrt）
+    //   ★ T4 把本段从原 §7 前置到 §5 之前：因为 §5 的门控要按"本拍真的有指令
+    //     被接收"钳零（见 §5 的 T4 补充说明），而该判据依赖 ds_busy/ds_pend。
+    //     逻辑内容与原 §7 逐字相同。
     //==========================================================================
     wire        ds_busy, ds_done;
     wire [63:0] ds_r;
     wire [4:0]  ds_f;
 
-    // 在途 div/sqrt 结果寄存（唯一的时序锁存；理由：done 拍上游可能已把
+    // 在途 div/sqrt 结果寄存（时序锁存；理由：done 拍上游可能已把
     // fp_op/fmt 换成下一条指令，结果的"选通 + S 结果 NaN-boxing"必须按
     // **派发时**的类别/格式决定，不能看当前输入）。
     reg  ds_pend;       // 1 = 最近派发的是 div/sqrt，结果尚未被 done 报出
@@ -346,7 +270,7 @@ module fpu #(
     wire ds_can_disp = ~ds_busy & ~ds_pend & ~flush;   // 允许新派发的唯一条件
     wire disp_any    = req_valid & ds_can_disp;        // 本条指令被本模块接收
     wire disp_ds     = disp_any & op_ds;               // 送给 fpu_div_sqrt 的 start
-    wire disp_sc     = disp_any & ~op_ds;              // 单拍类
+    wire disp_sc     = disp_any & ~op_ds;              // 非 div/sqrt（流水类）
 
     fpu_div_sqrt #(
         .FDIV_CYCLES  (FDIV_CYCLES),      // ★ 参数透传（不在本文件内换算拍数）
@@ -375,33 +299,194 @@ module fpu #(
     // S 结果补高 32 位 1（NaN-boxing）；D 结果完整 64 位
     wire [63:0] ds_r_box = ds_fmt_d ? ds_r : {BOX_HI, ds_r[31:0]};
 
+
+    //==========================================================================
+    // 5. 算术子单元（S/D 双核 + fmt 选择；与 fpu_cmp.v 同风格：以面积换直白）
+    //--------------------------------------------------------------------------
+    // ★ 仿真吞吐优化（2026-09-17，**语义逐位不变**，只为让 arch-test F 组在
+    //   run.sh 的超时内跑完）：**未选中子单元的操作数输入钳到 0**。
+    //   本文件按"面积换直白"例化了 S/D 双份算术核（add/mul/fma × S/D + cvt + cmp），
+    //   但 §8 的结果选择只会用到 fp_op/fmt 选中的那一份，其余输出**恒被丢弃**。
+    //   若照常把 fregfile 的操作数接到所有子单元，iverilog 每拍都要重算全部单元
+    //   （D 侧含 110 bit 移位域 × 多个舍入原语实例）⇒ F 组用例跑不完。
+    //   ★ T4 流水化后该机制**保留**：钳零后未选中单元的输入不再跳变，事件驱动
+    //     仿真不再重算它们；选中单元的端口、位宽与位级语义一位不动。
+    //   ★ 判据只用 fp_op/fmt（E 级指令字段）——多拍/停顿期间这两个字段保持不变
+    //     （E 级被冻结），故结果与钳零前逐位相同；冲刷拍即使变化，结果也会被丢弃。
+    //==========================================================================
+    //   ★ T4 补充（2026-09-20）：门控再与"本拍真的有指令被接收"相与。
+    //     流水化后每个子单元内部多了 6~8 级寄存器，若仍只按 fp_op/fmt 钳零，
+    //     非 FP 指令（fp_op 字段是任意位型，op_addsub/is_d 可能为 1）会让**整个
+    //     子单元流水线每拍跟着 fregfile 读口翻转** ⇒ iverilog 回归吞吐明显下降
+    //     （实测 tb_m3_ddr3 由 300 s 内跑不完）。与 `disp_any` 相与后：只有真正被
+    //     接收的那一拍输入才非零，其后各拍全 0 ⇒ 未选中子单元完全静止。
+    //     语义不变：子单元的输出只在"该指令的 done 拍"被消费，而 done 拍由 fpu.v
+    //     的有效位链给出，链条起点就是 disp_sc —— 没有派发就没有结果被消费。
+    wire       sc_gate = disp_any;          // 本拍有一条指令被本模块接收
+    wire en_add_s = (op_addsub & ~is_d) & sc_gate;
+    wire en_add_d = (op_addsub &  is_d) & sc_gate;
+    wire en_mul_s = (op_mul    & ~is_d) & sc_gate;
+    wire en_mul_d = (op_mul    &  is_d) & sc_gate;
+    wire en_fma_s = (op_fma    & ~is_d) & sc_gate;
+    wire en_fma_d = (op_fma    &  is_d) & sc_gate;
+    wire en_cmp   =  op_cmp & sc_gate;
+    wire en_cvt   =  op_cvt & sc_gate;
+
+    wire [63:0] a_add_s = en_add_s ? a_ar : 64'd0;
+    wire [63:0] b_add_s = en_add_s ? b_ar : 64'd0;
+    wire [63:0] a_add_d = en_add_d ? a    : 64'd0;
+    wire [63:0] b_add_d = en_add_d ? b    : 64'd0;
+    wire [63:0] a_mul_s = en_mul_s ? a_ar : 64'd0;
+    wire [63:0] b_mul_s = en_mul_s ? b_ar : 64'd0;
+    wire [63:0] a_mul_d = en_mul_d ? a    : 64'd0;
+    wire [63:0] b_mul_d = en_mul_d ? b    : 64'd0;
+    wire [63:0] a_fma_s = en_fma_s ? a_ar : 64'd0;
+    wire [63:0] b_fma_s = en_fma_s ? b_ar : 64'd0;
+    wire [63:0] c_fma_s = en_fma_s ? c_ar : 64'd0;
+    wire [63:0] a_fma_d = en_fma_d ? a    : 64'd0;
+    wire [63:0] b_fma_d = en_fma_d ? b    : 64'd0;
+    wire [63:0] c_fma_d = en_fma_d ? c    : 64'd0;
+    wire [63:0] a_cmp   = en_cmp   ? a    : 64'd0;
+    wire [63:0] b_cmp   = en_cmp   ? b    : 64'd0;
+    wire [63:0] a_cvt   = en_cvt   ? a    : 64'd0;
+
+    wire [31:0] add_s_r;  wire [63:0] add_d_r;  wire [4:0] add_s_f, add_d_f;
+    wire [31:0] mul_s_r;  wire [63:0] mul_d_r;  wire [4:0] mul_s_f, mul_d_f;
+    wire [31:0] fma_s_r;  wire [63:0] fma_d_r;  wire [4:0] fma_s_f, fma_d_f;
+
+    fpu_add_s u_add_s (
+        .clk (clk),
+        .a (a_add_s), .b (b_add_s), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
+        .result (add_s_r), .fflags (add_s_f)
+    );
+    fpu_add_d u_add_d (
+        .clk (clk),
+        .a (a_add_d), .b (b_add_d), .op_sub (fp_op == FP_FSUB), .rm (rm_eff),
+        .result (add_d_r), .fflags (add_d_f)
+    );
+    fpu_mul_s u_mul_s (
+        .clk (clk),
+        .a (a_mul_s), .b (b_mul_s), .rm (rm_eff),
+        .result (mul_s_r), .fflags (mul_s_f)
+    );
+    fpu_mul_d u_mul_d (
+        .clk (clk),
+        .a (a_mul_d), .b (b_mul_d), .rm (rm_eff),
+        .result (mul_d_r), .fflags (mul_d_f)
+    );
+    // FMA：fpu_fma_s/d 内是"精确积 + 精确对阶 + **一次**舍入"⇒ 单次舍入
+    // （08 §5.3 ③；结构上不可能两次舍入，见 fpu_add.v 头注 §2.3）
+    fpu_fma_s u_fma_s (
+        .clk (clk),
+        .a (a_fma_s), .b (b_fma_s), .c (c_fma_s),
+        .neg_prod (op_fma_np), .neg_add (op_fma_na),
+        .rm (rm_eff), .result (fma_s_r), .fflags (fma_s_f)
+    );
+    fpu_fma_d u_fma_d (
+        .clk (clk),
+        .a (a_fma_d), .b (b_fma_d), .c (c_fma_d),
+        .neg_prod (op_fma_np), .neg_add (op_fma_na),
+        .rm (rm_eff), .result (fma_d_r), .fflags (fma_d_f)
+    );
+
+    //==========================================================================
+    // 6. 比较/分类（fpu_cmp）与转换/搬移（fpu_cvt）：同为 LAT 拍潜伏期
+    //    （两者的结果定向/NaN-boxing 已在其头注与实现内完成）
+    //==========================================================================
+    wire [63:0] cmp_r;  wire [4:0] cmp_f;
+    fpu_cmp u_cmp (
+        .clk (clk),
+        .fp_op (fp_op), .fmt (fmt), .a (a_cmp), .b (b_cmp),
+        .result (cmp_r), .fflags (cmp_f)
+    );
+
+    wire [63:0] cvt_r;  wire [4:0] cvt_f;
+    fpu_cvt u_cvt (
+        .clk (clk),
+        .spec_gate (sc_gate),
+        .fp_op (fp_op), .fmt (fmt), .rm (rm_eff), .frm (frm), .a (a_cvt),
+        .result (cvt_r), .fflags (cvt_f)
+    );
+
+    //==========================================================================
+    // 7.（div/sqrt 已前置到 §4.5：busy/done **透传** + 参数原样透传）
+    //==========================================================================
+    //==========================================================================
+    // 7.5 非 div/sqrt 类的**有效位 + 类别元数据流水**（T4；时序锁存，理由见 §6）
+    //--------------------------------------------------------------------------
+    //   · 槽 0 = 最新（本拍派发的那条），最高槽 = 第 FPU_SC_LAT 拍要报结果的那条；
+    //     `sc_v[k]` 表示"第 k 级里有一条待报结果的指令"。
+    //   · 只带"结果选择"必需的两位信息：fp_op（7 bit）与 fmt（2 bit）。
+    //     操作数/中间值全部在各子单元自己的数据流水线里，本文件不重复携带。
+    //   · flush ⇒ 整链清零（在途结果全部作废，与 div/sqrt 的 flush 口径一致）。
+    //   · 元数据寄存器**不随 flush 清零**（无关紧要：`sc_v=0` 时它们不被消费，
+    //     且每拍都会被新数据覆盖）——减少一路 70 bit 的复位扇出。
+    //==========================================================================
+    reg  [FPU_SC_LAT-1:0]   sc_v;
+    reg  [FPU_SC_LAT*7-1:0] sc_op;
+    reg  [FPU_SC_LAT*2-1:0] sc_fmt;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sc_v   <= {FPU_SC_LAT{1'b0}};
+            sc_op  <= {(FPU_SC_LAT*7){1'b0}};
+            sc_fmt <= {(FPU_SC_LAT*2){1'b0}};
+        end else if (flush) begin
+            sc_v   <= {FPU_SC_LAT{1'b0}};
+        end else begin
+            sc_v   <= {sc_v[FPU_SC_LAT-2:0],        disp_sc};
+            sc_op  <= {sc_op[(FPU_SC_LAT-1)*7-1:0], fp_op};
+            sc_fmt <= {sc_fmt[(FPU_SC_LAT-1)*2-1:0], fmt};
+        end
+    end
+
+    wire        sc_done  = sc_v[FPU_SC_LAT-1];
+    wire [6:0]  sc_op_o  = sc_op [FPU_SC_LAT*7-1 : (FPU_SC_LAT-1)*7];
+    wire [1:0]  sc_fmt_o = sc_fmt[FPU_SC_LAT*2-1 : (FPU_SC_LAT-1)*2];
+
+    // ---- 输出级的类别（必须用**流水后**的 fp_op/fmt 选结果）----
+    wire out_is_d     = (sc_fmt_o == 2'b01);
+    wire out_op_mul   = (sc_op_o == FP_FMUL);
+    wire out_op_fma   = (sc_op_o >= FP_FMADD) & (sc_op_o <= FP_FNMADD);
+    wire out_op_cmp   = (sc_op_o >= FP_FSGNJ) & (sc_op_o <= FP_FCLASS);
+    wire out_op_cvt   = (sc_op_o >= FP_FMV_X) & (sc_op_o <= FP_FCVT_D_S);
+    wire out_op_known = (sc_op_o <= FP_FNMADD);
+
     //==========================================================================
     // 8. 结果 / fflags / 握手输出
     //==========================================================================
-    wire [63:0] sc_r = op_cmp ? cmp_r :
-                       op_cvt ? cvt_r :
-                                arith_r;        // 含未定义 op ⇒ arith_r（FADD 通路）
-    wire [4:0]  sc_f = op_cmp ? cmp_f :
-                       op_cvt ? cvt_f :
-                                arith_f;
+    // ---- 算术结果打包：S 输出补高 32 位 1（NaN-boxing），D 输出完整 64 位 ----
+    wire [63:0] arith_r = out_op_mul ? (out_is_d ? mul_d_r : {BOX_HI, mul_s_r}) :
+                          out_op_fma ? (out_is_d ? fma_d_r : {BOX_HI, fma_s_r}) :
+                                       (out_is_d ? add_d_r : {BOX_HI, add_s_r});
+    wire [4:0]  arith_f = out_op_mul ? (out_is_d ? mul_d_f : mul_s_f) :
+                          out_op_fma ? (out_is_d ? fma_d_f : fma_s_f) :
+                                       (out_is_d ? add_d_f : add_s_f);
+
+    wire [63:0] sc_r = out_op_cmp ? cmp_r :
+                       out_op_cvt ? cvt_r :
+                                    arith_r;        // 含未定义 op ⇒ arith_r（FADD 通路）
+    wire [4:0]  sc_f = out_op_cmp ? cmp_f :
+                       out_op_cvt ? cvt_f :
+                                    arith_f;
 
     // 选通：div/sqrt 的 done 拍与在途期间选 div/sqrt 结果（上游 fp_op 已不可信）；
     // 未定义 op 不在任何类别 ⇒ 结果确定 0（不挂死，见头注 §1 ★）
     wire sel_ds  = ds_done | ds_pend;
-    wire op_known = (fp_op <= FP_FNMADD);
 
     assign result    = sel_ds        ? ds_r_box :
-                       op_known      ? sc_r     :
+                       out_op_known  ? sc_r     :
                                        64'b0;
     assign fflags    = sel_ds        ? ds_f     :
-                       op_known      ? sc_f     :
+                       out_op_known  ? sc_f     :
                                        5'b0;
 
-    // busy：div/sqrt 在途（多拍）⇒ 冻结前端；单拍类恒 0（纯组合，不占拍）
-    assign busy      = ds_busy;
+    // busy：有在途运算（div/sqrt 迭代 或 非 div/sqrt 流水类未报结果）⇒ 冻结前端；
+    //       done 拍为 0（该拍结果已报出，上游可推进）
+    assign busy      = ds_busy | (|sc_v[FPU_SC_LAT-2:0]);
 
-    // done：单拍类的完成拍 = 被接收拍（组合结果已就绪）；div/sqrt 透传其 done
-    assign done      = ~flush & (ds_done | disp_sc);
+    // done：流水类 = 第 FPU_SC_LAT 拍的有效位；div/sqrt 透传其 done（均单拍脉冲）
+    assign done      = ~flush & (ds_done | sc_done);
     assign fflags_we = done;
 
 endmodule

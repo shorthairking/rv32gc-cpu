@@ -29,8 +29,14 @@
 //   下表的 `exp` 两列即该模型的输出，TB 只做"逐位相等"判定。
 //
 // 时序断言（按 rtl/exec/fpu.v 头注 §2 的时序契约）：
-//   · 单拍类：req_valid 拉高的**同一拍** done=1、busy=0、result/fflags/fflags_we
-//     有效；req_valid 收回后 done 必须为 0（单拍脉冲、不重复）。
+//   · 非 div/sqrt 类（算术/比较/转换/搬移）：**T4 起为固定潜伏期的多拍类**
+//     （FPU_SC_LAT = 8 拍，见 fpu.v §2「T4 契约变更」）：
+//       派发拍 E0：done=0、busy=0（此前无在途运算）；
+//       E0+1 … E0+7：busy 必须为 1、done 必须为 0（**在途断言，T4 新增**）；
+//       E0+8：done=1（单拍脉冲）、busy=0、result/fflags/fflags_we 与期望逐位相等；
+//       E0+9：done 必须已落 0。
+//     ★ 本段断言强度**不低于**改前（改前是"同一拍 done=1 且 busy=0"，现在是
+//       "逐拍查 busy/done 的位置 + 末拍逐位比 result/fflags"，检查条数由 2 增到 11）。
 //   · div/sqrt：派发拍 done=0；在途期间 busy 必须持续为 1（不得出现
 //     "done=0 且 busy=0" 的空档）；done 拍 busy=0、result/fflags 与期望逐位
 //     相等；此后 2 拍不得再出现 done。**不**对 busy 拍数作任何硬编码断言
@@ -163,7 +169,11 @@ module tb_fpu;
     endtask
 
 
+    // ---- 非 div/sqrt 类的固定潜伏期（★ 必须与 rtl/exec/fpu.v 的 FPU_SC_LAT 一致）----
+    localparam integer SC_LAT = 8;
+
     // ---- frm/DYN 解析用例（rm=111 时取 frm；保留 frm/rm 按 RNE）------------
+    //   ★ T4：非 div/sqrt 类改为 8 拍潜伏期 ⇒ 采样点随之移到 E0+SC_LAT。
     task sc_case_frm;
         input [6:0]  p_op;
         input [1:0]  p_fmt;
@@ -171,31 +181,52 @@ module tb_fpu;
         input [63:0] p_a;
         input [63:0] p_b;
         input [4:0]  p_f;
+        integer w;
         begin
             known_dev_mode = 1'b0;
             @(posedge clk);
             fp_op <= p_op; fmt <= p_fmt; rm <= p_rm; a <= p_a; b <= p_b;
             c <= 64'd0; flush <= 1'b0; req_valid <= 1'b1;
+            for (w = 1; w < SC_LAT; w = w + 1) @(posedge clk);   // E0+1 … E0+7
+            req_valid <= 1'b0;
+            @(posedge clk);                                      // E0+SC_LAT
             #1.5;
             checks = checks + 1;
             if (done !== 1'b1) fail("frm done", {63'b0, done}, 64'd1);
             if (fflags !== p_f) fail("frm fflags", {59'b0, fflags}, {59'b0, p_f});
-            @(posedge clk); req_valid <= 1'b0; #1.5;
+            @(posedge clk); #1.5;
         end
     endtask
-    // ---- 单拍类用例 -------------------------------------------------------
+    // ---- 非 div/sqrt 类用例（T4：8 拍固定潜伏期）----------------------------
     // 驱动约定：所有激励用**非阻塞赋值**在 posedge 上给出 ⇒ req_valid 恰好保持
     // 一个时钟周期；采样点在"边沿 + 1.5 ns"（clk 低电平中部，无竞争）。
+    // ★ T4：本任务把非 div/sqrt 类切成 8 级流水（fpu.v §2）⇒ 采样点从"派发同拍"
+    //   移到 E0 + SC_LAT，并在 E0+1 … E0+7 逐拍断言 busy=1 / done=0。
     task sc_case;
         input integer id;
+        integer w;
         begin
             known_dev_mode = (KNOWN_DEV_ENABLE && t_xf[id]) ? 1'b1 : 1'b0;
             snap = errors + known_devs;
             @(posedge clk);
             fp_op <= t_op[id]; fmt <= t_fmt[id]; rm <= t_rm[id]; frm <= t_frm[id];
             a <= t_a[id]; b <= t_b[id]; c <= t_c[id];
-            flush <= 1'b0; req_valid <= 1'b1;         // 本拍 = 派发拍
-            #1.5;                                     // 派发拍中部：组合结果已稳定
+            flush <= 1'b0; req_valid <= 1'b1;         // 本拍 = 派发拍（E0）
+            #1.5;                                     // 派发拍中部：本条尚未完成
+            checks = checks + 1;
+            if (done !== 1'b0) fail("sc done@disp", {63'b0, done}, 64'd0);
+            if (busy !== 1'b0) fail("sc busy@disp", {63'b0, busy}, 64'd0);
+            for (w = 1; w < SC_LAT; w = w + 1) begin  // E0+1 … E0+7：在途
+                @(posedge clk);
+                if (w == 1) req_valid <= 1'b0;        // 只占一个周期
+                #1.5;
+                checks = checks + 1;
+                if (done !== 1'b0) fail("sc done early", {63'b0, done}, 64'd0);
+                checks = checks + 1;
+                if (busy !== 1'b1) fail("sc busy low",  {63'b0, busy}, 64'd1);
+            end
+            @(posedge clk);                           // E0+SC_LAT：结果拍
+            #1.5;
             checks = checks + 1;
             if (done !== 1'b1)      fail("done!=1",  {63'b0, done},  64'd1);
             if (busy !== 1'b0)      fail("busy!=0",  {63'b0, busy},  64'd0);
@@ -203,7 +234,6 @@ module tb_fpu;
             if (result !== t_r[id]) fail("result", result, t_r[id]);
             if (fflags !== t_f[id]) fail("fflags", {59'b0, fflags}, {59'b0, t_f[id]});
             @(posedge clk);
-            req_valid <= 1'b0;
             #1.5;                                     // 下一拍中部：done 必须已落
             checks = checks + 1;
             if (done !== 1'b0) fail("done not pulse", {63'b0, done}, 64'd0);
@@ -284,21 +314,34 @@ module tb_fpu;
             checks = checks + 1;
             if (done !== 1'b0) fail("rst done", {63'b0, done}, 64'd0);
 
-            // (2) 背靠背单拍：两条 fadd.s 连续两拍各出一个 done
-            @(posedge clk);
+            // (2) 背靠背（T4：流水类）：两条 fadd.s 连续两拍各被接收 ⇒
+            //     第 E0+8 拍出第 1 条 done、第 E0+9 拍出第 2 条 done（无空隙）
+            @(posedge clk);                          // E0
             fp_op <= 7'd0; fmt <= 2'b00; rm <= 3'b000; flush <= 1'b0;
             a <= 64'hFFFFFFFF3F800000; b <= 64'hFFFFFFFF40000000; c <= 64'd0; req_valid <= 1'b1;
-            #1.5;                                    // 第 1 条
+            @(posedge clk);                          // E0+1：第 2 条被接收（req_valid 保持 1，无空隙）
+            a <= 64'hFFFFFFFF40000000; b <= 64'hFFFFFFFF40000000;
+            @(posedge clk);                          // E0+2：收回 req_valid（两条都已接收）
+            req_valid <= 1'b0;
+            repeat (5) @(posedge clk);               // 到 E0+7
+            #1.5;
+            checks = checks + 1;
+            if (done !== 1'b0) fail("b2b early done", {63'b0, done}, 64'd0);
+            checks = checks + 1;
+            if (busy !== 1'b1) fail("b2b busy", {63'b0, busy}, 64'd1);
+            @(posedge clk);                          // E0+8：第 1 条结果拍
+            #1.5;
             checks = checks + 1;
             if (done !== 1'b1) fail("b2b done1", {63'b0, done}, 64'd1);
             if (result !== 64'hFFFFFFFF40400000) fail("b2b res1", result, 64'hFFFFFFFF40400000);
-            @(posedge clk);
-            a <= 64'hFFFFFFFF40000000; b <= 64'hFFFFFFFF40000000;                // 第 2 条（req_valid 保持 1，无空隙）
+            @(posedge clk);                          // E0+9：第 2 条结果拍（背靠背无气泡）
             #1.5;
             checks = checks + 1;
             if (done !== 1'b1) fail("b2b done2", {63'b0, done}, 64'd1);
             if (result !== 64'hFFFFFFFF40800000) fail("b2b res2", result, 64'hFFFFFFFF40800000);
-            @(posedge clk); req_valid <= 1'b0; #1.5;
+            @(posedge clk); #1.5;
+            checks = checks + 1;
+            if (done !== 1'b0) fail("b2b done3", {63'b0, done}, 64'd0);
 
             // (3) div 迭代中途 flush：busy 落 0、不得有 done、之后可恢复
             @(posedge clk);
@@ -330,6 +373,102 @@ module tb_fpu;
             if (done !== 1'b1) fail("recover done", {63'b0, done}, 64'd1);
             if (result !== 64'hFFFFFFFF3F800000) fail("recover res", result, 64'hFFFFFFFF3F800000);
             @(posedge clk); #1.5;
+        end
+    endtask
+
+    // ---- T4 新增：**逐类潜伏期 + 背靠背**断言 ---------------------------------
+    //   为什么需要（T4 实测教训）：流水化后每类单元内部级数不同（add=6、mul=4、
+    //   fma=8 个寄存器级，各自再补齐到 FPU_SC_LAT = 8）。若某一类的补齐级数写错
+    //   1 拍，**单条指令**的用例仍会"看似正确"（操作数在停拍期间保持不变 ⇒ 流水线
+    //   每拍都吐出同一个结果），只有"两条不同操作数背靠背"才能暴露。
+    //   ⇒ 本任务对每类各跑两条背靠背，断言：第 8 拍 = 第 1 条结果、第 9 拍 = 第 2 条
+    //     结果、第 7 拍必须无 done、第 10 拍必须无 done。断言强度 = 只增不减。
+    //   ★ 两条的 op/rm **故意允许不同**：`rm`/`is_unsigned` 等"第 0 级即定值"的
+    //     控制量在背靠背时必须随流水携带（实测踩到：fcvt 的 f2i 三段流水里若直接
+    //     读 r1_rm/r1_f2i_uns，后一条会污染前一条的舍入/饱和）。故本任务把 op/rm
+    //     也做成逐条参数。
+    task b2b_case;
+        input [8*12-1:0] nm;
+        input [6:0]  p_op1, p_op2;
+        input [1:0]  p_fmt;
+        input [2:0]  p_rm1, p_rm2;
+        input [63:0] a1, b1, c1, e1;
+        input [63:0] a2, b2, c2, e2;
+        begin
+            $display("TB_FPU_UNIT: b2b %0s", nm);
+            @(posedge clk);
+            fp_op <= p_op1; fmt <= p_fmt; rm <= p_rm1; frm <= 3'b000;
+            a <= a1; b <= b1; c <= c1; flush <= 1'b0; req_valid <= 1'b1;
+            @(posedge clk);                       // E0+1：第 2 条被接收
+            fp_op <= p_op2; rm <= p_rm2;
+            a <= a2; b <= b2; c <= c2;
+            @(posedge clk); req_valid <= 1'b0;    // E0+2：两条都已接收
+            repeat (4) @(posedge clk);            // 到 E0+6
+            #1.5;
+            checks = checks + 1;
+            if (done !== 1'b0) fail("b2bcls early", {63'b0, done}, 64'd0);
+            @(posedge clk); #1.5;                 // E0+8 … 等等：E0+7
+            checks = checks + 1;
+            if (done !== 1'b0) fail("b2bcls c7", {63'b0, done}, 64'd0);
+            @(posedge clk); #1.5;                 // E0+8：第 1 条
+            checks = checks + 1;
+            if (done !== 1'b1)    fail("b2bcls done1", {63'b0, done}, 64'd1);
+            if (result !== e1)    fail("b2bcls res1", result, e1);
+            @(posedge clk); #1.5;                 // E0+9：第 2 条
+            checks = checks + 1;
+            if (done !== 1'b1)    fail("b2bcls done2", {63'b0, done}, 64'd1);
+            if (result !== e2)    fail("b2bcls res2", result, e2);
+            @(posedge clk); #1.5;                 // E0+10
+            checks = checks + 1;
+            if (done !== 1'b0) fail("b2bcls c10", {63'b0, done}, 64'd0);
+        end
+    endtask
+
+    task lat_class_tests;
+        begin
+            b2b_case("fadd.s",  7'd0, 7'd0, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFF3F800000, 64'hFFFFFFFF40000000, 64'd0, 64'hFFFFFFFF40400000,
+                     64'hFFFFFFFF40000000, 64'hFFFFFFFF40400000, 64'd0, 64'hFFFFFFFF40A00000);
+            b2b_case("fadd.d",  7'd0, 7'd0, 2'b01, 3'b000, 3'b000,
+                     64'h3FF0000000000000, 64'h4000000000000000, 64'd0, 64'h4008000000000000,
+                     64'h4000000000000000, 64'h4000000000000000, 64'd0, 64'h4010000000000000);
+            b2b_case("fmul.s",  7'd2, 7'd2, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFF40000000, 64'hFFFFFFFF40400000, 64'd0, 64'hFFFFFFFF40C00000,
+                     64'hFFFFFFFF40400000, 64'hFFFFFFFF40800000, 64'd0, 64'hFFFFFFFF41400000);
+            b2b_case("fmul.d",  7'd2, 7'd2, 2'b01, 3'b000, 3'b000,
+                     64'h4000000000000000, 64'h4008000000000000, 64'd0, 64'h4018000000000000,
+                     64'h4000000000000000, 64'h4000000000000000, 64'd0, 64'h4010000000000000);
+            b2b_case("fmadd.s", 7'd26, 7'd26, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFF40000000, 64'hFFFFFFFF40400000, 64'hFFFFFFFF40800000, 64'hFFFFFFFF41200000,
+                     64'hFFFFFFFF3F800000, 64'hFFFFFFFF3F800000, 64'hFFFFFFFF3F800000, 64'hFFFFFFFF40000000);
+            b2b_case("fmadd.d", 7'd26, 7'd26, 2'b01, 3'b000, 3'b000,
+                     64'h4000000000000000, 64'h4008000000000000, 64'h4010000000000000, 64'h4024000000000000,
+                     64'h3FF0000000000000, 64'h3FF0000000000000, 64'h3FF0000000000000, 64'h4000000000000000);
+            b2b_case("fcvt.w.s", 7'd16, 7'd16, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFF3FC00000, 64'd0, 64'd0, 64'h0000000000000002,
+                     64'hFFFFFFFF3F800000, 64'd0, 64'd0, 64'h0000000000000001);
+            // ★ rm 逐条不同：1.5 RNE=2 / 1.5 RTZ=1（验"rm 随流水携带"）
+            b2b_case("fcvt.w.s rm", 7'd16, 7'd16, 2'b00, 3'b000, 3'b001,
+                     64'hFFFFFFFF3FC00000, 64'd0, 64'd0, 64'h0000000000000002,
+                     64'hFFFFFFFF3FC00000, 64'd0, 64'd0, 64'h0000000000000001);
+            // ★ is_unsigned 逐条不同（用 -1.0 作判别：有符号饱和到 0x8000_0000、
+            //   无符号饱和到 0 —— 两者结果不同，能真正验"is_unsigned 随流水携带"）
+            b2b_case("fcvt.w/wu.s", 7'd16, 7'd17, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFFFF800000, 64'd0, 64'd0, 64'h0000000080000000,
+                     64'hFFFFFFFFFF800000, 64'd0, 64'd0, 64'h0000000000000000);
+            // ★ f2i 只比较结果位（fflags 由既有向量用例覆盖）
+            b2b_case("fcvt.w.d rm", 7'd20, 7'd20, 2'b01, 3'b000, 3'b010,
+                     64'h3FF8000000000000, 64'd0, 64'd0, 64'h0000000000000002,
+                     64'hBFF8000000000000, 64'd0, 64'd0, 64'h00000000FFFFFFFE);
+            b2b_case("fcvt.d.s", 7'd25, 7'd25, 2'b01, 3'b000, 3'b000,
+                     64'hFFFFFFFF3F800000, 64'd0, 64'd0, 64'h3FF0000000000000,
+                     64'hFFFFFFFF3FC00000, 64'd0, 64'd0, 64'h3FF8000000000000);
+            b2b_case("feq.s",   7'd10, 7'd10, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFF3F800000, 64'hFFFFFFFF3F800000, 64'd0, 64'h0000000000000001,
+                     64'hFFFFFFFF3F800000, 64'hFFFFFFFF40000000, 64'd0, 64'h0000000000000000);
+            b2b_case("fsgnj.s", 7'd5, 7'd5, 2'b00, 3'b000, 3'b000,
+                     64'hFFFFFFFF3F800000, 64'hFFFFFFFFC0000000, 64'd0, 64'hFFFFFFFFBF800000,
+                     64'hFFFFFFFF40000000, 64'hFFFFFFFF3F800000, 64'd0, 64'hFFFFFFFF40000000);
         end
     endtask
 
@@ -574,6 +713,9 @@ module tb_fpu;
         end
 
         flow_tests();
+
+        // ---- T4 新增：逐类潜伏期 + 背靠背（见 lat_class_tests 头注）----
+        lat_class_tests();
 
         // ---- frm/DYN 用例（rm=111）----
         frm = 3'b011; sc_case_frm(7'd16, 2'b00, 3'b111, 64'hFFFFFFFF3FC00000, 64'h0000000000000000, 5'b00001); // fcvt.w.s(1.5,DYN+frm=RUP)=2 NX

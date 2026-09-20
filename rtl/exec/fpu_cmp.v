@@ -189,8 +189,14 @@ endmodule
 
 //==============================================================================
 // fpu_cmp —— 顶层：fmt 选择 S/D 两个核心，并完成 NaN-boxing 与结果定向
+//------------------------------------------------------------------------------
+// ★ T4（2026-09-20）：本单元组合很浅（比较/分类），流水化只为**统一全核 FPU
+//   潜伏期**：把组合结果经 `fpu_delay(N = 8)` 延迟 LAT 拍后输出 ⇒ 与
+//   add/mul/fma/cvt 同为 LAT = 8 拍完成。位级语义一位不变（延迟只改时刻）。
+//   `fpu_cmp_core`（单格式核心）保持纯组合、端口不变（单元 TB 仍直接例化它）。
 //==============================================================================
 module fpu_cmp (
+    input  wire        clk,        // ★ T4：统一潜伏期用的流水时钟
     input  wire [6:0]  fp_op,      // 归一化操作码（本模块子集：5..13）
     input  wire [1:0]  fmt,        // 00=S(32b) / 01=D(64b)
     input  wire [63:0] a,          // 操作数（fregfile 64 位视图）
@@ -255,6 +261,15 @@ module fpu_cmp (
     wire [63:0] r_fp  = is_d ? r_d : {32'hFFFF_FFFF, r_s};     // S ⇒ 高 32 位全 1
     wire [63:0] r_int = is_d ? {32'b0, r_d[31:0]} : {32'b0, r_s};
 
-    assign result = int_target ? r_int : r_fp;
-    assign fflags = is_d ? fl_d : fl_s;
+    wire [63:0] r_c = int_target ? r_int : r_fp;
+    wire [4:0]  f_c = is_d ? fl_d : fl_s;
+
+    // ---- T4：统一潜伏期（LAT = 8；★ 必须与 fpu.v 的 FPU_SC_LAT 一致）----
+    wire [68:0] cmp_d;
+    assign cmp_d = {r_c, f_c};
+    wire [68:0] cmp_q;
+    fpu_delay #(.W(69), .N(8)) u_lat (.clk (clk), .d (cmp_d), .q (cmp_q));
+
+    assign result = cmp_q[68:5];
+    assign fflags = cmp_q[4:0];
 endmodule
