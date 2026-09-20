@@ -2,10 +2,13 @@
 # fpga/tcl/synth.tcl —— 非工程模式综合（M4：Vivado 2023.2 batch）
 #==============================================================================
 # 项目 : rv32gc-cpu（阶段二 2A 单发射顺序 5 级基线核）
-# 用法 : ./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl [part] [clk_period_ns]
+# 用法 : ./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl [clk_period_ns] [part]
 #        （★ 一律经三坑统一入口调用，禁止直接 `vivado -mode batch`，08 §7.1 第 7 条）
-#          默认 part = xc7a200tfbg676-2（AGENT.md §2 平台器件）
+#        ★ T3（2026-09-19）起**周期优先**：argv0 传给 CLK_PERIOD_NS（与
+#          fpga/scratch/*.tcl、fpga/tcl/report_timing_detail.tcl 口径统一）；
+#          argv0 为器件串（含 `xc`/`-`）时按旧位次解释为 part，**向后兼容**。
 #          默认 clk_period_ns = 16.667（60 MHz，M4 判据② 的验收时钟；100 MHz 余量参考用 10.0）
+#          默认 part = xc7a200tfbg676-2（AGENT.md §2 平台器件）
 # 产物 : fpga/out/synth_utilization.rpt        —— 资源占用（M4 判据③）
 #        fpga/out/synth_utilization_hier.rpt   —— 层次化资源占用（按模块核对）
 #        fpga/out/synth_timing_summary.rpt     —— 时序摘要（M4 判据②，看 WNS/TNS）
@@ -47,8 +50,23 @@ set PART       "xc7a200tfbg676-2"         ;# AGENT.md §2 平台器件
 set CLK_PERIOD_NS 16.667                  ;# 60 MHz（M4 判据②）；100 MHz 余量参考传 10.0
 set IP_MACRO   "RV32GC_USE_VIVADO_IP"     ;# 宏名真源（08 §3.3 第 3 条）
 
-if {[info exists argv] && [llength $argv] >= 1 && [lindex $argv 0] ne ""} { set PART [lindex $argv 0] }
-if {[info exists argv] && [llength $argv] >= 2 && [lindex $argv 1] ne ""} { set CLK_PERIOD_NS [lindex $argv 1] }
+# ---- 参数解析（T3 2026-09-19：周期优先，兼容旧 [part] [period] 位次）----
+#   T3 验收判据按 `... synth.tcl 16.667` 调用 ⇒ argv0 优先解释为**周期**（与
+#   nofpu_*.tcl / report_timing_detail.tcl 的"argv0 = period"口径一致）；
+#   若 argv0 是器件串（含 'xc' 或以 '-' 结尾，如 xc7a200tfbg676-2）则按**旧位次**
+#   解释为 part、argv1 为周期 ⇒ 旧命令行（含 M4/T2 留档命令）仍逐字可用。
+if {[info exists argv] && [llength $argv] >= 1 && [lindex $argv 0] ne ""} {
+    if {[string match "xc*" [lindex $argv 0]] || [string match "*-*" [lindex $argv 0]]} {
+        set PART [lindex $argv 0]
+        if {[llength $argv] >= 2 && [lindex $argv 1] ne ""} { set CLK_PERIOD_NS [lindex $argv 1] }
+    } else {
+        set CLK_PERIOD_NS [lindex $argv 0]
+        if {[llength $argv] >= 2 && [lindex $argv 1] ne ""} { set PART [lindex $argv 1] }
+    }
+}
+if {![string is double -strict $CLK_PERIOD_NS] || $CLK_PERIOD_NS <= 0} {
+    error "clk_period_ns 非法：'$CLK_PERIOD_NS'（应为正数 ns，如 16.667 = 60 MHz / 10.0 = 100 MHz）"
+}
 
 puts "== synth.tcl: PROJ_ROOT=$PROJ_ROOT"
 puts "== synth.tcl: TOP=$TOP  PART=$PART  CLK_PERIOD=${CLK_PERIOD_NS}ns（[format %.2f [expr {1000.0 / $CLK_PERIOD_NS}]] MHz）"
@@ -229,21 +247,33 @@ proc rv32_apply_constraints {} {
 # 4. 报告落盘（M4 判据②③）
 #------------------------------------------------------------------------------
 proc rv32_report {tag} {
-    global OUT_DIR
-    set util   [file join $OUT_DIR "${tag}_utilization.rpt"]
-    set utilh  [file join $OUT_DIR "${tag}_utilization_hier.rpt"]
-    set timing [file join $OUT_DIR "${tag}_timing_summary.rpt"]
+    global OUT_DIR CLK_PERIOD_NS
+    # T3（2026-09-19）：文件名带周期（如 synth_16.667ns_utilization.rpt）⇒ 60 MHz 与
+    #   100 MHz 两轮跑的**证据互不覆盖**；同时并列一份惯例名（synth_*.rpt / impl_*.rpt）
+    #   供 M4 判据②③ 的固定路径引用（跑 100 MHz 前会把 60 MHz 的惯例名另存为
+    #   fpga/out/m4_60mhz_*，见交付说明）。
+    set stem "${tag}_${CLK_PERIOD_NS}ns"
+    set util   [file join $OUT_DIR "${stem}_utilization.rpt"]
+    set utilh  [file join $OUT_DIR "${stem}_utilization_hier.rpt"]
+    set timing [file join $OUT_DIR "${stem}_timing_summary.rpt"]
+    set util_c   [file join $OUT_DIR "${tag}_utilization.rpt"]
+    set utilh_c  [file join $OUT_DIR "${tag}_utilization_hier.rpt"]
+    set timing_c [file join $OUT_DIR "${tag}_timing_summary.rpt"]
 
     report_utilization -file $util
     report_utilization -hierarchical -file $utilh
     report_timing_summary -file $timing
+    # 惯例名副本（固定路径，M4 判据口径）
+    file copy -force $util $util_c
+    file copy -force $utilh $utilh_c
+    file copy -force $timing $timing_c
 
     set wns "n/a"
     if {[catch {set wns [get_property SLACK [get_timing_paths -delay_type max -max_paths 1]]} err]} {
         set wns "n/a"
     }
-    puts "== $tag: 报告 ⇒ $util | $utilh | $timing"
-    puts "== $tag: WNS(max) = $wns ns（M4 判据②：60 MHz 约束下要求 WNS >= 0）"
+    puts "== $tag: 报告 ⇒ $util | $utilh | $timing（惯例名副本 ${tag}_*.rpt）"
+    puts "== $tag: WNS(max) = $wns ns @ ${CLK_PERIOD_NS}ns（M4 判据②：60 MHz 约束下要求 WNS >= 0）"
 }
 
 #------------------------------------------------------------------------------
@@ -262,10 +292,16 @@ if {![info exists ::RV32_SYNTH_DEFS_ONLY]} {
         puts "== synth.tcl: 宏 $IP_MACRO 已定义（综合走 Vivado IP 分支；仿真回归从不定义该宏）"
         rv32_apply_constraints
         rv32_report synth
+        # ---- T3（2026-09-19）：检查点除惯例名外再写一份**周期标签**副本 ----
+        #   目的：60 MHz 与 100 MHz 两轮跑**不可能互相污染**（impl.tcl 优先取
+        #   post_synth_<period>ns.dcp，取不到才回退惯例名 post_synth.dcp）。
+        #   两个文件的 netlist 与约束同源，只是周期不同（各带自己的 create_clock）。
         set dcp [file join $OUT_DIR post_synth.dcp]
         write_checkpoint -force $dcp
-        puts "== synth.tcl 完成：报告 $OUT_DIR/synth_*.rpt；检查点 $dcp"
-        puts "== synth.tcl 提示：实现流程用 ./fpga/run_vivado_batch.sh fpga/tcl/impl.tcl"
+        set dcp_tag [file join $OUT_DIR [format "post_synth_%sns.dcp" $CLK_PERIOD_NS]]
+        write_checkpoint -force $dcp_tag
+        puts "== synth.tcl 完成：报告 $OUT_DIR/synth_*.rpt；检查点 $dcp（周期副本 $dcp_tag）"
+        puts "== synth.tcl 提示：实现流程用 ./fpga/run_vivado_batch.sh fpga/tcl/impl.tcl $CLK_PERIOD_NS"
     } err]} {
         puts stderr "ERROR: synth.tcl 失败：$err"
         puts stderr $::errorInfo
