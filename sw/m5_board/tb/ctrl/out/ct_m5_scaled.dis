@@ -1,0 +1,367 @@
+
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sw/m5_board/tb/ctrl/out/ct_m5_scaled.elf:     file format elf32-littleriscv
+
+
+Disassembly of section .text:
+
+1c000000 <_start>:
+1c000000:	1fe00437          	lui	x8,0x1fe00
+1c000004:	1e040413          	addi	x8,x8,480 # 1fe001e0 <UART_BASE>
+1c000008:	1fd004b7          	lui	x9,0x1fd00
+1c00000c:	08000137          	lui	x2,0x8000
+1c000010:	ff010113          	addi	x2,x2,-16 # 7fffff0 <DELAY_SW_TICKS+0x7fcf2b0>
+1c000014:	04700293          	addi	x5,x0,71
+1c000018:	00540123          	sb	x5,2(x8)
+1c00001c:	08000293          	addi	x5,x0,128
+1c000020:	005401a3          	sb	x5,3(x8)
+1c000024:	01200293          	addi	x5,x0,18
+1c000028:	00540023          	sb	x5,0(x8)
+1c00002c:	000400a3          	sb	x0,1(x8)
+1c000030:	00300293          	addi	x5,x0,3
+1c000034:	005401a3          	sb	x5,3(x8)
+1c000038:	1c000537          	lui	x10,0x1c000
+1c00003c:	5bc50513          	addi	x10,x10,1468 # 1c0005bc <msg_boot>
+1c000040:	288000ef          	jal	x1,1c0002c8 <puts_str>
+
+1c000044 <main_loop>:
+1c000044:	00100913          	addi	x18,x0,1
+1c000048:	00800993          	addi	x19,x0,8
+
+1c00004c <hb_loop>:
+1c00004c:	0000ff37          	lui	x30,0xf
+1c000050:	01e48fb3          	add	x31,x9,x30
+1c000054:	012fa023          	sw	x18,0(x31)
+1c000058:	01091293          	slli	x5,x18,0x10
+1c00005c:	00001337          	lui	x6,0x1
+1c000060:	0062e2b3          	or	x5,x5,x6
+1c000064:	0000ff37          	lui	x30,0xf
+1c000068:	010f0f13          	addi	x30,x30,16 # f010 <TGT_TOL+0x37b0>
+1c00006c:	01e48fb3          	add	x31,x9,x30
+1c000070:	005fa023          	sw	x5,0(x31)
+1c000074:	1c000537          	lui	x10,0x1c000
+1c000078:	4a850513          	addi	x10,x10,1192 # 1c0004a8 <str_hb>
+1c00007c:	24c000ef          	jal	x1,1c0002c8 <puts_str>
+1c000080:	00090513          	addi	x10,x18,0
+1c000084:	2a0000ef          	jal	x1,1c000324 <puts_dec>
+1c000088:	278000ef          	jal	x1,1c000300 <puts_nl>
+1c00008c:	00018537          	lui	x10,0x18
+1c000090:	6a050513          	addi	x10,x10,1696 # 186a0 <DELAY_HB_TICKS>
+1c000094:	34c000ef          	jal	x1,1c0003e0 <delay_ticks>
+1c000098:	00191913          	slli	x18,x18,0x1
+1c00009c:	fff98993          	addi	x19,x19,-1
+1c0000a0:	fa0996e3          	bne	x19,x0,1c00004c <hb_loop>
+1c0000a4:	1c000537          	lui	x10,0x1c000
+1c0000a8:	56c50513          	addi	x10,x10,1388 # 1c00056c <msg_steps>
+1c0000ac:	21c000ef          	jal	x1,1c0002c8 <puts_str>
+1c0000b0:	0000ff37          	lui	x30,0xf
+1c0000b4:	020f0f13          	addi	x30,x30,32 # f020 <TGT_TOL+0x37c0>
+1c0000b8:	01e48fb3          	add	x31,x9,x30
+1c0000bc:	000fa303          	lw	x6,0(x31)
+1c0000c0:	0ff37313          	andi	x6,x6,255
+1c0000c4:	0000ff37          	lui	x30,0xf
+1c0000c8:	01e48fb3          	add	x31,x9,x30
+1c0000cc:	006fa023          	sw	x6,0(x31)
+1c0000d0:	01031293          	slli	x5,x6,0x10
+1c0000d4:	00003f37          	lui	x30,0x3
+1c0000d8:	01e2e2b3          	or	x5,x5,x30
+1c0000dc:	0000ff37          	lui	x30,0xf
+1c0000e0:	010f0f13          	addi	x30,x30,16 # f010 <TGT_TOL+0x37b0>
+1c0000e4:	01e48fb3          	add	x31,x9,x30
+1c0000e8:	005fa023          	sw	x5,0(x31)
+1c0000ec:	1c000537          	lui	x10,0x1c000
+1c0000f0:	4c850513          	addi	x10,x10,1224 # 1c0004c8 <str_sw>
+1c0000f4:	1d4000ef          	jal	x1,1c0002c8 <puts_str>
+1c0000f8:	00030513          	addi	x10,x6,0 # 1000 <MEAS_ITER+0x830>
+1c0000fc:	228000ef          	jal	x1,1c000324 <puts_dec>
+1c000100:	200000ef          	jal	x1,1c000300 <puts_nl>
+1c000104:	00031537          	lui	x10,0x31
+1c000108:	d4050513          	addi	x10,x10,-704 # 30d40 <DELAY_SW_TICKS>
+1c00010c:	2d4000ef          	jal	x1,1c0003e0 <delay_ticks>
+1c000110:	0000ef37          	lui	x30,0xe
+1c000114:	01e48fb3          	add	x31,x9,x30
+1c000118:	000fa023          	sw	x0,0(x31)
+1c00011c:	000faa03          	lw	x20,0(x31)
+1c000120:	7d000513          	addi	x10,x0,2000
+1c000124:	2f4000ef          	jal	x1,1c000418 <delay_loop>
+1c000128:	000faa83          	lw	x21,0(x31)
+1c00012c:	414a8b33          	sub	x22,x21,x20
+1c000130:	000b0513          	addi	x10,x22,0
+1c000134:	7d000593          	addi	x11,x0,2000
+1c000138:	30c000ef          	jal	x1,1c000444 <udiv>
+1c00013c:	00050b93          	addi	x23,x10,0
+1c000140:	0001d2b7          	lui	x5,0x1d
+1c000144:	cf028293          	addi	x5,x5,-784 # 1ccf0 <TGT_TICKS>
+1c000148:	405b0333          	sub	x6,x22,x5
+1c00014c:	00035463          	bge	x6,x0,1c000154 <chk_pos>
+1c000150:	40600333          	sub	x6,x0,x6
+
+1c000154 <chk_pos>:
+1c000154:	0000c3b7          	lui	x7,0xc
+1c000158:	86038393          	addi	x7,x7,-1952 # b860 <TGT_TOL>
+1c00015c:	0063bdb3          	sltu	x27,x7,x6
+1c000160:	001dcc13          	xori	x24,x27,1
+1c000164:	00fbf293          	andi	x5,x23,15
+1c000168:	01029293          	slli	x5,x5,0x10
+1c00016c:	00004337          	lui	x6,0x4
+1c000170:	0062e2b3          	or	x5,x5,x6
+1c000174:	014c1313          	slli	x6,x24,0x14
+1c000178:	0062e2b3          	or	x5,x5,x6
+1c00017c:	0000ff37          	lui	x30,0xf
+1c000180:	010f0f13          	addi	x30,x30,16 # f010 <TGT_TOL+0x37b0>
+1c000184:	01e48fb3          	add	x31,x9,x30
+1c000188:	005fa023          	sw	x5,0(x31)
+1c00018c:	0000ff37          	lui	x30,0xf
+1c000190:	01e48fb3          	add	x31,x9,x30
+1c000194:	018fa023          	sw	x24,0(x31)
+1c000198:	1c000537          	lui	x10,0x1c000
+1c00019c:	4e450513          	addi	x10,x10,1252 # 1c0004e4 <str_tick>
+1c0001a0:	128000ef          	jal	x1,1c0002c8 <puts_str>
+1c0001a4:	000b0513          	addi	x10,x22,0
+1c0001a8:	17c000ef          	jal	x1,1c000324 <puts_dec>
+1c0001ac:	1c000537          	lui	x10,0x1c000
+1c0001b0:	50050513          	addi	x10,x10,1280 # 1c000500 <str_tpi>
+1c0001b4:	114000ef          	jal	x1,1c0002c8 <puts_str>
+1c0001b8:	000b8513          	addi	x10,x23,0
+1c0001bc:	168000ef          	jal	x1,1c000324 <puts_dec>
+1c0001c0:	1c000537          	lui	x10,0x1c000
+1c0001c4:	51450513          	addi	x10,x10,1300 # 1c000514 <str_tpiavg>
+1c0001c8:	100000ef          	jal	x1,1c0002c8 <puts_str>
+1c0001cc:	0001d537          	lui	x10,0x1d
+1c0001d0:	cf050513          	addi	x10,x10,-784 # 1ccf0 <TGT_TICKS>
+1c0001d4:	150000ef          	jal	x1,1c000324 <puts_dec>
+1c0001d8:	128000ef          	jal	x1,1c000300 <puts_nl>
+1c0001dc:	0000ff37          	lui	x30,0xf
+1c0001e0:	030f0f13          	addi	x30,x30,48 # f030 <TGT_TOL+0x37d0>
+1c0001e4:	01e48fb3          	add	x31,x9,x30
+1c0001e8:	000fac83          	lw	x25,0(x31)
+1c0001ec:	000c8e13          	addi	x28,x25,0
+1c0001f0:	00fe7293          	andi	x5,x28,15
+1c0001f4:	01029293          	slli	x5,x5,0x10
+1c0001f8:	00005337          	lui	x6,0x5
+1c0001fc:	0062e2b3          	or	x5,x5,x6
+1c000200:	0000ff37          	lui	x30,0xf
+1c000204:	010f0f13          	addi	x30,x30,16 # f010 <TGT_TOL+0x37b0>
+1c000208:	01e48fb3          	add	x31,x9,x30
+1c00020c:	005fa023          	sw	x5,0(x31)
+1c000210:	0000ff37          	lui	x30,0xf
+1c000214:	01e48fb3          	add	x31,x9,x30
+1c000218:	01cfa023          	sw	x28,0(x31)
+1c00021c:	1c000537          	lui	x10,0x1c000
+1c000220:	52850513          	addi	x10,x10,1320 # 1c000528 <str_freq>
+1c000224:	0a4000ef          	jal	x1,1c0002c8 <puts_str>
+1c000228:	000e0513          	addi	x10,x28,0
+1c00022c:	150000ef          	jal	x1,1c00037c <puts_hex8>
+1c000230:	1c000537          	lui	x10,0x1c000
+1c000234:	53850513          	addi	x10,x10,1336 # 1c000538 <str_freqmhz>
+1c000238:	090000ef          	jal	x1,1c0002c8 <puts_str>
+1c00023c:	000f4537          	lui	x10,0xf4
+1c000240:	24050513          	addi	x10,x10,576 # f4240 <DELAY_SW_TICKS+0xc3500>
+1c000244:	00050593          	addi	x11,x10,0
+1c000248:	000c8513          	addi	x10,x25,0
+1c00024c:	1f8000ef          	jal	x1,1c000444 <udiv>
+1c000250:	0d4000ef          	jal	x1,1c000324 <puts_dec>
+1c000254:	1c000537          	lui	x10,0x1c000
+1c000258:	54450513          	addi	x10,x10,1348 # 1c000544 <str_mhz>
+1c00025c:	06c000ef          	jal	x1,1c0002c8 <puts_str>
+1c000260:	014cde93          	srli	x29,x25,0x14
+1c000264:	01f00f13          	addi	x30,x0,31
+1c000268:	41ee8eb3          	sub	x29,x29,x30
+1c00026c:	01d03eb3          	sltu	x29,x0,x29
+1c000270:	01dded33          	or	x26,x27,x29
+1c000274:	1c000537          	lui	x10,0x1c000
+1c000278:	54c50513          	addi	x10,x10,1356 # 1c00054c <str_total>
+1c00027c:	04c000ef          	jal	x1,1c0002c8 <puts_str>
+1c000280:	000d1a63          	bne	x26,x0,1c000294 <total_bad>
+1c000284:	1c000537          	lui	x10,0x1c000
+1c000288:	56050513          	addi	x10,x10,1376 # 1c000560 <str_ok>
+1c00028c:	03c000ef          	jal	x1,1c0002c8 <puts_str>
+1c000290:	0100006f          	jal	x0,1c0002a0 <total_end>
+
+1c000294 <total_bad>:
+1c000294:	1c000537          	lui	x10,0x1c000
+1c000298:	56450513          	addi	x10,x10,1380 # 1c000564 <str_bad>
+1c00029c:	02c000ef          	jal	x1,1c0002c8 <puts_str>
+
+1c0002a0 <total_end>:
+1c0002a0:	060000ef          	jal	x1,1c000300 <puts_nl>
+1c0002a4:	da1ff06f          	jal	x0,1c000044 <main_loop>
+
+1c0002a8 <puts_char>:
+1c0002a8:	04000593          	addi	x11,x0,64
+
+1c0002ac <pc_wait>:
+1c0002ac:	00544283          	lbu	x5,5(x8)
+1c0002b0:	0202f293          	andi	x5,x5,32
+1c0002b4:	00029663          	bne	x5,x0,1c0002c0 <pc_send>
+1c0002b8:	fff58593          	addi	x11,x11,-1
+1c0002bc:	fe0598e3          	bne	x11,x0,1c0002ac <pc_wait>
+
+1c0002c0 <pc_send>:
+1c0002c0:	00a40023          	sb	x10,0(x8)
+1c0002c4:	00008067          	jalr	x0,0(x1)
+
+1c0002c8 <puts_str>:
+1c0002c8:	ff010113          	addi	x2,x2,-16
+1c0002cc:	00112623          	sw	x1,12(x2)
+1c0002d0:	00a12423          	sw	x10,8(x2)
+
+1c0002d4 <ps_loop>:
+1c0002d4:	00812503          	lw	x10,8(x2)
+1c0002d8:	00054503          	lbu	x10,0(x10)
+1c0002dc:	00050c63          	beq	x10,x0,1c0002f4 <ps_end>
+1c0002e0:	fc9ff0ef          	jal	x1,1c0002a8 <puts_char>
+1c0002e4:	00812503          	lw	x10,8(x2)
+1c0002e8:	00150513          	addi	x10,x10,1
+1c0002ec:	00a12423          	sw	x10,8(x2)
+1c0002f0:	fe5ff06f          	jal	x0,1c0002d4 <ps_loop>
+
+1c0002f4 <ps_end>:
+1c0002f4:	00c12083          	lw	x1,12(x2)
+1c0002f8:	01010113          	addi	x2,x2,16
+1c0002fc:	00008067          	jalr	x0,0(x1)
+
+1c000300 <puts_nl>:
+1c000300:	ff010113          	addi	x2,x2,-16
+1c000304:	00112623          	sw	x1,12(x2)
+1c000308:	00d00513          	addi	x10,x0,13
+1c00030c:	f9dff0ef          	jal	x1,1c0002a8 <puts_char>
+1c000310:	00a00513          	addi	x10,x0,10
+1c000314:	f95ff0ef          	jal	x1,1c0002a8 <puts_char>
+1c000318:	00c12083          	lw	x1,12(x2)
+1c00031c:	01010113          	addi	x2,x2,16
+1c000320:	00008067          	jalr	x0,0(x1)
+
+1c000324 <puts_dec>:
+1c000324:	fd010113          	addi	x2,x2,-48
+1c000328:	02112623          	sw	x1,44(x2)
+1c00032c:	00050f13          	addi	x30,x10,0
+1c000330:	00010e93          	addi	x29,x2,0
+1c000334:	00a00e13          	addi	x28,x0,10
+1c000338:	01000f93          	addi	x31,x0,16
+
+1c00033c <pd_loop>:
+1c00033c:	03cf72b3          	remu	x5,x30,x28
+1c000340:	03cf5f33          	divu	x30,x30,x28
+1c000344:	03028293          	addi	x5,x5,48
+1c000348:	005e8023          	sb	x5,0(x29)
+1c00034c:	001e8e93          	addi	x29,x29,1
+1c000350:	ffff8f93          	addi	x31,x31,-1
+1c000354:	000f8463          	beq	x31,x0,1c00035c <pd_out>
+1c000358:	fe0f12e3          	bne	x30,x0,1c00033c <pd_loop>
+
+1c00035c <pd_out>:
+1c00035c:	fffe8e93          	addi	x29,x29,-1
+1c000360:	000ec503          	lbu	x10,0(x29)
+1c000364:	f45ff0ef          	jal	x1,1c0002a8 <puts_char>
+1c000368:	00010313          	addi	x6,x2,0
+1c00036c:	ffd368e3          	bltu	x6,x29,1c00035c <pd_out>
+1c000370:	02c12083          	lw	x1,44(x2)
+1c000374:	03010113          	addi	x2,x2,48
+1c000378:	00008067          	jalr	x0,0(x1)
+
+1c00037c <puts_hex8>:
+1c00037c:	fe010113          	addi	x2,x2,-32
+1c000380:	00112e23          	sw	x1,28(x2)
+1c000384:	00a12c23          	sw	x10,24(x2)
+1c000388:	00800e13          	addi	x28,x0,8
+
+1c00038c <ph_loop>:
+1c00038c:	01812283          	lw	x5,24(x2)
+1c000390:	01c2d293          	srli	x5,x5,0x1c
+1c000394:	00a00313          	addi	x6,x0,10
+1c000398:	0062e663          	bltu	x5,x6,1c0003a4 <ph_digit>
+1c00039c:	03728293          	addi	x5,x5,55
+1c0003a0:	0080006f          	jal	x0,1c0003a8 <ph_emit>
+
+1c0003a4 <ph_digit>:
+1c0003a4:	03028293          	addi	x5,x5,48
+
+1c0003a8 <ph_emit>:
+1c0003a8:	00028513          	addi	x10,x5,0
+1c0003ac:	efdff0ef          	jal	x1,1c0002a8 <puts_char>
+1c0003b0:	01812283          	lw	x5,24(x2)
+1c0003b4:	00429293          	slli	x5,x5,0x4
+1c0003b8:	00512c23          	sw	x5,24(x2)
+1c0003bc:	fffe0e13          	addi	x28,x28,-1
+1c0003c0:	fc0e16e3          	bne	x28,x0,1c00038c <ph_loop>
+1c0003c4:	01c12083          	lw	x1,28(x2)
+1c0003c8:	02010113          	addi	x2,x2,32
+1c0003cc:	00008067          	jalr	x0,0(x1)
+
+1c0003d0 <timer_now>:
+1c0003d0:	0000ef37          	lui	x30,0xe
+1c0003d4:	01e48fb3          	add	x31,x9,x30
+1c0003d8:	000fa503          	lw	x10,0(x31)
+1c0003dc:	00008067          	jalr	x0,0(x1)
+
+1c0003e0 <delay_ticks>:
+1c0003e0:	ff010113          	addi	x2,x2,-16
+1c0003e4:	00112623          	sw	x1,12(x2)
+1c0003e8:	00050293          	addi	x5,x10,0
+1c0003ec:	fe5ff0ef          	jal	x1,1c0003d0 <timer_now>
+1c0003f0:	00550333          	add	x6,x10,x5
+
+1c0003f4 <dt_loop>:
+1c0003f4:	0000ef37          	lui	x30,0xe
+1c0003f8:	01e48fb3          	add	x31,x9,x30
+1c0003fc:	000fa503          	lw	x10,0(x31)
+1c000400:	40650fb3          	sub	x31,x10,x6
+1c000404:	000fd463          	bge	x31,x0,1c00040c <dt_done>
+1c000408:	fedff06f          	jal	x0,1c0003f4 <dt_loop>
+
+1c00040c <dt_done>:
+1c00040c:	00c12083          	lw	x1,12(x2)
+1c000410:	01010113          	addi	x2,x2,16
+1c000414:	00008067          	jalr	x0,0(x1)
+
+1c000418 <delay_loop>:
+1c000418:	02050463          	beq	x10,x0,1c000440 <dl_end>
+
+1c00041c <dl_loop>:
+1c00041c:	00000013          	addi	x0,x0,0
+1c000420:	00000013          	addi	x0,x0,0
+1c000424:	00000013          	addi	x0,x0,0
+1c000428:	00000013          	addi	x0,x0,0
+1c00042c:	00000013          	addi	x0,x0,0
+1c000430:	00000013          	addi	x0,x0,0
+1c000434:	00000013          	addi	x0,x0,0
+1c000438:	fff50513          	addi	x10,x10,-1
+1c00043c:	fe0510e3          	bne	x10,x0,1c00041c <dl_loop>
+
+1c000440 <dl_end>:
+1c000440:	00008067          	jalr	x0,0(x1)
+
+1c000444 <udiv>:
+1c000444:	fe010113          	addi	x2,x2,-32
+1c000448:	00112e23          	sw	x1,28(x2)
+1c00044c:	00050293          	addi	x5,x10,0
+1c000450:	00058313          	addi	x6,x11,0
+1c000454:	00000393          	addi	x7,x0,0
+1c000458:	00000e13          	addi	x28,x0,0
+1c00045c:	00000f13          	addi	x30,x0,0
+1c000460:	02000e93          	addi	x29,x0,32
+1c000464:	02030a63          	beq	x6,x0,1c000498 <ud_zero>
+
+1c000468 <ud_loop>:
+1c000468:	00139393          	slli	x7,x7,0x1
+1c00046c:	001e1e13          	slli	x28,x28,0x1
+1c000470:	01f2df93          	srli	x31,x5,0x1f
+1c000474:	01fe6e33          	or	x28,x28,x31
+1c000478:	00129293          	slli	x5,x5,0x1
+1c00047c:	006e6663          	bltu	x28,x6,1c000488 <ud_skip>
+1c000480:	406e0e33          	sub	x28,x28,x6
+1c000484:	00138393          	addi	x7,x7,1
+
+1c000488 <ud_skip>:
+1c000488:	001f0f13          	addi	x30,x30,1 # e001 <TGT_TOL+0x27a1>
+1c00048c:	fddf6ee3          	bltu	x30,x29,1c000468 <ud_loop>
+1c000490:	00038513          	addi	x10,x7,0
+1c000494:	0080006f          	jal	x0,1c00049c <ud_ret>
+
+1c000498 <ud_zero>:
+1c000498:	fff00513          	addi	x10,x0,-1
+
+1c00049c <ud_ret>:
+1c00049c:	01c12083          	lw	x1,28(x2)
+1c0004a0:	02010113          	addi	x2,x2,32
+1c0004a4:	00008067          	jalr	x0,0(x1)
