@@ -250,6 +250,6 @@
 
 ## 9. 当前状态与下一步
 
-- **⏸ 已暂停（2026-09-17 用户指令「暂停任务，等指令再恢复」）**：现场已保存（NEXT_SESSION.md §1.6：T3 子 Agent `95efb630` 被打断、其已获证据=全核合成 60 418 LUT(44.89%) 无 OOM 但 WNS −52.9 ns（FPU fsqrt 域 166 级组合 69.4 ns）、恢复路径与「T4=FPU 内部分级流水」后续任务）。**等待用户指令恢复。**
-- **已达成（均已提交）**：M2 收口（act4 新树全量基线全绿，`188fa00`）；M3 DDR3 裸机内存测试（`13a80ab`）；M4 流程全通+双阻塞登记（`f6115f5`）；T1 FPU 窄域+sticky 重写 546k→22k LUT（`48ca2eb`）；**T2 非 FPU 时序流水化（`011fb28`：非 FPU 归因核布线 60.03 MHz 达标、隐式声明清零）**。
-- **下一步（恢复后）**：① T3 续跑完（impl/100 MHz 证据）→ 提交其 tcl/报告；② **T4：FPU 内部分级流水**（fsqrt/fma 对阶域切级，fpu.v 端口契约不变，F 80/D 106 回归网）；③ 全核 60/100 MHz 收口 M4；④ M5 上板串口输出。
+- **M4 已收口（2026-09-17/18，提交至 `ae906cd`）**：全核（含 FPU）@60 MHz 综合 WNS **+0.338**（0 失败端点）、布线 WNS **+0.031**（0 失败端点 / Fmax 60.11 MHz）；面积 53 066 LUT(39.4%)/12 BRAM/34 DSP；regress 23/23；arch-test 全绿不退化。攻克链：T1 FPU 面积（546k→22k）→ T2 非 FPU 流水（→60.03 MHz）→ T3 全核证据（FPU 单拍锥 166 级）→ T4 FPU 8 级流水（综合 −52.9→+0.42）→ T5 非 FPU 收口（pmp_check 恒等式+前缀树、m_lsu_va_q）。100 MHz 差 7.2×（需 FPU ≥8 级微架构重做，未做，如实登记）。
+- **下一步（M5 上板，需用户硬件参与）**：① chiplab 集成：把 `rtl/**` 挂进平台 SoC（core_top 48 端口契约已对齐、soc_top.v 接线：cpu_clk/uncore_clk 同域 33 MHz 或 Clocking Wizard 100 MHz、intrpt[4:0]）；② 平台综合+生成 bitstream（复用 `soc_up.xdc` 约束口径）；③ 上板验证（docs 08 §8.6）：LED 心跳 → UART 输出 → 开关回读 → 定时器对照 → FREQ 回读；④ 上板失败定位纪律：先假设自己的缺陷。
+- **待办清单**（跨阶段遗留）：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控潜在死锁、跨页 8B 重翻译、CMO PMA 对 MMIO 窗口残余口径、DFIL 错误行 poison 升级、100 MHz 余量（ExtraNetDelay_high 备选档 / FPU 再切级）、post-route 网表仿真（phys_opt -retime 后未验）。
