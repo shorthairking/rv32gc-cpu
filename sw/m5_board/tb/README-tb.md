@@ -163,9 +163,30 @@ AXI 上出现连续单字节写 `0x08000850…0x0800085B`（越出 DDR3 上限 `
   `b7e5ee14…` → `503dfae4…` → `3c8a3a37…` → `ca055abf…`（TB 每轮结论均标注对应 md5）。
 
 ## 7. 红线不变式（动手前后一致）
+
 ```bash
 find rtl -name '*.v' | sort | xargs md5sum | md5sum   # 前/后均为 ef20b2c0d17fbd07016b44bdd05dd822（38 个 .v）
-find sim scripts -type f | sort | xargs md5sum | md5sum  # 前/后均为 e9c0381b766210c352b3779a92649232
 ```
-本任务只新建/修改 `sw/m5_board/tb/**`；`rtl/**`、`sim/**`、`sw/m5_board/m5_board.S`、
-`build.sh` 全程未改。
+
+* 本任务只新建/修改 `sw/m5_board/tb/**`；`rtl/**`、`sim/**`、`sw/m5_board/m5_board.S`、`build.sh`
+  全程未改（父 Agent git 复核：`git status --porcelain sim/` 为空；母 Agent 的三个 M5 提交
+  `092baca`/`5b10578`/`494a148` 均未触碰 `sim/**` 与 `scripts/**`）。
+* 本会话内 `sim/` 下唯一变化是父 Agent **新增**的 `sim/tb/prog/m5_board.hex`
+  （md5 `43758f32f9b2206fc24f87b1f785f786`，与冻结 hex 同）。因此
+  `find sim scripts -type f | sort | xargs md5sum | md5sum` 的**聚合**值由会话开始时的
+  `e9c0381b766210c352b3779a92649232` 变为 `3a58178208dd66c95d07a54839c3fc40` ——
+  这是"**新增文件**"造成的，不是既有共享件被改。
+* 我依赖的共享件逐字节未变（下方 md5 由父 Agent 复核确认一致），mtime 均为 09-15/09-17，早于本会话：
+
+  | 共享件 | md5 |
+  |---|---|
+  | `sim/tb/sim_mem_model.sv` | `8deed3ad15b2547d5154ad33fc31e06f` |
+  | `sim/tb/tb_core_top.sv` | `2d91c81273e5687aabd17c3e3c369d7c` |
+  | `sim/tb/uart_ser_decoder.sv` | `7330c3ca5912556c2403d56ff4e692a0` |
+  | `sim/tb/prog/m1_uart.S` | `8a79750ee1d381b3e6615396124ebb18` |
+  | `sim/tb/prog/m1_uart.hex` | `7b49e3d019f0971a46d1fdf8f4a1e51f` |
+  | `scripts/env.sh` | `89fe7ece00fb150bfb13f2a08966d031` |
+  | `scripts/regress.sh` | `2137946e676e218849da7ba6d7021529` |
+
+  **注意**：`sim/tb/tb_arch_test.sv` 的 mtime 是 **09-17 23:04**（上一轮 arch-test 工作），
+  不是本会话的改动；`git log -1 -- sim/tb/tb_arch_test.sv` = `113cb09`。
