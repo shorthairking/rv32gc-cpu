@@ -104,7 +104,8 @@ for pair in "diag_hold:PASS" "diag_nonhold:PASS" "diag_old_nonhold:FAIL"; do
     if [ "${want}" = "PASS" ] && [ "${got_rc}" != "0" ]; then log "  ⇒ FAIL: 期望 rc=0（PASS），实际 rc=${got_rc}"; VERDICT=1; fi
     if [ "${want}" = "FAIL" ] && [ "${got_rc}" = "0" ]; then log "  ⇒ FAIL: 期望 rc≠0（反证必红），实际 rc=0"; VERDICT=1; fi
     # 内容判据（比 rc 更严）：BUILD 标记 + 三个诊断步的结论
-    if grep -q 'BUILD=m5_board-diag-2026-09-21c' "${f}"; then
+    # 镜像标记随程序换代同步（当前 = m5_board.S 的 BUILD=m5_board-diag-2026-09-21d）
+    if grep -q 'BUILD=m5_board-diag-2026-09-21d' "${f}"; then
         log "  ⇒ BUILD 标记在位 ✅（证明被测镜像 = 本轮诊断版）"
     else
         log "  ⇒ FAIL: 未打印 BUILD 标记"; VERDICT=1

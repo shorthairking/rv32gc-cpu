@@ -122,7 +122,20 @@ MDU_SRC=sw/m5_board/tb/ip/mdu_prefix_ref.v bash sw/m5_board/tb/ip/run_mdu_ip_xsi
 | `ctl_b_v7_nonhold` | **R2 修复后**同程序 + `DDR_R_NONHOLD=1`（非保持型 R 通道 = MIG 口径） | **PASS**：C0–C5 全过；**2 920 848 拍 / 626 字节，且 UART 字节流与 `ctl_b_v7_hold` 逐字节相同**（`cmp` 为空）⇒ 修复后核不再依赖从设备保持 RDATA |
 | `r2_cp_B_oldrtl_nonhold` | **反证**：临时还原旧采样 RTL + `DDR_R_NONHOLD=1` | **FAIL**（预期）：程序在第 ~26 条指令就跑飞（只出 1 个 UART 字节、无 CONFREG 访问、超时）|
 
-### 4.1 第三轮（2026-09-21 · 诊断版：stack-free 打印 + 四个探针 + M 扩展根因）
+### 4.1 第五轮（2026-09-21 · 步④ `cycles/iter` 窗口修正版；BUILD `m5_board-diag-2026-09-21d`）——**当前判定口径**
+
+| 运行 | 配置 | 结果 |
+|---|---|---|
+| `accept_hold_d2` | 修复后 RTL + 保持型 R（`DDR_R_NONHOLD=0`）；`TIMEOUT_CYCLES=6000000` | **PASS**（判据 C0–C5；C6 未启用 = `EXPECT_EXTRA` 空串）：**4 439 635 拍 / 1167 字节**（结果行于第 1167 字节、4 439 633 拍命中，预算 6 000 000 拍）；`step2.5 … word=0x12345678 re-read=0x12345678 byte=0x5A … R2FIX: yes`；步④ 行 = `step4 timer delta = 118055, cycle delta = 118049, cycles/iter = 59 (informational only; window 20..20000; board-calib=4120, sim-calib=59 cycles/iter)`；步⑤ `FREQ = 0x01F78A40 (div1e6 = 33 MHz)`；`RESULT: RV32GC-M5-OK`（日志 `out/accept_hold_d2.log`） |
+| `accept_nonhold_d2` | 同程序 + **非保持型** R 通道（`DDR_R_NONHOLD=1` = MIG 口径） | **PASS**（同口径）：**4 439 635 拍 / 1167 字节**，逐行与 `accept_hold_d2` 相同；**UART 字节流逐字节相同**（日志 `out/accept_nonhold_d2.log`） |
+| `diag_hold` / `diag_nonhold` / `diag_old_nonhold`（矩阵复跑，同一 `…d` 程序） | `bash tb/run_diag_matrix.sh` 三配置并行：修复后+保持型 / 修复后+非保持型 / **修复前** RTL+非保持型；`EXPECT_EXTRA="R2FIX: yes"`、预算 6 000 000 拍/个 | **`DIAG_MATRIX: OK`**（rc=0）：A/B 两配置 **PASS 且 C0–C6 全过**（各 4 439 635 拍 / 1167 字节，`C6 "R2FIX: yes"` 命中于第 732 字节）；A/B UART 捕获逐字节相同（1 210 字符）；C 反证 **FAIL（rc=1，预期）**：`R2FIX: no` + `STACKBF: BAD` + `RESULT: RV32GC-M5-BAD`（4 445 306 拍提前收尾）；`rtl/**` 指纹前后一致（见 `out/diag_matrix.log`） |
+
+> ★ 本轮的**判定口径变化**（`…d` 版程序，见 §5.2）：步④ 的 `cycles/iter` 窗口由历史 `[20, 300]` 放宽为
+> `[20, 20000]` 并**降级为信息性**（不参与 BAD）；**BAD 只由判据 A + 步⑤ FREQ + 三探针锚定**。
+> 因一轮完整判定 ≈ 4.44e6 拍，两轮都必须显式给 `TIMEOUT_CYCLES=6000000`（`run_tb.sh` 的默认预算
+> 4M 会在结果行之前超时；实测需 4 439 635 拍）。
+
+### 4.2 第三轮（2026-09-21 · 诊断版：stack-free 打印 + 四个探针 + M 扩展根因）——**历史**（BUILD `m5_board-diag-2026-09-21c` 轮；已被 §4.1 的 `…d` 轮取代，保留作证据链）
 
 | 运行 | 配置 | 结果 |
 |---|---|---|
@@ -134,7 +147,7 @@ MDU_SRC=sw/m5_board/tb/ip/mdu_prefix_ref.v bash sw/m5_board/tb/ip/run_mdu_ip_xsi
 
 > ★ `diag_old_nonhold` 里 `MEXT: OK` 是**预期**的：iverilog 跑的是 `mdu.v` 的**行为分支**
 > （function 实现，商余数本来正确）——M 扩展那个缺陷只存在于 **IP 分支**，只能用 xsim 复现
-> （见 §4.1 末两行）。这也正是"板上一眼判据"必须放进程序（步2.6）的原因。
+> （见 §4.2 末两行）。这也正是"板上一眼判据"必须放进程序（步2.6）的原因。
 
 ---
 
@@ -152,12 +165,17 @@ AXI 上出现连续单字节写 `0x08000850…0x0800085B`（越出 DDR3 上限 `
 ### 5.2【P1・程序】步④ 的绝对拍数判据不可移植（`b7e5ee14` 版 → **2026-09-21 已改成一致性判据**）
 * 历史：判据曾是 `|ticks − MEAS_ITER×XIP_CPI| ≤ ±40%`，其中 `XIP_CPI=59` 是**核级仿真**
   （零延迟内存模型）的标定值。真机 SPI Flash XIP 每笔读要几十拍 ⇒ 该绝对窗口在板上不可移植。
-* 现状（2026-09-21 鲁棒化）：步④ 判据 = **`TIMER` 增量 ≡ `rdcycle` 增量**
+* 历史②：窗口上界一度写成 `cycles/iter ∈ [20, 300]`（按零延迟仿真的标定值 59 的量级定的）
+  —— 板级实测 **4120** ⇒ 真实标定值会被误判 BAD；2026-09-21 **第五轮**已改为 `[20, 20000]`。
+* 现状（2026-09-21 鲁棒化；BUILD `m5_board-diag-2026-09-21d`）：步④ 判据 = **`TIMER` 增量 ≡ `rdcycle` 增量**
   （`|Δtimer − Δcycle| ≤ max(256, Δcycle/128)`，两者都在核时钟域每拍 +1），
-  外加**健全性窗口** `cycles/iter ∈ [20, 300]`（实测值打印；只把"计数器异常/时钟域差量级"
-  钉成 FAIL，**不是**主频判据 —— 主频由步⑤ `FREQ=0x01F78A40` 锚定）。
+  外加**健全性窗口** `cycles/iter ∈ [20, 20000]` —— **降级为信息性，不参与判定**：
+  实测值照旧打印（**板级 4120 / 零延迟仿真 59** cycles/iter，`m5_board.S` 的 `CPI_SANITY_HI` 注释同口径），
+  只用来看"计数器异常/时钟域差量级"，**无论如何取值都不会把结果翻成 BAD**。
+  **BAD 判定只由 ① 判据 A（上式）+ ② 步⑤ `FREQ` 锚定（`div1e6 == 33` ∧ `FREQ>>20 == 31`）
+  + 三个探针（步2.5 `R2FIX` / 步2.6 `MEXT` / 步2.7 `STACKBF`）锚定**。
   `XIP_CPI=59` 降级为**打印参考**，不参与判定；`build.sh` 判据⑧f1–f5 机器核对
-  "真的有 `rdcycle` / 健全性窗口量级合理 / 无绝对拍数常量残留"。
+  "真的有 `rdcycle` / 窗口有界且有序（`> 下界`、`≤ 1e6`）/ 无绝对拍数常量残留"。
 ### 5.3【P0・程序】步⑤ `t3` 被 `puts_hex8` 破坏（`ca055abf` 之前）
 `mv a0,t3; jal puts_hex8` 之后才用 `t3` 判定，而 `puts_hex8` 把 `t3` 当 nibble 计数器（返回 0）
 ⇒ 判据算的是 `0>>20`。现象 `(high20 = 0 MHz)` + BAD。→ FREQ 改存 **s9**。

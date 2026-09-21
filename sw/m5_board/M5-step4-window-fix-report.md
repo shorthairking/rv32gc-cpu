@@ -9,7 +9,7 @@
 |---|---|
 | `bash sw/m5_board/build.sh` | **rc=0**，53 条 PASS / 0 条 FAIL，`RESULT_M5_BUILD: OK` |
 | `bash tb/ctrl/build_ctrl.sh` + `python3 tb/ctrl/diff_equiv.py` | **rc=0**；缩放副本与冻结程序差异 **4 字**，全部是 `DELAY_HB/SW_TICKS` 的 `li` 立即数对 |
-| `bash tb/run_tb.sh`（保持型） | **`TB_M5_BOARD: PASS`**（C0–C6 全绿，4439635 拍，1167 字节，`RESULT: RV32GC-M5-OK`） |
+| `bash tb/run_tb.sh`（保持型） | **`TB_M5_BOARD: PASS`**（C0–C5 + 唯一 PASS 锚点，C6 未启用=EXPECT_EXTRA 空串；4439635 拍，1167 字节，`RESULT: RV32GC-M5-OK`；**C6 覆盖由 tb 矩阵轮补齐**：`DIAG_MATRIX: OK`，hold/nonhold 两配置 C0–C6 全过且 C6 命中 `R2FIX: yes`，旧 RTL 反证必红） |
 | `bash tb/run_tb.sh`（非保持型 `DDR_R_NONHOLD=1`） | **`TB_M5_BOARD: PASS`**；UART 字节流与保持型轮**逐字节相同** |
 | `bash sw/m5_board/verify_m5.sh` | **`V5: ALL CHECKS PASS`**（未改 V5b 基线；`rtl/**` md5 = `66e3225645b6f29375c786fe166448d6` 不变） |
 | 反证（判据 A 容差强制 0） | 仿真该轮 **`RESULT: RV32GC-M5-BAD`**、`TB_M5_BOARD: FAIL C3`；恢复后 src md5 与镜像 md5 **逐字节一致** |
