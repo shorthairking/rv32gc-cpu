@@ -545,3 +545,88 @@ wire [31:0] div_quot_next = ip_div_dout[63:32];
    若商/余数互换（`divu(59,10)` 打印 `9`）⇒ 仍是修复前的 bitstream，按 §7.1 重下。
 2. **再看步2.5/2.7**：`R2FIX: yes` + `STACKBF: OK` ⇒ DDR3 读通路也正常。
 3. 三行都 ok 后，`RESULT: RV32GC-M5-OK` 才算**本轮完整通过**。
+3. 三行都 ok 后，`RESULT: RV32GC-M5-OK` 才算**本轮完整通过**。
+
+---
+
+## 9. ★ 引导链（B-3.5）：SPI Flash 引导镜像烧写与上电期望
+
+> **本章适用**：把"复位 → 引导桩 → OpenSBI → U-Boot"这条链跑上板。
+> **与 §3/§4 的关系**：§3/§4 用的 `m5_diag.bin`（2.7 KB）是**自检程序**（验证核本身）；
+> 本章用的 `spi_flash.img`（≈1 MB）是**真正的引导链镜像**（boot 到 U-Boot）。
+> 两者都从 Flash 偏移 0 起烧 ⇒ **同一时刻只能烧一个**。
+> **真源**：`sw/boot/README.md`（布局/构建/反证）、`docs/porting/01-overview.md` §2。
+
+### 9.1 镜像布局（`spi_flash.img`，从 Flash 偏移 0 起写）
+
+```
+ Flash 偏移        内容                 大小          核看到什么
+ 0x000000  引导桩 boot_stub.bin          128 B     ← 复位 PC = 0x1C00_0000（XIP 主窗口就地执行）
+ 0x004000  OpenSBI fw_jump.bin       272 080 B     读出 → 拷到 DDR3 0x0100_0000（M 模式入口）
+ 0x080000  U-Boot u-boot.bin         398 332 B     读出 → 拷到 DDR3 0x0200_0000（S 模式）
+ 0x0E8000  U-Boot DTB u-boot.dtb       6 004 B     读出 → 拷到 DDR3 0x0300_0000（= a1）
+ 0x0E9774  —— 镜像末尾（共 956 276 B）——
+```
+
+桩跳转前设置：`a0 = 0`（hartid）、`a1 = 0x0300_0000`（DTB 物理地址）、`a2 = 0`，然后跳到 `0x0100_0000`。
+镜像 ≤ 1 MiB 是**硬约束**（核的 XIP 主窗口只有 1 MiB；超出部分会静默落到 DDR3 默认从设备）。
+
+### 9.2 本机构建（WSL；详细命令见 `sw/boot/README.md` §3）
+
+```sh
+cd <仓库>/rv32gc-cpu
+./sw/boot/build_opensbi_rv32.sh          # ① OpenSBI RV32 FW_JUMP ⇒ OPENSBI_BUILD: OK
+./sw/boot/build_spi_image.sh             # ② ⇒ SPI_IMAGE: OK（打印布局表与逐段 md5）
+./sw/boot/check_stub_layout.sh           # ③ ⇒ STUB_LAYOUT: OK（桩常量 ⇄ 布局 ⇄ 镜像三方对账）
+md5sum sw/boot/out/spi_flash.img         # ④ 记下镜像 md5，烧写后与 §9.5 回报项一致
+```
+
+### 9.3 烧写步骤（顺序不能换）
+
+1. **JTAG 下载我们的 bitstream**（按 §3 方式 A）。★ 本章口径：**bitstream 走 JTAG，不固化** ——
+   核的 XIP 窗口只映射 Flash 偏移 0 起的 1 MiB，而引导桩必须落在偏移 0；把 FPGA 位流也固化到偏移 0 会与引导镜像**互相覆盖**。
+2. 用 Vivado Hardware Manager 下载 **`programmer_by_uart.bit`**（chiplab 官方串口烧写器，不是我们的 bitstream）。
+3. 串口改为 **230400 8N1**（烧写器波特率），按提示输入 **`x`** 开始接收 xmodem。
+4. 用串口软件的 **xmodem 发送** `sw/boot/out/spi_flash.img`（956 276 B ≈ 1 MB；比 §3 的 2.7 KB 慢，耐心等）。
+5. 传输完成后**断电重上电**（或按复位键），把串口改回 **115200 8N1**。
+6. 若上电后**没有任何输出** ⇒ 按 §9.5 的 10 项清单回报；**不要**反复乱烧。
+
+### 9.4 上电期望（115200 8N1）
+
+按顺序应看到（时间从复位算起约 1 s 内）：
+
+| # | 期望 | 说明 |
+|---|---|---|
+| ① | **OpenSBI 横幅**：`OpenSBI v1.9` 与平台名 `Generic`、`Platform Name`、`Firmware Base : 0x1000000` | 说明桩把 OpenSBI 拷到 0x0100_0000 并跳进去了（`fw_jump.bin` 由本机 opensbi 3593a5f 构建） |
+| ② | OpenSBI 的域/内存区间打印（`Domain0 Region…`） | generic 平台从 a1 传入的 DTB 发现硬件 |
+| ③ | **U-Boot 横幅**：`U-Boot 2026.10-…` + `Model: loongson,chiplab-rv32` + `DRAM:  128 MiB` | M→S 切换成功、U-Boot 在 0x0200_0000 跑起来了 |
+| ④ | **U-Boot 提示符 `=>`**（或 `U-Boot>`）出现，可敲 `help` | ★ **本阶段成功的判定行** |
+| ⑤ | 可选：`bdinfo`/`version`/`md` 能正常回显 | 串口/SBI 定时器/内存通路正常 |
+
+> **本阶段（B-3.5）验收口径**：看到 **U-Boot 提示符**即可（NAND 读、`saveenv`、`bootcmd` 属 B-4/B-5）。
+> OpenSBI 横幅里若报 `Domain0 Next Address`/`Next Arg1` 与本文不符，或卡在 OpenSBI 之后无 U-Boot 输出，按 §9.5 回报。
+> **已知前提（务必一起回报）**：33 MHz 同域（`cpu_clk = uncore_clk`）、UART `0x1FE0_01E0` 115200、DDR3 128 MiB、
+> SPI XIP 主窗口 `0x1C00_0000`；OpenSBI 平台时钟与 `mtime` 口径按 33 MHz 编译（未在板上实测频率）。
+
+### 9.5 失败时必报的 10 项信息
+
+1. **镜像 md5 与大小**：`md5sum sw/boot/out/spi_flash.img`（应 = 本次交付说明里那个 md5）与烧写器实际发送的文件名/字节数。
+2. **bitstream 来源**：`Program Device` 用的 `.bit` 文件路径 + 其 md5（§7.3 的本地核对命令），以及是否最近一次构建。
+3. **串口参数与连接**：115200 8N1（含流控设置）、接的是主 UART（`UART_RX=F23`/`UART_TX=H19`）还是 debug UART（`M25`/`P25`）。
+4. **完整串口抓包**：从复位（或上电）开始**到现象出现后至少 30 秒**的原始文本（含乱码也要原样贴）。若完全无输出，明确写"0 字节"。
+5. **是否见过 OpenSBI 横幅**：见到/未见到；见到的话贴出 `Firmware Base`、`Domain0 Next Address`、`Domain0 Next Arg1` 三行。
+6. **是否见过 U-Boot 横幅**：见到/未见到；见到的话贴出第一行（含版本与 Model）。
+7. **板级状态**：LED/数码管是否有动静（心跳？常亮？全灭？）；拨码开关位置。
+8. **复位方式**：按复位键 / 断电重上电 / 仅 JTAG 重新 Program（三者行为可能不同，务必注明）。
+9. **是否重新烧过 Flash**：烧写器版本与波特率、xmodem 是否报错、烧写耗时；有没有在同一片 Flash 上烧过别的镜像（如 §3 的 `m5_diag.bin`）。
+10. **本机侧复核结果**（不需要板子，30 秒可跑完，请贴输出）：
+    ```sh
+    cd <仓库>/rv32gc-cpu
+    ./sw/boot/check_stub_layout.sh                 # 期望 STUB_LAYOUT: OK
+    md5sum sw/boot/out/spi_flash.img sw/boot/out/boot_stub.bin
+    riscv32-unknown-linux-gnu-objdump -d sw/boot/out/boot_stub.elf | head -20   # 入口应为 0x1c000000
+    ```
+
+> **回报纪律**：把上述 10 项**一次性**贴给母 Agent（缺项会让定位变成猜谜）。禁止只看"没输出"就去改 RTL/改桩——
+> 先分清是"镜像没烧对/没进 FPGA"（第 1/2/9 项）还是"桩跑了但 payload 不对"（第 4/5/6 项）。
+
