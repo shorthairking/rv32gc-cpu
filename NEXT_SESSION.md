@@ -25,7 +25,7 @@
 
 1. 新项目载体 = **就地沿用 `rv32gc-cpu/` dev 分支**（不再另建 rv32gc-cpu-v2/；旧实现文件已从磁盘移除，历史在 master）。
 2. 用户已发"开始阶段一"指令：info 复核 → coding 重写 docs/design+porting+kb → 收尾提交 → 停下审阅。
-3. 子 Agent 路由：`provider=deepseek-official`、`model=deepseek-flash`（ds v4.1，官方 API；settings.yaml allowedModels 已由用户加入，**新会话生效**）。
+3. 子 Agent 路由（2026-09-21 更新）：`provider=opencode-go-chat`、`model=deepseek-v4.1-flash`、reasoning_effort=max（OpenCode Go 网关；旧 deepseek-official 口径作废）。
 
 ## 3. 平台硬事实快照（info 复核 + 母 Agent 复跑，引用分级见 docs/kb/platform-facts.md）
 
@@ -95,7 +95,7 @@ spike --version     # 预期 /opt/riscv/bin/spike
 ## 7. 纪律提醒（对本文件读者）
 
 - **kb 检索环境（2026-09-14 发现，待处理）**：常驻 `kb_search` 的 LSA 语义层已退化（返回无关命中）；`kb_get`（path+行号）与直接 `read` 手册源文件完全正常。已做：CLI `node dsh-extension/bin/riscv-kb.js build --no-lsa` 把磁盘索引重建为纯词法版；**待用户重启 `dsh web` 使常驻进程重载**。重启前子 Agent 查 ISA 细节一律用 `kb_get`/`read`（`riscv-isa-manual/src/**`），不依赖 `kb_search` 排序。
-- 母 Agent 只调度；子 Agent 路由 deepseek-official/deepseek-flash（官方 ds v4.1），**reasoning_effort 一律 "max"**（2026-09-14 用户指令；适配器支持 off/low/high/max）；知识盲区：kb → 联网 → 自试≤3 → 上报。
+- 母 Agent 只调度；子 Agent 路由 opencode-go-chat/deepseek-v4.1-flash（2026-09-21 用户指令切换），**reasoning_effort 一律 "max"**（2026-09-14 用户指令；适配器支持 off/low/high/max）；知识盲区：kb → 联网 → 自试≤3 → 上报。
 - **goal 纪律（AGENT.md §0.7，2026-09-17 收紧）**：母 Agent 未在自己 session 运行实质性任务（bash 验证/文件读写）时禁止 create_goal/update_goal resume；派发子 Agent 后结束回合等宿主完成通知（子 Agent 结束自动唤醒母 Agent 交接）；禁止轮询；子 Agent 自驱一次做完；goal 工具仅顶层 Agent 可用。历史 goal（goal-783b30b5）已 paused 且按新规不再 resume。
 - 旧项目（master 分支、kb 中 rv32gc-project 来源）只作反面教训，禁止照抄。
 - 阶段一结束必须停下等用户审阅后再进阶段二（2A 顺序 5 级基线核）。

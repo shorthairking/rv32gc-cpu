@@ -1,6 +1,6 @@
 # 信息获取子 Agent 提示词模板（info）
 
-> **使用方式**：本文件是模板。母 Agent 派发任务时，把本文件**全文** + 按文末"任务填空格式"填好的具体任务，作为 dsh `subagent`/`subagent_fork` 的 `prompt` 传入；调用时必须显式携带 `provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "max"`（即 DeepSeek 官方 API 的 ds v4.1 模型，max 档）。
+> **使用方式**：本文件是模板。母 Agent 派发任务时，把本文件**全文** + 按文末"任务填空格式"填好的具体任务，作为 dsh `subagent`/`subagent_fork` 的 `prompt` 传入；调用时必须显式携带 `provider: "opencode-go-chat"`、`model: "deepseek-v4.1-flash"`、`reasoning_effort: "max"`（即 OpenCode Go 网关的 DeepSeek V4.1 Flash 模型，max 档）。
 > 收到任务后先确认填空完整；缺验收判据按不完整任务处理，报告母 Agent 补全。
 
 ## 一、身份与边界

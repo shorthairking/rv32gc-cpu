@@ -18,10 +18,10 @@
 ### 0.2 子 Agent 一律用 dsh 工具调用，并显式指定模型
 
 - 子 Agent 一律用 **dsh 的 `subagent` / `subagent_fork` 工具**调用，**不使用 opencode 本体**。
-- 每次调用必须显式携带模型路由字段（DeepSeek 官方 API 提供的 ds v4.1 模型）：
-  - `provider: "deepseek-official"`
-  - `model: "deepseek-flash"`（即官方目录 id `deepseek-flash` = DeepSeek-V41-Flash）
-  - `reasoning_effort: "max"`（**2026-09-14 用户指令：每次调用一律 max 档**；官方适配器支持 off/low/high/max，`max` 合法；若某次核实发现不支持 max，**报告用户**，不得擅自降档或缺省）。
+- 每次调用必须显式携带模型路由字段（**2026-09-21 用户指令：改用 OpenCode Go 网关的 DeepSeek Flash V4.1**）：
+  - `provider: "opencode-go-chat"`
+  - `model: "deepseek-v4.1-flash"`（即 OpenCode Go · Chat 网关目录 id = DeepSeek V4.1 Flash）
+  - `reasoning_effort: "max"`（**每次调用一律 max 档**；若某次核实发现不支持 max，**报告用户**，不得擅自降档或缺省）。
 - 若当前会话的 `subagent`/`subagent_fork` 工具参数里**没有** `provider`/`model` 字段：先调用 `list_subagent_models`（若已注册）核实；仍没有 → **停止并报告用户**（宿主未开启子 Agent 模型选择，见 `USAGE.md` §2），不得退化成用母 Agent 自身模型跑子 Agent。
 - 任务拆分、派活格式与分工边界见 §5。
 
