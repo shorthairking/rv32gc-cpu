@@ -269,3 +269,138 @@ make ARCH=riscv CROSS_COMPILE=<toolchain-prefix> -j$(nproc)
 3. **构建与验收脚本**（可复现命令 + 判定输出，fail-closed）；
 4. **自证报告**：按 §4.2 表格逐项给出证据；
 5. **登记不确定项**到本文件 §6 与 `docs/kb/platform-facts.md` §9。
+
+---
+
+## 8. 基线变更（2026-09-21 起生效）：改用上游 u-boot fork 的 `dev` 分支
+
+> **本章是补充说明，效力高于本文 §1–§7**：§1–§7 写的是 `la32r-uboot`（U-Boot **2019.07**）口径，
+> 现**已被取代**，仅作为"移植经验与陷阱清单"保留。实际交付物在上游树里，
+> 板级说明见 `u-boot/board/loongson/chiplab/README`。
+
+### 8.1 新基线
+
+| 项 | 旧口径（§1–§7） | 新口径（本章） |
+|---|---|---|
+| 基线树 | `la32r-uboot/`（U-Boot 2019.07） | `/home/shorthair/dsh/rv32-cpu/u-boot/`（用户 fork；`VERSION=2026` / `PATCHLEVEL=10`） |
+| 分支 | — | 工作分支 **`dev`**（main @ `211de43d0f9`）；全程不切 main |
+| 移植方式 | 新增 board/defconfig/DTS + 补丁序列 | 同上：**新增文件为主**，对上游既有文件只做 2 处必要登记改动（见 8.4） |
+| 板名/目标 | `rv32gc_defconfig`（规划名） | `configs/chiplab_rv32_defconfig` + `CONFIG_TARGET_CHIPLAB_RV32` + `board/loongson/chiplab/` |
+| DTS | `arch/riscv/dts/rv32gc.dts`（规划名） | `arch/riscv/dts/chiplab-rv32.dts`（`CONFIG_DEFAULT_DEVICE_TREE="chiplab-rv32"`） |
+| 板级配置头 | `SYS_CONFIG_NAME` 旧写法 | `CONFIG_SYS_CONFIG_NAME="chiplab-rv32"` → `include/configs/chiplab-rv32.h` |
+
+### 8.2 符号/机制口径变化（新树必须按新名写）
+
+| 旧口径 | 新口径（本树实测） | 出处 |
+|---|---|---|
+| `CONFIG_SYS_TEXT_BASE`（defconfig 里写） | **`CONFIG_TEXT_BASE`**；板级默认值写在 `board/<vendor>/<board>/Kconfig` 的 `config TEXT_BASE default ...` | 本树 `board/emulation/qemu-riscv/Kconfig`、`board/sifive/unleashed/Kconfig` |
+| 运行模式符号 | 仍是 `RISCV_MMODE`/`RISCV_SMODE`（**没有** `RISCV_M_MODE`） | `arch/riscv/Kconfig:213,218`；`CONFIG_RISCV_M_MODE` 仅剩 `arch/riscv/include/asm/hwcap.h:97` 一个恒假的 `#ifdef` 死分支 |
+| `CONFIG_SIFIVE_CLINT`（§2.3 提到的 S 模式依赖项） | **本树已无该符号**；M 模式改用 `RISCV_ACLINT` / `SPL_RISCV_ACLINT`（`depends on RISCV_MMODE`） | `arch/riscv/Kconfig:388,397`；`grep -rn "config SIFIVE_CLINT" --include=Kconfig` 无输出 |
+| env 偏移写在板级头文件 | 走 Kconfig：`CONFIG_ENV_OFFSET` / `ENV_SIZE` / `ENV_RANGE`（defconfig 里写十六进制） | `env/Kconfig:337,644,675` |
+| `CONFIG_SYS_NAND_SELF_INIT`（可写进 defconfig 的假设） | **隐藏符号**（`depends on MTD_RAW_NAND`，无 prompt）：写进 defconfig 会被**静默丢弃**，必须由板级 `select` | 本树 `drivers/mtd/nand/raw/Kconfig:6`；本轮实测见 8.5 |
+| NAND 子系统符号 | `MTD` + `MTD_RAW_NAND`（menuconfig）+ `CMD_NAND`/`CMD_MTD`/`CMD_MTDPARTS` | `drivers/mtd/Kconfig:7`、`drivers/mtd/nand/raw/Kconfig:1`、`cmd/Kconfig:1619,3024` |
+| S 模式服务 | `CONFIG_SBI`（`RISCV_SMODE` 隐含）+ `SBI_V02` + `SYSRESET_SBI`（`default y`，复位/关机走 SBI） | `arch/riscv/Kconfig:449-451`；`drivers/sysreset/Kconfig:184-187` |
+
+> **§2 的结论是否仍然有效？** —— 有效，且方向相反也要防：新树同样**没有** `RISCV_M_MODE`，
+> defconfig 里写 `CONFIG_RISCV_M_MODE=y` 依旧被静默忽略；本项目的纪律不变：
+> **只允许** `RISCV_MMODE` / `RISCV_SMODE`（本项目取 `CONFIG_RISCV_SMODE=y`）。
+
+### 8.3 阶段三 B-1：RV32 交叉构建打样（结果）
+
+- 工具链（本机实测）：`/opt/riscv/bin/riscv32-unknown-linux-gnu-gcc`，**GCC 16.1.0**。
+- 口径：`ARCH=riscv`、`CROSS_COMPILE=riscv32-unknown-linux-gnu-`；`*_defconfig` 与 `make` **都必须带**这两个变量。
+- 打样板：`qemu-riscv32_smode_defconfig`（本树现成，S 模式 + RV32，最贴近本项目）。
+- 命令与结果：
+
+  ```sh
+  make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- qemu-riscv32_smode_defconfig
+  make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j16
+  # 末行：  OFCHK   .config ; rc=0
+  # 产物：  u-boot.bin = 1 033 368 B
+  # size：  text 944165  data 89180  bss 60440  dec 1093785
+  # 编译器告警：0 warning / 0 error（GCC 16.1.0）
+  ```
+
+- **唯一拦路问题（宿主机，不是 GCC16 兼容性）**：`make tools` 编译 `tools/mkeficapsule.o` 失败：
+  `fatal error: gnutls/gnutls.h: No such file or directory`（缺 `libgnutls28-dev`，本项目不装系统包/不提权）。
+  处置：`./scripts/config --file .config --disable TOOLS_MKEFICAPSULE` 后 `make olddefconfig` 再编，rc=0。
+- **GCC16 兼容性问题清单：无**（目标代码 0 error / 0 warning）。§6 的 R4 风险由此关闭：
+  **2019.07 + GCC16 的"老树遇新编译器"风险在新基线上不存在**。
+
+### 8.4 阶段三 B-2：板级骨架（结果）
+
+新增文件（全部在 `u-boot/` 内）：
+
+| 文件 | 作用 |
+|---|---|
+| `configs/chiplab_rv32_defconfig` | 板级 defconfig（S 模式 / 16550 / NAND-MTD 预留 / env 区） |
+| `include/configs/chiplab-rv32.h` | `CFG_SYS_SDRAM_BASE`、33 MHz 定时器口径、DDR 内地址划分与 env 地址 |
+| `arch/riscv/dts/chiplab-rv32.dts` | DDR3/UART/CLINT/PLIC/SPI XIP + NAND(disabled) 节点 |
+| `board/loongson/chiplab/{Kconfig,Makefile,chiplab.c,MAINTAINERS,README}` | 板级代码与文档 |
+| `board/loongson/chiplab/check-addresses.sh` | 地址口径机器核对脚本（fail-closed，带反证方法） |
+
+对上游既有文件的最小改动（2 处，属"目录挂接"的必要条件）：
+
+1. `arch/riscv/Kconfig`：`target choice` 内新增 `config TARGET_CHIPLAB_RV32`；`# board-specific options below` 段新增 `source "board/loongson/chiplab/Kconfig"`。
+2. `arch/riscv/dts/Makefile`：新增 `dtb-$(CONFIG_TARGET_CHIPLAB_RV32) += chiplab-rv32.dtb`。
+
+构建与验收证据：
+
+```sh
+make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- chiplab_rv32_defconfig
+make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j16
+# 末行：  OFCHK   .config ; rc=0
+# 产物：  u-boot.bin = 341 066 B ; u-boot.dtb = 6 002 B
+# size：  text 317857  data 17184  bss 39088  dec 374129 ; 0 warning
+# DTS：   dtc 编译 0 error；板级构建内联 DTC 同一份
+# 核对：  board/loongson/chiplab/check-addresses.sh → rc=0（全部命中）
+```
+
+- 地址口径逐条对齐 `docs/kb/platform-facts.md`（DDR3 `0x0/128 MiB`、UART `0x1FE0_01E0`@33 MHz/115200、
+  CLINT `0x1F00_0000`、PLIC `0x1F10_0000`、SPI XIP `0x1C00_0000`、NAND `0x1FE7_8000`），
+  并交叉核对 `defconfig`（`DEBUG_UART_BASE/CLOCK`、`BAUDRATE`、`ENV_RANGE`）与 DTS 两侧不许分叉。
+- UART 取 `reg-shift = 0` / `reg-io-width = 1`：依据是平台 `URT/uart_top.v:86`（`PADDR[2:0]` 即寄存器号）、
+  `IP/AMBA/axi2apb.v:168,216`（AXI 字节地址原样进 APB）与旧树 `la32rsoc_defconfig:805`（`DEBUG_UART_SHIFT=0`）。
+- 反证（构建级）：把 DTS 的 UART `reg` 改成 `0x1fe00000`（注释与 node 名不动）→ `dtc` 仍然 rc=0，
+  但 `check-addresses.sh` rc=1（节点级核对 + 两侧交叉核对同时报红）；只改 defconfig 的
+  `DEBUG_UART_BASE` 同样 rc=1；`cp` 恢复后 sha256 一致、脚本回到 rc=0。
+
+### 8.5 与本文旧章节的逐条映射
+
+| 旧章节 | 新口径下的状态 |
+|---|---|
+| §2.1/§2.2（不存在 `RISCV_M_MODE`；用 `RISCV_MMODE/RISCV_SMODE`） | **沿用**（新树同名符号）；`CONFIG_RISCV_M_MODE` 只有一处恒假 `#ifdef` 残留 |
+| §2.3（S 模式不能直接驱动 CLINT ⇒ 定时器/复位走 SBI） | **沿用**（符号换成 `RISCV_ACLINT` 且仍 `depends on RISCV_MMODE`）；新树 S 模式定时器由 CPU 驱动用 `/cpus/timebase-frequency` 绑定通用 `riscv,timer` 驱动 |
+| §2.4（`la32rsoc_defconfig` 作结构模板） | **不再适用**（新树没有 `la32rsoc_*`）；结构模板改为 `board/emulation/qemu-riscv/` + `board/sifive/unleashed/` |
+| §3.1 board 目录 `board/<vendor>/rv32gc/` | 实际落点 **`board/loongson/chiplab/`**；`dram_init` 不自己写，用 `arch/riscv/cpu/generic/dram.c` 从自带 DTS `/memory` 取，板级只做 bank 与平台事实的对账（`chiplab.c:board_init`） |
+| §3.2 defconfig 名 `rv32gc_defconfig` 与其中条目 | 实际 **`chiplab_rv32_defconfig`**；`CONFIG_RISCV_SMODE=y` ✔、`RISCV_M_MODE` 未出现 ✔；**`CONFIG_SYS_NAND_SELF_INIT=y` 写进 defconfig 会被静默丢弃**（隐藏符号），改由板级 `select` |
+| §3.3 DTS 节点清单（cpus/memory/chosen/UART/NAND） | **已落地**（另加 CLINT/PLIC/SPI XIP）；`timebase-frequency` 放在 `/cpus`（CPU 驱动先查 hart 节点、再回退父节点） |
+| §3.4/§3.5 NAND 驱动、`saveenv`、`bootcmd` 自动启动 | **未完成**：defconfig/DTS 只做编译期预留（`MTD`/`MTD_RAW_NAND`/`CMD_NAND`/`ENV_IS_IN_NAND`，NAND 节点 `status="disabled"`，板级提供弱 `board_nand_init()` 空桩）；驱动与寄存器语义见 `docs/porting/04-nand-driver.md` 与 PF §4/§9(U1,U2) |
+| §4.1 构建命令与 GCC 兼容风险 | 命令更新为 `make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- chiplab_rv32_defconfig && make ...`；GCC16 风险 **无**（8.3） |
+| §4.2 验收 U1–U7 | U1（defconfig 无符号丢失）：**已按"逐条在 `.config` 里回查"完成**（`savedefconfig` 只省默认值，不能当丢符号判据）；U2（无 `RISCV_M_MODE`）：✔（脚本 §4）；U3（产出 `u-boot.bin`）：✔；U4–U7（NAND 识别/`mtdparts` 一致/`saveenv` 掉电保持/自动启动）：**待 NAND 驱动与上板** |
+| §5 与 `arch/la32r`、`la32rsoc_defconfig` 的边界 | **不再适用**（新树无这些对象）；新边界＝只新增文件 + 2 处挂接改动（8.4），改上游文件须写清理由 |
+| §6 风险 R1–R6 | R4（GCC16 兼容）**关闭**；R2（NAND 控制器寄存器全表）**仍在**（PF §9 U1/U2）；R3（`TEXT_BASE` 取值）按下述约定定：`0x0200_0000`（S 模式运行在 DDR3，由 OpenSBI 装载，**不走 SPI XIP**） |
+
+### 8.6 新基线上的地址/时钟约定（与 `01-overview.md` §2.3 对齐）
+
+| 用途 | 地址 | 依据 |
+|---|---|---|
+| OpenSBI (M) | `0x0100_0000`（≤1 MiB） | `01-overview.md` §2.3 [工程约定] |
+| U-Boot (S) 代码 | `0x0200_0000`（`CONFIG_TEXT_BASE`） | 同上 |
+| U-Boot 重定位前栈 | `0x01E0_0000`（`CUSTOM_SYS_INIT_SP_ADDR`） | 同上（本项目细分） |
+| Linux kernel | `0x0400_0000`（`kernel_addr_r`，≤50 MiB） | 同上 + NAND `50M(kernel)` 分区 |
+| DTB / ramdisk / script | `0x0740_0000` / `0x0750_0000` / `0x0730_0000` | 本项目细分，全部落在 DDR3 内 |
+| U-Boot 重定位区 | DDR 顶端（`SYS_MALLOC_LEN=4 MiB`） | U-Boot 通用行为 |
+
+### 8.7 遗留 / 风险（本次新增）
+
+1. **无 qemu 冒烟**：本机 `qemu-system-riscv32` 缺失（`which` 实测），B-1/B-2 只到构建级；
+   且本板 DTS 是真实平台地址，`-M virt` 无法等价验证（详见 `u-boot/board/loongson/chiplab/README` §遗留）。
+2. **宿主机缺 `libgnutls28-dev`**：影响 `make tools`（`mkeficapsule`）。本项目**不装系统包、不提权**，
+   在 defconfig 中 `# CONFIG_TOOLS_MKEFICAPSULE is not set` 以保持 `defconfig && make` 两条命令可复现。
+3. **CLINT/PLIC 地址无平台 RTL 佐证**（PF §9 U8）：DTS 已按 `0x1F00_0000`/`0x1F10_0000` 登记，
+   核内译码实现时须写进 `rtl/pkg/*defs.vh` 并回写 PF。
+4. **`riscv,isa` 用传统字符串**（`rv32imafdc_zicsr_zifencei_zicntr_zicbom`）；Linux 阶段如需
+   `riscv,isa-base` + `riscv,isa-extensions` 再补，须与核实际实现逐条对齐。
+5. **UART 窗口内偏移 `+0x1E0` 含转述成分**（PF §2.5/§9 U3）；上板首轮若串口无声，按 U3 反查 APB 从口译码。
+6. **NAND 路径未通**：`saveenv`/`nand`/`mtdparts` 目前不可用（§3.4/§3.5 待做）。
