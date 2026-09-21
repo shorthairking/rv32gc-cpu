@@ -379,3 +379,112 @@ apb1_req/ack/rw/enab/psel/addr/datai/datao  →  NAND_top
    而 `lib/Makefile:120` 仅在 `CONFIG_BCH` 下编译该文件
    —— 缺它会出现 `undefined reference to 'init_bch'`。
    本驱动在 Kconfig 里 `select BCH`。
+
+---
+
+## 11. E6–E8：QEMU 运行期实测勘误（2026-09-21，阶段三 B-4/B-5）
+
+> **背景**：本节全部结论来自 `qemu-system-riscv32 -M chiplab`（PC 上模拟 chiplab 实验板：
+> SPI XIP 主窗/别名窗 + NAND 控制器 + confreg DMA 引擎 + UART/CLINT/PLIC）冷启**真 SPI 镜像**
+> 跑到 U-Boot `=>` 后做 B-4/B-5 的实测。B-3 阶段只做到"构建级 + 逻辑级"验证，以下缺陷
+> 均为运行期才暴露。完整命令、串口日志与镜像证据见 `docs/chiplab-qemu/`。
+> **修复范围**：全部改动都在 `u-boot/drivers/mtd/nand/raw/chiplab_nand.c` 一个文件内，
+> 未改 `chiplab_nand.h` 的任何常量（§4.3 的 ECC 布局契约逐字未动）。
+
+### E6. 驱动把 `mtd` 单独分配 —— 运行期必崩（到不了 U-Boot 提示符）
+
+* **现象**：冷启后 U-Boot 打印 banner 与 `chiplab-nand: ID_INFORM = ec f1 ...`，
+  随即 `Unhandled exception: Illegal instruction  EPC: 00000000 RA: ...nand_command+0x46`
+  —— 崩在 `board_init_r` 的 `nand_init()` 阶段。
+* **根因**：U-Boot 2026.10 的 `struct nand_chip` **第一个成员**就是 `struct mtd_info mtd`
+  （`include/linux/mtd/rawnand.h:915`），`mtd_to_nand()` 走
+  `container_of(mtd, nand_chip, mtd)`（同文件 `:1016`）。而驱动原以
+  `mtd = calloc(1, sizeof(*mtd))` 单独分配 `mtd`、把 `cmdfunc/read_buf/write_buf/...`
+  装在另一份 `chip` 上（旧 API 写法），于是 `nand_scan(mtd, 1)` 把那份 `mtd` 当成
+  `nand_chip`：驱动回调全部不可见 → 框架退回默认 `nand_command()` → 调用为 NULL 的
+  `chip->cmd_ctrl` → `jalr` 跳 0。
+* **修法**：`mtd = &chip->mtd;`，并删除 `err_mtd`/`free(mtd)` 分支（内嵌后**不可** free）。
+* **反证**：未修版本冷启必红（`logs/orig_image_smoke.log`）；修后同一镜像直达 `=>`。
+* 强度：**[QEMU 运行期实测]**。
+
+### E7. `PAGEPROG` 丢失页地址 —— 数据静默写到最后 1 页
+
+* **现象**：`nand write 0x04000000 0x100000 0x2000` 报 `failed -5`；主机侧扫描 NAND 镜像发现
+  8 KiB 图案落在**第 65535 页**（MTD 0x7FFF800），请求的 0x100000 未被写入。
+* **根因**：框架约定 `nand_prog_page_begin_op()` 用
+  `cmdfunc(NAND_CMD_SEQIN, offset_in_page, page)` 开始一次页编程，收尾的
+  `nand_prog_page_end_op()` 只发 `cmdfunc(NAND_CMD_PAGEPROG, -1, -1)`
+  （`nand_base.c:1243` / `:1266`；页地址由**芯片**在 0x80 序列里锁存，框架不再重复传递）。
+  控制器侧每写一次 `ADDRH` 就换页，故 `(u32)page_addr = 0xFFFFFFFF` 被截成行地址 `0xFFFF`。
+* **修法**：在 `SEQIN` 把页号锁存进驱动私有结构（新增 `u32 page`），`PAGEPROG` 用它。
+* **反证**：只打 E6 不打 E7 时 `nand write 0x100000` 报 -5 且 `non-erased pages: [65535]`
+  （`logs/counterproof_pageprog.log`）；修后写→读→比较逐字节一致。
+* 强度：**[QEMU 运行期实测]**。
+
+### E8. ECC / ID / OOB 三条运行期缺陷
+
+#### E8-① 自定义 BCH-4 未生效（框架 `NAND_ECC_SOFT` 覆盖钩子）
+
+* **现象**：驱动自报 `ECC BCH-1/512B`、`nand info` 报 `ecc strength 1 bits`——与 §4.3
+  "4 段 × 7 B、备用区尾部 28 B"的契约不符（实际写的是框架 Hamming-1 的 3 B/步）。
+* **根因**：`nand_scan_tail()` 的 `NAND_ECC_SOFT` 分支**无条件**覆盖
+  `ecc->calculate/correct` 并置 `ecc->bytes = 3`、`ecc->strength = 1`
+  （`nand_base.c:5055-5066`）。
+* **修法**（三处，均在 `chiplab_nand.c`）：
+  1. 驱动自带 `struct nand_ecclayout chiplab_nand_oob_64`
+     （`eccbytes = 28`、`eccpos = 36..63`、`oobfree = {offset 2, length 34}`），并在
+     `nand_scan()` **之前**挂到 `chip->ecc.layout`——框架只在 `ecc->layout` 为空时才套用
+     `nand_oob_64` 默认表（`nand_base.c:4959-4975`），自带表原样保留 ⇒ §4.3 的布局契约不变；
+  2. `nand_scan()` 之后把 `calculate/correct` 换回 `chiplab_bch_encode/decode`，补回
+     `ecc.bytes = 7`、`ecc.total = 28`、`ecc.strength = 4`、`mtd->ecc_strength = 4`、
+     `mtd->bitflip_threshold = 3`（`ecc.size = 512`、`ecc.steps = 4` 由框架按
+     `writesize / ecc->size` 算得，未被改动），并加 fail-closed 复核：`ecc.size/steps/layout`
+     与契约不符即 `nand_unregister()` 退出，绝不带着错参数继续；
+  3. 擦除态页：全 0xFF 数据经 BCH 编码**不**得到全 0xFF 校验位，硬解会把每个刚擦除的页判成
+     不可纠（现象：空白芯片读 env 直接 `-EBADMSG/-74`）。框架 SW ECC 路径不做该判断，改由
+     驱动的 `correct()` 调框架导出的 `nand_check_erased_ecc_chunk()`
+     （`rawnand.h:1339`，语义见 `nand_base.c:1726-1760`）识别擦除页并补回 0xFF 位；
+     超出阈值仍返回 `-EBADMSG`（fail-closed）。
+* **修后验证**：启动打印 `ECC BCH-4/512B`；`nand info` 报 `ecc strength 4 bits /
+  ecc step size 512 b`；`mtd list` 报 `OOB available: 34 bytes`；写页后主机镜像实测
+  备用区 `[0..1] = FF`、`[2..35] = FF`、`[36..63] = 4×7 B ECC`。
+* **故障注入**（在宿主 NAND 镜像里对某页第 1 个 512 B 段翻位，之后 `nand read` + `cmp.b`）：
+
+  | 注入 | 结果 | 判据 |
+  |---|---|---|
+  | 1–3 bit | `2048 bytes read: OK`、`Total of 2048 byte(s) were the same` | 透明纠正 |
+  | **4 bit** | 同上（BCH-4 能力边界） | 透明纠正 |
+  | **5 bit** | `NAND read from offset 200000 failed -74`、`0 bytes read: ERROR` | fail-closed |
+  | 6 bit | 同上 | fail-closed |
+
+* 强度：**[QEMU 运行期实测]**（`logs/ecc_a.log`、`ecc_b.log`、`ecc_c.log`、
+  `ecc_4bit.log`、`ecc_5bit.log`）。
+
+#### E8-② ID 字节拼接偏移一字节（第 5 字节取成第 6 字节）
+
+* **依据**：`HIT5 = {status[7:0], ID_INFORM[47:32]}`（`nand.v:347`）⇒ 寄存器 `[15:8]` 是
+  `ID_INFORM[47:40]`（第 6 字节）、`[7:0]` 是 `ID_INFORM[39:32]`（第 5 字节）；
+  而 `ID_INFORM` 的字节序为 `[7:0]` 起装第 1 字节（`nand.v:1366-1376`）。
+* **缺陷**：驱动原先 `id[4] = sth >> 8`、`id[5] = sth >> 16`，打印成
+  `ID_INFORM = ec f1 00 1d 00 40`（第 5 字节读成 0x00、第 6 字节读成 status）。
+* **修法**：`id[4] = sth >> 0`、`id[5] = sth >> 8`；`read_byte()` 的 READID 分支同步改为
+  cursor 4 → `sth >> 0`、5 → `sth >> 8`、≥6 → `0x00`。
+* **修后**：`ID_INFORM = ec f1 00 1d 15 00 (expect ec f1 ..)`——前 4 字节不变，
+  第 5 字节 0x15 归位（与 K9F1G08U0C 的 5 字节 ID `EC F1 00 1D 15` 一致）。
+* 强度：**[QEMU 运行期实测]** + [RTL 实测]。
+
+#### E8-③ `READOOB` 返回主区数据 —— 坏块标记扫描误判正常数据块为坏块
+
+* **现象**：写完数据（某页首字节 0xA5）后，一旦 flash BBT 需要重建，
+  `nand bad` 把该数据块报成坏块（实测 `0x00080000`）。
+* **根因**：坏块扫描只读 OOB——`nand_bbt.c:413 scan_block_fast` → `mtd_read_oob`
+  （`datbuf == NULL`）→ `nand_do_read_oob` → `chip->ecc.read_oob`
+  （= `nand_read_oob_std`）→ `cmdfunc(NAND_CMD_READOOB, offset_in_oob, page)` +
+  `read_buf(oobsize)`。驱动原先对 `READOOB` 整帧读后把游标停在 0，于是把**主区前 64 B**
+  当 OOB 返回；坏块标记字节（OOB offset 0）实际取到主区第 0 字节 → 非 0xFF 即判坏块。
+* **修法**：`READ0/READOOB` 统一按"帧内偏移"定位游标——`READOOB` 的 column 是
+  **备用区内**偏移，需 `+2048`；超过 2112 B 帧再按芯片线性地址顺延页号，最后
+  `p->cursor = col`。
+* **反证**：修前 `logs/bbm_a.log` + `bbm_b.log`：清掉 flash BBT 后重启重建，
+  `nand bad` 列出 `0x00080000`（该块只有正常数据）；修后同场景只剩 4 个 `bbt reserved` 块。
+* 强度：**[QEMU 运行期实测]**。

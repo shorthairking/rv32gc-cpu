@@ -11,13 +11,12 @@
   - `docs/porting/01-overview.md` 02-uboot 03-linux-opensbi 04-nand-driver 05-rootfs（5 篇）
   - `docs/kb/platform-facts.md` isa-notes.md tools-and-flow.md（3 篇）
 
-## 1.5 阶段二 2A 当前状态（2026-09-17，M2 已收口，提交至 188fa00；下一里程碑 M3）
+## 1.5 当前状态（2026-09-21 晚：2A 收官 + 2B/U-Boot 双线并行）
 
-- **M2 收口（act4 新树全量基线，母 Agent 亲跑，日志 /tmp/newtree_accept.log）**：非特权 I 39/M 8/F 80/D 106/Zicsr 6/Zicntr 2/Zicbom 3/Zifencei 1 + PMP* 63/63 + Sv 29/29、SvPMP 4/4、SvPMPZicbo 4/4、SvZicbo 2/2、Svade 2/2、Svbare 3/3 + L0 回归 22/22 + check-exclude PASS（80 条）；sbe 2 例按上游 NORUN 排除。关键提交：`0b15b7c`（非特权+并行化）→`a2f5561`（FP 互锁）→`563913c`（底座开关）→`a69ee8c`/`113cb09`（PMP+DECERR）→`e799328`（sfence.vma+取指 Sv32）→`188fa00`（Sv32 收口+exclude 迁移）。
-- **环境**：riscv-arch-test 已迁移到 act4（HEAD `92c31f71`，扁平命名 `<目录>_<名>-00.S`）；新树各组成绩见上；旧树日志路径作废。
-- **M4 已收口（提交至 `ae906cd`）**：全核（含 FPU）@60 MHz **综合 WNS +0.338（0 失败端点）/ 布线 WNS +0.031（0 失败端点，Fmax 60.11 MHz）**；面积 53 066 LUT(39.4%)/12 BRAM/34 DSP。攻克链：T1 FPU 面积 546k→22k LUT（`48ca2eb`）→ T2 非 FPU 流水 60.03 MHz（`011fb28`）→ T3 全核证据（`bf10957`：FPU 单拍锥 166 级）→ T4 FPU 8 级流水（`ac81129`：综合 −52.9→+0.42 ns）→ T5 非 FPU 收口（`ae906cd`：+0.031 ns）。100 MHz 差 7.2×（需 FPU ≥8 级微架构重做，如实登记未做）。
-- **待办**：axi_req_desc is_plic 口径统一、plic 3bit WARL 与文档对齐、锁步探针扩展、M_S_MMIO 字节合并、L1D 8B store 门控、跨页 8B 重翻译、CMO PMA 对 MMIO 窗口残余口径、DFIL 错误行 l1d poison 升级、100 MHz 余量（ExtraNetDelay_high 备选档 +0.212 ns / FPU 再切级）、post-route 网表仿真（phys_opt -retime 后未验）、**R2：MMIO 读 R 通道晚 1 拍采样风险**（axi_master_ctrl.v:257-258 rdata 组合直通 + core_top.v:2986 axi_done_q 再打一拍 ⇒ M 级在 RVALID&RREADY 后第 2 拍采样 m_rd_data_q；cache fill 通路 :2914 握手拍取数=正确对照。平台 confreg_syn 保持型从设备下安全，换流水化互连/新 IP 会读错；修法=在 axi_rdata_valid 拍锁存 rdata 进 axi_rdata_q）、**XIP 写只能走 0x1FE8 别名**（godson_sbridge_spi.v:189 io_hit 门控写路径，0x1C00 写被静默丢弃）；→ M5 上板（已交付 bitstream+镜像+手册，待用户实测）。
-- **M5 上板前仿真拦截 8 缺陷**（全部在冻结版 b824c9f0 修掉，细节见子 Agent 补充报告与 sw/m5_board/tb 日志）：puts_dec 累积 or 死循环/TPI_SIG 余量不足/步⑤ t3 被清零/FREQ>>20 判据数学错/汇总极性混用/坏标志寄存器被 udiv 覆盖/udiv 商位序镜像/上板实测 cycles-per-iter 可能 60~90（判据窗 35~82，超窗先重标定不判坏板）。
+- **2A M1–M5 全部收官**（tag `2A-M5` 已推远端；master=dev=9fac069）：arch-test 全绿、60 MHz 时序达标（WNS +0.031/0 失败端点，面积 39.4%）、上板 `RESULT: RV32GC-M5-OK` @33 MHz 同域；板上三缺陷修复（R2 rdata 锁存 `7a06825`、mdu div_gen 字段序 `4a86a05`、步④ 窗口 `2e93a4f`）。
+- **A 线 2B（用户已批）**：2B-1 前端+预测器 ✅（`f42827e`：regress 26/26、准确率 mixed 90.85% 选择器优于单侧、Spike 黄金轨迹 248/248）；**2B-2 在途**（`138a1067`：ROB 128/重命名/6 队列/锁步+IPC>1.0）；后续 2B-3 LSQ → 2B-4 合体 → 2B-5 时序上板。
+- **B 线 U-Boot（基线=上游 fork dev 分支）**：B-1/B-2 板级骨架 ✅（u-boot `3d9e78e8e80`）；B-3 NAND 驱动 ✅（u-boot `124a604ebc5`，自包含 BCH-4 + DMA 描述符，13.6 万断言）；B-3.5 引导链 ✅（`1c8fce2`）；**QEMU chiplab machine ✅**（qemu/ chiplab-qemu-dev `1d78934a9c`，-M chiplab，报告 docs/chiplab-qemu/）；**B-4/B-5 + E6–E8 ✅ 运行期验证全绿**（u-boot dev：E6 mtd 内嵌、E7 PAGEPROG 页号锁存、E8① BCH-4 真生效+故障注入（1–4bit 纠正/5–6bit fail-closed）、E8② ID 字节序、E8③ 坏块扫描 OOB 游标 bug；nand 往返/saveenv 跨重启/bootcmd 自动执行全绿，regress 27/27）；**官方重打包 ✅**（boot_stub.S BOOT_LEN_UBOOT→0x620AC，spi_flash.img 956276B md5 27a9d9a5，旧件 .pre-E8.bak）；下一步：上板实测 → Linux 移植（03-linux-opensbi.md）。
+- **远端**：rv32gc-cpu origin 已切 SSH（git@github.com:shorthairking/rv32gc-cpu.git）；master/tag/dev 已推。u-boot/linux 两 fork 仓各建 dev 分支。
 
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 

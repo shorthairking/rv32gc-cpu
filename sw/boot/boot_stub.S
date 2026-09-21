@@ -97,7 +97,7 @@
     .equ BOOT_SRC_UBOOT,    0x080000
     .equ BOOT_DST_UBOOT,    0x02000000
     .ifndef BOOT_LEN_UBOOT
-    .equ BOOT_LEN_UBOOT,    0x000613FC     # 398 332 B（u-boot.bin 398 330 B 补齐到 4）
+    .equ BOOT_LEN_UBOOT,    0x000620AC     # 401 580 B（u-boot.bin 401 578 B 补齐到 4，E6-E8 修复后重编）
     .endif
 
     # ---- 段 3：U-Boot 设备树（OpenSBI 按 FW_JUMP_FDT_ADDR 传给下一级）----
