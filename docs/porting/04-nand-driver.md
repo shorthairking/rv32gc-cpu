@@ -281,3 +281,101 @@ apb1_req/ack/rw/enab/psel/addr/datai/datao  →  NAND_top
 3. **驱动实现**（U-Boot 侧 + Linux 侧，**本文不含实现代码**）；
 4. **自证报告**：按 §7 表格逐项给出证据，**N6 必须含变异测试记录**；
 5. **不确定项登记**：同步至 `docs/kb/platform-facts.md` §9。
+
+---
+
+## 10. 勘误与实施补充（2026-09-21，阶段三 B-3 实测回写）
+
+> **原文一律不改**，本节只做**追加**。每条给出「原文口径 → 实码口径 → 证据」。
+> 证据强度沿用 `docs/kb/platform-facts.md` 的标注约定。
+
+### E1. `nand_size` 的几何编码（关闭原文 §1.3 的不确定项）
+
+* **原文口径**（§1.3）：`nand_type=2'h2` → `nand_size[3:0]` 的映射链"未逆向完成"，
+  驱动的地址构造"必须与该分支表一致"但分支表未给出。
+* **实码口径**：`nand.v:225-282` 的 case 直接给出列/行位宽—
+  `nand_size==4'h0/4'h1` 用 `nand_addr_c[11:0]` + `nand_addr_r[15:0]`/`[16:0]`，
+  `4'h2/4'h3` 用 `+[17:0]`/`[18:0]`。配合 `READ_START`/`WRITE_START` 的周期数
+  选择（`nand.v:809`、`nand.v:982`）与 `NAND_ADDR_COUNT` 各分支的字节抽取
+  （`nand.v:733-757`），1 Gbit（1024 块 × 64 页 ⇒ 16 位行地址、2048 B 页 ⇒
+  列地址只需 3 字节周期）对应 **`nand_size == 4'h0`**（3 地址周期）。
+  Linux 侧写 `0x9fe78018 = 0x08005300`（`ls1a_nand.c:910`）得
+  `nand_size = (0x08005300 >> 8) & 0xf = 3`，与复位默认
+  `0x0800_5000`（`nand.v:160`，`nand_size = 0`）分属不同分支，
+  **两者都能给出 3 地址周期**（`nand.v:809`/`:982` 对 `4'h0` 与 `4'hc/4'hd`
+  都给 `3'b100`，对 `4'h9/4'ha/4'hb` 给 `3'b011`）。
+* **本驱动的取值**：显式写 `nand_size = 3`（`CHIPLAB_NAND_SIZE_1GBIT`），
+  与 Linux 侧同值；`op_scope = 2048` 与页容量一致。
+  强度：[RTL 实测]（`nand.v` 行号如上）。
+* **仍未关闭的部分**：`nand_size` 各分支的**字节抽取是否与真实器件地址周期
+  完全等价**需要上板用"读一页已知内容"验证（原文 §7 N3/N4）。
+
+### E2. 寄存器逐条语义复核（关闭 D3 / PF §9 U1）
+
+* **原文口径**（§3.1 表）：只给"命中信号 + 写侧行号 + 读侧行号 + 推测语义"。
+* **实码口径**：逐寄存器语义已按 `nand.v` 读写两侧实码关闭，
+  全表（含命令字位域、`NAND_PARAM` 位域、`0x24`/`0x2C` 的"未写时硬件回填"行为）
+  见 U-Boot 侧交付物 `u-boot/board/loongson/chiplab/README` 的
+  「控制器寄存器映射表」与 `u-boot/drivers/mtd/nand/raw/chiplab_nand.h` 顶部注释。
+* **对原文 §3.1 表的两处修正**：
+  1. `0x2C`（原文"`HIT11` → RDY 映射 1"）：写侧确为 `nand_rdy_map1`（`nand.v:196`），
+     但**未写时硬件回填 `{WRITE_MAX_COUNT, NAND_OP_NUM[15:0]}`**（`nand.v:197`），
+     故它同时是"上一次写入的实际传输量"只读观测口（`0x24` 与之对称，
+     `nand.v:194`）。
+  2. `0x24`（原文"CE 映射 1"）：同上，写侧是 CE 映射，未写时回填
+     `{READ_MAX_COUNT, NAND_OP_NUM[15:0]}`。
+* **命令字位域**（原文未列）：`[0]` 有效、`[1]` 读、`[2]` 写、`[3]` 擦除、
+  `[4]` 连续擦除、`[5]` 读 ID、`[6]` 复位、`[7]` 读状态、`[8]` 主区、`[9]` 备用区、
+  `[10]` DONE（只读）、`[13]` 中断使能；
+  **`[11] ECC_RD`、`[12] ECC_WR`、`[15] RAM_OP` 在 `nand.v` 中完全未被引用**
+  —— 这是原文 D4「控制器是否有硬件 ECC 引擎」的**直接反证**：
+  RTL 保留了软件 ECC 的命令位但无任何实现（`nand.v` 全文无 ECC 计算逻辑）。
+  强度：[RTL 实测]。
+
+### E3. DMA 搬运（关闭 D5；更正 §5.3 的部分表述）
+
+* **原文口径**（§5.3）：门铃写 `0x1FE7_8040` 触发 DMA，`nand_dma_ack_i` 应答。
+* **实码口径**：`0x1FE7_8040` 上的**普通 load/store 就是搬运本身**
+  —— `nand_dma_ack_i = psel & (ADDR == 11'h40)`（`nand.v:129`），
+  DMA 引擎对设备侧的每次访问都会在这条地址上产生一个 APB 周期
+  （`dma.v:370 assign dma_ack_out = apb_psel`），
+  **不需要软件在门铃上写任何数据**。软件的职责是：
+  1. 在 confreg 的 order 寄存器 `0x1FD0_1160`（`confreg_syn.v:33`）
+     写入 **32 字节对齐**的描述符物理地址并置 `dma_start`（bit3，`dma.v:137`）；
+  2. 描述符 = 4×64 位：`{mem_addr, order_addr}` / `{length(4B 字数), dev_addr}` /
+     `{step_times, step_length}` / `{状态, cmd}`（`dma.v:559-574`），
+     其中 `dev_addr` 必须 = `0x1FE78040`，`cmd[12] = dma_r_w` 决定 **DDR 侧**方向；
+  3. 轮询 order 寄存器的 bit3/bit2 清零判定完成（`confreg_syn.v:325-330`）。
+* **原文 §5.3 "cache 一致性"补充**：U-Boot（S 模式、无 MMU、无 D-cache 语义）
+  只需 `flush_dcache_range`/`invalidate_dcache_range` 包住缓冲区（本驱动已做）；
+  Linux 侧仍需按原文做 DMA API 同步。
+* 强度：[RTL 实测]（`dma.v`/`confreg_syn.v` 行号如上）。
+
+### E4. ECC 布局：原文 §4.3 的"公共头文件"落到具体位置
+
+* **原文口径**（§4.3）：ECC 布局常量必须放在两侧共用的单一头文件，
+  "如 `include/linux/mtd/nand_ecc_layout.h` 风格"。
+* **实码口径**：U-Boot 侧唯一定义在
+  `u-boot/drivers/mtd/nand/raw/chiplab_nand.h` §3（`CHIPLAB_NAND_ECC_*`），
+  且该头**不依赖 U-Boot**，将来 Linux 侧把同一份文件放进内核即可共用。
+  位序约定（数据位 `p` ↔ `x^p`、ECC 位 `j` ↔ `x^(8n+j)`）也写在该头，
+  并由 U-Boot 侧单元测试 `test_bit_order` 锁死。
+* **具体布局**：段 512 B × 4 段，每段 7 B（BCH-4，GF(2^13)），
+  ECC 占**备用区 offset 36..63**（尾部 28 B），出厂坏块标记 offset 0、
+  运行时标记 offset 1，`oobfree` = offset 2..35。
+  该布局与 U-Boot `nand_bch_init()` 的默认布局一致（`nand_bch.c:160-175`），
+  因此 Linux 侧可用标准 `nand_ecclayout` 表达。
+* 强度：[工程约定] + [RTL 实测]（备用区 64 B 来自 `nand.v` 的 `0x40` 门铃路径与
+  原文 §1.2 裁决口径）。
+
+### E5. 实施中发现的两条 U-Boot 2026.10 树内约束（供后续复用）
+
+1. **`nand_release()` 在该树中不存在**：只有 `nand_unregister(mtd)`
+   （`drivers/mtd/nand/raw/nand.c:80`）与静态的 `nand_release_device()`
+   （`nand_base.c:134`）。用 `mtd_device_unregister()` 会**链接失败**
+   —— 该符号在本配置下未编译进 `mtdcore.o`。
+2. **软件 BCH 需要 `CONFIG_BCH=y`**：`NAND_ECC_BCH` 只启用 `nand_bch.c`，
+   它调用 `lib/bch.c` 的 `init_bch/encode_bch/decode_bch`，
+   而 `lib/Makefile:120` 仅在 `CONFIG_BCH` 下编译该文件
+   —— 缺它会出现 `undefined reference to 'init_bch'`。
+   本驱动在 Kconfig 里 `select BCH`。
