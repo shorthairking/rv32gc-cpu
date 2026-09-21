@@ -10,7 +10,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `confreg_axi_filter.v` | **AXI4 地址过滤层 + 上板 CONFREG 行为模型**。插在 `core_top`（主）与 `sim_mem_model`（从）之间：地址落在 `0x1FD0_0000–0x1FD0_FFFF` 的读/写自答，其余**逐字段透传**。实现 `+0xF000` LED（读写）、`+0xF010` 数码管（读写）、`+0xF020` switch（只读，`SWITCH_VAL=8'hA5`）、`+0xF030` FREQ（只读，`32'd33000000`）、`+0xE000` TIMER（自由运行、写任意值清零）。读数据在 **AR 握手拍寄存并保持**（= 上板 `confreg_syn.v:295` 行为；见 §5.5）。输出判据/诊断观测：首笔 AR、五寄存器访问标志、AXI 轨迹、路由一致性计数。 |
+| `confreg_axi_filter.v` | **AXI4 地址过滤层 + 上板 CONFREG 行为模型**。插在 `core_top`（主）与 `sim_mem_model`（从）之间：地址落在 `0x1FD0_0000–0x1FD0_FFFF` 的读/写自答，其余**逐字段透传**。实现 `+0xF000` LED（读写）、`+0xF010` 数码管（读写）、`+0xF020` switch（只读，`SWITCH_VAL=8'hA5`）、`+0xF030` FREQ（只读，`32'd33000000`）、`+0xE000` TIMER（自由运行、写任意值清零）。读数据在 **AR 握手拍寄存并保持**（= 上板 `confreg_syn.v:295` 行为；见 §5.5）。两个**从设备行为模型开关**：`R_STICKY`（CONFREG 侧保持，默认 1 = 上板口径）、`DDR_R_NONHOLD`（DDR3/XIP 侧：1 = **非保持型 R 通道**，RDATA 只在 `m_rvalid & m_rready` 拍有效，其余拍为 0，= 真实 MIG / 流水化互连口径；默认 0 = 原样透传）。输出判据/诊断观测：首笔 AR、五寄存器访问标志、AXI 轨迹、路由一致性计数。 |
 | `tb_m5_board.sv` | **顶层 TB**：48 端口逐字例化 `core_top` + 过滤层 + `sim_mem_model`；时钟半周期 15.1515 ns（周期 30.303 ns ≈ 33.0 MHz，上板口径）；复位 20 拍后负沿释放；`intrpt=0`；UART 子串匹配（滚动窗口，逐字节增量，支持"结果行前缀 + 宽限字节"提前收尾）；AXI 区域统计与轨迹直方图；判据 C0–C5、PASS/FAIL 输出。 |
 | `run_tb.sh` | 编译（`iverilog -g2012 -I rtl/pkg -I <repo>` + `rtl/**/*.v` 全量）+ 运行（`stdbuf` 行缓冲）+ 三重判定（vvp 退出码 / PASS 锚点恰 1 行 / 无 `FAIL` 字样）；日志落 `tb/out/`；**失败即非零退出**。 |
 | `ctrl/ct_selftest.S` | **控制实验 A（测试台自检）**：独立编写的最小程序，点亮"CONFREG 五寄存器读写 + UART 捕获 + 复位取指"。预期 **PASS** —— 证明判定链本身有效。 |
@@ -46,7 +46,14 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_selftest.hex RUN_TAG=ctl_a_nosticky R_STICKY
 ```
 
 环境变量：`PROG_HEX`、`TIMEOUT_CYCLES`、`TOP`、`RUN_TAG`、`PROGRESS_EVERY`、`TRACE_PRINT_N`、
-`UART_PRINT_MAX`、`R_STICKY`（默认 **1**）、`RD_TRACE_WINDOW`（默认 0）。
+`UART_PRINT_MAX`、`R_STICKY`（默认 **1**）、`DDR_R_NONHOLD`（默认 **0**）、`RD_TRACE_WINDOW`（默认 0）。
+
+**非保持型 R 通道模型（2026-09-21 新增，用于 R2 缺陷复现/反证）**：
+```bash
+# 修复后两种模型都必须 PASS（判据 C0–C5 一字不动）
+PROG_HEX=sw/m5_board/tb/ctrl/out/ct_m5_scaled.hex RUN_TAG=ctl_b_v7_hold    TIMEOUT_CYCLES=6000000 bash sw/m5_board/tb/run_tb.sh
+PROG_HEX=sw/m5_board/tb/ctrl/out/ct_m5_scaled.hex RUN_TAG=ctl_b_v7_nonhold DDR_R_NONHOLD=1 TIMEOUT_CYCLES=6000000 bash sw/m5_board/tb/run_tb.sh
+```
 
 ---
 
@@ -76,6 +83,9 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_selftest.hex RUN_TAG=ctl_a_nosticky R_STICKY
 | `verify_final_b824c9f0` | 同上（父 Agent 用本 TB 独立复跑） | **PASS**（同口径；日志 `out/verify_final_b824c9f0.log`，唯一 PASS 锚点 1 行） |
 | `ctl_b_v4` / `ctl_b_v5` / `ctl_b_v6` | 中间版本 | FAIL→PASS 演进，见 §5 缺陷清单（每个缺陷都是一次实测定位） |
 | `spec4m` / `frozen3m` | 冻结程序完整版 | **预算不足**（§5.6）：4M 拍只到横幅第 ~24 字节 |
+| `ctl_b_v7_hold` | **R2 修复后**缩放五步程序（`DDR_R_NONHOLD=0`，保持型从设备） | **PASS**：C0–C5 全过；2 920 848 拍 / 626 字节；步④ `timer delta = 118055, cycle delta = 118049, cycles/iter = 59`；步⑤ `FREQ = 0x01F78A40 (div1e6 = 33 MHz)`；`RESULT: RV32GC-M5-OK` |
+| `ctl_b_v7_nonhold` | **R2 修复后**同程序 + `DDR_R_NONHOLD=1`（非保持型 R 通道 = MIG 口径） | **PASS**：C0–C5 全过；**2 920 848 拍 / 626 字节，且 UART 字节流与 `ctl_b_v7_hold` 逐字节相同**（`cmp` 为空）⇒ 修复后核不再依赖从设备保持 RDATA |
+| `r2_cp_B_oldrtl_nonhold` | **反证**：临时还原旧采样 RTL + `DDR_R_NONHOLD=1` | **FAIL**（预期）：程序在第 ~26 条指令就跑飞（只出 1 个 UART 字节、无 CONFREG 访问、超时）|
 
 ---
 
@@ -90,11 +100,15 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_selftest.hex RUN_TAG=ctl_a_nosticky R_STICKY
 AXI 上出现连续单字节写 `0x08000850…0x0800085B`（越出 DDR3 上限 `0x0800_0000`）。
 → 改为 `bnez t5` + 16 位上限保护。
 
-### 5.2【P1・程序】步④ 的 `TPI_SIG`/`XIP_CPI` 没有余量（`b7e5ee14` 版）
-9 条指令的循环在单发射核上 ≥9 拍，加取分支重定向 ≥10 拍；旧 `TPI_SIG=8.0`（窗口 [6,10]）无余量。
-→ 改为 **TIMER 绝对时刻等待 + 实测标定** `XIP_CPI=59`、判据 `|ticks − 118000| ≤ 47200`。
-★ 上板提醒：59 是**零延迟仿真内存模型**下的**下界**；真机 SPI XIP 更慢，换算窗口上沿 = CPI 82.6。
-
+### 5.2【P1・程序】步④ 的绝对拍数判据不可移植（`b7e5ee14` 版 → **2026-09-21 已改成一致性判据**）
+* 历史：判据曾是 `|ticks − MEAS_ITER×XIP_CPI| ≤ ±40%`，其中 `XIP_CPI=59` 是**核级仿真**
+  （零延迟内存模型）的标定值。真机 SPI Flash XIP 每笔读要几十拍 ⇒ 该绝对窗口在板上不可移植。
+* 现状（2026-09-21 鲁棒化）：步④ 判据 = **`TIMER` 增量 ≡ `rdcycle` 增量**
+  （`|Δtimer − Δcycle| ≤ max(256, Δcycle/128)`，两者都在核时钟域每拍 +1），
+  外加**健全性窗口** `cycles/iter ∈ [20, 300]`（实测值打印；只把"计数器异常/时钟域差量级"
+  钉成 FAIL，**不是**主频判据 —— 主频由步⑤ `FREQ=0x01F78A40` 锚定）。
+  `XIP_CPI=59` 降级为**打印参考**，不参与判定；`build.sh` 判据⑧f1–f5 机器核对
+  "真的有 `rdcycle` / 健全性窗口量级合理 / 无绝对拍数常量残留"。
 ### 5.3【P0・程序】步⑤ `t3` 被 `puts_hex8` 破坏（`ca055abf` 之前）
 `mv a0,t3; jal puts_hex8` 之后才用 `t3` 判定，而 `puts_hex8` 把 `t3` 当 nibble 计数器（返回 0）
 ⇒ 判据算的是 `0>>20`。现象 `(high20 = 0 MHz)` + BAD。→ FREQ 改存 **s9**。
@@ -117,29 +131,48 @@ AXI 上出现连续单字节写 `0x08000850…0x0800085B`（越出 DDR3 上限 `
 （真值 59 的位序镜像）、`udiv(33000000,1000000) = 0x84000000 = 2214592512`（真值 33 的镜像）。
 → 改为教科书恢复余数法（`q<<=1; q|=1`，无位掩码），作者并用隔离程序在核上实测 59/3/33 全对。
 
-### 5.8【P1・RTL 已登记风险】M 级 AXI 读在 **R 握手后第 2 拍** 才取 `rdata`
-* 代码链（只读引用，未改 RTL）：
-  `axi_master_ctrl.v:218` `r_fire = r_go & m_rvalid & m_rready`（**唯一的采样点**）
-  → `:257` `rdata_valid = r_fire` → `:385-386` `if (r_fire) if (r_last_beat) state_q <= ST_DONE;`
-  → `:296` `done = (state_q == ST_DONE)`（末拍 r_fire 的**下一拍**）
-  → `core_top.v:2986` `axi_done_q <= 1'b1`（再打一拍）
+### 5.8【P0・RTL 已修复】M 级 AXI 读在 **R 握手后第 2 拍** 才取 `rdata`（M5 上板实测暴露）
+**上板现象（用户实测）**：串口字符串（Flash XIP ⇒ 走 L1D 填充/取指通路）全部正常、
+CONFREG 的 FREQ 十六进制正常（`confreg_syn` 寄存器保持型），但 **DDR3 的 `.data/.bss`
+十进制打印全乱**（`ticks=000000000000000""`、`cycles/iter=?`、`div1e6=…3`），
+最终 `RESULT: RV32GC-M5-BAD` 并循环重跑 —— 因为"十进制打印"要把数字先存进**栈缓冲**
+（`sp` 在 DDR3 顶），再用 `lbu` 读回来打印；而 DDR3 数据访问走 **MDTA（uncached 单 beat AXI）**。
+
+* **根因链（行号级，修复前）**：
+  `axi_master_ctrl.v:218` `r_fire = r_go & m_rvalid & m_rready`（唯一握手点）
+  → `:257` `rdata_valid = r_fire` / `:258` `rdata_data = m_rdata`（**组合直通，未锁存**）
+  → `:385` 握手后 `state_q <= ST_DONE` → `:296` `done` = ST_DONE 拍（握手后第 1 拍）
+  → `core_top.v:2986` `axi_done_q <= 1'b1`（再打一拍 = **握手后第 2 拍**）
   → `core_top.v:949` `axi_rdata_q = rdata`（**实时总线**）
-  → `core_top.v:2221` `m_axi_ld_data_ext = ld_extract(axi_rdata_q, …)`
-  → `core_top.v:4129` `m_rd_data_q <= m_axi_ld_data`（**在 axi_done_q 那一拍**）。
-  对照：cache fill 通路 `core_top.v:2914` `axi_fill_valid = axi_rdata_valid` 在**握手拍**取数（正确）。
-* 逐拍实测（`out/ctl_a_sticky.log` + `out/ctl_a_nosticky.log`，`TB_M5_RDTRACE`）：
-  ```
-  +1 rvalid=0 rready=0 rdata=0x00001234 | axi_done_q=0 axi_owner_q=5 m_state_q=11 m_rd_data_q=0x1c000040
-  +2 rvalid=0 rready=0 rdata=0x00001234 | axi_done_q=1 axi_owner_q=0 m_state_q=11 m_rd_data_q=0x1c000040
-  +3 rvalid=0 rready=0 rdata=0x00001234 | axi_done_q=0 axi_owner_q=0 m_state_q=0  m_rd_data_q=0x00001234  ← R_STICKY=1 正确
-  ```
-  `R_STICKY=0`（从设备握手后立刻换数据）同一拍序：`rdata=0x1FD0FFB7`（下游 `sim_mem_model`
-  当时正在取指的指令字）⇒ `m_rd_data_q=0x1FD0FFB7`（**错**），控制程序打印的
-  LED/SEG/SWITCH/FREQ 全错；`R_STICKY=1` 全部正确。
-* 影响：当前上板配置大概率无症状（`confreg_syn.v:289-296` 的 `s_rdata` 是寄存器、下一笔 AR 前一直保持；
-  DDR 侧只用 cache fill，采样点正确），但这是**主设备侧 AXI4 协议偏差**：换互连 IP / 流水化桥
-  即会让 MMIO load 读到别的事务的数据。建议（RTL 冻结，仅登记）：在 `axi_rdata_valid` 拍把
-  `rdata` 锁存进 `axi_rdata_q`，M 级改从该寄存器取数。
+  → `core_top.v:2221` `m_axi_ld_data = ld_extract(axi_rdata_q, …)`
+  → `core_top.v:4129` `m_rd_data_q <= m_axi_ld_data`（就在 `axi_done_q` 那一拍）。
+  对照（正确）：cache 填充 `core_top.v:2914 axi_fill_valid = axi_rdata_valid`、
+  XIP 取指字捕获 `:3702`、AMO 读相 `:2035` 都在**握手拍**取数。
+* **为什么仿真全绿**：`sim_mem_model`（以及本 TB 的过滤层默认口径）在 R 握手之后**继续保持**
+  RDATA ⇒ 晚 2 拍采样仍然读到同一值。**上板 MIG 不是这样**：Xilinx MIG 的 `app_rd_data`
+  只在 `app_rd_data_valid` 拍有效，握手后总线上会是"别的事务的数据"。
+* **修复（2026-09-21）**：
+  * `rtl/axi/axi_master_ctrl.v`：新增 **`rdata_hold`**（`r_fire` 拍锁存 `m_rdata`、
+    保持到下一次握手）。`rdata_valid`/`rdata_data` 的组合直通语义**保持不变**
+    （握手套消费者逐拍等价）。
+  * `rtl/top/core_top.v`：`axi_rdata_q = rdata`（实时直通）**删除**；M 级数据读
+    （`m_axi_ld_data`，`core_top.v:2238/2247`）与 AXI 通路的 AMO/LR/SC 读相
+    （`lsu_amo_rdata_src`，`core_top.v:2052`）一律改取 **`axi_rdata_hold`**。
+    逐拍论证见 `axi_master_ctrl.v` §5 的"★★ R 数据时序论证"。
+* **证据链（本目录 + `fpga/scratch/`）**：
+  1. **复现（非保持型 R 模型）**：`sim/tb/tb_arch_test.sv` 新增 `R_HOLD_IDLE`（0 = RDATA 只在
+     `rvalid & rready` 拍有效）。修复前 `R_HOLD_IDLE=0` 跑 `I-add-00` ⇒ **FAIL**：
+     签名 394/15412 行与 Spike 分歧（`dut=deadbeef` vs `spike=c70e0523`）、未到 HTIF 终止点；
+     同一份代码 `R_HOLD_IDLE=1` ⇒ PASS（0 分歧）。
+  2. **修复后**：`R_HOLD_IDLE=0` 跑 `I-add-00`/`Zaamo-amoadd.w-00`/`Zalrsc-lr.w-00`/
+     `M-mul-00`/`D-fadd.d-00`/`PMPZaamo_cfg_wr-00` ⇒ **全部 0 分歧 + 唯一 PASS 锚点**。
+  3. **反证（cp 备份 → 临时还原旧采样 → 必 FAIL → 恢复 + md5 自证）**：
+     `bash fpga/scratch/r2_counterproof.sh`（不使用 git checkout/stash/reset/clean）。
+  4. **上板程序级双模型**：本 TB 的 `DDR_R_NONHOLD=1` 下，缩放五步程序
+     修复前 ⇒ FAIL（跑飞到 26 条指令就停、只出 1 个 UART 字节），修复后 ⇒ PASS。
+* **影响面（上板）**：DDR3 的 `.data/.bss` 读（含栈上的 `ra`/数字缓冲）、平台 MMIO 读
+  （本核 2A 的数据侧**全部**经 MDTA：`mmio_route` 把除 CLINT/PLIC/XIP 外的 PA 判为 ROUTE_AXI）。
+  CONFREG 侧因 `confreg_syn` 保持而"看起来正常"，是这次缺陷**被误判为"只是打印问题"**的原因。
 
 ### 5.6【可行性】完整版端到端判定 = 预算不足（≈7.7×10⁷ 拍 ≈ 9.3 小时）
 * 实测吞吐：本核 XIP 直连取指（每 4 B 一次单 beat AXI 读）⇒ 循环里 ≈8.6 拍/指令、
@@ -162,31 +195,29 @@ AXI 上出现连续单字节写 `0x08000850…0x0800085B`（越出 DDR3 上限 `
 * 程序版本沿革（本任务期间作者并发修改）：`m5_board.S` md5 依次为
   `b7e5ee14…` → `503dfae4…` → `3c8a3a37…` → `ca055abf…`（TB 每轮结论均标注对应 md5）。
 
-## 7. 红线不变式（动手前后一致）
+## 7. 红线不变式（本轮 = 2026-09-21 R2 修复）
 
 ```bash
-find rtl -name '*.v' | sort | xargs md5sum | md5sum   # 前/后均为 ef20b2c0d17fbd07016b44bdd05dd822（38 个 .v）
+find rtl -name '*.v' | sort | xargs md5sum | md5sum
+#   本轮开始前（修复前）：ef20b2c0d17fbd07016b44bdd05dd822（38 个 .v）
+#   本轮结束后（修复后）：0e20b6182e3ad96ae8d70680c2b51aa8（38 个 .v）
+#   —— **唯一变化**：`rtl/axi/axi_master_ctrl.v`（新增 rdata_hold 锁存输出）
+#      与 `rtl/top/core_top.v`（数据读/AMO 读相改取锁存值；删除实时直通线）。
 ```
 
-* 本任务只新建/修改 `sw/m5_board/tb/**`；`rtl/**`、`sim/**`、`sw/m5_board/m5_board.S`、`build.sh`
-  全程未改（父 Agent git 复核：`git status --porcelain sim/` 为空；母 Agent 的三个 M5 提交
-  `092baca`/`5b10578`/`494a148` 均未触碰 `sim/**` 与 `scripts/**`）。
-* 本会话内 `sim/` 下唯一变化是父 Agent **新增**的 `sim/tb/prog/m5_board.hex`
-  （md5 `43758f32f9b2206fc24f87b1f785f786`，与冻结 hex 同）。因此
-  `find sim scripts -type f | sort | xargs md5sum | md5sum` 的**聚合**值由会话开始时的
-  `e9c0381b766210c352b3779a92649232` 变为 `3a58178208dd66c95d07a54839c3fc40` ——
-  这是"**新增文件**"造成的，不是既有共享件被改。
-* 我依赖的共享件逐字节未变（下方 md5 由父 Agent 复核确认一致），mtime 均为 09-15/09-17，早于本会话：
+* 本轮**故意**改了上述两个 RTL 文件（R2 根因修复，任务授权范围内）；
+  `rtl/**` 其余 36 个文件、`sim/arch_test/**`、`scripts/**` 一字未动。
+* 本轮新增/修改的 TB 侧：本目录 `confreg_axi_filter.v`（+`DDR_R_NONHOLD` 开关）、
+  `tb_m5_board.sv`（参数透传）、`run_tb.sh`（环境变量透传）、本 README；
+  `sim/tb/tb_arch_test.sv` 新增 `R_HOLD_IDLE` 开关（默认 1 = 历史保持口径，
+  **判据语义不变**，只用于复现/反证）。
+* 本轮新增脚本（不改判据）：`fpga/scratch/r2_repro_arch_test.sh`（arch-test 单例复现）、
+  `fpga/scratch/r2_counterproof.sh`（cp 备份→临时还原旧采样→必 FAIL→恢复+md5 自证）、
+  `fpga/scratch/r2_full_regression.sh`（判据 3 的六项回归入口）。
+* 被依赖的共享件 md5（未变，供复核）：
 
   | 共享件 | md5 |
   |---|---|
   | `sim/tb/sim_mem_model.sv` | `8deed3ad15b2547d5154ad33fc31e06f` |
-  | `sim/tb/tb_core_top.sv` | `2d91c81273e5687aabd17c3e3c369d7c` |
   | `sim/tb/uart_ser_decoder.sv` | `7330c3ca5912556c2403d56ff4e692a0` |
-  | `sim/tb/prog/m1_uart.S` | `8a79750ee1d381b3e6615396124ebb18` |
-  | `sim/tb/prog/m1_uart.hex` | `7b49e3d019f0971a46d1fdf8f4a1e51f` |
-  | `scripts/env.sh` | `89fe7ece00fb150bfb13f2a08966d031` |
   | `scripts/regress.sh` | `2137946e676e218849da7ba6d7021529` |
-
-  **注意**：`sim/tb/tb_arch_test.sv` 的 mtime 是 **09-17 23:04**（上一轮 arch-test 工作），
-  不是本会话的改动；`git log -1 -- sim/tb/tb_arch_test.sv` = `113cb09`。

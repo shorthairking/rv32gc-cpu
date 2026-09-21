@@ -101,7 +101,18 @@ module tb_arch_test #(
     parameter integer HEARTBEAT_CYCLES    = 0,        // >0 ⇒ 每 N 拍打印一次进度（诊断）
     // 复位桩首字 = `lui x5, 0x80000`（见 sim/arch_test/boot_stub.S）；
     // 用于 fail-closed 校验"镜像里确实有复位桩"，防止空/错镜像假通过。
-    parameter [31:0]  BOOT_STUB_W0        = 32'h8000_02B7
+    parameter [31:0]  BOOT_STUB_W0        = 32'h8000_02B7,
+
+    // ---- ★ R 数据保持口径（"非保持型 R 通道模型"开关；默认保持 = 历史行为）----
+    //   1 = **保持型**（本 TB 历史口径）：RDATA 恒等于 `rd_addr_q` 所指内容 ——
+    //       即从设备在 R 握手之后仍把数据留在总线上。**掩盖**了主设备"晚拍采样"缺陷。
+    //   0 = **非保持型**（AXI4 严格口径 / 真实 MIG·互连口径）：RDATA 只在
+    //       `RVALID & RREADY` 同拍有效，其余拍一律呈现 0。
+    //       ⇒ 主设备必须**在握手拍**取数；任何"晚 1 拍/晚 2 拍采样"都会读到 0（垃圾）。
+    //   用途：复现/反证"uncached 数据读在 R 握手后第 2 拍采样"的 M5 上板缺陷
+    //   （见 rtl/axi/axi_master_ctrl.v 头注 §R 数据锁存）。**判定语义不变**：
+    //   开关只改从设备行为模型，不改任何 PASS/FAIL 判据。
+    parameter integer R_HOLD_IDLE         = 1
 ) ();
 
     //==========================================================================
@@ -396,7 +407,12 @@ module tb_arch_test #(
 
     assign arready = arready_r;
     assign rid     = rd_id_q;
-    assign rdata   = mem_read;      // ★ 见 §4 mem_read 注释：不能再写成函数调用
+    // ★ 见 §4 mem_read 注释：不能再写成函数调用。
+    //   R_HOLD_IDLE=1：历史保持口径（RDATA 恒为 rd_addr_q 指向的内容）。
+    //   R_HOLD_IDLE=0：严格 AXI 口径 —— 只有握手拍（rvalid & rready）呈现 RDATA，
+    //     其余拍呈现 0 ⇒ 主设备只能在握手拍取数（模拟 MIG/流水化互连的 R 通道行为）。
+    assign rdata   = (R_HOLD_IDLE != 0) ? mem_read
+                                        : ((rvalid & rready) ? mem_read : 32'h0000_0000);
     assign rresp   = mem_resp(rd_addr_q);
     assign rvalid  = rd_active;
     assign rlast   = (rd_cnt_q[3:0] == rd_len_q);

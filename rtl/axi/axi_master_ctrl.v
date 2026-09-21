@@ -18,6 +18,13 @@
 //   addr_q 是核内总线地址寄存器的**唯一**赋值点，且只接受物理地址。
 //   4 K 边界的第二笔（拆突发）也写同一处（在 done 时用 addr_next）。
 //
+// ★ R 数据锁存（2026-09-21 根因修复；M5 上板实测暴露的 P0 缺陷）：
+//   本控制器只在 R 握手拍（`r_fire`）能取到 `m_rdata`，而核内 M 级 uncached 数据读
+//   （MDTA）的完成判定晚于握手拍 2 拍（`done` → core_top 的 `axi_done_q`）。
+//   因此新增 `rdata_hold`（握手拍锁存、保持到下一次握手）供该消费者取数；
+//   `rdata_valid`/`rdata_data`（握手拍脉冲 + 组合直通）语义**保持不变**，
+//   填充/取指/AMO 等"握手拍消费者"继续用它（逐拍等价，见 §4/§5 的论证）。
+//
 // 五通道（08 §7.1 要点 1；2A 简化：读通道与写通道**交替**在途）
 //   读：AR（读地址） → R（读数据，逐 beat）；读 R 的最后一 beat ⇒ 本笔完成
 //   写：AW（写地址）→ W（写数据，逐 beat）→ B（写响应）；B 收到 ⇒ 本笔完成
@@ -91,6 +98,26 @@ module axi_master_ctrl #(
     // ---- 读数据（填充数据流，逐 beat 输出） ----
     output wire                 rdata_valid,
     output wire [DATA_W-1:0]    rdata_data,
+    // ★ R 数据**握手拍锁存值**（`r_fire` 拍锁存 `m_rdata`，保持到下一次 `r_fire`）
+    //   为什么需要它（2026-09-21 根因修复，M5 上板实测暴露）：
+    //     本控制器只在 **R 握手拍**（`r_fire`，见 §3）拿到 `m_rdata`；而核内 M 级
+    //     uncached 数据读（MDTA）的**完成判定**是 `done`（ST_DONE 拍）再经 core_top
+    //     的 `axi_done_q` 打一拍 ⇒ 真正把数据写进 `m_rd_data_q` 的时点是
+    //     **R 握手之后第 2 拍**（core_top.v 的 M_S_AXI 分支）。此时 `m_rdata` 早已
+    //     不再属于本笔事务：
+    //       · 上板 MIG（DDR3）只在 `app_rd_data_valid` 拍驱动 RDATA；
+    //       · 任何非保持型从设备/流水化互连同理。
+    //     ⇒ 从"实时总线"取数会把**别的事务的数据**（实测：XIP 取指指令字 / 0）
+    //       当成读结果 ⇒ `.data/.bss`（DDR3）常量与变量损坏。
+    //     `rdata_hold` 把**属于本笔事务**的数据锁存下来，供"完成晚于握手"的消费者
+    //     取用，逐拍语义见 §4 与 §5 的 ★ 注释。
+    //   ★ 与 `rdata_data` 的分工（两者**都保留**，不是重复）：
+    //     · `rdata_data` = 组合直通 `m_rdata`，**只在 `rdata_valid=1` 那一拍有效**
+    //       —— cache 行填充（l1i/l1d）、XIP 取指字捕获、AMO 读相等通路在**握手拍**
+    //         消费它，语义与修复前逐拍一致；
+    //     · `rdata_hold` = 寄存器，握手**之后**仍然保持，供完成判定晚于握手拍的
+    //         消费者（M 级 MDTA 读数据）取用。
+    output wire [DATA_W-1:0]    rdata_hold,
     output wire [ID_W-1:0]      rdata_id,
     output wire                 rdata_last,
     input  wire                 rdata_ready,   // 消费侧 ready：2A 无背压通路 ⇒ 不参与逻辑（见 §4）
@@ -186,6 +213,9 @@ module axi_master_ctrl #(
     reg [LEN_W:0]    wcnt_q;
     reg [LEN_W:0]    rcnt_q;
 
+    // ★ R 数据锁存（唯一赋值点 = `r_fire` 拍；见 §4/§5 的 ★ 注释）
+    reg [DATA_W-1:0] rdata_hold_q;
+
     // 4 K 拆分的"第二笔"信息（首笔完成时锁存）
     reg              split_req_q;       // 首笔请求声明需拆（来自 req_split）
     reg              split_issued_q;    // 第二笔已排入（防止重复）
@@ -258,6 +288,11 @@ module axi_master_ctrl #(
     assign rdata_data  = m_rdata;
     assign rdata_id    = m_rid;
     assign rdata_last  = m_rlast;
+    // ★ R 数据锁存值：`r_fire` 拍（且仅该拍）把 `m_rdata` 落进 `rdata_hold_q`。
+    //   握手之后的任何拍（含 core_top 的 `axi_done_q` 拍 = 握手后第 2 拍）读到的
+    //   都是**本笔事务**的数据；下一次 R 握手才会覆盖它（本控制器单笔在途 +
+    //   读/写通道互斥 ⇒ 覆盖永远发生在下一个消费者的取数之后，见 §5 的 ★ 论证）。
+    assign rdata_hold  = rdata_hold_q;
     // ★ `rdata_ready` 是**消费侧（核内填充通路）给出的 ready**，方向为模块**输入**
     //   （core_top 直接把它接常量 1'b1：MSHR 填充恒可收；tb_axi_master_ctrl 也按输入驱动）。
     //   本控制器在 2A **不实现读数据背压**：R 通道由 `m_rready = r_go` 收数，
@@ -302,6 +337,26 @@ module axi_master_ctrl #(
     //    必须用 always 块：这是状态元件（FSM + 数据通路寄存器）。
     //    所有状态跃迁的条件均为 valid && ready 或"本拍完成"。
     //--------------------------------------------------------------------------
+    // ★★ R 数据时序论证（修复的核心，逐拍）★★
+    //   设 R 握手（末 beat）发生在第 N 拍（`r_fire`，此时 state_q==ST_R）：
+    //     第 N   拍：`r_fire=1` ∧ `rdata_valid=1` ∧ `m_rdata` = 本 beat 数据
+    //                ⇒ 本拍末 `rdata_hold_q <= m_rdata`（数据被锁存）
+    //                ⇒ 末 beat ⇒ `state_q <= ST_DONE`
+    //                （握手拍消费者：cache 填充/AMO 读相的 valid 窗口 = 本拍，正确）
+    //     第 N+1 拍：state_q==ST_DONE ⇒ `done=1`；`rdata_hold` 已稳定 = 本笔数据
+    //     第 N+2 拍：core_top 的 `axi_done_q=1` ⇒ M 级用 `rdata_hold` 写 `m_rd_data_q`
+    //                （**本笔数据**；修复前这里读的是实时 `m_rdata` = 别的事务的数据）
+    //   为什么第 N+2 拍读 `rdata_hold` 一定还是本笔数据（不会被下一笔覆盖）：
+    //     · `req_ready = ~busy_q & ~split_pending_q`，而第 N+2 拍状态机在 ST_IDLE、
+    //       最早也在本拍才接受新请求 ⇒ 新请求要到第 N+3 拍才进 ST_AR，
+    //       R 握手最早在第 N+4 拍（AR 握手后再进 ST_R）⇒ 覆盖点 ≥ N+4 > N+2；
+    //     · 4 K 拆分的"第二笔"同理（ST_DONE 拍才置 split_pending_q，
+    //       第 N+2 拍 ST_IDLE 发 AR，R 握手 ≥ N+4）；
+    //     · 写事务不产生 `r_fire`（读/写通道互斥）⇒ 不会覆盖读数据。
+    //   保持型从设备（历史 TB 模型）下：`m_rdata` 在第 N+2 拍仍是同一值
+    //   ⇒ 新旧实现在**所有消费点的取值逐拍相等**（语义不变的机器证据见交付报告：
+    //     `sim/tb/tb_arch_test.sv` 的 `R_HOLD_IDLE=1` 全量回归 + 签名逐行比对）。
+    //--------------------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
             state_q         <= ST_IDLE;
@@ -326,7 +381,13 @@ module axi_master_ctrl #(
             err_code_q      <= 2'b00;
             cache_q         <= `RV32GC_AXI_CACHE_CACHED;
             strb_q          <= {STRB_W{1'b1}};
+            rdata_hold_q    <= {DATA_W{1'b0}};
         end else begin
+            // ★ R 数据锁存（含复位/正常两相的唯一赋值点；理由见 §4 的 `rdata_hold`）
+            //   用的是**握手拍**（valid && ready）而非 `r_go`：只有真正完成的 beat
+            //   才允许覆盖上一笔的数据（保持到下一个消费者取走）。
+            if (r_fire) rdata_hold_q <= m_rdata;
+
             // 错误标志自动清零（脉冲可见一拍）
             if (b_err | r_err) begin
                 err_pending_q <= 1'b1;

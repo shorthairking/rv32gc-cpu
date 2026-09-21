@@ -70,7 +70,7 @@ say "PASS: 工具链存在（$($CC -dumpversion 2>>"$LOG")）"
 # 编译 / 链接 / 转镜像
 #------------------------------------------------------------------------------
 CFLAGS=(
-    -march=rv32im            # 只用 RV32I + M（核已实现；Zicsr 未使用）
+    -march=rv32im_zicsr      # RV32I + M（打印用 remu/divu）+ Zicsr（步④ 只读 rdcycle）
     -mabi=ilp32
     -mno-relax               # ★ 关闭链接器松弛 ⇒ 不产生 R_RISCV_* 绝对/松弛重定位
     -mcmodel=medlow
@@ -207,6 +207,29 @@ check "判据⑧d：MEAS_ITER ≥ 1000（测量窗口足够）" test "${SRC_IT:-
 # 判据⑧e：程序里必须有"延时不再用空转计数"的两条护栏——delay_ticks 存在 + 心跳用 TIMER 等待
 check "判据⑧e：反汇编含 delay_ticks 与 timer_now" \
       bash -c "grep -q '<delay_ticks>:' '${OUT}/m5_board.dis' && grep -q '<timer_now>:' '${OUT}/m5_board.dis'" 
+
+#------------------------------------------------------------------------------
+# ⑧f 步④ 鲁棒化后的**机器护栏**（2026-09-21）
+#   步④ 判据 = "CONFREG TIMER 增量 == 核周期（rdcycle）增量" ⇒ 必须机器核对：
+#     ① 源码里确实有 `rdcycle`（否则判据会退化成只看 TIMER 自己，自洽但无意义）
+#     ② 反汇编里确实出现读 cycle CSR 的指令（`-march=rv32im_zicsr` 生效 + 真读 0xC00）
+#     ③ 健全性窗口常量 CPI_SANITY_LO/HI 存在且量级合理（下界 ≥ 循环体 9 条指令、
+#        上界 ≤ 400）—— 防止把窗口改成"必过"（如 [1, 1000000]）
+#     ④ 旧的"绝对标定拍数"判据（TGT_TICKS/TGT_TOL）不得残留
+#   rdcycle rd, cycle, x0 的编码 = csrrs rd, 0xC00, x0 ⇒ 反汇编渲染为
+#   `csrrs x<rd>,cycle,x0`（-M no-aliases）；这里按助记符+CSR 名匹配，容忍别名渲染。
+#------------------------------------------------------------------------------
+check "判据⑧f1：源码含 rdcycle（步④ 的核周期对照）" grep -qE '^[[:space:]]*rdcycle[[:space:]]' "$SRC"
+check "判据⑧f2：反汇编含读 cycle CSR（csrrs ...,cycle,...）" \
+      grep -qE 'csrrs?[[:space:]]+x[0-9]+,(cycle|0xc00),x0' "${OUT}/m5_board.text.dis"
+SAN_LO="$(grep -oE '^\.equ[[:space:]]+CPI_SANITY_LO,[[:space:]]+[0-9]+' "$SRC" | grep -oE '[0-9]+$')"
+SAN_HI="$(grep -oE '^\.equ[[:space:]]+CPI_SANITY_HI,[[:space:]]+[0-9]+' "$SRC" | grep -oE '[0-9]+$')"
+say "== 源码 CPI 健全性窗口 = [${SAN_LO:-?}, ${SAN_HI:-?}]"
+check "判据⑧f3：健全性窗口下界 ≥ 9（循环体指令数）" test "${SAN_LO:-0}" -ge 9
+check "判据⑧f4：健全性窗口上界 ≤ 400（不得改成必过窗口）" \
+      test "${SAN_HI:-99999}" -le 400 -a "${SAN_HI:-0}" -gt "${SAN_LO:-0}"
+check "判据⑧f5：步④ 判据不再依赖绝对标定拍数（无 TGT_TICKS/TGT_TOL 残留）" \
+      bash -c "! grep -qE '^\.equ[[:space:]]+(TGT_TICKS|TGT_TOL),' '$SRC'"
 
 #------------------------------------------------------------------------------
 # ⑨ CONFREG 访问地址自检（防止"偏移量写错/基址丢失"这类静默错）

@@ -19,6 +19,9 @@
 #   · **不开 MMU**：不写 satp/mstatus ⇒ 复位后 satp.MODE=Bare，取指/数据全是物理地址。
 #   · 指令集：RV32I + **仅**用于打印的 M 扩展 `remu/divu`（十进制打印）；
 #     步④ 的**时序判据**用的是本文件自写的 `udiv`（移位减法），**不依赖 M 扩展**。
+#   · Zicsr：**只有**步④ 的 `rdcycle`（CSR 0xC00，核内 cycle_cnt_r 每拍 +1）——
+#     用于把 CONFREG TIMER 与核周期计数做**一致性对照**（Zicntr 已由 arch-test 验证：
+#     构建用 `-march=rv32im_zicsr`；不写任何 CSR，只读 cycle）。
 #   · 不使能任何中断（不写 mie/mstatus.MIE），`intrpt` 恒 0 即可。
 #
 #------------------------------------------------------------------------------
@@ -32,7 +35,9 @@
 #   ⇒ ① 一切软件忙等必须按**拍数**定量，不能按"看起来很快"估；
 #      ② 本程序的可见延时改用 **CONFREG TIMER 绝对时刻等待**（见 `delay_ticks`），
 #         使延时精度与指令吞吐解耦；
-#      ③ 步④ 的主频对照判据以**实测标定常量** `XIP_CPI` 为单位。
+#      ③ 该拍数**依赖板上 SPI Flash 时序**、不可移植 ⇒ 步④ 的判据**不能**用"绝对拍数
+#         对照仿真标定值 59"（2026-09-21 鲁棒化：改为 TIMER ↔ `rdcycle` 增量一致性，
+#         对 Flash 延迟不敏感；见 §三 步④）。
 #
 #------------------------------------------------------------------------------
 # 二、地址与寄存器口径（真源：rtl/pkg/core_params.vh §2 + confreg_syn.v:34-42）
@@ -53,20 +58,23 @@
 #        数码管 = 0x1000 | (led << 16)（进度码 1）。
 #   步② UART 输出：打印横幅与步骤说明（每轮循环打印一次）。
 #   步③ 开关回读：读 +0xF020 → 写 LED（低 8 位）与数码管（0x3000|switch<<16），并打印。
-#   步④ 定时器对照：TIMER 清零 → `delay_loop` 跑 N_MEAS=2_000_000 次迭代 → 再读 TIMER。
-#        ticks = ΔTIMER；cycles/iter = ticks / N_MEAS（由 `udiv` 计算，非 M 扩展除法）。
-#        `delay_loop` 的循环体是**固定 7 条单拍指令 + 1 条回跳分支**，
-#        在 5 级顺序核上实测 **8 周期/迭代**（见 out/m5_board.dis 的 dl_loop 段与构建记录）。
-#        ⇒ 判据：|cycles/iter − 8| ≤ 2（即 6..10）视为与 33 MHz 同域口径一致；
-#          该窗口等价于"实际主频落在 24.75..41.25 MHz"，足以把"仍跑在 50 MHz 域"
-#          （cycles/iter ≈ 12）与"跑在 33 MHz"区分开。
-#   步⑤ FREQ 回读：读 +0xF030（期望 0x01F78A40 = 33 000 000），打印十六进制与高 20 位十进制。
-#   结论：步④ 判定 ∧（FREQ 高 20 位 == 33）⇒ 打印 `RESULT: RV32GC-M5-OK`，否则 `...-BAD`。
+#   步④ TIMER ↔ 核周期一致性：TIMER 清零 → 记 `rdcycle` 与 TIMER 起点 →
+#        `delay_loop` 跑 MEAS_ITER=2000 次迭代 → 记 `rdcycle` 与 TIMER 终点。
+#        Δcycle = rdcycle 增量（核周期）；Δtimer = TIMER 增量；cycles/iter = Δcycle/MEAS_ITER。
+#        判据 A（主判据）：|Δtimer − Δcycle| ≤ max(256, Δcycle/128) —— 两者都在核时钟域
+#          每拍 +1，同一窗口内增量必须相等（对 SPI Flash 取指延迟**不敏感**）。
+#        判据 B（健全性窗口）：cycles/iter ∈ [20, 300]（实测值打印；把"计数器异常/
+#          时钟域差一个量级"钉成 FAIL；**不是**主频判据）。
+#        ★ 2026-09-21 鲁棒化前：判据 = |ticks − 2000×59| ≤ ±40%（59 为零延迟仿真标定值）
+#          ⇒ 真机 Flash 时序下不可移植；放宽窗口会退化成"看着像过"。新判据不用任何
+#          绝对拍数常量（`XIP_CPI=59` 仅作打印参考）。
+#   步⑤ FREQ 回读：读 +0xF030（期望 0x01F78A40 = 33 000 000），打印十六进制与 div1e6。
+#   结论：步④ 判定 ∧（FREQ 高 20 位 == 31）⇒ 打印 `RESULT: RV32GC-M5-OK`，否则 `...-BAD`。
 #
 #------------------------------------------------------------------------------
 # 四、编译（见 sw/m5_board/build.sh；工具链 /opt/riscv/bin/riscv32-unknown-linux-gnu-）
 #------------------------------------------------------------------------------
-#   -march=rv32i -mabi=ilp32 -mno-relax -nostdlib -ffreestanding
+#   -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -ffreestanding
 #   -Wl,-Ttext=0x1C000000 -Wl,-e,_start -Wl,--build-id=none
 #   产物：m5_board.elf / m5_board.bin（烧写镜像）/ m5_board.hex（仿真加载）/ m5_board.dis
 #==============================================================================
@@ -89,18 +97,16 @@
 .equ UART_BASE,      0x1FE001E0
 .equ CONF_BASE,      0x1FD00000
 .equ MEAS_ITER,      2000          # 步④ delay_loop 迭代数（×≈59 拍 ≈ 1.2e5 拍 ≈ 3.5 ms）
-.equ XIP_CPI,        59            # ★ 标定常量：XIP 直连取指下 delay_loop 的"每迭代拍数"
-                                   #   （核级仿真实测 59.02；改 delay_loop 循环体必须同步改它，
-                                   #    build.sh 判据⑧ 核对循环体结构与 XIP_CPI 声明的一致性）
-.equ TGT_TICKS,      MEAS_ITER * XIP_CPI          # 目标 ticks = 118000
-.equ TGT_TOL,        (TGT_TICKS * 40) / 100       # 容差 ±40%（= ±47200；窗口 70800..165200）
-                                   #   ★ 为什么放到 ±40%：XIP 直连取指的每指令拍数取决于
-                                   #     SPI Flash 读时序（TB 里是零延迟模型 59.02 拍/迭代），
-                                   #     上板每笔 Flash 读会多几十拍 ⇒ 实测值可能高于标定值。
-                                   #     而"主频跑错"（例如 50 MHz 域）会把该值整体放大 1.5 倍
-                                   #     （≈88.5 拍/迭代 ⇒ ticks≈177000 > 上限 165200）⇒ 仍能判出。
-                                   #   ★ 真正的"主频对不对"由上板**目视心跳节奏**（0.24 s/拍）判定，
-                                   #     本步是量化的自洽性/诊断判据，见 runbook §4 步④。
+.equ XIP_CPI,        59            # ★ **参考**标定常量：零延迟仿真内存模型下 delay_loop 的
+                                   #   "每迭代拍数"（核级仿真实测 59.02）。真机 SPI Flash XIP
+                                   #   的每指令拍数更高且不可移植 ⇒ 本常量**只用于打印参考**，
+                                   #   **不参与**判定（步④ 判据 = TIMER 与 rdcycle 增量相等，
+                                   #   见下）。改 delay_loop 循环体必须同步改它（build.sh 判据⑧
+                                   #   核对循环体结构与声明的一致性）。
+.equ CPI_SANITY_LO,  20            # 步④ 判据 B 下界：cycles/iter 低于它 ⇒ 荒谬（核没按拍跑）
+.equ CPI_SANITY_HI,  300           # 步④ 判据 B 上界：高于它 ⇒ 荒谬（远超任何 XIP 取指时序）
+                                   #   ★ 该窗口**不是**主频判据（主频由步⑤ FREQ 锚定），
+                                   #     只把"计数器异常/时钟域差一个量级"钉成 FAIL。
 .equ DELAY_HB_TICKS, 8000000       # 心跳间隔 = 8e6 拍 ≈ 0.24 s @33 MHz（TIMER 拍 = 核周期）
 .equ DELAY_SW_TICKS, 10000000      # 步③ 停留 = 1e7 拍 ≈ 0.3 s（便于观察 LED 跟随开关）
 
@@ -194,33 +200,64 @@ hb_loop:
     jal   ra, delay_ticks
 
     #--------------------------------------------------------------------------
-    # 步④ 定时器对照（TIMER 拍 = 核周期；判据是"实测 ticks vs 标定 ticks"）
+    # 步④ TIMER ↔ 核周期计数一致性（对 Flash 取指延迟**不敏感**）
+    #   ★ 2026-09-21 鲁棒化（M5 上板暴露"绝对拍数判据不可移植"）：
+    #     旧口径是"实测 ticks ≈ MEAS_ITER × XIP_CPI(=59)"——而 59 是**零延迟仿真内存模型**
+    #     下的标定值；真机 SPI Flash XIP 每笔读要几十拍，实测 cycles/iter 会明显更高
+    #     ⇒ 绝对窗口不可移植（放宽窗口又会把判据变成"看着像过"）。
+    #     新口径（与 Flash 时序无关、且仍是**真判据**）：
+    #       判据 A（主判据）：CONFREG TIMER（confreg_syn.v:346 每 clk +1）与
+    #         `rdcycle`（core_top.v:3555 cycle_cnt_r 每 clk +1）处于**同一时钟域**，
+    #         同一窗口内两者增量必须相等：
+    #             |Δtimer − Δcycle| ≤ tol = max(256, Δcycle/128)   （≈1%，足够钉住
+    #             "TIMER 没按核周期走 / 分频 / 停摆"这类会让全部可见延时失效的错）
+    #       判据 B（健全性窗口，诊断 + 荒谬值兜底）：cycles/iter = Δcycle / MEAS_ITER
+    #         必须落在 [CPI_SANITY_LO, CPI_SANITY_HI] = [20, 300]（实测值原样打印）。
+    #         ★ 它**不是**主频判据：主频由步⑤ FREQ(=0x01F78A40=33 MHz) 锚定；
+    #           本窗口只把"核根本没按拍跑 / 时钟域差一个量级"钉成 FAIL。
+    #   为什么这样更严：旧判据在"TIMER 完全不走"或"TIMER 被分频"时可能仍然通过
+    #   （只要绝对拍数落进 ±40% 窗口），新判据直接比较两个独立计数器的增量。
     #--------------------------------------------------------------------------
     li    t5, 57344                # 0xE000 TIMER
     add   t6, s1, t5
     sw    x0, 0(t6)                # TIMER <= 0（写即清零；核保证该写完成后才发下一笔）
-    lw    s4, 0(t6)                # s4 = 起始值（≈0）
+    rdcycle s4                     # s4 = 窗口起点：核周期计数（Zicntr，CSR 0xC00）
+    lw    s5, 0(t6)                # s5 = 窗口起点：TIMER
     li    a0, MEAS_ITER
-    jal   ra, delay_loop           # 固定迭代数（每迭代 ≈XIP_CPI 拍）
-    lw    s5, 0(t6)                # s5 = 结束值
-    sub   s6, s5, s4               # s6 = ticks = ΔTIMER
+    jal   ra, delay_loop           # 固定迭代数（每迭代 ≈XIP_CPI 拍，随 Flash 时序浮动）
+    rdcycle s3                     # s3 = 窗口终点：核周期计数
+    sub   s3, s3, s4               # ★ s3 = Δcycle（核周期增量；步④ 内部报废，下一轮重建）
+    lw    s6, 0(t6)                # s6 = 窗口终点：TIMER
+    sub   s6, s6, s5               # s6 = Δtimer
 
-    mv    a0, s6
-    li    a1, MEAS_ITER
-    jal   ra, udiv                 # a0 = ticks / MEAS_ITER = cycles/iter
-    mv    s7, a0
-
-    #   |ticks − TGT_TICKS| ≤ TGT_TOL ⇒ 步④ 通过
-    li    t0, TGT_TICKS
-    sub   t1, s6, t0
-    bgez  t1, chk_pos
-    sub   t1, x0, t1               # t1 = |Δticks|
-chk_pos:
-    li    t2, TGT_TOL
-    sltu  s11, t2, t1              # ★ s11 = (容差 < |Δticks|) ⇒ 步④ **坏**（x27，跨子程序存活：
+    #   ---- 判据 A：|Δtimer − Δcycle| ≤ max(256, Δcycle/128) ----
+    sub   t0, s6, s3               # t0 = Δtimer − Δcycle
+    bgez  t0, tl_abs
+    sub   t0, x0, t0               # t0 = |Δtimer − Δcycle|
+tl_abs:
+    srli  t1, s3, 7                # t1 = Δcycle / 128（≈1%）
+    li    t2, 256                  # 容差下限（覆盖两个读点之间几条指令的固有错位）
+    bltu  t1, t2, tl_tol
+    mv    t2, t1
+tl_tol:
+    sltu  s11, t2, t0              # ★ s11(x27) = (容差 < |差值|) ⇒ 步④ **坏**（跨子程序存活：
                                    #   步⑤ 打印 div1e6 时会再调一次 udiv，而 udiv 内部用 t2 存商
                                    #   ⇒ 坏标志绝不能放 t 系列，否则被覆盖成商值 ⇒ 恒判 BAD）
-    xori  s8, s11, 1               # s8 = 1 ⇒ 步④ 通过（供 LED/数码管显示）
+
+    #   ---- 判据 B（健全性）：cycles/iter = Δcycle / MEAS_ITER ∈ [LO, HI] ----
+    mv    a0, s3
+    li    a1, MEAS_ITER
+    jal   ra, udiv                 # a0 = Δcycle / MEAS_ITER = cycles/iter
+    mv    s7, a0                   # s7 = cycles/iter（现场实测值，打印用）
+    li    t0, CPI_SANITY_LO
+    bltu  s7, t0, tp_bad           # 低于下限 ⇒ 荒谬（核没有按拍推进/计数器异常）
+    li    t0, CPI_SANITY_HI
+    bltu  t0, s7, tp_bad           # 高于上限 ⇒ 荒谬（远超任何可解释的 XIP 取指时序）
+    j     tp_flags
+tp_bad:
+    li    s11, 1                   # 坏 = 1（与判据 A 同极性，统一口径）
+tp_flags:
+    xori  s8, s11, 1               # ★ s8(x24) = 1 ⇒ 步④ 通过（供 LED/数码管显示）
 
     #   数码管 <= 0x4000 | (cycles/iter 低 4 bit) | (判定 << 20)
     andi  t0, s7, 0xF
@@ -238,20 +275,27 @@ chk_pos:
 
     lui   a0, %hi(str_tick)
     addi  a0, a0, %lo(str_tick)
-    jal   ra, puts_str             # "step4 timer ticks = "
+    jal   ra, puts_str             # "step4 timer delta = "
     mv    a0, s6
     jal   ra, puts_dec
     lui   a0, %hi(str_tpi)
     addi  a0, a0, %lo(str_tpi)
-    jal   ra, puts_str             # ", cycles/iter = "
-    mv    a0, s7
+    jal   ra, puts_str             # ", cycle delta = "
+    mv    a0, s3
     jal   ra, puts_dec
     lui   a0, %hi(str_tpiavg)
     addi  a0, a0, %lo(str_tpiavg)
-    jal   ra, puts_str             # ", expected ticks = "
-    li    a0, TGT_TICKS
+    jal   ra, puts_str             # ", cycles/iter = "
+    mv    a0, s7
     jal   ra, puts_dec
-    jal   ra, puts_nl
+    lui   a0, %hi(str_tpiwin)
+    addi  a0, a0, %lo(str_tpiwin)
+    jal   ra, puts_str             # ", window = 20..300, sim-calib = "
+    li    a0, XIP_CPI
+    jal   ra, puts_dec
+    lui   a0, %hi(str_tpical)
+    addi  a0, a0, %lo(str_tpical)
+    jal   ra, puts_str             # " cycles/iter (informational only)\r\n"
 
     #--------------------------------------------------------------------------
     # 步⑤ FREQ 回读
@@ -566,13 +610,19 @@ str_sw:
     .asciz "step3 switch readback = "
     .align   2
 str_tick:
-    .asciz "step4 timer delta ticks = "
+    .asciz "step4 timer delta = "
     .align   2
 str_tpi:
-    .asciz ", cycles/iter = "
+    .asciz ", cycle delta = "
     .align   2
 str_tpiavg:
-    .asciz ", expected ticks = "
+    .asciz ", cycles/iter = "
+    .align   2
+str_tpiwin:
+    .asciz ", window = 20..300, sim-calib = "
+    .align   2
+str_tpical:
+    .asciz " cycles/iter (informational only)\r\n"
     .align   2
 str_freq:
     .asciz "step5 FREQ = 0x"

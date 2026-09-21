@@ -8,6 +8,11 @@
 #        TOP=<模块名>            覆盖顶层（默认 tb_m5_board；控制实验用同名 TB 即可不改）
 #        RUN_TAG=<标签>          日志/产物名后缀（默认 tb_m5_board）
 #        TRACE_PRINT_N / UART_PRINT_MAX / PROGRESS_EVERY 亦可透传
+#        R_STICKY=<0|1>          CONFREG 侧 R 数据保持（默认 1 = 上板 confreg_syn 口径）
+#        DDR_R_NONHOLD=<0|1>     ★ 下游（DDR3/XIP）侧 R 数据保持：默认 0 = 原样透传；
+#                                1 = 非保持型 R 通道模型（严格 AXI4 / MIG 口径：
+#                                    RDATA 只在 R 握手拍有效，其余拍为 0）
+#        RD_TRACE_WINDOW=<N>     >0 ⇒ 打印首笔读起 N 拍的 R 通道/M 级采样（诊断）
 # 产物 : sw/m5_board/tb/out/<RUN_TAG>.vvp      编译产物
 #        sw/m5_board/tb/out/<RUN_TAG>.log      完整运行日志（判定证据）
 #        sw/m5_board/tb/out/<RUN_TAG>.compile.log
@@ -30,6 +35,7 @@ TRACE_PRINT_N="${TRACE_PRINT_N:-48}"
 UART_PRINT_MAX="${UART_PRINT_MAX:-4096}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-100000}"
 R_STICKY="${R_STICKY:-1}"
+DDR_R_NONHOLD="${DDR_R_NONHOLD:-0}"
 
 VVP="${VVP:-$(command -v vvp || true)}"
 IV="${IV:-$(command -v iverilog || true)}"
@@ -65,6 +71,7 @@ set -o pipefail
     -P "${TOP}.UART_PRINT_MAX=${UART_PRINT_MAX}" \
     -P "${TOP}.PROGRESS_EVERY=${PROGRESS_EVERY}" \
     -P "${TOP}.R_STICKY=${R_STICKY}" \
+    -P "${TOP}.DDR_R_NONHOLD=${DDR_R_NONHOLD}" \
     -P "${TOP}.RD_TRACE_WINDOW=${RD_TRACE_WINDOW:-0}" \
     "${RTL_SRCS[@]}" \
     sim/tb/sim_mem_model.sv \

@@ -63,6 +63,13 @@ module tb_m5_board #(
     parameter integer      SIM_TRACE_DEPTH  = 2048,
     // ---- 过滤层 R 数据保持（1 = 上板 confreg_syn 口径；0 = A/B 对照，见 tb/README-tb.md）----
     parameter integer      R_STICKY         = 1,
+    // ---- ★ 下游（DDR3/XIP 侧）R 数据保持口径（透传给 confreg_axi_filter）----
+    //   0（默认）= 原样透传（历史行为：sim_mem_model 在握手后仍把数据留在总线上）；
+    //   1        = **非保持型 R 通道模型**（严格 AXI4 / 真实 MIG 口径：RDATA 只在
+    //              R 握手拍 `m_rvalid & m_rready` 有效，其余拍呈现 0）—— 用于复现
+    //              M5 上板"uncached 数据读在 R 握手后第 2 拍采样 ⇒ .data/.bss 读回垃圾"。
+    //   只改从设备行为模型，**不改 C0–C5 判据语义**。
+    parameter integer      DDR_R_NONHOLD    = 0,
     // ---- 逐拍 R 通道探针（>0 = 对**首笔 CONFREG 读**打印这么多拍的 R 通道/M 级采样）----
     //   纯诊断（层次引用），不参与判据；用于给"核在 R 握手后第几拍取 rdata"留证据。
     parameter integer      RD_TRACE_WINDOW  = 0
@@ -201,7 +208,8 @@ module tb_m5_board #(
         .SWITCH_VAL  (SWITCH_VAL),
         .FREQ_VAL    (FREQ_VAL),
         .TRACE_DEPTH (SIM_TRACE_DEPTH),
-        .R_STICKY    (R_STICKY)
+        .R_STICKY    (R_STICKY),
+        .DDR_R_NONHOLD (DDR_R_NONHOLD)
     ) u_conf (
         .clk (clk), .rst_n (aresetn),
 

@@ -55,7 +55,19 @@ module confreg_axi_filter #(
     //     才从 `rdata` 上取值（`m_axi_ld_data`，core_top.v:2221）。对"握手后立刻换数据"
     //     的从设备，这会读到**别的事务的数据**（本 TB 实测：读到的是 XIP 取指指令字）。
     //     置 0 可复现该现象，用来给核 RTL 的这一时序脆弱点留证据（见 tb/README-tb.md）。
-    parameter integer R_STICKY    = 1
+    parameter integer R_STICKY    = 1,
+    // ---- ★ 下游（DDR3/XIP 侧 = sim_mem_model）R 数据保持口径 ----
+    //   0（默认，= 历史行为）：下游 RDATA 原样透传（`sim_mem_model` 在握手后仍把数据
+    //     留在总线上 ⇒ 掩盖主设备"晚拍采样"缺陷）。
+    //   1（"非保持型 R 通道模型"，= 真实 MIG / 流水化互连口径）：下游 RDATA **只在
+    //     `m_rvalid & m_rready` 同拍有效**，其余拍一律呈现 0。
+    //   ★ 为什么需要它：M5 上板的 DDR3 侧就是这种从设备（Xilinx MIG 的 app_rd_data 只在
+    //     `app_rd_data_valid` 拍有效）⇒ 核内 AXI 控制器若在 R 握手之后才取数，读回的是
+    //     总线上"别的东西"（实测上板表现为 `.data/.bss` 常量/变量损坏、十进制打印全乱）。
+    //     本开关只改**从设备行为模型**，不改任何判断语义（C0–C5 一字不动）。
+    //   注：CONFREG 本层自答的读数据口径由 R_STICKY 单独控制（上板 confreg_syn 是
+    //     寄存器保持型 ⇒ 默认 R_STICKY=1 才对）。
+    parameter integer DDR_R_NONHOLD = 0
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -256,7 +268,12 @@ module confreg_axi_filter #(
 
     assign arready   = ar_hit ? ~c_rd_busy : m_arready;
     assign rvalid    = rd_sel_conf ? c_rd_valid : m_rvalid;
-    assign rdata     = rd_sel_conf ? c_rd_data_q : m_rdata;
+    // ★ DDR_R_NONHOLD=1：下游（DDR3/XIP）RDATA 只在 `m_rvalid & m_rready` 同拍有效；
+    //   其余拍呈现 0（严格 AXI4 / MIG 口径）。默认 0 = 原样透传（历史行为）。
+    assign rdata     = rd_sel_conf ? c_rd_data_q
+                                   : ((DDR_R_NONHOLD != 0)
+                                      ? ((m_rvalid & m_rready) ? m_rdata : 32'h0000_0000)
+                                      : m_rdata);
     assign rresp     = rd_sel_conf ? RESP_OKAY : m_rresp;
     assign rlast     = rd_sel_conf ? (c_rd_cnt[3:0] == c_rd_len) : m_rlast;
     assign rid       = rd_sel_conf ? c_rd_id : m_rid;

@@ -321,7 +321,18 @@ module core_top (
     wire        axi_wb_accept, axi_wb_done;
     wire [4:0]  axi_wb_word_idx;
     wire        axi_rdata_valid;
-    wire [31:0] axi_rdata_data, axi_rdata_q;
+    wire [31:0] axi_rdata_data;
+    // ★ 2026-09-21 根因修复（M5 上板 P0：`.data/.bss` 读到垃圾）：核内 R 数据真源。
+    //   来源 = axi_master_ctrl 的 **R 握手拍锁存值**（`rdata_hold`），**不是**实时
+    //   总线 `rdata`。为什么必须这样：本核 M 级 uncached 数据读（MDTA）的完成判定
+    //   在 R 握手后第 2 拍（`axi_ctrl_done` → `axi_done_q`），而上板 MIG/流水化互连
+    //   只在 RVALID 拍驱动 RDATA ⇒ 实时取数会读到别的事务的数据（上板现象：串口
+    //   字符串正常、FREQ 十六进制正常，但 DDR3 的 .data/.bss 十进制值全乱）。
+    //   ★ 语义口径：凡"完成判定晚于 R 握手拍"的消费者一律取 `axi_rdata_hold`；
+    //     凡"R 握手拍当拍消费"的通路（cache 填充 `axi_fill_*`、XIP 取指字捕获、
+    //     mmio 数据读的 valid 窗口）保持用 `axi_rdata_valid`/`axi_rdata_data`，
+    //     逐拍语义不变（见 axi_master_ctrl.v §4/§5 的时序论证）。
+    wire [31:0] axi_rdata_hold;
     reg  [2:0]  axi_owner_q;
     reg  [4:0]  axi_beat_q, axi_beats_q;
     reg         axi_is_wr_q, axi_done_q;
@@ -946,7 +957,9 @@ module core_top (
     reg  [31:0] xip_word_data_q;
     reg         xip_word_vld_q;
     reg         xip_req_pend_q;    // XIP 取指请求**在途**（已送控制器、数据未回）
-    assign axi_rdata_q = rdata;            // R 通道数据（唯一读取点）
+    // ★ 2026-09-21：原先这里写的是 `assign axi_rdata_q = rdata;`（实时总线）
+    //   —— 已删除：核内**不允许**在 R 握手拍之外取实时 `rdata`。数据真源改为
+    //   `axi_rdata_hold`（axi_master_ctrl 在 R 握手拍锁存），接线见 §11.2 例化。
 
     wire xip_req_go   = fu_fetch_req_valid & fu_fetch_req_uncached &
                         ~xip_word_vld_q & ~xip_req_pend_q;
@@ -2028,11 +2041,15 @@ module core_top (
     assign m_lsu_req_valid = (m_state_q == M_S_ISS) & ~m_kill_fsm;
 
     // ---- AMO/LR/SC 读相数据源（按路由选源；2026-09-17 修复 AMO 写相数据）----
-    //   ROUTE_AXI 的 AMO 读结果落在 `axi_rdata_q`（R 通道唯一读取点），而 L1D 通路的
+    //   ROUTE_AXI 的 AMO 读结果取 `axi_rdata_hold`（R 握手拍锁存值），L1D 通路的
     //   读结果在 `l1d_cs_rdata`。amo_unit 的 rd_old_o/wdata_o 全部由 rdata_i 组合派生
     //   ⇒ 两条通路必须各自喂入**本通路**的读数据，否则写相数据取自另一条通路的残留值。
     //   （lsu_route 由 mem_pa 经 mmio_route 组合产生，不含 amo_rdata 路径 ⇒ 无组合环。）
-    wire [31:0] lsu_amo_rdata_src = (lsu_route == ROUTE_AXI) ? axi_rdata_q : l1d_cs_rdata;
+    //   ★ 2026-09-21 根因修复：AXI 通路的消费点在 M 级 `axi_done_q` 拍（= R 握手后
+    //     第 2 拍，见 M_S_AXI 的 `m_rd_data_q <= lsu_amo_rd_old` / `m_amo_wdata_q`），
+    //     该拍实时 `rdata` 已不属本笔事务 ⇒ 必须取**锁存值**（修复前用实时总线，
+    //     非保持型从设备下 AMO/LR 读相拿到的是别的事务的数据）。
+    wire [31:0] lsu_amo_rdata_src = (lsu_route == ROUTE_AXI) ? axi_rdata_hold : l1d_cs_rdata;
     wire        lsu_amo_rdata_vld = (lsu_route == ROUTE_AXI) ? axi_rdata_valid : l1d_cs_ready;
 
     lsu #(
@@ -2111,7 +2128,8 @@ module core_top (
         // ★ 接线要点 3：amo_unit 读相返回 —— **按路由选源**（2026-09-17 修复）：
         //   · L1D 通路（M_S_RSP）：l1d_cs_rdata / l1d_cs_ready；
         //   · ROUTE_AXI 通路（M_S_AXI，本仿真里 DDR 走这条）：AXI 单 beat 读回的整字
-        //     axi_rdata_q —— 必须接进来，否则 amo_unit 的 `amo_apply(f5, rdata_i, rs2)`
+        //     `axi_rdata_hold`（R 握手拍锁存值；2026-09-21 起不再取实时总线）
+        //     —— 必须接进来，否则 amo_unit 的 `amo_apply(f5, rdata_i, rs2)`
         //     用的是**上一次 L1D 读的残留值** ⇒ 写相数据错（见 §13 M_S_AXI 注释）。
         //   amo_unit 是纯组合，rd_old_o/wdata_o 都只依赖 rdata_i ⇒ 该 mux 即足够；
         //   rdata_valid 只影响未被使用的 w_req_o/busy_o，故按同源选一个等效有效位。
@@ -2218,10 +2236,16 @@ module core_top (
     //     0x80006679 处 NUL 字节被读成整字 0x520a000a）⇒ arch-test rvmodel 的
     //     `lbu t1,0(a0); beqz t1` 字符循环永远等不到 '\0'，收尾打印死循环、HTIF
     //     终止码永不写入（I-nop-00/I-add-00 都在此处挂死）。
-    wire [31:0] m_axi_ld_data_ext = ld_extract(axi_rdata_q, m_va[1:0], m_lsu_size,
+    //   ★ 2026-09-21 根因修复（M5 上板 P0）：采样源从**实时总线** `axi_rdata_q(= rdata)`
+    //     改为 **R 握手拍锁存值** `axi_rdata_hold`。本式的结果只在 M_S_AXI 的
+    //     `axi_done_q` 拍（R 握手后第 2 拍）被写进 `m_rd_data_q`/`m_rd_hi_q`
+    //     （见 §13 M_S_AXI），该拍实时总线已不属本笔事务 ⇒ 修复前在非保持型
+    //     从设备（上板 MIG / 流水化互连）下读到别的事务的数据（= 上板 .data/.bss
+    //     常量与变量损坏、十进制打印全乱的直接根因）。
+    wire [31:0] m_axi_ld_data_ext = ld_extract(axi_rdata_hold, m_va[1:0], m_lsu_size,
                                                em_mem_unsign);
     wire [31:0] m_axi_ld_data = (em_mem_op == MEM_LOAD) ? m_axi_ld_data_ext
-                                                        : axi_rdata_q;
+                                                        : axi_rdata_hold;
 
     //   ★ 2026-09-15 修复（同一条 MMIO 读通路的第二半缺陷）：核内 MMIO 的**寄存器地址**
     //     —— clint.v/plic.v 的寄存器译码是「窗口内偏移 == 寄存器偏移」的**整字比较**
@@ -2850,6 +2874,8 @@ module core_top (
     .wdata_ready (axi_wdata_ready),
     .rdata_valid (axi_rdata_valid),
     .rdata_data  (axi_rdata_data),
+    // ★ R 数据锁存值（握手拍锁存；供"完成晚于握手拍"的消费者取数，见 §11 Z 的说明）
+    .rdata_hold  (axi_rdata_hold),
     .rdata_id    (axi_rdata_id),
     .rdata_last  (axi_rdata_last),
     .rdata_ready (1'b1),
@@ -4065,7 +4091,8 @@ module core_top (
                             //   后回 M_S_ISS —— 该拍 `m_amo_write=1` ⇒ `m_mmio_we_q=1`
                             //   ⇒ 由 MDTA 写事务把 `m_amo_wdata_q` 写回。
                             //   数据真源仍是 amo_unit：`lsu_amo_wdata`/`lsu_amo_rd_old`/
-                            //   `m_sc_ok_cap_q`（读相数据经 §9.5 的路由 mux 选自 axi_rdata_q；
+                            //   `m_sc_ok_cap_q`（读相数据经 §9.5 的路由 mux 选自
+                            //   `axi_rdata_hold` = R 握手拍锁存值；
                             //   SC 成功标志在 M_S_ISS 请求拍锁存，理由见那里的注释）。
                             // ★ 2026-09-17（PMPSm_cfg_A_tor_zero-00 收尾）：**总线响应
                             //   错误优先于一切正常收尾** —— SLVERR/DECERR ⇒ access fault。

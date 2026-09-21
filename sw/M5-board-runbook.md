@@ -126,34 +126,42 @@
 - ✅ **期望**：拨开关，LED 跟随；串口数值与开关一致。
 - ❌ **若 LED 不跟随**：读 MMIO（`0x1FD0_F020`）通路有问题 ⇒ 记录串口打印的数值（可能是固定值/0）。
 
-### 步④ 定时器对照（**这是主频判据**）
+### 步④ TIMER ↔ 核周期一致性（**对 Flash 取指延迟不敏感**）
 
-- **现象**：串口打印
+- **现象**：串口打印一行（示例值为核级仿真实测；上板数值以实际为准）
   ```
-  step4 timer ticks = 118043, cycles/iter = 59, expected ticks = 118000
+  step4 timer delta = 118043, cycle delta = 118043, cycles/iter = 59, window = 20..300, sim-calib = 59 cycles/iter (informational only)
   ```
-  （上板实测 `ticks` 以实际为准；`cycles/iter` 为 `ticks/2000` 的整数商，标定值 59。）
-- **口径**：程序把 CONFREG 的自由运行计数器 `TIMER`（`0x1FD0_E000`）清零，跑固定 **2000** 次 `delay_loop` 迭代，再读 `TIMER`：
-  - `ticks` = 两次读数之差（TIMER 一拍 = 核一个周期）；
-  - `cycles/iter` = `ticks / 2000` = 每次迭代消耗的核周期数（由程序内自写的移位除法算出，**不用 M 扩展**，故该判据不依赖乘法/除法 IP）；
-  - `expected ticks` = 程序内写死的**标定值** 118000 = `2000 × XIP_CPI(59)`。
-- **为什么"每迭代 59 拍"而不是 9 拍**：本程序在 **SPI Flash XIP 窗口**里执行，且核的取指**绕过 I-Cache**（平台口径：XIP 无 cache 一致性）⇒ 每条指令都要走 AXI + SPI 时序从 Flash 读字，实测约 **6.5 拍/指令**。延时循环体是固定的 9 条指令（7×`nop` + `addi` + `bne`），故 ≈59 拍/迭代。这个数字可以在 `sw/m5_board/out/m5_board.dis` 的 `dl_loop` 段核对（`build.sh` 判据⑧ 会机器核对循环体结构；`XIP_CPI` 常量必须在 `m5_board.S` 里同步）。
-- ✅ **期望（33 MHz 同域）**：
-  - `cycles/iter`（程序内 `ticks / 2000` 的整数商）= **59** 为标定值；**判据窗口 35 ~ 82**（±40%，
-    上限放宽是为了容纳上板 SPI Flash 读延迟与仿真模型的差异）；
-  - `ticks` ≈ **118000**（窗口 **70800 ~ 165200**）。
-  - ★ 若核实际跑在另一个时钟域（例如误接 50 MHz），`ticks` 会按频率比 **≈50/33 = 1.5 倍**整体变化
-    （≈177000）⇒ **跳出窗口** ⇒ 步④ 判 BAD、LED 显示 0，串口行里 `ticks` 会明显偏大。
-  - ★ **注意**：标定常量 59 来自核级仿真（TB 的 AXI 从设备是零延迟模型），**上板**每笔 Flash 读会多几十拍，
-    所以实测 `cycles/iter` 高于 59 属正常。若它落在 60 ~ 90 而 `ticks` 超窗口，
-    请把这一行**原文抄回来**，我们按实测重标定后重新出镜像——**不要**据此判断板子坏了。
-- **★ 主频的最终确认靠"心跳节奏目视核对"**（本步是量化自洽性/诊断判据）：
+- **口径**（2026-09-21 鲁棒化后的判据）：程序把 CONFREG 的自由运行计数器 `TIMER`
+  （`0x1FD0_E000`，`confreg_syn.v:346` 每 clk `+1`）清零，然后：
+  1. 读 `rdcycle`（核内 `cycle` CSR = `cycle_cnt_r`，`core_top.v:3555` **每拍 +1**）与 `TIMER` 起点；
+  2. 跑固定 **2000** 次 `delay_loop` 迭代；
+  3. 再读 `rdcycle` 与 `TIMER` 终点。
+  - `timer delta` = `TIMER` 增量；`cycle delta` = **核周期**增量（`rdcycle` 差值）；
+  - `cycles/iter` = `cycle delta / 2000`（由程序内自写的移位除法算出，**不用 M 扩展**）；
+  - **判据 A（主判据）**：`|timer delta − cycle delta| ≤ max(256, cycle delta/128)`（≈1%）。
+    两个计数器都在**核时钟域**每拍 +1 ⇒ 同一窗口内增量必须相等。这条**不看任何绝对拍数**，
+    因此对 SPI Flash 的取指延迟完全免疫（真机每笔 Flash 读多几十拍也不影响）。
+  - **判据 B（健全性窗口）**：`cycles/iter ∈ [20, 300]`，实测值原样打印。
+    ★ 它是**荒谬值兜底**（把"计数器异常 / 时钟域差一个量级"钉成 FAIL），
+    **不是主频判据** —— 主频由步⑤ 的 `FREQ`（`0x01F78A40` = 33 MHz）锚定。
+- **为什么不再用旧的绝对判据**：旧口径是 `|ticks − 2000×59| ≤ ±40%`，其中 **59 是零延迟仿真
+  内存模型**下 `delay_loop` 的标定拍数；真机 SPI Flash XIP 每笔读要几十拍，实测 `cycles/iter`
+  会明显更高 ⇒ 绝对窗口在板上不可移植（放宽窗口又会退化成"看着像过"）。
+  新判据只用**两个独立计数器的一致性**，不需要任何绝对拍数常量。
+  `sim-calib = 59` 只是把仿真标定值打印出来作参考（**不参与判定**）。
+- ✅ **期望（33 MHz 同域、核与 TIMER 同源）**：
+  - `timer delta` 与 `cycle delta` **两列相等**（差 ≤ 1%）；若两者差得离谱 ⇒ 步④ 判 BAD、
+    LED 显示 0 ⇒ 说明 `TIMER` 不在核时钟域（例如被分频），请把该行**原文抄回来**；
+  - `cycles/iter` 落在 **20 ~ 300**（真机预计 60 ~ 200：它 = 每迭代 9 条指令 × SPI XIP 每指令拍数）；
+  - 该值**越大只说明 Flash 读越慢**，不是故障（延时正确性由"心跳节奏"目视核对）。
+- **★ 主频的最终确认靠"心跳节奏目视核对"**：
   步① 每拍等 `8 000 000` 拍 = **0.24 s**（33 MHz 下），8 拍一轮 ≈ **1.9 s**。
   用手机秒表量"从一次 LED0 亮到下一次 LED0 亮"的间隔：
   - **≈1.9 s** ⇒ 主频口径正确（33 MHz）；
   - **≈1.3 s** ⇒ 实际是 50 MHz 域（比例 1.5 倍）⇒ 把现象报回来；
-  - 其他数值 ⇒ 连同 `cycles/iter`、`ticks` 一起报回来。
-- ❌ **若 `cycles/iter` ≈ 88（= 59×1.5）**：说明实际主频是 50 MHz ⇒ **把这一行原文抄回来**。
+  - 其他数值 ⇒ 连同 `cycles/iter`、`timer delta` 一起报回来。
+- ❌ **若 `cycles/iter` 高于 300 或低于 20**：计数器/时钟域可疑 ⇒ **把这一行原文抄回来**。
 
 ### 步⑤ FREQ 回读
 
@@ -207,7 +215,7 @@
 | **串口无输出，但 LED 在跑马灯** | UART 通路问题：程序在跑，但串口参数/接线不对 | ① 换 57600/230400 试；② 确认插的是 UART0（F23/H19）而不是 debug 串口（M25/P25）；③ 交换 RX/TX |
 | **串口乱码**（能看出字符轮廓但错位） | 波特率不匹配 | ① 终端设 115200 8N1 无流控；② 关掉终端的"软件流控/硬件流控"；③ 若你的终端有 114583 自定义档位就填它 |
 | **打印在 `step1` 反复出现，之后没有 `step3/4/5`** | 程序卡在 LED 心跳段（不太可能死循环，但可能被反复复位） | 检查复位键是否卡住 / 电源是否不稳（`timer` 数值若每次都很小说明被反复复位） |
-| **`RESULT: RV32GC-M5-BAD`（只在最后一行）** | 步④ 时序判据或步⑤ FREQ 判据不满足 | **把 `step4`/`step5` 那两行的完整原文抄回来**（`ticks`、`cycles/iter`、`expected ticks`、`FREQ`），这决定了是 XIP 取指延迟标定偏差、主频不对、还是平台寄存器读回问题 |
+| **`RESULT: RV32GC-M5-BAD`（只在最后一行）** | 步④ `TIMER`/`rdcycle` 增量不一致、或步⑤ FREQ 判据不满足 | **把 `step4`/`step5` 那两行的完整原文抄回来**（`timer delta`、`cycle delta`、`cycles/iter`、`FREQ`），这决定了是 TIMER 不在核时钟域、核与 uncore 时钟不同源、还是平台寄存器读回问题 |
 | **LED 全亮或全灭且串口正常** | LED 段接线/极性，或程序在写 `0xFFFF/0x0000` | 抄回 `step1 LED heartbeat, pattern=` 的数值 |
 | **拨开关 LED 不跟随** | MMIO 读通路（`0x1FD0F020`）问题 | 抄回 `step3 switch readback =` 的数值（拨到 0x55 和 0xAA 各试一次） |
 | **Vivado 下载报 DRC/IDCODE 错** | JTAG 线/驱动/供电 | 换线、换 USB 口、Auto Connect 重新识别；回报 Vivado 报错原文 |
@@ -229,19 +237,38 @@ grep -E "WNS|Timing constraints are not met|All user specified timing constraint
 
 ## 6. 交付记录（由构建方填写，用户对照）
 
+> ★ **2026-09-21 第二轮交付（R2 修复）**：核内 AXI 读数据采样点修复后重出 bitstream 与镜像，
+> 以下为**当前应烧写的产物**（上一轮 md5 见本表下的"历史"行，**不要再烧**）。
+
 | 项 | 值 |
 |---|---|
-| 核 RTL 冻结版本 | `rv32gc-cpu` commit `ae906cd`（全 `rtl/**` 的 md5 汇总 = `f41d1f253d5e0e5baa8030e118af87c1`） |
+| 核 RTL 版本 | `rv32gc-cpu` `dev` 分支 R2 修复（`rtl/axi/axi_master_ctrl.v` + `rtl/top/core_top.v`；全 `rtl/**`（`*.v`+`*.vh`）md5 汇总 = **`c558e750441afc0b13c3dbb3776bcbd3`**，修复前为 `f41d1f253d5e0e5baa8030e118af87c1`） |
 | 上板时钟口径 | 33 MHz 同域（`clk_pll_33.clk_out1` 留空，`assign cpu_clk = uncore_clk`）；`config.h` `FREQ = 32'd33000000` |
 | 器件 / 约束 | `xc7a200tfbg676-2` / `chiplab/fpga/loongson/soc_up.xdc`（板级 100 MHz 输入时钟约束，PLL 派生 33 MHz） |
-| **bitstream** | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（**9 730 756 B**，md5 `5e3bd4f138d6e408728db3590726bfd1`） |
-| FPGA 配置 bin（同源） | 同目录 `soc_top.bin`（9 730 652 B，md5 `6748db8c9119f60080da5d8324c60a7d`） |
-| **Flash 镜像** | `rv32gc-cpu/sw/m5_board/out/m5_board.bin`（**1621 B**，md5 `3b60ccac3b227e367eb8497fd66ff024`） |
+| **bitstream** | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（**9 730 756 B**，md5 **`f375baa04d8e495cfbb8c5df2042adf4`**） |
+| FPGA 配置 bin（同源） | 同目录 `soc_top.bin`（9 730 652 B，md5 **`c448dfdc982608344dee5c6bd8e4ea7c`**） |
+| **Flash 镜像** | `rv32gc-cpu/sw/m5_board/out/m5_board.bin`（**1773 B**，md5 **`b82be1fc4f67d029232a6409f6941b33`**） |
 | 程序波特率 | 115200 8N1（核内设分频 = 18，实际 114583 Bd） |
 | 烧写器波特率 | 230400（`programmer_by_uart.bit`，仅固化 Flash 时用） |
-| 时序（33 MHz 约束，布线后） | WNS **+0.978 ns** / TNS 0 / 失败端点 **0**；WHS **+0.050 ns** / THS 0 / 失败端点 **0**；`All user specified timing constraints are met` |
-| 资源（整片 SoC，含平台） | Slice LUT 70 226 / 134 600（52.2%）、FF 41 515（15.4%）、BRAM 15.5/365、DSP 34/740（核本身 `core_top` ≈ 52 646 LUT） |
+| 时序（33 MHz 约束，布线后） | WNS **+0.978 ns** / TNS 0 / 失败端点 **0**；`All user specified timing constraints are met` |
+| 核级时序（60 MHz = 16.667 ns，核单独综合+布线） | 见 `fpga/out/impl_16.667ns_timing_summary.rpt`（本轮复跑，WNS ≥ 0） |
+| 资源（整片 SoC，含平台，2026-09-21 报告） | Slice LUT 70 232 / 134 600（52.18%）、FF 41 500 / 269 200（15.42%）、BRAM 15.5/365（4.25%）、DSP 34/740（4.59%）；其中核本身 `cpu_mid`(core_top) = **52 643 LUT** / 23 230 FF / 12 BRAM / 34 DSP |
 
-> **构建方补充**：以上数字取自 `chiplab/fpga/loongson/2023.2/rv32gc_out/{impl_timing_summary,impl_utilization}.rpt`（2026-09-20 构建）。
-> 步④ 的 `cycles/iter` 期望值（59）来自核级仿真实测（`rv32gc-cpu/sw/m5_board/tb/`）；若上板实测与 59 偏差 >25%，
-> 请按 §4 步④ 的说明把原文抄回来重标定，**不要**据此判定板子故障。
+**历史产物（上一轮，已被上面替换，勿再烧写）**：bitstream md5 `5e3bd4f138d6e408728db3590726bfd1`；
+`soc_top.bin` md5 `6748db8c9119f60080da5d8324c60a7d`；Flash 镜像 1621 B / md5 `3b60ccac3b227e367eb8497fd66ff024`
+（那一版在真实 MIG 下 `.data/.bss` 读回垃圾 ⇒ 十进制打印全乱，见 §4 步④ 的 2026-09-21 说明）。
+
+### 6.1 本轮重烧步骤（只需换两个文件）
+
+1. **bitstream**：Windows 侧 Vivado Hardware Manager → Open Target → Program Device →
+   选 `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（md5 见上表）。
+2. **程序镜像**：按 §3 方式 B（`programmer_by_uart.bit` + xmodem）把 **新的**
+   `rv32gc-cpu/sw/m5_board/out/m5_board.bin`（1773 B）写进 Flash 地址 0。
+3. 断电重上电（或重新下载 bitstream），按 §4 观察五步。
+   本轮**可见变化**：步④ 的行格式变为
+   `step4 timer delta = …, cycle delta = …, cycles/iter = …, window = 20..300, sim-calib = 59 cycles/iter (informational only)`
+   —— 其中 `timer delta` 与 `cycle delta` 必须相等（差 ≤ 1%）。
+
+> **构建方补充**：以上数字取自 `chiplab/fpga/loongson/2023.2/rv32gc_out/{impl_timing_summary,impl_utilization}.rpt`
+> （2026-09-21 构建）。步④ 的 `sim-calib = 59 cycles/iter` 只是**仿真参考值**（零延迟内存模型），
+> 真机 SPI Flash 时序下 `cycles/iter` 更高属正常，**不参与**判定（判据见 §4 步④）。

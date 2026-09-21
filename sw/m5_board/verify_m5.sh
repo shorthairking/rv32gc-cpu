@@ -113,15 +113,27 @@ chk "V4b：手册含 115200 串口口径" grep -q "115200" "${REPO}/sw/M5-board-
 chk "V4c：手册含失败回报清单" grep -q "必报信息清单" "${REPO}/sw/M5-board-runbook.md"
 
 #------------------------------------------------------------------------------
-# V5 核 RTL 冻结（git 无改动 + md5 汇总）
+# V5 核 RTL 冻结（改动必须**恰好**是 R2 修复的两文件 + md5 汇总基线）
+#   2026-09-21 R2 修复：`rtl/axi/axi_master_ctrl.v`（+rdata_hold 锁存）与
+#   `rtl/top/core_top.v`（数据读/AMO 读相改取锁存值）是**授权范围内**的唯一改动；
+#   本判据把"允许的改动白名单"写死 ⇒ 既能在父 Agent 提交前通过，也能在提交后
+#   （git 干净）通过，且任何**其它** RTL 改动一律判失败。
+#   md5 基线：R2 修复后 = c558e750441afc0b13c3dbb3776bcbd3
+#             （R2 修复前 = f41d1f253d5e0e5baa8030e118af87c1）
 #------------------------------------------------------------------------------
 echo "--- V5 核 RTL 冻结 ---"
-if [ -z "$(git -C "$REPO" status --porcelain rtl/ 2>/dev/null)" ]; then ok "V5a：git status rtl/ 为空（核 RTL 未被改动）"
-else bad "V5a：rtl/ 下有未提交改动"; git -C "$REPO" status --porcelain rtl/ | head -5; fi
+RTL_DIRTY="$(git -C "$REPO" status --porcelain rtl/ 2>/dev/null | awk '{print $2}' | sort | tr '\n' ' ')"
+if [ -z "$RTL_DIRTY" ]; then
+    ok "V5a：git status rtl/ 为空（核 RTL 已提交冻结）"
+elif [ "$RTL_DIRTY" = "rtl/axi/axi_master_ctrl.v rtl/top/core_top.v " ]; then
+    ok "V5a：rtl/ 的未提交改动恰好是 R2 修复的两个文件（父 Agent 提交后即为空）"
+else
+    bad "V5a：rtl/ 下出现了 R2 修复**白名单之外**的改动"; printf '    %s\n' "$RTL_DIRTY"
+fi
 RTL_MD5="$(cd "$REPO" && find rtl -name '*.v' -o -name '*.vh' | sort | xargs md5sum | md5sum | awk '{print $1}')"
 echo "    rtl/** 全树 md5 汇总 = ${RTL_MD5}"
-chk "V5b：rtl/** md5 汇总等于冻结基线 f41d1f253d5e0e5baa8030e118af87c1" \
-    test "${RTL_MD5}" = "f41d1f253d5e0e5baa8030e118af87c1"
+chk "V5b：rtl/** md5 汇总等于 R2 修复后基线 c558e750441afc0b13c3dbb3776bcbd3" \
+    test "${RTL_MD5}" = "c558e750441afc0b13c3dbb3776bcbd3"
 
 echo
 if [ "$FAIL" -ne 0 ]; then
