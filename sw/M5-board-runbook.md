@@ -19,7 +19,7 @@
 | 1 | 上电 + 连接 | 电源、Xilinx 下载线（JTAG）、串口线（板载 UART） | 电源灯亮；串口能打开 |
 | 2 | 下载 bitstream | Vivado Hardware Manager（**Windows 侧**）或 SPI Flash 固化 | **Program Device 成功、无 ERROR**（见 §7 两步走） |
 | 3 | 烧诊断镜像 | `programmer_by_uart.bit` + xmodem 烧 `m5_diag.bin` | 烧写器提示完成 |
-| 4 | 打开串口 | **115200 8N1**，无流控 | 横幅含 `BUILD=m5_board-diag-2026-09-21c` |
+| 4 | 打开串口 | **115200 8N1**，无流控 | 横幅含 `BUILD=m5_board-diag-2026-09-21d` |
 | 5 | **看步2.5/2.6/2.7 三行** | 串口 | **`R2FIX: yes` + `MEXT: OK` + `STACKBF: OK`** ⇒ 新 bitstream 生效；`MEXT: BAD` ⇒ 板子里还是旧 bitstream（§7） |
 | 6 | 看 LED / 数码管 | 板载 16 个 LED、8 位数码管 | LED 心跳 → 显示开关值 → 显示数字 |
 | 7 | 读结论行 | 串口 | `RESULT: RV32GC-M5-OK`（**含** R2 回环判据，见 §7） |
@@ -119,11 +119,11 @@
 - **现象（上电/复位后立即）**：
   ```
   RV32GC-M5 board test (chiplab / xc7a200tfbg676-2) @ 33MHz
-  BUILD=m5_board-diag-2026-09-21c (stack-free prints; R2+MEXT+stack probes)
+  BUILD=m5_board-diag-2026-09-21d (stack-free prints; R2+MEXT+stack probes; CPI window informational)
   UART 115200 8N1 (divisor=18, PCLK=33MHz -> 114583 Bd)
   RESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only
   ```
-  > `BUILD=` 这一行是**诊断版标志**：看到 `BUILD=m5_board-diag-2026-09-21c` 就说明
+  > `BUILD=` 这一行是**诊断版标志**：看到 `BUILD=m5_board-diag-2026-09-21d` 就说明
   > **Flash 镜像确实是本轮的新镜像**（它只证明"程序是新烧的"，**不**证明 FPGA 里是新
   > bitstream —— 后者由步2.5/2.6/2.7 判定）。
 - 以及循环里的：
@@ -219,10 +219,16 @@
 
 ### 步④ TIMER ↔ 核周期一致性（**对 Flash 取指延迟不敏感**）
 
-- **现象**：串口打印一行（示例值为核级仿真实测；上板数值以实际为准）
+- **现象**：串口打印一行。示例为核级仿真（零延迟内存模型）实测值：
   ```
-  step4 timer delta = 118043, cycle delta = 118043, cycles/iter = 59, window = 20..300, sim-calib = 59 cycles/iter (informational only)
+  step4 timer delta = 118055, cycle delta = 118049, cycles/iter = 59 (informational only; window 20..20000; board-calib=4120, sim-calib=59 cycles/iter)
   ```
+  > **上板实测**的同一行（`timer delta` / `cycle delta` / `cycles/iter` 随 Flash 时序浮动）例如：
+  > `step4 timer delta = 8241325, cycle delta = 8240913, cycles/iter = 4120 (informational only; window 20..20000; board-calib=4120, sim-calib=59 cycles/iter)`。
+  > **两种口径并存**：板级 `board-calib=4120`（真机 SPI Flash XIP，每取指 ≈458 拍）/ 仿真 `sim-calib=59`（每指令 ≈6.5 拍）。
+  > ★ 本节第一处 `cycles/iter = N` 的 **N（= 仿真标定值 59）** 是 `build.sh` 判据⑨d 抽取的
+  > "标定值"（用于核对 `m5_board.S` 的 `.equ XIP_CPI`）⇒ 改动本节时**必须保留一行
+  > `cycles/iter = 59`**，且它要出现在任何里含数字的 `cycles/iter` 之前。
 - **口径**（2026-09-21 鲁棒化后的判据）：程序把 CONFREG 的自由运行计数器 `TIMER`
   （`0x1FD0_E000`，`confreg_syn.v:346` 每 clk `+1`）清零，然后：
   1. 读 `rdcycle`（核内 `cycle` CSR = `cycle_cnt_r`，`core_top.v:3555` **每拍 +1**）与 `TIMER` 起点；
@@ -230,29 +236,37 @@
   3. 再读 `rdcycle` 与 `TIMER` 终点。
   - `timer delta` = `TIMER` 增量；`cycle delta` = **核周期**增量（`rdcycle` 差值）；
   - `cycles/iter` = `cycle delta / 2000`（由程序内自写的移位除法算出，**不用 M 扩展**）；
-  - **判据 A（主判据）**：`|timer delta − cycle delta| ≤ max(256, cycle delta/128)`（≈1%）。
+  - **判据 A（唯一被判的步④ 判据）**：`|timer delta − cycle delta| ≤ max(256, cycle delta/128)`（≈1%）。
     两个计数器都在**核时钟域**每拍 +1 ⇒ 同一窗口内增量必须相等。这条**不看任何绝对拍数**，
     因此对 SPI Flash 的取指延迟完全免疫（真机每笔 Flash 读多几十拍也不影响）。
-  - **判据 B（健全性窗口）**：`cycles/iter ∈ [20, 300]`，实测值原样打印。
-    ★ 它是**荒谬值兜底**（把"计数器异常 / 时钟域差一个量级"钉成 FAIL），
-    **不是主频判据** —— 主频由步⑤ 的 `FREQ`（`0x01F78A40` = 33 MHz）锚定。
-- **为什么不再用旧的绝对判据**：旧口径是 `|ticks − 2000×59| ≤ ±40%`，其中 **59 是零延迟仿真
-  内存模型**下 `delay_loop` 的标定拍数；真机 SPI Flash XIP 每笔读要几十拍，实测 `cycles/iter`
-  会明显更高 ⇒ 绝对窗口在板上不可移植（放宽窗口又会退化成"看着像过"）。
+    上板实测：`|8241325 − 8240913| = 412` ≤ `8240913/128 = 64382` ⇒ **通过**。
+  - **健全性窗口（信息性：只打印，不参与判定）**：`cycles/iter ∈ [20, 20000]`。
+    ★ 2026-09-21 上板实测把它**降级为信息性**：真机 `cycles/iter ≈ 4120`（SPI Flash XIP 无缓存、
+    每取指走平台 Flash 桥 ≈458 拍/指令），而窗口上界原按**仿真标定值 59** 的量级定为 300
+    ⇒ **真实标定值反而被误判 BAD**。现在窗口**只打印**（便于换平台/换 Flash 时一眼看出差异），
+    **不参与 BAD 判定** —— BAD 只由下面两条真判据决定：
+    **① 判据 A**（TIMER ↔ rdcycle 增量一致）**∧ ② 步⑤ FREQ 锚定**（`div1e6 == 33` ∧ `FREQ>>20 == 31`）。
+    ★ 这不是"放水"：窗口负责的"计数器/时钟域差一个量级"这一类异常，已被判据 A（两个独立计数器
+    增量必须同步）与步⑤（主频锚定）**完全覆盖**；被降级的只是"绝对拍数窗口"这个**不可移植**的量。
+- **为什么不用绝对拍数判据**：旧口径是 `|ticks − 2000×59| ≤ ±40%`，其中 **59 是零延迟仿真
+  内存模型**下 `delay_loop` 的标定拍数；真机 SPI Flash XIP 每笔读要几十拍，实测 `cycles/iter ≈ 4120`
+  （是仿真值的 ≈70 倍）⇒ 绝对窗口在板上不可移植（放宽窗口又会退化成"看着像过"）。
   新判据只用**两个独立计数器的一致性**，不需要任何绝对拍数常量。
-  `sim-calib = 59` 只是把仿真标定值打印出来作参考（**不参与判定**）。
+  `board-calib=4120` / `sim-calib=59` 都只是把标定值打印出来作参考（**不参与判定**）。
 - ✅ **期望（33 MHz 同域、核与 TIMER 同源）**：
-  - `timer delta` 与 `cycle delta` **两列相等**（差 ≤ 1%）；若两者差得离谱 ⇒ 步④ 判 BAD、
-    LED 显示 0 ⇒ 说明 `TIMER` 不在核时钟域（例如被分频），请把该行**原文抄回来**；
-  - `cycles/iter` 落在 **20 ~ 300**（真机预计 60 ~ 200：它 = 每迭代 9 条指令 × SPI XIP 每指令拍数）；
-  - 该值**越大只说明 Flash 读越慢**，不是故障（延时正确性由"心跳节奏"目视核对）。
+  - `timer delta` 与 `cycle delta` **两列之差 ≤ 1%**（上板实测差 412 拍，判据上限 64382）；
+    若两者差得离谱 ⇒ 步④ 判 BAD、LED 显示 0 ⇒ 说明 `TIMER` 不在核时钟域（例如被分频），
+    请把该行**原文抄回来**；
+  - `cycles/iter` **只在板上做记录**（典型 3000 ~ 6000）：它 = 每迭代 9 条指令 × SPI XIP 每指令拍数，
+    **越大只说明 Flash 读越慢**，不是故障；延时正确性由"心跳节奏"目视核对。
+  - ★ **`cycles/iter` 超出窗口不再判 BAD**（信息性），但若它**明显异常**（例如 < 100 或 > 100000）
+    仍请把这一行原文抄回来 —— 那是"平台/Flash 通路变了"的强信号。
 - **★ 主频的最终确认靠"心跳节奏目视核对"**：
   步① 每拍等 `8 000 000` 拍 = **0.24 s**（33 MHz 下），8 拍一轮 ≈ **1.9 s**。
   用手机秒表量"从一次 LED0 亮到下一次 LED0 亮"的间隔：
   - **≈1.9 s** ⇒ 主频口径正确（33 MHz）；
   - **≈1.3 s** ⇒ 实际是 50 MHz 域（比例 1.5 倍）⇒ 把现象报回来；
   - 其他数值 ⇒ 连同 `cycles/iter`、`timer delta` 一起报回来。
-- ❌ **若 `cycles/iter` 高于 300 或低于 20**：计数器/时钟域可疑 ⇒ **把这一行原文抄回来**。
 
 ### 步⑤ FREQ 回读
 
@@ -310,7 +324,7 @@
 | **`step2.5 … R2FIX: no`（word/byte 是垃圾值或 0）但十进制数字正常** | ★ FPGA 里跑的还是**旧 bitstream**（R2 缺陷在位）—— 新程序已生效，但配置没换成新的 | 按 §7 重做两步走：`Program Device` → **确认成功**（看 Vivado 的 `Program Device` 完成提示与 `Device properties`）→ 复位；仍为 `no` 则回报 bitstream 文件 md5（§5.1 第①项） |
 | **`step2.5 … R2FIX: no` 且数字也乱** | 新程序没烧进去（Flash 里还是老镜像：横幅里没有 `BOARD-PROG:` 行）或程序没跑完 | 抄回横幅原文；重烧 `m5_diag.bin`（§3 方式 B） |
 | **打印在 `step1` 反复出现，之后没有 `step3/4/5`** | 程序卡在 LED 心跳段（不太可能死循环，但可能被反复复位） | 检查复位键是否卡住 / 电源是否不稳（`timer` 数值若每次都很小说明被反复复位） |
-| **`RESULT: RV32GC-M5-BAD`（只在最后一行）** | ① `step2.5` 判 R2 回环失败（= 旧 bitstream）② 步④ `TIMER`/`rdcycle` 增量不一致 ③ 步⑤ FREQ 判据不满足 | **先看 `step2.5` 行**（§4 步2.5 判别表）；若 `R2FIX: yes` 再把 `step4`/`step5` 两行完整原文抄回来（`timer delta`、`cycle delta`、`cycles/iter`、`FREQ`） |
+| **`RESULT: RV32GC-M5-BAD`（只在最后一行）** | ① `step2.5` 判 R2 回环失败（= 旧 bitstream）② 步④ `TIMER`/`rdcycle` 增量不一致（判据 A）③ 步⑤ FREQ 锚定不满足 | **先看 `step2.5` 行**（§4 步2.5 判别表）；若 `R2FIX: yes` 再把 `step4`/`step5` 两行完整原文抄回来（`timer delta`、`cycle delta`、`cycles/iter`、`FREQ`）。★ 注意：`cycles/iter` 超出 `[20,20000]` **不会**导致 BAD（该窗口本轮起只是信息性打印） |
 | **LED 全亮或全灭且串口正常** | LED 段接线/极性，或程序在写 `0xFFFF/0x0000` | 抄回 `step1 LED heartbeat, pattern=` 的数值 |
 | **拨开关 LED 不跟随** | MMIO 读通路（`0x1FD0F020`）问题 | 抄回 `step3 switch readback =` 的数值（拨到 0x55 和 0xAA 各试一次） |
 | **Vivado 下载报 DRC/IDCODE 错** | JTAG 线/驱动/供电 | 换线、换 USB 口、Auto Connect 重新识别；回报 Vivado 报错原文 |
@@ -345,44 +359,61 @@ grep -a -o 'cpu_mid/u_axi_master_ctrl/rdata_hold_q' \
 > ★ **2026-09-21 第四轮交付（M 扩展根因修复 + 四步诊断探针）**：RTL 只改 **`rtl/exec/mdu.v`**
 > 一处（div_gen 输出字段序：`{余数,商}` → `{商,余数}`，见 §8 —— 这是"上板十进制乱码"的真正根因）；
 > 上板程序加了 BUILD 标记 + 步2.5/2.6/2.7 三个探针。**bitstream 已重建 ⇒ md5 变了，必须重下**。
+>
+> ★ **2026-09-21 第五轮交付（步④ 窗口修正；★★ RTL / bitstream 一律不动 ★★）**：
+> 上板实测已确认硬件全部正常（`R2FIX: yes` / `MEXT: OK` / `STACKBF: OK` / `FREQ = 0x01F78A40`，
+> 步④ 判据 A：`|8241325 − 8240913| = 412 ≤ 64382` 通过），唯一 BAD 来源是
+> **`cycles/iter = 4120` 落在为仿真标定值 59 而设的旧窗口 `[20,300]` 之外** —— 4120 是**真实标定值**
+> （真机 SPI Flash XIP 无缓存，每取指走平台 Flash 桥 ≈458 拍/指令）。本轮只改**上板程序**：
+> ① 窗口 `[20,300]` → **`[20,20000]`**；② 窗口**降级为信息性**（只打印，不参与 BAD 判定；
+> BAD 只由 判据 A + 步⑤ FREQ 锚定 + 三个探针 决定）；③ 步④ 打印文案同步（一行给出两种标定口径）。
+> **bitstream 保持 `167dc9dfd487a9d6148ddee02d407726` 不变 ⇒ 本轮只需重烧程序镜像（§6.1）。**
 
 | 项 | 值 |
 |---|---|
 | 核 RTL 版本 | `rv32gc-cpu`：R2 修复（`rtl/axi/axi_master_ctrl.v` + `rtl/top/core_top.v`）+ **本轮 M 扩展字段序修复**（`rtl/exec/mdu.v`，md5 **`30a1ab7f7ac2432d605baad24d91c504`**）；全 `rtl/**`（`*.v`+`*.vh`）md5 汇总 = **`66e3225645b6f29375c786fe166448d6`**（仅 `*.v` 时 = `ce31b3c8c51fd813c6437ba9af29e54a`） |
-| 上板程序源码 | `rv32gc-cpu/sw/m5_board/m5_board.S`（md5 **`61c6599e3b936465eb0732c6bcbf81fc`**） |
-| 程序内 BUILD 标记 | **`BUILD=m5_board-diag-2026-09-21c`**（横幅第 2 行；看到它就说明 Flash 里是本轮镜像） |
+| 上板程序源码 | `rv32gc-cpu/sw/m5_board/m5_board.S`（md5 **`ac51c14a823b6dbaf665aae13acc59f0`**） |
+| 程序内 BUILD 标记 | **`BUILD=m5_board-diag-2026-09-21d`**（横幅第 2 行；看到它就说明 Flash 里是本轮镜像） |
 | 上板时钟口径 | 33 MHz 同域（`clk_pll_33.clk_out1` 留空，`assign cpu_clk = uncore_clk`）；`config.h` `FREQ = 32'd33000000` |
 | 器件 / 约束 | `xc7a200tfbg676-2` / `chiplab/fpga/loongson/soc_up.xdc`（板级 100 MHz 输入时钟约束，PLL 派生 33 MHz） |
 | **bitstream（本轮，必烧）** | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（**9 730 756 B**，md5 **`167dc9dfd487a9d6148ddee02d407726`**，2026-09-21 12:36 构建） |
 | FPGA 配置 bin（同源） | 同目录 `soc_top.bin`（md5 **`6e57443600cacbfedabf038dda58cc5a`**） |
-| **Flash 镜像（诊断版）** | `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（**2774 B**，md5 **`54987330af13d146f7c9d10c2a57edef`**；与 `m5_board.bin` 逐字节相同） |
-| 仿真加载 hex（同源） | `rv32gc-cpu/sw/m5_board/out/m5_board.hex`（md5 **`3dd17c54ec259b54c1b93fab1bedb7d9`**） |
+| **Flash 镜像（诊断版）** | `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（**2772 B**，md5 **`a91f6f64630237cb1e0f76f2a32c40a9`**；与 `m5_board.bin` 逐字节相同） |
+| 仿真加载 hex（同源） | `rv32gc-cpu/sw/m5_board/out/m5_board.hex`（md5 **`26b38763b7e02d8efe638817a04ab911`**） |
 | 程序波特率 | 115200 8N1（核内设分频 = 18，实际 114583 Bd） |
 | 烧写器波特率 | 230400（`programmer_by_uart.bit`，仅固化 Flash 时用） |
 | 时序（33 MHz 约束，布线后，2026-09-21 12:36 重建） | WNS **+0.978 ns** / WHS +0.058 ns / TNS 0 / 失败端点 **0**；`All user specified timing constraints are met` |
 | 核级时序（60 MHz = 16.667 ns，核单独综合+布线；**含 mdu 修复后复跑**） | 综合 WNS **+0.556 ns** / TNS 0 / 失败端点 0；布线后 WNS **+0.110 ns**、WHS **+0.066 ns**、失败端点 **0**，`All user specified timing constraints are met`（`fpga/out/{synth,impl}_16.667ns_timing_summary.rpt`） |
 | 资源（整片 SoC，含平台，2026-09-21 报告） | Slice LUT 70 232 / 134 600（52.18%）、FF 41 500 / 269 200（15.42%）、BRAM 15.5/365（4.25%）、DSP 34/740（4.59%）；其中核本身 `cpu_mid`(core_top) = **52 643 LUT** / 23 230 FF / 12 BRAM / 34 DSP |
-| 本轮可见变化 | ① 横幅第 2 行 = `BUILD=m5_board-diag-2026-09-21c …`；② 新增 `step2.5 DDR3 loopback … R2FIX: …`、`step2.6 MEXT=…`、`step2.7 stack[16B]=…` 三个探针行；③ 十进制/十六进制打印不再依赖 DDR3（纯寄存器路径）；④ 最终判定 = 步④ ∧ FREQ ∧ 三个探针 |
+| 本轮可见变化 | ① 横幅第 2 行 = `BUILD=m5_board-diag-2026-09-21d …`；② 新增 `step2.5 DDR3 loopback … R2FIX: …`、`step2.6 MEXT=…`、`step2.7 stack[16B]=…` 三个探针行；③ 十进制/十六进制打印不再依赖 DDR3（纯寄存器路径）；④ 步④ 的 `cycles/iter` 窗口 `[20,300]` → `[20,20000]` 并**降级为信息性**（只打印、不参与 BAD 判定，见 §4 步④）；⑤ 最终判定 = 步④（判据 A：TIMER↔rdcycle 增量一致） ∧ 步⑤ FREQ ∧ 三个探针 |
 
 **历史产物（前三轮，已被上面替换，勿再烧写）**：bitstream md5 `f375baa04d8e495cfbb8c5df2042adf4`（R2 修复版，**没有** M 扩展字段序修复 ⇒ 板子仍会打印 `MEXT: BAD`/乱码）；Flash 镜像 2199 B / md5 `84314223b0c1343ec972e5a1b238cbfe`（第三轮诊断版）；1773 B / md5 `b82be1fc4f67d029232a6409f6941b33`（R2 修复后、无探针的那版程序）；
 更早：bitstream md5 `5e3bd4f138d6e408728db3590726bfd1`、`soc_top.bin` md5 `6748db8c9119f60080da5d8324c60a7d`、Flash 镜像 1621 B / md5 `3b60ccac3b227e367eb8497fd66ff024`
 （那一版在真实 MIG 下 `.data/.bss` 读回垃圾 ⇒ 十进制打印全乱，见 §5.8 的 R2 说明）。
 
-### 6.1 本轮重烧步骤（只需换两个文件）
+### 6.1 本轮重烧步骤（★ 本轮**只需换程序镜像**，bitstream 不动）
 
-1. **bitstream**：Windows 侧 Vivado Hardware Manager → Open Target → Program Device →
-   选 `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（md5 见上表）。
-   **一定要看到下载成功**（§7.1 有核对清单）。
-2. **程序镜像**：按 §3 方式 B（`programmer_by_uart.bit` + xmodem）把 **新的**
-   `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（2774 B）写进 Flash 地址 0。
-3. 断电重上电（或按复位键），按 §4 观察；**第一眼看横幅有没有 `BUILD=m5_board-diag-2026-09-21c`，
-   第二眼看步2.6 的 `MEXT:`（本轮根因判据）、再看步2.5/2.7 的 `R2FIX:`/`STACKBF:`**。
+1. **bitstream（本轮不用动）**：`chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`
+   （md5 `167dc9dfd487a9d6148ddee02d407726`，与上一轮**同一份**）。若板子里已经是在跑的那份
+   新 bitstream（步2.5/2.6/2.7 三行都判过），**本轮不要再烧 bitstream**，只做第 2 步。
+   （若不确定 FPGA 里是哪份，按 §7.1 核对：Program Device → 确认成功 → 复位。）
+2. **程序镜像（本轮唯一要烧的东西）**：按 §3 方式 B（`programmer_by_uart.bit` + xmodem）把 **新的**
+   `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（**2772 B**，md5 **`a91f6f64630237cb1e0f76f2a32c40a9`**）
+   写进 Flash 地址 0。**看到 xmodem 完成提示后才算烧成功**。
+3. 断电重上电（或按复位键），按 §4 观察；**第一眼看横幅有没有 `BUILD=m5_board-diag-2026-09-21d`，
+   第二眼看步2.6 的 `MEXT:`、再看步2.5/2.7 的 `R2FIX:`/`STACKBF:`**。
    本轮**可见变化**：
-   - 横幅第 2 行变为 `BUILD=m5_board-diag-2026-09-21c (stack-free prints; R2+MEXT+stack probes)`；
+   - 横幅第 2 行变为 `BUILD=m5_board-diag-2026-09-21d (stack-free prints; R2+MEXT+stack probes; CPI window informational)`；
    - 新增 `step2.5 DDR3 loopback: word=0x12345678 re-read=0x12345678 byte=0x5A (expect 12345678/5A) -> R2FIX: yes`；
    - 新增 `step2.6 MEXT=00000005 00000009 0000003B 00000031 00000000 00000000 0000002A 40000000 FFFFFFFE -> MEXT: OK`；
    - 新增 `step2.7 stack[16B]=30 31 32 33 34 35 36 37 38 39 41 42 43 44 45 46 -> STACKBF: OK`；
-   - 步④ 行格式（上一轮起）：`step4 timer delta = …, cycle delta = …, cycles/iter = …, window = 20..300, sim-calib = 59 cycles/iter (informational only)`。
+   - ★ **步④ 行文案变了**（本轮核心修复）：`cycles/iter` 的健全性窗口从 `[20,300]` 放宽到
+     `[20,20000]` 并**降级为信息性**（只打印、不参与 BAD 判定）——
+     上板行形如
+     `step4 timer delta = 8241325, cycle delta = 8240913, cycles/iter = 4120 (informational only; window 20..20000; board-calib=4120, sim-calib=59 cycles/iter)`；
+   - ★ **BAD 判定口径**（本轮起）= **判据 A**（`|Δtimer − Δcycle| ≤ max(256, Δcycle/128)`）
+     **∧ 步⑤ FREQ 锚定**（`div1e6 == 33` ∧ `FREQ>>20 == 31`）**∧ 步2.5/2.6/2.7 三个探针**；
+     `cycles/iter` 落在窗口外**不再**导致 BAD（只作为"平台差异"信息打印）。
 
 ---
 
@@ -401,7 +432,7 @@ grep -a -o 'cpu_mid/u_axi_master_ctrl/rdata_hold_q' \
 | ① | Vivado → `Open Hardware Manager` → `Open Target` → `Auto Connect` → `Program Device` → 选 `rv32gc_chiplab_soc.bit` → `Program` | Vivado 的 Tcl Console / 提示框出现 `Programming device ... done` / 进度 100% 且**无 ERROR**；`Hardware` 面板显示 `xc7a200t`；下载后按板载复位键 | 出现 `ERROR`/`IDCODE mismatch`/进度中断 ⇒ JTAG 线/供电问题（§5.2 末行） |
 | ①′ | **核对你要下载的 .bit 文件本身**（Windows 侧，可选但推荐）<br>`certutil -hashfile rv32gc_chiplab_soc.bit MD5` | 输出 `167dc9dfd487a9d6148ddee02d407726` | 不是这个值 ⇒ **你手里的文件不是本轮交付的 bitstream**（重新从本仓库拷一份） |
 | ② | 烧 `m5_diag.bin`（§3 方式 B：`programmer_by_uart.bit` + xmodem，230400） | 烧写器提示传输完成；之后**回到 115200** 打开串口、按复位 | 传输中断/进度卡住 ⇒ 重来一次；注意"烧写器波特率 230400 ≠ 程序波特率 115200" |
-| ③ | 观察串口 | 横幅有 `BUILD=m5_board-diag-2026-09-21c …`；步2.5/2.6/2.7 三行的结论分别是 `R2FIX: yes` / `MEXT: OK` / `STACKBF: OK`；末尾 `RESULT: RV32GC-M5-OK` | 见下表 |
+| ③ | 观察串口 | 横幅有 `BUILD=m5_board-diag-2026-09-21d …`；步2.5/2.6/2.7 三行的结论分别是 `R2FIX: yes` / `MEXT: OK` / `STACKBF: OK`；末尾 `RESULT: RV32GC-M5-OK` | 见下表 |
 
 > ⚠️ **顺序建议**：先做 ①（bitstream），确认成功后再做 ②（程序）；反过来也物理可行，但
 > 若 ① 失败你会把"旧 bitstream + 新程序"的现象（`R2FIX: no`）误当成"程序的问题"。
@@ -414,7 +445,7 @@ grep -a -o 'cpu_mid/u_axi_master_ctrl/rdata_hold_q' \
 
 ### 7.2 判别表（把这三行抄回来即可定位）
 
-| 横幅里有 `BUILD=m5_board-diag-2026-09-21c` | 步2.6 的 `MEXT:` | 步2.5 的 `R2FIX:` | 结论 | 下一步 |
+| 横幅里有 `BUILD=m5_board-diag-2026-09-21d` | 步2.6 的 `MEXT:` | 步2.5 的 `R2FIX:` | 结论 | 下一步 |
 |---|---|---|---|---|
 | 有 | `ok` | `yes` | ✅ 新程序 + **新 bitstream**（M 扩展字段序修复 + R2 修复都在位） | 看 `RESULT`；若还是 BAD，抄回 step4/step5 原文 |
 | 有 | `BAD`（商/余数互换） | 视 bitstream 而定 | ⚠️ 新程序 + **修复前 bitstream** ⇒ FPGA 配置没换成新的（这正是本轮"现象逐字不变"的原因） | 重做 §7.1 ①，**确认 Program Device 成功**；仍为 `BAD` 则把 bitstream 文件 md5 报回来 |

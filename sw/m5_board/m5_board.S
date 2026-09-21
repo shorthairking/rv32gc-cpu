@@ -84,11 +84,11 @@
 #        Δcycle = rdcycle 增量（核周期）；Δtimer = TIMER 增量；cycles/iter = Δcycle/MEAS_ITER。
 #        判据 A（主判据）：|Δtimer − Δcycle| ≤ max(256, Δcycle/128) —— 两者都在核时钟域
 #          每拍 +1，同一窗口内增量必须相等（对 SPI Flash 取指延迟**不敏感**）。
-#        判据 B（健全性窗口）：cycles/iter ∈ [20, 300]（实测值打印；把"计数器异常/
-#          时钟域差一个量级"钉成 FAIL；**不是**主频判据）。
+#        判据 B（健全性窗口，**信息性，不参与判定**）：cycles/iter ∈ [20, 20000] ——
+#          只打印实测值与窗口，不再据此判 BAD（见 §四下 步④ "窗口为何只打印"）。
 #        ★ 2026-09-21 鲁棒化前：判据 = |ticks − 2000×59| ≤ ±40%（59 为零延迟仿真标定值）
 #          ⇒ 真机 Flash 时序下不可移植；放宽窗口会退化成"看着像过"。新判据不用任何
-#          绝对拍数常量（`XIP_CPI=59` 仅作打印参考）。
+#          绝对拍数常量（`XIP_CPI=59` 仅在打印/文档里作参考，代码不引用它）。
 #   步⑤ FREQ 回读：读 +0xF030（期望 0x01F78A40 = 33 000 000），打印十六进制与 div1e6。
 #   结论：步④ 判定 ∧（FREQ 高 20 位 == 31）∧（步2.5 R2 回环通过）⇒ 打印
 #         `RESULT: RV32GC-M5-OK`，否则 `...-BAD`。
@@ -151,14 +151,21 @@
 .equ MEAS_ITER,      2000          # 步④ delay_loop 迭代数（×≈59 拍 ≈ 1.2e5 拍 ≈ 3.5 ms）
 .equ XIP_CPI,        59            # ★ **参考**标定常量：零延迟仿真内存模型下 delay_loop 的
                                    #   "每迭代拍数"（核级仿真实测 59.02）。真机 SPI Flash XIP
-                                   #   的每指令拍数更高且不可移植 ⇒ 本常量**只用于打印参考**，
-                                   #   **不参与**判定（步④ 判据 = TIMER 与 rdcycle 增量相等，
-                                   #   见下）。改 delay_loop 循环体必须同步改它（build.sh 判据⑧
-                                   #   核对循环体结构与声明的一致性）。
-.equ CPI_SANITY_LO,  20            # 步④ 判据 B 下界：cycles/iter 低于它 ⇒ 荒谬（核没按拍跑）
-.equ CPI_SANITY_HI,  300           # 步④ 判据 B 上界：高于它 ⇒ 荒谬（远超任何 XIP 取指时序）
-                                   #   ★ 该窗口**不是**主频判据（主频由步⑤ FREQ 锚定），
-                                   #     只把"计数器异常/时钟域差一个量级"钉成 FAIL。
+                                   #   实测 ≈**4120**（≈458 拍/指令）⇒ 该常量**已不参与任何判定**，
+                                   #   也**不再出现在代码里**（2026-09-21 起步④ 的打印改用字符串
+                                   #   字面量同时给出两种口径：board-calib=4120 / sim-calib=59）。
+                                   #   保留声明只为：① 留档"仿真标定值"；② build.sh 判据⑧c/⑨d
+                                   #   仍机器核对它与 runbook 的标定值一致；③ 改 delay_loop 循环体
+                                   #   时必须同步改它（判据⑧ 核对循环体结构与声明的一致性）。
+.equ CPI_SANITY_LO,  20            # 步④ 健全性窗口下界（**信息性**）：低于它 ⇒ 核没按拍跑
+.equ CPI_SANITY_HI,  20000         # 步④ 健全性窗口上界（**信息性**）：
+                                   #   ★ 2026-09-21 放宽 300 → 20000 ——上板实测约 **4120**（真机 SPI Flash
+                                   #     XIP 无缓存，每取指走平台 Flash 桥 ≈458 拍/指令），而上界原按
+                                   #     零延迟仿真标定值 59 的量级定为 300 ⇒ 真实标定值被判 "BAD"。
+                                   #     真实口径并存：板级 **4120** / 仿真 **59**。
+                                   #   ★ 该窗口**不是**主频判据（主频由步⑤ FREQ 锚定），也**不再参与判定**
+                                   #     ——只打印实测值与窗口，便于一眼分辨平台差异；BAD 只由
+                                   #     判据 A（TIMER ↔ rdcycle 增量一致）与步⑤ FREQ 锚定共同决定。
 .equ DELAY_HB_TICKS, 8000000       # 心跳间隔 = 8e6 拍 ≈ 0.24 s @33 MHz（TIMER 拍 = 核周期）
 .equ DELAY_SW_TICKS, 10000000      # 步③ 停留 = 1e7 拍 ≈ 0.3 s（便于观察 LED 跟随开关）
 
@@ -476,10 +483,19 @@ stk_done:
     #         同一窗口内两者增量必须相等：
     #             |Δtimer − Δcycle| ≤ tol = max(256, Δcycle/128)   （≈1%，足够钉住
     #             "TIMER 没按核周期走 / 分频 / 停摆"这类会让全部可见延时失效的错）
-    #       判据 B（健全性窗口，诊断 + 荒谬值兜底）：cycles/iter = Δcycle / MEAS_ITER
-    #         必须落在 [CPI_SANITY_LO, CPI_SANITY_HI] = [20, 300]（实测值原样打印）。
-    #         ★ 它**不是**主频判据：主频由步⑤ FREQ(=0x01F78A40=33 MHz) 锚定；
-    #           本窗口只把"核根本没按拍跑 / 时钟域差一个量级"钉成 FAIL。
+    #       判据 B（健全性窗口，**信息性：只打印，不参与 BAD 判定**）：cycles/iter =
+    #         Δcycle / MEAS_ITER 落在 [CPI_SANITY_LO, CPI_SANITY_HI] = [20, 20000]；
+    #         实测值原样打印，方便"一眼看出是不是换平台/换 Flash"。
+    #         ★ 为什么降级为信息性（2026-09-21 上板实测；本文件 §四下"窗口为何只打印"）：
+    #           真机 SPI Flash XIP（无缓存、每取指走平台 Flash 桥）实测 ≈**4120** 拍/迭代
+    #           （≈458 拍/指令），而窗口上界原按**零延迟仿真**标定值 **59** 的量级定为 300
+    #           ⇒ 真实标定值被误判 BAD。真实口径两者并存：板级 4120 / 仿真 59。
+    #         ★ 窗口不再是判据 ⇒ BAD 判定只由两条**真判据**决定：
+    #             ① 判据 A：|Δtimer − Δcycle| ≤ max(256, Δcycle/128)（同域两计数器必须同步）
+    #             ② 步⑤ FREQ 锚定：div1e6 == 33 ∧ FREQ>>20 == 31（主频口径）
+    #           —— 这正是"信息性窗口"与"放水判据"的区别：放水会削弱 BAD 的触发能力，
+    #              而这里被降级的那条判据，其职责已由 A（计数器一致性）+ 步⑤（主频锚定）
+    #              完全覆盖；窗口只留下"一眼可见"的诊断价值。
     #   为什么这样更严：旧判据在"TIMER 完全不走"或"TIMER 被分频"时可能仍然通过
     #   （只要绝对拍数落进 ±40% 窗口），新判据直接比较两个独立计数器的增量。
     #--------------------------------------------------------------------------
@@ -509,20 +525,18 @@ tl_tol:
                                    #   步⑤ 打印 div1e6 时会再调一次 udiv，而 udiv 内部用 t2 存商
                                    #   ⇒ 坏标志绝不能放 t 系列，否则被覆盖成商值 ⇒ 恒判 BAD）
 
-    #   ---- 判据 B（健全性）：cycles/iter = Δcycle / MEAS_ITER ∈ [LO, HI] ----
+    #   ---- 健全性窗口（**信息性：只打印，不参与判定**）----
+    #   cycles/iter = Δcycle / MEAS_ITER 仍然算出并原样打印（见下面 str_tpiwin 一行），
+    #   但不与 CPI_SANITY_LO/HI 比较、不置任何坏标志 ⇒ BAD 只由判据 A 与步⑤ FREQ 决定。
+    #   ★ 删除的原逻辑：`bltu s7,LO ⇒ tp_bad` / `bltu HI,s7 ⇒ tp_bad`（曾把 s11 置 1）
+    #     —— 真机 4120 落在旧窗口 [20,300] 之外会被误判（见 §四下 步④ 注释）。
+    #   ★ 注意 udiv 会破坏 t0..t6（t2/t3…），故此处**不得**再用 t 系列持有坏标志；
+    #     s11 原样保留（判据 A 的结论）。
     mv    a0, s3
     li    a1, MEAS_ITER
     jal   ra, udiv                 # a0 = Δcycle / MEAS_ITER = cycles/iter
-    mv    s7, a0                   # s7 = cycles/iter（现场实测值，打印用）
-    li    t0, CPI_SANITY_LO
-    bltu  s7, t0, tp_bad           # 低于下限 ⇒ 荒谬（核没有按拍推进/计数器异常）
-    li    t0, CPI_SANITY_HI
-    bltu  t0, s7, tp_bad           # 高于上限 ⇒ 荒谬（远超任何可解释的 XIP 取指时序）
-    j     tp_flags
-tp_bad:
-    li    s11, 1                   # 坏 = 1（与判据 A 同极性，统一口径）
-tp_flags:
-    xori  s8, s11, 1               # ★ s8(x24) = 1 ⇒ 步④ 通过（供 LED/数码管显示）
+    mv    s7, a0                   # s7 = cycles/iter（现场实测值，**仅用于打印**）
+    xori  s8, s11, 1               # ★ s8(x24) = 1 ⇒ 步④ 通过（只由判据 A 决定；供 LED/数码管显示）
 
     #   数码管 <= 0x4000 | (cycles/iter 低 4 bit) | (判定 << 20)
     andi  t0, s7, 0xF
@@ -553,14 +567,13 @@ tp_flags:
     jal   ra, puts_str             # ", cycles/iter = "
     mv    a0, s7
     jal   ra, puts_dec
+    #   ---- 窗口/标定值（**信息性 only**）：一行打印完，避免把"窗口"误读成判据 ----
+    #   ★ 2026-09-21：判据 B 窗口降级为信息性（不再参与 BAD 判定，见上）；这一行继续打印
+    #     实测 cycles/iter 与窗口、并同时给出**两种标定口径**（板级 4120 / 仿真 59），
+    #     便于以后换平台、换 Flash 时序时一眼看出差异。三个数值都是**打印专用**。
     lui   a0, %hi(str_tpiwin)
     addi  a0, a0, %lo(str_tpiwin)
-    jal   ra, puts_str             # ", window = 20..300, sim-calib = "
-    li    a0, XIP_CPI
-    jal   ra, puts_dec
-    lui   a0, %hi(str_tpical)
-    addi  a0, a0, %lo(str_tpical)
-    jal   ra, puts_str             # " cycles/iter (informational only)\r\n"
+    jal   ra, puts_str             # " (informational only; window 20..20000; board-calib=4120, sim-calib=59 cycles/iter)\r\n"
 
     #--------------------------------------------------------------------------
     # 步⑤ FREQ 回读
@@ -932,10 +945,14 @@ str_tpiavg:
     .asciz ", cycles/iter = "
     .align   2
 str_tpiwin:
-    .asciz ", window = 20..300, sim-calib = "
-    .align   2
-str_tpical:
-    .asciz " cycles/iter (informational only)\r\n"
+    #   ★ 一行打印完（**informational only** = 不参与 BAD 判定，只供人眼分辨平台差异）：
+    #     实测 cycles/iter 已在前一条 puts_dec 打印；这里给窗口与**两种标定口径**：
+    #       板级 board-calib = 4120（真机 SPI Flash XIP 实测，每取指 ≈458 拍）、
+    #       仿真 sim-calib   = 59（零延迟仿真内存模型标定）。
+    #     ★ 该 `.asciz` 必须在**同一条**里写完（GNU as 每条 `.asciz` 都补 NUL；见文件头 §三点五）。
+    #     ★ 文本里**不得出现**被 build.sh 判据⑨d 正则（`cycles/iter[^0-9]*[0-9]+`）误抓的数字：
+    #       仿真标定值 59 必须紧跟 "cycles/iter"（紧邻才是 XIP_CPI 口径）。
+    .asciz " (informational only; window 20..20000; board-calib=4120, sim-calib=59 cycles/iter)\r\n"
     .align   2
 #   ---- 步2.5 DDR3 回环判别的打印串（拼成一行；R2FIX 结论在行尾，便于 grep）----
 str_ddr:
@@ -1005,6 +1022,6 @@ msg_boot:
     #     读到第一个 NUL 就返回 —— 旧版把三行拆成三条 `.asciz` ⇒ 上板只打印第 1 行，
     #     runbook §4 期望的 `UART 115200 …` / `RESET_PC=…` 两行**从来没打出来过**。
     #     机器护栏：build.sh 判据⑪h 核对 .rodata 里横幅四行**首尾相接**（中间无 NUL）。
-    .asciz "\r\nRV32GC-M5 board test (chiplab / xc7a200tfbg676-2) @ 33MHz\r\nBUILD=m5_board-diag-2026-09-21c (stack-free prints; R2+MEXT+stack probes)\r\nUART 115200 8N1 (divisor=18, PCLK=33MHz -> 114583 Bd)\r\nRESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only\r\n"
+    .asciz "\r\nRV32GC-M5 board test (chiplab / xc7a200tfbg676-2) @ 33MHz\r\nBUILD=m5_board-diag-2026-09-21d (stack-free prints; R2+MEXT+stack probes; CPI window informational)\r\nUART 115200 8N1 (divisor=18, PCLK=33MHz -> 114583 Bd)\r\nRESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only\r\n"
 
     .end

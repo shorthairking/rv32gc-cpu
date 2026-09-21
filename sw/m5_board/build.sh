@@ -222,7 +222,12 @@ check "判据⑧e：反汇编含 delay_ticks 与 timer_now" \
 #     ① 源码里确实有 `rdcycle`（否则判据会退化成只看 TIMER 自己，自洽但无意义）
 #     ② 反汇编里确实出现读 cycle CSR 的指令（`-march=rv32im_zicsr` 生效 + 真读 0xC00）
 #     ③ 健全性窗口常量 CPI_SANITY_LO/HI 存在且量级合理（下界 ≥ 循环体 9 条指令、
-#        上界 ≤ 400）—— 防止把窗口改成"必过"（如 [1, 1000000]）
+#        上界 ≤ 1e6 且 > 下界）—— 仍 fail-closed：窗口必须**有界且有意义**，
+#        防止改成 `[1, 4294967295]` 这类无界/必过的样子货（`[LO,HI]` 也仍要打印出来）。
+#        ★ 2026-09-21 上板实测：窗口上界 300 → **20000**（真机 SPI Flash XIP 实测
+#          ≈**4120** 拍/迭代 ⇒ 原上界把**真实标定值**误判 BAD）。同时该窗口已**降级为
+#          信息性**（只打印、不参与 BAD 判定，判据由 A + 步⑤ 承担）⇒ 这里的上界校验
+#          放宽到 **1e6**：既然它不再是判据，就不该再要求它"窄"；有界 + 有序即可。
 #     ④ 旧的"绝对标定拍数"判据（TGT_TICKS/TGT_TOL）不得残留
 #   rdcycle rd, cycle, x0 的编码 = csrrs rd, 0xC00, x0 ⇒ 反汇编渲染为
 #   `csrrs x<rd>,cycle,x0`（-M no-aliases）；这里按助记符+CSR 名匹配，容忍别名渲染。
@@ -232,10 +237,10 @@ check "判据⑧f2：反汇编含读 cycle CSR（csrrs ...,cycle,...）" \
       grep -qE 'csrrs?[[:space:]]+x[0-9]+,(cycle|0xc00),x0' "${OUT}/m5_board.text.dis"
 SAN_LO="$(grep -oE '^\.equ[[:space:]]+CPI_SANITY_LO,[[:space:]]+[0-9]+' "$SRC" | grep -oE '[0-9]+$')"
 SAN_HI="$(grep -oE '^\.equ[[:space:]]+CPI_SANITY_HI,[[:space:]]+[0-9]+' "$SRC" | grep -oE '[0-9]+$')"
-say "== 源码 CPI 健全性窗口 = [${SAN_LO:-?}, ${SAN_HI:-?}]"
+say "== 源码 CPI 健全性窗口 = [${SAN_LO:-?}, ${SAN_HI:-?}]（信息性；不参与 BAD 判定）"
 check "判据⑧f3：健全性窗口下界 ≥ 9（循环体指令数）" test "${SAN_LO:-0}" -ge 9
-check "判据⑧f4：健全性窗口上界 ≤ 400（不得改成必过窗口）" \
-      test "${SAN_HI:-99999}" -le 400 -a "${SAN_HI:-0}" -gt "${SAN_LO:-0}"
+check "判据⑧f4：健全性窗口上界有界且 > 下界（≤ 1e6；窗口本身不参与判定，但不得改成无界/必过）" \
+      test "${SAN_HI:-99999999}" -le 1000000 -a "${SAN_HI:-0}" -gt "${SAN_LO:-0}"
 check "判据⑧f5：步④ 判据不再依赖绝对标定拍数（无 TGT_TICKS/TGT_TOL 残留）" \
       bash -c "! grep -qE '^\.equ[[:space:]]+(TGT_TICKS|TGT_TOL),' '$SRC'"
 
@@ -423,7 +428,7 @@ check "判据⑪f3：步2.7 栈字节探针在位（反汇编含 addi x28,x2,-64
                grep -qE 'lbu[[:space:]]+x[0-9]+,-?[0-9]+\(x28\)' '${OUT}/m5_board.text.dis'"
 #   ⑫ BUILD 标记（"板上跑的是哪份镜像"的判定依据）：源码与 .rodata 都必须含下面这条，
 #     且与 build.sh 里的期望值**一字不差**（防止改了程序忘了改标记 ⇒ 标记失去意义）。
-EXPECT_BUILD_TAG="BUILD=m5_board-diag-2026-09-21c"
+EXPECT_BUILD_TAG="BUILD=m5_board-diag-2026-09-21d"
 check "判据⑫a：源码含 BUILD 标记 ${EXPECT_BUILD_TAG}" \
       grep -qF "${EXPECT_BUILD_TAG}" "$SRC"
 check "判据⑪g：m5_diag.bin 与 m5_board.bin 逐字节一致" cmp -s "${OUT}/m5_board.bin" "${OUT}/m5_diag.bin"
@@ -452,8 +457,8 @@ elf, tmp = sys.argv[1], sys.argv[2]
 subprocess.run(["/opt/riscv/bin/riscv32-unknown-linux-gnu-objcopy", "-O", "binary",
                 "-j", ".rodata", elf, tmp], check=True)
 blob = open(tmp, "rb").read()
-need = [b"33MHz\r\nBUILD=m5_board-diag-2026-09-21c",
-        b"R2+MEXT+stack probes)\r\nUART 115200 8N1 (divisor=18",
+need = [b"33MHz\r\nBUILD=m5_board-diag-2026-09-21d",
+        b"stack probes; CPI window informational)\r\nUART 115200 8N1 (divisor=18",
         b"114583 Bd)\r\nRESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only",
         b"-> R2FIX: "]
 miss = [n for n in need if n not in blob]
