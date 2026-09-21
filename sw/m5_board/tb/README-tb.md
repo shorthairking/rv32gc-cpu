@@ -11,13 +11,18 @@
 | 文件 | 作用 |
 |---|---|
 | `confreg_axi_filter.v` | **AXI4 地址过滤层 + 上板 CONFREG 行为模型**。插在 `core_top`（主）与 `sim_mem_model`（从）之间：地址落在 `0x1FD0_0000–0x1FD0_FFFF` 的读/写自答，其余**逐字段透传**。实现 `+0xF000` LED（读写）、`+0xF010` 数码管（读写）、`+0xF020` switch（只读，`SWITCH_VAL=8'hA5`）、`+0xF030` FREQ（只读，`32'd33000000`）、`+0xE000` TIMER（自由运行、写任意值清零）。读数据在 **AR 握手拍寄存并保持**（= 上板 `confreg_syn.v:295` 行为；见 §5.5）。两个**从设备行为模型开关**：`R_STICKY`（CONFREG 侧保持，默认 1 = 上板口径）、`DDR_R_NONHOLD`（DDR3/XIP 侧：1 = **非保持型 R 通道**，RDATA 只在 `m_rvalid & m_rready` 拍有效，其余拍为 0，= 真实 MIG / 流水化互连口径；默认 0 = 原样透传）。输出判据/诊断观测：首笔 AR、五寄存器访问标志、AXI 轨迹、路由一致性计数。 |
-| `tb_m5_board.sv` | **顶层 TB**：48 端口逐字例化 `core_top` + 过滤层 + `sim_mem_model`；时钟半周期 15.1515 ns（周期 30.303 ns ≈ 33.0 MHz，上板口径）；复位 20 拍后负沿释放；`intrpt=0`；UART 子串匹配（滚动窗口，逐字节增量，支持"结果行前缀 + 宽限字节"提前收尾）；AXI 区域统计与轨迹直方图；判据 C0–C5、PASS/FAIL 输出。 |
-| `run_tb.sh` | 编译（`iverilog -g2012 -I rtl/pkg -I <repo>` + `rtl/**/*.v` 全量）+ 运行（`stdbuf` 行缓冲）+ 三重判定（vvp 退出码 / PASS 锚点恰 1 行 / 无 `FAIL` 字样）；日志落 `tb/out/`；**失败即非零退出**。 |
+| `tb_m5_board.sv` | **顶层 TB**：48 端口逐字例化 `core_top` + 过滤层 + `sim_mem_model`；时钟半周期 15.1515 ns（周期 30.303 ns ≈ 33.0 MHz，上板口径）；复位 20 拍后负沿释放；`intrpt=0`；UART 子串匹配（滚动窗口，逐字节增量，支持"结果行前缀 + 宽限字节"提前收尾）；AXI 区域统计与轨迹直方图；判据 C0–C5（+ **可选 C6**）、PASS/FAIL 输出。 |
+| `run_tb.sh` | 编译（`iverilog -g2012 -I rtl/pkg -I <repo>` + RTL 全量）+ 运行（`stdbuf` 行缓冲）+ 三重判定（vvp 退出码 / PASS 锚点恰 1 行 / 无 `FAIL` 字样）；日志落 `tb/out/`；**失败即非零退出**。新增两个环境变量：**`EXPECT_EXTRA`**（可选判据 C6 的子串；默认空 = 不启用 ⇒ C0–C5 语义不变）与 **`RTL_DIR`**（RTL 源目录，默认 `rtl`；旧 RTL 注入反证用 `tb/scratch/oldrtl`）。 |
+| `make_oldrtl_overlay.sh` | **旧 RTL 只读拷贝**生成器：`tb/scratch/oldrtl/` = `rtl/**` 逐字节拷贝 + 两个文件换成 **R2 修复前**版本（`git show 68ff5fd:<path>`，只读；**不用** checkout/stash/reset）⇒ 反证实验期间**一行 `rtl/**` 都不改**（脚本前后自证 `rtl/**` md5 汇总一致）。 |
+| `run_diag_matrix.sh` | **诊断版三配置仿真矩阵**（本轮主证据入口）：`diag_hold`（修复后+保持型）、`diag_nonhold`（修复后+非保持型）、`diag_old_nonhold`（**修复前**+非保持型）三跑并行，末尾逐条比对期望（前两个 PASS + `R2FIX: yes`；第三个必 FAIL 且 step2.5 回环必红）+ A/B UART 字节流比对 + `rtl/**` 指纹自证。 |
 | `ctrl/ct_selftest.S` | **控制实验 A（测试台自检）**：独立编写的最小程序，点亮"CONFREG 五寄存器读写 + UART 捕获 + 复位取指"。预期 **PASS** —— 证明判定链本身有效。 |
 | `ctrl/ct_delay_probe.S` | **控制实验 C**：用**与 m5 逐字相同的 `delay_loop`**（7×`nop`+`addi`+`bnez` = 9 条指令）+ CONFREG TIMER 实测 `cycles/iter`，给步④ 标定常量 `XIP_CPI` 一个硬数字。 |
 | `ctrl/make_scaled.py` | 生成**控制实验 B**：把冻结程序只做**与判据无关**的挂钟常量缩放（`DELAY_HB_TICKS`、`DELAY_SW_TICKS`），其余逐字不动；每处替换断言"恰好命中 1 次"。 |
 | `ctrl/diff_equiv.py` | **等价性机器证据**：冻结 hex 与缩放 hex 逐字比对，列出全部差异字并反汇编，断言差异 ≤ 8 字。 |
 | `ctrl/build_ctrl.sh` | 用与 `sw/m5_board/build.sh` 同口径的工具链/链接参数构建三个控制程序。 |
+| `ip/tb_ip_div.v` + `ip/run_ip_div_xsim.sh` | ★ **真实 div_gen IP 的时序/字段序探针**（xsim）：直接驱动 `fpga/ip/rv32_div/rv32_div_sim_netlist.v`（Vivado 加密功能模型），实测 59/10 ⇒ `tdata=0x00000005_00000009`、118049/2000 ⇒ `0x0000003b_00000031` ⇒ **字段序 = {商[63:32], 余数[31:0]}**。 |
+| `ip/tb_mdu_ip.v` + `ip/run_mdu_ip_xsim.sh` | ★ **mdu 的 IP 分支自检**（xsim）：`-d RV32GC_USE_VIVADO_IP` + 真实 div_gen/mult_gen 网表，25 个向量覆盖 MUL/MULH/MULHSU/MULHU/DIV/DIVU/REM/REMU 与 ISA 边界（除零、-2^31/-1、向零取整）。修复前 15 条 FAIL（商余数互换）、修复后 25/25 PASS；`--expect-fail` / `MDU_SRC=<修复前只读副本>` 做**不改 rtl/** 的反证。 |
+| `ip/mdu_prefix_ref.v` / `ip/mdu_ipfix.v` | 修复前 / 修复后的 `mdu.v` **只读副本**（前者由 `git show HEAD:rtl/exec/mdu.v` 取出，md5 `d96ed0ce…`；后者 md5 `30a1ab7f…`）—— 供反证与复核用。 |
 | `out/` | 全部日志与编译产物。 |
 
 ---
@@ -46,7 +51,8 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_selftest.hex RUN_TAG=ctl_a_nosticky R_STICKY
 ```
 
 环境变量：`PROG_HEX`、`TIMEOUT_CYCLES`、`TOP`、`RUN_TAG`、`PROGRESS_EVERY`、`TRACE_PRINT_N`、
-`UART_PRINT_MAX`、`R_STICKY`（默认 **1**）、`DDR_R_NONHOLD`（默认 **0**）、`RD_TRACE_WINDOW`（默认 0）。
+`UART_PRINT_MAX`、`R_STICKY`（默认 **1**）、`DDR_R_NONHOLD`（默认 **0**）、`RD_TRACE_WINDOW`（默认 0）、
+`EXPECT_EXTRA`（默认**空** = 判据 C6 不启用）、`RTL_DIR`（默认 `rtl`）。
 
 **非保持型 R 通道模型（2026-09-21 新增，用于 R2 缺陷复现/反证）**：
 ```bash
@@ -54,6 +60,30 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_selftest.hex RUN_TAG=ctl_a_nosticky R_STICKY
 PROG_HEX=sw/m5_board/tb/ctrl/out/ct_m5_scaled.hex RUN_TAG=ctl_b_v7_hold    TIMEOUT_CYCLES=6000000 bash sw/m5_board/tb/run_tb.sh
 PROG_HEX=sw/m5_board/tb/ctrl/out/ct_m5_scaled.hex RUN_TAG=ctl_b_v7_nonhold DDR_R_NONHOLD=1 TIMEOUT_CYCLES=6000000 bash sw/m5_board/tb/run_tb.sh
 ```
+
+**★ 诊断版三配置矩阵（2026-09-21 本轮主证据；一条命令跑完 A/B/C）**：
+```bash
+bash sw/m5_board/tb/run_diag_matrix.sh
+#   diag_hold        修复后 RTL + 保持型   ⇒ 期望 PASS（step2.5: word=0x12345678 byte=0x5A R2FIX: yes）
+#   diag_nonhold     修复后 RTL + 非保持型 ⇒ 期望 PASS（且 UART 字节流与 hold 逐字节相同）
+#   diag_old_nonhold 修复前 RTL + 非保持型 ⇒ 期望 FAIL（step2.5 回环必红）
+# 汇总日志：tb/out/diag_matrix.log；三份完整日志：tb/out/diag_{hold,nonhold,old_nonhold}.log
+```
+其中"修复前 RTL"来自 `tb/scratch/oldrtl/`（由 `make_oldrtl_overlay.sh` 生成：
+`rtl/**` 只读拷贝 + `git show 68ff5fd:` 取出的两个旧文件，**全程不改 `rtl/**`**）。
+
+**★ M 扩展 IP 分支验证（2026-09-21 第三轮 · 板上十进制乱码根因；xsim）**：
+```bash
+# ① 真实 div_gen 的字段序（本轮的根因证据）：59/10 ⇒ 高半=5(商)、低半=9(余数)
+bash sw/m5_board/tb/ip/run_ip_div_xsim.sh
+# ② mdu 的 IP 分支自检：修复后 25/25 PASS
+bash sw/m5_board/tb/ip/run_mdu_ip_xsim.sh
+# ③ 反证（**不改 rtl/**）：拿修复前的只读副本 ⇒ 同一 TB 15 条 FAIL（商余数互换）
+MDU_SRC=sw/m5_board/tb/ip/mdu_prefix_ref.v bash sw/m5_board/tb/ip/run_mdu_ip_xsim.sh --expect-fail
+```
+为什么必须用 **xsim**：Vivado 生成的 IP 网表是 `pragma protect` **加密**的，iverilog/Verilator
+不能编译 ⇒ 历次回归只覆盖 `mdu.v` 的**行为分支**（板上跑的是 IP 分支！）。xsim 自带解密密钥，
+配合预编译 `unisims_ver` 原语库与 `glbl` 即可把 IP 分支拉进仿真闭环。
 
 ---
 
@@ -67,9 +97,14 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_m5_scaled.hex RUN_TAG=ctl_b_v7_nonhold DDR_R
 | C3 | UART 捕获序列出现子串 `RESULT: RV32GC-M5-OK`（结果行出现后宽限 4 字节即判定确定，可提前收尾；不放宽判据） | 同上 |
 | C4 | 捕获到 `0x1FD0F000`（LED）写，且 `+0xF020`/`+0xE000`/`+0xF030` 读各 ≥1 | **上游 AR/AW 握手** |
 | C5 | `TIMEOUT_CYCLES` 拍内未出现结果行 ⇒ FAIL | TB 主流程 |
+| C6 | **可选（默认关闭）**：`EXPECT_EXTRA` 非空时，UART 捕获序列必须出现该子串（诊断版用 `R2FIX: yes`） | TB 内部 |
 
 `sim_mem_model` 的 `UART_QUEUE_DEPTH` 由本 TB 覆盖为 **65536**（默认 64 装不下每轮约 500–700 字节
 的输出；溢出会让 C3 永远不可能命中）。
+
+> ★ **C6 为什么默认关闭**：判据 C0–C5 是上一轮冻结的判定语义（老程序、控制实验都按它判）。
+> C6 只在显式传 `EXPECT_EXTRA` 时参与 ⇒ 既给诊断版加了机器判据，又不改变任何历史运行的口径。
+> `EXPECT_EXTRA` 是**fail-closed** 的：非空而未命中 ⇒ `FAIL C6`（已用 `ct_selftest` + 假子串实测，见 §4）。
 
 ---
 
@@ -86,6 +121,20 @@ PROG_HEX=sw/m5_board/tb/ctrl/out/ct_m5_scaled.hex RUN_TAG=ctl_b_v7_nonhold DDR_R
 | `ctl_b_v7_hold` | **R2 修复后**缩放五步程序（`DDR_R_NONHOLD=0`，保持型从设备） | **PASS**：C0–C5 全过；2 920 848 拍 / 626 字节；步④ `timer delta = 118055, cycle delta = 118049, cycles/iter = 59`；步⑤ `FREQ = 0x01F78A40 (div1e6 = 33 MHz)`；`RESULT: RV32GC-M5-OK` |
 | `ctl_b_v7_nonhold` | **R2 修复后**同程序 + `DDR_R_NONHOLD=1`（非保持型 R 通道 = MIG 口径） | **PASS**：C0–C5 全过；**2 920 848 拍 / 626 字节，且 UART 字节流与 `ctl_b_v7_hold` 逐字节相同**（`cmp` 为空）⇒ 修复后核不再依赖从设备保持 RDATA |
 | `r2_cp_B_oldrtl_nonhold` | **反证**：临时还原旧采样 RTL + `DDR_R_NONHOLD=1` | **FAIL**（预期）：程序在第 ~26 条指令就跑飞（只出 1 个 UART 字节、无 CONFREG 访问、超时）|
+
+### 4.1 第三轮（2026-09-21 · 诊断版：stack-free 打印 + 四个探针 + M 扩展根因）
+
+| 运行 | 配置 | 结果 |
+|---|---|---|
+| `diag_hold` | 修复后 RTL + 保持型 R（`DDR_R_NONHOLD=0`）；`EXPECT_EXTRA="R2FIX: yes"` | **PASS**：C0–C6 全过，4 322 567 拍完成；`step2.5 … word=0x12345678 re-read=0x12345678 byte=0x5A … R2FIX: yes`；`step2.6 MEXT=00000005 00000009 0000003B 00000031 00000000 00000000 0000002A 40000000 FFFFFFFE -> MEXT: OK`；`step2.7 stack[16B]=30 31 … 46 -> STACKBF: OK`；`step4 timer delta = 118055, cycle delta = 118049, cycles/iter = 59`；`RESULT: RV32GC-M5-OK` |
+| `diag_nonhold` | 修复后 RTL + **非保持型** R（`DDR_R_NONHOLD=1` = MIG 口径） | **PASS**：同上逐行相同，**且 UART 字节流与 `diag_hold` 逐字节相同（1168 字符，`cmp` 为空）** |
+| `diag_old_nonhold` | **修复前** RTL（`tb/scratch/oldrtl` 只读拷贝，R2 缺陷在位）+ 非保持型 R | **FAIL**（预期，反证）：`step2.5 … word=0x00000000 re-read=0x00000000 byte=0x00 -> R2FIX: no`；`step2.7 stack[16B]=00 00 … -> STACKBF: BAD`；`RESULT: RV32GC-M5-BAD` ⇒ **三个探针确实能抓到旧 bitstream** |
+| xsim `run_ip_div_xsim.sh` | 真实 `rv32_div` IP（加密网表，xsim 解密） | **PASS**：59/10 ⇒ `tdata=0x00000005_00000009`、118049/2000 ⇒ `0x0000003b_00000031`、`0x19999999_00000005`（max/10）⇒ **字段序 = {商[63:32], 余数[31:0]}**，`start→done` 实测 37 拍 |
+| xsim `run_mdu_ip_xsim.sh` | `mdu` **IP 分支**（`-d RV32GC_USE_VIVADO_IP` + 真实 div/mult IP） | **修复前 15/25 FAIL**（商余数互换，日志 `out/xsim_prefix.log`）⇒ **修复后 25/25 PASS**（`out/xsim.log`） |
+
+> ★ `diag_old_nonhold` 里 `MEXT: OK` 是**预期**的：iverilog 跑的是 `mdu.v` 的**行为分支**
+> （function 实现，商余数本来正确）——M 扩展那个缺陷只存在于 **IP 分支**，只能用 xsim 复现
+> （见 §4.1 末两行）。这也正是"板上一眼判据"必须放进程序（步2.6）的原因。
 
 ---
 
@@ -195,14 +244,18 @@ CONFREG 的 FREQ 十六进制正常（`confreg_syn` 寄存器保持型），但 
 * 程序版本沿革（本任务期间作者并发修改）：`m5_board.S` md5 依次为
   `b7e5ee14…` → `503dfae4…` → `3c8a3a37…` → `ca055abf…`（TB 每轮结论均标注对应 md5）。
 
-## 7. 红线不变式（本轮 = 2026-09-21 R2 修复）
+## 7. 红线不变式（逐轮记录）
 
 ```bash
-find rtl -name '*.v' | sort | xargs md5sum | md5sum
-#   本轮开始前（修复前）：ef20b2c0d17fbd07016b44bdd05dd822（38 个 .v）
-#   本轮结束后（修复后）：0e20b6182e3ad96ae8d70680c2b51aa8（38 个 .v）
-#   —— **唯一变化**：`rtl/axi/axi_master_ctrl.v`（新增 rdata_hold 锁存输出）
-#      与 `rtl/top/core_top.v`（数据读/AMO 读相改取锁存值；删除实时直通线）。
+find rtl -name '*.v' | sort | xargs md5sum | md5sum          # 仅 *.v
+find rtl \( -name '*.v' -o -name '*.vh' \) | sort | xargs md5sum | md5sum   # *.v + *.vh
+#   ① R2 修复轮（2026-09-21）：*.v = ef20b2c0… → 0e20b6182e3ad96ae8d70680c2b51aa8（38 个 .v）
+#      唯一变化 = `rtl/axi/axi_master_ctrl.v`（新增 rdata_hold 锁存输出）
+#                 与 `rtl/top/core_top.v`（数据读/AMO 读相改取锁存值；删除实时直通线）。
+#   ② 第三轮（2026-09-21，本轮）：*.v = 0e20b618… → **ce31b3c8c51fd813c6437ba9af29e54a**
+#      （*.v + *.vh = 66e3225645b6f29375c786fe166448d6）
+#      **唯一变化** = `rtl/exec/mdu.v`（IP 分支 div_gen 输出字段序：{余数,商} → {商,余数}；
+#      行为分支一字未动）。两个只在 IP 分支生效的 wire 改写 + 注释同步。
 ```
 
 * 本轮**故意**改了上述两个 RTL 文件（R2 根因修复，任务授权范围内）；

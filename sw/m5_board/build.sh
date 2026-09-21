@@ -5,6 +5,8 @@
 # 用法 : ./sw/m5_board/build.sh [--clean]
 # 产物 : sw/m5_board/out/m5_board.elf     —— 可执行（链接 0x1C00_0000）
 #        sw/m5_board/out/m5_board.bin     —— **烧写镜像**（原始二进制，从 Flash 偏移 0 起）
+#        sw/m5_board/out/m5_diag.bin      —— **诊断版镜像**（与 m5_board.bin 逐字节相同的显式
+#                                            命名副本；runbook 诊断节引用它 ⇒ 用户不会拿错）
 #        sw/m5_board/out/m5_board.hex     —— iverilog $readmemh 用（4B/行）
 #        sw/m5_board/out/m5_board.dis     —— 反汇编（供人工核对，随交付留档）
 #        sw/m5_board/out/m5_board.size    —— 镜像大小（字节）
@@ -17,6 +19,10 @@
 #   ⑤ `nm` 中**不存在**重定位/绝对地址符号表项导致运行期依赖（用 readelf -r 判定：无 R_RISCV_32 类
 #      绝对重定位；只有 R_RISCV_JAL/BRANCH/HI20/LO12 这类 PC 相对或同段内相对重定位）；
 #   ⑥ 镜像首字 != 0（不是空白 Flash），且首 4 字节 == 反汇编第一条指令的编码。
+#   ⑦ 反汇编无非法/未知编码；⑧ delay_loop 结构 + XIP_CPI 自洽；⑨ CONFREG/UART 基址与偏移；
+#   ⑩ 跨子程序"存活值"寄存器体检（s8/s9/s10/s11）；
+#   ⑪ ★ 诊断版专用（2026-09-21）：打印路径**无栈访存** + DDR3 回环探针在位 + 无 M 扩展指令
+#      + 探针地址不与任何已分配段重叠 + m5_diag.bin 与 m5_board.bin 一致（详见 §⑪）。
 #==============================================================================
 set -uo pipefail
 
@@ -105,6 +111,8 @@ say "PASS: 编译/链接成功 ⇒ ${OUT}/m5_board.elf"
     "$OBJDUMP" -s -j .rodata "${OUT}/m5_board.elf"
 } > "${OUT}/m5_board.dis" 2>>"$LOG"
 run "$OBJCOPY" -O binary "${OUT}/m5_board.elf" "${OUT}/m5_board.bin"
+# ★ 诊断版镜像（显式命名副本；内容必须与 m5_board.bin 逐字节相同 ⇒ 判据⑪g 用 cmp 核对）
+cp -f "${OUT}/m5_board.bin" "${OUT}/m5_diag.bin"
 run "$READELF" -a "${OUT}/m5_board.elf" > "${OUT}/m5_board.readelf" 2>>"$LOG"
 run "$NM" -n "${OUT}/m5_board.elf" > "${OUT}/m5_board.nm" 2>>"$LOG"
 
@@ -291,6 +299,174 @@ check "判据⑩d：FREQ 的 MHz 整数部分用自写 udiv（不能出现 *du/M
       bash -c "! grep -qE '\b(divu|remu|div|rem)[[:space:]]' '${OUT}/m5_board.text.dis' || grep -q '<udiv>:' '${OUT}/m5_board.text.dis'"
 
 #------------------------------------------------------------------------------
+# ⑪ ★ 诊断版专用判据（2026-09-21 新增；本轮的**核心**：让"十进制打印"与 DDR3 解耦，
+#    并让"新/旧 bitstream"一眼可判）
+#   背景：R2 缺陷（旧 bitstream）下 DDR3 读回垃圾。旧版 puts_dec 把数字写进栈缓冲
+#   （sp 在 DDR3）再 lbu 读回 ⇒ 数字全乱、且无法分辨"核坏了"还是"跑的是旧 bitstream"。
+#   ⑪a 全程序**无栈访存**：反汇编里不得出现任何以 sp(x2) 为基址的访存 ⇒ 结构上证明
+#       "打印路径不依赖内存"（也不依赖任何 DDR3 缓冲）。
+#   ⑪b puts_dec/pd_one/puts_hex8/puts_hex2（打印数字的三个子程序，含内部标签）段内
+#       **不含任何访存指令** ⇒ 数字打印与存储系统完全无关。
+#   ⑪c DDR3 回环探针在位（机器级核对指令编码，见 m5_board.S §三 步2.5）：
+#       lui x5,0x8（0x000082b7 ⇒ 地址 0x8000）+ sw x6,0(x5) + lw x7,0(x5) + lw x28,0(x5)
+#       + sb x6,3(x5) + lbu x29,3(x5) + 立即数 0x12345678（lui x6,0x12345 = 0x12345337）
+#   ⑪d R2 判定接线：`or x18,x30,x31`（s2 = word坏 | byte坏）与 `or x26,x26,x18`
+#       （汇总判定并入 s2）；.dis 里含字符串 "R2FIX: yes"/"R2FIX: no"（objdump -s 的 ASCII 列）。
+#   ⑪e 探针地址 0x0000_8000 不与任何已分配段/栈重叠：ELF **无 .data/.bss**，.text/.rodata
+#       都在 0x1C00_0000 附近（不覆盖 0x8000），栈顶 0x07FF_FFF0（远高于 0x8000+4）。
+#   ⑪f 全程序**不含 M 扩展指令**（mul/div/rem 系列）—— 十进制打印改用"比较-减法 + 常量幂链"。
+#   ⑪g m5_diag.bin 与 m5_board.bin 逐字节一致（诊断镜像=烧写镜像，防止两个文件漂移）。
+#------------------------------------------------------------------------------
+check "判据⑪a：全程序无栈访存（反汇编无以 x2/sp 为基址的 lw/sw/sb/lbu…）" \
+      bash -c "! grep -qE '\b(lw|sw|sb|lbu|lhu|lb|lh|sh)[[:space:]]+x[0-9]+,-?[0-9]+\(x2\)' '${OUT}/m5_board.text.dis'"
+#   ⑪b/⑪f：按**函数地址区间**切片（起止地址由 `nm -S` 给出），逐段核对两件事：
+#     · ⑪b 这些子程序里**零访存**（打印/自写除法不碰内存 ⇒ 数字打印与存储系统无关）；
+#     · ⑪f 这些子程序里**零 M 扩展指令**（十进制打印不依赖 M；M 只在步2.6 探针里出现）。
+#       说明：不能只看源码文本（`lbu` 也可能是字符串里的字节），也不能只看符号名 ——
+#       区间切片是对**机器码**的核对：这些函数编译出来的每一条指令都在检查范围内。
+HELPER_FNS="puts_dec,pd_one,puts_hex8,puts_hex2,puts_str,puts_nl,udiv,delay_ticks"
+region_scan() {                                 # region_scan <mem|mop>
+    python3 - "${OUT}/m5_board.text.dis" "${OUT}/m5_board.elf" "$1" <<'PY'
+import re, subprocess, sys
+dis, elf, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(dis).read().splitlines()
+syms = []
+for l in subprocess.run(["/opt/riscv/bin/riscv32-unknown-linux-gnu-nm", "-S", "-n", elf],
+                        capture_output=True, text=True).stdout.splitlines():
+    p = l.split()
+    if len(p) == 4 and p[2] in ("t", "T"):
+        syms.append((int(p[0], 16), int(p[1], 16), p[3]))
+syms.sort()
+mode = sys.argv[3]
+if mode == "mem":
+    pat = re.compile(r'\b(lw|sw|sb|lbu|lhu|lb|lh|sh)\s+x')
+    what = "访存指令"
+else:
+    pat = re.compile(r'\b(mul|mulh|mulhsu|mulhu|div|divu|rem|remu)\s+x')
+    what = "M 扩展指令"
+targets = ["puts_dec", "pd_one", "puts_hex8", "puts_hex2", "puts_str", "puts_nl", "udiv", "delay_ticks"]
+bad = []
+for i, (a, sz, name) in enumerate(syms):
+    if name not in targets:
+        continue
+    b = a + sz
+    for l in lines:
+        m = re.match(r'^\s*([0-9a-f]+):', l)
+        if not m:
+            continue
+        pc = int(m.group(1), 16)
+        if a <= pc < b and pat.search(l):
+            bad.append((name, l.strip()))
+print(f"== 判据⑪{'b' if mode == 'mem' else 'f'}：打印/自写除法子程序段内 {what} 检查（区间切片）")
+for name, l in bad:
+    print(f"   {name}: {l}")
+print("   " + (f"OK：这些子程序段内零{what}" if not bad else f"发现 {len(bad)} 条{what} ⇒ 应当 FAIL"))
+sys.exit(0 if not bad else 1)
+PY
+}
+region_scan mem >>"$LOG" 2>&1
+if [ $? -eq 0 ]; then say "PASS: 判据⑪b：打印/除法子程序段内零访存（puts_dec/pd_one/puts_hex8/puts_hex2/puts_str/puts_nl/udiv/delay_ticks）"
+else say "FAIL: 判据⑪b：打印/除法子程序段内出现访存"; FAILED=1; fi
+region_scan mop >>"$LOG" 2>&1
+if [ $? -eq 0 ]; then say "PASS: 判据⑪f：打印/自写除法子程序段内零 M 扩展指令（十进制打印不依赖 M）"
+else say "FAIL: 判据⑪f：打印/除法子程序段内出现 M 扩展指令"; FAILED=1; fi
+check "判据⑪c1：探针地址装载 lui x5,0x8（0x000082b7 ⇒ 0x8000）" \
+      grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+000082b7' "${OUT}/m5_board.text.dis"
+check "判据⑪c2：探针写 sw x6,0(x5)（0x0062a023）" \
+      grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+0062a023' "${OUT}/m5_board.text.dis"
+check "判据⑪c3：探针读 lw x7,0(x5)（0x0002a383）" \
+      grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+0002a383' "${OUT}/m5_board.text.dis"
+check "判据⑪c4：探针再读 lw x28,0(x5)（0x0002ae03）" \
+      grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+0002ae03' "${OUT}/m5_board.text.dis"
+check "判据⑪c5：字节回环 sb x6,3(x5)（0x006281a3）+ lbu x29,3(x5)（0x0032ce83）" \
+      bash -c "grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+006281a3' '${OUT}/m5_board.text.dis' && grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+0032ce83' '${OUT}/m5_board.text.dis'"
+check "判据⑪c6：回环模式立即数 0x12345678（lui x6,0x12345 = 0x12345337 + addi …0x678）" \
+      bash -c "grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+12345337' '${OUT}/m5_board.text.dis' && grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+67830313' '${OUT}/m5_board.text.dis'"
+check "判据⑪d1：R2 逐位判定接线 or x18,x30,x31（0x01ff6933）" \
+      grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+01ff6933' "${OUT}/m5_board.text.dis"
+check "判据⑪d2：汇总判定并入 s2（or x26,x26,x18 = 0x012d6d33）" \
+      grep -qE '^[[:space:]]*[0-9a-f]+:[[:space:]]+012d6d33' "${OUT}/m5_board.text.dis"
+check "判据⑪d3：判别串在位（.rodata 含 \"R2FIX: \" 文本 + \"yes\\0\"/\"no\\0\" 字节）" \
+      bash -c "grep -q 'R2FIX:' '${OUT}/m5_board.dis' && grep -qE '79657300' '${OUT}/m5_board.dis' && grep -qE '6e6f0000' '${OUT}/m5_board.dis'"
+check "判据⑪d4：R2FIX 结论按 s2 分支打印（反汇编含 bne x18,x0,<ddr_stale>）" \
+      grep -qE 'bne[[:space:]]+x18,x0,' "${OUT}/m5_board.text.dis"
+#   ⑪e：探针地址区间 [0x8000,0x8004) 不与任何已分配段重叠，且无 .data/.bss
+#        （栈顶由源码 `lui sp,0x08000` 固定为 0x0800_0000 ⇒ 远高于探针地址；本判据只需
+#          确认"没有任何 ELF 段覆盖 0x8000" ⇒ 探针不会踩到程序自己的数据）
+python3 - "${OUT}/m5_board.elf" <<'PY' >>"$LOG" 2>&1
+import re, subprocess, sys
+out = subprocess.run(["/opt/riscv/bin/riscv32-unknown-linux-gnu-readelf", "-S", "-W", sys.argv[1]],
+                     capture_output=True, text=True).stdout
+bad = []
+for m in re.finditer(r'^\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)', out, re.M):
+    name, typ, addr, off, size = m.group(1), m.group(2), int(m.group(3), 16), int(m.group(4), 16), int(m.group(5), 16)
+    if name in (".data", ".bss"):
+        bad.append(f"存在段 {name}（addr=0x{addr:x} size=0x{size:x}）")
+    if typ != "NULL" and size > 0 and addr and addr < 0x8004 and addr + size > 0x8000:
+        bad.append(f"段 {name} 覆盖 0x8000（addr=0x{addr:x} size=0x{size:x}）")
+print("== 判据⑪e：探针地址 0x00008000 未被任何已分配段覆盖、且无 .data/.bss")
+for b in bad:
+    print("   " + b)
+print("   " + ("OK：探针地址安全（.text/.rodata 均在 0x1C00_0000 附近，无 .data/.bss）" if not bad else "不满足"))
+sys.exit(0 if not bad else 1)
+PY
+if [ $? -eq 0 ]; then say "PASS: 判据⑪e：探针地址 0x0000_8000 不与任何已分配段/栈重叠（无 .data/.bss）"
+else say "FAIL: 判据⑪e：探针地址与已分配段重叠或存在 .data/.bss"; FAILED=1; fi
+check "判据⑪f2：步2.6 的 9 个 M 扩展向量都在（divu×4 / remu×2 / mul / mulh / mulhu 各 ≥1）" \
+      bash -c "cd '${OUT}' && for m in divu:4 remu:2 mul:1 mulh:1 mulhu:1; do \
+                 op=\${m%%:*}; n=\${m##*:}; c=\$(grep -cE \"^[[:space:]]*[0-9a-f]+:[[:space:]]+[0-9a-f]{8}[[:space:]]+\$op[[:space:]]+x\" m5_board.text.dis); \
+                 [ \"\$c\" -ge \"\$n\" ] || { echo \"   \$op 计数=\$c < \$n\"; exit 1; }; \
+               done"
+check "判据⑪f3：步2.7 栈字节探针在位（反汇编含 addi x28,x2,-64 的栈缓冲指针 + sb/lbu 各 ≥1）" \
+      bash -c "grep -qE '[0-9a-f]+:[[:space:]]+fc010e13' '${OUT}/m5_board.text.dis' && \
+               grep -qE 'sb[[:space:]]+x[0-9]+,-?[0-9]+\(x28\)' '${OUT}/m5_board.text.dis' && \
+               grep -qE 'lbu[[:space:]]+x[0-9]+,-?[0-9]+\(x28\)' '${OUT}/m5_board.text.dis'"
+#   ⑫ BUILD 标记（"板上跑的是哪份镜像"的判定依据）：源码与 .rodata 都必须含下面这条，
+#     且与 build.sh 里的期望值**一字不差**（防止改了程序忘了改标记 ⇒ 标记失去意义）。
+EXPECT_BUILD_TAG="BUILD=m5_board-diag-2026-09-21c"
+check "判据⑫a：源码含 BUILD 标记 ${EXPECT_BUILD_TAG}" \
+      grep -qF "${EXPECT_BUILD_TAG}" "$SRC"
+check "判据⑪g：m5_diag.bin 与 m5_board.bin 逐字节一致" cmp -s "${OUT}/m5_board.bin" "${OUT}/m5_diag.bin"
+#   ⑫b：在 **.rodata 字节流**上核对同一条标记（`objdump -s` 的文本 dump 每行只显示 16 B，
+#        标记会被换行切断 ⇒ 必须按字节核对；手法同 ⑪h）。
+python3 - "${OUT}/m5_board.elf" "${OUT}/.rodata.tmp2" "${EXPECT_BUILD_TAG}" <<'PY' >>"$LOG" 2>&1
+import subprocess, sys
+elf, tmp, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+subprocess.run(["/opt/riscv/bin/riscv32-unknown-linux-gnu-objcopy", "-O", "binary",
+                "-j", ".rodata", elf, tmp], check=True)
+blob = open(tmp, "rb").read()
+ok = tag.encode() in blob
+print(f"== 判据⑫b：.rodata 字节流含 BUILD 标记「{tag}」⇒ {ok}")
+sys.exit(0 if ok else 1)
+PY
+if [ $? -eq 0 ]; then say "PASS: 判据⑫b：.rodata 字节流含 BUILD 标记（板上横幅即"哪份镜像"的判定依据）"
+else say "FAIL: 判据⑫b：.rodata 里没有 BUILD 标记"; FAILED=1; fi
+rm -f "${OUT}/.rodata.tmp2"
+#   ⑪h 横幅必须整体可打印：GNU as 的 `.asciz` 每条都补 NUL ⇒ 旧版把横幅四行拆成四条
+#      `.asciz`，`puts_str` 读到第一个 NUL 就返回 ⇒ 上板只打印第 1 行（runbook 期望的
+#      `BOARD-PROG:` / `UART 115200 …` / `RESET_PC=…` 三行从来没出现过）。本判据在
+#      **.rodata 字节流**上核对"四行首尾相接、中间无 NUL"。
+python3 - "${OUT}/m5_board.elf" "${OUT}/.rodata.tmp" <<'PY' >>"$LOG" 2>&1
+import subprocess, sys
+elf, tmp = sys.argv[1], sys.argv[2]
+subprocess.run(["/opt/riscv/bin/riscv32-unknown-linux-gnu-objcopy", "-O", "binary",
+                "-j", ".rodata", elf, tmp], check=True)
+blob = open(tmp, "rb").read()
+need = [b"33MHz\r\nBUILD=m5_board-diag-2026-09-21c",
+        b"R2+MEXT+stack probes)\r\nUART 115200 8N1 (divisor=18",
+        b"114583 Bd)\r\nRESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only",
+        b"-> R2FIX: "]
+miss = [n for n in need if n not in blob]
+print("== 判据⑪h：横幅/判别串在 .rodata 里整体连续（无嵌入 NUL）")
+for n in need:
+    print(f"   {'OK  ' if n in blob else 'MISS'}  {n[:60].decode('ascii', 'replace')}")
+sys.exit(0 if not miss else 1)
+PY
+if [ $? -eq 0 ]; then say "PASS: 判据⑪h：横幅四行 + R2FIX 前缀在 .rodata 里首尾相接（中间无 NUL）"
+else say "FAIL: 判据⑪h：横幅被 NUL 截断（`.asciz` 拆分问题复发）"; FAILED=1; fi
+rm -f "${OUT}/.rodata.tmp"
+
+#------------------------------------------------------------------------------
 # 汇总
 #------------------------------------------------------------------------------
 if grep -qiE '\b(bad|unknown|illegal)\b' "${OUT}/m5_board.text.dis"; then
@@ -303,6 +479,11 @@ fi
 
 say "== 产物清单"
 ls -l "${OUT}" | tee -a "$LOG" >/dev/null
+#   ★ "哪份镜像"的三元组（与程序里的 BUILD 标记呼应；烧写前记下这三行即可自证）
+say "== BUILD 标记 = ${EXPECT_BUILD_TAG}"
+say "== 源码 md5   = $(md5sum "$SRC" | awk '{print $1}')（m5_board.S）"
+say "== 镜像 md5   = $(md5sum "${OUT}/m5_board.bin" | awk '{print $1}')（m5_board.bin = m5_diag.bin）"
+say "== hex  md5   = $(md5sum "${OUT}/m5_board.hex" | awk '{print $1}')（m5_board.hex，仿真加载用）"
 if [ "$FAILED" -ne 0 ]; then
     say "RESULT_M5_BUILD: FAIL（见上面 FAIL 条目）"
     exit 1

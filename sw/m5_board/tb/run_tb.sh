@@ -13,6 +13,12 @@
 #                                1 = 非保持型 R 通道模型（严格 AXI4 / MIG 口径：
 #                                    RDATA 只在 R 握手拍有效，其余拍为 0）
 #        RD_TRACE_WINDOW=<N>     >0 ⇒ 打印首笔读起 N 拍的 R 通道/M 级采样（诊断）
+#        EXPECT_EXTRA=<子串>     ★ 可选判据 C6：UART 捕获序列必须含该子串
+#                                （默认空 = **不启用** ⇒ 判据 C0–C5 语义与历史逐字一致）。
+#                                诊断版用 EXPECT_EXTRA="R2FIX: yes"。
+#        RTL_DIR=<目录>          ★ 覆盖 RTL 源目录（默认 rtl）。用于"旧 RTL 注入反证"：
+#                                指向 tb/scratch/oldrtl（rtl/** 的**只读拷贝** + 旧采样两文件）
+#                                ⇒ 全程不修改 rtl/**（见 tb/README-tb.md §8）。
 # 产物 : sw/m5_board/tb/out/<RUN_TAG>.vvp      编译产物
 #        sw/m5_board/tb/out/<RUN_TAG>.log      完整运行日志（判定证据）
 #        sw/m5_board/tb/out/<RUN_TAG>.compile.log
@@ -36,6 +42,8 @@ UART_PRINT_MAX="${UART_PRINT_MAX:-4096}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-100000}"
 R_STICKY="${R_STICKY:-1}"
 DDR_R_NONHOLD="${DDR_R_NONHOLD:-0}"
+EXPECT_EXTRA="${EXPECT_EXTRA:-}"          # 空 = C6 不启用（判据 C0–C5 语义不变）
+RTL_DIR="${RTL_DIR:-rtl}"                 # RTL 源目录（旧 RTL 注入反证用 tb/scratch/oldrtl）
 
 VVP="${VVP:-$(command -v vvp || true)}"
 IV="${IV:-$(command -v iverilog || true)}"
@@ -49,15 +57,18 @@ VVP_OUT="${OUT_DIR}/${RUN_TAG}.vvp"
 cd "${REPO_ROOT}" || { printf 'ERROR: 无法进入仓库根 %s\n' "${REPO_ROOT}" >&2; exit 2; }
 
 # RTL 源全集（与 scripts/env.sh 的 rv32_rtl_sources 同口径：find rtl -name '*.v' | sort）
-mapfile -t RTL_SRCS < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
-[ "${#RTL_SRCS[@]}" -gt 0 ] || { printf 'ERROR: rtl/**/*.v 为空\n' >&2; exit 2; }
+#   ★ RTL_DIR 默认 rtl（仓库冻结核）；旧 RTL 注入反证时指向 tb/scratch/oldrtl（只读拷贝）
+mapfile -t RTL_SRCS < <(find "${RTL_DIR}" -type f -name '*.v' | LC_ALL=C sort)
+[ "${#RTL_SRCS[@]}" -gt 0 ] || { printf 'ERROR: %s/**/*.v 为空\n' "${RTL_DIR}" >&2; exit 2; }
 
 {
     printf '== run_tb.sh: repo=%s\n' "${REPO_ROOT}"
     printf '== PROG_HEX=%s\n' "${PROG_HEX}"
     printf '== TIMEOUT_CYCLES=%s TOP=%s RUN_TAG=%s\n' "${TIMEOUT_CYCLES}" "${TOP}" "${RUN_TAG}"
+    printf '== RTL_DIR=%s（默认 rtl；非默认 = 旧 RTL 注入反证）\n' "${RTL_DIR}"
+    printf '== EXPECT_EXTRA=%s（空 = C6 不启用）\n' "${EXPECT_EXTRA:-<空>}"
     printf '== rtl 源 %d 个；RTL 指纹 = %s\n' "${#RTL_SRCS[@]}" \
-        "$(find rtl -name '*.v' | sort | xargs md5sum | md5sum | cut -d' ' -f1)"
+        "$(find "${RTL_DIR}" -name '*.v' | sort | xargs md5sum | md5sum | cut -d' ' -f1)"
 } | tee "${CMP_LOG}"
 
 #------------------------------------------------------------------------------
@@ -72,6 +83,7 @@ set -o pipefail
     -P "${TOP}.PROGRESS_EVERY=${PROGRESS_EVERY}" \
     -P "${TOP}.R_STICKY=${R_STICKY}" \
     -P "${TOP}.DDR_R_NONHOLD=${DDR_R_NONHOLD}" \
+    -P "${TOP}.EXPECT_EXTRA=\"${EXPECT_EXTRA}\"" \
     -P "${TOP}.RD_TRACE_WINDOW=${RD_TRACE_WINDOW:-0}" \
     "${RTL_SRCS[@]}" \
     sim/tb/sim_mem_model.sv \

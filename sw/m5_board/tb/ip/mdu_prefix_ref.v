@@ -24,10 +24,7 @@
 //             rv32_mult_su       : A[Signed]   B[Unsigned]  32x32 → P[63:0]（纯组合）
 //             rv32_mult_unsigned : A[Unsigned] B[Unsigned]  32x32 → P[63:0]（纯组合）
 //             rv32_div           : 32/32 Radix2 Unsigned，AXI-Stream 握手
-//                                  tdata[63:0] = {商[63:32], 余数[31:0]}
-//                                  ★ 2026-09-21 实测修正（此前误写为 {余数, 商} —— 见 §6.2 的
-//                                    缺陷说明与 xsim 复现证据；**方向错了半个字，后果是
-//                                    divu/remu 商余数互换**，板上十进制打印因此全乱）。
+//                                  tdata[63:0] = {余数[63:32], 商[31:0]}
 //           ⇒ 改任一侧必须同步另一侧（接口契约）。
 //==============================================================================
 // ★★★ 红线 1 检索结论 + **实测证据**（本文件即证据之一，另一份在 create_ip.tcl）★★★
@@ -456,7 +453,7 @@ module mdu (
     //        此时 a_q/b_q 已锁存新操作数 ⇒ IP 采到的就是本条指令的操作数。
     //        `FlowControl=NonBlocking`（无 tready 背压），`ARESETN=1` 供 flush 复位。
     //--------------------------------------------------------------------------
-    wire [63:0] ip_div_dout;     // {商[63:32], 余数[31:0]}（★ 实测字段序，见下）
+    wire [63:0] ip_div_dout;     // {余数[63:32], 商[31:0]}
 
     // ★ 时序元件（always 的正当场合：无法用 assign 表达的寄存器）
     //   启动脉冲：start 被接收 ⇒ 下一拍（= S_DIV 首拍）向 IP 发 tvalid。
@@ -493,7 +490,7 @@ module mdu (
         .s_axis_dividend_tvalid (ip_div_launch_q ),   // 与被除数同拍有效
         .s_axis_dividend_tdata  (ip_div_a       ),    // 被除数（幅值）
         .m_axis_dout_tvalid     (ip_div_dout_valid),  // 结果有效脉冲
-        .m_axis_dout_tdata      (ip_div_dout    )     // {商[63:32], 余数[31:0]}
+        .m_axis_dout_tdata      (ip_div_dout    )     // {余数[63:32], 商[31:0]}
     );
 
 `endif // RV32GC_USE_VIVADO_IP
@@ -509,23 +506,8 @@ module mdu (
 `ifdef RV32GC_USE_VIVADO_IP
     wire [31:0] mul_core_out  = ip_mul_out;
     wire        div_iter_last = ip_div_dout_valid;                 // IP 报有效 ⇒ 结束等待
-    //   ★★★ 2026-09-21 **实测修正**（板上十进制乱码的根因，M5 第三轮诊断）★★★
-    //   此前把 `ip_div_dout` 当成 {余数[63:32], 商[31:0]}，实际 div_gen（Radix2、无符号、
-    //   Fractional_B=0）的 `m_axis_dout_tdata` 是 **{商[63:32], 余数[31:0]}**
-    //   ⇒ 商余数互换：`divu` 返回余数、`remu` 返回商。
-    //   后果（上板实测现象）：十进制打印靠 remu/divu 逐位取数字 ⇒ 全部乱码；
-    //     字符串（不碰除法）、FREQ 十六进制（不碰除法）正常；且**与 bitstream 是否含 R2 修复无关**
-    //     ⇒ 换新 bitstream 后现象逐字节不变。
-    //   证据（真实 IP 的仿真闭环，非推断）：
-    //     · `sw/m5_board/tb/ip/run_ip_div_xsim.sh`：直接驱动真实 `rv32_div` 网表，
-    //       实测 59/10 ⇒ tdata=0x00000005_00000009（高半 5 = 商、低半 9 = 余数）；
-    //       118049/2000 ⇒ 0x0000003b_00000031（59 / 49）；max/10 ⇒ 0x19999999_00000005。
-    //     · `sw/m5_board/tb/ip/run_mdu_ip_xsim.sh --expect-fail`：修复前本模块 25 个向量
-    //       15 条 FAIL，全部呈"商余数互换"形态（如 DIVU 59/10 读回 9、REMU 59%10 读回 5）；
-    //       修复后同一 TB 全过（同一脚本，去掉 --expect-fail）。
-    //   ⇒ 结论：**字段序写反**（不是握手时序问题；握手拍与 IP 的 tvalid 严格同拍，见下）。
-    wire [32:0] div_rem_next  = {1'b0, ip_div_dout[31:0]};         // IP 幅值余数（**低半部**，本拍有效）
-    wire [31:0] div_quot_next = ip_div_dout[63:32];                // IP 幅值商（**高半部**）
+    wire [32:0] div_rem_next  = {1'b0, ip_div_dout[63:32]};        // IP 幅值余数（本拍有效）
+    wire [31:0] div_quot_next = ip_div_dout[31:0];                 // IP 幅值商
 `else
     wire [31:0] mul_core_out  = mul_result(a_q, b_q, op_q);
     wire        div_iter_last = (cnt_q == DIV_ITER_LAST);

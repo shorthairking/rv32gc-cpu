@@ -1,0 +1,1 @@
+-i "/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sw/m5_board/tb/ip/xsim.dir" --nolog --debug "off" -L "unisims_ver" -L "secureip" -snapshot "tb_mdu_ip_sim" "tb_mdu_ip" "glbl" 

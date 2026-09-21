@@ -118,8 +118,10 @@ chk "V4c：手册含失败回报清单" grep -q "必报信息清单" "${REPO}/sw
 #   `rtl/top/core_top.v`（数据读/AMO 读相改取锁存值）是**授权范围内**的唯一改动；
 #   本判据把"允许的改动白名单"写死 ⇒ 既能在父 Agent 提交前通过，也能在提交后
 #   （git 干净）通过，且任何**其它** RTL 改动一律判失败。
-#   md5 基线：R2 修复后 = c558e750441afc0b13c3dbb3776bcbd3
-#             （R2 修复前 = f41d1f253d5e0e5baa8030e118af87c1）
+#   md5 基线：**2026-09-21 第三轮（M 扩展 div_gen 字段序修复）后** = 66e3225645b6f29375c786fe166448d6
+#             R2 修复后 = c558e750441afc0b13c3dbb3776bcbd3（第三轮前）
+#             R2 修复前 = f41d1f253d5e0e5baa8030e118af87c1
+#   白名单（第三轮）：R2 两文件 + `rtl/exec/mdu.v`（div_gen 字段序修复）。
 #------------------------------------------------------------------------------
 echo "--- V5 核 RTL 冻结 ---"
 RTL_DIRTY="$(git -C "$REPO" status --porcelain rtl/ 2>/dev/null | awk '{print $2}' | sort | tr '\n' ' ')"
@@ -127,13 +129,17 @@ if [ -z "$RTL_DIRTY" ]; then
     ok "V5a：git status rtl/ 为空（核 RTL 已提交冻结）"
 elif [ "$RTL_DIRTY" = "rtl/axi/axi_master_ctrl.v rtl/top/core_top.v " ]; then
     ok "V5a：rtl/ 的未提交改动恰好是 R2 修复的两个文件（父 Agent 提交后即为空）"
+elif [ "$RTL_DIRTY" = "rtl/axi/axi_master_ctrl.v rtl/exec/mdu.v rtl/top/core_top.v " ]; then
+    ok "V5a：rtl/ 的未提交改动恰好是 R2 两文件 + mdu.v（M 扩展字段序修复，第三轮授权范围）"
+elif [ "$RTL_DIRTY" = "rtl/exec/mdu.v " ]; then
+    ok "V5a：rtl/ 的未提交改动恰好是 mdu.v（第三轮 M 扩展字段序修复；R2 两文件已提交冻结）"
 else
-    bad "V5a：rtl/ 下出现了 R2 修复**白名单之外**的改动"; printf '    %s\n' "$RTL_DIRTY"
+    bad "V5a：rtl/ 下出现了授权**白名单之外**的改动"; printf '    %s\n' "$RTL_DIRTY"
 fi
 RTL_MD5="$(cd "$REPO" && find rtl -name '*.v' -o -name '*.vh' | sort | xargs md5sum | md5sum | awk '{print $1}')"
 echo "    rtl/** 全树 md5 汇总 = ${RTL_MD5}"
-chk "V5b：rtl/** md5 汇总等于 R2 修复后基线 c558e750441afc0b13c3dbb3776bcbd3" \
-    test "${RTL_MD5}" = "c558e750441afc0b13c3dbb3776bcbd3"
+chk "V5b：rtl/** md5 汇总等于第三轮基线 66e3225645b6f29375c786fe166448d6（R2 + mdu 字段序修复）" \
+    test "${RTL_MD5}" = "66e3225645b6f29375c786fe166448d6"
 
 echo
 if [ "$FAIL" -ne 0 ]; then

@@ -4,7 +4,11 @@
 > **本文口径真源**：`docs/kb/platform-facts.md`（平台地址/时钟/约束）、`docs/design/08-baseline-5stage.md` §8.6（M5 五步序列）、
 > `rv32gc-cpu/rtl/pkg/core_params.vh`（核侧地址宏）、`chiplab/IP/CONFREG/confreg_syn.v:34-42`（CONFREG 寄存器偏移）、
 > `chiplab/IP/APB_DEV/URT/uart_regs.v`（UART 分频口径）、`chiplab/fpga/loongson/soc_up.xdc`（引脚）。
-> **状态**：RTL 冻结（commit `ae906cd`，全核 60 MHz 布线 WNS +0.031 / 0 失败端点）；上板时钟 **33 MHz 同域**（平台 `clk_pll_33.clk_out2` 同驱 `cpu_clk` 与 `uncore_clk`）。
+> **状态**：RTL 冻结（R2 修复 commit `7a06825`；全 `rtl/**`（`*.v`+`*.vh`）md5 汇总 = **`c558e750441afc0b13c3dbb3776bcbd3`**）；上板时钟 **33 MHz 同域**（平台 `clk_pll_33.clk_out2` 同驱 `cpu_clk` 与 `uncore_clk`）。
+> **★ 2026-09-21 诊断版（本轮）**：上板程序新增 **步2.5 DDR3 回环判别**（`R2FIX: yes/no`），
+> 用来**一眼判定 FPGA 里跑的是新 bitstream 还是旧 bitstream**；同时把十进制/十六进制打印
+> 全部改成**纯寄存器路径**（不再用 DDR3 栈缓冲）⇒ 即使旧 bitstream 在位，数字也不会乱码，
+> 而是明确打印 `R2FIX: no`。**先读 §7 诊断节**，再按 §3/§4 烧写观察。
 
 ---
 
@@ -13,13 +17,15 @@
 | # | 你要做的事 | 用什么 | 期望看到 |
 |---|---|---|---|
 | 1 | 上电 + 连接 | 电源、Xilinx 下载线（JTAG）、串口线（板载 UART） | 电源灯亮；串口能打开 |
-| 2 | 下载 bitstream | Vivado Hardware Manager（**Windows 侧**）或 SPI Flash 固化 | 无报错 |
-| 3 | 打开串口 | **115200 8N1**，无流控 | 上电/复位后打印启动横幅 |
-| 4 | 看 LED / 数码管 | 板载 16 个 LED、8 位数码管 | LED 心跳 → 显示开关值 → 显示数字 |
-| 5 | 读结论行 | 串口 | `RESULT: RV32GC-M5-OK` |
+| 2 | 下载 bitstream | Vivado Hardware Manager（**Windows 侧**）或 SPI Flash 固化 | **Program Device 成功、无 ERROR**（见 §7 两步走） |
+| 3 | 烧诊断镜像 | `programmer_by_uart.bit` + xmodem 烧 `m5_diag.bin` | 烧写器提示完成 |
+| 4 | 打开串口 | **115200 8N1**，无流控 | 横幅含 `BUILD=m5_board-diag-2026-09-21c` |
+| 5 | **看步2.5/2.6/2.7 三行** | 串口 | **`R2FIX: yes` + `MEXT: OK` + `STACKBF: OK`** ⇒ 新 bitstream 生效；`MEXT: BAD` ⇒ 板子里还是旧 bitstream（§7） |
+| 6 | 看 LED / 数码管 | 板载 16 个 LED、8 位数码管 | LED 心跳 → 显示开关值 → 显示数字 |
+| 7 | 读结论行 | 串口 | `RESULT: RV32GC-M5-OK`（**含** R2 回环判据，见 §7） |
 
-**核心判据（一句话）**：串口出现 `RESULT: RV32GC-M5-OK`，且 LED 能跟随拨码开关变化。
-**失败判据（一句话）**：串口无任何输出，或输出乱码，或出现 `RESULT: RV32GC-M5-BAD`。
+**核心判据（一句话）**：串口出现 `R2FIX: yes` **且** `RESULT: RV32GC-M5-OK`，LED 能跟随拨码开关变化。
+**失败判据（一句话）**：串口无任何输出；或 `step2.5 … R2FIX: no`（= 旧 bitstream 仍被加载，见 §7）；或 `RESULT: RV32GC-M5-BAD`。
 
 ---
 
@@ -28,8 +34,9 @@
 | 文件 | 路径（本仓库内） | 用途 |
 |---|---|---|
 | **bitstream** | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit` | JTAG 直接下载（掉电丢失） |
-| bitstream（同源副本） | 同上目录 `system_run.bit`（Vivado 原始文件名） | 同上 |
-| **Flash 镜像（bin）** | `rv32gc-cpu/sw/m5_board/out/m5_board.bin`（约 1.5 KB） | 烧进 SPI Flash（掉电保持，复位即自动运行） |
+| bitstream（同源副本，**内容完全相同**） | 同目录 `soc_top.bit`（Vivado 原始文件名）与 `../system_run.runs/impl_1/soc_top.bit` | 同上；三份 md5 均为 `167dc9dfd487a9d6148ddee02d407726`（2026-09-21 12:36 构建） |
+| **Flash 镜像（bin，诊断版）** | `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（2774 B） | 烧进 SPI Flash（掉电保持，复位即自动运行） |
+| Flash 镜像（同一份内容） | 同目录 `m5_board.bin`（与 `m5_diag.bin` **逐字节相同**，`build.sh` 判据⑪g 用 `cmp` 核对） | 同上 |
 | 程序 ELF / 反汇编 | `rv32gc-cpu/sw/m5_board/out/m5_board.elf` / `.dis` | 排障时核对 |
 | 构建日志 | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_build.vivado.log` | 构建证据 |
 | 时序/利用率报告 | 同目录 `impl_timing_summary.rpt` / `impl_utilization.rpt` | 时序与资源证据 |
@@ -76,10 +83,14 @@
 1. 用 Vivado Hardware Manager 下载 **`programmer_by_uart.bit`**（不是我们的 bitstream）。
 2. 打开串口软件：**230400 8N1**（这是**烧写器**的波特率，不是我们程序的 115200）。
 3. 串口终端里按提示输入 **`x`**（开始接收 xmodem 传输）。
-4. 用串口软件的 **xmodem 发送**功能，发送 `rv32gc-cpu/sw/m5_board/out/m5_board.bin`。
+4. 用串口软件的 **xmodem 发送**功能，发送 `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`
+   （= 诊断版镜像；与 `m5_board.bin` 内容完全相同，2199 B，md5 见 §6）。
 5. **期望**：传输进度到 100%，提示完成。
 6. 重新下载**我们的 bitstream**（方式 A 的第 2 步），或直接断电重上电（若已把我们的 bitstream 也固化）。
 7. **回到 115200** 重开串口，按复位键。
+8. **按 §7 的两步走核对**：先确认 Vivado `Program Device` 成功（新 bitstream 真的进去了），
+   再看串口步2.5 的 `R2FIX: yes/no`。**只烧程序不换 bitstream 是最容易踩的坑**
+   （现象：横幅是新的、`step2.5 … R2FIX: no`）—— 这正是本轮诊断版要暴露的事。
 
 > ⚠️ **注意**：`programmer_by_uart.bit` 会把收到的二进制**从 Flash 地址 0 开始**写入 —— 这正是我们要的位置（Flash 地址 0 = 核的 `0x1C00_0000`）。**不要把别的镜像和它混烧**，否则会覆盖本程序。
 
@@ -108,16 +119,96 @@
 - **现象（上电/复位后立即）**：
   ```
   RV32GC-M5 board test (chiplab / xc7a200tfbg676-2) @ 33MHz
+  BUILD=m5_board-diag-2026-09-21c (stack-free prints; R2+MEXT+stack probes)
   UART 115200 8N1 (divisor=18, PCLK=33MHz -> 114583 Bd)
   RESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only
   ```
+  > `BUILD=` 这一行是**诊断版标志**：看到 `BUILD=m5_board-diag-2026-09-21c` 就说明
+  > **Flash 镜像确实是本轮的新镜像**（它只证明"程序是新烧的"，**不**证明 FPGA 里是新
+  > bitstream —— 后者由步2.5/2.6/2.7 判定）。
 - 以及循环里的：
   ```
-  step2 UART output alive; sequence = LED -> UART -> switch -> timer -> FREQ
+  step2 UART output alive; sequence = LED -> UART -> DDR3-R2-probe -> switch -> timer -> FREQ
   ```
 - ✅ **期望**：文字**完整、无乱码**。
 - ❌ **若完全无输出**：见 §5 表第 1、2 行。
 - ❌ **若乱码**：见 §5 "串口乱码"。
+
+### 步2.5 ★ DDR3 回环判别（新 bitstream / 旧 bitstream 的**一眼判据**）
+
+- **现象**：紧跟 `step2` 行之后打印**一行**（数值为上板实测；下面是新 bitstream 的期望值）
+  ```
+  step2.5 DDR3 loopback: word=0x12345678 re-read=0x12345678 byte=0x5A (expect 12345678/5A) -> R2FIX: yes
+  ```
+- **这一步在测什么**：程序把 `0x12345678` 写进 **DDR3 地址 `0x0000_8000`**（避开程序区与栈），
+  用 `lw` 读回；再把 `0x5A` 写进 `0x0000_8003`，用 `lbu` 按字节读回。DDR3 数据访问在核内走
+  **MDTA（uncached 单 beat AXI）** —— 正是 R2 缺陷（R 握手后第 2 拍才采样读数据）所在的那条通路。
+- **判别表（照这个表下结论）**：
+
+  | `step2.5` 读到什么 | 含义 | 你要做什么 |
+  |---|---|---|
+  | `word=0x12345678 re-read=0x12345678 byte=0x5A … R2FIX: yes` | ✅ FPGA 里跑的是**新 bitstream**（含 R2 修复） | 继续看步③④⑤ 与 `RESULT` |
+  | word/byte 是**别的值**（如 `0x00000000`、`0x1C0xxxxx`、两次读还不一致）⇒ `R2FIX: no` | ❌ FPGA 里**仍是旧 bitstream**（R2 缺陷在位） | 按 §7 重做 `Program Device`，**确认下载成功**（§7 有核对清单） |
+  | 一行都没有（或 step2 之后卡住） | 程序没跑到这里 | 回报 §5.1 的必报信息（尤其串口原文与 LED 状态） |
+
+- ✅ **期望**：`word=0x12345678`、`re-read=0x12345678`、`byte=0x5A`、**`R2FIX: yes`**。
+- ★ **`R2FIX: no` 会直接把最终结论钉成 `RESULT: RV32GC-M5-BAD`**（判定链 = 步④ ∧ FREQ ∧ 步2.5/2.6/2.7），
+  所以"看到 BAD"时**先看步2.5/2.6/2.7 这三行**再谈其它。
+- ★ 本轮**数字不会再乱码**：十进制/十六进制打印全部改成**纯寄存器路径**（不再用 DDR3 栈缓冲），
+  所以 `step1/step4/step5` 的数字在任何 bitstream 下都是可信的 —— 唯一会"读到垃圾"的是下面这些
+  **故意**读出来的探针值。
+
+### 步2.6 ★ M 扩展探针（`MEXT: ok / BAD`）—— 本轮根因的**板上判据**
+
+- **现象**：紧跟步2.5 之后打印三行（一行值、一行结论）：
+  ```
+  step2.6 MEXT=00000005 00000009 0000003B 00000031 00000000 00000000 0000002A 40000000 FFFFFFFE -> MEXT: ok
+  ```
+- **数值顺序**（9 个向量，与程序注释/`sw/m5_board/build.sh` 判据⑪f2 一致）：
+
+  | # | 向量 | 期望值 |
+  |---|---|---|
+  | ① | `divu(59,10)` | `0x00000005` |
+  | ② | `remu(59,10)` | `0x00000009` |
+  | ③ | `divu(118049,2000)` | `0x0000003B` |
+  | ④ | `remu(118049,2000)` | `0x00000031` |
+  | ⑤ | `divu(0,10)` | `0x00000000` |
+  | ⑥ | `divu(1,10)` | `0x00000000` |
+  | ⑦ | `mul(6,7)` | `0x0000002A` |
+  | ⑧ | `mulh(0x80000000,0x80000000)` | `0x40000000` |
+  | ⑨ | `mulhu(0xFFFFFFFF,0xFFFFFFFF)` | `0xFFFFFFFE` |
+
+- **判别表**：
+
+  | `step2.6` 读到什么 | 含义 | 结论 |
+  |---|---|---|
+  | 9 个值与上表**逐字相同** ⇒ `MEXT: OK` | ✅ FPGA 里的 M 扩展（div_gen/mult_gen IP 通路）正常 | 继续看步③④⑤ |
+  | 商/余数**互换**（如 `divu(59,10)` 回读 `9`、`remu(59,10)` 回读 `5`） | ❌ 跑的是**修复前**的 bitstream（`mdu.v` 把 div_gen 的 tdata 字段序写反：商在**高**半、余数在**低**半） | 重新下载**本轮新 bitstream**（§6/§7） |
+  | 其它乱值 | ❌ M 扩展通路仍不正常 | 把整行原文抄回来（§5.1） |
+
+- ✅ **期望**：`MEXT: OK`（大写，与程序内的 `OK` 字面量一致）。
+- ★ 为什么必须单列这一步：**RTL 的 IP 分支（综合走 div_gen/mult_gen）在 iverilog 里跑不了**
+  （Vivado 生成的 IP 网表是 `pragma protect` 加密的）⇒ 历次仿真回归只覆盖**行为分支**，
+  板上才是 IP 分支的第一次功能验证。本轮用 **xsim + 真实 IP** 复现并修掉了这个缺陷
+  （见 §8 根因与证据）。
+
+### 步2.7 ★ 栈字节通路探针（`STACKBF: ok / BAD`）
+
+- **现象**：
+  ```
+  step2.7 stack[16B]=30 31 32 33 34 35 36 37 38 39 41 42 43 44 45 46 -> STACKBF: ok
+  ```
+- **这一步在测什么**：把 16 字节模式 `"0123456789ABCDEF"` 写进**栈缓冲**（`sp-64`，DDR3 空间），
+  再逐字节 `lbu` 读回并按两位 hex 打印 ⇒ 直接暴露"DDR3 字节路径错位 / lane 串位 / 读回垃圾"。
+  期望的 16 个字节就是 `"0123456789ABCDEF"` 的 ASCII：`30 31 … 39 41 … 46`。
+- **判别表**：
+
+  | `step2.7` 读到什么 | 含义 |
+  |---|---|
+  | `30 31 32 … 46` ⇒ `STACKBF: OK` | ✅ DDR3 字节读路径正常 |
+  | 全 `00`、错位、重复/乱字节 ⇒ `STACKBF: BAD` | ❌ DDR3 读通路有问题（R2 缺陷在位：跑的是旧 bitstream；或该通路另有缺陷） |
+
+- ✅ **期望**：`STACKBF: OK`。
 
 ### 步③ 开关回读
 
@@ -182,7 +273,9 @@
   ```
   RESULT: RV32GC-M5-OK
   ```
-- ✅ **期望**：出现 `OK`（步④ 与步⑤ 同时满足才打印 OK；任一不满足打印 `BAD`）。
+- ✅ **期望**：出现 `OK`（**五个**子判据同时满足才打印 OK：步④ 通过 ∧ `FREQ>>20 == 31`
+  ∧ 步2.5 R2 回环 ∧ 步2.6 M 扩展向量 ∧ 步2.7 栈字节探针；任一不满足打印 `BAD`）。
+- ★ **BAD 的定位顺序**：`step2.6 … MEXT:` → `step2.5 … R2FIX:` → `step2.7 … STACKBF:` → `step4`/`step5`。
 - 之后程序**回到主循环继续跑**（LED 心跳/打印循环往复），这是正常的，不是死机。
 
 ---
@@ -211,11 +304,13 @@
 
 | 现象 | 最可能的原因 | 立刻可做的对照实验 |
 |---|---|---|
-| **串口完全无输出**，LED 也不动 | 核没有跑起来：取指失败（Flash 里没有程序 / Flash 未插好）或时钟没起 | ① 确认已按 §3 方式 B 把 `m5_board.bin` 烧进 Flash；② 确认下载的是**我们的** bitstream；③ 用示波器/逻辑分析仪看 `SPI_CLK`（引脚 P20）在复位后是否有活动 |
+| **串口完全无输出**，LED 也不动 | 核没有跑起来：取指失败（Flash 里没有程序 / Flash 未插好）或时钟没起 | ① 确认已按 §3 方式 B 把 `m5_diag.bin` 烧进 Flash；② 确认下载的是**我们的** bitstream；③ 用示波器/逻辑分析仪看 `SPI_CLK`（引脚 P20）在复位后是否有活动 |
 | **串口无输出，但 LED 在跑马灯** | UART 通路问题：程序在跑，但串口参数/接线不对 | ① 换 57600/230400 试；② 确认插的是 UART0（F23/H19）而不是 debug 串口（M25/P25）；③ 交换 RX/TX |
 | **串口乱码**（能看出字符轮廓但错位） | 波特率不匹配 | ① 终端设 115200 8N1 无流控；② 关掉终端的"软件流控/硬件流控"；③ 若你的终端有 114583 自定义档位就填它 |
+| **`step2.5 … R2FIX: no`（word/byte 是垃圾值或 0）但十进制数字正常** | ★ FPGA 里跑的还是**旧 bitstream**（R2 缺陷在位）—— 新程序已生效，但配置没换成新的 | 按 §7 重做两步走：`Program Device` → **确认成功**（看 Vivado 的 `Program Device` 完成提示与 `Device properties`）→ 复位；仍为 `no` 则回报 bitstream 文件 md5（§5.1 第①项） |
+| **`step2.5 … R2FIX: no` 且数字也乱** | 新程序没烧进去（Flash 里还是老镜像：横幅里没有 `BOARD-PROG:` 行）或程序没跑完 | 抄回横幅原文；重烧 `m5_diag.bin`（§3 方式 B） |
 | **打印在 `step1` 反复出现，之后没有 `step3/4/5`** | 程序卡在 LED 心跳段（不太可能死循环，但可能被反复复位） | 检查复位键是否卡住 / 电源是否不稳（`timer` 数值若每次都很小说明被反复复位） |
-| **`RESULT: RV32GC-M5-BAD`（只在最后一行）** | 步④ `TIMER`/`rdcycle` 增量不一致、或步⑤ FREQ 判据不满足 | **把 `step4`/`step5` 那两行的完整原文抄回来**（`timer delta`、`cycle delta`、`cycles/iter`、`FREQ`），这决定了是 TIMER 不在核时钟域、核与 uncore 时钟不同源、还是平台寄存器读回问题 |
+| **`RESULT: RV32GC-M5-BAD`（只在最后一行）** | ① `step2.5` 判 R2 回环失败（= 旧 bitstream）② 步④ `TIMER`/`rdcycle` 增量不一致 ③ 步⑤ FREQ 判据不满足 | **先看 `step2.5` 行**（§4 步2.5 判别表）；若 `R2FIX: yes` 再把 `step4`/`step5` 两行完整原文抄回来（`timer delta`、`cycle delta`、`cycles/iter`、`FREQ`） |
 | **LED 全亮或全灭且串口正常** | LED 段接线/极性，或程序在写 `0xFFFF/0x0000` | 抄回 `step1 LED heartbeat, pattern=` 的数值 |
 | **拨开关 LED 不跟随** | MMIO 读通路（`0x1FD0F020`）问题 | 抄回 `step3 switch readback =` 的数值（拨到 0x55 和 0xAA 各试一次） |
 | **Vivado 下载报 DRC/IDCODE 错** | JTAG 线/驱动/供电 | 换线、换 USB 口、Auto Connect 重新识别；回报 Vivado 报错原文 |
@@ -226,49 +321,196 @@
 # 反汇编（核对程序内容；本机可跑）
 less rv32gc-cpu/sw/m5_board/out/m5_board.dis
 # 镜像前 64 字节（应为非 0 的指令字）
-xxd -l 64 rv32gc-cpu/sw/m5_board/out/m5_board.bin
+xxd -l 64 rv32gc-cpu/sw/m5_board/out/m5_diag.bin
+# ★ "打印路径不依赖内存"的机器证据（本机可跑，不需要板子）：
+#   全程序不得有任何以 sp(x2) 为基址的访存（诊断版把数字打印改成纯寄存器路径）
+grep -nE '\b(lw|sw|sb|lbu)\b.*\(x2\)' rv32gc-cpu/sw/m5_board/out/m5_board.text.dis || echo "OK：零栈访存"
+#   全程序唯一的 DDR3 访问 = 步2.5 探针（地址 0x8000）：把访存按基址寄存器归类
+grep -oE '\b(lw|sw|sb|lbu)\s+x[0-9]+,-?[0-9]+\(x[0-9]+\)' rv32gc-cpu/sw/m5_board/out/m5_board.text.dis \
+  | sed -E 's/.*\((x[0-9]+)\)/\1/' | sort | uniq -c
+#   （期望：x2 一个都没有；x4 = 只读串（.rodata）；x5 = DDR3 探针 5 条；x8 = UART；x31 = CONFREG）
 # 构建证据（时序/利用率/综合日志）
 ls chiplab/fpga/loongson/2023.2/rv32gc_out/
 grep -E "WNS|Timing constraints are not met|All user specified timing constraints are met" \
      chiplab/fpga/loongson/2023.2/rv32gc_out/impl_timing_summary.rpt
+# ★ bitstream 里"到底是不是修复后 RTL"的本地证据（不需要板子；见 §7.3）
+grep -a -o 'cpu_mid/u_axi_master_ctrl/rdata_hold_q' \
+     chiplab/fpga/loongson/2023.2/system_run.runs/impl_1/soc_top_power_routed.rpx | sort -u
 ```
 
 ---
 
 ## 6. 交付记录（由构建方填写，用户对照）
 
-> ★ **2026-09-21 第二轮交付（R2 修复）**：核内 AXI 读数据采样点修复后重出 bitstream 与镜像，
-> 以下为**当前应烧写的产物**（上一轮 md5 见本表下的"历史"行，**不要再烧**）。
+> ★ **2026-09-21 第四轮交付（M 扩展根因修复 + 四步诊断探针）**：RTL 只改 **`rtl/exec/mdu.v`**
+> 一处（div_gen 输出字段序：`{余数,商}` → `{商,余数}`，见 §8 —— 这是"上板十进制乱码"的真正根因）；
+> 上板程序加了 BUILD 标记 + 步2.5/2.6/2.7 三个探针。**bitstream 已重建 ⇒ md5 变了，必须重下**。
 
 | 项 | 值 |
 |---|---|
-| 核 RTL 版本 | `rv32gc-cpu` `dev` 分支 R2 修复（`rtl/axi/axi_master_ctrl.v` + `rtl/top/core_top.v`；全 `rtl/**`（`*.v`+`*.vh`）md5 汇总 = **`c558e750441afc0b13c3dbb3776bcbd3`**，修复前为 `f41d1f253d5e0e5baa8030e118af87c1`） |
+| 核 RTL 版本 | `rv32gc-cpu`：R2 修复（`rtl/axi/axi_master_ctrl.v` + `rtl/top/core_top.v`）+ **本轮 M 扩展字段序修复**（`rtl/exec/mdu.v`，md5 **`30a1ab7f7ac2432d605baad24d91c504`**）；全 `rtl/**`（`*.v`+`*.vh`）md5 汇总 = **`66e3225645b6f29375c786fe166448d6`**（仅 `*.v` 时 = `ce31b3c8c51fd813c6437ba9af29e54a`） |
+| 上板程序源码 | `rv32gc-cpu/sw/m5_board/m5_board.S`（md5 **`61c6599e3b936465eb0732c6bcbf81fc`**） |
+| 程序内 BUILD 标记 | **`BUILD=m5_board-diag-2026-09-21c`**（横幅第 2 行；看到它就说明 Flash 里是本轮镜像） |
 | 上板时钟口径 | 33 MHz 同域（`clk_pll_33.clk_out1` 留空，`assign cpu_clk = uncore_clk`）；`config.h` `FREQ = 32'd33000000` |
 | 器件 / 约束 | `xc7a200tfbg676-2` / `chiplab/fpga/loongson/soc_up.xdc`（板级 100 MHz 输入时钟约束，PLL 派生 33 MHz） |
-| **bitstream** | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（**9 730 756 B**，md5 **`f375baa04d8e495cfbb8c5df2042adf4`**） |
-| FPGA 配置 bin（同源） | 同目录 `soc_top.bin`（9 730 652 B，md5 **`c448dfdc982608344dee5c6bd8e4ea7c`**） |
-| **Flash 镜像** | `rv32gc-cpu/sw/m5_board/out/m5_board.bin`（**1773 B**，md5 **`b82be1fc4f67d029232a6409f6941b33`**） |
+| **bitstream（本轮，必烧）** | `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（**9 730 756 B**，md5 **`167dc9dfd487a9d6148ddee02d407726`**，2026-09-21 12:36 构建） |
+| FPGA 配置 bin（同源） | 同目录 `soc_top.bin`（md5 **`6e57443600cacbfedabf038dda58cc5a`**） |
+| **Flash 镜像（诊断版）** | `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（**2774 B**，md5 **`54987330af13d146f7c9d10c2a57edef`**；与 `m5_board.bin` 逐字节相同） |
+| 仿真加载 hex（同源） | `rv32gc-cpu/sw/m5_board/out/m5_board.hex`（md5 **`3dd17c54ec259b54c1b93fab1bedb7d9`**） |
 | 程序波特率 | 115200 8N1（核内设分频 = 18，实际 114583 Bd） |
 | 烧写器波特率 | 230400（`programmer_by_uart.bit`，仅固化 Flash 时用） |
-| 时序（33 MHz 约束，布线后） | WNS **+0.978 ns** / TNS 0 / 失败端点 **0**；`All user specified timing constraints are met` |
-| 核级时序（60 MHz = 16.667 ns，核单独综合+布线） | 见 `fpga/out/impl_16.667ns_timing_summary.rpt`（本轮复跑，WNS ≥ 0） |
+| 时序（33 MHz 约束，布线后，2026-09-21 12:36 重建） | WNS **+0.978 ns** / WHS +0.058 ns / TNS 0 / 失败端点 **0**；`All user specified timing constraints are met` |
+| 核级时序（60 MHz = 16.667 ns，核单独综合+布线；**含 mdu 修复后复跑**） | 综合 WNS **+0.556 ns** / TNS 0 / 失败端点 0；布线后 WNS **+0.110 ns**、WHS **+0.066 ns**、失败端点 **0**，`All user specified timing constraints are met`（`fpga/out/{synth,impl}_16.667ns_timing_summary.rpt`） |
 | 资源（整片 SoC，含平台，2026-09-21 报告） | Slice LUT 70 232 / 134 600（52.18%）、FF 41 500 / 269 200（15.42%）、BRAM 15.5/365（4.25%）、DSP 34/740（4.59%）；其中核本身 `cpu_mid`(core_top) = **52 643 LUT** / 23 230 FF / 12 BRAM / 34 DSP |
+| 本轮可见变化 | ① 横幅第 2 行 = `BUILD=m5_board-diag-2026-09-21c …`；② 新增 `step2.5 DDR3 loopback … R2FIX: …`、`step2.6 MEXT=…`、`step2.7 stack[16B]=…` 三个探针行；③ 十进制/十六进制打印不再依赖 DDR3（纯寄存器路径）；④ 最终判定 = 步④ ∧ FREQ ∧ 三个探针 |
 
-**历史产物（上一轮，已被上面替换，勿再烧写）**：bitstream md5 `5e3bd4f138d6e408728db3590726bfd1`；
-`soc_top.bin` md5 `6748db8c9119f60080da5d8324c60a7d`；Flash 镜像 1621 B / md5 `3b60ccac3b227e367eb8497fd66ff024`
-（那一版在真实 MIG 下 `.data/.bss` 读回垃圾 ⇒ 十进制打印全乱，见 §4 步④ 的 2026-09-21 说明）。
+**历史产物（前三轮，已被上面替换，勿再烧写）**：bitstream md5 `f375baa04d8e495cfbb8c5df2042adf4`（R2 修复版，**没有** M 扩展字段序修复 ⇒ 板子仍会打印 `MEXT: BAD`/乱码）；Flash 镜像 2199 B / md5 `84314223b0c1343ec972e5a1b238cbfe`（第三轮诊断版）；1773 B / md5 `b82be1fc4f67d029232a6409f6941b33`（R2 修复后、无探针的那版程序）；
+更早：bitstream md5 `5e3bd4f138d6e408728db3590726bfd1`、`soc_top.bin` md5 `6748db8c9119f60080da5d8324c60a7d`、Flash 镜像 1621 B / md5 `3b60ccac3b227e367eb8497fd66ff024`
+（那一版在真实 MIG 下 `.data/.bss` 读回垃圾 ⇒ 十进制打印全乱，见 §5.8 的 R2 说明）。
 
 ### 6.1 本轮重烧步骤（只需换两个文件）
 
 1. **bitstream**：Windows 侧 Vivado Hardware Manager → Open Target → Program Device →
    选 `chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit`（md5 见上表）。
+   **一定要看到下载成功**（§7.1 有核对清单）。
 2. **程序镜像**：按 §3 方式 B（`programmer_by_uart.bit` + xmodem）把 **新的**
-   `rv32gc-cpu/sw/m5_board/out/m5_board.bin`（1773 B）写进 Flash 地址 0。
-3. 断电重上电（或重新下载 bitstream），按 §4 观察五步。
-   本轮**可见变化**：步④ 的行格式变为
-   `step4 timer delta = …, cycle delta = …, cycles/iter = …, window = 20..300, sim-calib = 59 cycles/iter (informational only)`
-   —— 其中 `timer delta` 与 `cycle delta` 必须相等（差 ≤ 1%）。
+   `rv32gc-cpu/sw/m5_board/out/m5_diag.bin`（2774 B）写进 Flash 地址 0。
+3. 断电重上电（或按复位键），按 §4 观察；**第一眼看横幅有没有 `BUILD=m5_board-diag-2026-09-21c`，
+   第二眼看步2.6 的 `MEXT:`（本轮根因判据）、再看步2.5/2.7 的 `R2FIX:`/`STACKBF:`**。
+   本轮**可见变化**：
+   - 横幅第 2 行变为 `BUILD=m5_board-diag-2026-09-21c (stack-free prints; R2+MEXT+stack probes)`；
+   - 新增 `step2.5 DDR3 loopback: word=0x12345678 re-read=0x12345678 byte=0x5A (expect 12345678/5A) -> R2FIX: yes`；
+   - 新增 `step2.6 MEXT=00000005 00000009 0000003B 00000031 00000000 00000000 0000002A 40000000 FFFFFFFE -> MEXT: OK`；
+   - 新增 `step2.7 stack[16B]=30 31 32 33 34 35 36 37 38 39 41 42 43 44 45 46 -> STACKBF: OK`；
+   - 步④ 行格式（上一轮起）：`step4 timer delta = …, cycle delta = …, cycles/iter = …, window = 20..300, sim-calib = 59 cycles/iter (informational only)`。
 
-> **构建方补充**：以上数字取自 `chiplab/fpga/loongson/2023.2/rv32gc_out/{impl_timing_summary,impl_utilization}.rpt`
-> （2026-09-21 构建）。步④ 的 `sim-calib = 59 cycles/iter` 只是**仿真参考值**（零延迟内存模型），
-> 真机 SPI Flash 时序下 `cycles/iter` 更高属正常，**不参与**判定（判据见 §4 步④）。
+---
+
+## 7. ★ 诊断节：判定 FPGA 里跑的 bitstream 是新还是旧（2026-09-21 诊断版）
+
+> **为什么需要这一节**：上一轮"重烧后现象与修复前逐字相同"的观测，最终由本轮定位为
+> **RTL 的 IP 分支缺陷**（`mdu.v` 把 div_gen 的 tdata 字段序写反 ⇒ divu/remu 商余数互换
+> ⇒ 十进制打印全乱，见 §8），**与 bitstream 新旧无关**。但"板子里跑的到底是哪份配置"
+> 仍必须能被**独立判定**（否则无法排除"配置没换成新的"这一可能）。本节 + 步2.5/2.6/2.7
+> 三行探针就是为此设计的：程序自己说出"我读到的 M 扩展 / DDR3 是好的还是垃圾"。
+
+### 7.1 两步走（顺序很重要：先 bitstream，再程序）
+
+| 步 | 动作 | **必须确认的"成功"证据** | 失败长什么样 |
+|---|---|---|---|
+| ① | Vivado → `Open Hardware Manager` → `Open Target` → `Auto Connect` → `Program Device` → 选 `rv32gc_chiplab_soc.bit` → `Program` | Vivado 的 Tcl Console / 提示框出现 `Programming device ... done` / 进度 100% 且**无 ERROR**；`Hardware` 面板显示 `xc7a200t`；下载后按板载复位键 | 出现 `ERROR`/`IDCODE mismatch`/进度中断 ⇒ JTAG 线/供电问题（§5.2 末行） |
+| ①′ | **核对你要下载的 .bit 文件本身**（Windows 侧，可选但推荐）<br>`certutil -hashfile rv32gc_chiplab_soc.bit MD5` | 输出 `167dc9dfd487a9d6148ddee02d407726` | 不是这个值 ⇒ **你手里的文件不是本轮交付的 bitstream**（重新从本仓库拷一份） |
+| ② | 烧 `m5_diag.bin`（§3 方式 B：`programmer_by_uart.bit` + xmodem，230400） | 烧写器提示传输完成；之后**回到 115200** 打开串口、按复位 | 传输中断/进度卡住 ⇒ 重来一次；注意"烧写器波特率 230400 ≠ 程序波特率 115200" |
+| ③ | 观察串口 | 横幅有 `BUILD=m5_board-diag-2026-09-21c …`；步2.5/2.6/2.7 三行的结论分别是 `R2FIX: yes` / `MEXT: OK` / `STACKBF: OK`；末尾 `RESULT: RV32GC-M5-OK` | 见下表 |
+
+> ⚠️ **顺序建议**：先做 ①（bitstream），确认成功后再做 ②（程序）；反过来也物理可行，但
+> 若 ① 失败你会把"旧 bitstream + 新程序"的现象（`R2FIX: no`）误当成"程序的问题"。
+> **判据与 bitstream 无关的部分**（`RESULT` 之外的 LED 心跳、文字输出）在两种顺序下都能看。
+>
+> ⚠️ **"下载成功"不等于"已生效"**：Vivado 里 `Program Device` 必须选**当前**的
+> `rv32gc_chiplab_soc.bit`（三份同源副本 md5 都是 `167dc9dfd487a9d6148ddee02d407726`）；
+> 下载完成后再**按一次板载复位键**（`resetn = Y3`）；若现象仍如旧，**Ctrl+Shift+P 重新
+> `Program Device` 并观察 Tcl Console 的完整输出**，把该输出原文回报。
+
+### 7.2 判别表（把这三行抄回来即可定位）
+
+| 横幅里有 `BUILD=m5_board-diag-2026-09-21c` | 步2.6 的 `MEXT:` | 步2.5 的 `R2FIX:` | 结论 | 下一步 |
+|---|---|---|---|---|
+| 有 | `ok` | `yes` | ✅ 新程序 + **新 bitstream**（M 扩展字段序修复 + R2 修复都在位） | 看 `RESULT`；若还是 BAD，抄回 step4/step5 原文 |
+| 有 | `BAD`（商/余数互换） | 视 bitstream 而定 | ⚠️ 新程序 + **修复前 bitstream** ⇒ FPGA 配置没换成新的（这正是本轮"现象逐字不变"的原因） | 重做 §7.1 ①，**确认 Program Device 成功**；仍为 `BAD` 则把 bitstream 文件 md5 报回来 |
+| 有 | `ok` | `no` | ⚠️ 新程序 + **R2 修复前 bitstream**（同一份旧 bitstream 的另一种表现） | 同上：重新下载新 bitstream |
+| 没有（横幅是老格式） | 无此行 | 无此行 | ⚠️ Flash 里还是**旧程序** | 重做 §7.1 ② |
+| 有 | 无此行 / 卡在 step2 | — | ⚠️ 程序没跑到探针 | 回报 §5.1 必报信息（串口原文 + LED 状态） |
+
+### 7.3 本地（不需要板子）核对"bitstream 是否含修复"
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu
+# ① bitstream 文件 md5 必须是 167dc9dfd487a9d6148ddee02d407726（本轮，含 M 扩展字段序修复）
+#    （上一轮 R2 版 = f375baa04d8e495cfbb8c5df2042adf4 —— 那个版本**没有**本轮修复，别烧错）
+md5sum chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_chiplab_soc.bit
+# ② 构建产物里必须能查到**修复后才有的寄存器** rdata_hold_q（在 axi_master_ctrl 里）：
+grep -a -o 'cpu_mid/u_axi_master_ctrl/rdata_hold_q' \
+     chiplab/fpga/loongson/2023.2/system_run.runs/impl_1/soc_top_power_routed.rpx | sort -u
+#   ⇒ 期望输出：cpu_mid/u_axi_master_ctrl/rdata_hold_q
+#     （该寄存器只在 R2 修复后的 axi_master_ctrl.v 里存在 ⇒ 这是"这份实现确实含修复"的内容级证据）
+# ③ 构建时间晚于 R2 修复（源码 mtime < 构建日志 mtime）：
+stat -c '%y %n' rv32gc-cpu/rtl/axi/axi_master_ctrl.v \
+                chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_build.vivado.log
+# ④ 构建脚本每次都会把 rtl/** 全部读入（不是旧快照）：
+grep -n 'add_files' chiplab/fpga/loongson/2023.2/rv32gc_build.tcl     # 逐文件 add_files（路径引用，非拷贝）
+grep -n 'reset_run synth_1' chiplab/fpga/loongson/2023.2/rv32gc_build.tcl   # 每次重置综合 ⇒ 重读源文件
+grep -a '加入核源文件' chiplab/fpga/loongson/2023.2/rv32gc_out/rv32gc_build.vivado.log
+```
+
+> 本节的**本地核查结论**（2026-09-21 实测，证据见交付报告）：
+> bit md5 = `f375baa04d8e495cfbb8c5df2042adf4` ✅（**这是上一轮的 R2 版；本轮 M 扩展修复后已重建，
+> 新 md5 见 §6 交付表**）；
+> `soc_top_power_routed.rpx`（布线后报告，11:12:11）含 `cpu_mid/u_axi_master_ctrl/rdata_hold_q[31]_i_1` ✅；
+> RTL 源 mtime 10:19/10:20 < 构建日志 mtime 11:14 ✅；
+> `rv32gc_build.tcl` 用 `add_files`（**路径引用**，不拷贝内容）+ `reset_run synth_1`（每次重读源）✅。
+> ⇒ 盘上的 bitstream 确实由当时的 RTL 构建而来。
+>
+> **本轮（含 `mdu.v` 字段序修复）的本地复核**：
+> * `rtl/exec/mdu.v` mtime = 2026-09-21 12:06:25 **早于**本轮综合启动时间 12:07:17（`rv32gc_build.vivado.log`）；
+> * 构建日志里没有**任何** rtl 源文件晚于综合启动（`find rtl -newermt '2026-09-21 12:07' ` 为空）；
+> * 布线后报告仍含 R2 修复的寄存器 `cpu_mid/u_axi_master_ctrl/rdata_hold_q`（12:33 生成）；
+> * 新 bitstream md5 = `167dc9dfd487a9d6148ddee02d407726`；时序结论见 §6。
+> * 字段序修复本身的功能证据在 **xsim**（真实 IP）：`sw/m5_board/tb/ip/run_mdu_ip_xsim.sh`
+>   （修复前 15 条 FAIL、修复后 25/25 PASS），见 §8。
+
+---
+
+## 8. 本轮根因与修复（2026-09-21 · M 扩展 IP 分支：div_gen 字段序）
+
+> **症状回顾**：上板串口"字符串/FREQ 十六进制/LED/开关全部正常，**只有十进制数字乱码**"，
+> 且换用含 R2 修复的 bitstream 后**逐字节相同**。
+
+### 8.1 根因（一句话）
+
+`rtl/exec/mdu.v` 的 **IP 分支**（综合用，即板上跑的那一支）把 `div_gen` 的输出
+`m_axis_dout_tdata[63:0]` 当成了 `{余数[63:32], 商[31:0]}`；**实测真实 IP 的字段序是
+`{商[63:32], 余数[31:0]}`** ⇒ `divu` 返回余数、`remu` 返回商（**商余数互换**）。
+
+* 十进制打印当时靠 `remu/divu` 逐位取数字（`puts_dec`）⇒ 每一位都错 ⇒ 乱码（确定性、可复现）；
+* 字符串、`FREQ` 十六进制、LED、开关**都不碰除法** ⇒ 全部正常；
+* 本缺陷与 R2（AXI R 数据采样点）**无关** ⇒ 换 R2 版 bitstream 现象不变。
+
+### 8.2 证据链（**仿真闭环，不是推断**）
+
+| # | 证据 | 命令 / 位置 |
+|---|---|---|
+| ① | 真实 `div_gen` 的输出字段序实测：59/10 ⇒ `tdata=0x00000005_00000009`（高半 = 商 5、低半 = 余数 9）；118049/2000 ⇒ `0x0000003b_00000031` | `bash sw/m5_board/tb/ip/run_ip_div_xsim.sh`（xsim + Vivado 加密 IP 网表） |
+| ② | **修复前**：`mdu` 的 IP 分支 25 个向量 **15 条 FAIL**，全部呈"商余数互换"形态（`DIVU 59/10` 读回 `9`、`REMU 59%10` 读回 `5`） | `bash sw/m5_board/tb/ip/run_mdu_ip_xsim.sh --expect-fail` |
+| ③ | **修复后**：同一 TB **25/25 PASS** | `bash sw/m5_board/tb/ip/run_mdu_ip_xsim.sh` |
+| ④ | 板上可判定：诊断版步2.6 `MEXT:` 行（9 个向量）—— 修复前会打印互换值 | §4 步2.6 |
+| ⑤ | 行为分支回归不受影响：`regress.sh` 23/23、arch-test I/F/D/PMP*/Sv 全过 | 见交付报告 |
+
+> 为什么此前没发现：iverilog/Verilator **不能编译 Vivado 加密 IP 网表**（`pragma protect`），
+> 历次回归只覆盖 `mdu.v` 的**行为分支**（function 实现，商余数本来是对的）；板子上才是
+> **IP 分支**的第一次功能验证。本轮用 **xsim（自带解密密钥）+ 预编译 `unisims_ver` 原语库 +
+> `glbl`** 把它拉进了仿真闭环。
+
+### 8.3 修复（`rtl/exec/mdu.v`，**唯一** RTL 改动）
+
+```verilog
+// 修复前（错）：按 {余数[63:32], 商[31:0]} 取
+wire [32:0] div_rem_next  = {1'b0, ip_div_dout[63:32]};
+wire [31:0] div_quot_next = ip_div_dout[31:0];
+// 修复后（对）：div_gen 实测字段序 = {商[63:32], 余数[31:0]}
+wire [32:0] div_rem_next  = {1'b0, ip_div_dout[31:0]};
+wire [31:0] div_quot_next = ip_div_dout[63:32];
+```
+
+* 只改**取值方向**与相应注释；握手时序（`ip_div_launch_q` 单拍脉冲发 `tvalid`、FSM 在
+  `m_axis_dout_tvalid` 那一拍采 `tdata`）经 xsim 实测**本来是对的**（`start`→`done` 实测 37 拍，
+  与 `C_LATENCY=34` + 状态机 2 拍一致）⇒ 没有 off-by-one；
+* 行为分支（`ifndef` 区间）**一字未动** ⇒ iverilog 回归语义不变；
+* 新 bitstream 的 md5 见 §6 交付表（本轮重建，含该修复）。
+
+### 8.4 用户重烧指引（本轮）
+
+1. **先看步2.6**：`MEXT:` 行 9 个值若与 §4 步2.6 表**逐字相同** ⇒ 板子里已是修复后配置；
+   若商/余数互换（`divu(59,10)` 打印 `9`）⇒ 仍是修复前的 bitstream，按 §7.1 重下。
+2. **再看步2.5/2.7**：`R2FIX: yes` + `STACKBF: OK` ⇒ DDR3 读通路也正常。
+3. 三行都 ok 后，`RESULT: RV32GC-M5-OK` 才算**本轮完整通过**。

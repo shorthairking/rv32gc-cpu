@@ -27,6 +27,10 @@
 //   C4 捕获到对 0x1FD0_F000（LED）的写，且至少一次对 +0xF020（switch）、+0xE000（TIMER）、
 //      +0xF030（FREQ）的读 —— 观测点全部在 AXI 通道上（confreg_axi_filter 的 AR/AW 握手）
 //   C5 超时保护：TIMEOUT_CYCLES 拍内未同时命中 C2/C3 ⇒ FAIL
+//   C6（**默认关闭**，只在 EXPECT_EXTRA 非空时生效）UART 捕获序列中必须出现
+//      `EXPECT_EXTRA` 子串（例如诊断版的 "R2FIX: yes"）。
+//      ★ 默认空串 ⇒ C0–C5 语义与历史运行**逐字不变**（老程序/控制实验不受影响）；
+//        诊断版运行时由 run_tb.sh 传 -P tb_m5_board.EXPECT_EXTRA=\"R2FIX: yes\"。
 //
 // ★ 本 TB **不打印任何兜底 PASS**：唯一 PASS 行是 `TB_M5_BOARD: PASS`，且只在 C0–C5
 //   全部通过时打印一次；FAIL 路径的诊断文字一律避开 "PASS" 字样。
@@ -46,6 +50,10 @@ module tb_m5_board #(
     //   （★ 不放宽任何判据：C3 仍要求完整子串 "RESULT: RV32GC-M5-OK" 出现；
     //     程序输出格式为 前缀+"OK"/"BAD"+CRLF ⇒ 宽限 4 字节即可判定完毕）
     parameter [8*32-1:0]   EXPECT_C3_PFX   = "RESULT: RV32GC-M5-",
+    // ---- ★ C6（默认关闭）：诊断版要求的附加子串（空串 = 不启用，判据 C0–C5 语义不变）----
+    //   诊断版（m5_board.S 步2.5）会打印 `... -> R2FIX: yes`；R2 缺陷在位时打印 `R2FIX: no`。
+    //   传空串 ⇒ C6 不参与判定（历史程序/控制实验照旧）。
+    parameter [8*32-1:0]   EXPECT_EXTRA    = "",
     parameter integer      GRACE_BYTES     = 4,
     // ---- 时钟/复位（上板 33 MHz：半周期 15.1515 ns ⇒ 周期 30.303 ns）----
     parameter real         CLK_HALF_NS    = 15.1515,
@@ -387,7 +395,10 @@ module tb_m5_board #(
     reg        rx_push_q;
     reg        c2_hit, c3_hit;
     reg        c3p_hit;                       // 结果行前缀命中（仅用于"提前收尾"）
+    reg        c6_hit;                        // ★ C6：EXPECT_EXTRA 子串命中（默认关闭）
     reg [31:0] c2_cycle, c3_cycle, c2_byte, c3_byte, c3p_byte;
+    reg [31:0] c6_cycle, c6_byte;
+    wire       c6_en = (str_nbytes(EXPECT_EXTRA) > 0);   // 空串 ⇒ C6 不启用
     integer    wi;
 
     // 提前收尾：① C2/C3 都命中；或 ② 结果行前缀命中且宽限字节已到（OK/BAD 必已确定）
@@ -420,8 +431,10 @@ module tb_m5_board #(
             for (wi = 0; wi < WIN; wi = wi + 1) rx_win[wi] <= 8'h00;
             c2_hit <= 1'b0; c3_hit <= 1'b0;
             c3p_hit <= 1'b0;
+            c6_hit <= 1'b0;
             c2_cycle <= 32'd0; c3_cycle <= 32'd0;
             c2_byte  <= 32'd0; c3_byte  <= 32'd0;
+            c6_cycle <= 32'd0; c6_byte  <= 32'd0;
         end else begin
             rx_push_q <= uart_char_valid;
             if (uart_char_valid) begin
@@ -443,6 +456,11 @@ module tb_m5_board #(
                 if (!c3p_hit && match_tail(EXPECT_C3_PFX)) begin
                     c3p_hit   <= 1'b1;
                     c3p_byte  <= rx_total;
+                end
+                if (c6_en && !c6_hit && match_tail(EXPECT_EXTRA)) begin
+                    c6_hit   <= 1'b1;
+                    c6_cycle <= gcyc;
+                    c6_byte  <= rx_total;
                 end
             end
         end
@@ -536,6 +554,11 @@ module tb_m5_board #(
         $write("  PROG_HEX    = ");                         print_pstr(PROG_HEX);  $write("\n");
         $write("  C2 期望子串 = \"");                        print_pstr(EXPECT_C2); $write("\"\n");
         $write("  C3 期望子串 = \"");                        print_pstr(EXPECT_C3); $write("\"\n");
+        if (c6_en) begin
+            $write("  C6 附加子串 = \"");                    print_pstr(EXPECT_EXTRA); $write("\"（启用）\n");
+        end else begin
+            $display("  C6 附加子串 = <未启用>（EXPECT_EXTRA 空串）");
+        end
         $display("  时钟        = 半周期 %f ns ⇒ 周期 %f ns（%f MHz）",
                  CLK_HALF_NS, CLK_HALF_NS*2.0, 1000.0/(CLK_HALF_NS*2.0));
         $display("  超时预算    = %0d 拍；复位 %0d 拍；SWITCH=0x%02h；FREQ=%0d",
@@ -650,6 +673,13 @@ module tb_m5_board #(
         $write("TB_M5_UART : 结果行前缀 \""); print_pstr(EXPECT_C3_PFX);
         $display("\" ⇒ %0s（命中字节序号 %0d；宽限 %0d 字节后判定确定=%b）",
                  c3p_hit ? "HIT" : "MISS", c3p_byte, GRACE_BYTES, c3_decided);
+        if (c6_en) begin
+            $write("TB_M5_UART : ★C6 附加子串 \"");
+            print_pstr(EXPECT_EXTRA);
+            $display("\" ⇒ %0s（命中字节序号 %0d，拍 %0d）", c6_hit ? "HIT" : "MISS", c6_byte, c6_cycle);
+        end else begin
+            $display("TB_M5_UART : ★C6 未启用（EXPECT_EXTRA 为空串 ⇒ 判据 C0–C5 语义与历史一致）");
+        end
         $display("------------------------------------------------------------------------");
 
         //----------------------------------------------------------------------
@@ -748,6 +778,20 @@ module tb_m5_board #(
             $display("TB_M5_BOARD: FAIL C5 %0d 拍内未出现结果行（超时保护触发；已收 %0d 字节）", TIMEOUT_CYCLES, uart_tx_count);
         end else begin
             $display("TB_M5_CHECK: C5 判定在 %0d 拍预算内完成（实用 %0d 拍）OK", TIMEOUT_CYCLES, cyc);
+        end
+
+        // ---- C6（可选，默认关闭）：附加子串（诊断版用 "R2FIX: yes"）----
+        if (c6_en) begin
+            if (!c6_hit) begin
+                pass = 1'b0;
+                $write("TB_M5_BOARD: FAIL C6 UART 捕获序列中未出现附加子串 \"");
+                print_pstr(EXPECT_EXTRA);
+                $display("\"（已收 %0d 字节）", uart_tx_count);
+            end else begin
+                $write("TB_M5_CHECK: C6 附加子串 \"");
+                print_pstr(EXPECT_EXTRA);
+                $display("\" 命中（第 %0d 字节，拍 %0d）OK", c6_byte, c6_cycle);
+            end
         end
 
         $display("TB_M5_SUMMARY: cycles=%0d uart_bytes=%0d c2=%b c3=%b first_ar=0x%08h conf_ar=%0d conf_aw=%0d led_wr=%b sw_rd=%b timer_rd=%b freq_rd=%b collision=%0d",

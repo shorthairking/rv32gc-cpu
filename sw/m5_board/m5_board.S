@@ -17,8 +17,11 @@
 #   · **全程只用 PC 相对寻址**：所有取串都是 `lui %hi(标签)` + `addi %lo(标签)`
 #     的**链接期就地解析**字面量，无运行期绝对地址（build.sh 判据⑤ 核对 `readelf -r` 为空）。
 #   · **不开 MMU**：不写 satp/mstatus ⇒ 复位后 satp.MODE=Bare，取指/数据全是物理地址。
-#   · 指令集：RV32I + **仅**用于打印的 M 扩展 `remu/divu`（十进制打印）；
-#     步④ 的**时序判据**用的是本文件自写的 `udiv`（移位减法），**不依赖 M 扩展**。
+#   · 指令集：**纯 RV32I**（外加步④ 只读的 `rdcycle` ⇒ Zicsr）。
+#     ★ 2026-09-21 诊断版起：十进制/十六进制打印**全部改为纯寄存器路径**（比较-减法 +
+#       常量幂链），**全程序不再含任何 M 扩展指令**（build.sh 判据⑪f 机器核对反汇编）；
+#       编译开关仍写 `rv32im_zicsr` 只为与工具链历史口径一致（M 指令一条也不会生成）。
+#     步④ 的**时序判据**用的是本文件自写的 `udiv`（移位减法），同样不依赖 M 扩展。
 #   · Zicsr：**只有**步④ 的 `rdcycle`（CSR 0xC00，核内 cycle_cnt_r 每拍 +1）——
 #     用于把 CONFREG TIMER 与核周期计数做**一致性对照**（Zicntr 已由 arch-test 验证：
 #     构建用 `-march=rv32im_zicsr`；不写任何 CSR，只读 cycle）。
@@ -57,6 +60,24 @@
 #   步① LED 心跳：8 个 LED 位依次点亮，每拍间隔 = `DELAY_HB_TICKS`（0.24 s 的 TIMER 等待）；
 #        数码管 = 0x1000 | (led << 16)（进度码 1）。
 #   步② UART 输出：打印横幅与步骤说明（每轮循环打印一次）。
+#   步2.5 ★ DDR3 回环判别（2026-09-21 新增的**诊断步**，紧跟步② 之后）：
+#        写 0x12345678 到 DDR3 固定地址 `R2_PROBE_ADDR = 0x0000_8000` → `lw` 读回 →
+#        对 `0x0000_8003` 做 `sb 0x5A`→`lbu` 字节回环；两个读回值都用**十六进制**打印
+#        （纯寄存器路径，不经任何缓冲），并在同一行给出判别结论：
+#          · 新 bitstream（含 R2 修复）⇒ `word=0x12345678`、`byte=0x5A`、`R2FIX: yes`
+#          · 旧 bitstream（R2 缺陷在位）⇒ 读回垃圾（≠ 期望）、`R2FIX: no`
+#        判别原理：DDR3 数据访问在核内走 **MDTA（uncached 单 beat AXI）**，正是 R2 缺陷
+#        （R 握手后第 2 拍才采样 rdata）所在的通路；写通路与该缺陷无关。
+#   步2.6 ★ M 扩展探针（2026-09-21 新增）：9 个固定向量（divu/remu/mul/mulh/mulhu）
+#        十六进制打印 + 与本文件内置期望值逐条比对 ⇒ `MEXT: ok / BAD`。
+#        为什么：RTL 的 **IP 分支**（综合走 div_gen/mult_gen）在 iverilog 里跑不了
+#        （网表加密）⇒ 历次仿真回归只覆盖行为分支；2026-09-21 用 xsim + 真实 IP 实测
+#        发现 div_gen 的 tdata 字段序 = {商, 余数}（RTL 原来按 {余数, 商} 取）
+#        ⇒ divu/remu 商余数互换 ⇒ 十进制打印全乱（= 上板现象）。本步让它在板上可判定。
+#   步2.7 ★ 栈字节通路探针（2026-09-21 新增）：把 "0123456789ABCDEF" 写进栈缓冲
+#        （sp-64，DDR3）再逐字节 `lbu` 读回、两位 hex 打印 ⇒ `STACKBF: ok / BAD`
+#        （检查 DDR3 字节 lane / 读回是否错位；与步2.5 一起覆盖 R2 缺陷的两条 DDR3 通路）。
+#   以上三个诊断步的结论**全部并入**最终判定（与步④、步⑤ 同为判据）。
 #   步③ 开关回读：读 +0xF020 → 写 LED（低 8 位）与数码管（0x3000|switch<<16），并打印。
 #   步④ TIMER ↔ 核周期一致性：TIMER 清零 → 记 `rdcycle` 与 TIMER 起点 →
 #        `delay_loop` 跑 MEAS_ITER=2000 次迭代 → 记 `rdcycle` 与 TIMER 终点。
@@ -69,7 +90,26 @@
 #          ⇒ 真机 Flash 时序下不可移植；放宽窗口会退化成"看着像过"。新判据不用任何
 #          绝对拍数常量（`XIP_CPI=59` 仅作打印参考）。
 #   步⑤ FREQ 回读：读 +0xF030（期望 0x01F78A40 = 33 000 000），打印十六进制与 div1e6。
-#   结论：步④ 判定 ∧（FREQ 高 20 位 == 31）⇒ 打印 `RESULT: RV32GC-M5-OK`，否则 `...-BAD`。
+#   结论：步④ 判定 ∧（FREQ 高 20 位 == 31）∧（步2.5 R2 回环通过）⇒ 打印
+#         `RESULT: RV32GC-M5-OK`，否则 `...-BAD`。
+#
+#------------------------------------------------------------------------------
+# 三点五、★ 打印路径与内存无关（诊断可读性的前提，2026-09-21 诊断版重写）
+#------------------------------------------------------------------------------
+#   问题：旧版 `puts_dec` 把每一位数字先 `sb` 进**栈缓冲**（sp = 0x07FF_FFF0，在 DDR3），
+#   再 `lbu` 读回来打印；`puts_str`/`puts_hex8`/`udiv`/`delay_ticks` 也都用栈保存 ra。
+#   而 R2 缺陷（旧 bitstream）下 **DDR3 读会返回垃圾** ⇒ 十进制打印全乱，且"乱码"这一
+#   现象无法区分"核坏了"还是"跑的是旧 bitstream"—— 正是本诊断版要解决的事。
+#   现口径（本文件）：
+#     · `puts_dec`：比较-减法 + 10 的常量幂链（10^9…10^0），**无除法、无访存、无缓冲**；
+#     · `puts_hex8`/`puts_hex2`：nibble 循环，值/计数全在寄存器；
+#     · `puts_str`（用 tp 当串游标）/`puts_nl`/`udiv`（ra 存 a5）/`delay_ticks`（ra 存 a5）：
+#       一律**不碰栈**；`sp` 仍在启动时按上板口径初始化，但全程序**一次都不访存它**
+#       （build.sh 判据⑪a 机器核对反汇编里没有任何以 x2 为基址的访存）。
+#   ⇒ 全程序**唯一的 DDR3 访问** = 步2.5 的回环探针（显式地址、读回值只进寄存器）。
+#     依赖的外部通路只剩：UART MMIO（写 + 有上界的 LSR 等待）、CONFREG（平台**保持型**
+#     寄存器读，`confreg_syn` 口径）⇒ 即使旧 bitstream 在位，本程序也能跑完全流程并
+#     明确打印 `R2FIX: no`，而不是"乱码一堆"。
 #
 #------------------------------------------------------------------------------
 # 四、编译（见 sw/m5_board/build.sh；工具链 /opt/riscv/bin/riscv32-unknown-linux-gnu-）
@@ -77,6 +117,8 @@
 #   -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -ffreestanding
 #   -Wl,-Ttext=0x1C000000 -Wl,-e,_start -Wl,--build-id=none
 #   产物：m5_board.elf / m5_board.bin（烧写镜像）/ m5_board.hex（仿真加载）/ m5_board.dis
+#         + m5_diag.bin（**诊断版镜像，与 m5_board.bin 逐字节相同**的显式命名副本，
+#           便于 runbook 诊断节引用；build.sh 判据⑪g 用 cmp 核对两者一致）
 #==============================================================================
 
     .section .text
@@ -87,15 +129,25 @@
 #------------------------------------------------------------------------------
 # 寄存器用途（全部在本文件内，直进直出；不遵守 ABI 调用约定）
 #   s0 = UART 基址 0x1FE001E0     s1 = CONFREG 基址 0x1FD00000
-#   s2 = LED 位模式               s3 = 心跳拍计数
-#   s4 = TIMER 起始值             s5 = TIMER 结束值
-#   s6 = 步④ 实测 ticks           s7 = 步④ cycles/iter
+#   s2 = ★ R2 回环判定（步2.5 起；1 = 坏 / 旧 bitstream）
+#        （步① 期间 s2 暂作 LED 位模式 ⇒ 步2.5 才写入本判定，无冲突）
+#   s3 = 步① 心跳拍计数 → 步2.5 借用存 word 读回值 → 步④ 重新占用为 Δcycle
+#   s4 = 步2.5 借用存 re-read 值 → 步④ 重新占用为 rdcycle 起点
+#   s5 = 步2.5 借用存 byte 读回值 → 步④ 重新占用为 TIMER 起点
+#   s6 = 步④ Δtimer               s7 = 步④ cycles/iter
 #   s8 = 步④ 判定（1 = 通过）     s9 = FREQ 值（跨 puts_* 保存）
 #   s10 = 最终判定（坏=1；跨 puts_* 保存）   s11 = 步④ 坏标志（跨 udiv/puts_* 保存）
-#   t0..t6 = 临时                 a0..a1 = 参数/返回值
+#   t0..t6 = 临时；a0..a1 = 参数/返回值；a2..a7 = 子程序内部（**不跨子程序存活**）
+#   tp(x4) = puts_str 的串游标（本程序不用于任何 ABI 用途）
+#   ★ 纪律：一切"跨子程序存活"的值放 s 系列 —— puts_dec/puts_hex8/udiv/delay_ticks
+#     会破坏 a2..a7 与 t0/t1（不再有栈保存，见 §三点五）。
 #------------------------------------------------------------------------------
 .equ UART_BASE,      0x1FE001E0
 .equ CONF_BASE,      0x1FD00000
+.equ R2_PROBE_ADDR,  0x00008000    # ★ 步2.5 的 DDR3 回环地址（见 §三 步2.5 的选址论证：
+                                   #   DDR3 内、远离 Flash 程序区与栈顶；本程序无 .data/.bss）
+.equ R2_PROBE_PAT,   0x12345678    #   回环写入模式（word）
+.equ R2_PROBE_BYTE,  0x5A          #   回环写入模式（byte，地址 = R2_PROBE_ADDR + 3）
 .equ MEAS_ITER,      2000          # 步④ delay_loop 迭代数（×≈59 拍 ≈ 1.2e5 拍 ≈ 3.5 ms）
 .equ XIP_CPI,        59            # ★ **参考**标定常量：零延迟仿真内存模型下 delay_loop 的
                                    #   "每迭代拍数"（核级仿真实测 59.02）。真机 SPI Flash XIP
@@ -115,8 +167,10 @@ _start:
     lui   s0, 0x1FE00
     addi  s0, s0, 0x1E0            # s0 = 0x1FE001E0（UART）
     lui   s1, 0x1FD00              # s1 = 0x1FD00000（CONFREG）
-    lui   sp, 0x08000              # 栈顶 = DDR3 末尾（本程序几乎不用栈，仅 puts_* 存 ra）
+    lui   sp, 0x08000              # 栈顶 = DDR3 末尾（0x07FF_FFF0）
     addi  sp, sp, -16
+    #   ★ 2026-09-21 诊断版：sp 仍按上板口径初始化，但**全程序不再访存栈**（见 §三点五）；
+    #     保留它只为口径一致 + 万一将来需要，且不产生任何 DDR3 访问。
 
     # ---- 1. UART 初始化：FCR=0x47 → DLAB=1 → DLL=18, DLM=0 → LCR=0x03（8N1）----
     #   33 MHz / (18 × 16) = 114583 Bd（与 115200 差 0.54%，在 UART 容差内）
@@ -172,6 +226,217 @@ hb_loop:
     lui   a0, %hi(msg_steps)
     addi  a0, a0, %lo(msg_steps)
     jal   ra, puts_str
+
+    #--------------------------------------------------------------------------
+    # 步2.5 ★ DDR3 回环判别（R2 缺陷探针）—— 本程序**唯一**的 DDR3 访问
+    #   通路：PA 0x0000_8000 在 DDR3 默认通路上 ⇒ mmio_route 判 ROUTE_AXI
+    #         ⇒ 核内走 **MDTA（uncached 单 beat AXI）**，正是 R2 缺陷（R 握手后
+    #         第 2 拍才采样 rdata）所在通路；写通路与该缺陷无关。
+    #   选址：DDR3 内（0x0000_0000–0x07FF_FFFF）；本程序 .text/.rodata 都在 Flash XIP
+    #         0x1C00_0000，**没有** .data/.bss（build.sh 判据⑪e 机器核对），栈顶
+    #         0x07FF_FFF0 且全程序不访存栈 ⇒ 0x8000 绝对安全。
+    #   读回值只进寄存器（s3/s4/s5），打印走纯寄存器路径 ⇒ 判据本身不依赖 DDR3 读。
+    #--------------------------------------------------------------------------
+    li    t0, R2_PROBE_ADDR        # t0 = 0x00008000（li 由汇编器展开 lui+addi）
+    li    t1, R2_PROBE_PAT         # t1 = 0x12345678
+    sw    t1, 0(t0)                # DDR3[0x8000] <= 0x12345678（写：与 R2 缺陷无关）
+    lw    t2, 0(t0)                # ★ 读回（MDTA；旧 bitstream 下 = 垃圾）
+    lw    t3, 0(t0)                # 再读一次（诊断：两次读是否一致）
+    li    t1, R2_PROBE_BYTE        # t1 = 0x5A
+    sb    t1, 3(t0)                # DDR3[0x8003] <= 0x5A（字节回环）
+    lbu   t4, 3(t0)                # ★ 按字节读回
+    #   ---- 判定（极性统一"坏 = 1"）：word 或 byte 任一不匹配 ⇒ s2 = 1 ----
+    li    t1, R2_PROBE_PAT
+    sub   t5, t2, t1
+    sltu  t5, x0, t5               # t5 = 1 ⇔ word 读回 != 0x12345678
+    li    t1, R2_PROBE_BYTE
+    sub   t6, t4, t1
+    sltu  t6, x0, t6               # t6 = 1 ⇔ byte 读回 != 0x5A
+    or    s2, t5, t6               # ★ s2 = 1 ⇔ R2 回环失败（旧 bitstream 在位）
+    #   ---- 打印（数值先搬 s 系列：跨 puts_* 存活；hex 打印无需任何缓冲）----
+    mv    s3, t2                   # word 首读
+    mv    s4, t3                   # word 再读
+    mv    s5, t4                   # byte 读回
+    lui   a0, %hi(str_ddr)
+    addi  a0, a0, %lo(str_ddr)
+    jal   ra, puts_str             # "step2.5 DDR3 loopback: word=0x"
+    mv    a0, s3
+    jal   ra, puts_hex8
+    lui   a0, %hi(str_ddr2)
+    addi  a0, a0, %lo(str_ddr2)
+    jal   ra, puts_str             # " re-read=0x"
+    mv    a0, s4
+    jal   ra, puts_hex8
+    lui   a0, %hi(str_ddr3)
+    addi  a0, a0, %lo(str_ddr3)
+    jal   ra, puts_str             # " byte=0x"
+    mv    a0, s5
+    jal   ra, puts_hex2
+    lui   a0, %hi(str_ddr4)
+    addi  a0, a0, %lo(str_ddr4)
+    jal   ra, puts_str             # " (expect 12345678/5A) -> R2FIX: "
+    bnez  s2, ddr_stale
+    lui   a0, %hi(str_yes)
+    addi  a0, a0, %lo(str_yes)
+    jal   ra, puts_str             # "yes"（新 bitstream / R2 修复在位）
+    j     ddr_done
+ddr_stale:
+    lui   a0, %hi(str_no)
+    addi  a0, a0, %lo(str_no)
+    jal   ra, puts_str             # "no"（旧 bitstream / R2 缺陷在位）
+ddr_done:
+    jal   ra, puts_nl
+
+    #--------------------------------------------------------------------------
+    # 步2.6 ★ M 扩展探针（IP 分支功能自检）——纯寄存器路径 + 十六进制打印
+    #   9 个固定向量（**打印顺序即下表顺序**；期望值见 runbook §4 步2.6）：
+    #     ① divu(59,10)                  期望 0x00000005
+    #     ② remu(59,10)                  期望 0x00000009
+    #     ③ divu(118049,2000)            期望 0x0000003B
+    #     ④ remu(118049,2000)            期望 0x00000031
+    #     ⑤ divu(0,10)                   期望 0x00000000
+    #     ⑥ divu(1,10)                   期望 0x00000000
+    #     ⑦ mul(6,7)                     期望 0x0000002A（乘法也走 IP 分支：mult_gen）
+    #     ⑧ mulh(0x80000000,0x80000000)  期望 0x40000000（有符号高半）
+    #     ⑨ mulhu(0xFFFFFFFF,0xFFFFFFFF) 期望 0xFFFFFFFE（无符号高半）
+    #   ★ 为什么必须有这一步：RTL 的 **IP 分支**（综合走 div_gen/mult_gen）在 iverilog 里
+    #     跑不了（IP 网表加密，见 fpga/ip/rv32_div 下的 "_sim_netlist.v" 里带 `pragma protect`）
+    #     ⇒ 历次回归只覆盖**行为分支**。2026-09-21 用 xsim + 真实 IP 实测发现：
+    #     div_gen 的 `m_axis_dout_tdata` 字段序是 {商[63:32], 余数[31:0]}，而 RTL 原来按
+    #     {余数, 商} 取 ⇒ **divu/remu 商余数互换** ⇒ 十进制打印全乱（正是上板现象）。
+    #     本步把这个结论做成"板上可判定"：全对 ⇒ `MEXT: ok`；任一不对 ⇒ `MEXT: BAD`，
+    #     并**并入最终结论**（RESULT: …-BAD）。
+    #--------------------------------------------------------------------------
+    li    t2, 0                    # t2 = 本步坏标志（t2 不被任何打印子程序破坏）
+    lui   a0, %hi(str_mext)
+    addi  a0, a0, %lo(str_mext)
+    jal   ra, puts_str             # "step2.6 MEXT="
+    li    t0, 59                   # ① divu(59,10)
+    li    t1, 10
+    divu  t3, t0, t1
+    li    t4, 5
+    jal   ra, mx_vec
+    li    t0, 59                   # ② remu(59,10)
+    li    t1, 10
+    remu  t3, t0, t1
+    li    t4, 9
+    jal   ra, mx_vec
+    li    t0, 118049               # ③ divu(118049,2000)
+    li    t1, 2000
+    divu  t3, t0, t1
+    li    t4, 59
+    jal   ra, mx_vec
+    li    t0, 118049               # ④ remu(118049,2000)
+    li    t1, 2000
+    remu  t3, t0, t1
+    li    t4, 49
+    jal   ra, mx_vec
+    li    t0, 0                    # ⑤ divu(0,10)
+    li    t1, 10
+    divu  t3, t0, t1
+    li    t4, 0
+    jal   ra, mx_vec
+    li    t0, 1                    # ⑥ divu(1,10)
+    li    t1, 10
+    divu  t3, t0, t1
+    li    t4, 0
+    jal   ra, mx_vec
+    li    t0, 6                    # ⑦ mul(6,7)
+    li    t1, 7
+    mul   t3, t0, t1
+    li    t4, 42
+    jal   ra, mx_vec
+    lui   t0, 0x80000              # ⑧ mulh(-2^31,-2^31) 高半
+    mv    t1, t0
+    mulh  t3, t0, t1
+    lui   t4, 0x40000
+    jal   ra, mx_vec
+    li    t0, -1                   # ⑨ mulhu(2^32-1,2^32-1) 高半
+    mulhu t3, t0, t0
+    li    t4, -2
+    jal   ra, mx_vec
+    lui   a0, %hi(str_mextv)
+    addi  a0, a0, %lo(str_mextv)
+    jal   ra, puts_str             # "-> MEXT: "
+    bnez  t2, mx_bad
+    lui   a0, %hi(str_ok)
+    addi  a0, a0, %lo(str_ok)
+    jal   ra, puts_str             # "ok"
+    j     mx_done
+mx_bad:
+    lui   a0, %hi(str_bad)
+    addi  a0, a0, %lo(str_bad)
+    jal   ra, puts_str             # "BAD"
+mx_done:
+    jal   ra, puts_nl
+    or    s2, s2, t2               # ★ 并入总坏标志（s2 已在步2.5 初始化）
+
+    #--------------------------------------------------------------------------
+    # 步2.7 ★ 栈字节通路探针（DDR3 字节 lane / 读回检查）
+    #   把 16 字节模式 "0123456789ABCDEF" 写进**栈缓冲**（sp-64：本程序不使用的 DDR3 空间，
+    #   栈顶 0x07FF_FFF0 之下 64 B），再逐字节 `lbu` 读回并按两位 hex 打印 ⇒ 直接暴露
+    #   "字节路径错位 / lane 串位 / 读回垃圾"。期望（ASCII）：
+    #     30 31 32 33 34 35 36 37 38 39 41 42 43 44 45 46 -> STACKBF: ok
+    #   与步2.5 一起，把"旧 bitstream（R2 缺陷在 DDR3 读通路上）"钉成可见现象。
+    #--------------------------------------------------------------------------
+    li    t2, 0                    # 本步坏标志
+    addi  t3, sp, -64              # t3 = 栈缓冲指针（DDR3）
+    li    t6, 0                    # t6 = k（0..15；★ 计数/指针放 t 系列中**打印子程序不碰**的
+                                   #   t2..t6 —— t0/t1 会被 puts_* 破坏）
+mk_loop:
+    li    t0, 9                    # ascii(k)：k<10 ⇒ '0'+k；k≥10 ⇒ 'A'+(k-10)
+    bltu  t0, t6, mk_up
+    addi  t4, t6, 48
+    j     mk_st
+mk_up:
+    addi  t4, t6, 55               # 'A' - 10 = 55
+mk_st:
+    sb    t4, 0(t3)                # 写 DDR3 栈缓冲
+    addi  t3, t3, 1
+    addi  t6, t6, 1
+    li    t5, 16
+    bltu  t6, t5, mk_loop
+    lui   a0, %hi(str_stk)
+    addi  a0, a0, %lo(str_stk)
+    jal   ra, puts_str             # "step2.7 stack[16B]="
+    addi  t3, sp, -64
+    li    t6, 0
+ck_loop:
+    li    t0, 9
+    bltu  t0, t6, ck_up
+    addi  t4, t6, 48               # t4 = 期望字节
+    j     ck_ld
+ck_up:
+    addi  t4, t6, 55
+ck_ld:
+    lbu   t5, 0(t3)                # t5 = 实读字节
+    sub   t4, t5, t4
+    sltu  t4, x0, t4
+    or    t2, t2, t4               # 累加"不匹配"
+    mv    a0, t5
+    jal   ra, puts_hex2            # 两位 hex（低字节）
+    lui   a0, %hi(str_sp)
+    addi  a0, a0, %lo(str_sp)
+    jal   ra, puts_str             # 空格分隔
+    addi  t3, t3, 1
+    addi  t6, t6, 1
+    li    t5, 16
+    bltu  t6, t5, ck_loop
+    lui   a0, %hi(str_stkv)
+    addi  a0, a0, %lo(str_stkv)
+    jal   ra, puts_str             # "-> STACKBF: "
+    bnez  t2, stk_bad
+    lui   a0, %hi(str_ok)
+    addi  a0, a0, %lo(str_ok)
+    jal   ra, puts_str
+    j     stk_done
+stk_bad:
+    lui   a0, %hi(str_bad)
+    addi  a0, a0, %lo(str_bad)
+    jal   ra, puts_str
+stk_done:
+    jal   ra, puts_nl
+    or    s2, s2, t2               # ★ 并入总坏标志
 
     #--------------------------------------------------------------------------
     # 步③ 开关回读
@@ -348,7 +613,11 @@ tp_flags:
     #     "FREQ 坏标志(t4=1)"混在一个 OR 里再取反 ⇒ 两个子判据都通过时反而判 BAD；
     #     ② 坏标志一度放在 t2，而步⑤ 打印用的 udiv 会把 t2 覆盖成商 ⇒ 又恒判 BAD）。
     #     现口径：坏标志 = s11（步④ 超差）| t4（FREQ 高 20 位 != 31），两者都在 s 系列。
+    #   ★ 2026-09-21 诊断版：再把 步2.5 的 R2 回环坏标志（s2）并进来 —— 判定链变为
+    #     "步④ 通过 ∧ FREQ>>20 == 31 ∧ R2 回环通过"，即**旧 bitstream 必然打印 BAD**
+    #     （用户不必在"乱码"里猜原因：`step2.5 ... R2FIX: no` 直接给出结论）。
     or    s10, s11, t4             # s10 = 1 ⇔ 任一子判据坏（s11=步④坏, t4=FREQ坏）（用 s10：跨 puts_str/puts_nl 存活）
+    or    s10, s10, s2             # ★ 并入 步2.5 的 R2 回环坏标志（s2；见 §三 步2.5）
     lui   a0, %hi(str_total)
     addi  a0, a0, %lo(str_total)
     jal   ra, puts_str             # "RESULT: RV32GC-M5-"
@@ -386,104 +655,152 @@ pc_send:
     ret
 
 #------------------------------------------------------------------------------
-# puts_str：打印 a0 指向的 NUL 结尾字符串
-# 破坏：a0, a1, t0, t1, ra（内部用栈保存 ra 与串指针）
+# puts_str：打印 a0 指向的 NUL 结尾字符串   ★ 纯寄存器路径（不碰栈）
+#   串游标用 tp(x4)（本程序不用于 ABI 用途）；ra 存 a2（puts_char 不破坏 a2）。
+#   注：串本身在 .rodata（Flash XIP ⇒ L1D/直连通路），与栈无关。
+# 破坏：a0, a1, a2, t0, t1, ra（tp 为内部游标）
 #------------------------------------------------------------------------------
 puts_str:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    a0, 8(sp)
+    mv    a2, ra                   # a2 = 返回地址
+    mv    tp, a0                   # tp = 串游标
 ps_loop:
-    lw    a0, 8(sp)
-    lbu   a0, 0(a0)
+    lbu   a0, 0(tp)
     beqz  a0, ps_end
     jal   ra, puts_char
-    lw    a0, 8(sp)
-    addi  a0, a0, 1
-    sw    a0, 8(sp)
+    addi  tp, tp, 1
     j     ps_loop
 ps_end:
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    mv    ra, a2
     ret
 
 #------------------------------------------------------------------------------
-# puts_nl：打印 CRLF
+# puts_nl：打印 CRLF   ★ 纯寄存器路径
+# 破坏：a0, a1, a2, t0, t1, ra
 #------------------------------------------------------------------------------
 puts_nl:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
+    mv    a2, ra
     addi  a0, x0, 13
     jal   ra, puts_char
     addi  a0, x0, 10
     jal   ra, puts_char
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    mv    ra, a2
     ret
 
 #------------------------------------------------------------------------------
-# puts_dec：打印 a0 的无符号十进制（无前导零）
-# 破坏：a0, a1, t0, t1, t3, t4, t5, t6, ra
-#   ★ 2026-09-20 修复（核级仿真暴露"任何 ≥10 的数都死循环"）：
-#     旧实现用 `or t6,t6,t5` 累积"是否继续"的标志 —— OR 一旦置位永不复位，
-#     商降到 0 后循环不退出，写指针一路越界写 '0'（实测写穿 DDR3 上限 0x0800_0000）。
-#     现改为每轮 `bnez t5` 直接判商，并加写入位数上限（16 位，缓冲 48 B）保护。
-#   说明：这里用 M 扩展的 remu/divu 只为"打印"服务；步④ 的时序判据用的是自写 `udiv`。
+# puts_dec：打印 a0 的无符号十进制（无前导零）—— ★ 纯寄存器路径：无访存、无缓冲、无除法
+#   算法：把 10 的幂（10^9 … 10^0）**逐条常量装载**（`li` = lui+addi：无查表、无访存），
+#         每位调 pd_one —— digit = 余值里能减几次当前幂（p 是 10 的幂 ⇒ digit ≤ 9），
+#         打印 '0'+digit；前导零抑制：digit==0 且尚未开始打印且 p != 1 ⇒ 跳过
+#         （p == 1 必打印 ⇒ v=0 也印出 "0"）。
+#   为什么必须这么写（本诊断版的根因之一）：见文件头 §三点五 —— 旧版把数字写进**栈缓冲**
+#   （sp 在 DDR3）再用 lbu 读回，而 R2 缺陷（旧 bitstream）下 DDR3 读回垃圾 ⇒ 十进制全乱、
+#   且掩盖"跑的是旧 bitstream"这一根因。现在十进制打印**与存储系统完全无关**。
+#   历史（2026-09-20）：旧版还用 `or t6,t6,t5` 累积退出条件 ⇒ 商降到 0 后死循环、写穿
+#   DDR3 上限；本次重写一并消除该类缺陷（无写指针、无缓冲、无越界可能）。
+# 破坏：a0, a1, a2, a3, a4, a5, a6, a7, t0, t1, ra
 #------------------------------------------------------------------------------
 puts_dec:
-    addi  sp, sp, -48
-    sw    ra, 44(sp)
-    mv    t5, a0                   # t5 = 剩余值
-    addi  t4, sp, 0                # t4 = 写指针（低位在低地址）
-    addi  t3, x0, 10
-    addi  t6, x0, 16               # t6 = 位数上限（缓冲 48 B，最坏 10 位）
-pd_loop:
-    remu  t0, t5, t3               # t0 = t5 % 10
-    divu  t5, t5, t3               # t5 = t5 / 10
-    addi  t0, t0, 48               # '0' + 余数
-    sb    t0, 0(t4)
-    addi  t4, t4, 1
-    addi  t6, t6, -1
-    beqz  t6, pd_out               # 上限保护（绝不越界写）
-    bnez  t5, pd_loop              # ★ 商非零才继续（不再用 OR 累积标志）
-pd_out:
-    addi  t4, t4, -1               # 从最高位（最后写入）开始输出
-    lbu   a0, 0(t4)
-    jal   ra, puts_char
-    addi  t1, sp, 0
-    bltu  t1, t4, pd_out           # t4 > sp+0 ⇒ 还有更低位的数
-    lw    ra, 44(sp)
-    addi  sp, sp, 48
+    mv    a2, ra                   # a2 = 返回地址（寄存器保存；本程序不用栈）
+    mv    a3, a0                   # a3 = 余值
+    li    a5, 0                    # a5 = "已开始打印"标志（前导零抑制用）
+    li    a4, 1000000000           # 10^9
+    jal   ra, pd_one
+    li    a4, 100000000
+    jal   ra, pd_one
+    li    a4, 10000000
+    jal   ra, pd_one
+    li    a4, 1000000
+    jal   ra, pd_one
+    li    a4, 100000
+    jal   ra, pd_one
+    li    a4, 10000
+    jal   ra, pd_one
+    li    a4, 1000
+    jal   ra, pd_one
+    li    a4, 100
+    jal   ra, pd_one
+    li    a4, 10
+    jal   ra, pd_one
+    li    a4, 1
+    jal   ra, pd_one
+    mv    ra, a2
     ret
 
 #------------------------------------------------------------------------------
-# puts_hex8：打印 a0 的 8 位十六进制（大写，无前缀）
-# 破坏：a0, a1, t0, t1, t3, ra
+# pd_one：打印"一位"十进制数字（幂在 a4、余值在 a3、抑制标志在 a5）
+#   digit = a3 里能连续减几次 a4；减完后的余值留在 a3（供更低位的幂继续用）。
+# 破坏：a0, a1, a6, a7, t0, t1, ra（a2/a3/a4/a5 由调用者持有，本子程序不破坏）
+#------------------------------------------------------------------------------
+pd_one:
+    mv    a7, ra                   # a7 = 返回地址（puts_char 只破坏 t0/t1/a1）
+    li    a6, 0                    # a6 = 该位数字
+pd_sub:
+    bltu  a3, a4, pd_sub_end       # 余值 < 当前幂 ⇒ 该位减法结束
+    sub   a3, a3, a4
+    addi  a6, a6, 1
+    j     pd_sub
+pd_sub_end:
+    bnez  a6, pd_emit              # digit != 0 ⇒ 打印（含中间位的 0）
+    bnez  a5, pd_emit              # 已开始打印 ⇒ 这个 0 也要打印
+    li    t0, 1
+    bne   a4, t0, pd_one_end       # 既没开始、又不是最低位 ⇒ 前导零，跳过
+pd_emit:
+    li    a5, 1                    # 标记"已开始打印"
+    addi  a0, a6, 48               # '0' + digit
+    jal   ra, puts_char
+pd_one_end:
+    mv    ra, a7
+    ret
+
+#------------------------------------------------------------------------------
+# mx_vec：打印一个 M 扩展探针向量（t3 = 实值、t4 = 期望值），
+#         并以 `t2 |= (实值 != 期望)` 累加坏标志（t2 不被任何打印子程序破坏）。
+#   ★ 入参走 t3/t4（**不是** a0/a1）：a 系列与 t0/t1 会被 puts_* 破坏，
+#     而本程序坚持"跨子程序存活的值放打印子程序不碰的寄存器"（见 §三点五）。
+# 破坏：a0, a1, a3, a4, a5, a6, a7, t0, t1, ra（t2/t3/t4 由调用者持有）
+#------------------------------------------------------------------------------
+mx_vec:
+    mv    a5, ra                   # a5 = 返回地址
+    sub   a6, t3, t4
+    sltu  a6, x0, a6               # a6 = 1 ⇔ 实值 ≠ 期望
+    or    t2, t2, a6               # 累加坏标志
+    mv    a0, t3
+    jal   ra, puts_hex8            # 打印 8 位 hex
+    lui   a0, %hi(str_sp)
+    addi  a0, a0, %lo(str_sp)
+    jal   ra, puts_str             # 空格分隔
+    mv    ra, a5
+    ret
+
+#------------------------------------------------------------------------------
+# puts_hex8 / puts_hex2：打印 a0 的 8 位 / 2 位十六进制（大写，无前缀）
+#   ★ 纯寄存器路径（不碰栈）：值放 a3、nibble 计数放 a4、ra 存 a7。
+#   puts_hex2 只看**低 8 bit**（先左移 24 位，把目标字节移到最高 nibble 位置）。
+# 破坏：a0, a1, a3, a4, a6, a7, t0, t1, ra
 #------------------------------------------------------------------------------
 puts_hex8:
-    addi  sp, sp, -32
-    sw    ra, 28(sp)
-    sw    a0, 24(sp)
-    addi    t3, x0, 8              # 8 个 nibble
+    li    a4, 8                    # 8 个 nibble
+    j     ph_enter
+puts_hex2:
+    slli  a0, a0, 24               # 低 8 bit ⇒ 最高字节（统一走 nibble 循环）
+    li    a4, 2                    # 2 个 nibble
+ph_enter:
+    mv    a7, ra                   # a7 = 返回地址（puts_char 只破坏 t0/t1/a1）
+    mv    a3, a0                   # a3 = 值
 ph_loop:
-    lw    t0, 24(sp)
-    srli  t0, t0, 28               # 最高 nibble
-    addi  t1, x0, 10
-    bltu  t0, t1, ph_digit
-    addi  t0, t0, 55               # 10..15 ⇒ 'A'..'F'
+    srli  a0, a3, 28               # 当前最高 nibble
+    li    t0, 10
+    bltu  a0, t0, ph_digit
+    addi  a0, a0, 55               # 10..15 ⇒ 'A'..'F'
     j     ph_emit
 ph_digit:
-    addi  t0, t0, 48               # 0..9 ⇒ '0'..'9'
+    addi  a0, a0, 48               # 0..9 ⇒ '0'..'9'
 ph_emit:
-    mv    a0, t0
     jal   ra, puts_char
-    lw    t0, 24(sp)
-    slli  t0, t0, 4
-    sw    t0, 24(sp)
-    addi  t3, t3, -1
-    bnez  t3, ph_loop
-    lw    ra, 28(sp)
-    addi  sp, sp, 32
+    slli  a3, a3, 4                # 下一个 nibble 升到最高位
+    addi  a4, a4, -1
+    bnez  a4, ph_loop
+    mv    ra, a7
     ret
 
 #------------------------------------------------------------------------------
@@ -504,8 +821,7 @@ timer_now:
 # 破坏：a0, t0, t1, t5, t6
 #------------------------------------------------------------------------------
 delay_ticks:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
+    mv    a5, ra                   # ★ 返回地址存 a5（本程序不用栈）
     mv    t0, a0                   # t0 = Δ
     jal   ra, timer_now            # a0 = 当前 TIMER
     add   t1, a0, t0               # t1 = target = now + Δ
@@ -517,8 +833,7 @@ dt_loop:
     bgez  t6, dt_done              # now ≥ target（32 bit 回绕下仍有符号语义正确）⇒ 到点
     j     dt_loop
 dt_done:
-    lw    ra, 12(sp)
-    addi  sp, sp, 16
+    mv    ra, a5
     ret
 
 #------------------------------------------------------------------------------
@@ -561,8 +876,7 @@ dl_end:
 # 破坏：a0, a1, t0, t1, t2, t3, t4, t5, t6, ra
 #------------------------------------------------------------------------------
 udiv:
-    addi  sp, sp, -32
-    sw    ra, 28(sp)
+    mv    a5, ra                   # ★ 返回地址存 a5（本程序不用栈；见文件头 §三点五）
     mv    t0, a0                   # t0 = 被除数 x
     mv    t1, a1                   # t1 = 除数 d
     li    t2, 0                    # t2 = 商 q
@@ -592,8 +906,7 @@ ud_skip:
 ud_zero:
     li    a0, 0xFFFFFFFF           # 除零：返回全 1（本程序不会走到）
 ud_ret:
-    lw    ra, 28(sp)
-    addi  sp, sp, 32
+    mv    ra, a5                   # ★ 从 a5 取回返回地址（不再从栈读 —— 旧 bitstream 下栈读会读回垃圾）
     ret
 
 #==============================================================================
@@ -624,8 +937,46 @@ str_tpiwin:
 str_tpical:
     .asciz " cycles/iter (informational only)\r\n"
     .align   2
+#   ---- 步2.5 DDR3 回环判别的打印串（拼成一行；R2FIX 结论在行尾，便于 grep）----
+str_ddr:
+    .asciz "step2.5 DDR3 loopback: word=0x"
+    .align   2
+str_ddr2:
+    .asciz " re-read=0x"
+    .align   2
+str_ddr3:
+    .asciz " byte=0x"
+    .align   2
+str_ddr4:
+    .asciz " (expect 12345678/5A) -> R2FIX: "
+    .align   2
+str_yes:
+    .asciz "yes"
+    .align   2
+str_no:
+    .asciz "no"
+    .align   2
 str_freq:
     .asciz "step5 FREQ = 0x"
+    .align   2
+#   ---- 步2.6 M 扩展探针 / 步2.7 栈字节探针的打印串 ----
+str_mext:
+    .asciz "step2.6 MEXT="
+    .align   2
+str_mextv:
+    .asciz "-> MEXT: "
+    .align   2
+str_stk:
+    .asciz "step2.7 stack[16B]="
+    .align   2
+str_stkv:
+    .asciz "-> STACKBF: "
+    .align   2
+str_sp:
+    .asciz " "
+    .align   2
+str_pat:
+    .asciz "0123456789ABCDEF"     # 步2.7 的 16 字节模式（字节 = 位置指纹，便于发现 lane 错位）
     .align   2
 str_freqmhz:
     .asciz " (div1e6 = "
@@ -646,11 +997,14 @@ str_nl:
     .asciz "\r\n"
     .align   2
 msg_steps:
-    .asciz "step2 UART output alive; sequence = LED -> UART -> switch -> timer -> FREQ\r\n"
+    .asciz "step2 UART output alive; sequence = LED -> UART -> DDR3-R2-probe -> switch -> timer -> FREQ\r\n"
     .align   2
 msg_boot:
-    .asciz "\r\nRV32GC-M5 board test (chiplab / xc7a200tfbg676-2) @ 33MHz\r\n"
-    .asciz "UART 115200 8N1 (divisor=18, PCLK=33MHz -> 114583 Bd)\r\n"
-    .asciz "RESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only\r\n"
+    #   ★ 2026-09-21 修复（诊断版顺带暴露）：GNU as 的 `.asciz` **每条都会补一个 NUL**，
+    #     所以下面这些行必须写在**同一条** `.asciz` 里（用 `\r\n` 转义），否则 `puts_str`
+    #     读到第一个 NUL 就返回 —— 旧版把三行拆成三条 `.asciz` ⇒ 上板只打印第 1 行，
+    #     runbook §4 期望的 `UART 115200 …` / `RESET_PC=…` 两行**从来没打出来过**。
+    #     机器护栏：build.sh 判据⑪h 核对 .rodata 里横幅四行**首尾相接**（中间无 NUL）。
+    .asciz "\r\nRV32GC-M5 board test (chiplab / xc7a200tfbg676-2) @ 33MHz\r\nBUILD=m5_board-diag-2026-09-21c (stack-free prints; R2+MEXT+stack probes)\r\nUART 115200 8N1 (divisor=18, PCLK=33MHz -> 114583 Bd)\r\nRESET_PC=0x1C000000 (SPI XIP), MMU off, PC-relative only\r\n"
 
     .end
