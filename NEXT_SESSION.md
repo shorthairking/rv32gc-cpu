@@ -14,9 +14,15 @@
 ## 1.5 当前状态（2026-09-21 晚：2A 收官 + 2B/U-Boot 双线并行）
 
 - **2A M1–M5 全部收官**（tag `2A-M5` 已推远端；master=dev=9fac069）：arch-test 全绿、60 MHz 时序达标（WNS +0.031/0 失败端点，面积 39.4%）、上板 `RESULT: RV32GC-M5-OK` @33 MHz 同域；板上三缺陷修复（R2 rdata 锁存 `7a06825`、mdu div_gen 字段序 `4a86a05`、步④ 窗口 `2e93a4f`）。
-- **A 线 2B（用户已批）**：2B-1 前端+预测器 ✅（`f42827e`：regress 26/26、准确率 mixed 90.85% 选择器优于单侧、Spike 黄金轨迹 248/248）；**2B-2 在途**（`138a1067`：ROB 128/重命名/6 队列/锁步+IPC>1.0）；后续 2B-3 LSQ → 2B-4 合体 → 2B-5 时序上板。
-- **B 线 U-Boot（基线=上游 fork dev 分支）**：B-1/B-2 板级骨架 ✅（u-boot `3d9e78e8e80`）；B-3 NAND 驱动 ✅（u-boot `124a604ebc5`，自包含 BCH-4 + DMA 描述符，13.6 万断言）；B-3.5 引导链 ✅（`1c8fce2`）；**QEMU chiplab machine ✅**（qemu/ chiplab-qemu-dev `1d78934a9c`，-M chiplab，报告 docs/chiplab-qemu/）；**B-4/B-5 + E6–E8 ✅ 运行期验证全绿**（u-boot dev：E6 mtd 内嵌、E7 PAGEPROG 页号锁存、E8① BCH-4 真生效+故障注入（1–4bit 纠正/5–6bit fail-closed）、E8② ID 字节序、E8③ 坏块扫描 OOB 游标 bug；nand 往返/saveenv 跨重启/bootcmd 自动执行全绿，regress 27/27）；**官方重打包 ✅**（boot_stub.S BOOT_LEN_UBOOT→0x620AC，spi_flash.img 956276B md5 27a9d9a5，旧件 .pre-E8.bak）；下一步：上板实测 → Linux 移植（03-linux-opensbi.md，**L-m1 ✅ + L-m2 ✅**：SOC_CHIPLAB+DTS+defconfig（linux dev `46200caf`）、QEMU 16MiB XIP + -kernel/-initrd/-dtb（qemu `b7e2881e16`/`3c095bf329`）、内核 0x03400000 可用内存 76MiB、NAND MTD 驱动 chiplab_nand.c+BCH-4 布局跨层交叉验证（Linux↔U-Boot crc32/md5 一致 + 4bit 纠正/6bit fail-closed + /proc/mtd 四分区），判据 L1–L8 全绿，报告 docs/linux-port/；下一站 L-m3 UBIFS rootfs / 精简 defconfig）。
-- **远端**：rv32gc-cpu origin 已切 SSH（git@github.com:shorthairking/rv32gc-cpu.git）；master/tag/dev 已推。u-boot/linux 两 fork 仓各建 dev 分支。
+- **A 线 2B（用户已批）**：2B-1 前端+预测器 ✅（`f42827e`：regress 26/26、准确率 mixed 90.85% 选择器优于单侧、Spike 黄金轨迹 248/248）；**2B-2 后端：iq PASS(151 项)、IPC=2.0000（tb_back2_ipc 6000 条/3000 拍）、程序 0 锁步全绿（161/161、436 拍）、B1–B27 缺陷台账 sim/unit/back2_report.md、regress 29/30（仅锁步 FAIL 保留，T6 墙钟放宽档已加）**；B27 已定案两轮实证：检查点路线不可用（2B-1 前端只给预测-taken 组发检查点，禁改）、"旧代快照"被 `fhead_q−undo_fhead_w==dist` 六连证据证伪 ⇒ 失步在**重放内容/窗口**，判定实验已设计（见报告 B27 段）；全部未提交（rtl/back2/ + sim/unit back2 件 + scripts/regress.sh T6 档）。后续 2B-3 LSQ → 2B-4 合体 → 2B-5 时序上板。
+- **B 线 U-Boot（基线=上游 fork dev 分支）**：B-1/B-2 板级骨架 ✅（u-boot `3d9e78e8e80`）；B-3 NAND 驱动 ✅（u-boot `124a604ebc5`，自包含 BCH-4 + DMA 描述符，13.6 万断言）；B-3.5 引导链 ✅（`1c8fce2`）；**QEMU chiplab machine ✅**（qemu/ chiplab-qemu-dev，-M chiplab，报告 docs/chiplab-qemu/）；**B-4/B-5 + E6–E8 ✅**（u-boot dev `0729af1c746`+`90373e8469b`，saveenv 持久/bootcmd 自动执行全绿）；**官方重打包 ✅**（spi_flash.img 956276B md5 27a9d9a5，旧件 .pre-E8.bak）；**Linux L-m1 ✅ + L-m2 ✅**（linux dev `46200caf`+`04e80124`，qemu `b7e2881e16`+`3c095bf329`，rv32gc-cpu tag `L2-NAND`；内核 0x03400000 可用内存 76MiB、NAND BCH-4 布局跨层交叉验证全 PASS，判据 L1–L8 全绿，报告 docs/linux-port/）；**L-m3 进行中**：UBI 层全通（空白 MTD 自动格式化/ubimkvol/UBIFS 首挂自格式化）、exec_op 擦除地址 bug 已修（原实现恒擦块 0）、**阻塞=UBI 多整页写未落盘**（u-boot E7 同构：SEQIN 锁存页号/PAGEPROG 用锁存，修复在途）、任务 2（纯 NAND 零注入冷启，nand_boot_test.py 就绪）与任务 3（精简 defconfig）未做；未提交（linux diff=defconfig+chiplab_nand.c 两文件），报告 docs/linux-port/README.md §9。
+- **远端**：rv32gc-cpu origin 已切 SSH（git@github.com:shorthairking/rv32gc-cpu.git）；master/tag/dev 已推。u-boot/linux 两 fork 仓各建 dev 分支（u-boot 已切 SSH，linux 已切 SSH）。
+
+### 1.5.1 ✅ 恢复执行（2026-09-21 深夜暂停后，用户指示"重新阅读 AGENT.md/USAGE.md 并重启任务"）
+
+- **暂停已解除**：用户指示重启；规范已复习（AGENT.md §0.1/§0.2/§0.6/§0.7/§5 与 USAGE.md），子 Agent 路由已对齐最终口径 `deepseek-official/deepseek-flash`+max（AGENT.md §0.2、USAGE.md §2/§4 已同步修正并提交）。
+- **两线已恢复**：`8009c161`（2B-2 第 7 轮 B27 判定实验）与 `501a646d`（L-m3 UBIFS 收尾）均 send_message 恢复；下一步见各自报告（`sim/unit/back2_report.md` B27 段 / `docs/linux-port/README.md` §9.4–§9.5）。
+- **未提交现场（恢复时先核对）**：rv32gc-cpu（rtl/back2/、sim/unit back2 件、scripts/regress.sh T6 档）；linux/（defconfig + chiplab_nand.c，含擦除 bug 修复）；qemu（已提交至 `3c095bf329`）。备份/日志在 /tmp/b2chk/、/tmp/b2work/、docs/linux-port/logs/。
 
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
