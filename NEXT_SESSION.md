@@ -18,14 +18,13 @@
 - **B 线 U-Boot（基线=上游 fork dev 分支）**：B-1/B-2 板级骨架 ✅（u-boot `3d9e78e8e80`）；B-3 NAND 驱动 ✅（u-boot `124a604ebc5`，自包含 BCH-4 + DMA 描述符，13.6 万断言）；B-3.5 引导链 ✅（`1c8fce2`）；**QEMU chiplab machine ✅**（qemu/ chiplab-qemu-dev，-M chiplab，报告 docs/chiplab-qemu/）；**B-4/B-5 + E6–E8 ✅**（u-boot dev `0729af1c746`+`90373e8469b`，saveenv 持久/bootcmd 自动执行全绿）；**官方重打包 ✅**（spi_flash.img 956276B md5 27a9d9a5，旧件 .pre-E8.bak）；**Linux L-m1 ✅ + L-m2 ✅**（linux dev `46200caf`+`04e80124`，qemu `b7e2881e16`+`3c095bf329`，rv32gc-cpu tag `L2-NAND`；内核 0x03400000 可用内存 76MiB、NAND BCH-4 布局跨层交叉验证全 PASS，判据 L1–L8 全绿，报告 docs/linux-port/）；**L-m3 ✅（UBIFS rootfs + 纯 NAND 冷启）**：根因=NAND_SUBPAGE_READ 子页读被框架接管（restamp_ecc 未清 ⇒ 短读全 0xFF），另修 READSTART/4 周期地址解析/fail-closed DATA_IN/initramfs sync/内核 image_size 口径/nandwrite -p；零注入冷启全链 PASS（U-Boot 从 NAND 读 kernel/dtb/initrd → booti → UBIFS 根 ubi0:rootfs，/persist.count 跨 QEMU 重启 1→3，母代理亲跑 `L-M3 (UBIFS + NAND boot): PASS`）；linux dev 已提交，rv32gc-cpu tag `L3-UBIFS`；遗留（可选）：精简 defconfig、真 ecc.read_subpage 性能优化；报告 docs/linux-port/README.md §9。
 - **远端**：rv32gc-cpu origin 已切 SSH（git@github.com:shorthairking/rv32gc-cpu.git）；master/tag/dev 已推。u-boot/linux 两 fork 仓各建 dev 分支（u-boot 已切 SSH，linux 已切 SSH）。
 
-### 1.5.1 ✅ 恢复执行（2026-09-22 凌晨暂停存档点 #2 后，用户指示"请继续当前工作"）
+### 1.5.1 ✅ 恢复执行（2026-09-22 环境异常中断恢复后，用户指示"继续任务"）
 
-- **两线状态**：L-m3 ✅（`501a646d` 已交付，母代理验收提交）；`8009c161`（2B-2 第 18 轮：发射侧修法 B28 + 修法 (c) 重落地 + 三程序全绿 + regress 30/30）仍在进行。
-- **未提交现场（验收时核对）**：rv32gc-cpu（rtl/back2/、sim/unit back2 件、scripts/regress.sh T6 档）；linux/（defconfig + chiplab_nand.c）；qemu（已提交至 `3c095bf329`）。备份/日志在 /tmp/b2chk/、/tmp/b2work/、docs/linux-port/logs/。
-- **2B-2 现场（可编译检查点，未提交）**：程序 0/1 C1–C5 全绿（443/721 拍、IPC 0.3917/0.2469，C5 分档下限 0.30/0.19 已落地）；程序 2 C2 过、仅 C1 第 11 条（B28：`sb→lbu` 同拍进 LSU，更年轻 load 先发射读填充 0x13）；CHK 零违规、无停顿；regress 29/30（锁步 fail-closed 保留，T6 墙钟档已加）。**下一步已定**（back2_report.md §17.3）：发射侧修法——iq.v 导出 iss_oldest_o（选中项=队列最老）+ backend_top 门控 load 仅在最老时可发射（store 不门控防死锁），修法 (c)（alloc_rob+窗口外作废）随轮一并重落地；修完程序 2 C1–C4→C5 实测×0.8 定档→三程序全绿→regress 30/30→报告全绿。已定案结论：B27=日志下标不回绕（已修，7bit 切片）、2A C2=TB 缺 L1I 失效（已修，程序分基址 16KB 步进）、B28=发射序问题（修法见上）；IPC 证据 tb_back2_ipc=2.0000。改动范围：rtl/back2/、sim/unit/ back2 件、scripts/regress.sh（T6 档 12+/2−）；2A/front4 零修改。
-- **L-m3 现场（未提交）**：UBI 层全通；真根因已定案=**子页读被框架 nand_read_subpage 接管**（NAND_SUBPAGE_READ 自动置位未清 + exec_op 不译 RNDOUT 0x05 ⇒ ECC 全 0xFF ⇒ 擦除判据静默返 0xFF）；已落补丁=清 NAND_SUBPAGE_READ+read_subpage=NULL、exec_op RNDOUT DATA_IN、n==2 仅列地址、SEQIN 锁存+PAGEPROG 提交帧；中断时正重编 Image→跑 nand_boot_test.py 三阶段+持久化终验→README §9 更新。**恢复时先核对 linux/ 工作树（defconfig + chiplab_nand.c 及可能的新改动）与编译状态**，再续 nand_boot_test.py。qemu 已提交至 `3c095bf329`；u-boot/opensbi/rv32gc-cpu 零修改。
-- **备份/日志**：/tmp/b2chk/（r11c/r12/r12b/r13/r14/r15/r16/r17 日志与备份）、/tmp/b2work/、docs/linux-port/logs/（l3-* 等）。
-- **恢复方式**：同一会话 send_message 对应 agent id；跨会话按 `sim/unit/back2_report.md`（§17.3 发射侧修法）与 `docs/linux-port/README.md` §9（子页读修复后续）fresh dispatch。
+- **异常中断处置**：中断前 8009c161 已停转（第 29 轮 §28.3 实施未开始，树停在可编译检查点：三 TB 零错误、iq 151/151、IPC=2.0000、旋钮全关 CHK=1、backend_top.v 仅余默认关闭的 DBG_CSR 透传未提交）。
+- **2B-2 恢复口径（第 29 轮）**：按 back2_report.md §28.3 落地 B29 修法——prf.v 读口+1，地址由 I1 发射拍 CSR uop（6 条 iq_iss_uop 扫 u_is_csr）的 u_ps1i 驱动，I1 采样进 csr_src_r；I2 当拍用稳定寄存器值组合生成 (upd_csr_v/idx/wdata) 同拍送 ROB。B29 已唯一化：ROB/载荷/旁路/时序/驱动九类假设全部实证排除，只剩"cb_src_w 表达式取值≠其打印输入"（§28）。修完程序 2 全链 C1–C4 + C5 实测×0.8 定档 → 三程序全绿 → regress 30/30 → 报告全绿。B28 已修（INORD_LOAD 队列级闸门）；程序 0/1 基线 443/721 拍、C5 分档 0.30/0.19 落地；WIP 检查点已打至 `b6ec9c0`（#10）。
+- **L-m3 ✅ 已收官**（linux dev `a73502e13f05`，tag `L3-UBIFS`，母代理亲跑 PASS；phase2 判据已主机侧化）。
+- **未提交现场**：rv32gc-cpu（backend_top.v 探针透传）；备份/日志在工作区 `../.b2chk/`、docs/linux-port/logs/。
+- **恢复方式**：同一会话 send_message `8009c161`；跨会话按 `sim/unit/back2_report.md` §28.3 fresh dispatch。
 
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
