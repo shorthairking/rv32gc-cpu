@@ -825,3 +825,44 @@ FAIL: 程序 2 第 15 条写回分歧：乱序 {we=1 rd=13 wd=0x00000001} vs 2A 
    csrrwi/csrsi/csrrci（zimm 形式，`csr_zimm` 已有信号 ✓）。
 4. 判据不变：B28 已修（不得回退）；程序 0/1 基线 443/721 拍不得回退；**B29 修复后**程序 2 全链
    C1–C4 过 ⇒ 实测 IPC 定 C5 档（= 实测 × 0.8）⇒ 三程序全绿 ⇒ regress 30/30。
+
+## 22. 第 21 轮：B29 修法①（按实际槽位索引）实测 = no-op ⇒ 病因进一步收敛到**读口地址/数据**
+
+### 22.1 本轮改动（保留：结构上更正确，实测无回归）
+
+`backend_top.v` 把 CSR 路的四处硬编码槽 0 改为**按 CSR 实际槽位**：
+`csr_lane`（扫描 6 个 I2 槽找第一条 CSR 指令）+ `csr_v_w` + `csr_uop = x_i2_uop[csr_lane]`；
+`csr_raddr_w = u_csra(csr_uop)`、`upd_csr_v = csr_v_w & (csrop != 0)`、`upd_csr_idx = x_i2_rob[csr_lane]`、
+`upd_csrw`/`cb_src_w` 均改用 `csr_uop`；`a0_wb_data` 的 CSR 选择也改为按 `csr_uop` 的队列字段。
+
+### 22.2 实测（`/home/shorthair/dsh/rv32-cpu/.b2chk/r21.log`）：**结果完全不变**
+
+程序 0/1：443 拍/0.3917、721 拍/0.2469（逐字不变）；程序 2：仍
+`第 15 条 wd=0x00000001 vs 0x00000003`；`RENAME-CHK` 0 条。
+⇒ **该 CSR 指令本来就在 I2 槽 0**（故槽位索引改动在此例是 no-op），四处"硬编码槽 0"不是本例病因。
+
+### 22.3 病因收敛（下一轮的直接起点）
+
+- 已知：`op/addr/s1i` 全对、`rdata=0`（旧值对）、`upd_csrw = 1`（应为 x11=3）⇒
+  `cb_src_w = iprf_rd[0*32 +: 32]` 读到的**不是槽 0 的 rs1（x11）**。
+- 结合 §919（`a0_opa = u_au(x_i2_uop[0]) ? u_pc : iprf_rd[0*32]`）可判定：设计把"ALU0 的源"
+  等同"槽 0 的源" ⇒ 端口映射没问题，**问题在 `iprf_ra` 的地址/使能**：
+  需核对 `iprf_ra[0*PW_I +: PW_I]` 是否按**槽 0 uop 的 PS1I**（`u_ps1i(x_i2_uop[0])`）驱动，
+  以及 `iprf_we/写口` 是否在该拍把 x11 的新值写进了那个物理号。
+- **下一轮探针（一次运行）**：打印 `iprf_ra[0*PW_I +: PW_I]`、`u_ps1i(x_i2_uop[0])`、
+  `iprf_rd[0*32 +: 32]`、`iprf_rd[2*32 +: 32]`、`x_i2_v`、以及**同拍 ALU0/ALU1 的写回**
+  `(wbi_v/wbi_tag/wbi_data)` ⇒ 区分"地址错"（读到了别的物理号）与"写口未落地"（读到旧值）。
+- 若为地址错：检查 `iprf_ra` 的驱动源（是否用了别的槽/别的字段，例如误用 PS2I 或 payload 的
+  `PDIDST`）；若为写口未落地：检查 x11（`lhu` 结果）的写回与该 CSR 的读是否在同拍竞争
+  （读优先旁路 `NW+1` 级链是否覆盖 CSR 所在槽）。
+- **本轮已核对的确定事实（缩小到最后两个嫌疑）**：`backend_top` 第 1266~1271 行
+  `iprf_ra[0*PW_I +: PW_I] = u_ps1i(x_i2_uop[0]); iprf_ra[1*PW_I +: PW_I] = u_ps2i(x_i2_uop[0]); …`
+  ⇒ **读口地址就是槽 0 的 PS1I，端口映射无误**。故 `iprf_rd[0*32]=1` 只能是：
+  (i) **uop 的 PS1I 字段本身不是 x11 的当前映射**（rename 侧给 CSR 指令的 rs1 映射错/取到旧映射），
+      或 (ii) **该物理号在 PRF 里确实是 1**（x11 的新值 3 没写进那个号 ⇒ 写口地址/使能问题，
+      注意 `lhu` 的 arch 写回 3 是通过 ROB 载荷对拍确认的，PRF 侧并未被 C1 覆盖）。
+  ⇒ 最终探针（一次运行即可二选一）：在 CSR 的 I2 拍打印
+      `u_ps1i(x_i2_uop[0])`、`iprf_ra[0*PW_I +: PW_I]`、`iprf_rd[0*32 +: 32]`、
+      同拍 `iprf_we/iprf_wa/iprf_wd`（PRF 写口），并与 **x11 的 RAT 当前映射**（可从 rename 的
+      `rat_q[11]` 层次引用）对照；若 PS1I ≠ rat_q[11] ⇒ 修 rename 对 CSR rs1 的映射；
+      若相等而 PRF 里不是 3 ⇒ 修 PRF 写口（地址/使能/`wkeep` 门控）。

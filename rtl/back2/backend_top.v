@@ -1037,7 +1037,8 @@ module backend_top #(
     assign mdu_free_w = ~mdu_if_v;
     assign fpu_free_w = ~fpu_if_v;
     assign stq_of_rob_r = stq_of_rob[x_i2_rob[4]];
-    wire [31:0] a0_wb_data = u_is_csr(x_i2_uop[0]) ? csr_rdata_w : a0_res;
+    wire [31:0] a0_wb_data = (csr_v_w & (csr_uop[`BACK2_UAX_Q_MSB:`BACK2_UAX_Q_LSB] == `BACK2_Q_ALU0))
+                             ? csr_rdata_w : a0_res;   // ★ B29：按 CSR 实际槽/队列
     wire        a0_wb_i    = u_di(x_i2_uop[0]);
     wire [31:0] a1_wb_data = a1_res;
     wire        a1_wb_i    = u_di(x_i2_uop[1]);
@@ -1191,7 +1192,20 @@ module backend_top #(
     wire [31:0] csr_wdata_w = csr_cmt_we ? (csr_cmt_addr == 12'h001 ?
                               (csr_cmt_data | ff_cmt_val) : csr_cmt_data)
                                          : (csr_ff_w | ff_cmt_val);
-    assign csr_raddr_w = u_csra(x_i2_uop[0]);
+    //   ★★ B29 修复：CSR 指令可能落在 I2 的**任意槽**（此前四处硬编码槽 0 ⇒ 取到别的指令的
+    //     `x_i2_rob[0]`/读口数据 ⇒ `csrrw` 写入了错误值，实测 mscratch 被写成 1 而非 3）。
+    //     CSR 属 ALU0 类（D1 的 oq 分配：CSR 的 opt ⇒ Q_ALU0）⇒ 源操作数取 ALU0 的 rs1 读口。
+    wire [2:0] csr_lane = (x_i2_v[0] & u_is_csr(x_i2_uop[0])) ? 3'd0 :
+                          (x_i2_v[1] & u_is_csr(x_i2_uop[1])) ? 3'd1 :
+                          (x_i2_v[2] & u_is_csr(x_i2_uop[2])) ? 3'd2 :
+                          (x_i2_v[3] & u_is_csr(x_i2_uop[3])) ? 3'd3 :
+                          (x_i2_v[4] & u_is_csr(x_i2_uop[4])) ? 3'd4 :
+                          (x_i2_v[5] & u_is_csr(x_i2_uop[5])) ? 3'd5 : 3'd0;
+    wire       csr_v_w  = (x_i2_v[0] & u_is_csr(x_i2_uop[0])) | (x_i2_v[1] & u_is_csr(x_i2_uop[1])) |
+                          (x_i2_v[2] & u_is_csr(x_i2_uop[2])) | (x_i2_v[3] & u_is_csr(x_i2_uop[3])) |
+                          (x_i2_v[4] & u_is_csr(x_i2_uop[4])) | (x_i2_v[5] & u_is_csr(x_i2_uop[5]));
+    wire [UOPW-1:0] csr_uop = x_i2_uop[csr_lane];
+    assign csr_raddr_w = u_csra(csr_uop);
 
     //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
     always @(posedge clk) begin
@@ -1214,14 +1228,14 @@ module backend_top #(
 
     // ---- ROB ----
     assign upd_tr_v = x_i2_v[2] & u_is_br(x_i2_uop[2]);
-    assign upd_csr_v   = x_i2_v[0] & u_is_csr(x_i2_uop[0]) &
-                         (u_csrop(x_i2_uop[0]) != 3'd0);
-    assign upd_csr_idx = x_i2_rob[0];
-    assign upd_csrw    = (u_csrop(x_i2_uop[0]) == 3'd1) ? cb_src_w :
-                         (u_csrop(x_i2_uop[0]) == 3'd2) ? (csr_rdata_w | cb_src_w) :
-                                                          (csr_rdata_w & ~cb_src_w);
+    assign upd_csr_v   = csr_v_w & (u_csrop(csr_uop) != 3'd0);
+    assign upd_csr_idx = x_i2_rob[csr_lane];                 // ★ B29：用 CSR 自己的 ROB 索引
+    assign upd_csrw    = (u_csrop(csr_uop) == 3'd1) ? cb_src_w :
+                         (u_csrop(csr_uop) == 3'd2) ? (csr_rdata_w | cb_src_w) :
+                                                      (csr_rdata_w & ~cb_src_w);
     assign upd_ff_v    = fpu_done & fpu_if_v;
-    wire   cb_src_w = u_s1i(x_i2_uop[0]) ? iprf_rd[0*32 +: 32] : u_imm(x_i2_uop[0]);
+    //   CSR 源操作数：ALU0 的 rs1 读口（CSR 属 ALU0 类）；csrrwi/csrsi/csrrci 用 imm（zimm）
+    wire   cb_src_w = u_s1i(csr_uop) ? iprf_rd[0*32 +: 32] : u_imm(csr_uop);
 
     rob #(.WB_N(7)) u_rob (
         .clk(clk), .rst_n(rst_n),
