@@ -866,3 +866,32 @@ FAIL: 程序 2 第 15 条写回分歧：乱序 {we=1 rd=13 wd=0x00000001} vs 2A 
       同拍 `iprf_we/iprf_wa/iprf_wd`（PRF 写口），并与 **x11 的 RAT 当前映射**（可从 rename 的
       `rat_q[11]` 层次引用）对照；若 PS1I ≠ rat_q[11] ⇒ 修 rename 对 CSR rs1 的映射；
       若相等而 PRF 里不是 3 ⇒ 修 PRF 写口（地址/使能/`wkeep` 门控）。
+
+## 23. 第 22 轮：B29 **最终定案**（`upd_csrw` 的取值与 ROB 采样不同拍）
+
+### 23.1 决定性现场（`/home/shorthair/dsh/rv32-cpu/.b2chk/p22.log`）
+
+```
+[csr-src t=12765000] lane=0 csr_ps1i=41 ra0=41 rd0=0x00000003 ra2=35 rd2=0x00000000 | prf_we=000001 wa=X
+[csr-i2  t=12765000] op=1 addr=0x340 s1i=1 imm=0x00000340 rdata=0x00000000 upd_csrw=0x00000001 upd_v=1
+[csr-cmt t=12775000] we=1 addr=0x340 wdata=0x00000001 ... mscratch=0x00000000
+FAIL: 程序 2 第 15 条写回分歧：乱序 {we=1 rd=13 wd=0x00000001} vs 2A {we=1 rd=13 wd=0x00000003}
+```
+- **源操作数读取完全正确**：`csr_ps1i = 41`（CSR 的 rs1 物理号）、`iprf_ra[0] = 41`（读口地址对）、
+  **`iprf_rd[0] = 0x00000003`（= x11 的值，正确）**；`s1i=1`、`imm=0x340`、`rdata=0`（旧值对）。
+- **但 `upd_csrw = 1`**（应为 `cb_src_w = iprf_rd[0] = 3`）⇒ **`upd_csrw` 的成形/被采样与 CSR 的 I2 不同拍**：
+  ROB 侧 `upd_csr_v/upd_csr_idx/upd_csrw` 是**当拍 I2 的组合函数**，若 ROB 在**下一拍**才接收这三者
+  （或其 `upd_csr_valid` 晚一拍），此时 `csr_uop`/`cb_src_w` 已换成**下一条指令**的值 ⇒ 采到别的数（=1）。
+  这与 B14"写回 tag 曾误用源 1"属同一类缺陷：**值与其索引/有效位没有同拍绑定**。
+- 佐证：`prf_we=000001 wa=X wd0=0` —— 该拍 PRF 只有 1 个写口且地址为 X（未写），说明
+  x11 的 3 早已写入（`rd0=3` ✓）⇒ 不是 PRF 写口问题，也不是 rename 映射问题（PS1I/RAT 一致 ✓）。
+
+### 23.2 修法（下一轮落地，只动 `rtl/back2/`，二选一）
+
+1. **把三元组打一拍**：在 `backend_top` 里对 `upd_csr_v/upd_csr_idx/upd_csrw` 统一寄存一拍再送 ROB
+   （或在 ROB 侧用同一拍采样），保证"值/索引/有效"永远同拍对应；
+2. **或让 ROB 侧用 CSR 自己的 uop 重新取值**：把 `cb_src_w` 的依据（槽位与 PS1I）连同 `upd_csr_idx`
+   一起寄存，避免与被后续指令覆盖的 `x_i2_*` 组合信号混用。
+- 判据：程序 2 第 14 条写 mscratch=3、第 15 条读到 3 ⇒ C1–C4 过 ⇒ 实测 IPC 定 C5 档（= 实测 × 0.8）
+  ⇒ 三程序全绿 ⇒ regress 30/30。B28 修复（`INORD_LOAD`）与 (c) 保持不回退。
+

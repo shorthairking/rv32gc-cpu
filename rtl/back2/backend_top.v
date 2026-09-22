@@ -1209,6 +1209,11 @@ module backend_top #(
 
     //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
     always @(posedge clk) begin
+        if (DBG_CSR && rst_n && csr_v_w)
+            $display("[csr-src t=%0t] lane=%0d csr_ps1i=%0d ra0=%0d rd0=0x%08x ra2=%0d rd2=0x%08x | prf_we=%b wa=%0d wd0=0x%08x",
+                     $time, csr_lane, u_ps1i(csr_uop), iprf_ra[0*PW_I +: PW_I], iprf_rd[0*32 +: 32],
+                     iprf_ra[2*PW_I +: PW_I], iprf_rd[2*32 +: 32],
+                     iprf_we, iprf_wa, iprf_wd[0*32 +: 32]);
         if (DBG_CSR && rst_n && x_i2_v[0] && u_is_csr(x_i2_uop[0]))
             $display("[csr-i2 t=%0t] op=%0d addr=0x%03x s1i=%b imm=0x%08x rdata=0x%08x upd_csrw=0x%08x upd_v=%b",
                      $time, u_csrop(x_i2_uop[0]), u_csra(x_i2_uop[0]),
