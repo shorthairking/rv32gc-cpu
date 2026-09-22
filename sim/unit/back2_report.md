@@ -895,3 +895,25 @@ FAIL: 程序 2 第 15 条写回分歧：乱序 {we=1 rd=13 wd=0x00000001} vs 2A 
 - 判据：程序 2 第 14 条写 mscratch=3、第 15 条读到 3 ⇒ C1–C4 过 ⇒ 实测 IPC 定 C5 档（= 实测 × 0.8）
   ⇒ 三程序全绿 ⇒ regress 30/30。B28 修复（`INORD_LOAD`）与 (c) 保持不回退。
 
+## 24. 第 23 轮：三元组寄存实测**更差**（已回退）⇒ B29 病因再收窄一格
+
+### 24.1 实测（`/home/shorthair/dsh/rv32-cpu/.b2chk/r23.log`）
+
+把 `(upd_csr_v, upd_csr_idx, upd_csrw)` 同拍寄存一拍再送 ROB 后：程序 2 第 15 条的取值由 `0x01` 变为
+**`0x00`**（= 更新完全没落地）⇒ 说明 **ROB 本来就在 CSR 的 I2 同拍采样**（原时序正确），
+寄存一拍后 `upd_csr_v` 在采样拍已为 0 ⇒ 无更新。**该改动已回退**（`grep upd_csr_v_q` = 0）。
+
+### 24.2 由此确定的两点
+
+1. **时序不是病因**：ROB 与 I2 同拍、`upd_csr_v=1` 在 CSR 的 I2 拍（探针实测 ✓）；
+2. **病因是 `upd_csrw` 在该拍的实际取值**：探针同拍打印 `s1i=1`、`iprf_rd[0]=0x00000003`，
+   而 `upd_csrw=0x01` ⇒ `upd_csrw` **并非**按 `cb_src_w = u_s1i(csr_uop) ? iprf_rd[0] : imm` 取值。
+   下一步（一次运行即可收口）必须把**同一个 `csr_uop`** 的几个量放在**同一行**打印：
+   `u_s1i(csr_uop)`、`u_imm(csr_uop)`、`iprf_rd[0*32 +: 32]`、`cb_src_w`、`upd_csrw`、
+   `u_csrop(csr_uop)` —— 之前那行 `s1i/imm` 打印用的是 `x_i2_uop[0]`（虽与 `csr_uop` 同槽，
+   但**不是同一个表达式**，不能作为 `cb_src_w` 分支的依据）。
+3. 若 `cb_src_w` 与 `upd_csrw` 在同一行里就自相矛盾（如 `s1i=1 & rd0=3` 而 `cb_src_w=1`），
+   则说明该 `cb_src_w` wire 存在**多驱动/被同名信号遮蔽**（iverilog 会解析成 x/1）——
+   下一步先 `grep -c "cb_src_w" backend_top.v` 确认只有一个驱动点，再按需改名消歧。
+
+（B28 修复 `INORD_LOAD` 与 (c) 保持不动；本轮无净功能改动。）
