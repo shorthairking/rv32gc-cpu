@@ -75,11 +75,21 @@ TB_TIMEOUT="${TB_TIMEOUT:-300}"                 ;# 单个 TB 运行超时（秒�
 #     （300 s）——保持"多数 TB 挂死能快速暴露"的纪律。
 #     两个值都可用环境变量覆盖（TB_TIMEOUT / TB_TIMEOUT_TB_M3_DDR3）。
 TB_TIMEOUT_TB_M3_DDR3="${TB_TIMEOUT_TB_M3_DDR3:-1800}"
+#   ★ T6（2026-09-21，2B-2）：`tb_back2_lockstep` 是"双核（2A 顺序核 + front4/back2 乱序核）
+#     同映像跑三组程序并与 Spike 黄金轨迹逐条比对"的**集成级** TB：
+#       · 单程序约 400~3000 拍，但 iverilog 吞吐受两核 + 大阵列（ROB 128×416 bit、
+#         6×16 项 uop 队列、PRF 96×32）影响，实测 ~300~800 拍/s；
+#       · 其自身有 CYC_LIMIT=200000 拍的**内部**预算（超限即判 C3 失败，与本变量无关）；
+#       · 通用 300 s 墙钟在"程序卡住"时会在跑到内部预算前把它 kill（非功能失败表征）。
+#     故按名给它单独的墙钟兜底；**只放宽墙钟、不放松任何判据**（判据仍是 C1–C5 + 锚点唯一）。
+#     `tb_back2_ipc` 是纯后端直驱短仿真（~3200 拍），保持通用档即可。
+TB_TIMEOUT_TB_BACK2_LOCKSTEP="${TB_TIMEOUT_TB_BACK2_LOCKSTEP:-900}"
 #   按 TB 名取墙钟兜底（默认 TB_TIMEOUT；tb_m3_ddr3 用放宽容口）。
 tb_timeout_for() {
     case "$1" in
-        tb_m3_ddr3) printf '%s' "$TB_TIMEOUT_TB_M3_DDR3" ;;
-        *)          printf '%s' "$TB_TIMEOUT" ;;
+        tb_m3_ddr3)         printf '%s' "$TB_TIMEOUT_TB_M3_DDR3" ;;
+        tb_back2_lockstep)  printf '%s' "$TB_TIMEOUT_TB_BACK2_LOCKSTEP" ;;
+        *)                  printf '%s' "$TB_TIMEOUT" ;;
     esac
 }
 STRICT_SKIP="${RV32_REGRESS_STRICT_SKIP:-0}"    ;# 1 = 有跳过即判失败
