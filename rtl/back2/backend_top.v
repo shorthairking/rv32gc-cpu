@@ -40,7 +40,7 @@ module backend_top #(
     parameter integer NO_WAKE  = 0,           // 反证实验：1 = ALU1 唤醒广播恒 0（会挂死）
     parameter integer DBG_IQ   = 0,           // 1 = 6 个发射队列每拍打印队内项/唤醒（诊断）
     parameter integer DBG_LSU  = 0,           // 1 = 访存队列每拍打印 load 槽状态（诊断）
-    parameter integer DBG_CSR  = 0            // 1 = 打印 CSR 执行/提交现场（B29 诊断）
+    parameter integer DBG_CSR  = 1            // 1 = 打印 CSR 执行/提交现场（B29 诊断）
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -1253,7 +1253,7 @@ module backend_top #(
     wire   cb_src_w = u_s1i(csr_uop) ? iprf_rd[0*32 +: 32] : u_imm(csr_uop);
 
 
-    rob #(.WB_N(7)) u_rob (
+    rob #(.WB_N(7), .DBG_CSR(DBG_CSR)) u_rob (   // B29 定案探针透传
         .clk(clk), .rst_n(rst_n),
         .alloc_valid(disp_fire_w), .alloc_n(d1_n_w),
         .alloc_ready(rob_alloc_ready),

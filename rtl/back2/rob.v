@@ -31,7 +31,8 @@ module rob #(
     parameter integer ROB_IDX_W  = `BACK2_ROB_IDX_W,
     parameter integer COMMIT_W   = `BACK2_COMMIT_W,
     parameter integer RB_W       = `BACK2_RB_W,
-    parameter integer WB_N       = `BACK2_WB_N
+    parameter integer WB_N       = `BACK2_WB_N,
+    parameter integer DBG_CSR    = 0        // B29 定案探针
 ) (
     input  wire                    clk,
     input  wire                    rst_n,
@@ -250,6 +251,7 @@ module rob #(
                 for (k = 0; k < COMMIT_W; k = k + 1) begin
                     if (alloc_lane_valid[k] & (k < alloc_n)) begin
                         pl_q[idx_add(tail_w, k[ROB_IDX_W:0])]   <= alloc_payload[k*RB_W +: RB_W];
+                        if (DBG_CSR) $display("[rob-alloc t=%0t] k=%0d idx=%0d pay_csrw=0x%08x", $time, k, idx_add(tail_w, k[ROB_IDX_W:0]), alloc_payload[k*RB_W + `BACK2_RB_CSRW_MSB -: 32]);
                         rep_q[idx_add(tail_w, k[ROB_IDX_W:0])] <= alloc_epoch;
                         done_q[idx_add(tail_w, k[ROB_IDX_W:0])] <= 1'b0;
                     end
@@ -272,8 +274,10 @@ module rob #(
             end
 
             // ---- 5.3 执行期字段回写 ----
-            if (upd_csr_valid) pl_q[upd_csr_idx][`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB]
-                                   <= upd_csr_wdata;
+            if (upd_csr_valid) begin
+                pl_q[upd_csr_idx][`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB] <= upd_csr_wdata;
+                if (DBG_CSR) $display("[rob-upd t=%0t] idx=%0d wdata=0x%08x", $time, upd_csr_idx, upd_csr_wdata);
+            end
             if (upd_tr_valid) begin
                 pl_q[upd_tr_idx][`BACK2_RB_TRTAKEN] <= upd_tr_taken;
                 pl_q[upd_tr_idx][`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB] <= upd_tr_target;
