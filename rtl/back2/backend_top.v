@@ -39,7 +39,8 @@ module backend_top #(
     parameter integer CKPT_N   = `BACK2_CKPT_N,
     parameter integer NO_WAKE  = 0,           // 反证实验：1 = ALU1 唤醒广播恒 0（会挂死）
     parameter integer DBG_IQ   = 0,           // 1 = 6 个发射队列每拍打印队内项/唤醒（诊断）
-    parameter integer DBG_LSU  = 0            // 1 = 访存队列每拍打印 load 槽状态（诊断）
+    parameter integer DBG_LSU  = 0,           // 1 = 访存队列每拍打印 load 槽状态（诊断）
+    parameter integer DBG_CSR  = 0            // 1 = 打印 CSR 执行/提交现场（B29 诊断）
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -865,7 +866,7 @@ module backend_top #(
         .iss_epoch(iq_iss_ep[3]), .iss_dead(iq_iss_dead[3]),
         .o_sel_v(i3_sel_v), .o_sel_uop(i3_sel_uop), .o_sel_rob(i3_sel_rob), .cnt_o()
     );
-    iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ)) u_iq4 (
+    iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ), .INORD_LOAD(1)) u_iq4 (   // B28: LSU in-order gate
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
@@ -1191,6 +1192,18 @@ module backend_top #(
                               (csr_cmt_data | ff_cmt_val) : csr_cmt_data)
                                          : (csr_ff_w | ff_cmt_val);
     assign csr_raddr_w = u_csra(x_i2_uop[0]);
+
+    //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
+    always @(posedge clk) begin
+        if (DBG_CSR && rst_n && x_i2_v[0] && u_is_csr(x_i2_uop[0]))
+            $display("[csr-i2 t=%0t] op=%0d addr=0x%03x s1i=%b imm=0x%08x rdata=0x%08x upd_csrw=0x%08x upd_v=%b",
+                     $time, u_csrop(x_i2_uop[0]), u_csra(x_i2_uop[0]),
+                     u_s1i(x_i2_uop[0]), u_imm(x_i2_uop[0]), csr_rdata_w, upd_csrw, upd_csr_v);
+        if (DBG_CSR && rst_n && csr_we_w)
+            $display("[csr-cmt t=%0t] we=%b addr=0x%03x wdata=0x%08x (cmt_we=%b cmt_addr=0x%03x cmt_data=0x%08x) mscratch=0x%08x",
+                     $time, csr_we_w, csr_waddr_w, csr_wdata_w,
+                     csr_cmt_we, csr_cmt_addr, csr_cmt_data, u_csr.mscratch_q);
+    end
 
     b2_csr u_csr (
         .clk(clk), .rst_n(rst_n),

@@ -42,7 +42,13 @@ module iq #(
     parameter integer WRP        = `BACK2_IQ_WR_PORTS,
     parameter integer WK_N       = `BACK2_WB_N,
     parameter integer SRC_N      = 5,             // {s1i, s2i, s1f, s2f, s3f}
-    parameter integer DBG        = 0              // 1 = 每拍打印队内项与唤醒广播（诊断用）
+    parameter integer DBG        = 0,             // 1 = 每拍打印队内项与唤醒广播（诊断用）
+    //   B28 队列级闸门开关：load 不得越过更老的未就绪项（仅 LSU 队列置 1）。
+    //   动机（第 16/17/18 轮）：store 与其后的 load 同块同拍进入 LSU，store 数据未就绪时 load 抢跑
+    //   ⇒ 转发扫描看不到该 store（其 STQ 项 av=0 且 stq_rob 不可用）⇒ 读到旧内存值。
+    //   门控只加在 load 项上：更老的 store 不受限，仍可在就绪后自行发射 ⇒ 不会死锁
+    //   （第 18 轮把门控加在发射许可上、要求 load 是队首，因过强而死锁；此处是队列内、仅对 load 的版本）。
+    parameter integer INORD_LOAD = 0
 ) (
     input  wire                  clk,
     input  wire                  rst_n,
@@ -139,6 +145,7 @@ module iq #(
     reg  [DEPTH-1:0]       e_rdy, e_sel;
     reg  [7:0]             e_age [0:DEPTH-1];
     reg  [DEPTH*SRC_N-1:0] wk_hit_w;
+    reg  [DEPTH-1:0]       sel_blk;    // 存在更老的未就绪项（⇒ load 项暂缓可选）
     reg  [7:0]             sel_idx, best_age;
     integer                gi, gk;
 
@@ -166,12 +173,18 @@ module iq #(
             end
         end
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
+            sel_blk[gi] = 1'b0;
+            for (gk = 0; gk < DEPTH; gk = gk + 1)
+                if (valid_q[gk] && (e_age[gk] < e_age[gi]) && ~e_rdy[gk]) sel_blk[gi] = 1'b1;
+        end
+        for (gi = 0; gi < DEPTH; gi = gi + 1) begin
             e_rdy[gi] = (~uop_q[gi][`BACK2_UB_S1_I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
                         (~uop_q[gi][`BACK2_UB_S2_I_USE] | rdy_q[gi*SRC_N+1] | wk_hit_w[gi*SRC_N+1]) &
                         (~uop_q[gi][`BACK2_UB_S1_F_USE] | rdy_q[gi*SRC_N+2] | wk_hit_w[gi*SRC_N+2]) &
                         (~uop_q[gi][`BACK2_UB_S2_F_USE] | rdy_q[gi*SRC_N+3] | wk_hit_w[gi*SRC_N+3]) &
                         (~uop_q[gi][`BACK2_UB_S3_F_USE] | rdy_q[gi*SRC_N+4] | wk_hit_w[gi*SRC_N+4]);
-            e_sel[gi] = valid_q[gi] & e_rdy[gi];
+            e_sel[gi] = valid_q[gi] & e_rdy[gi] &
+                        ~(INORD_LOAD[0] & uop_q[gi][`BACK2_UB_IS_LOAD] & sel_blk[gi]);
         end
     end
     assign wk_hit = wk_hit_w;

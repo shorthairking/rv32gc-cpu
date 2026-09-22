@@ -739,3 +739,89 @@ ld slot=0 req=0 tag=0 rob=13 ep=1 addr=0x80009008          ← lbu **已经进�
   `backend_top` 的派发顺序/写口重试；若同拍入队且顺序正确，则在 **LSU 队列内部**用
   "更老未定址 store ⇒ 本项不可选"（队列级闸门，而非发射级）实现严格序，避开死锁（更老的
   store 仍可自行发射，因为门控只加在 load 项上）。
+
+## 20. 第 19 轮：**B28 修复成功**（LSU 队列级顺序闸门）+ 新缺陷 B29（CSR）
+
+### 20.1 修法（已落地并实测生效）
+
+`iq.v` 新增参数 `INORD_LOAD`（默认 0，仅 LSU 队列置 1）与队列级闸门：
+```
+sel_blk[gi] = ∃ gk: valid_q[gk] && (e_age[gk] < e_age[gi]) && ~e_rdy[gk]     // 存在"更老的未就绪项"
+e_sel[gi]   = valid_q[gi] & e_rdy[gi] & ~(INORD_LOAD & IS_LOAD(uop[gi]) & sel_blk[gi])
+```
+`backend_top.v` 把 LSU 队列（`u_iq4`）实例化为 `.INORD_LOAD(1)`。
+- 与第 18 轮被否决的"发射侧要求 load 是队首"不同：门控**只加在 load 项**上，更老的 store 不受限、
+  就绪后仍可自行发射 ⇒ **实测无死锁**；
+- 语义：load 不得越过更老的未就绪项 ⇒ 更老的 store 定址后 load 才可选 ⇒ 转发扫描必然能看到它。
+
+### 20.2 实测（`/home/shorthair/dsh/rv32-cpu/.b2chk/ls19.log`）
+
+| 项 | 结果 |
+|---|---|
+| `tb_back2_iq` | ✅ **PASS（151/151）** |
+| 程序 0 / 1 | ✅ **与基线逐字一致**：161/199、**443 拍**、IPC **0.3917**；178/215、**721 拍**、IPC **0.2469** |
+| 程序 2 | ⚠️ **B28 已修**（第 11 条 `lbu` 不再失败）；失败点前移到**第 15 条** |
+| `RENAME-CHK` / 死锁 | ✅ 0 条 / ✅ 无 |
+
+⇒ **B28（字节 store→load 漏转发）确已修复**：`sb x9,8(x5)` → `lbu x10,8(x5)` 的取值与 2A 一致（不再读 0x13）。
+
+### 20.3 新缺陷 B29（**下一步**）：CSR 读改写不一致
+
+```
+FAIL: 程序 2 第 15 条写回分歧：乱序 {we=1 rd=13 wd=0x00000001} vs 2A {we=1 rd=13 wd=0x00000003}
+```
+- 指令：`#14 csrrw x12, mscratch, x11`（x11 = `lhu` 结果 = 3）→ `#15 csrrs x13, mscratch, x0`。
+  第 14 条的写回（rd=12，旧 mscratch）与 2A 一致 ✅；第 15 条读到的 mscratch 乱序核为 **0x01**、2A 为 **0x03**
+  ⇒ OoO 的 CSR 小栈（`rtl/back2/b2_csr.v`，本阶段过渡实现，登记子集 mscratch/frm/fflags）
+  没有正确保存/回读 `csrrw` 写入的值。
+- 下一轮排查（只动 `rtl/back2/`）：
+  1. `b2_csr.v`：`csrrw` 的写通路（写使能/写地址/写数据取自 uop 的 CSROP/CSRADDR/IMM）与
+     提交序（CSR 操作按"只在 ROB 头执行"口径 ⇒ 读改写应按程序序）；
+  2. `backend_top.v`：CSR uop 的 CSROP 编码（csrrw/csrrs/csrrc + imm 形式）与读写数据的 mux；
+  3. 探针：`DBG` 打开后打印每条 CSR 提交的（PC、CSROP、CSRADDR、wdata、rdata、mscratch 当前值）。
+- 判据不变：B28 已修（不得回退）。(c)/B24 保持；程序 0/1 基线 443/721 拍不得回退。
+
+## 21. 第 20 轮：B29 定案（**CSR 写数据取自错误的 I2 PRF 读口**）
+
+### 21.1 探针实测（`/home/shorthair/dsh/rv32-cpu/.b2chk/csr.log`）
+
+```
+[csr-i2  t=12765000] op=1 addr=0x340 s1i=1 imm=0x00000340 rdata=0x00000000 upd_csrw=0x00000001
+[csr-cmt t=12775000] we=1 addr=0x340 wdata=0x00000001 ... mscratch=0x00000000
+[csr-i2  t=12795000] op=2 addr=0x340 s1i=1 imm=0x00000340 rdata=0x00000001 upd_csrw=0x00000001
+[csr-cmt t=12805000] we=1 addr=0x340 wdata=0x00000001 ... mscratch=0x00000001
+FAIL: 程序 2 第 15 条写回分歧：乱序 {we=1 rd=13 wd=0x00000001} vs 2A {we=1 rd=13 wd=0x00000003}
+```
+- `#14 csrrw x12, mscratch, x11`（x11 = `lhu` 结果 = 3）的 **I2 现场**显示：
+  `op=1`（csrrw ✓）、`addr=0x340`（mscratch ✓）、`s1i=1`（用 rs1 ✓）、`imm=0x340`
+  （CSR 指令的 imm 字段就是 CSR 地址 ✓ 预期）、`rdata=0`（旧值 ✓）—— 但 **`upd_csrw = 1`**
+  （应为 3）⇒ 提交写入 `mscratch = 1` ✗ ⇒ 随后的 `csrrs x13, mscratch, x0` 读到 **1**（2A 为 3）。
+- ⇒ **CSR 小栈（`b2_csr.v`）本身没问题**（写使能/地址/时序都对，`rdata` 也随提交正确更新为 1）；
+  真正的缺陷是 `cb_src_w = u_s1i(uop) ? iprf_rd[0*32 +: 32] : u_imm(uop)`
+  —— **`iprf_rd` 的 slot-0 读口读到的不是该 CSR 指令的 rs1（x11=3）**。
+  注意 `imm=0x340` 说明解码器把"CSR 地址"填进了 imm 字段（I 型立即数=rs1 域），故当 `s1i` 判据
+  不可靠时会退化成写 imm（0x340）或别的槽的数据 —— 实测落在 1（疑为同拍另一条指令的源操作数）。
+
+### 21.2b 关键结构性怀疑（`backend_top` 里 CSR 路全部**硬编码槽 0**）
+
+- `csr_raddr_w = u_csra(x_i2_uop[0])`、`upd_csr_v = x_i2_v[0] & u_is_csr(x_i2_uop[0]) & ...`、
+  `upd_csrw = ... iprf_rd[0*32 +: 32] ...`、`a0_wb_data = u_is_csr(x_i2_uop[0]) ? csr_rdata_w : a0_res`
+  —— **四处都假定 CSR 指令在 I2 槽 0**；而 `iprf_rd[0*32]` 是 **ALU0 的 rs1 读口**
+  （见 919 行 `a0_opa`）。若 CSR 指令被判到别的槽（或 ALU0 槽当拍是别的指令），
+  `cb_src_w`/`csr_raddr_w`/写回数据全部取错 ⇒ 与实测"写数据 = 1（别条指令的源操作数）"完全吻合。
+- 因此下一轮应优先确认并在必要时**按 CSR 实际槽位索引**（或强制 CSR 只在槽 0 执行/派发），
+  而不是只在 CSR 小栈里找问题。探针补充项：`iprf_ra[0*PW_I +: PW_I]`、`u_ps1i(x_i2_uop[0])`、
+  `iprf_rd[0*32 +: 32]`、`iprf_rd[2*32 +: 32]`、`x_i2_v`、以及 CSR 指令的 `lane_cls/opt`。
+
+### 21.2 下一轮修法（只动 `rtl/back2/`，一次探针即可收口）
+
+1. 打印 csrrw 的 I2 现场补充：`iprf_ra[0*PDW_I +: PDW_I]`（读口物理号）、`u_ps1i(uop)`、
+   `iprf_rd[0*32 +: 32]`、以及**同拍其它槽**的 `iprf_ra/iprf_rd`，确认 slot-0 读口是否接了
+   正确的物理号/使能；
+2. 重点核对 `backend_top` 中 I2 读口 `iprf_ra/iprf_rd` 的**槽位映射**与 `u_is_csr` 指令是否
+   在 slot 0（读口使能/地址是否按 slot 0 驱动）；
+3. 修法方向：CSR 指令的源操作数应取"**该 uop 自己的 rs1 读口**"（按槽位索引），
+   或对 CSR 指令强制在**槽 0 的读口**上驱动 `u_ps1i(uop)`；同时保留 `imm` 兜底仅用于
+   csrrwi/csrsi/csrrci（zimm 形式，`csr_zimm` 已有信号 ✓）。
+4. 判据不变：B28 已修（不得回退）；程序 0/1 基线 443/721 拍不得回退；**B29 修复后**程序 2 全链
+   C1–C4 过 ⇒ 实测 IPC 定 C5 档（= 实测 × 0.8）⇒ 三程序全绿 ⇒ regress 30/30。
