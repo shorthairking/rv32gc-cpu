@@ -1209,6 +1209,16 @@ module backend_top #(
 
     //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
     always @(posedge clk) begin
+        if (DBG_CSR && rst_n && (|iprf_we))
+            $display("[prf-w t=%0t] we=%b wa=%0d,%0d,%0d,%0d,%0d,%0d wd0=0x%08x wd1=0x%08x",
+                     $time, iprf_we,
+                     iprf_wa[0*PW_I +: PW_I], iprf_wa[1*PW_I +: PW_I], iprf_wa[2*PW_I +: PW_I],
+                     iprf_wa[3*PW_I +: PW_I], iprf_wa[4*PW_I +: PW_I], iprf_wa[5*PW_I +: PW_I],
+                     iprf_wd[0*32 +: 32], iprf_wd[1*32 +: 32]);
+        if (DBG_CSR && rst_n && csr_v_w)
+            $display("[csr-r t=%0t] ra0=%0d rd0=0x%08x cb_src=0x%08x upd_csrw=0x%08x csrop=%0d",
+                     $time, iprf_ra[0*PW_I +: PW_I], iprf_rd[0*32 +: 32], cb_src_w, upd_csrw,
+                     u_csrop(csr_uop));
         if (DBG_CSR && rst_n && csr_v_w)
             $display("[csr-uop t=%0t] lane=%0d ps1i=%0d s1i=%b imm=0x%08x csrop=%0d | rd0=0x%08x cb_src=0x%08x upd_csrw=0x%08x | v=%b idx=%0d rdata=0x%08x",
                      $time, csr_lane, u_ps1i(csr_uop), u_s1i(csr_uop), u_imm(csr_uop),
