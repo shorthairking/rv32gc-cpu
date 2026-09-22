@@ -328,9 +328,9 @@ module backend_top #(
     reg  [`BACK2_PRF_F_N-1:0] busy_f_nx;
 
     // PRF 端口
-    wire [14:0]     iprf_re;
-    wire [15*PW_I-1:0] iprf_ra;
-    wire [15*32-1:0]   iprf_rd;
+    wire [15:0]     iprf_re;
+    wire [16*PW_I-1:0] iprf_ra;      // ★ B29：+1 路提交级 CSR 源读口
+    wire [16*32-1:0]   iprf_rd;
     wire [5:0]      iprf_we;
     wire [6*PW_I-1:0]  iprf_wa;
     wire [6*32-1:0]    iprf_wd;
@@ -757,7 +757,7 @@ module backend_top #(
             1'b0,                                          // tr_taken（执行期回写）
             32'h0,                                         // tr 实际目标（执行期回写）
             d1_uop_q[g5][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],   // 异常 tval
-            32'h0,                                         // CSR 新值（执行期回写）
+            {25'b0, u_ps1i(lane_uop_fin[g5])},             // ★ B29：改为携带该 lane 的 PS1I（提交级 CSR 源解析用）
             lane_uop_fin[g5]                               // uop
         };
     end
@@ -1164,12 +1164,13 @@ module backend_top #(
 
     // 提交点 CSR 写（同拍至多 1 条：CSR 指令只在 ROB 头执行 ⇒ 至多一条在飞）
     reg        csr_cmt_we;  reg [11:0] csr_cmt_addr; reg [31:0] csr_cmt_data;
+    reg [2:0]  csr_cmt_op;   // ★ B29：提交级 CSR 操作码
     reg        ff_cmt_any;  reg [4:0]  ff_cmt_val;
     integer    cw;
     always @(*) begin
         csr_cmt_we   = 1'b0;
         csr_cmt_addr = 12'h0;
-        csr_cmt_data = 32'h0;
+        csr_cmt_data = 32'h0; csr_cmt_op = 3'd0;
         ff_cmt_any   = 1'b0;
         ff_cmt_val   = 5'h0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
@@ -1178,6 +1179,7 @@ module backend_top #(
                     csr_cmt_we   = 1'b1;
                     csr_cmt_addr = p_csra(cmt_pay[cw*RB_W +: RB_W]);
                     csr_cmt_data = p_csrw(cmt_pay[cw*RB_W +: RB_W]);
+                    csr_cmt_op   = p_csrop(cmt_pay[cw*RB_W +: RB_W]);   // ★ B29：提交级合成用
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
                     ff_cmt_any = 1'b1;
@@ -1189,8 +1191,12 @@ module backend_top #(
     // fflags 累积写入（FPU 结果提交时），与 CSR 写并路：地址 0x001 用"读改写"
     wire        csr_we_w    = csr_cmt_we | ff_cmt_any;
     wire [11:0] csr_waddr_w = csr_cmt_we ? csr_cmt_addr : 12'h001;
+    //   ★ B29：提交级合成（W→src；S→old|src；C→old&~src；zimm 形式本里程碑不涉及，保留旧值语义）
+    wire [31:0] csr_cmt_new = (csr_cmt_op == 3'd1) ? csr_cmt_src :
+                              (csr_cmt_op == 3'd2) ? (csr_rdata_w | csr_cmt_src) :
+                                                     (csr_rdata_w & ~csr_cmt_src);
     wire [31:0] csr_wdata_w = csr_cmt_we ? (csr_cmt_addr == 12'h001 ?
-                              (csr_cmt_data | ff_cmt_val) : csr_cmt_data)
+                              (csr_cmt_new | ff_cmt_val) : csr_cmt_new)
                                          : (csr_ff_w | ff_cmt_val);
     //   ★★ B29 修复：CSR 指令可能落在 I2 的**任意槽**（此前四处硬编码槽 0 ⇒ 取到别的指令的
     //     `x_i2_rob[0]`/读口数据 ⇒ `csrrw` 写入了错误值，实测 mscratch 被写成 1 而非 3）。
@@ -1205,7 +1211,14 @@ module backend_top #(
                           (x_i2_v[2] & u_is_csr(x_i2_uop[2])) | (x_i2_v[3] & u_is_csr(x_i2_uop[3])) |
                           (x_i2_v[4] & u_is_csr(x_i2_uop[4])) | (x_i2_v[5] & u_is_csr(x_i2_uop[5]));
     wire [UOPW-1:0] csr_uop = x_i2_uop[csr_lane];
-    assign csr_raddr_w = u_csra(csr_uop);
+    //   ★★ B29 修法（第 34 轮，按母代理更正）：提交点现算 CSR 写数据 —— 载荷的 CSRW 字段里
+    //   携带的是**该 CSR 指令的 rs1 物理号（PS1I）**（分配期写入、单写者、天然稳定），
+    //   提交拍直接 `PRF[ps1i]` 取值；不再从 `p_imm[19:15]` 反推（那是 CSR 地址 0x340，
+    //   [19:15]=6 ⇒ ARAT[6] 恰为值 1 的寄存器，正是第 33 轮仍为 1 的原因）。
+    wire [31:0] csr_cmt_src = iprf_rd[15*32 +: 32];
+    assign iprf_ra[15*PW_I +: PW_I] = p_csrw(cmt_pay[0 +: RB_W]);
+    wire [31:0] csr_cmt_src_sel = csr_cmt_we ? csr_cmt_src : csr_cmt_src;   // 占位保持可读性
+    assign csr_raddr_w = csr_cmt_we ? csr_cmt_addr : u_csra(csr_uop);
 
     //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
     always @(posedge clk) begin
@@ -1260,7 +1273,7 @@ module backend_top #(
         .alloc_idx0(rob_alloc_idx0), .alloc_lane_valid(d1_v_q), .alloc_payload(rob_pay_w),
         .alloc_epoch(epoch_w),
         .wb_valid(wb_v), .wb_rob_idx(wb_rob), .wb_epoch(wb_ep),
-        .upd_csr_valid(upd_csr_v), .upd_csr_idx(upd_csr_idx), .upd_csr_wdata(upd_csrw),
+        .upd_csr_valid(1'b0), .upd_csr_idx(upd_csr_idx), .upd_csr_wdata(upd_csrw),   // ★ B29：值改由提交级现算
         .upd_tr_valid(upd_tr_v), .upd_tr_idx(x_i2_rob[2]),
         .upd_tr_taken(bru_act_tk), .upd_tr_target(bru_target),
         .upd_ff_valid(upd_ff_v), .upd_ff_idx(fpu_if_rob), .upd_ff_flags(fpu_ff),
@@ -1278,7 +1291,7 @@ module backend_top #(
     //==========================================================================
     // 10. PRF（整数 15 读 6 写 / 浮点 8 读 2 写）
     //==========================================================================
-    assign iprf_re = 15'h7FFF;
+    assign iprf_re = 16'hFFFF;
     assign iprf_ra[0*PW_I +: PW_I]  = u_ps1i(x_i2_uop[0]);
     assign iprf_ra[1*PW_I +: PW_I]  = u_ps2i(x_i2_uop[0]);
     assign iprf_ra[2*PW_I +: PW_I]  = u_ps1i(x_i2_uop[1]);
@@ -1301,7 +1314,7 @@ module backend_top #(
     assign iprf_wd    = wbi_data;
     assign iprf_we_ep = { fpu_if_ep, lsu_wb_ep, mdu_if_ep, x_i2_ep[2], x_i2_ep[1], x_i2_ep[0] };
 
-    prf #(.NW(6), .NRD(15), .NREG(`BACK2_PRF_I_N), .PDW(PW_I), .DW(32)) u_prf_i (
+    prf #(.NW(6), .NRD(16), .NREG(`BACK2_PRF_I_N), .PDW(PW_I), .DW(32)) u_prf_i (
         .clk(clk), .rst_n(rst_n),
         .we(iprf_we), .waddr(iprf_wa), .wdata(iprf_wd), .wepoch(iprf_we_ep), .epoch(epoch_w),
         .wkeep(wbi_keep),
