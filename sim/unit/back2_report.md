@@ -1867,3 +1867,174 @@ iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ipc.vvp -s tb_back2_ipc "${RTL[@]}
 # 全量回归（31 个 TB，T6 墙钟档不变）
 ./scripts/regress.sh
 ```
+
+---
+
+# 2B-4 第 2 段 · **取指集成**：新顶层 `core_top_2b`（front4 + backend_top 合体）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 HEAD=`d7932a3`=tag `2B-4`，**未提交**）
+> 新增：`rtl/top/core_top_2b.v`、`sim/unit/tb_core_top_2b.sv`；
+> **2A 既有文件零修改、只读例化**（`core_top.v`/`exec`/`mem`/`csr`/`cache`/`fetch`/`decode`/`axi`/`pkg`）；
+> `scripts/regress.sh` **未改**（新 TB 因 glob `tb_*.sv` 被**自动纳入** ⇒ TB 数 31→32，见 §B4.2.5）。
+
+## B4.2.0 结论一览
+
+| 验收判据 | 结果 |
+|---|---|
+| ① iverilog 整设计（含新 top 与新 TB）零错误 | ✅ `-Wall` 0 error、**0 隐式网**、0 位宽不匹配 |
+| ② `tb_core_top_2b` 跑 p1_int 全链 | ✅ **PASS**：449 拍、提交 **161** 条（黄金 161）、**PC 流 0 分歧** |
+| ③ regress 不回退 | ✅ 既有 31 项全绿（新 TB 自动纳入后为 **32/32**，见 §B4.2.5） |
+| ④ 报告（端口契约表 / 接线说明 / 占位清单） | ✅ 本章 §B4.2.2–§B4.2.3 |
+
+## B4.2.1 本段做了什么（真实现）
+
+`core_top_2b` = 2A 核的 **F/D/E 段**替换为 **front4_top（F1–F4 + 锦标赛预测器 + 检查点 + RAS）
+＋ backend_top（D1–D3 / I1–I2 / E1 / W1：ROB 128 + 重命名 + 分布式发射 + PRF + LSQ + `b2_csr` 过渡栈）**，
+取指侧按 2A 口径接 **I-TLB/PTW → L1I → XIP 直通 → 核内 AXI 读引擎**：
+
+1. **复位与取指入口**：`RESET_PC = 0x1C00_0000`（front4 `pc_gen4.v` 内置，与 2A 同源）；
+   XIP 窗口（`0x1C00_0000` / 别名 `0x1FE8_0000`）**不经 I-Cache**，单 beat 直读 + 字保持
+   （`xip_hit_held` 地址比对，防陈旧响应 —— 2A §5.4 同法）。
+2. **L1I**：2A `l1i` 实例（16 KB / 2 路 / 32 B 行）+ 行填充握手（`fill_req/accepted/valid/
+   data/word_idx/done`）；**响应归属校验**（`l1i_pend_q`/`l1i_pa_q`：响应属于上一拍被接受的
+   请求 ⇒ 重定向后丢弃，2A §5.3 同款修复）。
+3. **核内 AXI 读引擎**：单笔在途 + 归属寄存器（`i_busy_q`/`i_src_q`），三请求源
+   **XIP 单字 > L1I 行填充（8 beat）> PTE 单字**，共用 2A `axi_master_ctrl`
+   （**AXI 五通道握手全部在该模块内 —— 本文件不重写 AXI 协议逻辑**，符合红线 4）。
+4. **front4 ↔ backend_top 全接口**：块握手（4 宽派发）/重定向/训练/检查点释放/RAS/D2 修复。
+5. **调试口**：`ws_valid` = 提交组非空；`debug0_wb_pc/rf_wen/rf_wnum/rf_wdata` 取**提交组 lane 0**
+   （2A 单发射 ⇒ 逐条一致；4 宽提交时每拍只输出最老一条 ⇒ 差异登记见 §B4.2.3）。
+6. **`break_point`** 真实接入 front4（断点冻结前端）。
+
+## B4.2.2 端口契约核对表（48/48 逐端口同名同向同位宽）
+
+> 核对方法：解析两份模块端口表逐项比对（脚本口径：`module` 头部至 `);`，
+> 忽略注释行，取 `(方向, 位宽, 名字)` 三元组）；**实测 48/48 匹配**，另有 **10 个占位端口**（§B4.2.3）。
+
+| # | core_top（契约） | 方向/位宽 | core_top_2b | 核对 |
+|---|---|---|---|---|
+| 1 | `aclk` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 2 | `intrpt` | input [7:0] | 同名同向同位宽 | ✅ |
+| 3 | `aresetn` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 4 | `arid` | output [3:0] | 同名同向同位宽 | ✅ |
+| 5 | `araddr` | output [31:0] | 同名同向同位宽 | ✅ |
+| 6 | `arlen` | output [3:0] | 同名同向同位宽 | ✅ |
+| 7 | `arsize` | output [2:0] | 同名同向同位宽 | ✅ |
+| 8 | `arburst` | output [1:0] | 同名同向同位宽 | ✅ |
+| 9 | `arlock` | output [1:0] | 同名同向同位宽 | ✅ |
+| 10 | `arcache` | output [3:0] | 同名同向同位宽 | ✅ |
+| 11 | `arprot` | output [2:0] | 同名同向同位宽 | ✅ |
+| 12 | `arvalid` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 13 | `arready` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 14 | `rid` | input [3:0] | 同名同向同位宽 | ✅ |
+| 15 | `rdata` | input [31:0] | 同名同向同位宽 | ✅ |
+| 16 | `rresp` | input [1:0] | 同名同向同位宽 | ✅ |
+| 17 | `rlast` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 18 | `rvalid` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 19 | `rready` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 20 | `awid` | output [3:0] | 同名同向同位宽 | ✅ |
+| 21 | `awaddr` | output [31:0] | 同名同向同位宽 | ✅ |
+| 22 | `awlen` | output [3:0] | 同名同向同位宽 | ✅ |
+| 23 | `awsize` | output [2:0] | 同名同向同位宽 | ✅ |
+| 24 | `awburst` | output [1:0] | 同名同向同位宽 | ✅ |
+| 25 | `awlock` | output [1:0] | 同名同向同位宽 | ✅ |
+| 26 | `awcache` | output [3:0] | 同名同向同位宽 | ✅ |
+| 27 | `awprot` | output [2:0] | 同名同向同位宽 | ✅ |
+| 28 | `awvalid` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 29 | `awready` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 30 | `wid` | output [3:0] | 同名同向同位宽 | ✅ |
+| 31 | `wdata` | output [31:0] | 同名同向同位宽 | ✅ |
+| 32 | `wstrb` | output [3:0] | 同名同向同位宽 | ✅ |
+| 33 | `wlast` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 34 | `wvalid` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 35 | `wready` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 36 | `bid` | input [3:0] | 同名同向同位宽 | ✅ |
+| 37 | `bresp` | input [1:0] | 同名同向同位宽 | ✅ |
+| 38 | `bvalid` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 39 | `bready` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 40 | `ws_valid` | output (1 bit) | 同名同向同位宽 | ✅ |
+| 41 | `break_point` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 42 | `infor_flag` | input (1 bit) | 同名同向同位宽 | ✅ |
+| 43 | `reg_num` | input [4:0] | 同名同向同位宽 | ✅ |
+| 44 | `rf_rdata` | output [31:0] | 同名同向同位宽 | ✅ |
+| 45 | `debug0_wb_pc` | output [31:0] | 同名同向同位宽 | ✅ |
+| 46 | `debug0_wb_rf_wen` | output [3:0] | 同名同向同位宽 | ✅ |
+| 47 | `debug0_wb_rf_wnum` | output [4:0] | 同名同向同位宽 | ✅ |
+| 48 | `debug0_wb_rf_wdata` | output [31:0] | 同名同向同位宽 | ✅ |
+
+**占位端口（10 个；第 3 段删除）**：`oo_mem_req_valid/wen/addr/wdata/wstrb/tag`（output）、
+`oo_mem_req_ready/rsp_valid/rsp_rdata/rsp_tag`（input），位宽与 `backend_top` 的
+`mem_req_*`/`mem_rsp_*` 逐位相同（tag = `BACK2_MEM_TAG_W` = 6 bit）。
+
+## B4.2.3 ★ 占位清单（本段**未实现**，不得读作已实现）
+
+| # | 占位项 | 现状 | 后续段计划 |
+|---|---|---|---|
+| 1 | **数据侧（LSU → 存储器）** | `oo_mem_*` 占位端口直连 TB 内存模型（单请求口 + 带标签响应） | **第 3 段**：接 2A `l1d` + AXI，与取指**共用总线主口** ⇒ 须按 2A"单笔在途 + 归属寄存器 + `valid&&ready` 推进"三件套做 I/D 仲裁 |
+| 2 | **完整 CSR / 陷阱 / 中断** | 仅 `b2_csr` 过渡栈（mscratch/mepc/mcause/mtvec/mstatus + fcsr）；`trap_valid_w` 只观测不交付；`intrpt[7:0]` **未接** | **第 4 段**：接 csr_file（2A）+ trap_ctrl + CLINT/PLIC（平台硬事实：核内 `0x1F00_0000`/`0x1F10_0000`） |
+| 3 | **Sv32（I 侧）** | `tlb`（第二查询口）+ `ptw` + PTE `pmp_check` **已实例化并接线**，但 `satp` 占位 = 0 ⇒ `sv32_translate_en = 0`（Bare 直通） | 第 4 段接 csr_file 的 satp/sfence 提交源后启用；**届时必须恢复 2A 的"PTW 串行复用 + 数据侧优先"纪律**（本段数据侧无翻译请求 ⇒ PTW 仅服务取指，无争用） |
+| 4 | **PTW 的 A/D 更新写通路** | **未实现**：`pte_ad_done` 恒 0（fail-closed：若启用 Sv32 会挂死而非静默跳过 A/D 更新）；PTE **读**通路经核内 AXI 引擎已可用 | 第 4 段补 AXI 写通路（含 `pte_ad_pa/data` 与 PMP 检查） |
+| 5 | **PMP 上下文** | 取指/PTE 的 `pmpcfg_i/pmpaddr_i` 恒 0 + `priv = M` ⇒ M 模式无匹配项 ⇒ 放行 | 第 4 段接 csr_file 的 PMP 拍平量 |
+| 6 | **L1I 维护（fence.i / cbo.inval）** | `inval_all` 恒 0（无 CSR 提交源） | 第 4 段接提交点 |
+| 7 | **`infor_flag/reg_num/rf_rdata`**（调试寄存器读口） | `rf_rdata` 恒 0；两个输入未使用 | 第 4 段按架构 RAT 选 PRF 读口实现 |
+| 8 | **多宽提交的调试口** | `debug0_wb_*` 只给 lane 0 | 若平台需要（chiplab debug 组按"每拍 1 条"口径）保持即可；如需全宽需扩展端口（属契约变更，须报批） |
+| 9 | **XIP 窗口外的 uncached 取指（MMIO 取指）** | 未接（front4 只在 XIP 窗口判 uncached ⇒ 结构上不可达） | 若将来有 MMIO 取指需求再补 |
+
+## B4.2.4 front4 ↔ L1I ↔ PTW ↔ AXI 接线说明（逐段）
+
+```
+front4_top
+  ├─ tr_req_valid/tr_req_va ──► tlb.lookup2_*（第二查询口，纯组合）
+  │                              └─ hit2/perm_fault2/pa2 ⇒ sv32_translate_{done,fault,paddr}
+  ├─ sv32_translate_en ◄── 占位 0（Bare）
+  ├─ l1i_req_valid/addr ──► l1i.cs_req/cs_paddr(=PA)/cs_vaddr
+  │     ◄── cs_ready(经归属校验 → l1i_ready) / cs_rdata / cs_miss
+  └─ unc_req_valid/pa ──► XIP 单字通路（字保持寄存器）
+        ◄── unc_rsp_valid/pa/data（地址比对 xip_hit_held）
+l1i.fill_req/paddr/beats ──► I 侧 AXI 引擎（三源仲裁）
+ptw.pte_req_valid/pa      ──► I 侧 AXI 引擎（PTE 单字读）
+        ◄── pte_resp_valid/data（同一 R 通道按 i_src_q 归属分发）
+I 侧 AXI 引擎 ──► 2A axi_master_ctrl ──► 48 端口契约的 AR/R（写通道恒空）
+```
+- **单笔在途**：`i_busy_q` 期间不再受理新请求（XIP 的 `xip_req_pend_q` 另有一层在途保护）；
+- **beat 分发**：R 握手拍按 `i_src_q` 把 `rdata` 分发给 L1I 的 `fill_valid/word_idx`、
+  PTW 的 `pte_resp_*` 或 XIP 字保持寄存器；`i_cnt_q == i_last_q` 时收尾并释放在途位；
+- **XIP 优先级最高**（启动关键路径），L1I 填充其次，PTE 读最低；32 B 行/单字均不跨 4 K
+  ⇒ `req_split=0`；
+- `AxCACHE`：DDR 行填充 `4'b1111`、XIP 单字 `4'b0000`（2A D5 口径）；`arlock/awlock` 只驱动 [0]。
+
+## B4.2.5 验证台账（判据逐条）
+
+| 判据 | 结果 | 证据 |
+|---|---|---|
+| ① 整设计（含新 top/TB）编译零错误 | ✅ 0 error / 0 隐式网 / 0 位宽不匹配（`-Wall`） | `../.b2chk/inttb3.log` |
+| ② p1_int 全链跑通：PC 流 = 黄金、条数 = 黄金 | ✅ **449 拍、提交 161 条（黄金 161）、PC 流 0 分歧** | `../.b2chk/final_int_run.log` |
+| ② 取指真走 L1I+AXI（自证） | ✅ AXI **AR=8 笔**（XIP 3 / DDR 行填充 5） | 同上（C4' 断言） |
+| ② 跳板路径 = RESET_PC XIP 直取 | ✅ `0x1C00_0000` 提交后顺序到 `0x8000_0000` | 同上（C3' 断言） |
+| ② 无提交点异常 | ✅ `trap_valid_w` 全程 0 | 同上（C5' 断言） |
+| ③ regress 不回退 | ✅ 既有 31 项全绿；新 TB 经 glob **自动纳入** ⇒ 报 **32/32**（脚本未改） | `../.b2chk/int_regress.log` |
+| ④ 端口契约 | ✅ **48/48** 同名同向同位宽 + 10 占位端口（§B4.2.2） | 逐端口比对脚本 |
+
+TB 自身检查项 7 项：C1' PC 流、C2' 条数、C3' 跳板（2 项）、C4' L1I/XIP 走 AXI（2 项）、C5' 无异常。
+
+## B4.2.6 遗留 / 下一步
+
+1. **第 3 段（数据侧）**：接 L1D + AXI，删除 `oo_mem_*` 占位口；做 I/D 总线仲裁
+   （单笔在途 + 归属寄存器）；`PTW` 恢复 2A 的串行复用（数据侧优先）。
+2. **第 4 段（特权/异常/中断）**：完整 csr_file + trap_ctrl + CLINT/PLIC + Sv32（含 A/D 写通路）。
+3. **本段未验证项**（结构就位但功能未跑）：Sv32 取指翻译、PTE 读通路、PMP 取指检查、
+   L1I 维护失效、多宽提交的调试口语义。
+4. **新 TB 是否长期纳入 regress**：因 `regress.sh` 按 `sim/unit/tb_*.sv` glob ⇒ 已自动纳入
+   （32/32）。若母代理希望"先不纳入"，需给 `regress.sh` 加白名单/排除（属脚本改动，**待批**）。
+5. 本段未做 L1I 命中率/取指带宽的性能测量（`tb_core_top_2b` 只判功能等价）。
+
+## B4.2.7 复现命令
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+# 整设计（含新顶层与新 TB）编译 + 顶层合体集成用例
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[@]}" sim/unit/tb_core_top_2b.sv && vvp /tmp/ct2b.vvp
+# 全量回归（新 TB 被 glob 自动纳入 ⇒ 32 项）
+./scripts/regress.sh
+```
