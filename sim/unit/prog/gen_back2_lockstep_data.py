@@ -60,6 +60,10 @@ PROGS = [
     #     逐条比；且本 SoC 的 CLINT 在 0x1F00_0000（Spike 默认在 0x0200_0000）⇒
     #     Spike 跑本程序根本不会收到 MTI。判据改由 TB 的 C8'（自记录+硬编码期望）。
     ("back2_p8_int.S",     "P8", "rv32ima_zicsr",   "rv32imac_zicsr", True),
+    #   ★ 2B-4 第 4b 段（第一步）：**mtvec 向量模式（MODE=1）**实测——
+    #     三条异常落三个不同槽（cause 11/2/3 ⇒ base+44/+8/+12），槽标记进写回轨迹
+    #     ⇒ 向量化目标算错必被黄金比对抓住。有 Spike 黄金（M 模式陷阱语义可比）。
+    ("back2_p9_trapvec.S", "P9", "rv32ima_zicsr",   "rv32imac_zicsr"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"

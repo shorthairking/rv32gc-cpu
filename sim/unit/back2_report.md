@@ -2282,3 +2282,156 @@ vvp /tmp/ct2b.vvp | tail -20      # ⇒ TB_CORE_TOP_2B: PASS（51 项）
 - `regress.sh`：**32/32 PASS**（日志 `../.b2chk/regress_4a_final.log`）。
 - 未提交 git；改动文件快照见 `../.b2chk/*.s13`（步骤 1~3 检查点）与 `../.b2chk/*.s14`（本段最终态）。
 - 证据日志：`../.b2chk/final_4a_run.log`（TB 全量输出）、`../.b2chk/gen_p8b.log`（黄金生成 stderr）。
+
+
+# 2B-4 第 4b 段（csr_file 替换 + Sv32 + PLIC + S 模式）—— **接口勘察 + 第一步落地 + 可执行方案**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 4a 收官
+> `09b5e32` + 补充 `d8b3600`，tag `2B-4.4`，**未提交新改动**）
+> 任务书：①`csr_file`+`trap_ctrl` 替换 `b2_csr` 过渡栈（含提交组适配层）②Sv32 全链路
+> ③PLIC + `intrpt[7:0]` + MEIP 最小闭环 ④向量模式 + S 模式判据。
+> **预算见底 ⇒ 本段按纪律停在"整设计可编译 + 既有判据全绿"检查点**，并交付：
+> **一项零风险、可独立验证的 4b 内容（向量模式实测，并已借此修掉一个真实 ISA 口径缺陷）**
+> + 其余三项的**逐条接口勘察与可执行方案**（附 file:line 证据）。
+
+## B4.5.0 结论（一句话）
+
+**本段实测了 mtvec 向量模式并修掉缺陷 D4（4a 段把"同步异常"也做了向量化，与 ISA/2A 口径不符）；
+`csr_file`+`trap_ctrl`+`priv_ctrl` 替换、Sv32 全链路、PLIC、S 模式四项只做了勘察与方案
+——它们都依赖 `csr_file` 落地（`satp`/`mstatus.MPP`/`sstatus`/`medeleg` 等 CSR 与 `priv` 状态机
+在 4a 的 `b2_csr` 过渡栈里**根本不存在**），半途替换必然打破"既有判据全绿"，故按任务书停在检查点。**
+
+## B4.5.1 本段已完成（可复核的实测增量）
+
+| 项 | 内容 | 证据 |
+|---|---|---|
+| **D4 缺陷修正** | `mtvec` MODE=1（Vectored）下**只有中断**取 `BASE + 4×cause`，**同步异常一律回 BASE**（4a 实现把异常也向量化 ⇒ 与 Spike/2A 口径不符） | 依据 `docs/design/06-csr-privilege.md §3.2`（"MODE=1：**同步异常** pc ← BASE；**中断** pc ← BASE + 4×cause"）；**实测抓住**：修正前 Spike 落 `vbase+0`、本核落 `vbase+44`（C1' 第 10 条分歧，p9 首轮日志）；修正后 `rtl/top/core_top_2b.v:900-917` |
+| 向量目标合成口径 | 采用 2A `csr_file` 式 `BASE(低 8 位 0) \| (cause << 2)`（Vectored 下 2A 要求 BASE 256 B 对齐，正是为省加法器，见 06 §11 P-3）；`trp_vect_w = {base[31:8],8'b00} \| {26'b0,7,2'b00}` | `core_top_2b.v:912-916` |
+| **新程序 `back2_p9_trapvec.S`** | MODE=1 + 三条同步异常（ecall 11 / 非法 2 / ebreak 3）⇒ **三次都落 BASE**；槽 1..11 塞 `j h_wrong`（标记 0xEE）作反例防护；`vbase` 256 B 对齐 | 黄金 92 条；TB 输出 `[C9'] 向量模式：mtvec=0x80014101（MODE=1，BASE=0x80014100）→ 三次同步异常目标均 = BASE（0x80014100×3），陷阱指令 PC=0x80014028/0x80014030/0x80014038，cause=11/2/3` |
+| **p8 增补"中断向量化"** | p8 的 `mtvec` 改 MODE=1 + 256 B 对齐向量表，槽 7（`BASE+28`）= 中断入口；槽 0..6/8..11 = `h_bad`（fail-loud） | TB 输出 `[C8'] 中断现场：mtvec=0x80010101 mepc=0x80010058 mcause=0x80000007`、`向量槽 7（BASE+28）已提交` |
+| TB 判据扩展 | 程序数 5→6；新增 `trp_tgt[]`（**异常重定向目标**采样）、`irq_target_q`（**中断重定向目标**采样，中断不走 ROB 异常口）；C8' 增 3 条（MODE=1 / 中断向量目标 / 槽 7 已提交）、C9' 6 条 | **TB_CORE_TOP_2B: PASS，68/68 项**（`../.b2chk/final_4b_run.log`） |
+| 既有判据不回退 | p1 449/161、p3 462/126、p6 1077/366（AW=2/W=16/B=2）、p7 755/89（陷阱 3 次 cause 11/2/3）、p8 4000/524（中断 1 次）全部同 4a | 同上日志；`regress.sh` 见 §B4.5.8 |
+
+## B4.5.2 ①`csr_file` + `trap_ctrl` 替换方案（含提交组适配层）
+
+**接口事实（只读勘察，2A 参考行）**
+
+| 模块 | 端口规模 | 2A 例化行 | 关键输入/输出 |
+|---|---|---|---|
+| `csr_file` | 45 | `rtl/top/core_top.v:2465-2534` | 读口 `raddr/rdata`；写口 `wen/waddr/wdata/w_illegal` + **W 级旁路** `rdata_w`，**M 级预览旁路** `byp_wdata/byp_rdata`；`priv/chk_addr/chk_illegal/chk_ro_write`；`mstatus_o/mstatus_set/mstatus_clr`；**陷阱写路径 `trap_we/trap_epc_i/trap_cause_i/trap_tval_i/trap_data_i`**；中断源 `irq_msip/mtip/meip/stip/seip`；计数器 `cycle_i/instret_i`；输出 `pmp_cfg_o/pmp_addr_o/satp_o/menvcfg_o/senvcfg_o/mcounteren_o/scounteren_o/mtvec_o/stvec_o/medeleg_o/mideleg_o/mie_o/mip_o/mepc_o/sepc_o` |
+| `trap_ctrl` | 35 | `core_top.v:2568-2610` | 入口 = "W 拍单发射"：`commit_valid/commit_pc/commit_pc_next/commit_insn/exc_valid/exc_cause/exc_tval/exc_is_fetch/priv/medeleg/mideleg/mip/mie/mstatus_i/mtvec/stvec`；出口 = `trap_valid/trap_is_int/trap_target/trap_cause/trap_tval/trap_epc/trap_pc` + **CSR 写路径 `trap_we/trap_epc_i/trap_cause_i/trap_tval_i`** + `redirect_pc` |
+| `priv_ctrl` | 20 | `core_top.v:2540-2562` | `trap_valid/trap_target/xret_valid/xret_kind/mstatus_i/csr_wen/csr_waddr/csr_wdata` → `priv_o/eff_priv_o/mprv_o/sum_o/mxr_o/mpp_o/tvm_o/tw_o/tsr_o/fetch_priv_is_m_o/flush_req/priv_next_o` |
+| `pmp_check` | — | `core_top.v:1848`（PTE 隐式访存）+ 取指/数据侧各一 | `cfg_i/addr_i/acc_pa_i/acc_bytes_i/acc_priv_i/acc_type_i` → `allow_o/fault_cause_o` |
+
+**适配层设计（`backend_top` → `trap_ctrl`，本段的结论性方案）**
+
+1. **"W 拍"= ROB 头**：`commit_valid = rob_head_valid & head_done`；`commit_pc = 头部 PC`；
+   `commit_pc_next = 头部 PC + len`（本核程序全 norvc ⇒ +4；压缩指令需从载荷取长度，登记为待办）；
+   `commit_insn = 载荷 TVAL`（= 原始指令位，4a 已验证可用）。
+2. **异常入口**：`exc_valid = commit_valid & head_exc`（**必须与 `commit_valid` 相与** —— 2A 的
+   `core_top.v:2571-2579` 记录了"裸 `exc_valid` 逐拍重复取同一次陷阱"的真实缺陷）；
+   `exc_cause/exc_tval` 取 ROB 头部的 `EXC`/`TVAL` 字段（4a 已有）；
+   `exc_is_fetch` 由取指侧的异常来源标记提供（本核取指异常目前只在 front4 内部，需引到后端，登记为待办）。
+3. **CSR 写在提交点**：`wen = 提交组里最老的那条 CSR 指令`（本核 CSR 只在 ROB 头发射 ⇒ **每组至多一条**
+   ⇒ 简单优先 mux 足够，沿用 4a 的 `csr_cmt_we/csr_cmt_addr/csr_cmt_op` 现场）；
+   `wdata` 用 `csr_file` 的 **W 级旁路 `rdata_w`** 合成（`W→src`、`S→old|src`、`C→old&~src`；
+   立即数形式源 = 载荷 TVAL 的 `insn[19:15]`，即 4a 修的 D2）；`mstatus_set/clr` 由 xRET/CSR 写驱动。
+   替换后 **4a 自己合成的 `trp_csr_*`（mepc/mcause/mtval/mstatus 进入/退出）全部删除**，
+   改由 `trap_ctrl` 的 `trap_we/trap_epc_i/trap_cause_i/trap_tval_i` → `csr_file` 落地（delegation 由 trap_ctrl 算）。
+4. **重定向优先级**：沿用 4a 的"外部优先"骨架，扩展为
+   `trap_valid ? trap_target : xret ? (kind==mret ? mepc_o : sepc_o) : sfence/cbo/fence.i ? … : squash`；
+   `trap_valid` 与 `redirect` **同拍**（2A `core_top.v:2619-2625` 同构）。
+5. **中断**：`csr_file` 的 `mip` 由 CLINT/PLIC 直驱；`trap_ctrl` 用 `mip/mie/mideleg/priv/mstatus_i`
+   判 `trap_is_int` 并给 `trap_cause/trap_target` ⇒ **4a 的 `irq_mti_w` 判定与 `0x8000_0007` 合成全部删除**；
+   本核只需保留"提交组边界采样 + ROB 非空"（`mepc` = 头部 PC，等价于 2A 的"下一条未提交 PC"）。
+6. **读口**：`csr_file.raddr/rdata` 直接替 `b2_csr` 的组合读口；**必须保留**本核的
+   "CSR 指令只在 ROB 头发射"闸门（否则读到投机中间态）。
+
+## B4.5.3 ②Sv32 全链路方案
+
+**现状（本仓已就位的骨架，全部为占位 tie-off）**
+
+| 项 | 现状 | 位置 |
+|---|---|---|
+| I 侧翻译 | `tlb` 第二查询口 + `ptw` 已接取指，`sv32_en = 0`（satp 占位 0）⇒ 直通 | `core_top_2b.v:242-292` |
+| D 侧翻译 | **完全未接**：`tlb` 第一查询口 `lookup_valid(1'b0)`；LSU 侧 `cs_vaddr = cs_paddr` | `core_top_2b.v:251-255`、`:469` |
+| PTW 串行复用 | **未做**：`ptw.req_valid = sv32_en & ~f_tlb_hit & tr_req_valid`（只有取指源）；2A 的 `m_tr_src_q` 归属仲裁（数据侧优先）未搬 | `core_top_2b.v:274`；2A `core_top.v:1587-1595/1790-1797/1988` |
+| PTE A/D 写通路 | **未做**：`ptw.pte_ad_done(1'b0)`（fail-closed，Bare 下不可达） | `core_top_2b.v:289` |
+| sfence.vma | **未接**：`tlb.sfence_valid(1'b0)`、`satp_we(1'b0)` | `core_top_2b.v:263-266` |
+| cbo/fence.i 维护 | **未接**：L1I `inval_all(1'b0)`、L1D `inval_all/clean_all(1'b0)` | `core_top_2b.v:439`、`:572` |
+| PTE 隐式访存 PMP | 已例化 `pmp_check`，但 `acc_type_i(2'b00)`（= X） | `core_top_2b.v:295-301` |
+
+**实施方案（按依赖排序）**
+1. `satp` 来自 `csr_file.satp_o` ⇒ `sv32_en = satp[MODE]`（2A `core_top.v:2536` 同式）；
+   `priv` 来自 `priv_ctrl.eff_priv_o`（数据侧）/`priv_o`（取指侧）。
+2. **D 侧翻译级**：把 LSU 请求拆成"VA 冻结 → tlb 口 1 查询 → 命中/未命中/缺页"，
+   未命中走 PTW（与取指源按 **数据优先** 仲裁 + `m_tr_src` 归属锁存），完成后
+   `cs_s_vaddr` 用译后 PA（`cs_vaddr=cs_paddr` 的注释块 `:469` 改成 VA/PA 分离）。
+3. **A/D 写通路**：`ptw.pte_ad_update/pte_ad_pa/pte_ad_data` → 在 §5 AXI 引擎里新增第 7 个来源
+   （单 beat 写；2A 口径：**在 M 级 uncached 写通道**发；本核引擎已有 `d_unc` 单 beat 写机制可复用），
+   完成后回 `pte_ad_done`；**失败关闭**改为：只有 `pte_ad_done` 回执后才填 TLB。
+4. **sfence.vma / cbo.***：在提交点识别（载荷 TVAL：`sfence.vma` = `0x12000073|rs`、cbo 族 funct3=0b100 族），
+   驱动 `tlb.sfence_*`（含 va/asid/all 口径）与 L1I `inval_all`、L1D `clean_all/inval_all`，
+   并按 2A 做"sfence 后同步重定向"（2A `core_top.v:2619-2625` 的 `sfence_sync_pending` 分支）。
+5. **PTE-PMP 口径（★ 待母代理裁定）**：任务书写"PTE-PMP 恒 LOAD"，但 2A 实测是
+   `acc_type_i(pmp_acc_xlat(ptw_pmp_req_acc))`（`core_top.v:1855` + `:471-479`）⇒ 取指遍历的 PTE 检查是
+   **X**、数据侧是 LOAD/STORE。本段按"**以 2A 实现为验收基准**"记录，落地下一步按 2A 对齐。
+6. `sv32_en` 打开后必须同时把 `cs_vaddr/cs_paddr` 分离、PTW kill 语义（`ptw.kill`）、
+   翻译未就绪期压制取指原生异常（2A `core_top.v:862-875` 的两条口径）一并搬。
+
+## B4.5.4 ③PLIC + `intrpt[7:0]` + MEIP 最小闭环
+
+- **现状**：`core_top_2b §4b.1` 只接 CLINT；PLIC 窗口的访问"立即完成 / 读回 0 / 写丢弃"（fail-safe）。
+- **2A 口径**：`clint` 与 `plic` 同挂 MMIO 截获；`plic #(.NUM_SOURCES, .NUM_CONTEXTS)` 例化于
+  `core_top.v:1460-1478`，`src = {3'b000, intrpt[7:0]}`、`intrpt_src_map` 按平台表；
+  `meip_o/seip_o` 经 **T2 的一拍寄存**（`core_top.v:1490-1500`）再进 `csr_file.mip`。
+- **最小闭环（建议第一步）**：PLIC 例化 → `intrpt[7:0]` 按 2A 平台表分配 → 软件写 `enable/threshold` →
+  外部源拉高 ⇒ `mip.MEIP` → `mie.MEIE`+`mstatus.MIE` ⇒ 取中断（cause 11 即 `0x8000_000B`）→
+  处理程序读 PLIC `claim` 寄存器（`PLIC_BASE+0x0020_0000+4*ctx`）→ 写 `complete` 清 pending。
+- **注意**：2A 把 PLIC 判决输出寄存一拍（时序修复，`core_top.v:1484-1500` 有完整论证）⇒ 本核接线
+  同样加这一级；`mip` 的软件可写位（SEIP/STIP/SSIP）不走该寄存（在 `csr_file` 内部）。
+
+## B4.5.5 ④S 模式判据（`back2_p10_priv.S`）设计草案
+
+依赖 ①（`csr_file` 提供 `sstatus/sie/sip/scause/sepc/stvec/medeleg/mideleg` + `priv_ctrl` 提供 priv 状态机），
+Spike 侧可直接给黄金（M/S 模式陷阱语义 Spike 全支持），故判据可沿用现有 C1'/C3' 逐条比对：
+1. `mret` 下陷 S 模式（`mstatus.MPP=01`）→ 读 `csrr t0, sstatus` 验证 SPP/SPIE 语义；
+2. S 模式 `ecall` ⇒ `scause = 9`、`sepc` = ecall PC、`stval = 0`（若 `medeleg[9]=1`）；
+   未委托时 ⇒ `mcause = 9`（M 处理）；
+3. M 处理程序 `sret` 返回 S ⇒ `sstatus.SIE ← SPIE`；
+4. S 模式访问 M 专属 CSR（如 `mtvec`）⇒ 非法（cause 2，Spike 可直接给黄金）。
+5. 若 S 模式 + Sv32 同时开，还需 `sum/mxr` 口径（`csr_file` 的 `sum_o/mxr_o`）。
+
+## B4.5.6 分步顺序 + 每步判据 + 风险（建议 4b 分三段执行）
+
+| 步 | 内容 | 通过判据 | 估计 | 主要风险 |
+|---|---|---|---|---|
+| 4b-1 | `csr_file`+`priv_ctrl`+trap_ctrl 替换 `b2_csr`（**保留** 4a 的重定向/flush 骨架，只换 CSR 与 trap 决策源） | p1/p3/p6/p7/p8/p9 全部旧判据 + regress 32/32；`misa/mstatus/mie/mip/mtvec/mepc/mcause/mtval/mscratch` 读写轨迹 = 黄金 | ~250 行 | 读口语义（W/M 旁路）、`mstatus` FS/SD 由顶层持有（2A `core_top.v:2538-2552` 有合并层，要一并搬）、xret 与 trap 同拍优先级 |
+| 4b-2 | Sv32：satp→`sv32_en`、D 侧 TLB/PTW 串行复用（数据优先）、A/D 写通路、sfence/cbo/fence.i | 新 `p9_sv32.S`（两级页表 + A/D 置位 + sfence 重映射 + PTE-PMP 拒绝）+ 旧判据不回退 | ~400 行 | 本步最大：D 侧翻译插入会动 LSU/L1D 时序；A/D 写通路要占 AXI 引擎一档；PTW 串行复用的 kill/归属 |
+| 4b-3 | PLIC + MEIP 最小闭环；S 模式判据 `p10_priv.S` | 新 `p10_priv.S`（M↔S 切换 + 委托/未委托 ecall + sret）+ PLIC claim/complete 闭环 | ~150 行 | PLIC 时序（T2 寄存）、Spike 平台地址表与本 SoC 的差异 |
+
+## B4.5.7 阻塞点（为什么本段不能"半途替换"）
+
+| # | 阻塞点 | 证据 |
+|---|---|---|
+| E1 | **`csr_file` 不是"换一个模块"而是换一套特权子系统**：它依赖 `priv_ctrl`（priv/MPRV/SUM/MXR/MPP 状态机）、`trap_ctrl`（delegation 决策）、`pmp_check`、计数器（`cycle_i/instret_i`）、中断同步级 | `core_top.v:2465/2540/2568` 三处例化互锁；缺任一项 CSR 读写即错 |
+| E2 | **4a 的 `b2_csr` 与 `csr_file` 不能并存于同一地址空间**（两套 CSR 寄存器；`mstatus` 还被顶层 FS/SD 合并层覆盖） | 2A `core_top.v:2538-2552` 的 `mstatus_merged` 逻辑必须随 `csr_file` 一起搬 |
+| E3 | **Sv32 依赖 `satp`/`priv`**：没有 `csr_file`+`priv_ctrl` 就没有 `satp`、没有 `eff_priv/sum/mxr`，D 侧翻译的权限判定无法成立 | `rtl/tlb/tlb.v` 的 `lookup_priv/sum/mxr` 端口；2A `core_top.v:1796` 用 `csr_eff_priv` |
+| E4 | **PLIC/MEIP 的 cause 与委托都经 `trap_ctrl`**：4a 的 `irq_mti_w` 是"只有 MTI"的特例，扩展成 `mip/mie/mideleg` 通用判定等于重写该判定 | 4a `backend_top.v` 事件组装段 |
+| E5 | 本段预算：任务书明确"预算见底 ⇒ 停在可编译 + 既有判据全绿检查点 + 报告已完成/阻塞点/下一步" | 任务书末段 |
+
+## B4.5.8 本段检查点状态（可复核）
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[@]}" sim/unit/tb_core_top_2b.sv
+vvp /tmp/ct2b.vvp | tail -12      # ⇒ TB_CORE_TOP_2B: PASS（**68 项**；含 C9' 向量模式）
+./scripts/regress.sh              # ⇒ REGRESS: 32/32 PASS
+```
+- 实测：整设计编译 **0 error**；`tb_core_top_2b` **PASS 68/68**（`../.b2chk/final_4b_run.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b.log`）。
+- 本段改动文件：`rtl/top/core_top_2b.v`（D4 修正 + 注释口径）、`sim/unit/tb_core_top_2b.sv`（C8'/C9' + 采样）、
+  `sim/unit/prog/back2_p9_trapvec.S`（新）、`sim/unit/prog/back2_p8_int.S`（向量表）、
+  `sim/unit/prog/gen_back2_lockstep_data.py`（p9 条目）、`sim/unit/prog/back2_lockstep_data.svh`（再生成）。
+- 未提交 git；快照 `../.b2chk/*.s15`（本段最终态）、`../.b2chk/*.s14`（4a 收官态）。

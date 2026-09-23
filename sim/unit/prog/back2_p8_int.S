@@ -16,6 +16,11 @@
  *     · 处理程序自记录：s1（次数）= 1、s2（mcause 异或）= 0x8000_0007
  *     · 主程序观察到 s1≠0 后走 `done`（写 tohost）⇒ 证明 mret 精确返回
  *
+ * ★ 2B-4 第 4b 段（第一步）增补：**mtvec 用 Vectored 模式（MODE=1）**
+ *   ⇒ 中断目标 = BASE + 4×cause = BASE + 4×7 = **BASE + 28**（槽 7）；
+ *     同步异常在 MODE=1 下仍回 BASE（槽 0 = h_bad，本程序不应走到）。
+ *   这样本程序同时成为"**中断向量化**"的实测载体（C8' 第 ⑤ 条）。
+ *
  * 中断源：`mtimecmp = mtime + 200` ⇒ 约 200 拍后 MTIP↑（本核 ~200 拍；Spike 侧无意义）
  * 处理程序：记录现场 → 抬高 mtimecmp（0xFFFF_FFFF）+ 清 mie.MTIE 双保险 → mret
  *          **不改 mepc** ⇒ 返回到被中断的那条指令（可重启指令：bne/addi/j）
@@ -25,7 +30,8 @@
     .globl _start
 _start:
     /* ---- 0. 陷阱向量 + 记录寄存器清零 ---- */
-    la    s0, handler
+    la    s0, vbase
+    ori   s0, s0, 1                 /* MODE = 1（Vectored）：中断 → BASE + 4×cause */
     csrw  mtvec, s0
 
     li    s1, 0                     /* 中断交付次数 */
@@ -88,6 +94,33 @@ handler:
     li    t5, 0x1F004004
     sw    t3, 0(t5)               /* mtimecmp 高字 = 全 1 ⇒ MTIP 迟早自清 */
     csrw  mie, x0                 /* MTIE = 0（关源，防重入） */
+    mret
+
+/*------------------------------------------------------------------------------
+ * 中断向量表（Vectored：BASE 256 B 对齐；槽 i = BASE + 4×i）
+ *   槽 7（BASE+28）= MTI ⇒ `j handler` ✓
+ *   其余槽 = h_bad（落这里说明向量化目标算错 ⇒ s1 被打成 0xBAD，TB 判据必失败）
+ *------------------------------------------------------------------------------*/
+    .align 8
+vbase:
+    j     h_bad                     /* 槽 0 */
+    j     h_bad                     /* 槽 1 */
+    j     h_bad                     /* 槽 2 */
+    j     h_bad                     /* 槽 3 */
+    j     h_bad                     /* 槽 4 */
+    j     h_bad                     /* 槽 5 */
+    j     h_bad                     /* 槽 6 */
+    j     handler                   /* 槽 7 ← MTI（cause 7） */
+    j     h_bad                     /* 槽 8 */
+    j     h_bad                     /* 槽 9 */
+    j     h_bad                     /* 槽 10 */
+    j     h_bad                     /* 槽 11 */
+
+h_bad:                              /* 向量目标错位时才会走到（fail-loud + 能返回） */
+    li    s1, 0xBAD
+    csrr  t1, mepc
+    addi  t1, t1, 4
+    csrw  mepc, t1
     mret
 
     .section .tohost,"aw"

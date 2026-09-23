@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 5;
+    localparam integer NPROG  = 6;
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -165,18 +165,26 @@ module tb_core_top_2b #(
     integer n_trap_p;                       // 本程序"异常被交付"的次数
     integer n_irq_p;                        // 本程序"中断被交付"的次数（C8'）
     reg     trap_seen_q, irq_seen_q;        // 边沿检测（同一事件只计一次）
+    //   ★ 中断的**重定向目标**：中断不走 ROB 异常口（`trap_valid_w` 只报异常）⇒
+    //     直接采顶层 trap FSM 的组合重定向 PC（`irq_mti_w` 同拍有效）
+    reg [31:0] irq_target_q;
     reg [3:0] trc_cause [0:7];              // 依次记录的 mcause 低位
-    reg [31:0] trc_pc   [0:7];              // 依次记录的陷阱 PC（= 头部 PC）
+    reg [31:0] trc_pc   [0:7];              // 依次记录的**陷阱指令 PC**（= ROB 头部 PC）
+    reg [31:0] trp_tgt  [0:7];              // 依次记录的**重定向目标 PC**（决定落哪个向量槽）
     always @(posedge clk) begin
         trap_seen_q <= rst_n & u_dut.trap_valid_w;
         if (rst_n && u_dut.trap_valid_w && !trap_seen_q && (n_trap_p < 8)) begin
             trc_cause[n_trap_p] <= u_dut.trap_cause_w;
             trc_pc[n_trap_p]    <= u_dut.trap_pc_w;
+            trp_tgt[n_trap_p]   <= u_dut.be_trp_redirect_pc;
             n_trap_p            <= n_trap_p + 1;
         end
         //   ★ 中断交付：后端 `irq_mti_w`（MIE×MTIE×MTIP×ROB 非空×非异常/xRET 拍）
         irq_seen_q <= rst_n & u_dut.irq_mti_w;
-        if (rst_n && u_dut.irq_mti_w && !irq_seen_q) n_irq_p <= n_irq_p + 1;
+        if (rst_n && u_dut.irq_mti_w) begin
+            irq_target_q <= u_dut.be_trp_redirect_pc;
+            if (!irq_seen_q) n_irq_p <= n_irq_p + 1;
+        end
     end
     //   ★ 逐程序**分基址**（16 KB 步进）：三个程序同址装载会让 L1I 里的上一程序陈旧行
     //     "同 tag 命中"（L1I 阵列无复位、`inval_all` 本段未接）⇒ PC 流对、指令却是上一
@@ -304,6 +312,7 @@ module tb_core_top_2b #(
         pidx[2] = 5; cmax_of[2] = P5_GOLD_N;    // p6_l1d（D-Cache 逐出）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
+        pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
         cur_p = 0;
         rst_n = 1'b0;
         load_back2_data;
@@ -318,8 +327,9 @@ module tb_core_top_2b #(
             @(negedge clk); rst_n = 1'b0;
             nrec = 0; on = 1'b0; bad_pc = -1; bad_rd = -1; bad_wd = -1;
             n_trap_p = 0; trap_seen_q = 1'b0; n_irq_p = 0; irq_seen_q = 1'b0;
+            irq_target_q = 32'h0;
             for (k = 0; k < 8; k = k + 1) begin
-                trc_cause[k] = 4'h0; trc_pc[k] = 32'h0;
+                trc_cause[k] = 4'h0; trc_pc[k] = 32'h0; trp_tgt[k] = 32'h0;
             end
             for (k = 0; k < GMAX; k = k + 1) begin
                 rpc[k] = 0; rwe[k] = 0; rrd[k] = 0; rwd[k] = 0;
@@ -424,6 +434,12 @@ module tb_core_top_2b #(
                     $sformatf("C8' p8：陷阱 CSR mcause = 0x80000007（MTI），实测 0x%08x", u_dut.u_back.u_csr.mcause_q));
                 chk((u_dut.u_back.u_csr.mepc_q >= cur_base) && (u_dut.u_back.u_csr.mepc_q < (cur_base + 32'h1000)),
                     $sformatf("C8' p8：mepc 落在程序映像内（实测 0x%08x，基址 0x%08x）", u_dut.u_back.u_csr.mepc_q, cur_base));
+                //   ★ 2B-4 第 4b 段（第一步）新增：**中断向量化**（MODE=1 ⇒ 中断目标 = BASE + 4×cause）
+                chk(u_dut.u_back.u_csr.mtvec_q[1:0] == 2'b01,
+                    $sformatf("C8' p8：mtvec MODE = 1（Vectored），实测 mtvec=0x%08x", u_dut.u_back.u_csr.mtvec_q));
+                chk(irq_target_q == ((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) | 32'd28),
+                    $sformatf("C8' p8：MTI(cause 7) 向量目标 = BASE+28，实测 0x%08x（BASE=0x%08x）",
+                              irq_target_q, u_dut.u_back.u_csr.mtvec_q & ~32'hFF));
                 //   · 处理程序里 `csrr t1, mepc`（x6）的写回值 = 被中断指令 PC
                 //     ⇒ 必须落在 wait 循环 [0x4c, 0x54]（相对基址）
                 d_pc = 0; d_rd = 0; d_wd = 0; d_rd = 0;
@@ -432,26 +448,58 @@ module tb_core_top_2b #(
                     if (rwe[k] && (rrd[k] == 5'd9) && (rwd[k] === 32'd1)) d_rd = 1;   // s1 == 1
                     if (rwe[k] && (rrd[k] == 5'd10) && (rwd[k] === 32'd1)) d_wd = 1;  // a0 == 1（走到 done）
                     //   · 处理程序首条已提交（= 重定向到 mtvec 成功）
-                    if (rpc[k] == (cur_base + 32'h7c)) crk = 1;
+                    if (rpc[k] == ((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) | 32'd28)) crk = 1;
                     //   · `csrr t1, mepc`（0x80，写 x6）采到的被中断指令 PC ∈ wait 循环
-                    if (rwe[k] && (rrd[k] == 5'd6) && (rpc[k] == (cur_base + 32'h80))) begin
+                    if (rwe[k] && (rrd[k] == 5'd6) && (rpc[k] == (cur_base + 32'h84))) begin
                         $display("   [C8'] handler 采到的 mepc=0x%08x（wait 循环 0x%08x..0x%08x）",
-                                 rwd[k], cur_base + 32'h4c, cur_base + 32'h54);
-                        if ((rwd[k] >= (cur_base + 32'h4c)) && (rwd[k] <= (cur_base + 32'h54))) d_pc = 1;
+                                 rwd[k], cur_base + 32'h50, cur_base + 32'h58);
+                        if ((rwd[k] >= (cur_base + 32'h50)) && (rwd[k] <= (cur_base + 32'h58))) d_pc = 1;
                     end
                 end
-                chk(crk == 1, "C8' p8：处理程序首条（mtvec 目标）已提交 ⇒ 中断重定向成功");
+                chk(crk == 1, "C8' p8：向量槽 7（BASE+28）已提交 ⇒ 中断向量化重定向成功");
                 chk(d_pc == 1, "C8' p8：中断返回点 mepc ∈ wait 循环（bne/addi/j，可重启指令）");
                 chk(d_rd == 1, "C8' p8：处理程序自记录 s1 = 1（中断交付次数）");
                 chk(d_wd == 1, "C8' p8：主程序观察到中断后走到 done（a0 = s1 = 1）⇒ mret 精确返回");
-                chk(u_dut.u_back.u_csr.mtvec_o == (cur_base + 32'h7c),
-                    $sformatf("C8' p8：mtvec = handler（实测 0x%08x）", u_dut.u_back.u_csr.mtvec_o));
+                //   （p8 的 mtvec 现在是"Vectored BASE|1"：BASE 必须 256 B 对齐且落在映像内）
+                chk(((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) >= cur_base) &&
+                    ((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) < (cur_base + 32'h1000)),
+                    $sformatf("C8' p8：mtvec BASE 落在程序映像内且 256 B 对齐（实测 mtvec=0x%08x）",
+                              u_dut.u_back.u_csr.mtvec_q));
             end
             //   ---- C5'：非陷阱程序必须"全程无提交点异常" ----
             //   ★ p7_trap 是**故意**制造异常的程序 ⇒ C5' 换判据 C7'（陷阱次数/原因/PC）。
-            if (pid != 3) begin
+            if ((pid != 3) && (pid != 5)) begin
                 chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
                 chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
+            end else if (pid == 5) begin
+                //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============
+                //   判据：三条异常各自落到 base + 4×cause 的**不同槽**（由槽内标记经写回轨迹背书）。
+                chk(n_trap_p == 3, $sformatf("C9' p9：陷阱交付次数 = 3（实测 %0d）", n_trap_p));
+                chk(u_dut.u_back.u_csr.mtvec_q[1:0] == 2'b01,
+                    $sformatf("C9' p9：mtvec MODE = 1（向量），实测 mtvec=0x%08x", u_dut.u_back.u_csr.mtvec_q));
+                chk(trc_cause[0] == 4'd11, $sformatf("C9' p9：第 1 次 mcause = 11，实测 %0d", trc_cause[0]));
+                chk(trc_cause[1] == 4'd2,  $sformatf("C9' p9：第 2 次 mcause = 2，实测 %0d", trc_cause[1]));
+                chk(trc_cause[2] == 4'd3,  $sformatf("C9' p9：第 3 次 mcause = 3，实测 %0d", trc_cause[2]));
+                //   ★ 口径（`docs/design/06-csr-privilege.md §3.2`，与 ISA 手册逐字同）：
+                //     MODE=1 下**同步异常一律回 BASE**，只有**中断**才 `BASE + 4×cause`
+                //     ⇒ 三条异常的落点必须**全部等于 BASE**（4a 段实现曾误做向量化，已修）
+                //   `trp_tgt[i]` = 该次陷阱的**重定向目标**；异常在 MODE=1 下必须落 BASE
+                chk(trp_tgt[0] == (u_dut.u_back.u_csr.mtvec_q & ~32'hFF),
+                    $sformatf("C9' p9：ecall(cause 11) 重定向目标 = BASE（Vectored 下异常不向量），实测 0x%08x（BASE=0x%08x）",
+                              trp_tgt[0], u_dut.u_back.u_csr.mtvec_q & ~32'hFF));
+                chk(trp_tgt[1] == (u_dut.u_back.u_csr.mtvec_q & ~32'hFF),
+                    $sformatf("C9' p9：非法(cause 2) 重定向目标 = BASE，实测 0x%08x", trp_tgt[1]));
+                chk(trp_tgt[2] == (u_dut.u_back.u_csr.mtvec_q & ~32'hFF),
+                    $sformatf("C9' p9：断点(cause 3) 重定向目标 = BASE，实测 0x%08x", trp_tgt[2]));
+                chk((trc_pc[0] < trc_pc[1]) && (trc_pc[1] < trc_pc[2]) &&
+                    (trc_pc[0] >= cur_base) && (trc_pc[2] < (cur_base + 32'h1000)),
+                    "C9' p9：三次陷阱指令 PC 严格递增且落在映像内");
+                $display("   [C9'] 向量模式：mtvec=0x%08x（MODE=1，BASE=0x%08x）→ 三次同步异常目标均 = BASE（实测 0x%08x/0x%08x/0x%08x），陷阱指令 PC=0x%08x/0x%08x/0x%08x，cause=%0d/%0d/%0d",
+                         u_dut.u_back.u_csr.mtvec_q, u_dut.u_back.u_csr.mtvec_q & ~32'hFF,
+                         trp_tgt[0], trp_tgt[1], trp_tgt[2],
+                         trc_pc[0], trc_pc[1], trc_pc[2],
+                         trc_cause[0], trc_cause[1], trc_cause[2]);
+                $fflush();
             end else begin
                 //   ---- C7'：陷阱路径（2B-4 第 4a 段验收判据）----
                 //     ① 陷阱次数：ecall / 非法指令 / ebreak 共 3 次

@@ -901,11 +901,20 @@ module core_top_2b (
 
     wire [1:0]  trp_mode_w   = csr_mtvec_w[1:0];
     wire [31:0] trp_base_w   = {csr_mtvec_w[31:2], 2'b00};
-    wire [3:0]  trp_cause4_w = trp_exc_w ? trap_cause_w : 4'd7;   // 中断码 = MTI(7)
-    wire [31:0] trp_vect_w   = trp_base_w + {26'b0, trp_cause4_w, 2'b00};
-    wire [31:0] trp_target_w = (~trp_xret_w & (trp_mode_w == 2'b01)) ? trp_vect_w :
-                               (~trp_xret_w)                         ? trp_base_w :
-                                                                       csr_mepc_w;
+    //   ★★ 2B-4 第 4b 段（第一步）**缺陷修正 4a-D4**：MODE=1（Vectored）下
+    //      **只有中断**取 `BASE + 4×cause`；**同步异常一律回 BASE**
+    //      （依据：`docs/design/06-csr-privilege.md §3.2`（本仓口径逐字同 ISA 手册）：
+    //        "MODE=1（Vectored）：**同步异常** pc ← BASE ；**中断** pc ← BASE + 4×cause"）。
+    //      4a 段实现把异常也做了向量化 ⇒ 与 Spike / 2A 口径**不一致**；
+    //      本轮用 p9_trapvec（MODE=1 + ecall/非法/ebreak）**实测抓住**：
+    //      Spike 落 `vbase+0`、本核落 `vbase+44`。
+    //   · 合成口径取 2A `csr_file` 的式：`BASE(低 8 位 0) | (cause << 2)`
+    //     （Vectored 下 2A 要求 BASE 256 B 对齐，正是为了省掉加法器）；
+    //   · 中断码：本段只有 MTI(7)；`BASE + 4×7 = BASE + 0x1C`。
+    wire [3:0]  trp_cause4_w = 4'd7;                              // 中断码 = MTI(7)
+    wire [31:0] trp_vect_w   = {trp_base_w[31:8], 8'b00} | {26'b0, trp_cause4_w, 2'b00};
+    wire [31:0] trp_target_w = trp_irq_w ? ((trp_mode_w == 2'b01) ? trp_vect_w : trp_base_w) :
+                               trp_exc_w ? trp_base_w : csr_mepc_w;
 
     assign be_trp_flush       = trp_take_w;
     assign be_trp_redirect_v  = trp_take_w;
