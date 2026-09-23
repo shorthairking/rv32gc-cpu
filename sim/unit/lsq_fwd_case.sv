@@ -128,18 +128,17 @@ module tb_back2_lsq_fwd_top;
     task wait_wb(input [31:0] rdata, output [31:0] got, output integer saw_req);
         integer t;
         begin
-            got = 32'h0; saw_req = 0;
-            for (t = 0; t < 12; t = t + 1) begin
+            got = 32'h0; saw_req = 0; mem_rsp_valid = 1'b0;
+            for (t = 0; t < 16; t = t + 1) begin
                 @(negedge clk);
+                //   ★ 修（§B3.3 ①）：一旦看到过请求就**连续**给响应（sticky），
+                //     因为 LSU 的 pend_any/mem_req_ready 交错可能使请求延后 ≥2 拍。
                 if (mem_req_valid) begin
                     saw_req = 1;
                     mem_rsp_valid = 1'b1; mem_rsp_tag = mem_req_tag; mem_rsp_rdata = rdata;
-                end else begin
-                    mem_rsp_valid = 1'b0;
                 end
-                if (wb_valid) begin got = wb_data; end
                 @(posedge clk);
-                if (wb_valid) t = 12;             // 写回已发生
+                if (wb_valid) begin got = wb_data; t = 16; end
             end
             @(negedge clk); mem_rsp_valid = 1'b0;
         end
