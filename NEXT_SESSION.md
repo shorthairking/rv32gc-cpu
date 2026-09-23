@@ -18,13 +18,14 @@
 - **B 线 U-Boot（基线=上游 fork dev 分支）**：B-1/B-2 板级骨架 ✅（u-boot `3d9e78e8e80`）；B-3 NAND 驱动 ✅（u-boot `124a604ebc5`，自包含 BCH-4 + DMA 描述符，13.6 万断言）；B-3.5 引导链 ✅（`1c8fce2`）；**QEMU chiplab machine ✅**（qemu/ chiplab-qemu-dev，-M chiplab，报告 docs/chiplab-qemu/）；**B-4/B-5 + E6–E8 ✅**（u-boot dev `0729af1c746`+`90373e8469b`，saveenv 持久/bootcmd 自动执行全绿）；**官方重打包 ✅**（spi_flash.img 956276B md5 27a9d9a5，旧件 .pre-E8.bak）；**Linux L-m1 ✅ + L-m2 ✅**（linux dev `46200caf`+`04e80124`，qemu `b7e2881e16`+`3c095bf329`，rv32gc-cpu tag `L2-NAND`；内核 0x03400000 可用内存 76MiB、NAND BCH-4 布局跨层交叉验证全 PASS，判据 L1–L8 全绿，报告 docs/linux-port/）；**L-m3 ✅（UBIFS rootfs + 纯 NAND 冷启）**：根因=NAND_SUBPAGE_READ 子页读被框架接管（restamp_ecc 未清 ⇒ 短读全 0xFF），另修 READSTART/4 周期地址解析/fail-closed DATA_IN/initramfs sync/内核 image_size 口径/nandwrite -p；零注入冷启全链 PASS（U-Boot 从 NAND 读 kernel/dtb/initrd → booti → UBIFS 根 ubi0:rootfs，/persist.count 跨 QEMU 重启 1→3，母代理亲跑 `L-M3 (UBIFS + NAND boot): PASS`）；linux dev 已提交，rv32gc-cpu tag `L3-UBIFS`；遗留（可选）：精简 defconfig、真 ecc.read_subpage 性能优化；报告 docs/linux-port/README.md §9。**MAC/TFTP ✅（tag `B-TFTP`）**：u-boot dev `e14e7f924b7`（chiplab_dmfe.c 811 行 Tulip 语义驱动、PHYLIB legacy MDIO 位拍、CSR6.PB 与项、MAC 地址 pdata->enetaddr）、qemu `ff45aed9cf`（hw/net/chiplab_dmfe.c 寄存器级模型挂 0x1ff00000）；QEMU 三阶段 regs/full/persist 全 PASS（ping 10.0.2.2 alive、tftpboot 三镜像字节一致、booti→UBIFS 根、bootcmd tftp 优先+NAND 回退冷启自动执行，母代理亲跑）；**官方重打包**：boot_stub.S BOOT_LEN_UBOOT 0x620AC→0x66830 + BOOT_LEN_DTB 0x1774→0x1830（DTS 加 MAC 节点后 dtb 6189B），spi_flash.img 956464B md5 **174a5a8970684e9f4bb7cc2e54ad43bd**（旧件 .pre-MAC.bak）；板上 TFTP runbook=docs/linux-port/mac-tftp-boot.md（对齐官方网页 §5.6，bootcmd 仅 ';' 串因 HUSH 关闭）；MAC 中断=PLIC 源 0（非源 5，RTL int_out[0]）。遗留：axi_mux_sim 不译码 MAC ⇒ 上板实测为最终判据；U-Boot 段余量仅 6096B。
 - **远端**：rv32gc-cpu origin 已切 SSH（git@github.com:shorthairking/rv32gc-cpu.git）；master/tag/dev 已推。u-boot/linux 两 fork 仓各建 dev 分支（u-boot 已切 SSH，linux 已切 SSH）。
 
-### 1.5.1 ✅ 恢复执行（2026-09-22 环境异常中断恢复后，用户指示"继续任务"）
+### 1.5.1 ⏸ 暂停存档点 #4（2026-09-22 深夜，用户指示"暂停所有任务，等待指令再恢复"）
 
-- **异常中断处置**：中断前 8009c161 已停转（第 29 轮 §28.3 实施未开始，树停在可编译检查点：三 TB 零错误、iq 151/151、IPC=2.0000、旋钮全关 CHK=1、backend_top.v 仅余默认关闭的 DBG_CSR 透传未提交）。
-- **2B-2 恢复口径（第 29 轮）**：按 back2_report.md §28.3 落地 B29 修法——prf.v 读口+1，地址由 I1 发射拍 CSR uop（6 条 iq_iss_uop 扫 u_is_csr）的 u_ps1i 驱动，I1 采样进 csr_src_r；I2 当拍用稳定寄存器值组合生成 (upd_csr_v/idx/wdata) 同拍送 ROB。B29 已唯一化：ROB/载荷/旁路/时序/驱动九类假设全部实证排除，只剩"cb_src_w 表达式取值≠其打印输入"（§28）。修完程序 2 全链 C1–C4 + C5 实测×0.8 定档 → 三程序全绿 → regress 30/30 → 报告全绿。B28 已修（INORD_LOAD 队列级闸门）；程序 0/1 基线 443/721 拍、C5 分档 0.30/0.19 落地；WIP 检查点已打至 `b6ec9c0`（#10）。
-- **L-m3 ✅ 已收官**（linux dev `a73502e13f05`，tag `L3-UBIFS`，母代理亲跑 PASS；phase2 判据已主机侧化）。
-- **未提交现场**：rv32gc-cpu（backend_top.v 探针透传）；备份/日志在工作区 `../.b2chk/`、docs/linux-port/logs/。
-- **恢复方式**：同一会话 send_message `8009c161`；跨会话按 `sim/unit/back2_report.md` §28.3 fresh dispatch。
+- **所有子代理已 interrupt 停转**：`d9ce4e74`（2B-4 第 1 段进行中，已停）、`55318938`（MAC 线已交付退场）。无我方后台 job。禁令：用户指令到达前不得恢复任何子代理、不得提交任何仓库。
+- **2B-4 第 1 段现场（未提交，恢复时先核对工作树）**：d9ce4e74 中断前正在 rtl/back2/（back2_params.vh/backend_top.v/lsq_simple.v/rename.v）与 sim/unit/（tb_back2_lockstep.sv、prog/gen_back2_lockstep_data.py、back2_lockstep_data.svh）上工作——git status 显示这 7 个文件有改动（均为 2B-4 任务授权范围）。任务书与判据见母代理派发记录：①rob.v 同拍多 store 提交组排空（slot_st_ok 只排最低 lane 的缺陷）；②LQ 分配 E1→D3 派发期（载荷 [415:411] 放 LQ 索引）后 INORD_LOAD 置 0 实测（无死锁才放开，否则保持 1）；③tb_back2_lsq_fwd 10→11 项（提交点释放用例）；④锁步新程序 p4_fpu/p5_mdu（.option norvc，黄金轨迹三重自检）；⑤可选 front4 检查点扩展（先报再动）。判据：锁步全程序 C1–C5 全绿 + CHK 零违规 + 基线（443/721/913）不回退 + iq 151/151 + fwd 11/11 + ipc≥2.0 + regress 31/31；2A/front4 零修改。
+- **已收官里程碑（全部已提交打 tag）**：2A-M5、2B-1（f42827e）、2B-2、2B-3、B5-QEMU、L2-NAND、L3-UBIFS、**B-TFTP**（MAC/TFTP：u-boot e14e7f92、qemu ff45aed9、官方镜像 md5 174a5a8970684e9f4bb7cc2e54ad43bd）。
+- **板上交付物**：bitstream 167dc9df…、spi_flash.img md5 174a5a89（956464B）、runbook docs/linux-port/mac-tftp-boot.md（TFTP 对齐官方网页 §5.6）；上板实测为最终判据（axi_mux_sim 不译码 MAC）。
+- **备份/日志**：../.b2chk/（2B 线全程）、docs/chiplab-qemu/mac/logs/、docs/linux-port/logs/。
+- **恢复方式**：同一会话 send_message 对应 agent id；跨会话按 sim/unit/back2_report.md（2B-3 段 §B3.7 + 2B-4 触点）与派发记录 fresh dispatch。
 
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
