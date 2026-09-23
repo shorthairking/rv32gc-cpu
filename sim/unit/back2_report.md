@@ -1333,3 +1333,25 @@ TB_BACK2_LOCKSTEP: PASS
 3. 再放开 load 乱序执行、"地址已证不相交才可越过"闸门、逐字节转发更年轻优先、提交序排空；
    每步后：整设计编译 + `tb_back2_iq` 151/151 + 锁步 C1–C5 + regress；性能基线变动时按
    "实测×0.8"重测 C5 档并更新 TB 注释与本报告。
+
+## B3.4 第 3 段：用例内层次探针的**决定性发现**（下一段 1 步可修）
+
+探针实测（`lsq_fwd_case.sv` 内 `[fwd-case]` 逐拍打印，第 10~21 拍）：
+```
+[fwd-case c=10] anyunk=0 issok=1 stqcnt=1 cntst=1 | stq0 v=1 av=1 msk=0001 a=0x80001000 rob=1 |
+                exe v=0 st=0 rob=2 a=0x80001000 sz=2 | reqv=x wen=x rspv=0 wbv=0 wbd=0x000000aa
+```
+- ✅ **store 入队正确**：`stq0 v=1 av=1 msk=0001 a=0x80001000 rob=1`，`cnt_store_o` 递增 ✓（§B3.3 第①点排除）；
+- ✅ **转发数据正确**：`wb_data = 0x000000aa`（C1 场景期望的字节 0 = store 数据）✓
+  ⇒ **LSQ 转发逻辑正确**（§B3.3 第②点方向排除）；
+- ❌ **`mem_req_valid` / `mem_req_wen` 为 `x`** —— 这是用例全部失败的**直接原因**：
+  我的 `wait_wb` 用 `if (mem_req_valid)` 采样 ⇒ x 参与判断 ⇒ `saw_req` 与期望不符 ⇒ 各场景判据失败。
+- `lsq_simple.v` 内 `mem_req_valid/wen/addr/tag` 各只有**一处** `assign`（无多驱动）⇒ 该 x 来自
+  其输入：`dr_fire = dr_any & mem_req_ready` 或 `ld_fire = pend_any & ~dr_any & mem_req_ready`
+  中的某个信号为 x（最可能是 TB 侧 `dr_valid/dr_idx` 与 `pend_sel/ld_*` 的初值或 `mem_req_ready`
+  的连接/时序）。
+
+**下一段第 1 步（一行探针即可定案）**：在同一个 `[fwd-case]` 行追加
+`u_lsq.pend_any / u_lsq.dr_any / u_lsq.pend_sel / dr_valid / dr_idx / mem_req_ready`
+（全部为 TB 可见信号），即可确定 x 的来源；修好后本用例应即刻全绿（转发数据已证正确），
+随后改名 `tb_back2_lsq_fwd.sv` 纳入 regress（目标 **31/31**），再进入"先扩 32+32、再放开真乱序"两步。

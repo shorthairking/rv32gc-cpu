@@ -155,6 +155,21 @@ module tb_back2_lsq_fwd_top;
 
     reg [31:0] v;
     integer    rq;
+
+    //   ★ 用例内层次探针（母代理 2B-3 第 3 段指令）：逐拍打印被测模块内部关键信号，
+    //     用于判定三点：① store 是否真入 STQ 且 stq_av=1；② age 窗口比较；③ load 是否被拒。
+    integer dbgc = 0;
+    always @(posedge clk) begin
+        if (rst_n && (dbgc < 46)) begin
+            dbgc = dbgc + 1;
+            $display("[fwd-case c=%0d] anyunk=%b issok=%b stqcnt=%0d cntst=%0d | stq0 v=%b av=%b msk=%b a=0x%08x rob=%0d | exe v=%b st=%b rob=%0d a=0x%08x sz=%0d | reqv=%b wen=%b rspv=%b wbv=%b wbd=0x%08x",
+                     dbgc, u_lsq.any_unk_w, iss_ok, stq_cnt_o, cnt_store_o,
+                     u_lsq.stq_v[0], u_lsq.stq_av[0], u_lsq.stq_msk[0],
+                     u_lsq.stq_a[0], u_lsq.stq_rob[0],
+                     exe_valid, exe_is_store, exe_rob, exe_addr, exe_size,
+                     mem_req_valid, mem_req_wen, mem_rsp_valid, wb_valid, wb_data);
+        end
+    end
     reg [STQ_IW-1:0] s0, s1;
 
     initial begin
