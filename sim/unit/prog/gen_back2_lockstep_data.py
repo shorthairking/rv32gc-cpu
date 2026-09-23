@@ -6,7 +6,7 @@
 #   python3 sim/unit/prog/gen_back2_lockstep_data.py > sim/unit/prog/back2_lockstep_data.svh
 #
 # 每个程序三步（可复现，TB 头注同步登记）：
-#   ① 汇编/链接：riscv32-unknown-linux-gnu-gcc -march=rv32ima_zicsr -mabi=ilp32
+#   ① 汇编/链接：riscv32-unknown-linux-gnu-gcc -march=<每程序见 PROGS> -mabi=ilp32
 #                ★ 不带 C：2A 基线核**不支持"32 bit 指令起始于奇 parcel"**
 #                  （fetch_unit.v §4.1 显式限定 `insn_valid_w = insn_valid &
 #                    insn_start_lo`，属 2A 已登记的 M2 遗留）；C 混合流会让 2A 侧
@@ -25,7 +25,7 @@
 #                 该条**计入**；序列 = 程序全部提交指令）
 #
 # 输出（被 sim/unit/tb_back2_lockstep.sv `include）：
-#   localparam P_NUM / P_IMG_MAX / P_GOLD_MAX / P0_GOLD_N / P1_GOLD_N / P2_GOLD_N
+#   localparam P_NUM / P_IMG_MAX / P_GOLD_MAX / P0_GOLD_N .. P4_GOLD_N
 #   reg [31:0] IMG  [0:P_NUM*P_IMG_MAX-1];   按程序槽位排布（未用槽填 nop=0x00000013）
 #   reg [31:0] GOLD [0:P_NUM*P_GOLD_MAX-1];  同上
 #
@@ -41,17 +41,22 @@ BASE = 0x80000000          # 两侧统一链接基址（仿真布局；2A 锁步
 SPIKE_BASE = 0x80000000    # Spike 侧同址 ⇒ 黄金轨迹无需重定位（保留参数以显式化口径）
 IMG_MAX = 2048
 GOLD_MAX = 1024
+#   ★ 每个程序带自己的 `-march` 与 Spike `--isa`（2B-4 新增 p4_fpu 需要 F/D）：
+#     整数程序保持 `rv32ima_zicsr`（**逐字节沿用 2B-3 的黄金轨迹口径，不受新增影响**），
+#     FP 程序用 `rv32imafd_zicsr`（**不带 C**：`.option norvc` 已禁用压缩指令，
+#     `-mabi=ilp32` 只是"不用 FP 寄存器传参"，不影响手写汇编）。
 PROGS = [
-    ("back2_p1_int.S",     "P1"),
-    ("back2_p2_branch.S",  "P2"),
-    ("back2_p3_memcsr.S",  "P3"),
+    ("back2_p1_int.S",     "P1", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    ("back2_p2_branch.S",  "P2", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    ("back2_p3_memcsr.S",  "P3", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    ("back2_p4_fpu.S",     "P4", "rv32imafd_zicsr", "rv32imafdc_zicsr"),
+    ("back2_p5_mdu.S",     "P5", "rv32ima_zicsr",   "rv32imac_zicsr"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"
 LD  = "riscv32-unknown-linux-gnu-ld"
 OBJCOPY = "riscv32-unknown-linux-gnu-objcopy"
 SPIKE = "/opt/riscv/bin/spike"
-SPIKE_ISA = "rv32ima_zicsr"
 SPIKE_INSN_CAP = 200000     # 兜底：程序异常（不写 tohost / 不自跳转）时也必须终止
 
 
@@ -104,10 +109,10 @@ def words_from_bytes(by, lo, hi):
     return out
 
 
-def golden_pcs(elf, tag):
+def golden_pcs(elf, tag, isa):
     """Spike --log-commits → 架构提交 PC 序列（到"PC 连续重复"为止，重复那条计入一次）"""
     logf = "/tmp/back2_%s.spike.log" % tag
-    run([SPIKE, "--pc=0x%08x" % SPIKE_BASE, "--isa=" + SPIKE_ISA,
+    run([SPIKE, "--pc=0x%08x" % SPIKE_BASE, "--isa=" + isa,
          "--instructions=%d" % SPIKE_INSN_CAP,
          "--log-commits", "--log=" + logf, elf])
     pat = re.compile(r"^core\s+\d+:\s+\S+\s+0x([0-9a-fA-F]+)\s+\(")
@@ -135,11 +140,11 @@ def main() -> int:
     img_all = []
     gold_all = []
     gold_n = []
-    for fname, tag in PROGS:
+    for fname, tag, march, isa in PROGS:
         src = os.path.join(HERE, fname)
         obj = "/tmp/back2_%s.o" % tag
         elf = "/tmp/back2_%s.elf" % tag
-        run([GCC, "-march=rv32ima_zicsr", "-mabi=ilp32", "-nostdlib",
+        run([GCC, "-march=" + march, "-mabi=ilp32", "-nostdlib",
              "-fno-pic", "-mno-relax", "-c", src, "-o", obj])
         run([LD, "--no-relax", "-T", os.path.join(HERE, "back2_lockstep.ld"), "-o", elf, obj])
         elf_sp = "/tmp/back2_%s_spike.elf" % tag
@@ -161,7 +166,7 @@ def main() -> int:
         hi = max(by) + 1
         n_w = (hi - BASE + 3) // 4
         words = words_from_bytes(by, BASE, hi)
-        pcs = golden_pcs(elf_sp, tag)
+        pcs = golden_pcs(elf_sp, tag, isa)
         # ---- 自检③：黄金轨迹重定位（本口径下恒等）后就落在 .text 范围内 ----
         pcs = [p - SPIKE_BASE + BASE for p in pcs]
         if max(pcs) >= text_end:
@@ -179,7 +184,7 @@ def main() -> int:
                          % (fname, n_w, BASE, hi, gold_n[-1], pcs[-1]))
 
     out.append("// 本文件由 sim/unit/prog/gen_back2_lockstep_data.py 生成，请勿手改")
-    out.append("// 真源：sim/unit/prog/back2_p{1,2,3}_*.S ＋ back2_lockstep{,_spike}.ld ＋ Spike --log-commits")
+    out.append("// 真源：sim/unit/prog/back2_p{1..5}_*.S ＋ back2_lockstep{,_spike}.ld ＋ Spike --log-commits")
     out.append("localparam integer P_NUM      = %d;" % len(PROGS))
     out.append("localparam integer P_IMG_MAX  = %d;" % IMG_MAX)
     out.append("localparam integer P_GOLD_MAX = %d;" % GOLD_MAX)

@@ -426,7 +426,15 @@ module rename #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             fhead_q   <= {FL_PTR_W{1'b0}};
-            ftail_q   <= {{(FL_PTR_W-7){1'b0}}, 7'd64};
+            //   ★★ 2B-4 修复（锁步 p4_fpu 暴露）：free list 尾指针必须 = **本实例**的
+            //     空闲项数 `FREE_N`（整型域 64 / 浮点域 **32**），不能硬编码 64。
+            //     旧实现在浮点域把 `ftail` 置 64，而 `flist_q[0..FREE_N-1] = ARCH_N+j`
+            //     只填了前 32 项 ⇒ 该域**虚报 32 个空闲项**，前 32 次分配用完后
+            //     fhead 越过 32 读到的全是初始化清零值 **preg=0**（= f0 的基线映射）
+            //     ⇒ 与"读改写同一架构寄存器"（`fadd.s f22,f22,f1`）撞出自环
+            //     （实测 `RENAME-CHK FAIL: ... arn=22 ... preg=0 | fhead=32 ftail=87
+            //       flist[fhead..+7]=0 0 0 0 0 0 0 0`）。
+            ftail_q   <= FREE_N[FL_PTR_W-1:0];
             log_wr_q  <= {LOG_PTR_W{1'b0}};
             undo_act  <= 1'b0; undo_ptr <= {LOG_PTR_W{1'b0}}; undo_dist <= 9'd0;
             rb_act    <= 1'b0; rb_cnt <= 9'd0; rb_head <= {FL_PTR_W{1'b0}};

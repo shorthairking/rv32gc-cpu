@@ -1660,7 +1660,7 @@ C3 判据只看程序段条数）——这是 `stq_rob`/闸门精确化后尾段
 
 ## B3.7.6 遗留 / 风险登记（本段新增，均未放宽任何判据）
 
-1. **同拍多 store 提交组的排空丢失风险（2B-2 既有潜在缺陷，本段只登记不改）**：
+1. ~~同拍多 store 提交组的排空丢失风险（2B-2 既有潜在缺陷，本段只登记不改）~~ **★ 2B-4 第 1 段已修**（任务①：LSQ 提交排空队列 CDQ，逐 lane 入队/逐拍顺序排空 + 判据⑤ 探针与断言）—— 见 **§B4.1.1**：
    `rob.v` 的 `slot_st_ok = ~store | mem_wr_ready` 允许**同拍 ≥2 条 store 提交**，而
    `lsq_simple` 每拍只排空**最低 lane 一条**，且 `cmt_st_drain` 只在提交拍有效 ⇒
    第二条会被提交掉但永不落存储。**探针实测三个程序"同拍多 store 提交组"= 0 拍**
@@ -1690,4 +1690,180 @@ iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ipc.vvp -s tb_back2_ipc "${RTL[@]}
 ./scripts/regress.sh
 # ④ 载荷位域核对（一次性探针，不进仓库）
 iverilog -g2012 -I . -o /tmp/pay.vvp ../.b2chk/probe/pay_probe.v && vvp /tmp/pay.vvp
+```
+
+---
+
+# 2B-4 第 1 段：后端收尾（排空/延迟分配）+ 锁步覆盖扩展 —— ①–④ 完成、⑤ 未做
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 HEAD=`7cf110b`=tag `2B-3`，**未提交**）
+> 写入范围：`rtl/back2/{lsq_simple.v,backend_top.v,back2_params.vh,rename.v}` +
+> `sim/unit/{tb_back2_lockstep.sv,tb_back2_lsq_fwd.sv}` + `sim/unit/prog/{back2_p4_fpu.S,
+> back2_p5_mdu.S,gen_back2_lockstep_data.py,back2_lockstep_data.svh}`；`scripts/regress.sh` **未改**；
+> **2A/front4 零修改**（本段暴露的 2A 侧问题一律以夹具侧修法处理，见 §B4.1.4 ⑦）。
+> 备份：`../.b2chk/*.s7`（①③④ 中间绿态）与 `../.b2chk/*.s8`（本段终态）。
+
+## B4.1.0 结论一览
+
+| 任务 | 状态 | 关键证据 |
+|---|---|---|
+| ① 同拍多 store 提交组排空 | ✅ **完成**（CDQ 逐 lane 入队、逐拍顺序排空） | 判据⑤ 探针：**30 拍**出现"≥2 store 同拍提交组"、CDQ 峰值 **7**、**入队 178 = 排空 178** + TB 硬断言 |
+| ② LQ 分配 E1→D3 + `INORD_LOAD=0` | ✅ **完成**（载荷 [415:411] 放 LQ 索引；置 0 后五程序逐位不变、无死锁） | 锁步五程序 C1–C5 全绿 + 性能逐位不变（§B4.1.2） |
+| ③ LQ 提交点释放单元用例 | ✅ **完成**（`tb_back2_lsq_fwd` **10→11**） | §B4.1.3 |
+| ④ 锁步新增 p4_fpu / p5_mdu | ✅ **完成**（黄金 91 / 265 条；**由此暴露并修复 7 处 RTL 真缺陷**） | §B4.1.4 |
+| ⑤ front4 检查点分配扩展（可选） | ⛔ **未做**（预算；按任务书"先报再动"未触碰 front4） | — |
+
+## B4.1.1 任务①：同拍多 store 提交组 ⇒ **提交排空队列（CDQ）**
+
+- **缺陷（2B-3 登记的"遗留 ①"）**：`rob.v` 的 `slot_st_ok = ~slot_store | mem_wr_ready` 允许**同拍
+  ≤4 条 store 提交**，而 LSQ 只按"本拍提交组 + 最低 lane"排空**一笔**；`cmt_st_drain` 只在提交拍
+  有效 ⇒ 同组其余 store **被提交却永不落地**。
+- **修法（逐 lane 排空）**：`lsq_simple` 新增 **CDQ**（深度 `BACK2_CDQ_N = 8`，参数文件真源）：
+  - **入队**：`dr_valid & dr_room_ok` 的每个 lane 按**组内压缩序号 rank** 写入 `tail+rank`
+    （全部连续赋值：rank 链 + `cdq_wp[g] = cdq_tail + rank[g]`）；
+  - **出队**：`dr_fire = (cdq_cnt != 0) & mem_req_ready`，逐拍一笔、FIFO 序 = **ROB 提交序**；
+  - **随提交拷贝** `{idx, addr, data, mask}` ⇒ STQ 项在被排空前仍有效（转发照旧），
+    且 `flush_all`（陷阱）清 STQ 后**已提交的 store 仍会落地**（架构可见性更强）；
+  - **背压**：`dr_room_ok = (CDQ_N - cdq_cnt) >= W`（只吃寄存器态 ⇒ **与 rob.v 提交链无组合环**），
+    回送 `rob.v` 的 `mem_wr_ready` ⇒ store 提交只要求"CDQ 放得下一整组"，**与排空口当拍是否空闲解耦**；
+  - 单请求口/单笔在途纪律**不变**（排空仍与 load 请求共口、排空拍不发 load 请求）。
+- **判据⑤ 覆盖证据（探针 + 硬断言，均在 `tb_back2_lockstep.sv`）**：
+  ```
+  提交排空：入队 3 笔 / 排空 3 笔 / 同拍多 store 提交组 0 拍 / CDQ 峰值 0     ← p1
+  提交排空：入队 11 笔 / 排空 11 笔 / 同拍多 store 提交组 0 拍 / CDQ 峰值 0    ← p2
+  提交排空：入队 35 笔 / 排空 35 笔 / 同拍多 store 提交组 0 拍 / CDQ 峰值 0    ← p3
+  提交排空：入队 16 笔 / 排空 16 笔 / 同拍多 store 提交组 2 拍 / CDQ 峰值 0    ← p4_fpu
+  提交排空：入队 113 笔 / 排空 113 笔 / 同拍多 store 提交组 28 拍 / CDQ 峰值 0  ← p5_mdu
+  == 判据⑤ 覆盖证据：同拍多 store 提交组合计 30 拍，CDQ 峰值占用 7，入队 178 / 排空 178 笔
+  ```
+  断言（fail-closed）：每程序 `入队 = 排空 + 在队`；收尾 `n_multi_grp > 0`（覆盖率不得丢失）
+  且 `入队总数 = 排空总数`。**CDQ 峰值 7 > 1 ⇒ 多 store 确实"多拍顺序发出"**。
+
+## B4.1.2 任务②：LQ 分配改 **D3 派发期** + `INORD_LOAD=0`
+
+- **载荷**：`BACK2_RB_LQ_MSB/LSB = 415/411`（5 bit，正好用尽顶端空闲位 ⇒ `RB_W` 仍 416；
+  与 STQ 字段同理"加在最顶端 ⇒ 其下字段绝对位置不变"）。
+- **RTL**：
+  - `lsq_simple`：新增 **LQ 分配器**（与 §1.2 的 STQ 分配器同构：空闲前缀和 + 候选或归约，
+    `lalloc_ok = 空闲数 ≥ 本组 load 数`）、新增 **`ld_ex`**（已执行 E1）位 —— 派发期分配后、
+    E1 之前的项**地址无效**，必须靠 `ld_ex` 挡在请求口外（`pend_vec = ld_v & ld_ex & ~ld_req & ~ld_dn`）；
+    E1 改用 `exe_lq_idx`（派发期槽号），**全转发**那条在 E1 当拍把槽还回；`iss_ok` 只剩
+    "无更老未定址 store"一条件（槽位已由派发保证）。
+  - `backend_top`：`ld_alloc_v = d1_v_q & is_load`；`disp_ok` 增加 `ld_alloc_ok`；
+    新增 `lq_of_rob[128]`（派发期登记"ROB 项 → LQ 槽"，E1 组合读，与 `stq_of_rob` 同法）。
+  - `iq.v` 的 `INORD_LOAD` **1 → 0**：2B-3 里"槽在 E1 分配 ⇒ 年轻 load 占满 32 槽 ⇒ 更老 load
+    永不发射 ⇒ ROB 头卡死 ⇒ 槽永不释放"的**结构性死锁**随派发期分配从根上消失。
+- **实测（置 0）**：五程序 **C1–C5 全绿、逐位不变**（443/721/913/1108/4472 拍；
+  IPC 0.3917/0.2469/0.1382/0.0848/0.0593；CHK 违规 0；判据⑤ 计数完全一致）⇒ **保留 0**。
+- **过程中的一次自伤（如实登记）**：首版把 `lai_fr[OUT_N]`（=**空闲**总数）当成占用数，
+  写成 `lalloc_ok = (32 - free) >= need` ⇒ "LQ 越空越不让派发 load" ⇒ 首个带 load 的块永久停摆
+  （实测程序 1 挂死）；改为 `lalloc_ok = free >= need` 后全绿。已在 RTL 注释里写明该陷阱。
+
+## B4.1.3 任务③：LQ 提交点释放单元用例（`tb_back2_lsq_fwd` 10 → **11**）
+
+新增 **C7**（恰好一项检查）：发一条无命中 load（走存储器）→ 等写回 → 断言 LQ 占用 **+1**
+（写回只置 `ld_dn`，槽仍占用 ⇒ 证明不是"响应即释放"）→ 驱动 `rob_head` 指向该 load 的 rob 号
+并给 `cmt_n=1`（模拟 ROB 提交组）→ 断言占用回到原值（槽被**提交点**释放）。
+夹具侧同步改为"先派发分配 LQ 槽、再 E1"（与 RTL 的 D3 分配口径一致）。实测
+`== 检查项合计 11 项全部满足`。
+
+## B4.1.4 任务④：锁步新增 **p4_fpu / p5_mdu**（并由此修掉 7 处 RTL 真缺陷）
+
+### 新程序与黄金轨迹（三重自检保持）
+- `sim/unit/prog/back2_p4_fpu.S`：RV32F 算术（FADD/FSUB/FMUL/FDIV/FSQRT/FMIN/FMAX/FSGNJ*）、
+  FMA 族、比较（feq/flt/fle ⇒ 整数寄存器）、搬移/转换（fmv.x.w / fmv.w.x / fcvt.s.w / fcvt.w.s）、
+  flw/fsw 访存 + 同址读回（FP 域转发）+ 依赖链循环；首两条先置 `mstatus.FS=Initial`
+  （**2A 侧 FS=Off 判非法指令**，乱序核无此门 ⇒ 必须显式打开，两核才同语义）。
+  **不读/写 fflags/frm/fcsr**（其"FPU done ⇒ 提交级累积"路径本段未覆盖，留作遗留）。
+- `sim/unit/prog/back2_p5_mdu.S`：mul/mulh/mulhsu/mulhu + div/divu/rem/remu，覆盖**除零**
+  （商=-1/全 1、余=被除数）与 **INT_MIN÷-1 溢出**（商=INT_MIN、余=0）两个规范边界，
+  内含 RAW 依赖链与 7 次循环（16 条 store/轮 ⇒ 密集提交组）。
+- 生成器：`PROGS` 每项带 **per-program `-march` 与 Spike `--isa`**（整数程序仍 `rv32ima_zicsr`，
+  黄金轨迹与 2B-3 **逐字节不变**：161/178/126）；**三重自检全部保留且通过**
+  （①两次链接 .text 逐字节同 ②.text 连续/不越界 ③黄金 PC 落在 .text 内）。
+  实测新增：p4 = **91** 条、p5 = **265** 条黄金提交。
+
+### ⑦ 本段由新程序暴露并修复的 **7 处 RTL 真缺陷**（全部有实测现场）
+| # | 位置 | 缺陷 / 现场 | 修法 |
+|---|---|---|---|
+| B30 | `backend_top.v` MDU/FPU 启动 | `start/req_valid` 取**发射拍**（`iq_iss_v[3/5]`）而操作数取 **E1**（`x_i2_*`）⇒ 单元永不启动、`*_if_v` 恒 1 ⇒ **p4 第 20 条 `fadd.s` 处永久挂死**（探针 `fpu_busy=0/done=0`，`x_i2_v[5]` 已脉冲） | 改取 `x_i2_v[3]` / `x_i2_v[5]`（与 mdu.v/fpu.v 端口契约"start 与操作数同拍采样"、与 2A 的 `e_mdu_go/e_fp_go` 一致） |
+| B31 | `rename.v` free list 初始化 | `ftail_q <= 7'd64` **硬编码**，而浮点域 `FREE_N=32`（只填了前 32 项）⇒ 浮点域**虚报 32 个空闲项**，用完后 fhead 读到清零值 **preg=0** ⇒ `RENAME-CHK FAIL: arn=22 ... preg=0` 自环 | `ftail_q <= FREE_N[FL_PTR_W-1:0]` |
+| B32 | `backend_top.v` 单元 flush | `flush(squash_v_w|flush_all_w)` **无条件**：比 squash 点**更老**的在飞 FP 项（实测正是 ROB 头 `fmv.x.w`，`fpu_if_rob=42=rob_head`、squash_idx=66）被执行被冲掉而 ROB 项不作废 ⇒ `done` 永不再来 ⇒ 头卡死 | **年龄限定冲刷** `fpu_kill/mdu_kill`（`age(在飞) > age(squash 点)`；与 ROB/LSU 同口径窗口算术），并只清对应在途登记 |
+| B33 | `backend_top.v` `fp_op_map` | 三组系统性错位：① FSGNJ/FMIN-FMAX/FEQ-FLT-FLE 的**组内选择位**取成 rs2 寄存器号（应为 **funct3**）⇒ `fmin.s f14,f1,f4` 被当 **FMAX**（实测锁步第 27 条 1.0 vs -0.5）；② `fcvt.s.w` 族 funct5 应为 **11010**（旧写 01000）⇒ 落到未定义 op 127（静默错值）；③ `01000` 实为 **F↔D 互转** | 照抄 2A `core_top.fp_op_map` 的映射（funct3/fmt/rs2[0] 选择 + FMA 26–29）；三组转换统一进 `fp_cvt_map` |
+| B34 | `backend_top.v` FMA 源 | `rs1_f/rs2_f = is_opfp & ~is_fma` ⇒ **只有 rs3 是 FP 源**，a/b 停在未映射值 ⇒ `fmadd.s fs3,ft2,ft3,ft1` 得 **c**（1.0）而 Spike/2A 得 8.0 | 三个 FP 源全置位（s1←rs1、s2←rs2、s3←rs3，与 fpu.v 的 a/b/c 对应） |
+| B35 | `backend_top.v` FP 源分类 | "源 1 是整数寄存器"的集合写错（把 **F↔D** 当整数源、漏掉 **11010**）⇒ `fcvt.s.w fs8,a4` 既没标整数源又被当 FP 源 ⇒ 得 0xce820000（应 5.0）；顺带把单源 FP 指令的 rs2 误标为源 | 与 2A 的 `e_fp_a_is_int = op∈{15,18,19,22,23}` 对齐；`rs2_f` 只对"双 FP 源族 + FMA + FP store"置位 |
+| B36 | `lsq_simple.v` STQ 分配器×队头回收 | 同拍"分配"与"队头回收"撞同一槽时，保护只比 **lane 0** 的分配结果 ⇒ lane1..3 命中队头时**新项被回收清 0（静默丢失）**，槽被更年轻 store 复用并覆盖 ⇒ 前一条 store 永不落地（实测 p4 C4：`0x8000d028` 乱序 0x13 vs 2A 0x40e00000） | **逐 lane** 比较（任一 lane 命中队头即本拍不回收） |
+| 夹具 | `tb_back2_lockstep.sv` | 2A 调试口 `debug0_wb_rf_wdata` 对 **FP 寄存器写**给出的不是架构值（实测 `flw ft1`：口给 0x8000d000（地址），Spike 给 f1=0xffffffff_3f800000）—— **夹具可观测性缺陷，非 2A 功能缺陷**（2A arch-test F/D 全绿，且禁止改 2A） | 夹具改取 **2A 的 FP 寄存器写口** `mw_fp_we/mw_fp_rd/mw_fp_wdata[31:0]`（判据不放宽，对 FP 写更忠实；顺带修正 f0：FP 写 rd=0 是真写） |
+
+> B30–B35 集中在"**FP/MDU 在乱序核里从未被任何程序执行过**"这一盲区（2B-2/2B-3 的三个程序
+> 全是整数流）；p4_fpu/p5_mdu 一上线即逐条暴露。B36 是 2B-3 遗留的分配器缺陷，由 p4 的
+> 8 连 store 触发。
+
+## B4.1.5 任务⑤（可选）：未做
+
+front4 检查点分配扩展未触碰（任务书要求"先报再动"，且本段预算已用于 ①–④ 与 §B4.1.4 的
+7 处修复）。登记为下一段候选，**不属于本段阻塞点**。
+
+## B4.1.6 验证台账（判据逐条）
+
+| 判据 | 结果 | 证据 |
+|---|---|---|
+| 整设计编译零错误 | ✅ | `iverilog -g2012 -Wall`（仅 2 条 fpu_cvt 既有 implicit 警告） |
+| 锁步**全部程序** C1–C5 | ✅ **57/57 PASS**（p1..p5） | `../.b2chk/t12_run.log` |
+| RENAME-CHK 零违规 | ✅ **0 行** | 同上（`grep -c RENAME-CHK` = 0） |
+| 无停顿 | ✅ 五程序均达黄金条数：161/178/126/**91**/**265** | 同上 |
+| 基线 443/721/913 拍不回退 | ✅ **逐位不变**（含 IPC） | 同上 |
+| 新程序 C5 定档（实测×0.8、裕量≥20%） | ✅ p4 Q8=21→**16**（24%）；p5 Q8=15→**12**（20%） | §B4.1.7 + TB 注释表 |
+| `tb_back2_iq` | ✅ **151/151** | 内联运行 |
+| `tb_back2_lsq_fwd` | ✅ **11/11**（新增 C7） | `../.b2chk/t13_run.log` |
+| `tb_back2_ipc` | ✅ **IPC=2.0000** | 内联运行 |
+| `regress.sh` 全量 | ✅ **31/31**（TB 数不变 31） | `../.b2chk/final_regress.log` |
+| 判据⑤ 同拍多 store 提交 + 全部排空 | ✅ 30 拍多组、CDQ 峰值 7、178=178 + 硬断言 | §B4.1.1 |
+| ② `INORD_LOAD=0` 无死锁 | ✅ 置 0 后五程序逐位不变 | §B4.1.2 |
+
+## B4.1.7 C5 分档更新（本段新增 p4/p5 两档）
+
+| 程序 | 总拍数 | 提交窗 | 提交条数 | 实测 IPC | 实测 Q8 | 下限 Q8 | 阈值 IPC | 裕量 |
+|---|---|---|---|---|---|---|---|---|
+| p1 int | 443 | 411 | 161 | 0.3917 | 100 | 77 | 0.3008 | 23% |
+| p2 branch | 721 | 721 | 178 | 0.2469 | 63 | 49 | 0.1914 | 22% |
+| p3 memcsr | 913 | 912 | 126 | 0.1382 | 35 | 28 | 0.1094 | 20% |
+| **p4_fpu** | **1108** | **1073** | **91** | **0.0848** | **21** | **16** | **0.0625** | **24%** |
+| **p5_mdu** | **4472** | **4469** | **265** | **0.0593** | **15** | **12** | **0.0469** | **20%** |
+
+口径不变：参照核 2A、冷 I$/冷预测器、窗起点 = 2A 进入程序拍（新两档低是因为 **2A 是顺序核**，
+FPU 固定 8 拍潜伏期 / div·sqrt 更长、MDU 多拍，逐条依赖被 2A 侧串行放大）。阈值表与注释
+已写入 `tb_back2_lockstep.sv`。
+
+## B4.1.8 遗留 / 下一步
+
+1. **fflags/frm/fcsr 覆盖缺失**（本段显式未做）：p4_fpu 只用静态 RNE、不读 fflags ⇒
+   "FPU done ⇒ 提交级 fflags 累积"与 `fcsr` 读写路径**仍未验证**。下一段建议加 p6_fcsr
+   （含 `frflags`/`fsflags`、frm 动态舍入、NaN/Inf 边界），先做**单元级**（直驱 fpu.v 的
+   fflags 通路）再上锁步。
+2. **D 扩展（fld/fsd、F↔D 互转、double 算术）**：`fp_op_map` 已按 2A 映射修好（含 20–25），
+   但乱序核的 64 bit 访存（B21 遗留：LSQ 只做 ≤4 B）与 D 数据通路**未验证**。
+3. **`rob.v` 的 store 提交串行化备选**：本段用 CDQ 让"同拍多 store 全排空"；
+   若后续要极简实现，也可在 `rob.v` 逐 lane 串行化（每拍至多一条 store 提交），
+   代价是提交宽度对 store 密集流降到 1/拍 —— 当前 CDQ 方案已实测无回退，保留。
+4. **陷阱（`flush_all`）+ 在飞 CDQ**：CDQ 拷贝了地址/数据/掩码 ⇒ 已提交 store 不因陷阱丢失
+   （比 2B-3 更强）；但**未做专门用例**（本 TB 无陷阱程序）。
+5. `tb_back2_lockstep` 的 C5 主体仍是 **2A 参照核**（母代理第 9/10/11 轮裁决）；
+   p4/p5 两档因此偏低 —— 若后续需要"乱序核自身的 FP/MDU 吞吐"证据，需另立 TB（不在本段范围）。
+
+## B4.1.9 复现命令
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+# 黄金轨迹/映像再生（三重自检；--march 每程序见生成器 PROGS 表）
+python3 sim/unit/prog/gen_back2_lockstep_data.py > sim/unit/prog/back2_lockstep_data.svh
+# 整设计编译 + 锁步五程序（C1–C5 + 判据⑤ 探针/断言）
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ls.vvp -s tb_back2_lockstep_top "${RTL[@]}" sim/unit/tb_back2_lockstep.sv && vvp /tmp/ls.vvp
+# 三个直驱/后端用例
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/iq.vvp  -s tb_back2_iq  "${RTL[@]}" sim/unit/tb_back2_iq.sv  && vvp /tmp/iq.vvp
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/fw.vvp  -s tb_back2_lsq_fwd_top "${RTL[@]}" sim/unit/tb_back2_lsq_fwd.sv && vvp /tmp/fw.vvp
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ipc.vvp -s tb_back2_ipc "${RTL[@]}" sim/unit/tb_back2_ipc.sv && vvp /tmp/ipc.vvp
+# 全量回归（31 个 TB，T6 墙钟档不变）
+./scripts/regress.sh
 ```

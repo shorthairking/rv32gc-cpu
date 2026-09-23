@@ -11,7 +11,7 @@
 //   · **发射**：LSU 单发射口，IQ-LSU 最老就绪优先；`INORD_LOAD`（队列级）与
 //     **精确 STQ 闸门**（§2.1）并联：更老 store **未定址** ⇒ 本 load 不可发射；
 //     更老 store 均已定址 ⇒ 放行（重叠字节由转发/合并兜住）。
-//   · **LQ**：load 在 **E1 入队**（`newslot` 取最低空闲槽），响应按 `ld_tag` 标签
+//   · **LQ**：load 在 **D3 派发期**分配槽位（程序序；2B-4 第二步），响应按 `ld_tag` 标签
 //     **乱序写回**（`ld_dn` 标记数据已齐），槽位本身**在提交点释放**（§4.4b：
 //     `(ld_rob - rob_head) & 7'h7F < cmt_n`，冲刷/陷阱拍 `cmt_n=0`）。
 //   · **字节级 load→store 转发**（§6.2）：扫描**更老且地址已确认**的 store（32 候选 ×
@@ -44,6 +44,8 @@ module lsq_simple #(
     parameter integer PDW_I    = `BACK2_PREG_I_W,
     parameter integer PDW_F    = `BACK2_PREG_F_W,
     parameter integer W        = `BACK2_DISP_W,
+    parameter integer CDQ_N    = `BACK2_CDQ_N,       // 提交排空队列深度（≥2×W）
+    parameter integer CDQ_PW   = 3,                  // CDQ 指针位宽（log2(CDQ_N)）
     parameter integer DBG = 0              // 1 = 每拍打印 load/store 槽状态（诊断）
 ) (
     input  wire                  clk,
@@ -58,6 +60,16 @@ module lsq_simple #(
     input  wire [W*ROB_IDX_W-1:0] alloc_rob,           // ★ 2B-3：随带各 lane 的 ROB 索引
     output wire                  alloc_ok,
     output wire [W*STQ_IW-1:0]   alloc_idx,
+
+    // ---- D3 派发：为 **load** 分配 LQ 项（≤4/拍，程序序；★ 2B-4 第二步）----
+    //   槽位在**派发期**确定（=程序序），E1 只是"填地址/数据/转发信息"；
+    //   释放点仍在**提交**（§4.4b 的窗口算术，用派发期写入的 `ld_rob`）。
+    //   ⇒ load 的槽位序不再依赖发射/执行顺序：年轻 load 不可能抢走更老 load 需要的槽
+    //     （这正是 2B-3 里"槽在 E1 分配"必须靠 iq.v 的 INORD_LOAD 防死锁的原因）。
+    input  wire [W-1:0]          lalloc_valid,
+    input  wire [W*ROB_IDX_W-1:0] lalloc_rob,
+    output wire                  lalloc_ok,
+    output wire [W*LQ_IW-1:0]    lalloc_idx,
 
     // ---- E1：LSU 执行（单发射；地址由 backend_top 的 AGU 算好）----
     input  wire                  exe_valid,
@@ -74,14 +86,19 @@ module lsq_simple #(
     input  wire [PDW_I-1:0]      exe_pdest_i,
     input  wire [PDW_F-1:0]      exe_pdest_f,
     input  wire [STQ_IW-1:0]     exe_stq_idx,
+    input  wire [LQ_IW-1:0]      exe_lq_idx,           // ★ 2B-4：本 load 在派发期分到的 LQ 槽
 
     // ---- 发射前检查（接 IQ 的 iss_ready）----
     input  wire [ROB_IDX_W-1:0]  iss_rob,              // ★ 2B-3：候选（i4_sel）的 ROB 索引
     output wire                  iss_ok,               // 有空余 LQ 槽 且 无更老未定址 store
 
-    // ---- 提交排空（ROB 头 store 项）----
+    // ---- 提交排空入队（ROB 提交组内的**所有** store，≤W/拍、程序序）----
     input  wire [W-1:0]          dr_valid,
     input  wire [W*STQ_IW-1:0]   dr_idx,
+    //   提交许可（回送 rob.v 的 `mem_wr_ready`）：CDQ 余量够放**一整组** store 才许可提交。
+    //   ★ 不再与"排空口当拍空闲"耦合：提交与排空解耦 ⇒ 同拍多 store 可全部入队、
+    //     由排空口逐拍顺序发出（单端口、单笔在途纪律不变）。
+    output wire                  dr_room_ok,
 
     // ---- 提交点释放（LQ 项；★ 2B-3 第 6 段第二步：E1 入队、提交点释放）----
     input  wire [2:0]            cmt_n,                // 本拍提交条数（外部已按 cmt_ok 门控）
@@ -207,7 +224,24 @@ module lsq_simple #(
         end
     end
     endgenerate
-    wire alloc_hits_head = (alloc_idx[0 +: STQ_IW] == stq_head_q) & alloc_ok & alloc_valid[0];
+    //   ★★ 2B-4 修复（锁步 p4_fpu 的 8 连 store 暴露的 **2B-2/2B-3 既有缺陷**）：
+    //     队头回收（"队头空闲/已排空 ⇒ 本拍清 stq_v[head] 并把 head 前移"）与**本拍分配**
+    //     可能撞在**同一个槽**上；旧实现的保护只比了 **lane 0** 的分配结果
+    //     （`alloc_idx[0 +: STQ_IW] == stq_head_q`），若命中的是 lane 1..3 分配的槽，
+    //     保护不生效 ⇒ 同拍"新写入 stq_v[head]=1"被"回收清 0"覆盖 ⇒ **新 store 项被静默丢失**
+    //     （其 E1 仍会写 av/a/d，但 stq_v=0 ⇒ 转发与排空都看不到它；该槽随后被更年轻的
+    //      store 复用并覆盖数据 ⇒ 前一条 store 永不落地）。
+    //     实测：p4_fpu 的 `fsw fs8,40(t1)`（0x8000d028）分配到的槽 = 当拍队头 ⇒ 丢失 ⇒
+    //     C4 报 0x8000d028 乱序 0x00000013 vs 2A 0x40e00000（该值 5.0）。
+    //     修法：**逐 lane** 比较（任一 lane 命中队头即本拍不回收），语义与原注释一致。
+    wire [W-1:0] alloc_hits_head_v;
+    generate
+    for (gv = 0; gv < W; gv = gv + 1) begin : g_ahh
+        assign alloc_hits_head_v[gv] = alloc_valid[gv] &
+                                       (alloc_idx[gv*STQ_IW +: STQ_IW] == stq_head_q);
+    end
+    endgenerate
+    wire alloc_hits_head = alloc_ok & (|alloc_hits_head_v);
 
     //==========================================================================
     // 2. 更老未定址 store 检查 + 字节级转发（组合，load 发射拍；全部连续赋值）
@@ -333,7 +367,7 @@ module lsq_simple #(
     //     · 槽标签 `ld_tag[slot] = slot`（最高位恒 0），**store 排空标签取全 1**
     //       ⇒ `BACK2_MEM_TAG_W` 必须 ≥ LQ_IW+1（已同步 3→6），否则 31 号槽会与
     //       排空标签撞车（响应被误当 load 数据写回）。
-    //     · 原实现把 4 个槽的 `ld_free/pend_vec/rsp_vec/newslot` **下标字面写死**，
+    //     · 原实现把 4 个槽的 `ld_free/pend_vec/rsp_vec` **下标字面写死**，
     //       扩容时必须改为 generate + 优先级链（下 §3.2），语义逐项等价（最低序号优先）。
     //     · **第一步**只扩容量/位宽（释放语义保持"响应即释放"）并保全绿；
     //       **第二步**改为真 LSQ 语义：E1 入队（§4.3）、写回可乱序（标签匹配）、
@@ -344,6 +378,9 @@ module lsq_simple #(
     //     与 `ld_v` 分离的原因：**提交点释放**要求项在写回之后仍占着 LQ（直到该 load
     //     按程序序提交），而"已完成"必须把它排除出请求口与响应匹配 ⇒ 两个状态位。
     reg                  ld_dn   [0:OUT_N-1];
+    //   ★ 2B-4：`ld_ex` = 该 LQ 项已完成 **E1**（地址/掩码/转发信息已填）。
+    //     派发期分配后、E1 之前，项存在但地址无效 ⇒ 必须靠本位置把它挡在请求口之外。
+    reg                  ld_ex   [0:OUT_N-1];
     reg  [ROB_IDX_W-1:0] ld_rob  [0:OUT_N-1];
     reg  [`BACK2_EPOCH_W-1:0] ld_ep [0:OUT_N-1];
     reg                  ld_di   [0:OUT_N-1];
@@ -358,12 +395,45 @@ module lsq_simple #(
     reg  [TAG_W-1:0]     ld_tag  [0:OUT_N-1];
 
     //--------------------------------------------------------------------------
+    // 3.1b LQ 分配器（D3 派发期；与 §1.2 的 STQ 分配器**同构**：空闲前缀和 + 候选或归约）
+    //   第 k 个空闲槽 = 唯一满足 `(空闲[j] && fr[j]==k)` 的 j；lane k 的索引 = 该候选向量
+    //   的按位或归约（候选互斥 ⇒ 无需优先级链）。语义 = "最低序号空闲槽优先"。
+    //--------------------------------------------------------------------------
+    wire [6*(OUT_N+1)-1:0] lai_fr;
+    assign lai_fr[0 +: 6] = 6'd0;
+    generate
+    for (gv = 0; gv < OUT_N; gv = gv + 1) begin : g_lfr
+        assign lai_fr[6*(gv+1) +: 6] = lai_fr[6*gv +: 6] + {5'b0, ~ld_v[gv]};
+    end
+    endgenerate
+    wire [W*LQ_IW*OUT_N-1:0] lai_cand;
+    generate
+    for (gk = 0; gk < W; gk = gk + 1) begin : g_lai_k
+        for (gb = 0; gb < LQ_IW; gb = gb + 1) begin : g_lai_b
+            for (gj = 0; gj < OUT_N; gj = gj + 1) begin : g_lai_j
+                assign lai_cand[((gk*LQ_IW)+gb)*OUT_N + gj] =
+                       ~ld_v[gj] & (lai_fr[6*gj +: 6] == gk[5:0]) & ((gj >> gb) & 1);
+            end
+            assign lalloc_idx[gk*LQ_IW + gb] =
+                   |lai_cand[((gk*LQ_IW)+gb)*OUT_N +: OUT_N];
+        end
+    end
+    endgenerate
+    //   ★ 注意：`lai_fr[j]` = 序号 < j 的**空闲**槽数（前缀和加的是 `~ld_v`）
+    //     ⇒ `lai_fr[OUT_N]` 就是**空闲总数**（不是占用数！曾把它当成占用数写反，
+    //     导致"LQ 越空越不允许派发 load"⇒ 首个带 load 的块永久派发不了，实测程序 1 挂死）。
+    wire [5:0] lq_free_w = lai_fr[6*OUT_N +: 6];
+    wire [5:0] lalloc_need = {4'b0, lalloc_valid[0]} + {4'b0, lalloc_valid[1]} +
+                             {4'b0, lalloc_valid[2]} + {4'b0, lalloc_valid[3]};
+    assign lalloc_ok = lq_free_w >= lalloc_need;
+
+    //--------------------------------------------------------------------------
     // 3.2 LQ 打包视角 + 归约（全部连续赋值；深度/位宽参数化）
     //   语义与原 4 项字面实现**逐项等价**：
     //     · `ld_free` = 各槽空闲（原 `~{ld_v[3],…,ld_v[0]}`）；
     //     · `pend_vec` = 已分配且未发请求（原 4 项拼接）；
     //     · `rsp_vec`  = 在等响应且标签命中（原 4 项拼接）；
-    //     · `newslot`  = 最低序号空闲槽（原三目链）。
+    //     · `ld_ex`    = 该槽已执行 E1（派发期分配 ⇒ 未执行项不得进请求口）。
     //   优先级编码用**纯函数**（只吃打包向量、不读存储器；本文件禁用"读存储器的 function"）。
     //--------------------------------------------------------------------------
     function [LQ_IW-1:0] pri_enc(input [OUT_N-1:0] v);
@@ -381,41 +451,70 @@ module lsq_simple #(
     generate
     for (gv = 0; gv < OUT_N; gv = gv + 1) begin : g_lq_pk
         assign ld_free [gv] = ~ld_v[gv];
-        assign pend_vec[gv] = ld_v[gv] & ~ld_req[gv] & ~ld_dn[gv];
+        assign pend_vec[gv] = ld_v[gv] & ld_ex[gv] & ~ld_req[gv] & ~ld_dn[gv];
         assign rsp_vec [gv] = ld_v[gv] & ld_req[gv] & (ld_tag[gv] == mem_rsp_tag);
     end
     endgenerate
 
-    wire             ld_slot_ok = |ld_free;
     wire             pend_any   = |pend_vec;
     wire [LQ_IW-1:0] pend_sel   = pri_enc(pend_vec);
     wire             rsp_ok     = mem_rsp_valid & (|rsp_vec);
     wire [LQ_IW-1:0] rsp_sel    = pri_enc(rsp_vec);
-    wire             newslot_ok = |ld_free;
-    wire [LQ_IW-1:0] newslot    = pri_enc(ld_free);
+    // 发射许可（★ 2B-4）：槽位已在**派发期**分配 ⇒ 此处只剩"无更老未定址 store"一条件
+    //   （旧口径还要求"有空闲 LQ 槽"，那是"槽在 E1 分配"时代的死锁防护，已不需要）。
+    assign iss_ok = ~any_unk_w;
 
-    // 发射许可：有空槽 且 无更老未定址 store（store 项不需槽，但统一门控损失可忽略）
-    assign iss_ok = ld_slot_ok & ~any_unk_w;
+    //==========================================================================
+    // 3.3 提交排空队列（CDQ）—— 逐 lane 收全提交组、逐拍顺序排空
+    //==========================================================================
+    //   ★★ 2B-4 修复（任务①；2B-3 `遗留 ①` 由锁步 p4_fpu 的 8 连 store 实测触发）：
+    //     `rob.v` 允许**同拍最多 4 条 store 提交**，而排空口每拍只发一笔；旧实现直接用
+    //     "本拍提交组 + 最低 lane"驱动排空 ⇒ 同组其余 store **被提交却永不落地**
+    //     （实测：p4_fpu 的 `fsw fs0,24(t1)` 与相邻 store 同组提交 ⇒ 只排空了前一条，
+    //      后续 `flw fs11,24(t1)` 读到 DDR 初值 0x00000013 而非 0x40e00000，C1 第 55 条分歧）。
+    //   本队列把**每个提交组内的全部 store**（≤W 笔、程序序）入队，出队按 FIFO 逐拍一笔
+    //   ⇒ 仍是**单请求口 / 单笔在途**，只是"提交"与"排空"解耦（可多拍顺序发出）。
+    //   · 地址/数据/掩码**随提交拷贝进队列**：STM 项在被排空前仍有效（转发照旧），
+    //     而 `flush_all`（陷阱）清 STQ 时已提交的 store 仍能落地（架构上必须可见）。
+    //   · 入队余量判据只用**寄存器态**（`cdq_cnt`）⇒ 与 rob.v 的提交链无组合环。
+    reg  [STQ_IW-1:0] cdq_idx [0:CDQ_N-1];
+    reg  [31:0]       cdq_a   [0:CDQ_N-1];
+    reg  [31:0]       cdq_d   [0:CDQ_N-1];
+    reg  [3:0]        cdq_m   [0:CDQ_N-1];
+    reg  [CDQ_N-1:0]  cdq_v;
+    reg  [CDQ_PW:0]   cdq_cnt;
+    reg  [CDQ_PW-1:0] cdq_head, cdq_tail;
 
-    // ---- 请求发射：store 排空优先；排空拍不发 load 请求 ----
-    //   ★★ 2B-3 第 5 段修法：**x 隐患**——原 `always @(*)` + `for` 归约只在输入变化时重算，
-    //   输入长期恒定时结果停留在 x（实测 `dr_valid=0000` 而 `dr_any=x` ⇒ `mem_req_valid=x`）。
-    //   改为**连续赋值优先级链**（恒被求值）：语义保持"最低 lane 优先"（原循环自 W-1 递减、
-    //   最后赋值者胜 ⇒ 最小 dk 胜），与 ROB 提交组内"最老 store 优先排空"一致。
-    wire [STQ_IW-1:0] dr_sel = dr_valid[0] ? dr_idx[0*STQ_IW +: STQ_IW] :
-                               dr_valid[1] ? dr_idx[1*STQ_IW +: STQ_IW] :
-                               dr_valid[2] ? dr_idx[2*STQ_IW +: STQ_IW] :
-                               dr_valid[3] ? dr_idx[3*STQ_IW +: STQ_IW] : {STQ_IW{1'b0}};
-    wire              dr_any = |dr_valid;
-    wire dr_fire = dr_any & mem_req_ready;
-    wire ld_fire = pend_any & ~dr_any & mem_req_ready;
+    //   入队许可：余量 ≥ 一整组（W 笔）——保守，且与"本拍出队释放 1 项"无关（无环）
+    assign dr_room_ok = ((CDQ_N[CDQ_PW:0]) - cdq_cnt) >= W[CDQ_PW:0];
+    wire [W-1:0] dr_take = dr_valid & {W{dr_room_ok}};
+    //   组内压缩序号（rank）：第 k 个被收下的 lane 写到 tail+k
+    wire [2*W-1:0] dr_rank;
+    generate
+    for (gv = 0; gv < W; gv = gv + 1) begin : g_drrank
+        if (gv == 0) assign dr_rank[0 +: 2] = 2'd0;
+        else         assign dr_rank[2*gv +: 2] = dr_rank[2*(gv-1) +: 2] + {1'b0, dr_take[gv-1]};
+    end
+    endgenerate
+    wire [CDQ_PW:0] dr_push_n = {{CDQ_PW-1{1'b0}}, dr_rank[2*(W-1) +: 2]} + {1'b0, dr_take[W-1]};
+    wire [CDQ_PW-1:0] cdq_wp [0:W-1];
+    generate
+    for (gv = 0; gv < W; gv = gv + 1)
+        assign cdq_wp[gv] = cdq_tail + dr_rank[2*gv +: 2];
+    endgenerate
+
+    //   出队：队首一笔；`dr_fire` = 与存储口的握手拍
+    wire              dr_any  = (cdq_cnt != {(CDQ_PW+1){1'b0}});
+    wire [STQ_IW-1:0] dr_sel  = cdq_idx[cdq_head];
+    wire              dr_fire = dr_any & mem_req_ready;
+    wire              ld_fire = pend_any & ~dr_any & mem_req_ready;
 
     assign mem_req_valid = dr_fire | ld_fire;
     assign mem_req_wen   = dr_fire;
-    assign mem_req_addr  = dr_fire ? stq_a[dr_sel]   : ld_addr[pend_sel];
-    assign mem_req_wdata = dr_fire ? stq_d[dr_sel]   : 32'h0;
-    assign mem_req_wstrb = dr_fire ? stq_msk[dr_sel] : 4'h0;
-    assign mem_req_tag   = dr_fire ? {TAG_W{1'b1}}   : ld_tag[pend_sel];
+    assign mem_req_addr  = dr_fire ? cdq_a[cdq_head]   : ld_addr[pend_sel];
+    assign mem_req_wdata = dr_fire ? cdq_d[cdq_head]   : 32'h0;
+    assign mem_req_wstrb = dr_fire ? cdq_m[cdq_head]   : 4'h0;
+    assign mem_req_tag   = dr_fire ? {TAG_W{1'b1}}     : ld_tag[pend_sel];
 
     // ---- 写回：响应到达 或（部分/全部）转发 + 响应 合并 ----
     wire [31:0] wb_word = mem_rsp_rdata;
@@ -479,6 +578,8 @@ module lsq_simple #(
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
             cnt_ld_q <= 32'h0; cnt_st_q <= 32'h0; cnt_fwd_q <= 32'h0; cnt_stall_q <= 32'h0;
+            cdq_cnt <= {(CDQ_PW+1){1'b0}}; cdq_head <= {CDQ_PW{1'b0}}; cdq_tail <= {CDQ_PW{1'b0}};
+            cdq_v   <= {CDQ_N{1'b0}};
             fwdp_v <= 1'b0; fwdp_rob <= {ROB_IDX_W{1'b0}}; fwdp_ep <= {`BACK2_EPOCH_W{1'b0}};
             fwdp_di <= 1'b0; fwdp_df <= 1'b0; fwdp_pi <= {PDW_I{1'b0}};
             fwdp_pf <= {PDW_F{1'b0}}; fwdp_data <= 32'h0; fwdp_size <= 3'h0;
@@ -489,7 +590,7 @@ module lsq_simple #(
                 stq_rob[si] <= {ROB_IDX_W{1'b0}}; stq_ret[si] <= 1'b0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
-                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0;
+                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
                 ld_rob[si] <= {ROB_IDX_W{1'b0}};
                 ld_ep[si] <= {`BACK2_EPOCH_W{1'b0}}; ld_di[si] <= 1'b0; ld_df[si] <= 1'b0;
                 ld_pi[si] <= {PDW_I{1'b0}}; ld_pf[si] <= {PDW_F{1'b0}};
@@ -501,7 +602,7 @@ module lsq_simple #(
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0; stq_ret[si] <= 1'b0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
-                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0;
+                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
             end
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
@@ -524,6 +625,22 @@ module lsq_simple #(
                         //     陈旧值 ⇒ `any_unk_w`（B28 保守闸门）判错年龄。
                         stq_rob[alloc_idx[si*STQ_IW +: STQ_IW]] <=
                                 alloc_rob[si*ROB_IDX_W +: ROB_IDX_W];
+                    end
+                end
+            end
+
+            // ---- 4.2b D3 派发：为 load 分配 LQ 项（★ 2B-4 第二步：槽位程序序）----
+            //   只写"归属/占用"：`ld_rob`（提交点释放的年龄依据）、`ld_ex=0`、
+            //   请求/完成标志清零；地址/掩码/转发信息等 E1（§4.3）再填。
+            if (lalloc_ok) begin
+                for (si = 0; si < W; si = si + 1) begin
+                    if (lalloc_valid[si]) begin
+                        ld_v  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b1;
+                        ld_ex [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_req[lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_dn [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_rob[lalloc_idx[si*LQ_IW +: LQ_IW]] <=
+                                lalloc_rob[si*ROB_IDX_W +: ROB_IDX_W];
                     end
                 end
             end
@@ -555,25 +672,28 @@ module lsq_simple #(
                     fwdp_size <= exe_size;
                     fwdp_off  <= exe_addr[1:0];
                     fwdp_uns  <= exe_unsign;
-                end else if (newslot_ok) begin
-                    ld_v   [newslot] <= 1'b1;
-                    ld_req [newslot] <= 1'b0;
-                    ld_dn  [newslot] <= 1'b0;
-                    ld_rob [newslot] <= exe_rob;
-                    ld_ep  [newslot] <= exe_epoch;
-                    ld_di  [newslot] <= exe_dst_i;
-                    ld_df  [newslot] <= exe_dst_f;
-                    ld_pi  [newslot] <= exe_pdest_i;
-                    ld_pf  [newslot] <= exe_pdest_f;
-                    ld_addr[newslot] <= exe_addr;
-                    ld_size[newslot] <= exe_size;
-                    ld_uns [newslot] <= exe_unsign;
-                    ld_hm  [newslot] <= fwd_hit_w;
-                    ld_hd  [newslot] <= fwd_data_w;
-                    //   ★ newslot 是 LQ_IW bit（LQ 32 ⇒ 5 bit）⇒ 必须零扩展到 TAG_W=6；
+                end else begin
+                    //   ★ 2B-4：槽号来自**派发期**（`exe_lq_idx`），不再是 E1 现选的 `newslot`；
+                    //     全转发的那条在 E1 当拍就把槽还回去（它不需要访存，也不参与提交释放）。
+                    ld_v   [exe_lq_idx] <= ~fwd_all_w;
+                    ld_ex  [exe_lq_idx] <= ~fwd_all_w;
+                    ld_req [exe_lq_idx] <= 1'b0;
+                    ld_dn  [exe_lq_idx] <= 1'b0;
+                    ld_rob [exe_lq_idx] <= exe_rob;
+                    ld_ep  [exe_lq_idx] <= exe_epoch;
+                    ld_di  [exe_lq_idx] <= exe_dst_i;
+                    ld_df  [exe_lq_idx] <= exe_dst_f;
+                    ld_pi  [exe_lq_idx] <= exe_pdest_i;
+                    ld_pf  [exe_lq_idx] <= exe_pdest_f;
+                    ld_addr[exe_lq_idx] <= exe_addr;
+                    ld_size[exe_lq_idx] <= exe_size;
+                    ld_uns [exe_lq_idx] <= exe_unsign;
+                    ld_hm  [exe_lq_idx] <= fwd_hit_w;
+                    ld_hd  [exe_lq_idx] <= fwd_data_w;
+                    //   ★ 槽号是 LQ_IW bit（LQ 32 ⇒ 5 bit）⇒ 必须零扩展到 TAG_W=6；
                     //     写 [TAG_W-1:0] 会取到向量外的位 ⇒ tag 为 **x** ⇒ 响应无法匹配（挂死）。
                     //     最高位恒 0 ⇒ 与 store 排空的"全 1"标签天然不撞车。
-                    ld_tag [newslot] <= {{(TAG_W-LQ_IW){1'b0}}, newslot};
+                    ld_tag [exe_lq_idx] <= {{(TAG_W-LQ_IW){1'b0}}, exe_lq_idx};
                 end
             end
 
@@ -599,9 +719,27 @@ module lsq_simple #(
                     ld_v  [si] <= 1'b0;
                     ld_req[si] <= 1'b0;
                     ld_dn [si] <= 1'b0;
+                    ld_ex [si] <= 1'b0;
                 end
             end
-            // ---- 4.5 store 排空标记与回收 ----
+            // ---- 4.5 提交排空：入队（全组）→ 出队（逐拍一笔）→ STQ 项回收 ----
+            //   ★ 入队与出队在**同一拍**都可能发生：`cdq_cnt` 必须用一条赋值合并，
+            //     否则后一条赋值会把前一条顶掉（净计数错 ⇒ 队空/队满判据失效）。
+            for (si = 0; si < W; si = si + 1) begin
+                if (dr_take[si]) begin
+                    cdq_v  [cdq_wp[si]] <= 1'b1;
+                    cdq_idx[cdq_wp[si]] <= dr_idx[si*STQ_IW +: STQ_IW];
+                    cdq_a  [cdq_wp[si]] <= stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
+                end
+            end
+            if (dr_push_n != {(CDQ_PW+1){1'b0}}) cdq_tail <= cdq_tail + dr_push_n[CDQ_PW-1:0];
+            if (dr_fire) begin
+                cdq_v[cdq_head] <= 1'b0;
+                cdq_head        <= cdq_head + 1'b1;
+            end
+            cdq_cnt <= cdq_cnt + dr_push_n - {{CDQ_PW{1'b0}}, dr_fire};
             //   队头回收：已排空（stq_ret）或已作废（冲刷/未执行前被清）⇒ 指针前移。
             //   ★ 若本拍分配器正好要写队头槽（队头无效时才可能），本拍不回收，
             //     否则会把新项顶掉（下拍再回收，不会饿死）。
@@ -624,6 +762,7 @@ module lsq_simple #(
                         ld_v[si]   <= 1'b0;
                         ld_req[si] <= 1'b0;
                         ld_dn[si]  <= 1'b0;
+                        ld_ex[si]  <= 1'b0;
                     end
                 end
             end
@@ -655,9 +794,9 @@ module lsq_simple #(
             $display("[lsu-dbg %m] pend_any=%b rsp_ok=%b dr_any=%b rspv=%b rsp_tag=%0d stq_head=%0d",
                      pend_any, rsp_ok, dr_any, mem_rsp_valid, mem_rsp_tag, stq_head_q);
             //   ★ B28 判别探针：E1 当拍信息 + pending 槽对每个 STQ 项的**命中条件分解**
-            $display("[lsu-dbg %m] E1 exe_valid=%b is_store=%b rob=%0d addr=0x%08x size=%0d | fwd_hit=%b fwd_all=%b lmask=%b newslot=%0d",
+            $display("[lsu-dbg %m] E1 exe_valid=%b is_store=%b rob=%0d addr=0x%08x size=%0d | fwd_hit=%b fwd_all=%b lmask=%b lq_idx=%0d",
                      exe_valid, exe_is_store, exe_rob, exe_addr, exe_size,
-                     fwd_hit_w, fwd_all_w, lmask_w, newslot);
+                     fwd_hit_w, fwd_all_w, lmask_w, exe_lq_idx);
             if (pend_any) begin
                 $display("[lsu-dbg %m] PEND sel=%0d addr=0x%08x size=%0d rob=%0d rob_head=%0d age_l=%0d",
                          pend_sel, ld_addr[pend_sel], ld_size[pend_sel], ld_rob[pend_sel],

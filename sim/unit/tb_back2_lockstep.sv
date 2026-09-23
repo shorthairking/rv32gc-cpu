@@ -88,22 +88,42 @@ module tb_back2_lockstep_top #(
     //   程序 1（分支密集+调用/返回）：实测 IPC=0.2469 ⇒ 下限 0.19（Q8=49，裕量 29%）
     //   程序 2（访存+CSR）       ：实测 IPC=0.1382 ⇒ 下限 0.1094（Q8=28，裕量 26%）
     //     （B29 修复后实测：913 拍/126 条；测量条件同上——参照核 2A、冷 I$/冷预测器、窗起点=2A 进入程序拍）
+    //   ★ 2B-4 新增两档（同一规程：每档 = 实测 × ≤0.8、裕量 ≥20%）：
+    //   程序 3（p4_fpu，RV32F 算术/比较/访存）：实测 IPC=0.0848（1073 拍/91 条）
+    //                                            ⇒ 下限 0.0625（Q8=16，裕量 24%）
+    //   程序 4（p5_mdu，乘/除/余流）          ：实测 IPC=0.0593（4469 拍/265 条）
+    //                                            ⇒ 下限 0.0469（Q8=12，裕量 20%）
+    //     两档都远低于程序 0–2：**参照核 2A 是顺序核**，FP 运算（FPU 固定 8 拍潜伏期、
+    //     div/sqrt 更长）与整数乘除（MDU 多拍）在 2A 侧逐条串行依赖 ⇒ 窗口被 2A 的
+    //     指令级延迟主导（本 TB 的 C5 主体=2A 提交吞吐，见文件头 C5 说明）。
     function integer ipc_lim_q8; input integer p;
         begin
             ipc_lim_q8 = (p == 0) ? 77 :
                          (p == 1) ? 49 :
-                         (p == 2) ? 28 : 0;   // 程序 2：实测 0.1382 ⇒ 下限 0.1094（Q8=28，裕量 26%）
+                         (p == 2) ? 28 :
+                         (p == 3) ? 16 :     // p4_fpu：实测 Q8=21（0.0848）⇒ 下限 0.0625（裕量 24%）
+                         (p == 4) ? 12 : 0;  // p5_mdu：实测 Q8=15（0.0593）⇒ 下限 0.0469（裕量 20%）
         end
     endfunction
 
     localparam [31:0] PROG_PC  = 32'h8000_0000;
     //   ★ 分基址（第 10 轮）：三个程序各占 16 KB 步进的独立基址 ⇒ 2A 的 I$ 陈旧行 tag 不同、
     //     永不命中（命中需 tag 相等）；镜像不变（程序全部 %pcrel 位置无关），黄金 PC 同量平移。
-    function [31:0] pbase; input integer i; begin pbase = PROG_PC + (i * 32'h4000); end endfunction
+    //   ★ 2B-4：5 个程序仍须全部落在 TB 存储体（64 KiB = 0x8000_0000..0x8000_FFFF）内
+    //     ⇒ 前三个保持 16 KB 步进（**既有三个程序的基址与黄金平移量不变**），
+    //     第 4/5 个用 0x8000_C000 / 0x8000_E000（8 KB 步进：镜像 ≤8 KB ⇒ 地址区间互不相交，
+    //     I$ 陈旧行的 tag 必不相同，仍然无需 fence.i）。
+    function [31:0] pbase;
+        input integer i;
+        begin
+            pbase = (i < 3) ? (PROG_PC + (i * 32'h4000))
+                            : (PROG_PC + 32'hC000 + ((i - 3) * 32'h2000));
+        end
+    endfunction
     localparam integer NI      = `BACK2_IQ_WR_PORTS;
     localparam integer GMAX    = 1024;
     localparam integer N_PMP   = `RV32GC_PMP_ENTRIES;
-    localparam integer P_NUM_L = 3;
+    localparam integer P_NUM_L = 5;   // ★ 2B-4：p1..p5（新增 p4_fpu / p5_mdu）
 
     // 跳板（XIP @0x1C00_0000）：lui x5,0x80000 ; jalr x0,0(x5) ⇒ 跳到 0x8000_0000
     localparam [31:0] STUB0 = 32'h800002b7;
@@ -488,9 +508,23 @@ module tb_back2_lockstep_top #(
             end
             if ((on2a | start2a) && (n2a < GMAX)) begin
                 r2a_pc[n2a] <= dbg_pc;
-                r2a_we[n2a] <= dbg_wen[0] & (dbg_wnum != 5'd0);
-                r2a_rd[n2a] <= dbg_wnum;
-                r2a_wd[n2a] <= dbg_wdata;
+                //   ★★ 2B-4（p4_fpu 暴露的**夹具可观测性缺陷**，不是 2A 功能缺陷）：
+                //     `debug0_wb_rf_wdata` 走的是 2A 的 `mw_wdata` 多路器，而 **FP 寄存器写**
+                //     （flw/fadd/…）的数据在 `mw_fp_wdata` 上（NaN-boxed）⇒ 调试口对 FP 写
+                //     给出的不是架构写回值（实测 `flw ft1,0(t1)`：调试口给 0x8000d000（地址），
+                //     Spike 黄金给 f1=0xffffffff_3f800000）。
+                //     本夹具改为**直接取 2A 的 FP 寄存器写口**（`mw_fp_we/rd/wdata`）——
+                //     判据不放宽：比的仍是"该指令的架构写回值"，且对 FP 写更忠实
+                //     （顺带修正 f0：FP 写 rd=0 是**真写**，不能用"rd!=0"推断）。
+                if (u_core2a.mw_fp_we) begin
+                    r2a_we[n2a] <= 1'b1;
+                    r2a_rd[n2a] <= u_core2a.mw_fp_rd;
+                    r2a_wd[n2a] <= u_core2a.mw_fp_wdata[31:0];
+                end else begin
+                    r2a_we[n2a] <= dbg_wen[0] & (dbg_wnum != 5'd0);
+                    r2a_rd[n2a] <= dbg_wnum;
+                    r2a_wd[n2a] <= dbg_wdata;
+                end
                 n2a <= n2a + 1;
             end
         end
@@ -590,6 +624,42 @@ module tb_back2_lockstep_top #(
     end
 
     //==========================================================================
+    // 6b. 判据⑤探针：同拍多 store 提交组 → LSQ 提交排空队列（CDQ）逐拍排空
+    //--------------------------------------------------------------------------
+    //   2B-4 任务①的验收证据。`rob.v` 允许同拍 ≤4 条 store 提交，而排空口每拍只发一笔
+    //   ⇒ LSQ 必须把**整组** store 全部收进 CDQ 并逐拍顺序落地（2B-3 的旧实现只排空
+    //   最低 lane，其余被提交却永不落地）。本探针同时给出：
+    //     · `n_multi_grp`：实测发生"≥2 store 同拍提交组"的拍数（覆盖率证据）；
+    //     · `cdq_peak`  ：CDQ 峰值占用（证明多 store 确实"多拍顺序发出"）；
+    //     · 记账不变式  ：**入队总数 = 排空总数 + 在队数**（判据⑤ 的断言）。
+    //==========================================================================
+    integer n_stg_push, n_stg_drain, n_multi_grp, cdq_peak;
+    integer n_stg_push_p  [0:4];
+    integer n_stg_drain_p [0:4];
+    integer n_multi_grp_p [0:4];
+    integer pb_i;
+    wire [2:0] drv_n = {2'b0, u_back.lsu_dr_valid[0]} + {2'b0, u_back.lsu_dr_valid[1]} +
+                       {2'b0, u_back.lsu_dr_valid[2]} + {2'b0, u_back.lsu_dr_valid[3]};
+    wire       drv_multi = (drv_n >= 3'd2);
+    always @(posedge clk) begin
+        if (rst_n) begin
+            if (|u_back.lsu_dr_valid) begin
+                n_stg_push = n_stg_push + drv_n;
+                if ((pi >= 0) && (pi < P_NUM_L)) n_stg_push_p[pi] = n_stg_push_p[pi] + drv_n;
+                if (drv_multi) begin
+                    n_multi_grp = n_multi_grp + 1;
+                    if ((pi >= 0) && (pi < P_NUM_L)) n_multi_grp_p[pi] = n_multi_grp_p[pi] + 1;
+                end
+            end
+            if (u_back.u_lsu.dr_fire) begin
+                n_stg_drain = n_stg_drain + 1;
+                if ((pi >= 0) && (pi < P_NUM_L)) n_stg_drain_p[pi] = n_stg_drain_p[pi] + 1;
+            end
+            if (u_back.u_lsu.cdq_cnt > cdq_peak[7:0]) cdq_peak = u_back.u_lsu.cdq_cnt;
+        end
+    end
+
+    //==========================================================================
     // 7. 主流程
     //==========================================================================
     integer pi, k, cyc, first_cyc, last_cyc, c4, n_commit_run;
@@ -650,6 +720,10 @@ module tb_back2_lockstep_top #(
         $display("== 锁步 TB 启动（第 1 拍前）");
         $fflush();
         n_checks = 0;
+        n_stg_push = 0; n_stg_drain = 0; n_multi_grp = 0; cdq_peak = 0;
+        for (pb_i = 0; pb_i < P_NUM_L; pb_i = pb_i + 1) begin
+            n_stg_push_p[pb_i] = 0; n_stg_drain_p[pb_i] = 0; n_multi_grp_p[pb_i] = 0;
+        end
         rst_n    = 1'b0;
         // ★ 必须显式调用内嵌映像/黄金轨迹装载任务：`include 只声明数组与任务，不会自动执行
         load_back2_data;
@@ -665,7 +739,9 @@ module tb_back2_lockstep_top #(
             case (pi)
                 0: cmax = P0_GOLD_N;
                 1: cmax = P1_GOLD_N;
-                default: cmax = P2_GOLD_N;
+                2: cmax = P2_GOLD_N;
+                3: cmax = P3_GOLD_N;
+                default: cmax = P4_GOLD_N;
             endcase
             $display("== 程序 %0d：黄金 %0d 条，映像 %0d 字 ==", pi, cmax, P_IMG_MAX);
             $fflush();
@@ -815,10 +891,23 @@ module tb_back2_lockstep_top #(
             chk(stats_ipc_q8 >= ipc_lim_q8(pi),
                 $sformatf("C5 程序 %0d 提交窗平均 IPC(Q8)=%0d 必须 ≥ %0d（分档防退化下限）",
                           pi, stats_ipc_q8, ipc_lim_q8(pi)));
+
+            // ---- 判据⑤：提交排空记账（push = drain + 在队）+ 覆盖率 ----
+            $display("      提交排空：入队 %0d 笔 / 排空 %0d 笔 / 同拍多 store 提交组 %0d 拍 / CDQ 峰值 %0d",
+                     n_stg_push_p[pi], n_stg_drain_p[pi], n_multi_grp_p[pi], u_back.u_lsu.cdq_cnt);
+            chk(n_stg_push_p[pi] == (n_stg_drain_p[pi] + u_back.u_lsu.cdq_cnt),
+                $sformatf("⑤ 程序 %0d：CDQ 记账一致（入队 %0d = 排空 %0d + 在队 %0d）",
+                          pi, n_stg_push_p[pi], n_stg_drain_p[pi], u_back.u_lsu.cdq_cnt));
         end
 
-        $display("== 检查项合计 %0d 项全部满足；提交总数 = %0d（3 程序）", n_checks,
-                 P0_GOLD_N + P1_GOLD_N + P2_GOLD_N);
+        $display("== 判据⑤ 覆盖证据（判据⑤）：同拍多 store 提交组合计 %0d 拍，CDQ 峰值占用 %0d，入队 %0d / 排空 %0d 笔",
+                 n_multi_grp, cdq_peak, n_stg_push, n_stg_drain);
+        chk(n_multi_grp > 0,
+            "⑤ 覆盖率：本轮至少出现一次「≥2 store 同拍提交组」（否则该路径未被覆盖）");
+        chk(n_stg_push == n_stg_drain,
+            "⑤ 全部已提交 store 均已排空落地（入队总数 = 排空总数）");
+        $display("== 检查项合计 %0d 项全部满足；提交总数 = %0d（%0d 程序）", n_checks,
+                 P0_GOLD_N + P1_GOLD_N + P2_GOLD_N + P3_GOLD_N + P4_GOLD_N, P_NUM_L);
         $display("TB_BACK2_LOCKSTEP: PASS");
         $finish;
     end

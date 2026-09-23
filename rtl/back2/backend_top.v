@@ -150,6 +150,7 @@ module backend_top #(
     localparam       PW_F  = `BACK2_PREG_F_W;
     localparam       SRC_N = 5;
     localparam       ROBW  = 7;              // ROB 索引位宽（= `BACK2_ROB_IDX_W）
+    localparam       LDW   = `BACK2_LQ_IDX_W;   // LQ 索引位宽
     localparam WBP_ALU0 = 0, WBP_ALU1 = 1, WBP_BRU = 2, WBP_MDU = 3,
                WBP_LSU  = 4, WBP_FPU  = 5, WBP_STD = 6;
 
@@ -207,6 +208,7 @@ module backend_top #(
     function [3:0] p_ckid; input [RB_W-1:0] p; begin p_ckid = p[`BACK2_U_CKPT_MSB:`BACK2_U_CKPT_LSB]; end endfunction
     function [2:0] p_cls;  input [RB_W-1:0] p; begin p_cls  = p[`BACK2_U_CLS_MSB:`BACK2_U_CLS_LSB]; end endfunction
     function [`BACK2_STQ_IDX_W-1:0] p_stq; input [RB_W-1:0] p; begin p_stq = p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB]; end endfunction
+    function [`BACK2_LQ_IDX_W-1:0]  p_lq;  input [RB_W-1:0] p; begin p_lq  = p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB];  end endfunction
     function [31:0] p_csrw;input [RB_W-1:0] p; begin p_csrw = p[`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB]; end endfunction
     function [11:0] p_csra;input [RB_W-1:0] p; begin p_csra = p[`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB]; end endfunction
     function [2:0]  p_csrop;input [RB_W-1:0] p;begin p_csrop= p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB]; end endfunction
@@ -221,35 +223,66 @@ module backend_top #(
     function t_cond; input [2:0] c; begin t_cond = (c == 3'd1); end endfunction
 
     // FP 归一化操作码（与 rtl/exec/fpu.v 头注 §1 的表逐条一致）
+    //   ★★ 2B-4 修复（锁步 p4_fpu 暴露，**3 组系统性错位**）：本函数必须与
+    //     `rtl/top/core_top.v` 的 `fp_op_map(de_fp_op, insn)` **逐条等价**（2A 核即按
+    //     那个映射执行，arch-test F/D 已全绿、且是锁步的比对基准）。旧实现按"自创"的
+    //     字段切法解码，三处错：
+    //       ① FSGNJ / FMIN-FMAX / FEQ-FLT-FLE 的**组内选择位取错**：这三族的变体由
+    //          **funct3（insn[14:12]）** 区分（`fsgnj.s/fsgnjn.s/fsgnjx.s` 与
+    //          `fmin.s/fmax.s`、`fle.s/flt.s/feq.s` 都是 rm 字段编码），旧实现却拿
+    //          **rs2 寄存器号**去选 ⇒ `fmin.s f14,f1,f4`（rs2=f4≠0）被当成 **FMAX**，
+    //          实测锁步第 27 条：乱序给 0x3f800000（max）而 Spike/2A 给 0xbf000000（min）。
+    //       ② `fcvt.s.w/wu/l/lu` 族的 funct5 = **11010**，旧实现写成 `01000` ⇒ 该族落到
+    //          `default 127`（fpu.v 对未定义 op 给"result=0、done 照常"）⇒ 静默错值。
+    //       ③ `01000` 实为 **F↔D 互转**（fcvt.s.d / fcvt.d.s），旧实现当成
+    //          `fcvt.s.w` 族 ⇒ 同样错值。
+    //     本段改为**照抄 2A 的映射**（含 funct3/fmt/rs2[0] 选择与 FMA 26–29）。
+    //   ★ F↔D 互转的组内选择：`insn[20]`（rs2 最低位）⇒ fcvt.s.d=24 / fcvt.d.s=25。
+    function [6:0] fp_cvt_map;
+        input [31:0] insn;
+        reg          is_d;
+        begin
+            is_d = (insn[26:25] == `RV32GC_FMT_D);
+            case (insn[31:27])
+                5'b01000: fp_cvt_map = insn[20] ? 7'd24 : 7'd25;              // F↔D
+                5'b11000: fp_cvt_map = is_d ? (insn[20] ? 7'd21 : 7'd20)      // →W/WU
+                                            : (insn[20] ? 7'd17 : 7'd16);
+                5'b11010: fp_cvt_map = is_d ? (insn[20] ? 7'd23 : 7'd22)      // →S/D
+                                            : (insn[20] ? 7'd19 : 7'd18);
+                default:  fp_cvt_map = 7'd0;
+            endcase
+        end
+    endfunction
+
     function [6:0] fp_op_map;
         input [31:0] insn;
-        reg [4:0] f5, rs2f;
+        reg [2:0] f3;
         begin
-            f5   = insn[31:27];
-            rs2f = insn[24:20];
+            f3 = insn[14:12];
             case (insn[6:0])
                 `RV32GC_OP_MADD : fp_op_map = 7'd26;
                 `RV32GC_OP_MSUB : fp_op_map = 7'd27;
                 `RV32GC_OP_NMSUB: fp_op_map = 7'd28;
                 `RV32GC_OP_NMADD: fp_op_map = 7'd29;
-                `RV32GC_OP_FP: case (f5)
-                    5'b00000: fp_op_map = 7'd0;
-                    5'b00001: fp_op_map = 7'd1;
-                    5'b00010: fp_op_map = 7'd2;
-                    5'b00011: fp_op_map = 7'd3;
-                    5'b01011: fp_op_map = 7'd4;
-                    5'b00100: fp_op_map = (rs2f == 5'd0) ? 7'd5 : (rs2f == 5'd1) ? 7'd6 : 7'd7;
-                    5'b00101: fp_op_map = (rs2f == 5'd0) ? 7'd8 : 7'd9;
-                    5'b10100: fp_op_map = (rs2f == 5'd2) ? 7'd10 : (rs2f == 5'd1) ? 7'd11 : 7'd12;
-                    5'b11100: fp_op_map = (rs2f == 5'd1) ? 7'd13 : 7'd14;
-                    5'b11110: fp_op_map = 7'd15;
-                    5'b01000: fp_op_map = (rs2f == 5'd0) ? 7'd18 : (rs2f == 5'd1) ? 7'd19 :
-                                          (rs2f == 5'd2) ? 7'd22 : 7'd23;
-                    5'b11000: fp_op_map = (rs2f == 5'd0) ? 7'd16 : (rs2f == 5'd1) ? 7'd17 :
-                                          (rs2f == 5'd2) ? 7'd20 : 7'd21;
-                    5'b01001: fp_op_map = 7'd24;
-                    5'b11001: fp_op_map = 7'd25;
-                    default : fp_op_map = 7'd127;
+                `RV32GC_OP_FP: case (insn[31:27])
+                    `RV32GC_FP_F5_FADD   : fp_op_map = 7'd0;
+                    `RV32GC_FP_F5_FSUB   : fp_op_map = 7'd1;
+                    `RV32GC_FP_F5_FMUL   : fp_op_map = 7'd2;
+                    `RV32GC_FP_F5_FDIV   : fp_op_map = 7'd3;
+                    `RV32GC_FP_F5_FSQRT  : fp_op_map = 7'd4;
+                    `RV32GC_FP_F5_FSGNJ  : fp_op_map = (f3 == `RV32GC_FP_F3_FSGNJ)  ? 7'd5 :
+                                                        (f3 == `RV32GC_FP_F3_FSGNJN) ? 7'd6 : 7'd7;
+                    `RV32GC_FP_F5_FMINMAX: fp_op_map = (f3 == `RV32GC_FP_F3_FMIN) ? 7'd8 : 7'd9;
+                    `RV32GC_FP_F5_FCMP   : fp_op_map = (f3 == `RV32GC_FP_F3_FEQ) ? 7'd10 :
+                                                        (f3 == `RV32GC_FP_F3_FLT) ? 7'd11 : 7'd12;
+                    `RV32GC_FP_F5_FMV_CMP: fp_op_map = (f3 == `RV32GC_FP_F3_FCLASS) ? 7'd13 : 7'd14;
+                    `RV32GC_FP_F5_FMV_W_X: fp_op_map = 7'd15;
+                    //   ★ 转换族三组都要进 `fp_cvt_map`：01000 = F↔D 互转、
+                    //     11000 = →W/WU（fcvt.w.s 等）、11010 = →S/D（fcvt.s.w 等）。
+                    //     （2A 侧由 decoder 的 `fp_cvt_any_ok` 归为一族后交给同一张表。）
+                    5'b01000, 5'b11000, 5'b11010
+                                         : fp_op_map = fp_cvt_map(insn);
+                    default              : fp_op_map = 7'd127;
                 endcase
                 default: fp_op_map = 7'd127;
             endcase
@@ -265,6 +298,10 @@ module backend_top #(
     wire [1:0]  snap_lane_w;
     wire [6:0]  restore_rob_idx_w;
     wire        mdu_free_w, fpu_free_w, lsu_iss_ok_w;
+    //   ★ 2B-4：LSQ 提交排空队列（CDQ）余量 —— rob.v 的 store 提交门（`mem_wr_ready`）。
+    //     语义变更：store 提交**不再**要求"排空口当拍空闲"，只要求 CDQ 放得下一整组
+    //     （≤4 笔）；排空口按 FIFO 逐拍把已提交的 store 落地（单端口、单笔在途不变）。
+    wire        lsu_dr_room_w;
     wire [31:0] csr_rdata_w;
     wire [2:0]  csr_frm_w;
     wire [4:0]  csr_ff_w;
@@ -277,6 +314,10 @@ module backend_top #(
     reg  [PW_I-1:0] mdu_if_pdi, fpu_if_pdi;
     reg  [PW_F-1:0] fpu_if_pdf;
     reg  [`BACK2_STQ_IDX_W-1:0] stq_of_rob [0:127];
+    //   ★ 2B-4 第二步：LQ 槽在 **D3 派发期**分配（load 项、程序序）⇒ 需要"ROB 项 → LQ 槽"
+    //     登记表供 E1 取用（与 store 的 `stq_of_rob` 同构）。
+    reg  [`BACK2_LQ_IDX_W-1:0]  lq_of_rob  [0:127];
+    wire [`BACK2_LQ_IDX_W-1:0]  lq_of_rob_r;
     wire [11:0] csr_raddr_w;
 
 
@@ -435,8 +476,15 @@ module backend_top #(
         wire is_fma  = (insn[6:0] == `RV32GC_OP_MADD) | (insn[6:0] == `RV32GC_OP_MSUB) |
                        (insn[6:0] == `RV32GC_OP_NMSUB)| (insn[6:0] == `RV32GC_OP_NMADD);
         wire is_opfp = (insn[6:0] == `RV32GC_OP_FP) | is_fma;
-        wire fp_src1_int = is_opfp & ~is_fma &
-                           ((f5 == 5'b11110) | ((f5 == 5'b01000) & ~rs2f[1]));
+        //   ★★ 2B-4 修复（锁步 p4_fpu 暴露）：**"源 1 是整数寄存器"的 FP 指令集合**必须与
+        //     2A 逐条一致（core_top §7.5：`e_fp_a_is_int = (e_fp_op==15)|(18)|(19)|(22)|(23)`）
+        //       · fmv.w.x / fmv.d.x（funct5=11110）      ⇒ op 15
+        //       · fcvt.s.w / .wu / fcvt.d.w / .wu（**11010**）⇒ op 18/19/22/23
+        //     旧实现把 `11110` 与 **`01000`**（= F↔D 互转，源是 **FP** 寄存器！）当成整数源、
+        //     又漏掉 `11010` ⇒ `fcvt.s.w` 既没被标成"整数源"（`rs1_used`=0）又被当成 FP 源
+        //     （`s1f`=1）⇒ 实测 `fcvt.s.w fs8,a4` 得 0xce820000（读的是 FP 口的垃圾），
+        //     而 Spike/2A 得 0x40a00000（5.0）。
+        wire fp_src1_int = is_opfp & ((f5 == `RV32GC_FP_F5_FMV_W_X) | (f5 == 5'b11010));
         wire unsup   = (opt == 4'd5) | (opt == 4'd8) | (opt == 4'd10) | (opt == 4'd15);
         wire illegal = ill_instr | (opt == 4'd15) | csr_ill | cbo_gate_ill;
         wire kill    = unsup | illegal;
@@ -446,8 +494,23 @@ module backend_top #(
                         ~kill & ~csr_zimm;
         wire rs2_int  = ((insn[6:0] == `RV32GC_OP_OP) | (opt == 4'd1) |
                          ((opt == 4'd4) & (memop == 4'd2))) & ~kill;
-        wire rs1_f    = is_opfp & ~is_fma & ~fp_src1_int & ~kill;
-        wire rs2_f    = (is_opfp ? ~is_fma : ((opt == 4'd12) & (memop == 4'd8))) & ~kill;
+        //   ★★ 2B-4 修复（锁步 p4_fpu 暴露）：**FMA 的三个操作数都是 FP 源**。
+        //     旧实现写成 `rs1_f/rs2_f = is_opfp & ~is_fma`（只有 rs3 是 FP 源）⇒ 重命名
+        //     只查/只唤醒第三个源，`pd_f_s[0]/[1]`（= FPU 的 a/b）停留在未映射值
+        //     ⇒ 实测 `fmadd.s fs3,ft2,ft3,ft1` 得 0x3f800000（= c）而 Spike/2A 给
+        //     0x41000000（2×3.5+1=8.0）。源槽映射见 §2 组装：s1←rs1、s2←rs2、s3←rs3，
+        //     与 fpu.v 的 `.a/.b/.c` 端口一一对应 ⇒ 三者都必须置位。
+        wire rs1_f    = is_opfp & ~fp_src1_int & ~kill;
+        //   ★ 源 2 只有"双 FP 源"的族（算术/符号注入/min-max/比较）+ FMA + FP store 才存在：
+        //     fsqrt / fmv.x.w / fclass / fcvt.* 的源 2 域是**变体选择位**，不是寄存器号
+        //     ⇒ 置位会凭空多出一个 FP 依赖（性能假停顿，且 fp_op_map 之外无任何用处）。
+        wire fp_two_fp_src = is_opfp & ~is_fma &
+                             ((f5 == `RV32GC_FP_F5_FADD)   | (f5 == `RV32GC_FP_F5_FSUB) |
+                              (f5 == `RV32GC_FP_F5_FMUL)   | (f5 == `RV32GC_FP_F5_FDIV) |
+                              (f5 == `RV32GC_FP_F5_FSGNJ)  | (f5 == `RV32GC_FP_F5_FMINMAX) |
+                              (f5 == `RV32GC_FP_F5_FCMP));
+        wire rs2_f    = (fp_two_fp_src | is_fma |
+                         ((opt == 4'd12) & (memop == 4'd8))) & ~kill;
         wire rs3_f    = is_fma & ~kill;
         wire dst_fp   = fp_we & (drd != 5'd0) & ~kill;
         wire dst_int  = ~fp_we & (drd != 5'd0) & (wbsel != WB_NONE) & ~kill;
@@ -659,6 +722,14 @@ module backend_top #(
     assign st_alloc_v[3] = d1_v_q[3] & d1_uop_q[3][`BACK2_UB_IS_STORE];
     wire       st_alloc_ok;
     wire [DISP_W*`BACK2_STQ_IDX_W-1:0] st_alloc_idx;
+    //   ★ 2B-4 第二步：LQ 在 D3 派发期为 **load** lane 分配（槽位 = 程序序）
+    wire [DISP_W-1:0] ld_alloc_v;
+    wire       ld_alloc_ok;
+    wire [DISP_W*LDW-1:0] ld_alloc_idx;
+    assign ld_alloc_v[0] = d1_v_q[0] & u_is_ld(d1_uop_q[0]);
+    assign ld_alloc_v[1] = d1_v_q[1] & u_is_ld(d1_uop_q[1]);
+    assign ld_alloc_v[2] = d1_v_q[2] & u_is_ld(d1_uop_q[2]);
+    assign ld_alloc_v[3] = d1_v_q[3] & u_is_ld(d1_uop_q[3]);
     //   ★ STQ 分配同时把各 lane 的 ROB 索引送进 LSQ：ROB 项与 lane 一一对应
     //     （同一块内 lane 0 最老：ROB 索引 = rob_alloc_idx0 + lane，与 §IQ 写口同式）。
     assign st_alloc_rob = {rob_alloc_idx0 + 7'd3, rob_alloc_idx0 + 7'd2,
@@ -666,7 +737,8 @@ module backend_top #(
     wire [3:0]  lsu_dr_ok_w;
     wire        disp_ok = (d1_v_q != {DISP_W{1'b0}}) & ~rn_i_busy & ~rn_f_busy &
                           ~squash_v_w & ~flush_all_w & ~trap_halt_q &
-                          rob_alloc_ready & free_i_ok & free_f_ok & iq_room_ok & st_alloc_ok;
+                          rob_alloc_ready & free_i_ok & free_f_ok & iq_room_ok &
+                          st_alloc_ok & ld_alloc_ok;
     assign disp_fire_w = disp_ok;
     assign blk_ready_o = (d1_v_q == {DISP_W{1'b0}}) | disp_fire_w;
 
@@ -761,6 +833,9 @@ module backend_top #(
     generate
     for (g5 = 0; g5 < DISP_W; g5 = g5 + 1) begin : g_rb
         assign rob_pay_w[g5*RB_W +: RB_W] = {
+            //   ★ 2B-4：顶端 [415:411] 放 LQ 索引（与 STQ 字段同理：加在最顶端不影响
+            //     其下任何字段的绝对位置；RB_W 仍 416）
+            ld_alloc_idx[g5*LDW +: LDW],                   // LQ 索引
             st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],   // STQ 索引
             5'b0,                                          // fflags
             1'b0,                                          // tr_taken（执行期回写）
@@ -890,7 +965,12 @@ module backend_top #(
     //       对一般程序可达）。真要放开，必须把 LQ 分配改到 **D3 派发期**（程序序分配、
     //       提交点释放，天然无此环）—— ROB 载荷 [415:411] 恰有 5 bit 空闲位可用（见
     //       `back2_params.vh` §2 的空位注），留作后续段。
-    iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ), .INORD_LOAD(1)) u_iq4 (   // B28 防死锁门（与精确 STQ 闸门并联）
+    //   ★★ 2B-4 第二步：LQ 槽已改为 **D3 派发期**分配（程序序）⇒ 2B-3 里"槽在 E1 分配"
+    //     造成的**结构性死锁**（年轻 load 占满 32 槽 ⇒ 更老 load 永不发射 ⇒ ROB 头卡死
+    //     ⇒ 槽永不释放）从根上消失：任何人都不可能抢走更老指令已分到的槽。
+    //     故队列级门撤销（`INORD_LOAD=0`），"更老未定址 store"的保守语义由 §2.1 的
+    //     精确 STQ 闸门（`iss_ok`）独立承担 —— 实测五个程序逐位不变（见报告 §B4.1）。
+    iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ), .INORD_LOAD(0)) u_iq4 (   // 2B-4: LQ 派发期分配 ⇒ 可放开
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
@@ -985,11 +1065,35 @@ module backend_top #(
                               (bru_act_tk & bru_cmp_t & (bru_target != bru_pred_n)));
 
     // MDU（至多 1 条在飞；busy/done 握手）
+    //   ★★ 2B-4 修复（锁步 p5_mdu 暴露）：`start` 必须取 **E1 有效**（`x_i2_v[3]`），
+    //     不能取 **发射拍**（`iq_iss_v[3]`）——mdu.v/fpu.v 的端口契约是
+    //     "`start`/`req_valid` 与操作数在**同一拍**被采样"（2A 侧即 `e_mdu_go`/`e_fp_go`
+    //     与 `e_rs1_byp`/`e_fp_src*` 同拍）。而本后端的操作数走 **E1**（`iprf_ra[6..10]`
+    //     = `u_ps1i(x_i2_uop[3/5])`，见 §PRF 读口），发射拍的操作数尚不在 `x_i2_*` 里
+    //     ⇒ 旧接法把"发射拍"当启动、却把"上一拍的 x_i2 内容"当操作数：
+    //     该 FP/MDU 指令**永远不启动** ⇒ `done` 不来 ⇒ `fpu_if_v/mdu_if_v` 恒 1
+    //     ⇒ 队列永久停摆（锁步实测：p4_fpu 第 20 条 `fadd.s` 处挂死，探针
+    //     `fpu_busy=0 拍 / fpu_done=0 拍` 而 `x_i2_v[5]` 已脉冲 1 拍）。
     wire        mdu_busy, mdu_done;
     wire [31:0] mdu_result;
-    wire        mdu_go = iq_iss_v[3];
+    wire        mdu_go = x_i2_v[3];
+    //   ★★ 2B-4 修复（锁步 p4_fpu 暴露）：**年龄限定冲刷** —— squash 只能杀"比 squash 点
+    //     更年轻"的在飞工作。旧实现把 `flush(squash_v_w | flush_all_w)` **无条件**送进
+    //     mdu/fpu，同时又无条件清 `*_if_v`：若在飞项**比 squash 点更老**（典型：它正是
+    //     ROB 头，前端口一次误判回滚时它并不在作废范围内），它的 ROB 项不会被作废，但执行
+    //     被冲掉 ⇒ `done` 永不再来 ⇒ ROB 头永久卡住（实测：p4_fpu 第 40 条 `fmv.x.w`
+    //     在 c=493 被 `squash_idx=66` 的冲刷打掉，`fpu_if_rob=42=rob_head`，
+    //     之后 200000 拍 ROB 头 hdone 恒 0、IQ-5 仍在发更年轻的 FP 指令）。
+    //     判据与 ROB/LSU 同口径（无掩码窗口算术，B27 纪律）：
+    //       age(在飞项) > age(squash 点) ⇒ 该项更年轻 ⇒ 本次冲刷该杀它。
+    wire        mdu_kill = flush_all_w |
+                           (squash_v_w & (((mdu_if_rob - rob_head_w) & 7'h7F) >
+                                          ((squash_idx_w - rob_head_w) & 7'h7F)));
+    wire        fpu_kill = flush_all_w |
+                           (squash_v_w & (((fpu_if_rob - rob_head_w) & 7'h7F) >
+                                          ((squash_idx_w - rob_head_w) & 7'h7F)));
     wire [4:0] mdu_brop = x_i2_uop[3][`BACK2_U_BROP_MSB:`BACK2_U_BROP_LSB];
-    mdu u_mdu (.aclk(clk), .aresetn(rst_n), .start(mdu_go), .flush(squash_v_w | flush_all_w),
+    mdu u_mdu (.aclk(clk), .aresetn(rst_n), .start(mdu_go), .flush(mdu_kill),
                .mdu_op(mdu_brop[2:0]),
                .a(iprf_rd[6*32 +: 32]), .b(iprf_rd[7*32 +: 32]),
                .busy(mdu_busy), .done(mdu_done), .result(mdu_result));
@@ -1001,8 +1105,9 @@ module backend_top #(
     wire [63:0] fpu_a = u_s1f(x_i2_uop[5]) ? fprf_rd[0*64 +: 64]
                                             : {32'hFFFF_FFFF, iprf_rd[10*32 +: 32]};
     fpu u_fpu (
-        .clk(clk), .rst_n(rst_n), .flush(squash_v_w | flush_all_w),
-        .req_valid(iq_iss_v[5]), .fp_op(u_fpop(x_i2_uop[5])),
+        .clk(clk), .rst_n(rst_n), .flush(fpu_kill),
+        //   ★★ 2B-4 同上：`req_valid` 取 **E1 有效**（与 `.a/.b/.c` 同拍）
+        .req_valid(x_i2_v[5]), .fp_op(u_fpop(x_i2_uop[5])),
         .fmt(u_fmt(x_i2_uop[5])), .rm(x_i2_uop[5][`BACK2_U_RM_MSB:`BACK2_U_RM_LSB]),
         .frm(csr_frm_w), .a(fpu_a), .b(fprf_rd[1*64 +: 64]), .c(fprf_rd[2*64 +: 64]),
         .busy(fpu_busy), .done(fpu_done), .result(fpu_result),
@@ -1028,6 +1133,9 @@ module backend_top #(
         .squash(squash_v_w), .squash_idx(squash_idx_w), .rob_head(rob_head_w),
         .alloc_valid(st_alloc_v & {DISP_W{disp_fire_w}}),
         .alloc_rob(st_alloc_rob),
+        .lalloc_valid(ld_alloc_v & {DISP_W{disp_fire_w}}),
+        .lalloc_rob(st_alloc_rob),
+        .lalloc_ok(ld_alloc_ok), .lalloc_idx(ld_alloc_idx),
         .alloc_ok(st_alloc_ok), .alloc_idx(st_alloc_idx),
         .exe_valid(x_i2_v[4]), .exe_is_store(u_is_st(x_i2_uop[4])),
         .exe_is_fp(u_fpls(x_i2_uop[4])),
@@ -1038,12 +1146,14 @@ module backend_top #(
         .exe_dst_i(u_di(x_i2_uop[4])), .exe_dst_f(u_df(x_i2_uop[4])),
         //   ★ 目的物理号取 **PDIDST**（u_pdi），不是源 1（u_ps1i）；写口/唤醒 tag 同源。
         .exe_pdest_i(u_pdi(x_i2_uop[4])), .exe_pdest_f(u_pdf(x_i2_uop[4])),
-        .exe_stq_idx(stq_of_rob_r),
+        .exe_stq_idx(stq_of_rob_r), .exe_lq_idx(lq_of_rob_r),
         //   ★ 发射闸门按**候选**（i4_sel）的 ROB 索引判年龄；iss_ok 即接 IQ 的 iss_ready。
         .iss_rob(i4_sel_rob),
         .iss_ok(lsu_iss_ok_w), 
         .dr_valid(lsu_dr_valid), .dr_idx(lsu_dr_idx),
         .cmt_n(cmt_n_w),
+        //   ★ 2B-4：CDQ 余量回送 ROB 的 store 提交门（见 §7 的 `mem_wr_ready` 接线）
+        .dr_room_ok(lsu_dr_room_w),
         .mem_req_valid(mem_req_valid_o), .mem_req_wen(mem_req_wen_o),
         .mem_req_addr(mem_req_addr_o), .mem_req_wdata(mem_req_wdata_o),
         .mem_req_wstrb(mem_req_wstrb_o), .mem_req_tag(mem_req_tag_o),
@@ -1065,6 +1175,8 @@ module backend_top #(
     assign mdu_free_w = ~mdu_if_v;
     assign fpu_free_w = ~fpu_if_v;
     assign stq_of_rob_r = stq_of_rob[x_i2_rob[4]];
+    //   ★ 2B-4：E1 的 load 取"派发期分到的 LQ 槽"（组合读 `lq_of_rob`，与 stq_of_rob 同法）
+    assign lq_of_rob_r  = lq_of_rob[x_i2_rob[4]];
     wire [31:0] a0_wb_data = (csr_v_w & (csr_uop[`BACK2_UAX_Q_MSB:`BACK2_UAX_Q_LSB] == `BACK2_Q_ALU0))
                              ? csr_rdata_w : a0_res;   // ★ B29：按 CSR 实际槽/队列
     wire        a0_wb_i    = u_di(x_i2_uop[0]);
@@ -1310,7 +1422,10 @@ module backend_top #(
         .upd_tr_taken(bru_act_tk), .upd_tr_target(bru_target),
         .upd_ff_valid(upd_ff_v), .upd_ff_idx(fpu_if_rob), .upd_ff_flags(fpu_ff),
         .upd_exc_valid(1'b0), .upd_exc_idx(7'd0), .upd_exc_code(4'd0), .upd_exc_tval(32'h0),
-        .mem_wr_ready(mem_req_ready_i),
+        //   ★ 2B-4：store 提交门 = LSQ 的 CDQ 余量（不再是"排空口空闲"）——
+        //     同拍多 store 提交组全部入队、逐拍顺序排空；`mem_req_ready_i` 仍作为排空口
+        //     本身的握手（在 lsq_simple 内使用）。
+        .mem_wr_ready(lsu_dr_room_w),
         .cmt_valid(cmt_raw), .cmt_payload(cmt_pay),
         .cmt_st_drain(cmt_st_drain), .cmt_st_ckpt(cmt_st_ckpt), .cmt_st_branch(cmt_st_branch),
         .trap_valid(trap_v_rob), .trap_pc(trap_pc_o), .trap_cause(trap_cause_o),
@@ -1531,15 +1646,15 @@ module backend_top #(
             fpu_if_df <= 1'b0; fpu_if_pdi <= {PW_I{1'b0}}; fpu_if_pdf <= {PW_F{1'b0}};
             for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) ck_rob_q[si2] <= 7'd0;
             for (si2 = 0; si2 < 128; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
+            for (si2 = 0; si2 < 128; si2 = si2 + 1) lq_of_rob[si2]  <= {`BACK2_LQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= 107'h0;
         end else begin
             busy_i_q <= busy_i_nx;
             busy_f_q <= busy_f_nx;
 
-            // ---- MDU/FPU 在途登记 ----
-            if (squash_v_w | flush_all_w) begin
+            // ---- MDU/FPU 在途登记（★ 只清"被本次冲刷杀掉的"在飞项，见 mdu_kill/fpu_kill）
+            if (mdu_kill) begin
                 mdu_if_v <= 1'b0;
-                fpu_if_v <= 1'b0;
             end else begin
                 if (iq_iss_v[3] & ~iq_iss_dead[3]) begin
                     mdu_if_v   <= 1'b1;
@@ -1548,6 +1663,10 @@ module backend_top #(
                     mdu_if_di  <= u_di(iq_iss_uop[3]);
                     mdu_if_pdi <= u_pdi(iq_iss_uop[3]);
                 end else if (mdu_done) mdu_if_v <= 1'b0;
+            end
+            if (fpu_kill) begin
+                fpu_if_v <= 1'b0;
+            end else begin
                 if (iq_iss_v[5] & ~iq_iss_dead[5]) begin
                     fpu_if_v   <= 1'b1;
                     fpu_if_rob <= iq_iss_rob[5];
@@ -1561,9 +1680,12 @@ module backend_top #(
 
             // ---- STQ 归属表（store 的 ROB 项 → STQ 索引）----
             if (disp_fire_w) begin
-                for (si2 = 0; si2 < DISP_W; si2 = si2 + 1)
+                for (si2 = 0; si2 < DISP_W; si2 = si2 + 1) begin
                     if (st_alloc_v[si2])
                         stq_of_rob[rob_alloc_idx0 + si2[6:0]] <= st_alloc_idx[si2*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W];
+                    if (ld_alloc_v[si2])
+                        lq_of_rob[rob_alloc_idx0 + si2[6:0]]  <= ld_alloc_idx[si2*LDW +: LDW];
+                end
             end
 
             // ---- 检查点表（登记 / 释放）----

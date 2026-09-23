@@ -39,6 +39,14 @@ module tb_back2_lsq_fwd_top;
     reg [ROBW-1:0]   iss_rob = 0;
     reg [2:0]        cmt_n = 0;
     wire             alloc_ok;
+    //   ★ 2B-4 第二步新增：LQ 槽在 **D3 派发期**分配 ⇒ 直驱夹具也要显式派发一次 LQ 分配，
+    //     并把分到的槽号在 E1 通过 `exe_lq_idx` 送回（与 backend_top 的用法一致）。
+    localparam integer LQ_IW = `BACK2_LQ_IDX_W;
+    reg [3:0]        lalloc_valid = 0;
+    reg [4*ROBW-1:0] lalloc_rob = 0;
+    wire             lalloc_ok;
+    wire [4*LQ_IW-1:0] lalloc_idx;
+    reg [LQ_IW-1:0]  exe_lq_idx = 0;
     wire [4*STQ_IW-1:0] alloc_idx;
     reg              exe_valid = 0, exe_is_store = 0, exe_is_fp = 0;
     reg [ROBW-1:0]   exe_rob = 0;
@@ -78,10 +86,13 @@ module tb_back2_lsq_fwd_top;
         .squash_idx(squash_idx), .rob_head(rob_head),
         .alloc_valid(alloc_valid), .alloc_rob(alloc_rob),
         .alloc_ok(alloc_ok), .alloc_idx(alloc_idx),
+        .lalloc_valid(lalloc_valid), .lalloc_rob(lalloc_rob),
+        .lalloc_ok(lalloc_ok), .lalloc_idx(lalloc_idx),
         .exe_valid(exe_valid), .exe_is_store(exe_is_store), .exe_is_fp(exe_is_fp),
         .exe_rob(exe_rob), .exe_epoch(exe_epoch), .exe_addr(exe_addr), .exe_wdata(exe_wdata),
         .exe_size(exe_size), .exe_unsign(exe_unsign), .exe_dst_i(exe_dst_i), .exe_dst_f(exe_dst_f),
         .exe_pdest_i(exe_pdest_i), .exe_pdest_f(exe_pdest_f), .exe_stq_idx(exe_stq_idx),
+        .exe_lq_idx(exe_lq_idx),
         .iss_rob(iss_rob), .iss_ok(iss_ok), .dr_valid(dr_valid), .dr_idx(dr_idx),
         .cmt_n(cmt_n),
         .mem_req_valid(mem_req_valid), .mem_req_wen(mem_req_wen), .mem_req_addr(mem_req_addr),
@@ -125,11 +136,19 @@ module tb_back2_lsq_fwd_top;
         end
     endtask
 
-    // ---- 单条 load 入队（E1）----
+    // ---- 单条 load：**D3 派发分配 LQ 槽** → E1（★ 2B-4 第二步口径）----
     task ld_issue(input [ROBW-1:0] rob, input [31:0] a, input [2:0] sz, input uns);
+        reg [LQ_IW-1:0] lslot;
         begin
             @(negedge clk);
+            lalloc_valid = 4'h1;
+            lalloc_rob[0*ROBW +: ROBW] = rob;
+            lslot = lalloc_idx[0*LQ_IW +: LQ_IW];   // 分配拍采样（组合读空闲表）
+            @(posedge clk);                          // 分配发生
+            @(negedge clk);
+            lalloc_valid = 4'h0;
             exe_valid = 1'b1; exe_is_store = 1'b0; exe_rob = rob;
+            exe_lq_idx = lslot;
             iss_rob = rob;
             exe_addr = a; exe_size = sz; exe_unsign = uns;
             @(posedge clk);
@@ -173,6 +192,15 @@ module tb_back2_lsq_fwd_top;
             @(negedge clk);
         end
     endtask
+
+    // ---- LQ 占用统计（判据③的 C7：提交点释放的可观测判据）----
+    function integer lq_occ;
+        integer q;
+        begin
+            lq_occ = 0;
+            for (q = 0; q < OUT_N; q = q + 1) if (u_lsq.ld_v[q]) lq_occ = lq_occ + 1;
+        end
+    endfunction
 
     // ---- 驱动 store 提交排空（dr_valid/dr_idx），使其离开 STQ ----
     task drain_store(input [STQ_IW-1:0] slot);
@@ -252,9 +280,32 @@ module tb_back2_lsq_fwd_top;
         wait_wb(32'h1357_2468, v, rq);
         chk(v == 32'h0000_7A5A, "C6 半字转发正确");
 
+        // ---------- C7（第 11 项）：LQ **提交点释放**（2B-3 第二步的释放语义）----------
+        //   旧口径是"响应到达即释放槽"；现口径是"响应只置 ld_dn（数据已齐），槽留到该 load
+        //   按程序序提交才释放"。本用例直驱该路径：
+        //     ① 发一条无命中 load（走存储器）→ 等写回；
+        //     ② 写回后断言 LQ 占用 **+1**（数据已齐但槽仍占 —— 证明不是"响应即释放"）；
+        //     ③ 驱动 `rob_head` 指向该 load 的 rob 号并给 `cmt_n=1`（模拟 ROB 提交组）；
+        //     ④ 断言 LQ 占用回到原值（槽被提交点释放）。
+        //   ★ 恰好**一项**检查（判据③要求 tb_back2_lsq_fwd 由 10 项增为 11 项）。
+        begin : c7
+            integer occ0, occ1, occ2;
+            occ0 = lq_occ();
+            ld_issue(7'd20, 32'h8000_9000, 3'd2, 1'b0);
+            wait_wb(32'h5566_7788, v, rq);
+            occ1 = lq_occ();
+            rob_head = 7'd20; cmt_n = 3'd1;          // ROB 提交该 load
+            @(posedge clk);
+            @(negedge clk);
+            cmt_n = 3'd0;
+            occ2 = lq_occ();
+            chk((occ1 == (occ0 + 1)) && (occ2 == occ0),
+                "C7 LQ 提交点释放：写回后仍占用（+1）、提交后释放（回原值）");
+        end
+
         // ---------- 结果 ----------
         if (n_fail == 0) begin
-            $display("== 检查项合计 %0d 项全部满足（转发掩码/合并/最年轻优先/全转发不访存/无命中走访存）", n_chk);
+            $display("== 检查项合计 %0d 项全部满足（转发掩码/合并/最年轻优先/全转发不访存/无命中走访存/LQ 提交点释放）", n_chk);
             $display("TB_BACK2_LSQ_FWD: PASS");
         end else begin
             $display("== 检查项 %0d 项中失败 %0d 项", n_chk, n_fail);
