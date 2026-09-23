@@ -15,8 +15,8 @@
 //   → 核内 AXI 读引擎（复用 2A 的 `axi_master_ctrl`）；**数据侧**本段为显式占位。
 //
 // 【端口契约】48 个契约端口与 `rtl/top/core_top.v` **逐端口同名同向同位宽**
-//   （核对表见报告 §B4.2.2）。此外**新增 10 个占位端口** `oo_mem_*`（LSU 访存口直连
-//   TB 内存模型；第 3 段换成 L1D + AXI 后删除）。
+//   （核对表见报告 §B4.2.2）。**2B-4 第 3 段起：不再有占位端口**（`oo_mem_*` 已删除，
+//   数据侧接 2A `l1d` + 核内 AXI 引擎）。
 //
 // 【本段"真实现"清单】
 //   ① 取指：RESET_PC=0x1C00_0000（由 front4/pc_gen4 内置）→ XIP 直通（不查 L1I）
@@ -38,9 +38,9 @@
 //     （第 4 段接 csr_file 的 PMP 上下文）。
 //
 // 【★ 本段"占位"清单（必须注释标注；报告 §B4.2.3 同步登记）】
-//   · **数据侧（LSU）**：`oo_mem_*` 占位端口直连 TB 内存模型；**第 3 段**换
-//     L1D + AXI（届时与取指共用总线主口，需按 2A 的"单笔在途 + 归属寄存器"三件套
-//     做 I/D 仲裁）。
+//   · **数据侧（LSU）**：**2B-4 第 3 段已接入** 2A `l1d`（32 KB/4 路/32 B 行）+
+//     核内 AXI 引擎；I/D 共用单笔在途总线口，仲裁优先序按 2A §11.1：
+//     写回 > D 填充 > uncached 数据/PTE > XIP 取指 > I 填充。
 //   · **完整 CSR / 陷阱 / 中断**：本段用 `backend_top` 内的 `b2_csr` 过渡栈
 //     （mscratch/mepc/mcause/mtvec/mstatus + fcsr）；`intrpt[7:0]` **本段不接**
 //     （CLINT/PLIC 端口按任务书悬空/契约电平）；完整特权与异常交付留**第 4 段**。
@@ -137,23 +137,9 @@ module core_top_2b (
     output wire [31:0] debug0_wb_pc,       // 提交组 lane 0 的 PC
     output wire [3:0]  debug0_wb_rf_wen,   // ★ [3:0]；本文件只驱动 [0]（与 2A 同口径）
     output wire [4:0]  debug0_wb_rf_wnum,  // 目的架构寄存器号（提交组 lane 0）
-    output wire [31:0] debug0_wb_rf_wdata, // 写回数据（提交组 lane 0）
-
-    //==========================================================================
-    // ★ 占位端口（2B-4 第 2 段专用；**第 3 段换 L1D + AXI 后删除**）
-    //   LSU 访存口直连 TB 内存模型：单请求口 + 带标签响应（与 backend_top 的
-    //   `mem_req_*`/`mem_rsp_*` 逐位相同），tag 宽度 = `BACK2_MEM_TAG_W`。
-    //==========================================================================
-    output wire                     oo_mem_req_valid,
-    output wire                     oo_mem_req_wen,
-    output wire [31:0]              oo_mem_req_addr,
-    output wire [31:0]              oo_mem_req_wdata,
-    output wire [3:0]               oo_mem_req_wstrb,
-    output wire [`BACK2_MEM_TAG_W-1:0] oo_mem_req_tag,
-    input  wire                     oo_mem_req_ready,
-    input  wire                     oo_mem_rsp_valid,
-    input  wire [31:0]              oo_mem_rsp_rdata,
-    input  wire [`BACK2_MEM_TAG_W-1:0] oo_mem_rsp_tag
+    output wire [31:0] debug0_wb_rf_wdata  // 写回数据（提交组 lane 0）
+    //   ★ 2B-4 第 3 段：数据侧占位端口 `oo_mem_*` **已删除** —— LSU 访存口改接
+    //     `l1d` 实例 + 核内 AXI 引擎（§4b/§5）⇒ 端口契约 = **纯 48 端口**。
 );
 
     //==========================================================================
@@ -387,6 +373,30 @@ module core_top_2b (
     wire [4:0]  l1i_fill_word_idx;
     wire        l1i_fill_done;
 
+    // D 侧（§4b）
+    wire        d_ready_w, d_rsp_v_w;
+    wire [31:0] d_rsp_d_w;
+    wire [`BACK2_MEM_TAG_W-1:0] d_rsp_tag_w;
+    wire        l1d_cs_ready, l1d_cs_miss, l1d_cs_stall, l1d_cs_wr_done, l1d_idle;
+    wire [31:0] l1d_cs_rdata;
+    wire        l1d_fill_req;
+    wire [31:0] l1d_fill_paddr;
+    wire [1:0]  l1d_fill_owner;
+    wire [4:0]  l1d_fill_beats;
+    wire        l1d_fill_accepted, l1d_fill_valid, l1d_fill_done;
+    wire [31:0] l1d_fill_data;
+    wire [4:0]  l1d_fill_word_idx;
+    wire        l1d_wb_req, l1d_wb_accepted, l1d_wb_done, l1d_wb_ready;
+    wire [31:0] l1d_wb_paddr, l1d_wb_data;
+    wire [1:0]  l1d_wb_way, l1d_wb_owner;
+    wire [4:0]  l1d_wb_beats, l1d_wb_word_idx;
+    // uncached 直通（由 §5 引擎服务）
+    wire        d_unc_done_w;
+    wire [31:0] d_unc_rdata_w;
+    // §5 引擎内部
+    wire        axi_wdata_ready_w, axi_done_w;
+    wire [2:0]  arlock_raw, awlock_raw;  // axi_master_ctrl 的 lock 为 3 bit（只用 [0]）
+
     wire        l1i_cs_req = l1i_req_valid;
     wire [31:0] l1i_cs_vaddr = l1i_req_addr;
 
@@ -434,66 +444,261 @@ module core_top_2b (
     assign unc_rsp_data  = xip_word_data_q;
 
     //==========================================================================
-    // 5. 核内 AXI 读引擎（单笔在途；三源：XIP 单字 / L1I 行填充 / PTE 单字）
+    // 4b. 数据侧：LSU ↔ L1D（2A 实例）+ uncached 分流（★ 2B-4 第 3 段新增）
     //--------------------------------------------------------------------------
-    //  ★ 只写"核内请求粘合"：AXI 五通道握手全部在 2A `axi_master_ctrl` 内
-    //    （红线：不重写 AXI 协议逻辑）。单笔在途 + 归属寄存器（本块的 `i_src_q`）。
-    //  ★ 优先级：XIP（启动关键路径）> L1I 填充 > PTE 读。
+    //   LSU 的存储口是"单请求 + 带标签响应"（`lsq_simple` §3.3）：
+    //    · load ：`mem_req_valid`(we=0) 握手 ⇒ 之后等 `mem_rsp_valid` 且 tag 匹配；
+    //    · store：`mem_req_valid`(we=1) 握手即视为"已落地"（STQ 项当拍释放）
+    //      ⇒ 适配器在**握手拍接管** store 的 {addr,data,strb}，此后自行完成
+    //        （可能要先填充整行），LSU 不再过问。
+    //   适配器状态机（组合判据 + 少量寄存器；与 2A M 级 LSU 的状态口径同构）：
+    //    IDLE → (cacheable) 发 `l1d.cs_req` → HIT：读命中 `cs_ready` 次拍回数据、
+    //            写命中 `cs_wr_done` 当拍完成；
+    //          MISS：L1D 自行先写回脏受害者（`wb_req`）再请求填充（`fill_req`），
+    //                两个握手都由 §5 的核内 AXI 引擎服务；期间 `cs_stall=1`
+    //                ⇒ 适配器进入 RETRY，等 L1D 回到 IDLE 后**重发**同一次访问。
+    //    IDLE → (uncached：XIP 窗口/MMIO，由 2A `mmio_route` 判定) 直接走 §5 引擎
+    //             的单 beat 读/写（不查 L1D）—— 与 2A 的 MDTA 口径一致。
+    //   ★ 本段 `cs_vaddr = cs_paddr`（Bare；`satp` 占位见 §2），第 4 段接 Sv32 后
+    //     两者分离（tag/index 用 VA）。
     //==========================================================================
-    localparam [1:0] ISRC_XIP = 2'd0, ISRC_FILL = 2'd1, ISRC_PTE = 2'd2;
-    //   axi_master_ctrl 的 lock 原始输出（只驱动 [0]，见 §5 末）
-    wire [2:0] arlock_raw, awlock_raw;   // axi_master_ctrl 的 lock 为 3 bit（本核只用 [0]）
+    wire        lsu_req_v, lsu_req_we;
+    wire [31:0] lsu_req_a, lsu_req_d;
+    wire [3:0]  lsu_req_strb;
+    wire [`BACK2_MEM_TAG_W-1:0] lsu_req_tag;
 
-    reg        i_busy_q;
-    reg [1:0]  i_src_q;
-    reg [4:0]  i_cnt_q;          // 已收 beat 数（从 0 起）
-    reg [4:0]  i_last_q;         // 末 beat 序号（= beat 数 - 1）
+    // ---- uncached 判定（2A `mmio_route` 只读复用；窗口口径不与 2A 分叉）----
+    wire [2:0]  d_mr_route;
+    wire        d_mr_no_axi, d_mr_clint_plic, d_mr_xip, d_mr_unc, d_mr_cac;
+    mmio_route u_mmio_route_d (
+        .pa_i(lsu_req_a), .route_o(d_mr_route), .no_axi_o(d_mr_no_axi),
+        .clint_plic_o(d_mr_clint_plic), .xip_direct_o(d_mr_xip),
+        .axi_uncached_o(d_mr_unc), .axi_cached_o(d_mr_cac),
+        .clint_hit_o(), .plic_hit_o(), .periph_hit_o()
+    );
+    //   ★ 本段：CLINT/PLIC 未接（第 4 段）⇒ 落到该窗口的访问**不产生总线事务**、
+    //     立即"完成"（读回 0 / 写丢弃），避免挂死；报告 §B4.3.3 登记为占位。
+    wire        d_clint_plic = (d_mr_route != 3'd0) & d_mr_clint_plic;
+    wire        d_unc_w      = (d_mr_route != 3'd0) & (d_mr_unc | d_mr_xip | d_mr_no_axi) &
+                               ~d_clint_plic;
 
-    wire        i_pte_go  = ptw_pte_req_valid;
-    wire        i_fill_go = l1i_fill_req;
-    wire        i_xip_go  = xip_req_go;
-    wire        i_any_go  = ~i_busy_q & (i_xip_go | i_fill_go | i_pte_go);
-    wire [1:0]  i_src_new = i_xip_go ? ISRC_XIP : (i_fill_go ? ISRC_FILL : ISRC_PTE);
+    //   ★★ 组合环警告（本段踩过）：**不得**把 `l1d.cs_stall` 用在"是否发请求"的组合式里
+    //      —— `cs_stall = access | cs_miss | (ms_state!=IDLE) | maint`，而 `access = cs_req`
+    //      ⇒ `cs_req ← cs_stall ← access = cs_req` 成环（iverilog 判环 ⇒ 全网 x ⇒ 一条不提交）。
+    //      重试判据只用 **纯寄存器量**：`l1d.idle = (ms_state_q==MS_IDLE) & ~maint_q` ✓。
+    localparam [1:0] AD_IDLE = 2'd0, AD_REQ = 2'd1, AD_WAIT = 2'd2, AD_RETRY = 2'd3;
 
-    wire        axi_req_ready_w;
-    wire        i_fire = i_any_go & axi_req_ready_w;
+    reg [1:0]   ad_st_q;
+    reg         d_we_q;
+    reg         d_unc_q;                 // 该笔走 uncached 直通（AXI 单 beat）
+    reg         d_cp_q;                  // 该笔落 CLINT/PLIC 窗口（本段无总线事务，占位）
+    reg [31:0]  d_a_q, d_d_q;
+    reg [3:0]   d_strb_q;
+    reg [`BACK2_MEM_TAG_W-1:0] d_tag_q;
 
-    wire [4:0]  i_beats_new = (i_src_new == ISRC_FILL) ? (l1i_fill_beats + 5'd1) : 5'd1;
+    wire        l1d_busy_w = ~l1d_idle;              // FSM 非空闲（填充/写回/维护）
+    wire        d_idle     = (ad_st_q == AD_IDLE);
+    assign      d_ready_w  = d_idle & ~l1d_busy_w;   // 可接管新请求
+    wire        d_start    = d_ready_w & lsu_req_v;
 
-    // 归属/接受握手（同拍）
-    assign l1i_fill_accepted = i_fire & (i_src_new == ISRC_FILL);
-    assign pte_req_ready_w   = i_fire & (i_src_new == ISRC_PTE);
+    // 请求发射：AD_REQ 拍恰好一次（重试时等 L1D 回到 IDLE）
+    wire        l1d_cs_req_w = (ad_st_q == AD_REQ);
+    wire [31:0] d_rdata_w    = d_unc_q ? d_unc_rdata_w : l1d_cs_rdata;
+    assign      d_rsp_v_w    = (ad_st_q == AD_WAIT) & ~d_we_q &
+                               (d_cp_q ? 1'b1 :
+                                d_unc_q ? d_unc_done_w : l1d_cs_ready);
+    assign      d_rsp_d_w    = d_cp_q ? 32'h0 : d_rdata_w;
+    assign      d_rsp_tag_w  = d_tag_q;
 
-    // AXI 请求属性
-    wire [63:0] i_addr_64 = (i_src_new == ISRC_XIP)  ? {32'h0, xip_req_pa} :
-                            (i_src_new == ISRC_FILL) ? {32'h0, l1i_fill_paddr} :
-                                                       {32'h0, ptw_pte_req_pa};
-    wire [3:0]  i_cache_new = (i_src_new == ISRC_XIP) ? 4'b0000 : 4'b1111;  // XIP=非缓存
+    l1d #(.OWNER_D_FILL(2'd1), .OWNER_WRBACK(2'd2)) u_l1d (
+        .clk(aclk), .rst_n(aresetn),
+        .cs_req(l1d_cs_req_w), .cs_we(d_we_q), .cs_wstrb(d_strb_q),
+        .cs_paddr(d_a_q), .cs_vaddr(d_a_q), .cs_wdata(d_d_q),
+        .cs_ready(l1d_cs_ready), .cs_rdata(l1d_cs_rdata),
+        .cs_miss(l1d_cs_miss), .cs_stall(l1d_cs_stall), .cs_wr_done(l1d_cs_wr_done),
+        .fill_req(l1d_fill_req), .fill_paddr(l1d_fill_paddr), .fill_owner(l1d_fill_owner),
+        .fill_beats(l1d_fill_beats), .fill_accepted(l1d_fill_accepted),
+        .fill_valid(l1d_fill_valid), .fill_data(l1d_fill_data),
+        .fill_word_idx(l1d_fill_word_idx), .fill_done(l1d_fill_done),
+        .wb_req(l1d_wb_req), .wb_paddr(l1d_wb_paddr), .wb_way(l1d_wb_way),
+        .wb_owner(l1d_wb_owner), .wb_beats(l1d_wb_beats), .wb_accepted(l1d_wb_accepted),
+        .wb_word_idx(l1d_wb_word_idx), .wb_data(l1d_wb_data), .wb_done(l1d_wb_done),
+        .wb_ready(l1d_wb_ready),
+        //   ★ 占位：L1D 维护（fence.i / cbo.inval / clean）本段无 CSR 提交源 ⇒ 恒 0
+        .inval_all(1'b0), .clean_all(1'b0), .idle(l1d_idle)
+    );
 
+    // ---- 适配器时序 ----
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
-            i_busy_q <= 1'b0; i_src_q <= ISRC_XIP; i_cnt_q <= 5'd0; i_last_q <= 5'd0;
+            ad_st_q <= AD_IDLE;
+            d_we_q <= 1'b0; d_unc_q <= 1'b0; d_cp_q <= 1'b0;
+            d_a_q <= 32'h0; d_d_q <= 32'h0; d_strb_q <= 4'h0;
+            d_tag_q <= {`BACK2_MEM_TAG_W{1'b0}};
         end else begin
-            if (i_fire) begin
-                i_busy_q <= 1'b1;
-                i_src_q  <= i_src_new;
-                i_cnt_q  <= 5'd0;
-                i_last_q <= i_beats_new - 5'd1;
-            end else if (r_fire_w) begin
-                if (i_cnt_q == i_last_q) i_busy_q <= 1'b0;
-                else                     i_cnt_q <= i_cnt_q + 5'd1;
-            end
+            case (ad_st_q)
+                AD_IDLE: begin
+                    if (d_start) begin
+                        d_we_q   <= lsu_req_we;
+                        d_a_q    <= lsu_req_a;
+                        d_d_q    <= lsu_req_d;
+                        d_strb_q <= lsu_req_strb;
+                        d_tag_q  <= lsu_req_tag;
+                        d_unc_q  <= d_unc_w;
+                        d_cp_q   <= d_clint_plic;
+                        ad_st_q  <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                    end
+                end
+                AD_REQ: begin
+                    // 请求已呈现一拍：写命中当拍完成（st_hit 组合），否则进 AD_WAIT
+                    ad_st_q <= l1d_cs_wr_done ? AD_IDLE : AD_WAIT;
+                end
+                AD_WAIT: begin
+                    if (d_cp_q)                                          ad_st_q <= AD_IDLE;
+                    else if (d_unc_q) begin if (d_unc_done_w)            ad_st_q <= AD_IDLE; end
+                    else if (d_we_q ? l1d_cs_wr_done : l1d_cs_ready)     ad_st_q <= AD_IDLE;
+                    else if (l1d_cs_miss)                                ad_st_q <= AD_RETRY;
+                end
+                AD_RETRY: begin
+                    // 缺失/写回由 L1D 自理（请求已由 §5 引擎服务）；回到 IDLE 后重发访问
+                    if (l1d_idle) ad_st_q <= AD_REQ;
+                end
+                default: ad_st_q <= AD_IDLE;
+            endcase
         end
     end
 
-    // 每 beat 交付（`r_fire_w` = R 握手拍）
+    //==========================================================================
+    // 5. 核内 AXI 引擎（单笔在途；I/D 共用；★ 第 3 段扩为"读 + 写"）
+    //--------------------------------------------------------------------------
+    //  ★ 只写"核内请求粘合"：AXI 五通道握手全部在 2A `axi_master_ctrl` 内
+    //    （红线：不重写 AXI 协议逻辑）。单笔在途 + 归属寄存器（`i_own_q`）。
+    //  请求源与优先序（**逐条对齐 2A core_top §11.1**）：
+    //    ① L1D 脏行写回 `l1d_wb_req`（写突发，8 beat）
+    //    ② L1D 行填充   `l1d_fill_req`（读突发，8 beat）
+    //    ③ uncached 数据 `d_unc_q`（单 beat，读/写；含 XIP 窗口数据访问）
+    //       —— 2A 把 PTE 取也归在 M 级 MDTA 一档，本引擎把 PTE 读放在同一档
+    //    ④ PTE 读 `ptw_pte_req_valid`（单 beat）
+    //    ⑤ XIP 取指字 `xip_req_go`（单 beat）
+    //    ⑥ L1I 行填充 `l1i_fill_req`（读突发，8 beat）
+    //  读拍按 `i_own_q` 分发；写拍的 W 数据按来源取（L1D 写回取 `wb_data`，
+    //  uncached store 取接管时锁存的数据/字节使能）。
+    //==========================================================================
+    localparam [2:0] IOWN_WRBK = 3'd0, IOWN_DFIL = 3'd1, IOWN_DUNC = 3'd2,
+                     IOWN_PTE  = 3'd3, IOWN_XIPF = 3'd4, IOWN_IFIL = 3'd5;
+    localparam [1:0] IST_IDLE = 2'd0, IST_RD = 2'd1, IST_WR = 2'd2, IST_WB = 2'd3;
+
+    reg [1:0]  ist_q;
+    reg [2:0]  i_own_q;
+    reg [4:0]  i_cnt_q;          // 已处理 beat 数（从 0 起）
+    reg [4:0]  i_last_q;         // 末 beat 序号（= beat 数 - 1）
+    reg [1:0]  i_wdly_q;         // 写回数据建立等待（行缓冲读延迟；2 拍保险）
+
+    wire        i_free   = (ist_q == IST_IDLE);
+    wire        d_unc_rd = (ad_st_q == AD_WAIT) & d_unc_q & ~d_we_q;
+    wire        d_unc_wr = (ad_st_q == AD_WAIT) & d_unc_q &  d_we_q;
+
+    // ---- 仲裁（2A §11.1 优先序）----
+    wire        g_wrbk = i_free &  l1d_wb_req;
+    wire        g_dfil = i_free & ~l1d_wb_req &  l1d_fill_req;
+    wire        g_dunc = i_free & ~l1d_wb_req & ~l1d_fill_req & (d_unc_rd | d_unc_wr);
+    wire        g_pte  = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
+                         ptw_pte_req_valid;
+    wire        g_xipf = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
+                         ~ptw_pte_req_valid & xip_req_go;
+    wire        g_ifil = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
+                         ~ptw_pte_req_valid & ~xip_req_go & l1i_fill_req;
+
+    wire        i_req_v   = g_wrbk | g_dfil | g_dunc | g_pte | g_xipf | g_ifil;
+    wire        i_req_wr  = g_wrbk | d_unc_wr;
+    wire [2:0]  i_own_new = g_wrbk ? IOWN_WRBK : g_dfil ? IOWN_DFIL : g_dunc ? IOWN_DUNC :
+                            g_pte  ? IOWN_PTE  : g_xipf ? IOWN_XIPF : IOWN_IFIL;
+    wire [31:0] i_addr_new= g_wrbk ? l1d_wb_paddr : g_dfil ? l1d_fill_paddr :
+                            g_dunc ? d_a_q : g_pte ? ptw_pte_req_pa :
+                            g_xipf ? xip_req_pa : l1i_fill_paddr;
+    wire [4:0]  i_beats_new = g_wrbk ? (l1d_wb_beats + 5'd1) :
+                              g_dfil ? (l1d_fill_beats + 5'd1) :
+                              g_ifil ? (l1i_fill_beats + 5'd1) : 5'd1;
+    wire [3:0]  i_cache_new = (g_wrbk | g_dfil | g_ifil) ? 4'b1111 : 4'b0000;
+    wire [3:0]  i_strb_new  = g_dunc ? d_strb_q : 4'hF;
+
+    wire        axi_req_ready_w;
+    wire        i_fire = i_req_v & axi_req_ready_w;
+
+    // 归属/接受握手（同拍）
+    assign l1d_fill_accepted = i_fire & (i_own_new == IOWN_DFIL);
+    assign l1i_fill_accepted = i_fire & (i_own_new == IOWN_IFIL);
+    assign l1d_wb_accepted   = i_fire & (i_own_new == IOWN_WRBK);
+    assign pte_req_ready_w   = i_fire & (i_own_new == IOWN_PTE);
+
+    // R 拍：`r_fire_w` = R 握手拍
     wire        r_fire_w = rvalid & rready;
-    assign l1i_fill_valid    = r_fire_w & (i_src_q == ISRC_FILL);
+
+    // W 拍数据源
+    wire        w_beat_now  = (ist_q == IST_WR) & (i_wdly_q == 2'd0);
+    wire        w_is_wrbk   = (i_own_q == IOWN_WRBK);
+    wire [31:0] w_data_sel  = w_is_wrbk ? l1d_wb_data : d_d_q;
+    wire        w_ready_w   = axi_wdata_ready_w;
+    wire        w_fire      = w_beat_now & w_ready_w;
+
+    // ---- 时序 ----
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            ist_q <= IST_IDLE; i_own_q <= IOWN_XIPF; i_cnt_q <= 5'd0; i_last_q <= 5'd0;
+            i_wdly_q <= 2'd0;
+        end else begin
+            case (ist_q)
+                IST_IDLE: begin
+                    if (i_fire) begin
+                        i_own_q  <= i_own_new;
+                        i_cnt_q  <= 5'd0;
+                        i_last_q <= i_beats_new - 5'd1;
+                        ist_q    <= i_req_wr ? IST_WR : IST_RD;
+                        i_wdly_q <= 2'd2;      // 写回数据建立（行缓冲读延迟）
+                    end
+                end
+                IST_RD: begin
+                    if (r_fire_w) begin
+                        if (i_cnt_q == i_last_q) ist_q <= IST_IDLE;
+                        else                     i_cnt_q <= i_cnt_q + 5'd1;
+                    end
+                end
+                IST_WR: begin
+                    if (i_wdly_q != 2'd0) i_wdly_q <= i_wdly_q - 2'd1;
+                    else if (w_fire) begin
+                        if (i_cnt_q == i_last_q) begin
+                            ist_q   <= IST_WB;
+                            i_wdly_q<= 2'd2;
+                        end else begin
+                            i_cnt_q <= i_cnt_q + 5'd1;
+                            i_wdly_q<= 2'd2;
+                        end
+                    end
+                end
+                IST_WB: begin
+                    // 等 B 响应 / 控制器 done（写事务收尾）
+                    if (axi_done_w) ist_q <= IST_IDLE;
+                end
+                default: ist_q <= IST_IDLE;
+            endcase
+        end
+    end
+
+    // ---- 读拍分发 ----
+    assign l1d_fill_valid    = r_fire_w & (i_own_q == IOWN_DFIL);
+    assign l1d_fill_data     = rdata;
+    assign l1d_fill_word_idx = i_cnt_q;
+    assign l1d_fill_done     = r_fire_w & (i_own_q == IOWN_DFIL) & (i_cnt_q == i_last_q);
+    assign l1i_fill_valid    = r_fire_w & (i_own_q == IOWN_IFIL);
     assign l1i_fill_data     = rdata;
     assign l1i_fill_word_idx = i_cnt_q;
-    assign l1i_fill_done     = r_fire_w & (i_src_q == ISRC_FILL) & (i_cnt_q == i_last_q);
-    assign pte_resp_valid_w  = r_fire_w & (i_src_q == ISRC_PTE);
+    assign l1i_fill_done     = r_fire_w & (i_own_q == IOWN_IFIL) & (i_cnt_q == i_last_q);
+    assign pte_resp_valid_w  = r_fire_w & (i_own_q == IOWN_PTE);
     assign pte_resp_data_w   = rdata;
+
+    // ---- 写拍分发（L1D 写回：逐字取行缓冲；uncached store：单 beat）----
+    assign l1d_wb_word_idx = i_cnt_q;
+    assign l1d_wb_done     = (ist_q == IST_WR) & w_is_wrbk & w_fire & (i_cnt_q == i_last_q);
 
     // XIP 字锁存 + 在途跟踪
     always @(posedge aclk or negedge aresetn) begin
@@ -501,20 +706,37 @@ module core_top_2b (
             xip_word_pa_q <= 32'h0; xip_word_data_q <= 32'h0000_0013;
             xip_word_vld_q <= 1'b0; xip_req_pend_q <= 1'b0;
         end else begin
-            if (i_fire & (i_src_new == ISRC_XIP)) begin
+            if (i_fire & (i_own_new == IOWN_XIPF)) begin
                 xip_req_pend_q <= 1'b1;
                 xip_word_vld_q <= 1'b0;
                 xip_word_pa_q  <= xip_req_pa;
             end
-            if (r_fire_w & (i_src_q == ISRC_XIP) & (i_cnt_q == i_last_q)) begin
-                xip_req_pend_q <= 1'b0;
-                xip_word_vld_q <= 1'b1;
-                xip_word_data_q<= rdata;
+            if (r_fire_w & (i_own_q == IOWN_XIPF) & (i_cnt_q == i_last_q)) begin
+                xip_req_pend_q  <= 1'b0;
+                xip_word_vld_q  <= 1'b1;
+                xip_word_data_q <= rdata;
             end
-            // 字被消费（PC 已前移）⇒ 清 valid
             if (xip_word_vld_q & ~xip_hit_held) xip_word_vld_q <= 1'b0;
         end
     end
+
+    // uncached 数据完成/数据（读：R 拍锁存；写：最后一个 W 拍 + B）
+    reg        d_unc_done_r;
+    reg [31:0] d_unc_rdata_r;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            d_unc_done_r <= 1'b0; d_unc_rdata_r <= 32'h0;
+        end else begin
+            d_unc_done_r <= 1'b0;
+            if (r_fire_w & (i_own_q == IOWN_DUNC)) begin
+                d_unc_rdata_r <= rdata;
+                if (i_cnt_q == i_last_q) d_unc_done_r <= 1'b1;
+            end
+            if (ist_q == IST_WB) d_unc_done_r <= axi_done_w;   // 写事务收尾
+        end
+    end
+    assign d_unc_done_w  = d_unc_done_r;
+    assign d_unc_rdata_w = d_unc_rdata_r;
 
     axi_master_ctrl #(
         .ADDR_W(32), .DATA_W(32), .STRB_W(4), .ID_W(4), .LEN_W(4),
@@ -522,23 +744,23 @@ module core_top_2b (
         .USE_REQ_ATTRS(1)
     ) u_axi (
         .clk(aclk), .rst_n(aresetn),
-        .req_valid(i_any_go),
-        .req_is_write(1'b0),                 // 本段只读（数据侧占位 ⇒ 无写主设备）
+        .req_valid(i_req_v),
+        .req_is_write(i_req_wr),
         .req_owner(3'd0),
-        .req_addr(i_addr_64[31:0]),
+        .req_addr(i_addr_new),
         .req_len(i_beats_new[3:0] - 4'd1),
         .req_beats(i_beats_new),
-        .req_split(1'b0),                    // 32 B 行/单字均 4 K 内（不跨页）
+        .req_split(1'b0),                    // 32 B 行/单字均不跨 4 K
         .req_beats_1(i_beats_new),
         .req_beats_2(5'd0),
         .req_id(AXI_ID_IFILL),
         .req_ready(axi_req_ready_w),
         .req_cache(i_cache_new),
-        .req_strb(4'h0),
-        .wdata_valid(1'b0), .wdata_data(32'h0), .wdata_ready(),
+        .req_strb(i_strb_new),
+        .wdata_valid(w_beat_now), .wdata_data(w_data_sel), .wdata_ready(axi_wdata_ready_w),
         .rdata_valid(), .rdata_data(), .rdata_hold(), .rdata_id(), .rdata_last(),
         .rdata_ready(1'b1),
-        .done(), .done_owner(), .done_addr(), .resp_error(), .resp_code(),
+        .done(axi_done_w), .done_owner(), .done_addr(), .resp_error(), .resp_code(),
         .m_awid(awid), .m_awaddr(awaddr), .m_awlen(awlen), .m_awsize(awsize),
         .m_awburst(awburst), .m_awlock(awlock_raw), .m_awcache(awcache), .m_awprot(awprot),
         .m_awvalid(awvalid), .m_awready(awready),
@@ -591,12 +813,12 @@ module core_top_2b (
         .d2_push_valid_o(d2_push_valid), .d2_push_addr_o(d2_push_addr),
         .d2_pop_valid_o(d2_pop_valid), .d2_pop_addr_o(d2_pop_addr),
         // ---- ★ 占位：数据侧访存口直连 TB 内存模型（第 3 段换 L1D/AXI）----
-        .mem_req_valid_o(oo_mem_req_valid), .mem_req_wen_o(oo_mem_req_wen),
-        .mem_req_addr_o(oo_mem_req_addr), .mem_req_wdata_o(oo_mem_req_wdata),
-        .mem_req_wstrb_o(oo_mem_req_wstrb), .mem_req_tag_o(oo_mem_req_tag),
-        .mem_req_ready_i(oo_mem_req_ready),
-        .mem_rsp_valid_i(oo_mem_rsp_valid), .mem_rsp_rdata_i(oo_mem_rsp_rdata),
-        .mem_rsp_tag_i(oo_mem_rsp_tag),
+        .mem_req_valid_o(lsu_req_v), .mem_req_wen_o(lsu_req_we),
+        .mem_req_addr_o(lsu_req_a), .mem_req_wdata_o(lsu_req_d),
+        .mem_req_wstrb_o(lsu_req_strb), .mem_req_tag_o(lsu_req_tag),
+        .mem_req_ready_i(d_ready_w),
+        .mem_rsp_valid_i(d_rsp_v_w), .mem_rsp_rdata_i(d_rsp_d_w),
+        .mem_rsp_tag_i(d_rsp_tag_w),
         .commit_valid_o(commit_valid), .commit_pc_o(commit_pc),
         .commit_arch_rd_o(commit_arch_rd), .commit_arch_rd_wdata_o(commit_arch_rd_wdata),
         .commit_arch_we_o(commit_arch_we),

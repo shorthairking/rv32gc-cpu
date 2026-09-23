@@ -2038,3 +2038,106 @@ iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[
 # 全量回归（新 TB 被 glob 自动纳入 ⇒ 32 项）
 ./scripts/regress.sh
 ```
+
+---
+
+# 2B-4 第 3 段 · **数据侧集成**：LSU → L1D → I/D 共用 AXI 引擎（删占位端口）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 HEAD=`e32c608`=tag `2B-4.2`，**未提交**）
+> 改动：`rtl/top/core_top_2b.v`、`sim/unit/tb_core_top_2b.sv`、
+> `sim/unit/prog/{back2_p6_l1d.S（新增）, gen_back2_lockstep_data.py, back2_lockstep_data.svh}`；
+> **2A 既有文件零修改（只读例化）**；`scripts/regress.sh` 未改。备份：`../.b2chk/*.s10`。
+
+## B4.3.0 结论
+
+| 判据 | 结果 |
+|---|---|
+| ① 整设计编译零错误 | ✅ `-Wall` 0 error / 0 隐式网 / 0 位宽不匹配 |
+| ② 数据程序（p3_memcsr + p6_l1d） | ✅ 两程序 **PC 流 + 写回寄存器轨迹（rd/写回值）均与 Spike 黄金逐条一致** |
+| ②' AXI 计数自证走 L1D | ✅ p6：**AR=13（XIP 3）/ R=80 / AW=2 / W=16 / B=2** = 2 笔**脏行写回**（8 beat×2）⇒ 写通道有真实流量 |
+| ③ p1_int 不回退 | ✅ **449 拍 / 161 条（黄金 161）**，与第 2 段逐位一致 |
+| ④ regress 32/32 | ✅ 见 §B4.3.4 | 
+| ⑤ 报告（接线/仲裁/PTW 复用/流量自证） | ✅ §B4.3.1–§B4.3.3 |
+
+## B4.3.1 L1D 接线与适配器（`core_top_2b §4b`）
+
+- **占位端口已删除**：`oo_mem_*` 10 个端口全部移除 ⇒ 顶级**回到纯 48 端口契约**（§B4.2.2 的表 48/48 依旧成立）。
+- **适配器（`AD_IDLE/AD_REQ/AD_WAIT/AD_RETRY` 四态）**把 LSU 的"单请求 + 带标签响应"口
+  翻译成 2A `l1d` 的 cache 访问口：
+  - **load**：`AD_REQ` 发一拍 `cs_req`（we=0）→ `AD_WAIT` 收 `cs_ready`（读命中，次拍数据到）
+    ⇒ 出 `mem_rsp_valid` + `mem_rsp_rdata` + 原 tag；
+  - **store**：`AD_REQ` 发一拍 `cs_req`（we=1 + strb + data）→ 写命中 `cs_wr_done` **当拍**完成；
+    **store 在 LSU 握手拍即被接管**（拷贝 addr/data/strb/tag），此后由适配器负责落地
+    （LSU 侧 STQ 项已释放，符合"提交即落地"语义）；
+  - **缺失**：`cs_miss` ⇒ `AD_RETRY`，L1D 自行"先写回脏受害者（`wb_req`）再填充（`fill_req`）"，
+    两个握手都由 §5 引擎服务；L1D 回到 `idle` 后适配器**重发**同一次访问（重试命中）。
+  - **uncached 分流**：复用 2A `mmio_route` 判定 XIP/MMIO 窗口 ⇒ 走引擎单 beat 读/写（不查 L1D）。
+- **★ 组合环教训（本段踩过并已修）**：**不得**把 `l1d.cs_stall` 用于"是否发请求"的组合式
+  —— `cs_stall = access | cs_miss | (ms_state!=IDLE) | maint` 而 `access = cs_req`
+  ⇒ `cs_req ← cs_stall ← cs_req` 成环（iverilog 判环 ⇒ 全网 x ⇒ **一条不提交**）。
+  重试判据只用**纯寄存器量** `l1d.idle = (ms_state_q==MS_IDLE) & ~maint_q`。已在 RTL 注释写明。
+- **命中/写回口径**：读 `cs_ready`/写 `cs_wr_done`/缺失 `cs_miss`/脏行 `wb_req`+`wb_data`
+  全部按 2A `l1d` 端口语义使用，未改 2A 任何文件。
+
+## B4.3.2 I/D 仲裁与优先序（§5 引擎扩展为"读 + 写"）
+
+- **单笔在途 + 归属寄存器**（`ist_q`/`i_own_q`）纪律不变；**不重写 AXI 协议**
+  （五通道握手仍在 2A `axi_master_ctrl` 内）。
+- **请求源与优先序（逐条对齐 2A `core_top` §11.1 的 grant 链）**：
+  `① L1D 脏行写回 > ② L1D 行填充 > ③ uncached 数据（含 PTE 读，2A 归在 MDTA 一档）
+   > ④ XIP 取指字 > ⑤ L1I 行填充`。
+- **读拍分发**：按 `i_own_q` 把 R 拍数据交给 L1D 填充 / L1I 填充 / PTE / XIP / uncached；
+- **写拍**：写回逐字取 `l1d.wb_data`（驱动 `wb_word_idx`，等 `wb_ready`，经 `wdata_valid/data`
+  推 W 通道），末拍给 `wb_done`；uncached store 单 beat（接管时锁存的 strb/data）。
+
+## B4.3.3 PTW 串行复用恢复说明（结构就位）
+
+- 2A 的口径是"PTW 单请求口由 **M 级 FSM 串行复用**：数据侧优先，空闲时代取指跑一次遍历"
+  （`m_tr_src_q` 记归属，见 2A §9.4.1）。本段的 `core_top_2b` **没有 M 级 FSM**（乱序核的
+  访存不发翻译请求：`satp` 占位 = Bare ⇒ `sv32_translate_en=0`，L1D 访问直接用 PA）。
+- 因此本段的结构是：**取指侧独占 PTW**（`tlb.lookup2_*` + `ptw`），**数据侧翻译请求恒 0** —— 
+  与 2A"数据侧优先"的**争用场景在本段不存在**（不是绕过纪律，而是无争用）。
+- **第 4 段必须做的事**（占位登记，§B4.2.3 第 3/4 项延续）：接 csr_file 的 satp/sfence 后，
+  L1D 访问需 VA→PA ⇒ 数据侧翻译请求出现 ⇒ **恢复 2A 的串行复用**：加 `m_tr_src` 归属寄存器、
+  数据侧优先仲裁、PTE 读/写（含 A/D 更新）共用同一 PTW 请求口与 §5 引擎。
+
+## B4.3.4 验证台账（判据逐条）
+
+| 程序 | 拍数 | 提交（黄金） | C1' PC | C3' 写回数据 | AXI AR | R | AW | W | B |
+|---|---|---|---|---|---|---|---|---|---|
+| p1_int | 449 | 161（161） | ✅ | ✅ | 9（XIP 3） | 51 | 0 | 0 | 0 |
+| p3_memcsr | 462 | 126（126） | ✅ | ✅ | 8（XIP 3） | 43 | 0 | 0 | 0 |
+| **p6_l1d** | 1077 | 366（366） | ✅ | ✅ | 13（XIP 3） | 80 | **2** | **16** | **2** |
+
+- **检查项 25 项全过**（每个程序 7–9 项：PC 流/条数/写回 rd/写回值/AXI 读/写流量/无异常）。
+- **AXI 写流量自证**：p6 的 2 笔 AW × 8 beat = 16 个 W beat ✓ = 2 条**脏行写回**
+  （p6 按 4 KB 步进向同一组写 5+ 条行 ⇒ 4 路组相联必然逐出；`l1d.wb_req` ⇒ §5 引擎写突发）。
+- **p3 的 0 写流量是正确行为**：其工作集 ≪ 32 KB，store 全部驻留 L1D（未逐出）。
+- **★ 夹具侧修复（本段踩过）**：三个程序原本**同址装载** ⇒ L1I（阵列无复位、`inval_all` 本段
+  未接）里上一程序的陈旧行**同 tag 命中** ⇒ 现象为"PC 流对、指令却是上一程序的"（实测 p3
+  的 rd/wdata 全是 p1 的）。修法：**逐程序分基址**（16 KB 步进，程序 %pcrel 位置无关）+
+  跳板按基址重建 + 黄金 PC 平移 `gold_delta`；**PC 相对量**（auipc/jal 结果）同样随基址平移，
+  故写回值比对接受"黄金值"或"黄金值 + `gold_delta`"（非 PC 相对量仍须逐位相等）。
+- **黄金轨迹扩展**：生成器新增 **`GREG_RD[]`/`GREG_WD[]`（逐条提交的写回寄存器号/写回值）**
+  —— 从同一次 Spike `--log-commits` 的**第二遍解析**得到，并有**自检④**（两遍 PC 序列逐条
+  一致，防解析错位）。这是"load/store 数据逐条正确"的直接判据（p5_mdu/p4_fpu 未变；
+  原三重自检全部保留）。
+- **新程序 p6_l1d**：`.option norvc`；4 KB 步进同行写 5+ 条（逐出）+ 回读 + 再逐出；黄金 366 条。
+
+## B4.3.5 遗留 / 下一步
+
+1. **第 4 段（特权/异常/中断/MMU）**：csr_file + trap_ctrl + CLINT/PLIC + Sv32（I/D 两侧翻译、
+   PTW 串行复用恢复、PTE A/D 写通路）；`inval_all/clean_all`（fence.i/cbo）接提交点。
+2. 本段**未做**：L1D 命中率/带宽性能测量；unaligned 访问（2A 的 M 级拆笔在乱序核里尚未接）；
+   AMO/CMO（2B-3 起即在本里程碑范围外）。
+3. `sim_mem_model` 的 DDR 体 64 KB（TB 侧）对 p6 的 6 行步进够用；更大数据程序需扩大窗口。
+
+## B4.3.6 复现命令
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+python3 sim/unit/prog/gen_back2_lockstep_data.py > sim/unit/prog/back2_lockstep_data.svh   # 含自检①②③④
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[@]}" sim/unit/tb_core_top_2b.sv && vvp /tmp/ct2b.vvp
+./scripts/regress.sh      # 32 项
+```

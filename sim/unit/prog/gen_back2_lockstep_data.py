@@ -25,7 +25,8 @@
 #                 该条**计入**；序列 = 程序全部提交指令）
 #
 # 输出（被 sim/unit/tb_back2_lockstep.sv `include）：
-#   localparam P_NUM / P_IMG_MAX / P_GOLD_MAX / P0_GOLD_N .. P4_GOLD_N
+#   localparam P_NUM / P_IMG_MAX / P_GOLD_MAX / P0_GOLD_N .. P5_GOLD_N
+#   reg [31:0] IMG[] / GOLD[]（PC 轨迹） / GREG_RD[]+GREG_WD[]（写回寄存器轨迹）
 #   reg [31:0] IMG  [0:P_NUM*P_IMG_MAX-1];   按程序槽位排布（未用槽填 nop=0x00000013）
 #   reg [31:0] GOLD [0:P_NUM*P_GOLD_MAX-1];  同上
 #
@@ -51,6 +52,7 @@ PROGS = [
     ("back2_p3_memcsr.S",  "P3", "rv32ima_zicsr",   "rv32imac_zicsr"),
     ("back2_p4_fpu.S",     "P4", "rv32imafd_zicsr", "rv32imafdc_zicsr"),
     ("back2_p5_mdu.S",     "P5", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    ("back2_p6_l1d.S",     "P6", "rv32ima_zicsr",   "rv32imac_zicsr"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"
@@ -109,6 +111,33 @@ def words_from_bytes(by, lo, hi):
     return out
 
 
+def golden_regs(elf, tag):
+    """Spike --log-commits → 逐条提交的 (写回寄存器号, 写回值)（供数据正确性比对）
+    · 行格式：`core 0: 3 0x<pc> (0x<insn>) [xN|fN] 0x<val> ...`；无写回则该条记 (0,0)
+    · 与 golden_pcs 的**同一批行**（同一次 Spike 运行），故下标一一对应"""
+    logf = "/tmp/back2_%s.spike.log" % tag
+    pat  = re.compile(r"^core\s+\d+:\s+\S+\s+0x([0-9a-fA-F]+)\s+\(0x([0-9a-fA-F]+)\)"
+                      r"(?:\s+([xf])(\d+)\s+0x([0-9a-fA-F]+))?")
+    pcs, rds, wds = [], [], []
+    prev = None
+    with open(logf) as f:
+        for line in f:
+            m = pat.match(line)
+            if not m:
+                continue
+            pc = int(m.group(1), 16)
+            if prev is not None and pc == prev:      # `j .` 自旋：与 golden_pcs 同口径
+                break
+            prev = pc
+            pcs.append(pc)
+            if m.group(3) is None:
+                rds.append(0); wds.append(0)
+            else:
+                rds.append(int(m.group(4)) & 0x1F)
+                wds.append(int(m.group(5), 16) & 0xFFFFFFFF)
+    return pcs, rds, wds
+
+
 def golden_pcs(elf, tag, isa):
     """Spike --log-commits → 架构提交 PC 序列（到"PC 连续重复"为止，重复那条计入一次）"""
     logf = "/tmp/back2_%s.spike.log" % tag
@@ -139,6 +168,8 @@ def main() -> int:
     out = []
     img_all = []
     gold_all = []
+    reg_rd_all = []
+    reg_wd_all = []
     gold_n = []
     for fname, tag, march, isa in PROGS:
         src = os.path.join(HERE, fname)
@@ -167,6 +198,11 @@ def main() -> int:
         n_w = (hi - BASE + 3) // 4
         words = words_from_bytes(by, BASE, hi)
         pcs = golden_pcs(elf_sp, tag, isa)
+        _pcs2, rds, wds = golden_regs(elf_sp, tag)
+        #   ★ 自检④（本段新增）：两次解析必须逐条对齐（同一次 Spike 运行的两遍解析）
+        if (len(_pcs2) != len(pcs)) or any(a != b for a, b in zip(_pcs2, pcs)):
+            die("%s: 黄金 PC 轨迹两次解析不一致（%d vs %d）—— 解析器有问题"
+                % (fname, len(_pcs2), len(pcs)))
         # ---- 自检③：黄金轨迹重定位（本口径下恒等）后就落在 .text 范围内 ----
         pcs = [p - SPIKE_BASE + BASE for p in pcs]
         if max(pcs) >= text_end:
@@ -179,6 +215,9 @@ def main() -> int:
         img = words + [0x00000013] * (IMG_MAX - n_w)
         gold_all += pcs + [0] * (GOLD_MAX - len(pcs))
         img_all += img
+        gold_all += []          # （占位：GOLD 已在上面拼接，寄存器轨迹单独输出）
+        reg_rd_all += rds + [0] * (GOLD_MAX - len(rds))
+        reg_wd_all += wds + [0] * (GOLD_MAX - len(wds))
         gold_n.append(len(pcs))
         sys.stderr.write("%s: img=%d words (0x%x..0x%x), golden=%d insns, last_pc=0x%x\n"
                          % (fname, n_w, BASE, hi, gold_n[-1], pcs[-1]))
@@ -192,12 +231,19 @@ def main() -> int:
         out.append("localparam integer P%d_GOLD_N = %d;" % (i, n))
     out.append("reg [31:0] IMG  [0:P_NUM*P_IMG_MAX-1];")
     out.append("reg [31:0] GOLD [0:P_NUM*P_GOLD_MAX-1];")
+    out.append("// 逐条提交的写回寄存器号/写回值（数据正确性比对；与 GOLD 同下标）")
+    out.append("reg [4:0]  GREG_RD [0:P_NUM*P_GOLD_MAX-1];")
+    out.append("reg [31:0] GREG_WD [0:P_NUM*P_GOLD_MAX-1];")
     out.append("task automatic load_back2_data;")
     out.append("    begin")
     for i, w in enumerate(img_all):
         out.append("        IMG[%d] = 32'h%08x;" % (i, w))
     for i, p in enumerate(gold_all):
         out.append("        GOLD[%d] = 32'h%08x;" % (i, p))
+    for i, r in enumerate(reg_rd_all):
+        out.append("        GREG_RD[%d] = 5'd%d;" % (i, r))
+    for i, w in enumerate(reg_wd_all):
+        out.append("        GREG_WD[%d] = 32'h%08x;" % (i, w))
     out.append("    end")
     out.append("endtask")
     print("\n".join(out))
