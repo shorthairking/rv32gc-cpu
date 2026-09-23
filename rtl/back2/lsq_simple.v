@@ -129,94 +129,180 @@ module lsq_simple #(
     //==========================================================================
     // 1. D3 分配（store 项）
     //==========================================================================
-    wire [4:0] stq_used = {1'b0, stq_v[0]}  + {1'b0, stq_v[1]}  + {1'b0, stq_v[2]}  +
-                          {1'b0, stq_v[3]}  + {1'b0, stq_v[4]}  + {1'b0, stq_v[5]}  +
-                          {1'b0, stq_v[6]}  + {1'b0, stq_v[7]}  + {1'b0, stq_v[8]}  +
-                          {1'b0, stq_v[9]}  + {1'b0, stq_v[10]} + {1'b0, stq_v[11]} +
-                          {1'b0, stq_v[12]} + {1'b0, stq_v[13]} + {1'b0, stq_v[14]} +
-                          {1'b0, stq_v[15]};
-    wire [4:0] stq_need = {3'b0, alloc_valid[0]} + {3'b0, alloc_valid[1]} +
-                          {3'b0, alloc_valid[2]} + {3'b0, alloc_valid[3]};
-    assign alloc_ok = ((STQ_N[4:0]) - stq_used) >= stq_need;
-
-    reg [STQ_IW-1:0] ai [0:W-1];
-    wire alloc_hits_head = (ai[0] == stq_head_q) & alloc_ok & alloc_valid[0];
-    integer fj, wk;
-    always @(*) begin
-        for (fj = 0; fj < W; fj = fj + 1) ai[fj] = {STQ_IW{1'b0}};
-        wk = 0;
-        for (fj = 0; fj < STQ_N; fj = fj + 1) begin
-            if (!stq_v[fj] && (wk < W)) begin
-                ai[wk] = fj[STQ_IW-1:0];
-                wk = wk + 1;
-            end
-        end
-    end
-    genvar ga;
+    //   ★★ 2B-3 第 5/6 段（x 隐患根治）：本文件**所有组合归约**一律改为 `assign` 连续赋值。
+    //     实测动机：`always @(*)` + `for` 的归约在输入长期恒定时结果停留在 x
+    //     （现场：`dr_valid=0000` 而 `dr_any=x` ⇒ `mem_req_valid=x` ⇒ 空闲拍请求口为 x）。
+    //     连续赋值恒被求值，不依赖过程块的敏感表推断；语义与原循环逐项等价（下方逐处标注）。
+    //   · 口径一次写死 **32 项**（`stq_v32` 高位补 0）⇒ 第 6 段把 STQ_N 从 16 扩到 32 时
+    //     本节零改动（只需把高位来源从常量 0 换成 stq_v[16..31]）。
+    genvar gv, gb, gk, gj;
+    wire [31:0] stq_v32;
     generate
-    for (ga = 0; ga < W; ga = ga + 1) begin : g_ai
-        assign alloc_idx[ga*STQ_IW +: STQ_IW] = ai[ga];
+    for (gv = 0; gv < 32; gv = gv + 1) begin : g_v32
+        if (gv < STQ_N) assign stq_v32[gv] = stq_v[gv];
+        else            assign stq_v32[gv] = 1'b0;
     end
     endgenerate
 
-    //==========================================================================
-    // 2. 更老未定址 store 检查 + 字节级转发（组合，load 发射拍）
-    //==========================================================================
-    reg  [3:0]  fwd_hit_w;
-    reg  [31:0] fwd_data_w;
-    reg         any_unk_w;
-    reg  [3:0]  lmask_w;
-    integer     b, j, q;
-    reg  [7:0]  best_age, cur_age;
-    reg  [1:0]  bl;
+    // ---- 1.1 占用数 popcount：assign 加法树（32 项口径；6 bit 覆盖 0..32）----
+    wire [31:0] stq_l1;                  // 16 × 2 bit 部分和
+    wire [23:0] stq_l2;                  //  8 × 3 bit
+    wire [15:0] stq_l3;                  //  4 × 4 bit
+    wire [9:0]  stq_l4;                  //  2 × 5 bit
+    generate
+    for (gv = 0; gv < 16; gv = gv + 1) begin : g_pc1
+        assign stq_l1[2*gv +: 2] = {1'b0, stq_v32[2*gv]} + {1'b0, stq_v32[2*gv+1]};
+    end
+    for (gv = 0; gv < 8; gv = gv + 1) begin : g_pc2
+        assign stq_l2[3*gv +: 3] = {1'b0, stq_l1[4*gv +: 2]} + {1'b0, stq_l1[4*gv+2 +: 2]};
+    end
+    for (gv = 0; gv < 4; gv = gv + 1) begin : g_pc3
+        assign stq_l3[4*gv +: 4] = {1'b0, stq_l2[6*gv +: 3]} + {1'b0, stq_l2[6*gv+3 +: 3]};
+    end
+    for (gv = 0; gv < 2; gv = gv + 1) begin : g_pc4
+        assign stq_l4[5*gv +: 5] = {1'b0, stq_l3[8*gv +: 4]} + {1'b0, stq_l3[8*gv+4 +: 4]};
+    end
+    endgenerate
+    wire [5:0] stq_used = {1'b0, stq_l4[0 +: 5]} + {1'b0, stq_l4[5 +: 5]};
+    wire [5:0] stq_need = {5'b0, alloc_valid[0]} + {5'b0, alloc_valid[1]} +
+                          {5'b0, alloc_valid[2]} + {5'b0, alloc_valid[3]};
+    assign alloc_ok = ((STQ_N[5:0]) - stq_used) >= stq_need;
 
-    always @(*) begin
-        // ---- 2.1 更老未定址 store（阻塞 load 发射）----
-        any_unk_w = 1'b0;
-        for (q = 0; q < STQ_N; q = q + 1) begin
-            //   ★【B28 未修·现场】此处用 `stq_rob[q]` 判年龄，而该字段只在 E1 写入 ⇒ 已分配未执行的
-            //     store 里是上一占用者的陈旧值 ⇒ 更老的未定址 store 可能漏检 ⇒ 更年轻的 load 抢跑
-            //     ⇒ 漏转发（实测 sb→lbu 读到内存填充 0x13，程序 2 C1 第 11 条分歧）。
-            //     两次修复尝试均已回退：(a) "任意未定址 store 都挡 load" ⇒ 死锁（更老 load ↔ 依赖它的
-            //     更年轻 store 互等，乱序核卡在 20 条）；(b) 分配期记录 ROB 索引 ⇒ 仍卡在 20 条。
-            //     下一轮用 DBG_LSU=1 + TB DBG_CYCLES 打印 stq_v/av/dv/msk 与 load 的 iss/rdy 逐拍现场。
-            if (stq_v[q] && !stq_av[q] &&
-                (((stq_rob[q] - rob_head) & 7'h7F) < age_rob)) any_unk_w = 1'b1;
+    // ---- 1.2 空闲槽分配（原 `for` 扫描的连续赋值等价）----
+    //   fr[j] = 序号 < j 的空闲槽数（前缀和链）；第 k 个空闲槽 = 唯一满足
+    //   (空闲[j] && fr[j]==k) 的 j ⇒ ai[k] 的每一位 = 该候选向量的或归约
+    //   （无需优先级链：候选天然互斥）。口径与"最低序号优先"一致。
+    wire [6*(STQ_N+1)-1:0] ai_fr;
+    assign ai_fr[0 +: 6] = 6'd0;
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_fr
+        assign ai_fr[6*(gv+1) +: 6] = ai_fr[6*gv +: 6] + {5'b0, ~stq_v32[gv]};
+    end
+    endgenerate
+    wire [W*STQ_IW*STQ_N-1:0] ai_cand;
+    generate
+    for (gk = 0; gk < W; gk = gk + 1) begin : g_ai_k
+        for (gb = 0; gb < STQ_IW; gb = gb + 1) begin : g_ai_b
+            for (gj = 0; gj < STQ_N; gj = gj + 1) begin : g_ai_j
+                assign ai_cand[((gk*STQ_IW)+gb)*STQ_N + gj] =
+                       ~stq_v32[gj] & (ai_fr[6*gj +: 6] == gk[5:0]) & ((gj >> gb) & 1);
+            end
+            assign alloc_idx[gk*STQ_IW + gb] =
+                   |ai_cand[((gk*STQ_IW)+gb)*STQ_N +: STQ_N];
         end
-        // ---- 2.2 字节级转发 ----
-        fwd_hit_w  = 4'h0;
-        fwd_data_w = 32'h0;
-        //   ★★ `exe_size` 的编码是 **log2(字节数)**，不是字节数！唯一真源 `decoder.v`
-        //      `mem_size_o`：LB/SB=3'd0、LH/SH=3'd1、LW/SW=3'd2、AMO=3'd2、flw=3'd2、
-        //      fld=3'd3（其注释里的"1/2/4 B"是**字节数说明**，不是字段取值）。
-        //      本里程碑只做 ≤4 B 对齐访问 ⇒ 用显式 case 给出字节掩码；
-        //      3'd3（8 B，fld/fsd）超出本里程碑范围，按 4 B 处理（2B-3 补 64 bit 访存）。
-        case (exe_size)
-            3'd0:    lmask_w = 4'h1 << exe_addr[1:0];
-            3'd1:    lmask_w = 4'h3 << exe_addr[1:0];
-            default: lmask_w = 4'hF << exe_addr[1:0];
-        endcase
-        for (b = 0; b < 4; b = b + 1) begin
-            best_age = 8'd255;
-            bl       = exe_addr[1:0] + b[1:0];
-            if (lmask_w[b] && ((exe_addr[1:0] + b[1:0]) < 3'd4)) begin
-                for (j = 0; j < STQ_N; j = j + 1) begin
-                    if (stq_v[j] && stq_av[j] && stq_msk[j][bl] &&
-                        (((stq_rob[j] - rob_head) & 7'h7F) < age_rob) &&
-                        (stq_a[j][31:2] == exe_addr[31:2])) begin
-                        cur_age = (stq_rob[j] - rob_head) & 7'h7F;
-                        if (cur_age <= best_age) begin
-                            best_age = cur_age;
-                            fwd_hit_w[b] = 1'b1;
-                            fwd_data_w[8*b +: 8] = stq_d[j][8*bl +: 8];
-                        end
-                    end
-                end
+    end
+    endgenerate
+    wire alloc_hits_head = (alloc_idx[0 +: STQ_IW] == stq_head_q) & alloc_ok & alloc_valid[0];
+
+    //==========================================================================
+    // 2. 更老未定址 store 检查 + 字节级转发（组合，load 发射拍；全部连续赋值）
+    //==========================================================================
+    // 2.1 更老未定址 store（阻塞 load 发射）
+    //   ★【B28 未修·现场】此处用 `stq_rob[q]` 判年龄，而该字段只在 E1 写入 ⇒ 已分配未执行的
+    //     store 里是上一占用者的陈旧值 ⇒ 更老的未定址 store 可能漏检 ⇒ 更年轻的 load 抢跑
+    //     ⇒ 漏转发（实测 sb→lbu 读到内存填充 0x13，程序 2 C1 第 11 条分歧）。
+    //     两次修复尝试均已回退：(a) "任意未定址 store 都挡 load" ⇒ 死锁（更老 load ↔ 依赖它的
+    //     更年轻 store 互等，乱序核卡在 20 条）；(b) 分配期记录 ROB 索引 ⇒ 仍卡在 20 条。
+    //     ★ 2B-2 的**兜底**是 `iq.v` 的 `INORD_LOAD` 队列级门（load 只能在更老项就绪后才发），
+    //       本条归约因此只是**双保险**；2B-3 第 6 段若放开 load 乱序，必须把分配期 ROB 索引
+    //       写进 STQ（`stq_rob` 在分配时即写），届时此条才成为真正的发射门。
+    wire [STQ_N-1:0] unk_v;
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_unk
+        assign unk_v[gv] = stq_v[gv] & ~stq_av[gv] &
+                           (((stq_rob[gv] - rob_head) & 7'h7F) < age_rob);
+    end
+    endgenerate
+    wire any_unk_w = |unk_v;
+
+    // 2.2 字节级转发（原 `always @(*)` + 双重 for 的连续赋值等价）
+    //   ★★ `exe_size` 的编码是 **log2(字节数)**，不是字节数！唯一真源 `decoder.v`
+    //      `mem_size_o`：LB/SB=3'd0、LH/SH=3'd1、LW/SW=3'd2、AMO=3'd2、flw=3'd2、
+    //      fld=3'd3（其注释里的"1/2/4 B"是**字节数说明**，不是字段取值）。
+    //      本里程碑只做 ≤4 B 对齐访问 ⇒ 用条件链给出字节掩码；
+    //      3'd3（8 B，fld/fsd）超出本里程碑范围，按 4 B 处理（2B-3 第 6 段补 64 bit 访存）。
+    wire [3:0] lmask_w = (exe_size == 3'd0) ? (4'h1 << exe_addr[1:0]) :
+                         (exe_size == 3'd1) ? (4'h3 << exe_addr[1:0]) :
+                                              (4'hF << exe_addr[1:0]);
+    //   ★★ 转发优先级**口径修正**（2B-3 规格 §6.2 / 本文件头注："取字内**最年轻**的更老匹配者"）：
+    //      原循环用 `cur_age <= best_age`（初值 255）⇒ 实际取到 age **最小**者 = **最老** store
+    //      —— 与规格相反（同字节两条更老 store 时应取更年轻者）。本段改为"取 age 最大者"
+    //      （age = 离 ROB 头的距离 ⇒ 越大越年轻）。用例 C3（同字节 0x11/0x22 ⇒ 期望 0x22）
+    //      即验此点。
+    //   布局：4 字节 × 32 候选（gj ≥ STQ_N 恒 0）——扩到 32 槽时零改动。
+    //   （所有中间网先声明后使用；连续赋值之间的先后次序无关。）
+    wire [4*32-1:0]    fw_match;
+    wire [4*32*8-1:0]  fw_age_c;             // 匹配 ⇒ 该 store 的 age；否则 0
+    wire [4*32*8-1:0]  fw_dat_c;             // 匹配 ⇒ 该字节数据；否则 0
+    wire [4*32-1:0]    fw_sel;               // 匹配 且 age == 该字节最优 age
+    wire [4*8-1:0]     fw_best;
+    wire [4*4*8*8-1:0] fw_ag_ch, fw_wd_ch;
+    wire [3:0]         fwd_hit_w;
+    wire [31:0]        fwd_data_w;
+    generate
+    for (gb = 0; gb < 4; gb = gb + 1) begin : g_fw_b
+        wire [2:0] bl_w = {1'b0, exe_addr[1:0]} + gb[2:0];   // 字内字节道（3 bit：0..6）
+        wire       in_w = lmask_w[gb] & (bl_w < 3'd4);        // 该字节在本次访问内
+        for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_j
+            if (gj < STQ_N) begin : g_fw_on
+                assign fw_match[gb*32 + gj] =
+                       in_w & stq_v[gj] & stq_av[gj] & stq_msk[gj][bl_w] &
+                       (stq_a[gj][31:2] == exe_addr[31:2]) &
+                       (((stq_rob[gj] - rob_head) & 7'h7F) < age_rob);
+                assign fw_age_c[(gb*32+gj)*8 +: 8] =
+                       fw_match[gb*32 + gj] ? ((stq_rob[gj] - rob_head) & 7'h7F) : 8'h0;
+                assign fw_dat_c[(gb*32+gj)*8 +: 8] =
+                       fw_match[gb*32 + gj] ? stq_d[gj][8*bl_w +: 8] : 8'h0;
+            end else begin : g_fw_off
+                assign fw_match[gb*32 + gj]       = 1'b0;
+                assign fw_age_c[(gb*32+gj)*8 +: 8] = 8'h0;
+                assign fw_dat_c[(gb*32+gj)*8 +: 8] = 8'h0;
+            end
+        end
+        //   best_age[b] = max over j（4 组 × 组内 8 项串行链 + 组间两级）
+        wire [7:0] bs01_w, bs23_w, bs_w;
+        assign bs01_w = (fw_ag_ch[((gb*4+0)*8+7)*8 +: 8] >= fw_ag_ch[((gb*4+1)*8+7)*8 +: 8])
+                        ? fw_ag_ch[((gb*4+0)*8+7)*8 +: 8] : fw_ag_ch[((gb*4+1)*8+7)*8 +: 8];
+        assign bs23_w = (fw_ag_ch[((gb*4+2)*8+7)*8 +: 8] >= fw_ag_ch[((gb*4+3)*8+7)*8 +: 8])
+                        ? fw_ag_ch[((gb*4+2)*8+7)*8 +: 8] : fw_ag_ch[((gb*4+3)*8+7)*8 +: 8];
+        assign bs_w   = (bs01_w >= bs23_w) ? bs01_w : bs23_w;
+        assign fw_best[gb*8 +: 8] = bs_w;
+        //   命中位（与 lmask 无关：in_w 已并入 fw_match）
+        assign fwd_hit_w[gb] = |fw_match[gb*32 +: 32];
+        //   胜者数据（唯一胜者 ⇒ 或归约等价于选择）
+        assign fwd_data_w[gb*8 +: 8] =
+               fw_wd_ch[((gb*4+0)*8+7)*8 +: 8] | fw_wd_ch[((gb*4+1)*8+7)*8 +: 8] |
+               fw_wd_ch[((gb*4+2)*8+7)*8 +: 8] | fw_wd_ch[((gb*4+3)*8+7)*8 +: 8];
+    end
+    endgenerate
+    generate
+    for (gb = 0; gb < 4; gb = gb + 1) begin : g_fw_sel
+        for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_selj
+            assign fw_sel[gb*32 + gj] = fw_match[gb*32 + gj] &
+                                        (fw_age_c[(gb*32+gj)*8 +: 8] == fw_best[gb*8 +: 8]);
+        end
+    end
+    for (gb = 0; gb < 4; gb = gb + 1) begin : g_fw_ch
+        for (gk = 0; gk < 4; gk = gk + 1) begin : g_fw_chg
+            assign fw_ag_ch[((gb*4+gk)*8 + 0)*8 +: 8] = fw_age_c[(gb*32 + gk*8 + 0)*8 +: 8];
+            assign fw_wd_ch[((gb*4+gk)*8 + 0)*8 +: 8] = fw_sel[gb*32 + gk*8 + 0]
+                                                        ? fw_dat_c[(gb*32 + gk*8 + 0)*8 +: 8] : 8'h0;
+            for (gj = 1; gj < 8; gj = gj + 1) begin : g_fw_chs
+                assign fw_ag_ch[((gb*4+gk)*8 + gj)*8 +: 8] =
+                       (fw_ag_ch[((gb*4+gk)*8 + gj-1)*8 +: 8] >=
+                        fw_age_c[(gb*32 + gk*8 + gj)*8 +: 8])
+                       ? fw_ag_ch[((gb*4+gk)*8 + gj-1)*8 +: 8]
+                       : fw_age_c[(gb*32 + gk*8 + gj)*8 +: 8];
+                assign fw_wd_ch[((gb*4+gk)*8 + gj)*8 +: 8] =
+                       fw_wd_ch[((gb*4+gk)*8 + gj-1)*8 +: 8] |
+                       (fw_sel[gb*32 + gk*8 + gj] ? fw_dat_c[(gb*32 + gk*8 + gj)*8 +: 8] : 8'h0);
             end
         end
     end
+    endgenerate
 
     wire fwd_all_w = ((fwd_hit_w & lmask_w) == lmask_w);
+
 
     //==========================================================================
     // 3. 在途 load 表
@@ -242,35 +328,23 @@ module lsq_simple #(
     // 发射许可：有空槽 且 无更老未定址 store（store 项不需槽，但统一门控损失可忽略）
     assign iss_ok = ld_slot_ok & ~any_unk_w;
 
-    // ---- 待发请求项（已分配、未发请求）与响应匹配 ----
-    reg        pend_any;
-    reg [1:0]  pend_sel;
-    reg        rsp_ok;
-    reg [1:0]  rsp_sel;
-    reg [1:0]  newslot;
-    reg        newslot_ok;
-    integer    nq;
-    always @(*) begin
-        pend_any = 1'b0; pend_sel = 2'd0;
-        for (nq = 0; nq < OUT_N; nq = nq + 1) begin
-            if (ld_v[nq] && !ld_req[nq] && !pend_any) begin
-                pend_any = 1'b1; pend_sel = nq[1:0];
-            end
-        end
-        rsp_ok = 1'b0; rsp_sel = 2'd0;
-        for (nq = 0; nq < OUT_N; nq = nq + 1) begin
-            if (mem_rsp_valid && ld_v[nq] && ld_req[nq] && (ld_tag[nq] == mem_rsp_tag)
-                && !rsp_ok) begin
-                rsp_ok = 1'b1; rsp_sel = nq[1:0];
-            end
-        end
-        newslot_ok = 1'b0; newslot = 2'd0;
-        for (nq = 0; nq < OUT_N; nq = nq + 1) begin
-            if (ld_free[nq] && !newslot_ok) begin
-                newslot_ok = 1'b1; newslot = nq[1:0];
-            end
-        end
-    end
+    // ---- 待发请求项（已分配、未发请求）与响应匹配：连续赋值（原 `always @(*)` + for）----
+    //   语义与原循环逐项等价：**最低序号优先**（原循环 nq 递增、`!pend_any` 锁存首个命中者）。
+    wire [OUT_N-1:0] pend_vec = { ld_v[3] & ~ld_req[3], ld_v[2] & ~ld_req[2],
+                                  ld_v[1] & ~ld_req[1], ld_v[0] & ~ld_req[0] };
+    wire [OUT_N-1:0] rsp_vec  = { ld_v[3] & ld_req[3] & (ld_tag[3] == mem_rsp_tag),
+                                  ld_v[2] & ld_req[2] & (ld_tag[2] == mem_rsp_tag),
+                                  ld_v[1] & ld_req[1] & (ld_tag[1] == mem_rsp_tag),
+                                  ld_v[0] & ld_req[0] & (ld_tag[0] == mem_rsp_tag) };
+    wire             pend_any   = |pend_vec;
+    wire [1:0]       pend_sel   = pend_vec[0] ? 2'd0 : pend_vec[1] ? 2'd1 :
+                                   pend_vec[2] ? 2'd2 : pend_vec[3] ? 2'd3 : 2'd0;
+    wire             rsp_ok     = mem_rsp_valid & (|rsp_vec);
+    wire [1:0]       rsp_sel    = rsp_vec[0] ? 2'd0 : rsp_vec[1] ? 2'd1 :
+                                   rsp_vec[2] ? 2'd2 : rsp_vec[3] ? 2'd3 : 2'd0;
+    wire             newslot_ok = |ld_free;
+    wire [1:0]       newslot    = ld_free[0] ? 2'd0 : ld_free[1] ? 2'd1 :
+                                   ld_free[2] ? 2'd2 : ld_free[3] ? 2'd3 : 2'd0;
 
     // ---- 请求发射：store 排空优先；排空拍不发 load 请求 ----
     //   ★★ 2B-3 第 5 段修法：**x 隐患**——原 `always @(*)` + `for` 归约只在输入变化时重算，
@@ -340,9 +414,9 @@ module lsq_simple #(
     assign st_done_rob   = exe_rob;
     assign st_done_epoch = exe_epoch;
 
-    //   ★ stq_used 只有 5 bit（STQ_N=16）⇒ 必须**零扩展**到 8 bit；写 [7:0] 属于
-    //     向量外位选，iverilog/Vivado 都返回 **x**（诊断口观测为 x）。
-    assign stq_cnt_o = {3'b0, stq_used};
+    //   ★ `stq_used` 现在是 6 bit（32 项口径）⇒ 零扩展到 8 bit；
+    //     写 [7:0] 之外的位属于向量外位选，iverilog/Vivado 都返回 x（诊断口观测为 x）。
+    assign stq_cnt_o = {2'b0, stq_used};
 
     //==========================================================================
     // 4. 时序
@@ -388,10 +462,10 @@ module lsq_simple #(
             if (alloc_ok) begin
                 for (si = 0; si < W; si = si + 1) begin
                     if (alloc_valid[si]) begin
-                        stq_v[ai[si]]   <= 1'b1;
-                        stq_av[ai[si]]  <= 1'b0;
-                        stq_dv[ai[si]]  <= 1'b0;
-                        stq_ret[ai[si]] <= 1'b0;
+                        stq_v  [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b1;
+                        stq_av [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_dv [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_ret[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                     end
                 end
             end
@@ -444,6 +518,17 @@ module lsq_simple #(
 
             // ---- 4.4 请求 / 响应推进 ----
             if (ld_fire) ld_req[pend_sel] <= 1'b1;
+            //   ★★ 2B-3 第 5 段（**转发覆盖用例暴露的真缺陷**）：原实现**从不在响应到达时释放
+            //     load 槽**（只有 flush_all / squash 才清）⇒ 无冲刷时满 `OUT_N` 笔 load 之后
+            //     `ld_slot_ok=0`：既不能全转发（无命中时）也无槽可分配 ⇒ 该 load **永不写回**，
+            //     LSU 从此不再受理 load（挂死）。锁步之所以未暴露：分支误判的 squash 顺手清了槽。
+            //     此处按**响应到达**释放（本里程碑口径：收到响应 = 该 load 已完成；2B-3 真 LSQ
+            //     改为**提交点释放**，并带 32 项 LQ —— 见报告 §B3.5 第 6 段计划）。
+            //     ★ 与 4.2 分配无冲突：`newslot` 只从 `ld_free` 选，本拍被释放的槽 ld_v 仍为 1。
+            if (rsp_ok) begin
+                ld_v  [rsp_sel] <= 1'b0;
+                ld_req[rsp_sel] <= 1'b0;
+            end
             // ---- 4.5 store 排空标记与回收 ----
             //   队头回收：已排空（stq_ret）或已作废（冲刷/未执行前被清）⇒ 指针前移。
             //   ★ 若本拍分配器正好要写队头槽（队头无效时才可能），本拍不回收，

@@ -1286,6 +1286,8 @@ TB_BACK2_LOCKSTEP: PASS
    `stq_rob`/`age_rob` 与 load 的 `exe_rob` 是否落在同一 ROB 窗口且 store 更老 ⇒ 需把激励里的
    `rob_head`/`exe_rob` 按窗口语义对齐）。下一步按此逐项对拍。**为守住 fail-closed（不得留失败用例），
    该文件暂以非 `tb_` 前缀命名，不计入 `regress.sh`（保持 30/30）**；跑通后改回 `tb_*.sv` 即自动纳入。
+   > ★ **第 5 段已闭环**：改名 `sim/unit/tb_back2_lsq_fwd.sv` 并纳入 regress（**31/31**）——
+   > 见 §B3.6（x 隐患根治 + 2 个 RTL 真缺陷 + 1 个用例协议缺陷）。本节以下为**历史现场**，保留不改。
 
 ## B3.1 2B-3 设计要点（下一轮实施，AGENT.md 口径）
 
@@ -1379,3 +1381,95 @@ TB_BACK2_LOCKSTEP: PASS
 3. `ai[]`（分配槽扫描）与 `stq_used`（16 项 popcount，扩 32 时同步改为 32 项）。
 改完：整设计编译 + `tb_back2_iq` 151/151 + 锁步三程序 C1–C5 + 本用例（应即刻全绿）
 ⇒ 改名 `tb_back2_lsq_fwd.sv` 纳入 regress（**31/31**）；随后进入 32+32 两步扩容。
+
+## B3.6 第 5 段：x 隐患**根治** + 覆盖用例暴露的 **3 个真问题**（含 2 个 RTL 缺陷）—— 全绿
+
+### B3.6.1 改动 1：六处组合归约全部改为连续赋值（x 隐患根治）
+
+`rtl/back2/lsq_simple.v` 里所有 `always @(*)` + `for` 归约改写为 `generate` + `assign`：
+
+| 归约 | 新实现 | 语义 |
+|------|--------|------|
+| `dr_sel/dr_any` | 连续赋值优先级链（lane 0→3） | 最低 lane 优先（原 dk 递减循环的等价） |
+| `pend_any/pend_sel` | `pend_vec` 或归约 + 三元链 | 最低序号优先 |
+| `rsp_ok/rsp_sel` | `rsp_vec` 或归约 + 三元链 | 原 `!rsp_ok` 锁存首个命中者 |
+| `newslot/newslot_ok` | `ld_free` 或归约 + 三元链 | 最低序号优先 |
+| `ai[]`（分配槽） | `ai_fr` 空闲前缀和 + 候选或归约 | 前 W 个空闲槽，序号升序 |
+| `stq_used` | **assign 加法树**（16×2b→8×3b→4×4b→2×5b→6b） | popcount |
+| `any_unk_w` | `unk_v` 逐项或归约 | B28 保守门 |
+| 字节级转发 | 候选/最优 age 串行链（**4 字节 × 32 候选**） | 见 B3.6.2 ① |
+
+**32 项扩展口径已就位**：`stq_v32`（高位补 0）、popcount 加法树、转发候选 4×32、
+`ai_fr` 前缀和全部按 **32 槽**写死 ⇒ 第 6 段把 `BACK2_STQ_N` 改成 32 时本节零改动。
+实测确认（同一探针）：`dr_any=0 pend_any=0/1 reqv=0 wen=0 anyunk=0` —— 空闲拍请求口
+**全部为确定值**，x 消失。
+
+### B3.6.2 覆盖用例暴露的 3 个真问题
+
+① **转发优先级方向与规格相反（RTL 真缺陷，已修）**：原循环 `if (cur_age <= best_age)`
+（初值 255）保留的是 **age 最小者 = 最老 store**，而规格 §6.2/文件头注要求"取字内**最年轻**的
+更老匹配者"（同字节两条更老 store 时必须取更年轻者）。新实现改为"候选 age 最大者胜"
+（`fw_ag_ch` 组内 8 项串行最大链 + 组间两级 ⇒ `fw_best`，再 `fw_sel = match & age==best`）。
+用例 **C3**（同字节 0x11/0x22 ⇒ 期望 0x22）即验此点 —— 旧实现在该场景必错。
+
+② **load 槽从不按响应释放（RTL 真缺陷，已修）**：原实现 `ld_v[]` 只在 `flush_all`/`squash`
+清（§4.4 只有 `if (ld_fire) ld_req <= 1`）。⇒ 无冲刷时满 `OUT_N=4` 笔 load 之后
+`ld_slot_ok=0`：既不满足"全转发"也无槽可分配 ⇒ 该 load **永不写回**、LSU 从此不受理 load。
+锁步未暴露纯属侥幸：分支误判的 squash 顺手清了槽（程序 0/1/2 各有 5/5 次误判）。
+**修法**：`if (rsp_ok) begin ld_v[rsp_sel] <= 0; ld_req[rsp_sel] <= 0; end`
+（本里程碑口径 "响应到达 = 该 load 完成"；2B-3 真 LSQ 改为**提交点释放**并带 32 项 LQ）。
+与 §4.2 分配无冲突：`newslot` 只从 `ld_free` 选，本拍被释放的槽 `ld_v` 仍为 1。
+
+③ **用例 TB 自身协议错（已修）**：LSU 的访存请求是**单拍握手脉冲**（`ld_fire` 当拍即把
+`ld_req` 置 1 ⇒ 下一拍 `mem_req_valid` 已回落）。原 `wait_wb` 在 **negedge** 采样
+`mem_req_valid` ⇒ 必然漏掉脉冲 ⇒ 响应永不产生 ⇒ 10 项判据 9 项 FAIL（**与 RTL 无关**）。
+修法：改为**寄存器化、posedge 采样的响应模型**（与 `tb_back2_lockstep.sv` 的存储器模型同口径，
+只对 load 响应、每次受理恰好一拍响应、`saw_req` 粘滞）；另把 `chk` 的检查名宽度由 255 bit
+（32 B）扩到 512 bit（64 B）—— 中文 UTF-8 检查名原被截成半个字符导致日志乱码。
+
+### B3.6.3 第 5 段验证台账（全部实测）
+
+| 项目 | 结果 | 日志 |
+|------|------|------|
+| 锁步三程序 C1–C5（槽释放改动后复验） | **30/30 PASS**，提交 465，IPC 0.3917/0.2469/0.1382（与基线逐位一致），CHK 零违规 | `../.b2chk/ls37.log` |
+| `tb_back2_iq` | **151/151 PASS** | 内联运行 |
+| `tb_back2_lsq_fwd`（原 `lsq_fwd_case.sv`） | **10/10 PASS**（C1 部分转发+合并、C2 双字节合并、C3 更年轻优先、C4 全转发不访存、C5 无命中走访存、C6 半字） | `../.b2chk/lsqf8.vvp` |
+| `scripts/regress.sh` 全量 | **31/31 PASS**（新增 `tb_back2_lsq_fwd` 计入 ⇒ TB 数 30→31；`scripts/regress.sh` 本次**无需改动**，仅 T6 墙钟档属允许改动范围） | `../.b2chk/regress31.log` |
+
+判据④（"新增/强化访存流 IPC 或转发覆盖用例并说明方法学"）**达成**：
+`sim/unit/tb_back2_lsq_fwd.sv`（LSQ 直驱、不经前端/重命名，逐场景构造"更老 store + 更年轻
+load"，6 场景 10 项检查；方法学见文件头注：接口与 2B-3 真 `lsq.v` 保持一致 ⇒ 可原样复用）。
+
+### B3.6.4 阻塞点 / 风险登记
+
+- 本段**无阻塞**。两条 RTL 修复均在 `rtl/back2/lsq_simple.v`（本里程碑允许改动范围）内，
+  锁步/IPC 基线未变（IPC 逐位一致 ⇒ C5 档无需重测）。
+- 遗留（**不属本段**，第 6 段处理）：`stq_rob` 仍是"E1 写入"的陈旧值语义 ⇒ `any_unk_w` 的
+  年龄判据在"已分配未执行"的 store 上不可靠；2B-2 靠 `iq.v` 的 `INORD_LOAD` 队列级门兜底。
+  放开 load 乱序前**必须**把 ROB 索引在**分配期**写进 STQ（`stq_rob`/`stq_epoch`）。
+- `lsq_simple.v` 是**过渡件**：`OUT_N=4` 在途表 ≠ 32 项 LQ；第 6 段需新增 32 项 LQ
+  （分配/提交点释放）并把 `OUT_N` 保留为"在途访存槽（MSHR 口径）"。
+
+### B3.6.5 下一步（第 6 段：两步扩 LSQ，每步后全量验证）
+
+1. **第一步（只扩容量/索引宽度，保绿）**：`BACK2_STQ_N` 16→32、`BACK2_STQ_IDX_W` 4→5、
+   `stq_head/tail` 指针宽度、`stq_v32` 高位由常量 0 换成 `stq_v[16..31]`、`stq_cnt_o`
+   零扩展位数、DBG 转储循环；转发候选 4×32 与 `ai_fr` 前缀和已按 32 项写死 ⇒ 预期零改动。
+   > ★ **本段已实测的"零改动"边界**（`grep BACK2_STQ_IDX_W rtl/back2/*.v` = 仅 `lsq_simple.v`）：
+   > `lsq_simple.v` 内部（归约/popcount/转发候选/LQ 表）确实零改动，但**索引宽度牵动
+   > `backend_top.v` 的 6 处硬编码 4 bit 与 ROB payload 字段**，第一步的准确触碰点清单：
+   > ① `back2_params.vh`：`BACK2_STQ_N` 16→32、`BACK2_STQ_IDX_W` 4→5、
+   > `BACK2_RB_STQ_MSB/LSB` 409/406→410/406、`BACK2_RB_W` 416→417（★ 需核对 payload 字段表：
+   > STQ 字段之上的其它字段偏移是否要整体上移，这是本步**唯一有系统性风险**的点）；
+   > ② `backend_top.v`：L208 `function [3:0] p_stq`→`[4:0]`、L270 `wire [3:0] stq_of_rob_r`→`[4:0]`、
+   > L278 `reg [3:0] stq_of_rob[0:127]`→`[4:0]`（L1501 复位字面量）、L656
+   > `wire [15:0] st_alloc_idx`→`[19:0]`、L755 / L1161 / L1534 三处 `*4 +: 4`→`*5 +: 5`；
+   > ③ `lsq_simple.v`：本段已按 32 项写死（popcount 加法树、转发候选 4×32、`ai_fr` 前缀和、
+   > `stq_cnt_o` 零扩展）⇒ **零改动**；仅需把 `stq_v32` 高位来源换成 `stq_v[16..31]`。
+   ⇒ 整设计编译 + `tb_back2_iq` 151/151 + 锁步 C1–C5 + `tb_back2_lsq_fwd` + regress 31/31。
+2. **第二步（放开真乱序）**：① 新增 32 项 LQ（E1 入队、写回乱序、**提交点释放**）；
+   ② "地址已证不相交才可越过"闸门（更老 store 已定址且与 load 字地址不交 ⇒ 放行；
+   未定址 ⇒ 保守阻塞，B28 教训）；③ 逐字节转发**更年轻优先**（本段已在候选层实现，
+   接到 32 项 LQ 的年龄窗口上）；④ store 提交序排空（单 AXI 在途 + 属主寄存器纪律）。
+   ⇒ 同上五项验证 + 若性能基线移动则按 "**实测 × 0.8**" 重测 C5 档（三程序）并更新
+   `tb_back2_lockstep.sv` 注释与本报告。

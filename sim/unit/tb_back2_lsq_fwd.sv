@@ -87,7 +87,8 @@ module tb_back2_lsq_fwd_top;
     );
 
     integer n_chk = 0, n_fail = 0;
-    task chk(input cond, input [255:0] nm);
+    //   ★ 检查名宽度 64 B（原 32 B 会把中文 UTF-8 串截断成半个字符 ⇒ 日志乱码）
+    task chk(input cond, input [8*64-1:0] nm);
         begin
             n_chk = n_chk + 1;
             if (!cond) begin n_fail = n_fail + 1; $display("FAIL[lsq-fwd]: %0s", nm); end
@@ -124,23 +125,40 @@ module tb_back2_lsq_fwd_top;
         end
     endtask
 
-    // ---- 等待写回（最多 12 拍）；同时若发访存请求则按要求给响应 ----
+    // ---- 内存响应模型（与 tb_back2_lockstep.sv 的存储器模型同口径）----
+    //   ★ 修（§B3.4 定案）：LSU 的请求是**单拍握手脉冲**——`ld_fire` 当拍即把 `ld_req` 置 1
+    //     ⇒ 下一拍 `mem_req_valid` 已回落。原 `wait_wb` 在 **negedge** 采样请求 ⇒ 必然漏掉
+    //     该脉冲 ⇒ 响应永不产生 ⇒ 判据全灭（与 RTL 无关）。本模型在 **posedge** 采样握手拍，
+    //     次拍给出带同 tag 的**单拍**响应（每次受理恰好一次响应，不重复、不漏）。
+    reg [31:0] rsp_data_m = 32'h0;
+    reg        saw_req_m  = 1'b0;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            mem_rsp_valid <= 1'b0;
+            mem_rsp_tag   <= {TAG_W{1'b0}};
+            mem_rsp_rdata <= 32'h0;
+        end else begin
+            mem_rsp_valid <= mem_req_valid & mem_req_ready & ~mem_req_wen;
+            mem_rsp_tag   <= mem_req_tag;
+            mem_rsp_rdata <= rsp_data_m;
+            if (mem_req_valid & mem_req_ready & ~mem_req_wen) saw_req_m <= 1'b1;
+        end
+    end
+
+    // ---- 等待写回（最多 16 拍）；请求由上面的响应模型自动应答 ----
     task wait_wb(input [31:0] rdata, output [31:0] got, output integer saw_req);
         integer t;
         begin
-            got = 32'h0; saw_req = 0; mem_rsp_valid = 1'b0;
+            got = 32'h0; rsp_data_m = rdata; saw_req = 0; saw_req_m = 1'b0;
             for (t = 0; t < 16; t = t + 1) begin
-                @(negedge clk);
-                //   ★ 修（§B3.3 ①）：一旦看到过请求就**连续**给响应（sticky），
-                //     因为 LSU 的 pend_any/mem_req_ready 交错可能使请求延后 ≥2 拍。
-                if (mem_req_valid) begin
-                    saw_req = 1;
-                    mem_rsp_valid = 1'b1; mem_rsp_tag = mem_req_tag; mem_rsp_rdata = rdata;
-                end
                 @(posedge clk);
-                if (wb_valid) begin got = wb_data; t = 16; end
+                if (wb_valid) begin
+                    got = wb_data;
+                    saw_req = saw_req_m | mem_req_valid;
+                    t = 16;
+                end
             end
-            @(negedge clk); mem_rsp_valid = 1'b0;
+            @(negedge clk);
         end
     endtask
 
