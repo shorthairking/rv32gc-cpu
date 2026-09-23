@@ -97,14 +97,14 @@
     .equ BOOT_SRC_UBOOT,    0x080000
     .equ BOOT_DST_UBOOT,    0x02000000
     .ifndef BOOT_LEN_UBOOT
-    .equ BOOT_LEN_UBOOT,    0x000620AC     # 401 580 B（u-boot.bin 401 578 B 补齐到 4，E6-E8 修复后重编）
+    .equ BOOT_LEN_UBOOT,    0x00066830     # 419 888 B（u-boot.bin 419 885 B 补齐到 4；MAC 驱动后重编）
     .endif
 
     # ---- 段 3：U-Boot 设备树（OpenSBI 按 FW_JUMP_FDT_ADDR 传给下一级）----
     .equ BOOT_SRC_DTB,      0x0E8000
     .equ BOOT_DST_DTB,      0x03000000
     .ifndef BOOT_LEN_DTB
-    .equ BOOT_LEN_DTB,      0x00001774     # 6 004 B（u-boot.dtb 6 002 B 补齐到 4）
+    .equ BOOT_LEN_DTB,      0x00001830     # 6 192 B（u-boot.dtb 6 189 B 补齐到 4；MAC 节点后重编）
     .endif
 
     # ---- 跳转与入口寄存器口径 ----
