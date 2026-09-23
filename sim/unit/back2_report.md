@@ -1355,3 +1355,27 @@ TB_BACK2_LOCKSTEP: PASS
 `u_lsq.pend_any / u_lsq.dr_any / u_lsq.pend_sel / dr_valid / dr_idx / mem_req_ready`
 （全部为 TB 可见信号），即可确定 x 的来源；修好后本用例应即刻全绿（转发数据已证正确），
 随后改名 `tb_back2_lsq_fwd.sv` 纳入 regress（目标 **31/31**），再进入"先扩 32+32、再放开真乱序"两步。
+
+## B3.5 第 4 段：x 源已定案 —— **`lsq_simple.v` 的组合归约块在输入长期不变时保持 x**（RTL 侧潜在缺陷）
+
+探针实测（`lsq_fwd_case.sv` 的 `[fwd-case]` 第二行）：
+```
+[fwd-case c=10] ... reqv=x wen=x ... | dr_any=x pend_any=1 dr_valid=0000 dr_idx=0 rdy=1
+```
+- **`dr_valid` 明确为 `0000`，而模块内部 `dr_any` 仍为 `x`** ⇒ `dr_fire = dr_any & mem_req_ready = x`
+  ⇒ `mem_req_valid/wen = x`。`pend_any=1` 正常。
+- 成因：`dr_any/dr_sel` 由 `always @(*)` + `for (dk = W-1; dk >= 0; dk = dk - 1)` 归约赋值；
+  该块**只在输入（`dr_valid/dr_idx`）变化时重算**：若仿真起始时输入为 x、而此后长期保持同一值
+  （本用例恒为 0），块不会再次执行 ⇒ `dr_any` 停留在 x（同一族工具/建模陷阱，与本设计已登记的
+  "function 不得放进位拼接/连续赋值"并列）。在锁步里 `dr_valid` 频繁变化，故该 x 会被及时冲掉，
+  未暴露为功能错误 —— 但这是**真实的 x 传播隐患**（空闲期请求口为 x）。
+- ✅ 同时再次确认：`stq0 v=1 av=1 msk=0001 a=0x80001000 rob=1`、`wb_data=0x000000aa`（转发数据正确）。
+
+**下一段修法（RTL 侧，安全且局部）**：把 `lsq_simple.v` 里这几处"`always @(*)` + for 归约"
+改为**连续赋值的优先级链（generate + assign 三元表达式）**——连续赋值随任意输入变化恒被求值，
+天然无该敏感性/初值陷阱：
+1. `dr_sel/dr_any`（提交排空选择，§3 前的 dk 循环）；
+2. `pend_any/pend_sel`、`rsp_ok/rsp_sel`、`newslot/newslot_ok`（§3 的 nq 循环）；
+3. `ai[]`（分配槽扫描）与 `stq_used`（16 项 popcount，扩 32 时同步改为 32 项）。
+改完：整设计编译 + `tb_back2_iq` 151/151 + 锁步三程序 C1–C5 + 本用例（应即刻全绿）
+⇒ 改名 `tb_back2_lsq_fwd.sv` 纳入 regress（**31/31**）；随后进入 32+32 两步扩容。

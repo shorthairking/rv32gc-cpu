@@ -168,6 +168,9 @@ module tb_back2_lsq_fwd_top;
                      u_lsq.stq_a[0], u_lsq.stq_rob[0],
                      exe_valid, exe_is_store, exe_rob, exe_addr, exe_size,
                      mem_req_valid, mem_req_wen, mem_rsp_valid, wb_valid, wb_data);
+            $display("                pend_any=%b dr_any=%b pend_sel=%0d dr_valid=%b dr_idx=%0d rdy=%b rspv=%b wbv=%b",
+                     u_lsq.pend_any, u_lsq.dr_any, u_lsq.pend_sel, dr_valid, dr_idx,
+                     mem_req_ready, mem_rsp_valid, wb_valid);
         end
     end
     reg [STQ_IW-1:0] s0, s1;
