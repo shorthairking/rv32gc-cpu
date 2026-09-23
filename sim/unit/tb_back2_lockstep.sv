@@ -235,10 +235,10 @@ module tb_back2_lockstep_top #(
     wire        mem_req_valid, mem_req_wen;
     wire [31:0] mem_req_addr, mem_req_wdata;
     wire [3:0]  mem_req_wstrb;
-    wire [2:0]  mem_req_tag;
+    wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag;   // ★ 2B-3：标签宽度随 LQ 扩容（3→6）
     reg         mem_rsp_valid;
     reg  [31:0] mem_rsp_rdata;
-    reg  [2:0]  mem_rsp_tag;
+    reg  [`BACK2_MEM_TAG_W-1:0] mem_rsp_tag;
     // 提交流
     wire [3:0]  commit_valid;
     wire [127:0] commit_pc, commit_arch_rd_wdata;
@@ -422,7 +422,7 @@ module tb_back2_lockstep_top #(
     //     表现为"响应 tag=x ⇒ LSU 永远匹配不上 ⇒ 该 load 永久在飞"（实测）。
     //     本模型由构造保证：每个被接收的读请求恰好产生**一拍**响应，且不会覆盖。
     reg        rq1_v, rq2_v;
-    reg [2:0]  rq1_t, rq2_t;
+    reg [`BACK2_MEM_TAG_W-1:0] rq1_t, rq2_t;
     reg [31:0] rq1_d, rq2_d;
     wire       rd_acc = mem_req_valid & mem_req_ready & ~mem_req_wen;
     assign mem_req_ready = ~rq2_v;
@@ -433,7 +433,8 @@ module tb_back2_lockstep_top #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rq1_v <= 1'b0; rq2_v <= 1'b0;
-            rq1_t <= 3'd0; rq2_t <= 3'd0; rq1_d <= 32'h0; rq2_d <= 32'h0;
+            rq1_t <= {`BACK2_MEM_TAG_W{1'b0}}; rq2_t <= {`BACK2_MEM_TAG_W{1'b0}};
+            rq1_d <= 32'h0; rq2_d <= 32'h0;
         end else begin
             // ---- 写：当拍按字节落地（LSU 单端口、单笔/拍）----
             if (mem_req_valid && mem_req_ready && mem_req_wen) begin

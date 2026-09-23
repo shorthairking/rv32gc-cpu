@@ -31,6 +31,13 @@ module tb_back2_lsq_fwd_top;
     reg              flush_all = 0, squash = 0;
     reg [ROBW-1:0]   squash_idx = 0, rob_head = 0;
     reg [3:0]        alloc_valid = 0;
+    //   ★ 2B-3 第 6 段第二步新增端口：STQ 分配随带的 ROB 索引（年龄在分配期写入）、
+    //     发射闸门的**候选** ROB 索引、以及提交点释放窗口 `cmt_n`。
+    //     本用例是"LSQ 直驱"夹具（不经 ROB/IQ）⇒ `cmt_n` 恒 0（不模拟提交点），
+    //     LQ 释放路径由锁步/regress 的端到端用例覆盖；LQ 深度 32 ≫ 本用例 5 笔 load。
+    reg [4*ROBW-1:0] alloc_rob = 0;
+    reg [ROBW-1:0]   iss_rob = 0;
+    reg [2:0]        cmt_n = 0;
     wire             alloc_ok;
     wire [4*STQ_IW-1:0] alloc_idx;
     reg              exe_valid = 0, exe_is_store = 0, exe_is_fp = 0;
@@ -69,12 +76,14 @@ module tb_back2_lsq_fwd_top;
     lsq_simple #(.DBG(0)) u_lsq (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all), .squash(squash),
         .squash_idx(squash_idx), .rob_head(rob_head),
-        .alloc_valid(alloc_valid), .alloc_ok(alloc_ok), .alloc_idx(alloc_idx),
+        .alloc_valid(alloc_valid), .alloc_rob(alloc_rob),
+        .alloc_ok(alloc_ok), .alloc_idx(alloc_idx),
         .exe_valid(exe_valid), .exe_is_store(exe_is_store), .exe_is_fp(exe_is_fp),
         .exe_rob(exe_rob), .exe_epoch(exe_epoch), .exe_addr(exe_addr), .exe_wdata(exe_wdata),
         .exe_size(exe_size), .exe_unsign(exe_unsign), .exe_dst_i(exe_dst_i), .exe_dst_f(exe_dst_f),
         .exe_pdest_i(exe_pdest_i), .exe_pdest_f(exe_pdest_f), .exe_stq_idx(exe_stq_idx),
-        .iss_ok(iss_ok), .dr_valid(dr_valid), .dr_idx(dr_idx),
+        .iss_rob(iss_rob), .iss_ok(iss_ok), .dr_valid(dr_valid), .dr_idx(dr_idx),
+        .cmt_n(cmt_n),
         .mem_req_valid(mem_req_valid), .mem_req_wen(mem_req_wen), .mem_req_addr(mem_req_addr),
         .mem_req_wdata(mem_req_wdata), .mem_req_wstrb(mem_req_wstrb), .mem_req_tag(mem_req_tag),
         .mem_req_ready(mem_req_ready), .mem_rsp_valid(mem_rsp_valid), .mem_rsp_rdata(mem_rsp_rdata),
@@ -101,6 +110,8 @@ module tb_back2_lsq_fwd_top;
         begin
             @(negedge clk);
             alloc_valid = 4'h1; exe_valid = 1'b0;
+            alloc_rob[0*ROBW +: ROBW] = rob;   // 分配期即给出 ROB 索引（年龄唯一写点）
+            iss_rob = rob;
             //   ★ 槽号必须在**分配拍**采样：`alloc_idx[0]` 是空闲表的组合读，
             //     在 `alloc_valid=1` 的那一拍它指向"下一拍将被分配的槽"。
             slot = alloc_idx[0*STQ_IW +: STQ_IW];
@@ -119,6 +130,7 @@ module tb_back2_lsq_fwd_top;
         begin
             @(negedge clk);
             exe_valid = 1'b1; exe_is_store = 1'b0; exe_rob = rob;
+            iss_rob = rob;
             exe_addr = a; exe_size = sz; exe_unsign = uns;
             @(posedge clk);
             @(negedge clk); exe_valid = 1'b0;

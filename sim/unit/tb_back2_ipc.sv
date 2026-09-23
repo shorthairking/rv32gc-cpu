@@ -159,7 +159,7 @@ module tb_back2_ipc;
     wire        mem_req_valid, mem_req_wen;
     wire [31:0] mem_req_addr, mem_req_wdata;
     wire [3:0]  mem_req_wstrb;
-    wire [2:0]  mem_req_tag;
+    wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag;   // ★ 2B-3：标签宽度随 LQ 扩容（3→6）
     wire [3:0]  commit_valid;
     wire [127:0] commit_pc, commit_arch_rd_wdata;
     wire [19:0]  commit_arch_rd;
@@ -207,7 +207,8 @@ module tb_back2_ipc;
         .mem_req_addr_o(mem_req_addr), .mem_req_wdata_o(mem_req_wdata),
         .mem_req_wstrb_o(mem_req_wstrb), .mem_req_tag_o(mem_req_tag),
         .mem_req_ready_i(1'b1),
-        .mem_rsp_valid_i(1'b0), .mem_rsp_rdata_i(32'h0), .mem_rsp_tag_i(3'h0),
+        .mem_rsp_valid_i(1'b0), .mem_rsp_rdata_i(32'h0),
+        .mem_rsp_tag_i({`BACK2_MEM_TAG_W{1'b0}}),
         .commit_valid_o(commit_valid), .commit_pc_o(commit_pc),
         .commit_arch_rd_o(commit_arch_rd), .commit_arch_rd_wdata_o(commit_arch_rd_wdata),
         .commit_arch_we_o(commit_arch_we),

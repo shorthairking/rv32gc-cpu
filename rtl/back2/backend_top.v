@@ -108,11 +108,11 @@ module backend_top #(
     output wire [31:0] mem_req_addr_o,
     output wire [31:0] mem_req_wdata_o,
     output wire [3:0]  mem_req_wstrb_o,
-    output wire [2:0]  mem_req_tag_o,
+    output wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag_o,   // ★ 2B-3：随 LQ 扩容 3→6 bit
     input  wire        mem_req_ready_i,
     input  wire        mem_rsp_valid_i,
     input  wire [31:0] mem_rsp_rdata_i,
-    input  wire [2:0]  mem_rsp_tag_i,
+    input  wire [`BACK2_MEM_TAG_W-1:0] mem_rsp_tag_i,
     // ---- 提交流（锁步比对）----
     output wire [3:0]  commit_valid_o,
     output wire [127:0] commit_pc_o,
@@ -149,6 +149,7 @@ module backend_top #(
     localparam       PW_I  = `BACK2_PREG_I_W;
     localparam       PW_F  = `BACK2_PREG_F_W;
     localparam       SRC_N = 5;
+    localparam       ROBW  = 7;              // ROB 索引位宽（= `BACK2_ROB_IDX_W）
     localparam WBP_ALU0 = 0, WBP_ALU1 = 1, WBP_BRU = 2, WBP_MDU = 3,
                WBP_LSU  = 4, WBP_FPU  = 5, WBP_STD = 6;
 
@@ -205,7 +206,7 @@ module backend_top #(
     function p_ckv; input [RB_W-1:0] p; begin p_ckv = p[`BACK2_UB_CKPT_VALID]; end endfunction
     function [3:0] p_ckid; input [RB_W-1:0] p; begin p_ckid = p[`BACK2_U_CKPT_MSB:`BACK2_U_CKPT_LSB]; end endfunction
     function [2:0] p_cls;  input [RB_W-1:0] p; begin p_cls  = p[`BACK2_U_CLS_MSB:`BACK2_U_CLS_LSB]; end endfunction
-    function [3:0] p_stq;  input [RB_W-1:0] p; begin p_stq  = p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB]; end endfunction
+    function [`BACK2_STQ_IDX_W-1:0] p_stq; input [RB_W-1:0] p; begin p_stq = p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB]; end endfunction
     function [31:0] p_csrw;input [RB_W-1:0] p; begin p_csrw = p[`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB]; end endfunction
     function [11:0] p_csra;input [RB_W-1:0] p; begin p_csra = p[`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB]; end endfunction
     function [2:0]  p_csrop;input [RB_W-1:0] p;begin p_csrop= p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB]; end endfunction
@@ -267,7 +268,7 @@ module backend_top #(
     wire [31:0] csr_rdata_w;
     wire [2:0]  csr_frm_w;
     wire [4:0]  csr_ff_w;
-    wire [3:0]  stq_of_rob_r;
+    wire [`BACK2_STQ_IDX_W-1:0] stq_of_rob_r;
     reg         trap_halt_q;
     reg         mdu_if_v, fpu_if_v;
     reg  [6:0]  mdu_if_rob, fpu_if_rob;
@@ -275,7 +276,7 @@ module backend_top #(
     reg         mdu_if_di, fpu_if_di, fpu_if_df;
     reg  [PW_I-1:0] mdu_if_pdi, fpu_if_pdi;
     reg  [PW_F-1:0] fpu_if_pdf;
-    reg  [3:0]  stq_of_rob [0:127];
+    reg  [`BACK2_STQ_IDX_W-1:0] stq_of_rob [0:127];
     wire [11:0] csr_raddr_w;
 
 
@@ -379,7 +380,11 @@ module backend_top #(
     // 提交
     wire [6:0]  cmt_i2;
     wire [3:0]  lsu_dr_valid;
-    wire [15:0] lsu_dr_idx;
+    wire [DISP_W*`BACK2_STQ_IDX_W-1:0] lsu_dr_idx;
+    //   ★ 2B-3 第 6 段第二步：STQ 分配随带的 ROB 索引（年龄在分配期写入）
+    wire [DISP_W*ROBW-1:0] st_alloc_rob;
+    //   本拍提交条数（LQ 提交点释放的窗口宽度；已按 cmt_ok 门控）
+    wire [2:0]  cmt_n_w;
 
     // 前端接口
     reg  [31:0] cnt_sq_q, cnt_cmt4_q, cnt_iss_q;
@@ -653,7 +658,11 @@ module backend_top #(
     assign st_alloc_v[2] = d1_v_q[2] & d1_uop_q[2][`BACK2_UB_IS_STORE];
     assign st_alloc_v[3] = d1_v_q[3] & d1_uop_q[3][`BACK2_UB_IS_STORE];
     wire       st_alloc_ok;
-    wire [15:0] st_alloc_idx;
+    wire [DISP_W*`BACK2_STQ_IDX_W-1:0] st_alloc_idx;
+    //   ★ STQ 分配同时把各 lane 的 ROB 索引送进 LSQ：ROB 项与 lane 一一对应
+    //     （同一块内 lane 0 最老：ROB 索引 = rob_alloc_idx0 + lane，与 §IQ 写口同式）。
+    assign st_alloc_rob = {rob_alloc_idx0 + 7'd3, rob_alloc_idx0 + 7'd2,
+                           rob_alloc_idx0 + 7'd1, rob_alloc_idx0};
     wire [3:0]  lsu_dr_ok_w;
     wire        disp_ok = (d1_v_q != {DISP_W{1'b0}}) & ~rn_i_busy & ~rn_f_busy &
                           ~squash_v_w & ~flush_all_w & ~trap_halt_q &
@@ -752,7 +761,7 @@ module backend_top #(
     generate
     for (g5 = 0; g5 < DISP_W; g5 = g5 + 1) begin : g_rb
         assign rob_pay_w[g5*RB_W +: RB_W] = {
-            st_alloc_idx[g5*4 +: 4],                       // STQ 索引
+            st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],   // STQ 索引
             5'b0,                                          // fflags
             1'b0,                                          // tr_taken（执行期回写）
             32'h0,                                         // tr 实际目标（执行期回写）
@@ -866,7 +875,22 @@ module backend_top #(
         .iss_epoch(iq_iss_ep[3]), .iss_dead(iq_iss_dead[3]),
         .o_sel_v(i3_sel_v), .o_sel_uop(i3_sel_uop), .o_sel_rob(i3_sel_rob), .cnt_o()
     );
-    iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ), .INORD_LOAD(1)) u_iq4 (   // B28: LSU in-order gate
+    //   ★★ 2B-3 第 6 段第二步（**真乱序的边界**）：`INORD_LOAD` **保持 1**，但它的角色
+    //     从"唯一兜底"变为"**LQ 槽位序的防死锁门**"，与精确的 STQ 闸门**并联**：
+    //       · STQ 闸门（`lsq_simple` §2.1，`iss_ok`）：更老 store **未定址** ⇒ 阻塞本 load
+    //         （B28 保守语义；年龄按**候选** `i4_sel_rob` 判定、`stq_rob` 在**分配期**写入
+    //         ⇒ 判定逐条精确）；更老 store **均已定址** ⇒ 放行，重叠字节由 §2.2 逐字节
+    //         转发/合并兜住（同字节取**最年轻**的更老匹配者）。
+    //       · INORD_LOAD（队列级）：更老的 LSU 项未就绪 ⇒ 本 load 不可选。
+    //     ★ **为何不能简单地把 INORD_LOAD 置 0**（本段实测 + 结构分析，记为 2B-3 遗留）：
+    //       LQ 槽在 **E1（发射后一拍）**分配，释放点在**提交**。若容许 load 越过"更老未就绪
+    //       的 load"，则年轻 load 可以先占满 32 个 LQ 槽并完成，而更老那条 load 因
+    //       `ld_slot_ok=0` 永远发不出去 ⇒ 它不 done ⇒ ROB 头无法越过它 ⇒ 那些年轻人的槽
+    //       也永不释放 ⇒ **结构性死锁**（实测程序 0/1/2 未触发：LQ 峰值占用仅 2，但该形态
+    //       对一般程序可达）。真要放开，必须把 LQ 分配改到 **D3 派发期**（程序序分配、
+    //       提交点释放，天然无此环）—— ROB 载荷 [415:411] 恰有 5 bit 空闲位可用（见
+    //       `back2_params.vh` §2 的空位注），留作后续段。
+    iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ), .INORD_LOAD(1)) u_iq4 (   // B28 防死锁门（与精确 STQ 闸门并联）
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
@@ -1003,6 +1027,7 @@ module backend_top #(
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w),
         .squash(squash_v_w), .squash_idx(squash_idx_w), .rob_head(rob_head_w),
         .alloc_valid(st_alloc_v & {DISP_W{disp_fire_w}}),
+        .alloc_rob(st_alloc_rob),
         .alloc_ok(st_alloc_ok), .alloc_idx(st_alloc_idx),
         .exe_valid(x_i2_v[4]), .exe_is_store(u_is_st(x_i2_uop[4])),
         .exe_is_fp(u_fpls(x_i2_uop[4])),
@@ -1014,8 +1039,11 @@ module backend_top #(
         //   ★ 目的物理号取 **PDIDST**（u_pdi），不是源 1（u_ps1i）；写口/唤醒 tag 同源。
         .exe_pdest_i(u_pdi(x_i2_uop[4])), .exe_pdest_f(u_pdf(x_i2_uop[4])),
         .exe_stq_idx(stq_of_rob_r),
+        //   ★ 发射闸门按**候选**（i4_sel）的 ROB 索引判年龄；iss_ok 即接 IQ 的 iss_ready。
+        .iss_rob(i4_sel_rob),
         .iss_ok(lsu_iss_ok_w), 
         .dr_valid(lsu_dr_valid), .dr_idx(lsu_dr_idx),
+        .cmt_n(cmt_n_w),
         .mem_req_valid(mem_req_valid_o), .mem_req_wen(mem_req_wen_o),
         .mem_req_addr(mem_req_addr_o), .mem_req_wdata(mem_req_wdata_o),
         .mem_req_wstrb(mem_req_wstrb_o), .mem_req_tag(mem_req_tag_o),
@@ -1133,6 +1161,10 @@ module backend_top #(
     // 9. 提交（W1）：写回值读出 / 架构 RAT / 释放 / CSR / store 排空 / 训练 / 检查点
     //==========================================================================
     assign cmt_ok = ~(squash_v_w | flush_all_w);
+    //   ★ LQ 提交点释放的窗口宽度：`cmt_raw` 是 rob.v 的**前缀连续**提交链（第 i 槽可提交 ⇒
+    //     前面全可提交）⇒ 条数 = popcount；冲刷/陷阱拍强制 0（不得释放未提交项）。
+    assign cmt_n_w = cmt_ok ? ({2'b0, cmt_raw[0]} + {2'b0, cmt_raw[1]} +
+                               {2'b0, cmt_raw[2]} + {2'b0, cmt_raw[3]}) : 3'd0;
     assign cmt_i2 = x_i2_rob[2];
 
     genvar cc;
@@ -1158,7 +1190,7 @@ module backend_top #(
         assign rel_f_we[cc]   = cmt_raw[cc] & cmt_ok & p_df(p);
         assign rel_f_pd[cc*PW_F +: PW_F] = p_pdfo(p);
         assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok;
-        assign lsu_dr_idx[cc*4 +: 4] = p_stq(p);
+        assign lsu_dr_idx[cc*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = p_stq(p);
     end
     endgenerate
 
@@ -1498,7 +1530,7 @@ module backend_top #(
             fpu_if_rob <= 7'd0; fpu_if_ep <= {EW{1'b0}}; fpu_if_di <= 1'b0;
             fpu_if_df <= 1'b0; fpu_if_pdi <= {PW_I{1'b0}}; fpu_if_pdf <= {PW_F{1'b0}};
             for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) ck_rob_q[si2] <= 7'd0;
-            for (si2 = 0; si2 < 128; si2 = si2 + 1) stq_of_rob[si2] <= 4'd0;
+            for (si2 = 0; si2 < 128; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= 107'h0;
         end else begin
             busy_i_q <= busy_i_nx;
@@ -1531,7 +1563,7 @@ module backend_top #(
             if (disp_fire_w) begin
                 for (si2 = 0; si2 < DISP_W; si2 = si2 + 1)
                     if (st_alloc_v[si2])
-                        stq_of_rob[rob_alloc_idx0 + si2[6:0]] <= st_alloc_idx[si2*4 +: 4];
+                        stq_of_rob[rob_alloc_idx0 + si2[6:0]] <= st_alloc_idx[si2*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W];
             end
 
             // ---- 检查点表（登记 / 释放）----

@@ -1,29 +1,33 @@
 //==============================================================================
-// rtl/back2/lsq_simple.v —— **过渡方案**简化访存队列（顺序发射 / 写回可乱序 / 提交排空）
+// rtl/back2/lsq_simple.v —— LSQ：**SQ 32 + LQ 32**（写回可乱序 / 提交点释放）
 //==============================================================================
-// 项目  : rv32gc-cpu（阶段二 2B-2；完整 LSQ 属 2B-3）
+// 项目  : rv32gc-cpu（阶段二 2B-3 第 6 段：SQ 16→32、LQ 4→32、真乱序边界）
 // 规格  : docs/design/03-out-of-order.md §6（LSQ 结构与访存序、load→store 转发、提交时
-//         释放）的**过渡子集**；本里程碑显式边界见下（交付说明同步登记）。
+//         释放）；2B-3 两步扩容的落地与实测见 sim/unit/back2_report.md §B3.7。
 //
-// 【本里程碑口径】
-//   · **顺序发射**：LSU 单端口；IQ-LSU 的最老优先选择保证按程序序进入本模块。
-//   · **写回可乱序**：≤`OUT_N` 笔 load 可同时在途，响应按标签各自写回 —— 这是与纯
-//     顺序核最本质的差别（2A 核为"单笔在途 + 顺序写回"）。
-//   · **字节级 load→store 转发**（§6.2）：load 发射拍扫描**更老且地址已确认**的 store，
-//     按字内字节道取**最年轻**的更老匹配者；全部字节命中 ⇒ 不访问存储、次拍直接写回。
-//     更老的 store 地址未生成 ⇒ 该 load **不可发射**（保守但正确；地址信息在
-//     顺序发射下必然齐备 ⇒ 本规则只在 store 与其紧邻 load 同拍起步时生效）。
+// 【本段口径（最终状态）】
+//   · **SQ 32 / LQ 32**：容量与位宽唯一真源 = `back2_params.vh`（`BACK2_STQ_N` /
+//     `BACK2_LQ_N`）；STQ 索引同时在 ROB 载荷 [410:406]（4→5 bit，见该文件"位域核对"注）。
+//   · **发射**：LSU 单发射口，IQ-LSU 最老就绪优先；`INORD_LOAD`（队列级）与
+//     **精确 STQ 闸门**（§2.1）并联：更老 store **未定址** ⇒ 本 load 不可发射；
+//     更老 store 均已定址 ⇒ 放行（重叠字节由转发/合并兜住）。
+//   · **LQ**：load 在 **E1 入队**（`newslot` 取最低空闲槽），响应按 `ld_tag` 标签
+//     **乱序写回**（`ld_dn` 标记数据已齐），槽位本身**在提交点释放**（§4.4b：
+//     `(ld_rob - rob_head) & 7'h7F < cmt_n`，冲刷/陷阱拍 `cmt_n=0`）。
+//   · **字节级 load→store 转发**（§6.2）：扫描**更老且地址已确认**的 store（32 候选 ×
+//     4 字节道），取**最年轻**的更老匹配者；全部字节命中 ⇒ 不访问存储、次拍直接写回。
 //   · **store 提交排空**：地址/数据在 E1 生成后驻留 STQ，**只在 ROB 提交该 store 时**
 //     才写入存储（§6.2 / §9：异常回滚不可能双重写）；排空与 load 请求共用单请求口，
 //     且**排空拍不发 load 请求**，保证 load 读到的存储内容严格晚于它必须看到的 store 写。
-//   · **不做**（留 2B-3）：未对齐拆笔、PMP/MMU 检查落地、AMO/LR-SC、cbo.*、fence 屏障项、
-//     64 bit（fld/fsd）访存。本模块只做 ≤4 B 的对齐访存。
+//   · **不做**（留后续段）：未对齐拆笔、PMP/MMU 检查落地、AMO/LR-SC、cbo.*、fence 屏障项、
+//     64 bit（fld/fsd）访存；**D3 期 LQ 分配**（放开 load 越过"更老未就绪 load"的前提，
+//     见 §B3.7.3③ 的死锁分析）。本模块只做 ≤4 B 的对齐访存。
 //   · **地址唯一来源**：STQ/SQ 的地址字段只写一次、只写物理地址（Bare 口径 VA=PA；
-//     Sv32 接线留 2B-3/2B-4）。
+//     Sv32 接线留 2B-4）；`stq_rob`（年龄）同样**唯一写点** = 分配期（§4.2）。
 //
-// 风格  : 组合逻辑用 `assign` + 条件表达式；两处 always 块分别为
-//         ①"字节级转发归约"（组合、逐项比较 STQ 阵列——转发网络必须比较的场合）；
-//         ②"STQ / 在途 load 表"（时序元件）。★ 不使用读存储器的 function。
+// 风格  : 组合逻辑用 `assign` + 条件表达式 + 纯函数（`pri_enc`/`ext_load`）；
+//         always 块只承载时序元件与阵列更新（STQ/LQ 表、指针、计数器）。
+//         ★ 不使用读存储器的 function；★ 归约一律连续赋值（B3.5 的 x 陷阱教训）。
 //==============================================================================
 
 `timescale 1ns / 1ps
@@ -33,7 +37,8 @@
 module lsq_simple #(
     parameter integer STQ_N    = `BACK2_STQ_N,
     parameter integer STQ_IW   = `BACK2_STQ_IDX_W,
-    parameter integer OUT_N    = `BACK2_MEM_OUT_N,
+    parameter integer OUT_N    = `BACK2_MEM_OUT_N,   // LQ 深度（32）
+    parameter integer LQ_IW    = `BACK2_LQ_IDX_W,    // LQ 下标宽度（5）
     parameter integer TAG_W    = `BACK2_MEM_TAG_W,
     parameter integer ROB_IDX_W= `BACK2_ROB_IDX_W,
     parameter integer PDW_I    = `BACK2_PREG_I_W,
@@ -50,6 +55,7 @@ module lsq_simple #(
 
     // ---- D3 派发：为 store 分配 STQ 项（≤4/拍，程序序）----
     input  wire [W-1:0]          alloc_valid,
+    input  wire [W*ROB_IDX_W-1:0] alloc_rob,           // ★ 2B-3：随带各 lane 的 ROB 索引
     output wire                  alloc_ok,
     output wire [W*STQ_IW-1:0]   alloc_idx,
 
@@ -70,11 +76,15 @@ module lsq_simple #(
     input  wire [STQ_IW-1:0]     exe_stq_idx,
 
     // ---- 发射前检查（接 IQ 的 iss_ready）----
-    output wire                  iss_ok,               // 有空余在途槽 且 无更老未定址 store
+    input  wire [ROB_IDX_W-1:0]  iss_rob,              // ★ 2B-3：候选（i4_sel）的 ROB 索引
+    output wire                  iss_ok,               // 有空余 LQ 槽 且 无更老未定址 store
 
     // ---- 提交排空（ROB 头 store 项）----
     input  wire [W-1:0]          dr_valid,
     input  wire [W*STQ_IW-1:0]   dr_idx,
+
+    // ---- 提交点释放（LQ 项；★ 2B-3 第 6 段第二步：E1 入队、提交点释放）----
+    input  wire [2:0]            cmt_n,                // 本拍提交条数（外部已按 cmt_ok 门控）
 
     // ---- 访存请求口（单请求；load 带标签）----
     output wire                  mem_req_valid,
@@ -124,7 +134,12 @@ module lsq_simple #(
     reg                  stq_ret [0:STQ_N-1];
     reg  [STQ_IW-1:0]    stq_head_q, stq_tail_q;
 
-    wire [7:0] age_rob  = (exe_rob - rob_head) & 7'h7F;      // 发射项年龄
+    wire [7:0] age_rob  = (exe_rob - rob_head) & 7'h7F;      // E1 项年龄（转发窗口）
+    //   ★★ 2B-3 第 6 段第二步：**发射闸门必须按"候选（i4_sel）"判年龄**。
+    //     旧实现用 `age_rob`（= 正在 E1 的那条，即上一拍发射的项）⇒ 闸门判的是别人，
+    //     只在"load 紧跟在 store 之后发射"这一拍凑巧正确（INORD_LOAD 队列门兜底）。
+    //     本段把闸门改为候选年龄 `age_iss`，"更老未定址 store"判定逐条精确。
+    wire [7:0] age_iss  = (iss_rob - rob_head) & 7'h7F;      // I1 候选年龄（发射闸门）
 
     //==========================================================================
     // 1. D3 分配（store 项）
@@ -197,20 +212,25 @@ module lsq_simple #(
     //==========================================================================
     // 2. 更老未定址 store 检查 + 字节级转发（组合，load 发射拍；全部连续赋值）
     //==========================================================================
-    // 2.1 更老未定址 store（阻塞 load 发射）
-    //   ★【B28 未修·现场】此处用 `stq_rob[q]` 判年龄，而该字段只在 E1 写入 ⇒ 已分配未执行的
-    //     store 里是上一占用者的陈旧值 ⇒ 更老的未定址 store 可能漏检 ⇒ 更年轻的 load 抢跑
-    //     ⇒ 漏转发（实测 sb→lbu 读到内存填充 0x13，程序 2 C1 第 11 条分歧）。
-    //     两次修复尝试均已回退：(a) "任意未定址 store 都挡 load" ⇒ 死锁（更老 load ↔ 依赖它的
-    //     更年轻 store 互等，乱序核卡在 20 条）；(b) 分配期记录 ROB 索引 ⇒ 仍卡在 20 条。
-    //     ★ 2B-2 的**兜底**是 `iq.v` 的 `INORD_LOAD` 队列级门（load 只能在更老项就绪后才发），
-    //       本条归约因此只是**双保险**；2B-3 第 6 段若放开 load 乱序，必须把分配期 ROB 索引
-    //       写进 STQ（`stq_rob` 在分配时即写），届时此条才成为真正的发射门。
+    // 2.1 更老未定址 store（阻塞 load 发射）—— **B28 保守闸门（2B-3 第 6 段已精确化）**
+    //   · 判据：存在 `stq_v & ~stq_av`（已分配、地址未生成）且**比候选 load 更老**的 store
+    //     ⇒ `iss_ok=0` ⇒ 该 load 本轮不可发射（B28 教训：更年轻 load 抢跑会漏转发）。
+    //   · 本段两处修正（原实现的两处偏差，均在 2B-2 时以 `INORD_LOAD` 队列级门兜底）：
+    //     ① `stq_rob` 改为**分配期**写入（§4.2）⇒ "已分配未执行"的 store 不再是上一占用者的
+    //        陈旧年龄（旧实现在 E1 才写 ⇒ 年龄判据在未执行项上不可靠）；
+    //     ② 年龄比较的基准由 `age_rob`（**正在 E1 的那条**）改为 `age_iss`（**I1 候选**）
+    //        ⇒ 判的是"要发射的这条"而不是"上一拍发射的那条"。
+    //   · 与 `iq.v` 的 `INORD_LOAD` **并联**：后者仍保留，作用是**LQ 槽位序的防死锁门**
+    //     （见 backend_top 例化处注：LQ 槽在 E1 分配、提交点释放，若容许越过"更老未就绪的
+    //     load"，年轻 load 可占满 32 槽而更老那条永远发不出 ⇒ 结构性死锁）。
+    //   · 更老 store **均已定址**时本条不阻塞：重叠字节由 §2.2 逐字节转发/合并兜住
+    //     （E1 当拍读到的 STQ 快照必然包含所有"更早已发射"的 store —— 单发射口 ⇒
+    //      更早发射的 store 至少早一拍完成 E1，`stq_av/stq_a/stq_msk/stq_d` 已全部落地）。
     wire [STQ_N-1:0] unk_v;
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_unk
         assign unk_v[gv] = stq_v[gv] & ~stq_av[gv] &
-                           (((stq_rob[gv] - rob_head) & 7'h7F) < age_rob);
+                           (((stq_rob[gv] - rob_head) & 7'h7F) < age_iss);
     end
     endgenerate
     wire any_unk_w = |unk_v;
@@ -305,10 +325,25 @@ module lsq_simple #(
 
 
     //==========================================================================
-    // 3. 在途 load 表
+    // 3. LQ（load queue）：`OUT_N` 项在途表（2B-3 第 6 段第一步：4 → 32 项）
     //==========================================================================
-    reg                  ld_v    [0:OUT_N-1];
+    //   ★ 扩容口径（第 6 段两步的最终状态）：
+    //     · 深度 = `OUT_N` =`BACK2_MEM_OUT_N` =`BACK2_LQ_N` = 32（LQ 32）；
+    //     · 下标宽度 = `LQ_IW` =`BACK2_LQ_IDX_W` = 5；
+    //     · 槽标签 `ld_tag[slot] = slot`（最高位恒 0），**store 排空标签取全 1**
+    //       ⇒ `BACK2_MEM_TAG_W` 必须 ≥ LQ_IW+1（已同步 3→6），否则 31 号槽会与
+    //       排空标签撞车（响应被误当 load 数据写回）。
+    //     · 原实现把 4 个槽的 `ld_free/pend_vec/rsp_vec/newslot` **下标字面写死**，
+    //       扩容时必须改为 generate + 优先级链（下 §3.2），语义逐项等价（最低序号优先）。
+    //     · **第一步**只扩容量/位宽（释放语义保持"响应即释放"）并保全绿；
+    //       **第二步**改为真 LSQ 语义：E1 入队（§4.3）、写回可乱序（标签匹配）、
+    //       **提交点释放**（§4.4b，`ld_dn` 与 `ld_v` 分离）。
+    reg                  ld_v    [0:OUT_N-1];        // 已分配（E1 入队 ⇒ 提交点释放）
     reg                  ld_req  [0:OUT_N-1];        // 请求已发（等响应）
+    //   ★★ 2B-3 第 6 段第二步：`ld_dn` = 该 load 的数据已齐（响应到 / 合并完成）。
+    //     与 `ld_v` 分离的原因：**提交点释放**要求项在写回之后仍占着 LQ（直到该 load
+    //     按程序序提交），而"已完成"必须把它排除出请求口与响应匹配 ⇒ 两个状态位。
+    reg                  ld_dn   [0:OUT_N-1];
     reg  [ROB_IDX_W-1:0] ld_rob  [0:OUT_N-1];
     reg  [`BACK2_EPOCH_W-1:0] ld_ep [0:OUT_N-1];
     reg                  ld_di   [0:OUT_N-1];
@@ -322,29 +357,45 @@ module lsq_simple #(
     reg  [31:0]          ld_hd   [0:OUT_N-1];
     reg  [TAG_W-1:0]     ld_tag  [0:OUT_N-1];
 
-    wire [OUT_N-1:0] ld_free = ~{ld_v[3], ld_v[2], ld_v[1], ld_v[0]};
-    wire ld_slot_ok = |ld_free;
+    //--------------------------------------------------------------------------
+    // 3.2 LQ 打包视角 + 归约（全部连续赋值；深度/位宽参数化）
+    //   语义与原 4 项字面实现**逐项等价**：
+    //     · `ld_free` = 各槽空闲（原 `~{ld_v[3],…,ld_v[0]}`）；
+    //     · `pend_vec` = 已分配且未发请求（原 4 项拼接）；
+    //     · `rsp_vec`  = 在等响应且标签命中（原 4 项拼接）；
+    //     · `newslot`  = 最低序号空闲槽（原三目链）。
+    //   优先级编码用**纯函数**（只吃打包向量、不读存储器；本文件禁用"读存储器的 function"）。
+    //--------------------------------------------------------------------------
+    function [LQ_IW-1:0] pri_enc(input [OUT_N-1:0] v);
+        integer pi;
+        begin
+            pri_enc = {LQ_IW{1'b0}};
+            for (pi = OUT_N-1; pi >= 0; pi = pi - 1)
+                if (v[pi]) pri_enc = pi[LQ_IW-1:0];
+        end
+    endfunction
+
+    wire [OUT_N-1:0] ld_free;
+    wire [OUT_N-1:0] pend_vec;
+    wire [OUT_N-1:0] rsp_vec;
+    generate
+    for (gv = 0; gv < OUT_N; gv = gv + 1) begin : g_lq_pk
+        assign ld_free [gv] = ~ld_v[gv];
+        assign pend_vec[gv] = ld_v[gv] & ~ld_req[gv] & ~ld_dn[gv];
+        assign rsp_vec [gv] = ld_v[gv] & ld_req[gv] & (ld_tag[gv] == mem_rsp_tag);
+    end
+    endgenerate
+
+    wire             ld_slot_ok = |ld_free;
+    wire             pend_any   = |pend_vec;
+    wire [LQ_IW-1:0] pend_sel   = pri_enc(pend_vec);
+    wire             rsp_ok     = mem_rsp_valid & (|rsp_vec);
+    wire [LQ_IW-1:0] rsp_sel    = pri_enc(rsp_vec);
+    wire             newslot_ok = |ld_free;
+    wire [LQ_IW-1:0] newslot    = pri_enc(ld_free);
 
     // 发射许可：有空槽 且 无更老未定址 store（store 项不需槽，但统一门控损失可忽略）
     assign iss_ok = ld_slot_ok & ~any_unk_w;
-
-    // ---- 待发请求项（已分配、未发请求）与响应匹配：连续赋值（原 `always @(*)` + for）----
-    //   语义与原循环逐项等价：**最低序号优先**（原循环 nq 递增、`!pend_any` 锁存首个命中者）。
-    wire [OUT_N-1:0] pend_vec = { ld_v[3] & ~ld_req[3], ld_v[2] & ~ld_req[2],
-                                  ld_v[1] & ~ld_req[1], ld_v[0] & ~ld_req[0] };
-    wire [OUT_N-1:0] rsp_vec  = { ld_v[3] & ld_req[3] & (ld_tag[3] == mem_rsp_tag),
-                                  ld_v[2] & ld_req[2] & (ld_tag[2] == mem_rsp_tag),
-                                  ld_v[1] & ld_req[1] & (ld_tag[1] == mem_rsp_tag),
-                                  ld_v[0] & ld_req[0] & (ld_tag[0] == mem_rsp_tag) };
-    wire             pend_any   = |pend_vec;
-    wire [1:0]       pend_sel   = pend_vec[0] ? 2'd0 : pend_vec[1] ? 2'd1 :
-                                   pend_vec[2] ? 2'd2 : pend_vec[3] ? 2'd3 : 2'd0;
-    wire             rsp_ok     = mem_rsp_valid & (|rsp_vec);
-    wire [1:0]       rsp_sel    = rsp_vec[0] ? 2'd0 : rsp_vec[1] ? 2'd1 :
-                                   rsp_vec[2] ? 2'd2 : rsp_vec[3] ? 2'd3 : 2'd0;
-    wire             newslot_ok = |ld_free;
-    wire [1:0]       newslot    = ld_free[0] ? 2'd0 : ld_free[1] ? 2'd1 :
-                                   ld_free[2] ? 2'd2 : ld_free[3] ? 2'd3 : 2'd0;
 
     // ---- 请求发射：store 排空优先；排空拍不发 load 请求 ----
     //   ★★ 2B-3 第 5 段修法：**x 隐患**——原 `always @(*)` + `for` 归约只在输入变化时重算，
@@ -438,7 +489,8 @@ module lsq_simple #(
                 stq_rob[si] <= {ROB_IDX_W{1'b0}}; stq_ret[si] <= 1'b0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
-                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_rob[si] <= {ROB_IDX_W{1'b0}};
+                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0;
+                ld_rob[si] <= {ROB_IDX_W{1'b0}};
                 ld_ep[si] <= {`BACK2_EPOCH_W{1'b0}}; ld_di[si] <= 1'b0; ld_df[si] <= 1'b0;
                 ld_pi[si] <= {PDW_I{1'b0}}; ld_pf[si] <= {PDW_F{1'b0}};
                 ld_addr[si] <= 32'h0; ld_size[si] <= 3'h0; ld_uns[si] <= 1'b0;
@@ -449,7 +501,7 @@ module lsq_simple #(
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0; stq_ret[si] <= 1'b0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
-                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0;
+                ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0;
             end
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
@@ -466,6 +518,12 @@ module lsq_simple #(
                         stq_av [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         stq_dv [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         stq_ret[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        //   ★★ 2B-3 第 6 段第二步（报告 §B3.6.4 的必办项）：ROB 索引在
+                        //     **分配期**即写入 ⇒ `stq_rob` 从这一刻起就是真年龄。
+                        //     旧实现在 E1 才写 ⇒ "已分配未执行"的 store 里是上一占用者的
+                        //     陈旧值 ⇒ `any_unk_w`（B28 保守闸门）判错年龄。
+                        stq_rob[alloc_idx[si*STQ_IW +: STQ_IW]] <=
+                                alloc_rob[si*ROB_IDX_W +: ROB_IDX_W];
                     end
                 end
             end
@@ -477,7 +535,8 @@ module lsq_simple #(
                 stq_a[exe_stq_idx]   <= exe_addr;                        // 物理地址唯一来源
                 stq_d[exe_stq_idx]   <= exe_wdata << {exe_addr[1:0], 3'b000};
                 stq_msk[exe_stq_idx] <= lmask_w;
-                stq_rob[exe_stq_idx] <= exe_rob;
+                //   `stq_rob` 已在**分配期**写入（§4.2）⇒ 此处不再重复写（唯一写点纪律）。
+                //   实测语义：分配期写入的 rob == 该 store 的 E1 rob（同一 ROB 项）。
                 cnt_st_q <= cnt_st_q + 32'd1;
                 if (any_unk_w) cnt_stall_q <= cnt_stall_q + 32'd1;
             end else if (exe_valid) begin
@@ -499,6 +558,7 @@ module lsq_simple #(
                 end else if (newslot_ok) begin
                     ld_v   [newslot] <= 1'b1;
                     ld_req [newslot] <= 1'b0;
+                    ld_dn  [newslot] <= 1'b0;
                     ld_rob [newslot] <= exe_rob;
                     ld_ep  [newslot] <= exe_epoch;
                     ld_di  [newslot] <= exe_dst_i;
@@ -510,24 +570,36 @@ module lsq_simple #(
                     ld_uns [newslot] <= exe_unsign;
                     ld_hm  [newslot] <= fwd_hit_w;
                     ld_hd  [newslot] <= fwd_data_w;
-                    //   ★ newslot 只有 2 bit（4 个在途槽）⇒ 必须零扩展到 TAG_W=3；
+                    //   ★ newslot 是 LQ_IW bit（LQ 32 ⇒ 5 bit）⇒ 必须零扩展到 TAG_W=6；
                     //     写 [TAG_W-1:0] 会取到向量外的位 ⇒ tag 为 **x** ⇒ 响应无法匹配（挂死）。
-                    ld_tag [newslot] <= {{(TAG_W-2){1'b0}}, newslot};
+                    //     最高位恒 0 ⇒ 与 store 排空的"全 1"标签天然不撞车。
+                    ld_tag [newslot] <= {{(TAG_W-LQ_IW){1'b0}}, newslot};
                 end
             end
 
             // ---- 4.4 请求 / 响应推进 ----
+            //   ★ 2B-3 第 5 段曾按**响应到达**释放 load 槽（修掉"槽永不释放 ⇒ 挂死"），
+            //     第 6 段第二步改为真 LSQ 语义：**响应到达只标记 `ld_dn`（数据已齐），
+            //     槽本身留到该 load 按程序序提交时释放**（§4.4b）。`ld_dn` 一旦置位，
+            //     该项即退出请求口（`pend_vec`）与响应匹配（`rsp_vec` 要 `ld_req`）⇒
+            //     写回只发生一次、不会被后到的响应重复触发。
             if (ld_fire) ld_req[pend_sel] <= 1'b1;
-            //   ★★ 2B-3 第 5 段（**转发覆盖用例暴露的真缺陷**）：原实现**从不在响应到达时释放
-            //     load 槽**（只有 flush_all / squash 才清）⇒ 无冲刷时满 `OUT_N` 笔 load 之后
-            //     `ld_slot_ok=0`：既不能全转发（无命中时）也无槽可分配 ⇒ 该 load **永不写回**，
-            //     LSU 从此不再受理 load（挂死）。锁步之所以未暴露：分支误判的 squash 顺手清了槽。
-            //     此处按**响应到达**释放（本里程碑口径：收到响应 = 该 load 已完成；2B-3 真 LSQ
-            //     改为**提交点释放**，并带 32 项 LQ —— 见报告 §B3.5 第 6 段计划）。
-            //     ★ 与 4.2 分配无冲突：`newslot` 只从 `ld_free` 选，本拍被释放的槽 ld_v 仍为 1。
             if (rsp_ok) begin
-                ld_v  [rsp_sel] <= 1'b0;
                 ld_req[rsp_sel] <= 1'b0;
+                ld_dn [rsp_sel] <= 1'b1;
+            end
+            // ---- 4.4b 提交点释放（LQ 项；★ 2B-3 第 6 段第二步）----
+            //   释放条件：该 LQ 项的 ROB 索引落在**本拍提交组** [head, head+cmt_n) 内。
+            //   依据：提交组恒为"从 ROB 头起的连续若干项"（rob.v 的前缀链），故用**窗口算术**
+            //   `(ld_rob - rob_head) & 7'h7F < cmt_n` 判定（禁掩码写法，B27 口径）；
+            //   释放是**幂等**的：不在窗口内的项保持占用，写回后的项靠 `ld_dn` 与请求口隔离。
+            //   `cmt_n` 由 backend_top 按 `cmt_ok`（非 squash/flush）门控后送入 ⇒ 冲刷拍恒 0。
+            for (si = 0; si < OUT_N; si = si + 1) begin
+                if (ld_v[si] & (((ld_rob[si] - rob_head) & 7'h7F) < {5'b0, cmt_n})) begin
+                    ld_v  [si] <= 1'b0;
+                    ld_req[si] <= 1'b0;
+                    ld_dn [si] <= 1'b0;
+                end
             end
             // ---- 4.5 store 排空标记与回收 ----
             //   队头回收：已排空（stq_ret）或已作废（冲刷/未执行前被清）⇒ 指针前移。
@@ -551,6 +623,7 @@ module lsq_simple #(
                         (((ld_rob[si] - rob_head) & 7'h7F) > ((squash_idx - rob_head) & 7'h7F))) begin
                         ld_v[si]   <= 1'b0;
                         ld_req[si] <= 1'b0;
+                        ld_dn[si]  <= 1'b0;
                     end
                 end
             end

@@ -67,11 +67,19 @@
 // ---- 唤醒/写回总线端口数（6 个执行部件各 1 个写回口）----
 `define BACK2_WB_N           6
 
-// ---- 简化访存队列（本里程碑过渡方案；完整 LSQ 属 2B-3）----
-`define BACK2_STQ_N          16
-`define BACK2_STQ_IDX_W      4
-`define BACK2_MEM_TAG_W      3          // 在途访存请求标签（≤8 笔）
-`define BACK2_MEM_OUT_N      4          // 允许同时在途的访存请求数（load 乱序写回）
+// ---- LSQ（2B-3：SQ 32 + LQ 32；本文件是容量/位宽唯一真源）----
+//   ★ 2B-3 第 6 段第一步：SQ 16→32（索引宽度 4→5），LQ 4→32（在途表 → 32 项 LQ）。
+//     `BACK2_STQ_IDX_W` 只被 lsq_simple.v 与 backend_top.v 的 6 处位宽引用使用；
+//     LQ 深度改变只牵动 lsq_simple.v 内部与内存标签宽度（见 `BACK2_MEM_TAG_W`）。
+`define BACK2_STQ_N          32
+`define BACK2_STQ_IDX_W      5
+`define BACK2_LQ_N           32
+`define BACK2_LQ_IDX_W       5
+//   标签宽度 = log2(LQ_N) + 1：槽标签用 0..LQ_N-1（最高位恒 0），**store 提交排空的
+//   标签取全 1** ⇒ 恰好多留 1 bit 才不会与 31 号槽撞车（LQ_N=4 时 3 bit 的旧口径
+//   只是因为 2 bit 槽号 + 1 bit 分隔位；LQ 扩到 32 后必须同步 +1）。
+`define BACK2_MEM_TAG_W      6
+`define BACK2_MEM_OUT_N      `BACK2_LQ_N     // 在途访存槽（MSHR 口径）= LQ 深度
 
 // ---- 统计（§10 风险项口径）----
 `define BACK2_STAT_W         32
@@ -210,12 +218,20 @@
 `define BACK2_RB_TRTAKEN     400        // [400]     分支实际方向（训练用）
 `define BACK2_RB_FFLAGS_MSB  405
 `define BACK2_RB_FFLAGS_LSB  401        // [405:401] 浮点 flags 累积（FPU done 时）
-`define BACK2_RB_STQ_MSB     409
-`define BACK2_RB_STQ_LSB     406        // [409:406] store queue 项索引（≤16 项）
+//   ★ 2B-3 第 6 段第一步：STQ 索引 4→5 bit。**位域位置必须逐位核对**——
+//     本载荷在 backend_top 的组装式 `{stq_idx, 5'b0, 1'b0, 32'h0, tval, {25'b0,ps1i}, uop}`
+//     是**右对齐（LSB 对齐）**拼接、高位由赋值零扩展 ⇒ **加宽最顶端的 STQ 字段只会向上
+//     生长，其下所有字段（fflags/trtgt/CSRW/uop…）的绝对 bit 位置逐位不变**。
+//     故 STQ_MSB 409→410、**STQ_LSB 恒为 406**、`BACK2_RB_W` 恒为 416
+//     （顶端保留位由 [415:410] 6 bit 缩为 [415:411] 5 bit）。
+//     ⚠ 不可写成 LSB 406→405：那会让 5 bit 字段跨进 [405]（= fflags 最高位），
+//       `p_stq` 取值将含 fflags 位而丢掉 STQ 高位。
+`define BACK2_RB_STQ_MSB     410
+`define BACK2_RB_STQ_LSB     406        // [410:406] store queue 项索引（≤32 项）
 // ---- 项内 epoch ----
 //   ★ 不占载荷位域：由 rob.v 的独立 2 bit 小数组 `rep_q[]` 承载（原因见 rob.v §0：
 //     放进 416 bit 载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
-//     载荷空位 [415:410] 保留 0。
+//     载荷空位 [415:411] 保留 0（5 bit；LQ 若也需上位域可直接用这段空闲位）。
 `define BACK2_RB_W           416
 
 // ---- 标志位在 uop 内的绝对 bit 位置（= FLAGS_LSB + fl 序号）----

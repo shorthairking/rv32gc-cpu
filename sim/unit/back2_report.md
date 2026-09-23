@@ -1473,3 +1473,221 @@ load"，6 场景 10 项检查；方法学见文件头注：接口与 2B-3 真 `l
    接到 32 项 LQ 的年龄窗口上）；④ store 提交序排空（单 AXI 在途 + 属主寄存器纪律）。
    ⇒ 同上五项验证 + 若性能基线移动则按 "**实测 × 0.8**" 重测 C5 档（三程序）并更新
    `tb_back2_lockstep.sv` 注释与本报告。
+
+> ★ **本计划已执行完毕**：两步各自全绿、性能基线逐位不变 ⇒ 见下方 **§B3.7**（第 6 段交付）。
+
+---
+
+# 2B-3 第 6 段：**两步扩容落地**（SQ 32 + LQ 32 + 真乱序边界）—— 两步各自全绿
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev 分支，起点 HEAD=`8a372fb`，**未提交**）
+> 写入范围：`rtl/back2/{lsq_simple.v, backend_top.v, back2_params.vh}` +
+> `sim/unit/tb_back2_{lockstep,lsq_fwd,ipc}.sv`；`scripts/regress.sh` **未改**（无需改）；
+> **2A/front4/exec/mem/csr/cache/fetch/decode/axi/top/pkg 零改动**（`git status` 仅上述 6 个文件）。
+> 备份：`../.b2chk/{lsq_simple.v,backend_top.v,back2_params.vh,tb_back2_*.sv}.s6`。
+
+## B3.7.0 两步划分与全绿结论（先给结论）
+
+| 步骤 | 内容 | 结果 |
+|---|---|---|
+| **第一步** | 容量/位宽扩容：`STQ_N 16→32`、`STQ_IDX_W 4→5`、LQ `4→32`、`MEM_TAG_W 3→6`、ROB 载荷 STQ 位域 4→5 bit、backend_top 6 处硬编码位宽 | ✅ 五项判据全绿（§B3.7.2/§B3.7.4） |
+| **第二步** | 语义：`stq_rob` **分配期**写入、发射闸门按**候选**判年龄、LQ **E1 入队 + 提交点释放**、写回乱序（标签匹配）、逐字节转发（32 项候选、最年轻胜）、store 按 ROB 序提交排空 | ✅ 同套判据全绿 + 性能基线**逐位不变**（§B3.7.3/§B3.7.4） |
+
+`regress.sh`：第一步在**内容逐字节相同**的副本树上跑（`.b2chk/s1_regress.log`，31/31）；
+第二步在**冻结后的正式树**上跑（`.b2chk/f_regress.log`，见 §B3.7.4）。
+
+## B3.7.1 触点改动清单（实际落地，逐处）
+
+### ① `rtl/back2/back2_params.vh`（容量/位宽唯一真源）
+
+| 宏 | 改前 | 改后 | 说明 |
+|---|---|---|---|
+| `BACK2_STQ_N` | 16 | **32** | SQ 32 |
+| `BACK2_STQ_IDX_W` | 4 | **5** | STQ 索引位宽 |
+| `BACK2_LQ_N` / `BACK2_LQ_IDX_W` | （新增） | **32 / 5** | LQ 32（新增宏，语义显式化） |
+| `BACK2_MEM_OUT_N` | 4 | **`BACK2_LQ_N`（=32）** | 在途访存槽 = LQ 深度 |
+| `BACK2_MEM_TAG_W` | 3 | **6** | **必须 ≥ LQ_IW+1**：槽标签 0..31 最高位恒 0，store 排空标签取**全 1** |
+| `BACK2_RB_STQ_MSB/LSB` | 409/406 | **410/406** | 见下方"位域核对" |
+| `BACK2_RB_W` | 416 | **416（不变）** | 顶端保留位 6 bit → 5 bit |
+
+**★ 位域核对结论（本步唯一系统性风险点，已用探针钉死）**：`backend_top` 的载荷组装
+`{stq_idx, 5'b0, 1'b0, 32'h0, tval, {25'b0,ps1i}, uop}` 是**右对齐（LSB 对齐）**拼接、
+高位由赋值零扩展 ⇒ **加宽最顶端的 STQ 字段只会向上生长，其下所有字段绝对 bit 位置逐位不变**。
+故正确改法是 **STQ_MSB 409→410、STQ_LSB 恒 406、RB_W 恒 416**；
+任务书摘录里"LSB 406→405、RB_W 416→417"的写法**会错**（5 bit 字段跨进 [405] = fflags 最高位，
+`p_stq` 将含 fflags 位而丢掉 STQ 最高位）。一次性核对探针（`../.b2chk/probe/pay_probe.v`，
+逐字复用该拼接式）：
+
+```
+PAY_PROBE: RB_W=416 STQ=[410:406] fflags=[405:401] csrw=[335:304] 错误 0 项
+PAY_PROBE: 位域核对通过（其余字段绝对位置不变）
+```
+
+### ② `rtl/back2/backend_top.v`
+
+| 位置（改后行号） | 改动 |
+|---|---|
+| 111/115 | `mem_req_tag_o` / `mem_rsp_tag_i` 由硬编码 `[2:0]` → `[`BACK2_MEM_TAG_W-1:0]`（**任务书触点表未列，编译期 `-Wall` 抓到**） |
+| 208 | `p_stq` 返回宽度 `[3:0]` → `[`BACK2_STQ_IDX_W-1:0]` |
+| 270/278 | `stq_of_rob_r` / `stq_of_rob[0:127]` 位宽 4→5 |
+| 382 | `lsu_dr_idx` `[15:0]` → `[DISP_W*`BACK2_STQ_IDX_W-1:0]`（20 bit） |
+| 385-388 | 新增 `st_alloc_rob`（4 lane × ROB 索引）与 `cmt_n_w`（提交条数）声明 |
+| 660 | `st_alloc_idx` `[15:0]` → 20 bit；新增 `assign st_alloc_rob = {idx0+3, +2, +1, +0}` |
+| 763 | ROB 载荷拼接 `st_alloc_idx[g5*4 +: 4]` → `[g5*5 +: 5]` |
+| 877 | IQ-LSU 例化：`INORD_LOAD` 注释重写（见 §B3.7.3 ③；**参数保持 1**） |
+| 1019 / 1031 / 1034 | LSQ 例化新增 `.alloc_rob(st_alloc_rob)`、`.iss_rob(i4_sel_rob)`、`.cmt_n(cmt_n_w)` |
+| 1153 | 新增 `assign cmt_n_w`（= `cmt_ok ? popcount(cmt_raw) : 0`；前缀连续链） |
+| 1182 | `lsu_dr_idx[cc*4 +: 4]` → `[cc*5 +: 5]` |
+| 1522 | `stq_of_rob` 复位字面量 `4'd0` → `{`BACK2_STQ_IDX_W{1'b0}}` |
+| 1555 | `stq_of_rob[...] <= st_alloc_idx[si2*4 +: 4]` → `[si2*5 +: 5]` |
+
+### ③ `rtl/back2/lsq_simple.v`
+
+| 区块 | 改动 |
+|---|---|
+| 参数 | 新增 `LQ_IW = `BACK2_LQ_IDX_W`（5） |
+| 端口 | 新增 `alloc_rob`（分配期 ROB 索引）、`iss_rob`（发射候选 ROB 索引）、`cmt_n`（提交条数，外部按 `cmt_ok` 门控） |
+| §2.1 闸门 | `unk_v` 的年龄比较由 `age_rob`（E1 项）→ **`age_iss`（候选）**；语义从"判别人"改为"判自己" |
+| §3 LQ | 4 项字面实现 → **`OUT_N`(=32) 项参数化**：`ld_free/pend_vec/rsp_vec` 改 generate 连续赋值，`pend_sel/rsp_sel/newslot` 改**纯函数** `pri_enc`（只吃打包向量，不读存储器）；新增状态位 `ld_dn`（数据已齐） |
+| §4.2 | STQ 分配同时写 `stq_rob <= alloc_rob[lane]`（**年龄唯一写点**，报告 §B3.6.4 的必办项） |
+| §4.3 | store E1 不再重复写 `stq_rob`（唯一写点纪律）；load E1 同时清 `ld_dn` |
+| §4.4 | 响应到达只置 `ld_dn=1`（**不再释放槽**）；退出请求口/响应匹配 |
+| §4.4b（新增） | **提交点释放**：`ld_v & ((ld_rob-rob_head)&7'h7F) < cmt_n` ⇒ 清 `ld_v/ld_req/ld_dn`（幂等、无掩码写法，B27 口径） |
+| §4.6 | squash 清 `ld_dn` |
+| `ld_tag` 写入 | 零扩展宽度 `TAG_W-2` → **`TAG_W-LQ_IW`** |
+
+### ④ `sim/unit/tb_back2_{lockstep,ipc}.sv`
+
+`mem_req_tag` / `mem_rsp_tag` / `rq1_t` / `rq2_t` 由硬编码 `[2:0]` → `[`BACK2_MEM_TAG_W-1:0]`
+（**不改则标签高位被截断 ⇒ 响应永匹配不上 ⇒ 挂死**）；`tb_back2_ipc` 的
+`.mem_rsp_tag_i(3'h0)` 同步为宏宽度。`tb_back2_lsq_fwd.sv` 追加驱动三个新端口
+（`alloc_rob` lane0、`iss_rob`、`cmt_n` 恒 0——直驱夹具不模拟提交点，见 §B3.7.6 遗留）。
+
+## B3.7.2 第一步实测（容量扩容保绿）
+
+```
+== 程序 0：两核提交 161 / 199 条（黄金 161），跳板 2 / 2 条，443 拍   IPC=0.3917
+== 程序 1：两核提交 178 / 215 条（黄金 178），跳板 2 / 2 条，721 拍   IPC=0.2469
+== 程序 2：两核提交 126 / 257 条（黄金 126），跳板 2 / 2 条，913 拍   IPC=0.1385（窗 910）
+== 检查项合计 30 项全部满足；提交总数 = 465（3 程序）           TB_BACK2_LOCKSTEP: PASS
+tb_back2_iq 151/151 PASS ｜ tb_back2_lsq_fwd 10/10 PASS ｜ tb_back2_ipc IPC=2.0000 PASS
+regress（内容相同副本树）：REGRESS: 31/31 PASS      ← ../.b2chk/s1_regress.log
+```
+程序 2 的**提交窗**由 912 → 910 拍（IPC 0.1382→0.1385）属测量抖动（第二步复测回到 912/0.1382，
+与基线**逐位相同**）⇒ **C5 分档无需重测**（阈值是防退化下限，且实测未降）。
+
+## B3.7.3 第二步实测与机制（真乱序边界）
+
+### ① LQ 32：E1 入队 + 写回可乱序 + **提交点释放**
+
+- `ld_v`（占用）与 `ld_dn`（数据已齐）分离：响应到达只置 `ld_dn`，槽留到该 load **提交**；
+- 释放判据用提交组窗口算术 `(ld_rob - rob_head) & 7'h7F < cmt_n`，
+  `cmt_n = popcount(cmt_rob 前缀链)` 且由 `cmt_ok` 门控（冲刷/陷阱拍恒 0）；
+- 与 §4.2 分配无冲突（`newslot` 只从 `ld_free` 选，本拍被释放的槽 `ld_v` 仍为 1）。
+
+**探针实测（`../.b2chk/probe_c1.log`，仅探针树含探针）**：
+```
+[lsq-probe] LQ 分配=37 全转发直通=2 响应=37 请求=37 提交点释放=31 排空=35 LQ峰值占用=2 rob不一致=0
+```
+⇒ 释放路径**确实被走到**（31 次）；LQ 峰值占用仅 **2/32**（提交点释放不构成容量瓶颈）；
+`rob不一致=0` = 分配期写入的 `stq_rob` 与 E1 的 `exe_rob` **逐次一致**（年龄唯一写点正确）。
+
+### ② 发射闸门精确化（`stq_rob` 分配期写入 + 按候选判年龄）
+
+旧实现两处偏差：`stq_rob` 只在 E1 写（已分配未执行的 store 里是**上一占用者的陈旧年龄**）、
+`any_unk_w` 用 **E1 项**的年龄（判的是上一拍发射的那条）。本段两处一并修正 ⇒
+"更老**未定址** store ⇒ 阻塞本 load"（B28 保守语义）逐条精确；
+更老 store **均已定址**时可越过，重叠字节由 §2.2 逐字节转发/合并兜住（同字节取**最年轻**者）。
+
+### ③ `INORD_LOAD` 保持 1 —— **不是保守，而是 LQ 槽位序的防死锁门**（本段重要结论）
+
+本段先按"放开真乱序"把 `INORD_LOAD` 置 0 实测（结果与置 1 **逐位相同**，见下），
+随后由结构分析判定**置 0 存在真实死锁形态**，故**回退为 1**并在 RTL 写明原因：
+
+> LQ 槽在 **E1（发射后一拍）**分配、释放点在**提交**。若容许 load 越过"更老**未就绪**的 load"，
+> 年轻 load 可先占满 32 个槽并完成，而更老那条因 `ld_slot_ok=0` 永远发不出 ⇒ 它不 done ⇒
+> ROB 头无法越过它 ⇒ 年轻人的槽也永不释放 ⇒ **结构性死锁**（本三个程序未触发：峰值占用 2，
+> 但对一般程序可达）。真要放开必须把 LQ 分配改到 **D3 派发期**（程序序分配、提交点释放，
+> 天然无此环；ROB 载荷 [415:411] 恰有 5 bit 空闲位可用）⇒ 登记为后续段任务。
+
+**实测对照（两个配置同一探针，逐位同结果）**：
+```
+INORD_LOAD=0：选中 load 且存在更老未就绪项=70 拍（其中真发射=0 拍）
+INORD_LOAD=1：选中 load 且存在更老未就绪项= 0 拍（其中真发射=0 拍）
+两配置的三程序提交流、拍数、全部计数器**逐位相同**：161/199、178/215、126/243、443/721/913
+```
+⇒ ① 置 0 时那 70 拍的候选 load **全部被精确 STQ 闸门挡住**（保守语义未因撤销队列门而放松）；
+② 该撤销对三个程序**行为中性**；③ 因 ①+死锁形态，最终保留 1（与任务书"未定址时保持
+B28 的 INORD_LOAD 保守闸门"一致）。
+
+### ④ store 提交序排空（未改语义，实测确认）
+
+排空仍走 `rob.v` 的提交组（`cmt_st_drain` = 前缀链 & store 槽）→ `lsu_dr_valid/dr_idx` →
+`lsq_simple` 取**最低 lane**（= 组内最老）⇒ 严格 ROB 序、单请求口、排空拍不发 load 请求。
+探针：`排空=35` 次，同拍多排空请求 **0 拍**；`mem_rsp` 与 store 写口共用单端口（B22 模型）。
+
+## B3.7.4 第二步验证台账（判据 1/2/3 逐条）
+
+| 判据 | 结果 | 证据 |
+|---|---|---|
+| 整设计编译（`-Wall`） | ✅ **0 error** | `../.b2chk/s2c_whole.comp.log`（仅 2 条 fpu_cvt 既有 implicit 警告） |
+| `tb_back2_iq` | ✅ **151/151 PASS** | `../.b2chk/f2_iq.log` |
+| 锁步三程序 C1–C5 | ✅ **30/30 PASS**，`RENAME-CHK` 违规 **0 条**，无停顿 | `../.b2chk/f2_lockstep.log` |
+| `tb_back2_lsq_fwd` | ✅ **10/10 PASS** | `../.b2chk/f2_fwd.log` |
+| `tb_back2_ipc` | ✅ **PASS，IPC=2.0000**（3000 拍 6000 条） | `../.b2chk/f2_ipc.log` |
+| `regress.sh` 全量 | ✅ **31/31 PASS**（冻结树） | `../.b2chk/f_regress.log` |
+| B24（size=log2 字节） | ✅ 未回退（锁步 C1/C4 绿 + 转发用例 C1/C6） | 同上 |
+| B27（窗口算术/禁掩码） | ✅ 未回退（本段新代码同样只用 7 bit 切片窗口算术；`lsq_simple` 的 LQ 释放判据即此口径） | `grep -r '& (LOG_N-1)' rtl/back2/` 命中 **0**（`rename.v` 里 3 处 `LOG_N-1` 是数组上界声明，非掩码） |
+| B28（更老未定址 store 保守闸门） | ✅ 未回退且**精确化**（分配期年龄 + 候选年龄） | §B3.7.3②③ |
+| B29（提交级 CSR） | ✅ 未回退（锁步 C1–C4 程序的 CSR 段全绿） | 同上 |
+| 性能基线 443/721/913 | ✅ **逐位不变**（IPC 0.3917/0.2469/0.1382） | §B3.7.5 |
+
+**非判据的可观测差异（如实登记）**：程序 2 乱序核提交条数 **257 → 243**（黄金 126 不变，
+C3 判据只看程序段条数）——这是 `stq_rob`/闸门精确化后尾段（`tohost` 之后 `j .` 自循环）
+的调度差异，不影响任何判据；拍数与 IPC 未变。
+
+## B3.7.5 C5 分档：**无需重测**（性能基线逐位不变）
+
+| 程序 | 实测拍数 | 提交窗 | IPC | 分档下限（Q8） | 裕量 |
+|---|---|---|---|---|---|
+| 0 | 443 | 411 | 0.3917 | 77（0.30） | 30% |
+| 1 | 721 | 721 | 0.2469 | 49（0.19） | 29% |
+| 2 | 913 | 912 | 0.1382 | 28（0.1094） | 26% |
+
+与 §B3.6.3/母代理第 11 轮裁决表**逐位相同** ⇒ 按"实测×0.8、裕量≥20%"规程**不需要**重测，
+`tb_back2_lockstep.sv` 的分档注释与阈值**保持原样**（本次未改该文件的分档表）。
+测量条件不变：参照核 2A、冷 I$/冷预测器、窗起点 = 2A 进入程序拍。
+
+## B3.7.6 遗留 / 风险登记（本段新增，均未放宽任何判据）
+
+1. **同拍多 store 提交组的排空丢失风险（2B-2 既有潜在缺陷，本段只登记不改）**：
+   `rob.v` 的 `slot_st_ok = ~store | mem_wr_ready` 允许**同拍 ≥2 条 store 提交**，而
+   `lsq_simple` 每拍只排空**最低 lane 一条**，且 `cmt_st_drain` 只在提交拍有效 ⇒
+   第二条会被提交掉但永不落存储。**探针实测三个程序"同拍多 store 提交组"= 0 拍**
+   （`../.b2chk/probe_c1.log`），故当前不可达；修法需动 `rob.v`（每 lane 串行化 store 提交）
+   或给排空加在途缓冲，**均超出本段授权文件范围**，登记为下一段候选。
+2. **LQ 分配改到 D3 派发期**（=真正放开 load 乱序发射的前提）：程序序分配 LQ 槽 +
+   提交点释放，可消除 §B3.7.3③ 的死锁形态；ROB 载荷 `[415:411]` 5 bit 空闲位可直接承载
+   LQ 索引（`BACK2_RB_LQ_MSB/LSB` 待加，`RB_W` 仍 416）。
+3. **LQ 提交点释放缺"专用单元用例"**：`tb_back2_lsq_fwd` 保持 **10/10**（判据未动，直驱夹具
+   `cmt_n=0`）；释放路径由锁步端到端 + 探针 31 次释放覆盖。建议后续加一条
+   "驱动 `rob_head/cmt_n` 的 LQ 释放"用例（会使该 TB 检查数 10→11，属判据增强，需母代理批准）。
+4. 仍属 2B-3 显式不做项：未对齐拆笔、PMP/MMU 落地、AMO/LR-SC、fence 屏障、`fld/fsd`（8 B）。
+
+## B3.7.7 复现命令（本段全部判据）
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+# ① 整设计编译（零错误判据）
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ls.vvp -s tb_back2_lockstep_top "${RTL[@]}" sim/unit/tb_back2_lockstep.sv
+vvp /tmp/ls.vvp                       # ⇒ C1–C5 30/30 PASS，443/721/913 拍
+# ② 三个直驱/后端用例
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/iq.vvp  -s tb_back2_iq  "${RTL[@]}" sim/unit/tb_back2_iq.sv  && vvp /tmp/iq.vvp
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/fw.vvp  -s tb_back2_lsq_fwd_top "${RTL[@]}" sim/unit/tb_back2_lsq_fwd.sv && vvp /tmp/fw.vvp
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ipc.vvp -s tb_back2_ipc "${RTL[@]}" sim/unit/tb_back2_ipc.sv && vvp /tmp/ipc.vvp
+# ③ 全量回归（含锁步；T6 墙钟档不变）
+./scripts/regress.sh
+# ④ 载荷位域核对（一次性探针，不进仓库）
+iverilog -g2012 -I . -o /tmp/pay.vvp ../.b2chk/probe/pay_probe.v && vvp /tmp/pay.vvp
+```
