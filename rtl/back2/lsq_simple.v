@@ -273,15 +273,15 @@ module lsq_simple #(
     end
 
     // ---- 请求发射：store 排空优先；排空拍不发 load 请求 ----
-    reg [STQ_IW-1:0] dr_sel;
-    reg              dr_any;
-    integer          dk;
-    always @(*) begin
-        dr_sel = {STQ_IW{1'b0}};
-        dr_any = 1'b0;
-        for (dk = W-1; dk >= 0; dk = dk - 1)
-            if (dr_valid[dk]) begin dr_sel = dr_idx[dk*STQ_IW +: STQ_IW]; dr_any = 1'b1; end
-    end
+    //   ★★ 2B-3 第 5 段修法：**x 隐患**——原 `always @(*)` + `for` 归约只在输入变化时重算，
+    //   输入长期恒定时结果停留在 x（实测 `dr_valid=0000` 而 `dr_any=x` ⇒ `mem_req_valid=x`）。
+    //   改为**连续赋值优先级链**（恒被求值）：语义保持"最低 lane 优先"（原循环自 W-1 递减、
+    //   最后赋值者胜 ⇒ 最小 dk 胜），与 ROB 提交组内"最老 store 优先排空"一致。
+    wire [STQ_IW-1:0] dr_sel = dr_valid[0] ? dr_idx[0*STQ_IW +: STQ_IW] :
+                               dr_valid[1] ? dr_idx[1*STQ_IW +: STQ_IW] :
+                               dr_valid[2] ? dr_idx[2*STQ_IW +: STQ_IW] :
+                               dr_valid[3] ? dr_idx[3*STQ_IW +: STQ_IW] : {STQ_IW{1'b0}};
+    wire              dr_any = |dr_valid;
     wire dr_fire = dr_any & mem_req_ready;
     wire ld_fire = pend_any & ~dr_any & mem_req_ready;
 
