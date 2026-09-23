@@ -95,12 +95,15 @@ module tb_back2_lsq_fwd_top;
     endtask
 
     // ---- 单条 store 入队并 E1 ----
-    task st_issue(input [STQ_IW-1:0] slot, input [ROBW-1:0] rob,
-                  input [31:0] a, input [31:0] d, input [2:0] sz);
+    task st_issue(input [ROBW-1:0] rob, input [31:0] a, input [31:0] d, input [2:0] sz);
+        reg [STQ_IW-1:0] slot;
         begin
             @(negedge clk);
             alloc_valid = 4'h1; exe_valid = 1'b0;
-            @(posedge clk);                       // 分配（alloc_idx[0] 即槽号）
+            //   ★ 槽号必须在**分配拍**采样：`alloc_idx[0]` 是空闲表的组合读，
+            //     在 `alloc_valid=1` 的那一拍它指向"下一拍将被分配的槽"。
+            slot = alloc_idx[0*STQ_IW +: STQ_IW];
+            @(posedge clk);                       // 分配发生
             @(negedge clk);
             alloc_valid = 4'h0;
             exe_valid = 1'b1; exe_is_store = 1'b1; exe_stq_idx = slot;
@@ -161,51 +164,43 @@ module tb_back2_lsq_fwd_top;
         rob_head = 7'd0;
 
         // ---------- C1：字节 store(A) → 字 load(A)：部分转发 + 合并 ----------
-        s0 = alloc_idx[0*STQ_IW +: STQ_IW];       // 观察分配槽（组合可用）
-        st_issue(s0, 7'd1, 32'h8000_1000, 32'h0000_00AA, 3'd0);   // sb 0xAA
+        st_issue(7'd1, 32'h8000_1000, 32'h0000_00AA, 3'd0);   // sb 0xAA
         ld_issue(7'd2, 32'h8000_1000, 3'd2, 1'b0);                // lw
         wait_wb(32'h1122_3344, v, rq);
         chk(rq == 1, "C1 部分转发仍须访存");
         chk(v == 32'h1122_33AA, "C1 字节 0 来自 store（0xAA），其余来自存储器");
 
         // ---------- C2：两个字节 store(A+0/A+1) → 字 load：部分重叠合并 ----------
-        s0 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s0, 7'd3, 32'h8000_2000, 32'h0000_0055, 3'd0);   // sb 0x55 @+0
-        s1 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s1, 7'd4, 32'h8000_2001, 32'h0000_0066, 3'd0);   // sb 0x66 @+1
+        st_issue(7'd3, 32'h8000_2000, 32'h0000_0055, 3'd0);   // sb 0x55 @+0
+        st_issue(7'd4, 32'h8000_2001, 32'h0000_0066, 3'd0);   // sb 0x66 @+1
         ld_issue(7'd5, 32'h8000_2000, 3'd2, 1'b0);                // lw
         wait_wb(32'hAABB_CCDD, v, rq);
         chk(rq == 1, "C2 两个字节 store 仍须访存（部分命中）");
         chk(v == 32'hAABB_6655, "C2 字节 0/1 合并自两条 store");
 
         // ---------- C3：同字节两条 store（更老 0x11 / 更年轻 0x22）→ lbu ⇒ 更年轻者 ----------
-        s0 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s0, 7'd6, 32'h8000_3000, 32'h0000_0011, 3'd0);
-        s1 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s1, 7'd7, 32'h8000_3000, 32'h0000_0022, 3'd0);
+        st_issue(7'd6, 32'h8000_3000, 32'h0000_0011, 3'd0);
+        st_issue(7'd7, 32'h8000_3000, 32'h0000_0022, 3'd0);
         ld_issue(7'd8, 32'h8000_3000, 3'd0, 1'b1);                // lbu
         wait_wb(32'hDEAD_BEEF, v, rq);
         chk(v == 32'h0000_0022, "C3 同字节取更年轻 store 的数据");
 
         // ---------- C4：字 store → 同址字 load：全转发，不访存 ----------
-        s0 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s0, 7'd9, 32'h8000_4000, 32'hCAFE_F00D, 3'd2);   // sw
+        st_issue(7'd9, 32'h8000_4000, 32'hCAFE_F00D, 3'd2);   // sw
         ld_issue(7'd10, 32'h8000_4000, 3'd2, 1'b0);               // lw
         wait_wb(32'h0000_0000, v, rq);
         chk(rq == 0, "C4 全转发不得产生访存请求");
         chk(v == 32'hCAFE_F00D, "C4 数据来自 store");
 
         // ---------- C5：地址不相交 ⇒ 零转发、结果 = 存储器 ----------
-        s0 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s0, 7'd11, 32'h8000_5000, 32'hFFFF_FFFF, 3'd2);
+        st_issue(7'd11, 32'h8000_5000, 32'hFFFF_FFFF, 3'd2);
         ld_issue(7'd12, 32'h8000_6000, 3'd2, 1'b0);
         wait_wb(32'h0BAD_F00D, v, rq);
         chk(rq == 1, "C5 无命中须访存");
         chk(v == 32'h0BAD_F00D, "C5 结果应为存储器原值");
 
         // ---------- C6：半字 store → 半字 load（掩码 0b0011） ----------
-        s0 = alloc_idx[0*STQ_IW +: STQ_IW];
-        st_issue(s0, 7'd13, 32'h8000_7000, 32'h0000_7A5A, 3'd1);  // sh
+        st_issue(7'd13, 32'h8000_7000, 32'h0000_7A5A, 3'd1);  // sh
         ld_issue(7'd14, 32'h8000_7000, 3'd1, 1'b1);               // lhu
         wait_wb(32'h1357_2468, v, rq);
         chk(v == 32'h0000_7A5A, "C6 半字转发正确");

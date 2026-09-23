@@ -1280,9 +1280,11 @@ TB_BACK2_LOCKSTEP: PASS
 2. **新增转发覆盖用例（验收判据④的半成品）**：`sim/unit/lsq_fwd_case.sv`（LSQ 直驱，
    覆盖 C1 字节→字部分转发合并、C2 两条字节 store→字 load 部分重叠合并、C3 同字节取**更年轻**
    store、C4 全转发不访存、C5 无命中走访存、C6 半字转发；含全局超时 fail-closed）。
-   **当前状态：编译通过（`-Wall` 零错误）、可运行，但激励尚未跑通**（10 项中 9 项 FAIL）——
-   根因是**激励侧**：`st_issue` 在断言 `alloc_valid` *之前*采样 `alloc_idx`，而分配发生在下一拍，
-   槽号应对齐"分配拍"的 `alloc_idx`；修正后再逐条对拍。**为守住 fail-closed（不得留失败用例），
+   **当前状态：编译通过（`-Wall` 零错误）、可运行，但激励仍未跑通**（10 项中 9 项 FAIL）。
+   已修：`st_issue` 的槽号改为**分配拍采样**（`alloc_valid=1` 当拍组合读 `alloc_idx[0]`）——修后
+   失败数不变 ⇒ 剩余问题在 **load 侧时序口径**（`wait_wb` 的请求/响应窗口；以及 store 的
+   `stq_rob`/`age_rob` 与 load 的 `exe_rob` 是否落在同一 ROB 窗口且 store 更老 ⇒ 需把激励里的
+   `rob_head`/`exe_rob` 按窗口语义对齐）。下一步按此逐项对拍。**为守住 fail-closed（不得留失败用例），
    该文件暂以非 `tb_` 前缀命名，不计入 `regress.sh`（保持 30/30）**；跑通后改回 `tb_*.sv` 即自动纳入。
 
 ## B3.1 2B-3 设计要点（下一轮实施，AGENT.md 口径）
