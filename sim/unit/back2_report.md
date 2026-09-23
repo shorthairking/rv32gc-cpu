@@ -1304,3 +1304,32 @@ TB_BACK2_LOCKSTEP: PASS
 1. 修 `lsq_fwd_case.sv` 的激励（按"分配拍"采样槽号）⇒ 全绿后改名 `tb_back2_lsq_fwd.sv` 纳入 regress；
 2. 以现有 `lsq_simple.v` 为骨架扩到 **32+32**（先只扩容量与索引宽度并保绿，再放开乱序执行）；
 3. 每步：整设计编译 + `tb_back2_iq` 151/151 复验 + 锁步三程序 C1–C5（性能基线变动时按规程重测 C5 档）。
+
+## B3.3 第 1 段收尾状态（预算见底时的检查点）
+
+**已完成**
+- 2B-2 基线复验：`REGRESS: 30/30 PASS`（含 `tb_back2_lockstep PASS`）、`tb_back2_iq` 151/151、
+  `tb_back2_ipc` IPC=2.0000、锁步三程序 443/721/913 拍 + CHK 0 + 无停顿；
+- 2B-3 设计要点落档（§B3.1）与转发覆盖用例骨架 `sim/unit/lsq_fwd_case.sv`
+  （C1–C6 六场景、含超时 fail-closed；编译 `-Wall` 零错误、可运行）。
+
+**阻塞点（唯一）**
+- `lsq_fwd_case.sv` 的**激励时序口径**未对齐：10 项检查 9 项 FAIL。
+  已排除：槽号采样时机（已改为分配拍采样，失败数不变）。
+  剩余待查（按可能性排序）：
+  1. **load 侧请求/响应窗口**：`wait_wb` 在 `mem_req_valid` 的**次一拍**给响应 ✓，但 LSU 的
+     `mem_req_ready`/`pend_any` 交错可能使请求延后 ≥2 拍 ⇒ 响应窗口应按"看到请求后**连续**给
+     响应直到 `wb_valid`"实现（而非只给一拍）；
+  2. **ROB 窗口口径**：store 的 `stq_rob` 在 E1 写入，需与 `rob_head`/`exe_rob` 同窗口且 store 更老；
+     激励里固定 `rob_head=0`、store rob=1..、load rob=2.. 时应成立，但仍需用**窗口算术**
+     （无掩码、宽度位差判先后）逐项打印核对；
+  3. **store 未排空的影响**：本用例不驱动 `dr_valid`，若某场景的 `any_unk_w` 或 `iss_ok` 语义与预期
+     不同，需在激励里显式排空（或断言 `cnt_store_o`/`stq_cnt_o` 以确认 store 已入队）。
+
+**下一步（按序）**
+1. 按上述 1→2→3 修激励 ⇒ 全绿 ⇒ 改名 `tb_back2_lsq_fwd.sv` 纳入 regress（**31/31**）；
+2. 两步扩 LSQ 到 **32+32**：先只扩容量/索引宽度（`BACK2_STQ_N`/`OUT_N` 与 `lsq_simple.v` 内
+   `stq_used` 的 16 项 popcount、`[4:0]` 计数、`ld_tag` 宽度等一并扩）并保绿；
+3. 再放开 load 乱序执行、"地址已证不相交才可越过"闸门、逐字节转发更年轻优先、提交序排空；
+   每步后：整设计编译 + `tb_back2_iq` 151/151 + 锁步 C1–C5 + regress；性能基线变动时按
+   "实测×0.8"重测 C5 档并更新 TB 注释与本报告。
