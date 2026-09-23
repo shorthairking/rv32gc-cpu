@@ -38,7 +38,15 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 3;
+    localparam integer NPROG  = 5;
+    //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
+    //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
+    localparam integer P8_CYCLES = 4000;
+    //   p8 诊断开关（默认关；定位"中断后为何长时间不派发"时置 1）：
+    //   · 实测结论（报告 §B4.4.3）：中断/xRET 的 `flush_all` 触发 rename 的 free list
+    //     重建 FSM（`rb_act`）逐拍扫描 NREG=96 项 ⇒ 约 96 拍 `busy=1` ⇒ 派发暂停
+    //     （非死锁：重建结束即恢复，处理程序随后逐条提交）
+    localparam integer DBG_P8 = 0;
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
@@ -98,15 +106,21 @@ module tb_core_top_2b #(
     //==========================================================================
     // 2. AXI 从设备内存模型（取指 + 访存共用；地址翻译同 tb_back2_lockstep）
     //==========================================================================
+    //   ★ 2B-4 第 4a 段：DDR3 别名窗口由 64 KB（0x8000_xxxx）放宽到 1 MB
+    //     （`a[31:20] == 12'h800`）—— 5 个程序按 16 KB 步进装到 0x8001_0000，
+    //     原判据（a[31:16]==0x8000）会把第 5 个程序当"未登记区域"读 0 ⇒ 全错。
     function [31:0] map_addr; input [31:0] a;
-        begin map_addr = (a[31:16] == 16'h8000) ? {16'h0000, a[15:0]} : a; end
+        begin map_addr = (a[31:20] == 12'h800) ? {12'h000, a[19:0]} : a; end
     endfunction
     wire [31:0] araddr_m = map_addr(araddr);
     wire [31:0] awaddr_m = map_addr(awaddr);
 
     sim_mem_model #(
         .XIP_BASE(XIP_PC), .XIP_ALIAS(`RV32GC_XIP_ALIAS), .XIP_SIZE(32'h0000_1000),
-        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0001_0000),
+        //   ★ 2B-4 第 4a 段：程序数 3→5（p7_trap / p8_int），16 KB 步进 ⇒ DDR3 窗口
+        //     必须 ≥ 5×16 KB = 80 KB（原 64 KB 会让第 5 个程序的基址落到窗口外 →
+        //     取指读到"未登记区域"的 0 ⇒ 立即非法指令陷阱）
+        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0002_0000),
         .UART_DATA_ADDR(32'h1FE0_01E0), .READ_LAT_DLY(0)
     ) u_mem (
         .clk(clk), .rst_n(rst_n),
@@ -147,18 +161,38 @@ module tb_core_top_2b #(
 
     integer pidx [0:NPROG-1];
     integer cmax_of [0:NPROG-1];
+    //   ★ 2B-4 第 4a 段：陷阱现场监视（C7'）
+    integer n_trap_p;                       // 本程序"异常被交付"的次数
+    integer n_irq_p;                        // 本程序"中断被交付"的次数（C8'）
+    reg     trap_seen_q, irq_seen_q;        // 边沿检测（同一事件只计一次）
+    reg [3:0] trc_cause [0:7];              // 依次记录的 mcause 低位
+    reg [31:0] trc_pc   [0:7];              // 依次记录的陷阱 PC（= 头部 PC）
+    always @(posedge clk) begin
+        trap_seen_q <= rst_n & u_dut.trap_valid_w;
+        if (rst_n && u_dut.trap_valid_w && !trap_seen_q && (n_trap_p < 8)) begin
+            trc_cause[n_trap_p] <= u_dut.trap_cause_w;
+            trc_pc[n_trap_p]    <= u_dut.trap_pc_w;
+            n_trap_p            <= n_trap_p + 1;
+        end
+        //   ★ 中断交付：后端 `irq_mti_w`（MIE×MTIE×MTIP×ROB 非空×非异常/xRET 拍）
+        irq_seen_q <= rst_n & u_dut.irq_mti_w;
+        if (rst_n && u_dut.irq_mti_w && !irq_seen_q) n_irq_p <= n_irq_p + 1;
+    end
     //   ★ 逐程序**分基址**（16 KB 步进）：三个程序同址装载会让 L1I 里的上一程序陈旧行
     //     "同 tag 命中"（L1I 阵列无复位、`inval_all` 本段未接）⇒ PC 流对、指令却是上一
     //     程序的。程序全部 %pcrel 位置无关 ⇒ 换基址只需平移黄金 PC（锁步 TB 同法）。
     function [31:0] pbase; input integer i; begin pbase = PROG_PC + (i * 32'h4000); end endfunction
     reg [31:0] cur_base, gold_delta;
-    function [13:0] w_idx; input [31:0] a; begin w_idx = a[15:2]; end endfunction
+    //   ★ 2B-4 第 4a 段：装载索引位宽 14→18 位（`a[15:2]` → `a[19:2]`）。
+    //     5 个程序 16 KB 步进的第 5 个基址 = 0x8001_0000 ⇒ `a[15:2]` 会**静默截断成 0**
+    //     （映像装到 DDR3 起始处，取指却读 0x0001_0000 ⇒ 全是 clear_mem 的 nop 填充）。
+    function [17:0] w_idx; input [31:0] a; begin w_idx = a[19:2]; end endfunction
 
     task automatic clear_mem;
         integer m;
         begin
             @(negedge clk);
-            for (m = 0; m < 16384; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
+            for (m = 0; m < 32768; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
             for (m = 0; m < 1024;  m = m + 1) u_mem.xip_mem[m]  = 32'h0000_0013;
             u_mem.xip_mem[0] = 32'h0000_0013;   // 跳板由 load_prog 按基址重建
             u_mem.xip_mem[1] = 32'h0000_0013;
@@ -236,6 +270,24 @@ module tb_core_top_2b #(
         end
     end
 
+    //   [诊断，默认关] MTI 中断交付后 220 拍的现场摘要（DBG_P8=1 时打开）
+    integer dbg_c;
+    initial dbg_c = -1;
+    always @(posedge clk) begin
+        if (u_dut.irq_mti_w && (dbg_c < 0)) dbg_c <= 0;
+        else if ((dbg_c >= 0) && (dbg_c < 220)) begin
+            if (DBG_P8) begin
+                if (u_dut.commit_valid != 0)
+                    $display("   [irq-cmt %0d] pc0=0x%08x v=%b", dbg_c, u_dut.commit_pc[0 +: 32], u_dut.commit_valid);
+                if ((dbg_c % 10) == 0)
+                    $display("   [irq-s %0d] rb_act=%b busy=%b/%b robcnt=%0d blkv=%b rdy=%b disp=%b",
+                             dbg_c, u_dut.u_back.u_ren_i.rb_act, u_dut.u_back.rn_i_busy, u_dut.u_back.rn_f_busy,
+                             u_dut.u_back.dbg_rob_cnt_o, u_dut.blk_valid, u_dut.blk_ready, u_dut.u_back.disp_fire_w);
+            end
+            dbg_c <= dbg_c + 1;
+        end
+    end
+
     //==========================================================================
     // 5. 主流程
     //==========================================================================
@@ -250,6 +302,8 @@ module tb_core_top_2b #(
         pidx[0] = 0; cmax_of[0] = P0_GOLD_N;    // p1_int
         pidx[1] = 2; cmax_of[1] = P2_GOLD_N;    // p3_memcsr
         pidx[2] = 5; cmax_of[2] = P5_GOLD_N;    // p6_l1d（D-Cache 逐出）
+        pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
+        pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         cur_p = 0;
         rst_n = 1'b0;
         load_back2_data;
@@ -263,6 +317,10 @@ module tb_core_top_2b #(
             gold_delta = cur_base - PROG_PC;
             @(negedge clk); rst_n = 1'b0;
             nrec = 0; on = 1'b0; bad_pc = -1; bad_rd = -1; bad_wd = -1;
+            n_trap_p = 0; trap_seen_q = 1'b0; n_irq_p = 0; irq_seen_q = 1'b0;
+            for (k = 0; k < 8; k = k + 1) begin
+                trc_cause[k] = 4'h0; trc_pc[k] = 32'h0;
+            end
             for (k = 0; k < GMAX; k = k + 1) begin
                 rpc[k] = 0; rwe[k] = 0; rrd[k] = 0; rwd[k] = 0;
             end
@@ -276,7 +334,24 @@ module tb_core_top_2b #(
             $display("== 程序 %0d（.svh 下标 %0d）：黄金 %0d 条 ==", pid, cur_p, cmax_of[pid]);
             $fflush();
             cyc = 0;
-            while ((nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
+            if (pid == 4) begin
+                //   ★ p8_int：固定拍数（无黄金轨迹可等；中断在 ~200 拍后到，余量充足）
+                for (k = 0; k < P8_CYCLES; k = k + 1) begin
+                    @(posedge clk);
+                    //   [诊断，默认关] CLINT/CSR/中断判定现场（每 500 拍一条，共 8 条）
+                    if (DBG_P8 && ((k % 500) == 0))
+                        $display("   [p8-dbg] cyc=%0d mtime=0x%08x mtimecmp=0x%08x MTIP=%b | mie=0x%03x mstatus=0x%08x | irq=%b robcnt=%0d clint_vld=%b hit=%b",
+                                 k, u_dut.u_clint.mtime_r[31:0], u_dut.u_clint.mtimecmp_r[31:0],
+                                 u_dut.clint_mtip_w, u_dut.u_back.u_csr.mie_q,
+                                 u_dut.u_back.u_csr.mstatus_q, u_dut.irq_mti_w,
+                                 u_dut.u_back.rob_cnt_w, u_dut.clint_req_vld, u_dut.clint_hit_w);
+                end
+                cyc = P8_CYCLES;
+                $display("   [C8'] 中断现场：mtvec=0x%08x mepc=0x%08x mcause=0x%08x | 处理程序 s1=1、主程序 a0=1（共提交 %0d 条）",
+                         u_dut.u_back.u_csr.mtvec_q, u_dut.u_back.u_csr.mepc_q,
+                         u_dut.u_back.u_csr.mcause_q, nrec);
+            end
+            while ((pid != 4) && (nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
                 @(posedge clk);
                 cyc = cyc + 1;
                 if ((cyc % 50000) == 0) begin
@@ -289,6 +364,7 @@ module tb_core_top_2b #(
                      n_rb - rb0, n_aw - aw0, n_wb - wb0, n_b - b0);
             $fflush();
 
+            if (pid != 4) begin
             // ---- C1' ----
             d_pc = 0;
             for (k = 0; k < cmax_of[pid]; k = k + 1)
@@ -297,13 +373,6 @@ module tb_core_top_2b #(
                              pid, k, rpc[k], GOLD[cur_p*P_GOLD_MAX + k] + gold_delta);
                     d_pc = 1;
                 end
-            if ((pid == 1) || (d_pc != 0)) begin
-                $display("   [诊断] bad_pc=%0d bad_rd=%0d bad_wd=%0d", bad_pc, bad_rd, bad_wd);
-                for (k = 0; k < 24; k = k + 1)
-                    $display("     idx=%0d pc=0x%08x gold=0x%08x | we=%b rd=%0d(g %0d) wd=0x%08x(g 0x%08x)",
-                             k, rpc[k], GOLD[cur_p*P_GOLD_MAX + k] + gold_delta, rwe[k], rrd[k],
-                             GREG_RD[cur_p*P_GOLD_MAX + k], rwd[k], GREG_WD[cur_p*P_GOLD_MAX + k]);
-            end
             chk(d_pc == 0, $sformatf("C1' 程序 %0d：提交 PC 流与 Spike 黄金逐条一致", pid));
             chk(nrec >= cmax_of[pid], $sformatf("C2' 程序 %0d：提交条数 ≥ 黄金条数", pid));
             // ---- C3' ----
@@ -346,7 +415,62 @@ module tb_core_top_2b #(
                 chk((n_wb - wb0) > 0, $sformatf("C6' 程序 %0d：AXI W 有写数据拍", pid));
                 chk((n_b  - b0)  > 0, $sformatf("C6' 程序 %0d：AXI B 有写响应", pid));
             end
-            chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
+            end else begin
+                //   ================= C8'：核内 CLINT + MTI 中断（2B-4 第 4a 段）=================
+                //   口径：**自记录 + 硬编码期望**（mtime 自由计数 ⇒ 与 Spike 不可逐条比）
+                chk(n_irq_p == 1, $sformatf("C8' p8：MTI 中断交付次数 = 1（实测 %0d，期望恰好 1 次：处理程序关源）", n_irq_p));
+                chk(n_trap_p == 0, $sformatf("C8' p8：无异常交付（实测 %0d）", n_trap_p));
+                chk(u_dut.u_back.u_csr.mcause_q == 32'h8000_0007,
+                    $sformatf("C8' p8：陷阱 CSR mcause = 0x80000007（MTI），实测 0x%08x", u_dut.u_back.u_csr.mcause_q));
+                chk((u_dut.u_back.u_csr.mepc_q >= cur_base) && (u_dut.u_back.u_csr.mepc_q < (cur_base + 32'h1000)),
+                    $sformatf("C8' p8：mepc 落在程序映像内（实测 0x%08x，基址 0x%08x）", u_dut.u_back.u_csr.mepc_q, cur_base));
+                //   · 处理程序里 `csrr t1, mepc`（x6）的写回值 = 被中断指令 PC
+                //     ⇒ 必须落在 wait 循环 [0x4c, 0x54]（相对基址）
+                d_pc = 0; d_rd = 0; d_wd = 0; d_rd = 0;
+                crk = 0;
+                for (k = 0; k < 1024; k = k + 1) begin
+                    if (rwe[k] && (rrd[k] == 5'd9) && (rwd[k] === 32'd1)) d_rd = 1;   // s1 == 1
+                    if (rwe[k] && (rrd[k] == 5'd10) && (rwd[k] === 32'd1)) d_wd = 1;  // a0 == 1（走到 done）
+                    //   · 处理程序首条已提交（= 重定向到 mtvec 成功）
+                    if (rpc[k] == (cur_base + 32'h7c)) crk = 1;
+                    //   · `csrr t1, mepc`（0x80，写 x6）采到的被中断指令 PC ∈ wait 循环
+                    if (rwe[k] && (rrd[k] == 5'd6) && (rpc[k] == (cur_base + 32'h80))) begin
+                        $display("   [C8'] handler 采到的 mepc=0x%08x（wait 循环 0x%08x..0x%08x）",
+                                 rwd[k], cur_base + 32'h4c, cur_base + 32'h54);
+                        if ((rwd[k] >= (cur_base + 32'h4c)) && (rwd[k] <= (cur_base + 32'h54))) d_pc = 1;
+                    end
+                end
+                chk(crk == 1, "C8' p8：处理程序首条（mtvec 目标）已提交 ⇒ 中断重定向成功");
+                chk(d_pc == 1, "C8' p8：中断返回点 mepc ∈ wait 循环（bne/addi/j，可重启指令）");
+                chk(d_rd == 1, "C8' p8：处理程序自记录 s1 = 1（中断交付次数）");
+                chk(d_wd == 1, "C8' p8：主程序观察到中断后走到 done（a0 = s1 = 1）⇒ mret 精确返回");
+                chk(u_dut.u_back.u_csr.mtvec_o == (cur_base + 32'h7c),
+                    $sformatf("C8' p8：mtvec = handler（实测 0x%08x）", u_dut.u_back.u_csr.mtvec_o));
+            end
+            //   ---- C5'：非陷阱程序必须"全程无提交点异常" ----
+            //   ★ p7_trap 是**故意**制造异常的程序 ⇒ C5' 换判据 C7'（陷阱次数/原因/PC）。
+            if (pid != 3) begin
+                chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
+                chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
+            end else begin
+                //   ---- C7'：陷阱路径（2B-4 第 4a 段验收判据）----
+                //     ① 陷阱次数：ecall / 非法指令 / ebreak 共 3 次
+                //     ② mcause 依次 = 11（M 模式 ecall）/ 2（非法指令）/ 3（断点）
+                //     ③ 陷阱 PC 依次 = 三条陷阱指令的 PC（gold_delta 平移后）
+                //     ④ 目标：处理器序（PC 流已在 C1' 与 Spike 逐条比中覆盖 mtvec/mepc）
+                chk(n_trap_p == 3, $sformatf("C7' p7：陷阱交付次数 = 3（实测 %0d）", n_trap_p));
+                chk(trc_cause[0] == 4'd11, $sformatf("C7' p7：第 1 次 mcause = 11（ecall_M），实测 %0d", trc_cause[0]));
+                chk(trc_cause[1] == 4'd2,  $sformatf("C7' p7：第 2 次 mcause = 2（非法指令），实测 %0d", trc_cause[1]));
+                chk(trc_cause[2] == 4'd3,  $sformatf("C7' p7：第 3 次 mcause = 3（breakpoint），实测 %0d", trc_cause[2]));
+                chk((trc_pc[0] < trc_pc[1]) && (trc_pc[1] < trc_pc[2]),
+                    "C7' p7：三次陷阱 PC 严格递增（按程序序）");
+                chk((trc_pc[0] >= cur_base) && (trc_pc[2] < (cur_base + 32'h1000)),
+                    $sformatf("C7' p7：陷阱 PC 落在程序映像内（0x%08x..0x%08x）", trc_pc[0], trc_pc[2]));
+                $display("   [C7'] 陷阱序列：pc=0x%08x/cause=%0d → pc=0x%08x/cause=%0d → pc=0x%08x/cause=%0d；mtvec 目标=0x%08x",
+                         trc_pc[0], trc_cause[0], trc_pc[1], trc_cause[1],
+                         trc_pc[2], trc_cause[2], u_dut.csr_mtvec_w);
+                $fflush();
+            end
         end
 
         $display("== 检查项合计 %0d 项全部满足（C1' PC 流 / C2' 条数 / C3' 写回数据 / C4' AXI 读 / C5' 无异常 / C6' 写回流量）", n_checks);

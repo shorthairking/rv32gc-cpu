@@ -2141,3 +2141,144 @@ python3 sim/unit/prog/gen_back2_lockstep_data.py > sim/unit/prog/back2_lockstep_
 iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[@]}" sim/unit/tb_core_top_2b.sv && vvp /tmp/ct2b.vvp
 ./scripts/regress.sh      # 32 项
 ```
+
+---
+
+# 2B-4 第 4a 段（特权/陷阱/中断集成）—— **实现状态 + 验证台账**（已落地）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 HEAD=`3dd93fa`=tag `2B-4.3`，**未提交**）
+> 本段范围（母代理裁决）：**步骤 1→2→3 短期→4→5**；CSR 路线 = 本段给 `b2_csr` 补 `mtval(0x343)`
+> 与陷阱进入/退出写路径，**换 `csr_file`+`trap_ctrl` 留作 4b 段**（与 Sv32/PTW 串行复用一并做）。
+
+## B4.4.0 结论（一句话）
+
+**乱序后端已从"陷阱即停机"改为"精确陷阱 + 外部重定向"，ecall/ebreak/非法指令 → `mtvec` → 处理程序
+→ `mret` 返回全链路跑通，且提交 PC 流与写回寄存器轨迹与 Spike 黄金逐条一致（0 分歧）；
+核内 CLINT 已例化，`mtimecmp` → MTIP → `mstatus.MIE×mie.MTIE×mip.MTIP` → 提交组边界取中断 →
+`mcause=0x8000_0007` → `mret` 精确返回被中断指令，也已跑通。**
+§B4.4.3 的 51 项判据全绿、`regress.sh` 32/32 无回归；`csr_file`/`trap_ctrl`/PLIC 仍为 4b 段的活。
+
+## B4.4.1 落地清单（改动文件 + 关键位置）
+
+| 文件 | 改动 | 关键位置 |
+|---|---|---|
+| `rtl/back2/rob.v` | 新增 `trap_retire`：陷阱拍**无副作用弹出**头部异常项（旧实现 `flush_all` 只清 `cnt`、不动 head ⇒ 异常项永驻头部 ⇒ 重取后又立刻再陷阱） | 端口 + §5.4 指针块 `head_q <= trap_retire ? idx_add(head_q,1) : 0` |
+| `rtl/back2/backend_top.v` | ① 新增 `trp_flush_v_i/trp_redirect_v_i/trp_redirect_pc_i/trp_halt_o/xret_cmt_o/mtip_i/irq_mti_o/mtvec_o/mepc_o`；② `flush_all_w = trap_v_rob \| trp_flush_v_i`（**去掉** `trap_halt_q`，并把 `disp_ok` 里的 `~trap_halt_q` 一并去掉 ⇒ 陷阱后能继续派发）；③ `unsup` 摘出 ecall/ebreak/mret/sret；④ `exc_w` 优先级：取指异常 > ecall(11)/ebreak(3) > 非法(2)；⑤ 提交点 xRET 识别（载荷 TVAL = 原始指令位 `0x3020_0073/0x1020_0073`）+ `cmt_ok` 的"xRET 上报"口子；⑥ 陷阱/中断 → CSR 硬件写路径事件组装 + `irq_mti_w` 判定 | `:130-150`（端口）、`:1503-1560`（flush/redirect/xret）、`:1560-1605`（事件组装）、`:1595`（`disp_ok`） |
+| `rtl/back2/b2_csr.v` | 新增 `CSR_MTVAL(0x343)`、`CSR_MIE(0x304)`、`CSR_MIP(0x344, 只读视图 MTIP)`；新增**陷阱进入**（mepc/mcause/mtval + MPIE←MIE、MIE←0、MPP←11）与**退出**（MIE←MPIE、MPIE←1、MPP←00）硬件写路径（优先级：硬件 > 软件 `csrw`）；引出 `mtvec_o/mepc_o/mstatus_o/mie_o` | 端口段 + 读 mux + `else if (trp_enter_v) … else if (trp_exit_v) …` |
+| `rtl/back2/back2_params.vh` | 新增异常码宏 `BACK2_EXC_BREAK(3)/ECALL_U(8)/ECALL_S(9)/ECALL_M(11)` | §异常码段 |
+| `rtl/top/core_top_2b.v` | ① 新增**无状态** trap FSM：`异常 > xRET > MTI 中断` 优先级，`trp_flush_v_i` 与 `trp_redirect_v_i` **同拍**（与 2A `core_top.v:2619` 同构），目标 = `mtvec`（MODE=0 直接 / MODE=1 向量 `base+4×cause`）或 `mepc`；② 例化**核内 CLINT**（2A `clint` 模块只读复用），`d_cp_q` 窗口的 MMIO 请求接 CLINT（偏移 = 地址 − `RV32GC_CLINT_BASE`），读响应取 `clint_rdata`，`mtip_o` → `backend.mtip_i` | §6b（trap FSM）、§4b.1（CLINT） |
+| `sim/unit/prog/back2_p7_trap.S` | **新增**：ecall / 非法指令（`.word 0x0000000b`）/ ebreak 三类陷阱 + 处理程序自记录 + `mepc+=4` + `mret`；累加量全部**基址无关** | 74→89 条黄金（改动后 89） |
+| `sim/unit/prog/back2_p8_int.S` | **新增**：写 `mtimecmp = mtime+200` → `mie.MTIE=1`/`mstatus.MIE=1` → 循环等中断 → 处理程序记录 + 关源 → `mret`（**不改 mepc** ⇒ 精确重启被中断指令） | 仅映像（无 Spike 黄金，见 §B4.4.2） |
+| `sim/unit/prog/gen_back2_lockstep_data.py` | PROGS 增 p7/p8；新增"**仅映像**"程序支持（第 5 元组元素 `True` ⇒ 不跑 Spike、`P?_GOLD_N=0`） | `PROGS` + `no_gold` 分支 |
+| `sim/unit/tb_core_top_2b.sv` | 程序数 3→5；新增 **C7'**（陷阱次数/cause/PC）与 **C8'**（中断交付次数/mcause/mepc 落点/处理程序与主程序自记录）；DDR3 窗口 64 KB→128 KB、别名窗口 `a[31:20]==0x800`、装载索引 `a[15:2]`→`a[19:2]`（5 程序 16 KB 步进的必然跟随） | 见 §B4.4.3 |
+| `sim/unit/tb_back2_lockstep.sv`、`tb_back2_ipc.sv` | 这两个 TB **直驱** `backend_top`（不经 `core_top_2b`）⇒ 给新增输入补常量 tie-off（`trp_*=0`、`mtip_i=0`），行为与加接口前逐拍等价 | 例化处 |
+
+> **红线遵守**：2A 文件（`rtl/decode/*`、`rtl/csr/*`、`rtl/l1*`、`rtl/clint/*`、`rtl/plic/*`、`rtl/top/core_top.v`…）
+> **零修改**，全部只读例化/只读参考；`scripts/regress.sh` 未动。
+
+## B4.4.2 口径登记（与 Spike 的比对口径，逐条实测）
+
+黄金口径：`/opt/riscv/bin/spike --pc=0x80000000 --isa=rv32imac_zicsr --log-commits`（`gen_back2_lockstep_data.py`）。
+本段新增的**四条**口径全部实测确认（`/tmp/p7exp/t4.log` 类实验 + p7 黄金轨迹）：
+
+1. **抛陷阱的那条指令不进提交日志**：Spike 只打印 `exception … epc` 行 ⇒ 黄金 PC 流里**没有** ecall/ebreak/非法
+   指令的 PC，处理程序 PC 直接跟在陷阱指令**前一条**之后。本核同口径：`slot_ok` 含 `~slot_exc` ⇒ 陷阱指令
+   不上报提交，仅由新增的 `trap_retire` 弹出（`p7` 89 条黄金逐条吻合即为证据）。
+2. **`mtval` 逐 cause 取值**（实测）：cause 11（M ecall）⇒ `0`；cause 2（非法）⇒ **出错指令编码**（实测 `0x0000000b`）；
+   cause 3（breakpoint）⇒ **ebreak 的 PC**（实测 `0x8000_0028`，不是 0！）。本核 `trp_csr_tval_w` 按此三分支实现。
+3. **`mret` 进提交日志**（它正常退役）⇒ 本核必须在 xRET 拍仍上报提交，故 `cmt_ok` 开了一个"仅上报"口子
+   （`cmt_ok = ~squash & (~flush_all | (xret_cmt_o & trp_flush_v_i))`；副作用仍由 `p_di/p_df/cmt_st_drain` 门控）。
+   `mstatus` 掩码 `0x1888` 实测：陷阱进入后 `0x1800`（MIE=0、MPIE=0、MPP=11）、`mret` 后 `0x0080`（MIE←MPIE=0、MPIE=1、MPP=0）
+   —— 与 `b2_csr` 的硬件写路径逐位一致。
+4. **p8（定时器中断）不与 Spike 逐条比**：`mtime` 是自由计数器（本核 `aclk` 每拍 +1），"源拉高→取中断"的拍数
+   依赖微架构时序；且本 SoC CLINT 在 `0x1F00_0000`，Spike 默认 CLINT 在 `0x0200_0000` ⇒ Spike 跑 p8 **根本收不到 MTI**。
+   故 p8 按任务书允许的"**程序自记录 + 硬编码期望**"口径：生成器按"仅映像"处理（`P7_GOLD_N = 0`），
+   判据由 TB 的 **C8'** 给出（§B4.4.3）。
+
+## B4.4.3 验证台账（判据逐条 + 本轮实测）
+
+命令见 §B4.4.6。**整设计编译 0 error；`tb_core_top_2b` 51 项判据全绿；`regress.sh` 32/32。**
+
+| 程序 | 拍数 | 提交/黄金 | AXI（AR/R/AW/W/B） | 判据 |
+|---|---|---|---|---|
+| p1_int（idx 0） | 449 | 161/161 | 9/51/0/0/0 | C1'~C5' 全绿（PC 流 + 写回逐条 = Spike） |
+| p3_memcsr（idx 2） | 462 | 126/126 | 8/43/0/0/0 | 同上 |
+| p6_l1d（idx 5） | 1077 | 366/366 | 13/80/**2/16/2** | 同上 + C6'（L1D 脏行写回真有 AW/W/B） |
+| **p7_trap（idx 6）** | 755 | **89/89** | 10/59/0/0/0 | **C1'/C2'/C3' 逐条 = Spike 黄金**（含处理程序与 `mret`）+ **C7'** |
+| **p8_int（idx 7）** | 4000（固定） | 522（无黄金） | 11/67/0/0/0 | **C8'**（自记录口径） |
+
+**C7'（陷阱路径，p7_trap）实测**
+```
+[C7'] 陷阱序列：pc=0x8000c028/cause=11 → pc=0x8000c030/cause=2 → pc=0x8000c038/cause=3；mtvec 目标=0x8000c068
+```
+- ① 陷阱交付次数 = **3**（ecall / 非法 / ebreak），无多余陷阱；② `mcause` 依次 = **11 / 2 / 3**（M 模式口径正确）；
+  ③ 陷阱 PC 严格递增且落在映像内；④ **PC 流 89/89 与 Spike 黄金逐条一致** ⇒ `mtvec` 重定向、处理程序、
+  `csrr mepc/mcause/mtval/mstatus`、`csrw mepc`、`mret` 返回全部正确；
+  ⑤ 写回寄存器轨迹（含处理程序把 `mcause/mepc/mtval/mstatus` 累加进 `s1/s2/s3/s5/s6` 的每一步）逐条一致
+  ⇒ **mcause / mepc / mtval（低 12 位）/ mstatus 掩码 / mepc 写后读**五个量都与 Spike 相同。
+
+**C8'（中断路径，p8_int）实测**
+```
+[C8'] 中断现场：mtvec=0x8001007c mepc=0x80010054 mcause=0x80000007 | 处理程序 s1=1、主程序 a0=1（共提交 522 条）
+[C8'] handler 采到的 mepc=0x80010054（wait 循环 0x8001004c..0x80010054）
+```
+- ① MTI 中断交付次数 = **1**（后端 `irq_mti_w` 监视；处理程序关源 ⇒ 恰好一次，无重入）；
+  ② 无异常交付（`n_trap_p = 0`）；③ 陷阱 CSR `mcause = 0x8000_0007`（MTI）、`mtvec = handler`；
+  ④ `mepc` 落在 wait 循环 `[0x4c, 0x54]` 内、且处理程序 `csrr t1, mepc` 采到的值同样是 `0x8001_0054`
+  ⇒ **精确中断**（返回被中断的那条可重启指令）；⑤ 处理程序自记录 `s1 = 1`、主程序观察到后走到 `done`（`a0 = 1`）
+  ⇒ `mret` 真的回到了主流程。
+
+**中断源证据**：MB 级过程量（DBG_P8=1 可复现）：`mtimecmp` 由 `0xFFFF_FFFF`（复位值）→ 程序写入 `mtime+200`
+（CLINT 写命中 `hit=1`）→ `MTIP` 在 ~200 拍后拉高 → `irq_mti_w` 一拍 ⇒ 交付。
+
+## B4.4.4 本段修掉的缺陷 + 新发现（都带证据）
+
+| # | 缺陷 | 证据 | 修法 |
+|---|---|---|---|
+| D1 | **陷阱即停机**（勘察期 B1）：`flush_all_w = trap_v_rob \| trap_halt_q` 且 `trap_halt_q` 一经置位永不清 ⇒ 第一条陷阱后永久停机 | 旧 `backend_top.v:1503-1507`；旧 TB 的 C5' 只敢判"全程无异常" | 见 §B4.4.1（`flush_all_w` 去掉 `trap_halt_q`、`disp_ok` 同样去掉、`trap_retire` 弹头） |
+| D2 | **CSR 立即数形式（csrrwi/csrsi/csrrci）的源取错**：载荷 `p_csrw` 存的是"被当成 rs1 重命名"的物理号，而立即数形式的 `insn[19:15]` 是 **zimm** ⇒ 提交点从 PRF 读回**无关寄存器**的值。实测 `csrsi mstatus, 8` 把 `s0`(=mtvec=`0x8001_007c`) 写进了 `mstatus`（`0x8001_00fc`），MIE 位纯属巧合才对 | p8 首轮现场：`mstatus=0x800100fc`（应为 `0x00001808`） | 提交点用载荷 TVAL（原始指令位）判 `funct3`（`insn[14:13] != 0` ⇒ 立即数形式）取 `insn[19:15]` 零扩展；**不改 2A 译码器**。修后 p8 的 `mstatus` 正确、p3_memcsr 仍逐条 = 黄金 |
+| D3 | **测试基建三处 16 位假设**（非 RTL）：DDR3 窗口 64 KB、别名判定 `a[31:16]==0x8000`、装载索引 `a[15:2]` —— 5 个程序 16 KB 步进后第 5 个基址 `0x8001_0000` 被静默截断/判为"未登记区域"⇒ 取指读 0、一条不提交 | 首轮 p8：`提交 0 条`、`AR 命中未登记区域 addr=0x80010000` | TB 侧改 128 KB / `a[31:20]==12'h800` / `a[19:2]`（§B4.4.1） |
+| N1 | **中断/xRET 的 `flush_all` 有 ~96 拍"派发暂停"**：`rename` 的 free list 重建 FSM（`rb_act`）逐拍扫描 `NREG=96` 项，期间 `busy=1` ⇒ `disp_ok=0`。**不是死锁**（重建结束即恢复，处理程序随后逐条提交），但会拉低中断响应后的 IPC | `DBG_P8=1` 的 `[irq-s]` 摘要：`rb_act=1` 自 t=0 持续到 t≈100，`rn_i_busy=1`；t=100 起 `pc0=0x8001007c`（处理程序首条）提交 | 记为 4b 优化项（可改成"仅重建被占用的 preg 区间"或用 `ar_used` 位图并行重建） |
+
+## B4.4.5 占位 / 遗留清单（**不得读作已实现**）
+
+| # | 项 | 现状 | 归属 |
+|---|---|---|---|
+| P1 | **PLIC 未接**：`mmio_route` 的 CLINT/PLIC 窗口里只有 CLINT 命中真件；PLIC 地址范围的访问仍是"立即完成、读回 0 / 写丢弃"（fail-safe，不挂死） | `core_top_2b §4b.1` | 4b（需 MEIP 优先级/阈值仲裁 + `intrpt[7:0]` 平台分配） |
+| P2 | **`mip.MSIP/MEIP` 恒 0**：`b2_csr` 的 mip 只驱动 `MTIP` | `b2_csr.v` 读 mux | 4b（随 PLIC） |
+| P3 | **无中断优先级/嵌套**：MTI 一取即清 `mstatus.MIE`，无"更高优先级抢占"、无 S 模式委托（`medeleg/mideleg` 不存在） | `backend_top` 的 `irq_mti_w` 只判 MTI | 4b/2C |
+| P4 | **CSR 路线仍是 `b2_csr` 过渡栈**：本段只补了 `mtval/mie/mip` 与陷阱写路径；仍**没有** `misa/mideleg/medeleg/pmp*/mcycle/minstret/satp/stval/sepc/scause/sstatus` 等 | `rtl/back2/b2_csr.v` 地址表 | **4b**（换 `csr_file`+`trap_ctrl`，与 Sv32/PTW 串行复用一并做） |
+| P5 | **priv 恒 M**：ecall 只可能 cause 11（S/U 的 9/8 已定义宏但不可达）；无 `mret` 到 S/U 的实际下陷路径（`MPP←00` 只有 CSR 语义） | `core_top_2b` 硬连线 M | 4b（随私有权状态机） |
+| P6 | **Sv32/PMP 未启用**：`satp` 占位 Bare、PTE 的 A/D 写路径未落地（`pte_ad_done=0` 失败关闭），PMP 上下文未接 | §B4.3.3 | 4b（与 `csr_file` 同一批） |
+| P7 | **陷阱向量模式（MODE=1）未实测**：实现按 `base + 4×cause` 写好了，但 p7/p8 只用 MODE=0；未做向量模式程序 | `core_top_2b §6b` | 4b（补一条向量模式判据） |
+| P8 | **xRET 的 `mstatus.MPP≠M` 情形未实测**（本段恒 M）；`sret` 可被识别（`0x1020_0073`）但 S 模式不存在 ⇒ 实测只覆盖 `mret` | `backend_top` `xret_cmt_o` | 4b |
+| P9 | **本段引入的接口对直驱 TB 的影响**：`tb_back2_lockstep`/`tb_back2_ipc` 例化 `backend_top` 时新增输入接常量 0；若将来这两个 TB 要测陷阱，需接上 `trp_*` 驱动 | §B4.4.1 末行 | 4b |
+
+## B4.4.6 复现命令
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+
+# 0) 黄金/映像再生成（改 .S 后必跑；★ 生成器**输出到 stdout**，必须重定向）
+python3 sim/unit/prog/gen_back2_lockstep_data.py > sim/unit/prog/back2_lockstep_data.svh
+
+# 1) 整设计编译 + 顶层集成 TB（5 程序 / 51 项判据）
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[@]}" sim/unit/tb_core_top_2b.sv
+vvp /tmp/ct2b.vvp | tail -20      # ⇒ TB_CORE_TOP_2B: PASS（51 项）
+
+#    p8 中断现场诊断（可选）：把 tb_core_top_2b.sv 的 DBG_P8 置 1 重编译
+#    ⇒ [irq-s] 每 10 拍现场 + [irq-cmt] 逐条提交 PC
+
+# 2) 全量回归（tb_*.sv glob 自动纳入本 TB ⇒ 32 项）
+./scripts/regress.sh              # ⇒ REGRESS: 32/32 PASS
+```
+
+## B4.4.7 本段检查点状态（可复核，2026-09-23 实测）
+
+- 整设计（含新顶层与新 TB）编译：**0 error**（`-Wall`，无新增 implicit-net 告警）。
+- `tb_core_top_2b`：**TB_CORE_TOP_2B: PASS，51/51 项**
+  （C1' PC 流 / C2' 条数 / C3' 写回 / C4' AXI 读 / C5' 无异常 / C6' 写回流量 / **C7' 陷阱路径** / **C8' 中断路径**）。
+- `regress.sh`：**32/32 PASS**（日志 `../.b2chk/regress_4a_final.log`）。
+- 未提交 git；改动文件快照见 `../.b2chk/*.s13`（步骤 1~3 检查点）与 `../.b2chk/*.s14`（本段最终态）。
+- 证据日志：`../.b2chk/final_4a_run.log`（TB 全量输出）、`../.b2chk/gen_p8b.log`（黄金生成 stderr）。

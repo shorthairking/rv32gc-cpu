@@ -277,5 +277,10 @@
 `define BACK2_EXC_ILLEGAL  4'd2          // 非法指令
 `define BACK2_EXC_LOAD_MIS 4'd4          // load 非对齐（保留，本里程碑不产生）
 `define BACK2_EXC_ST_MIS   4'd6          // store 非对齐（保留）
+//   ★ 2B-4 第 4a 段：特权/断点异常码（与 rv32_defs.vh 的 cause 口径一致）
+`define BACK2_EXC_BREAK    4'd3          // ebreak（断点）
+`define BACK2_EXC_ECALL_U  4'd8          // U 模式 ecall
+`define BACK2_EXC_ECALL_S  4'd9          // S 模式 ecall
+`define BACK2_EXC_ECALL_M  4'd11         // M 模式 ecall
 
 `endif // BACK2_PARAMS_VH

@@ -98,6 +98,11 @@ module rob #(
     input  wire                    squash_valid,
     input  wire [ROB_IDX_W-1:0]    squash_idx,
     input  wire                    flush_all,
+    //   ★ 2B-4 第 4a 段：**陷阱退役**（无副作用弹出头部异常项）。
+    //     陷阱在头部被精确抛出（`trap_valid`）时，该指令**不得提交**（`slot_ok` 已含 `~slot_exc`），
+    //     但硬件处理程序已接管 ⇒ 它必须从此消失，否则 `flush_all` 保留头部 ⇒ 重取后又立刻再陷阱
+    //     （死循环）。本信号与 `trp_flush_v_i` 同拍：head 前移 1、cnt 保持 0。
+    input  wire                    trap_retire,
 
     //==================================================================
     // 观测
@@ -292,7 +297,9 @@ module rob #(
             // ---- 5.4 指针推进（提交 / 冲刷 / 分配）----
             if (flush_all) begin
                 cnt_q   <= {(ROB_IDX_W+1){1'b0}};
-                head_q  <= {ROB_IDX_W{1'b0}};
+                //   ★ 陷阱退役：头部异常项**弹出**（其余全清）；否则只清 cnt（原口径）
+                head_q  <= trap_retire ? idx_add(head_q, {{ROB_IDX_W-1{1'b0}}, 1'b1})
+                                       : {ROB_IDX_W{1'b0}};
                 epoch_q <= epoch_q + 1'b1;
             end else if (squash_valid) begin
                 epoch_q <= epoch_q + 1'b1;

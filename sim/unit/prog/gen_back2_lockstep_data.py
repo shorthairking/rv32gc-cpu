@@ -53,6 +53,13 @@ PROGS = [
     ("back2_p4_fpu.S",     "P4", "rv32imafd_zicsr", "rv32imafdc_zicsr"),
     ("back2_p5_mdu.S",     "P5", "rv32ima_zicsr",   "rv32imac_zicsr"),
     ("back2_p6_l1d.S",     "P6", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    #   ★ 2B-4 第 4a 段：特权/陷阱路径（ecall / 非法指令 / ebreak → mtvec → mret）
+    ("back2_p7_trap.S",    "P7", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    #   ★ 2B-4 第 4a 段：核内 CLINT + MTI 中断。**仅映像、无黄金轨迹**（第 5 个元素
+    #     = True）：mtime 自由计数 ⇒ "取中断的拍数"依赖微架构时序，Spike 与本核不可
+    #     逐条比；且本 SoC 的 CLINT 在 0x1F00_0000（Spike 默认在 0x0200_0000）⇒
+    #     Spike 跑本程序根本不会收到 MTI。判据改由 TB 的 C8'（自记录+硬编码期望）。
+    ("back2_p8_int.S",     "P8", "rv32ima_zicsr",   "rv32imac_zicsr", True),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"
@@ -171,23 +178,26 @@ def main() -> int:
     reg_rd_all = []
     reg_wd_all = []
     gold_n = []
-    for fname, tag, march, isa in PROGS:
+    for fname, tag, march, isa, *prog_opt in PROGS:
+        #   `prog_opt[0] = True` ⇒ 只出映像、不出黄金（见 PROGS 处 p8 的说明）
+        no_gold = bool(prog_opt and prog_opt[0])
         src = os.path.join(HERE, fname)
         obj = "/tmp/back2_%s.o" % tag
         elf = "/tmp/back2_%s.elf" % tag
         run([GCC, "-march=" + march, "-mabi=ilp32", "-nostdlib",
              "-fno-pic", "-mno-relax", "-c", src, "-o", obj])
         run([LD, "--no-relax", "-T", os.path.join(HERE, "back2_lockstep.ld"), "-o", elf, obj])
-        elf_sp = "/tmp/back2_%s_spike.elf" % tag
-        run([LD, "--no-relax", "-T", os.path.join(HERE, "back2_lockstep_spike.ld"),
-             "-o", elf_sp, obj])
         by = image_bytes(elf, tag)
-        by_sp = image_bytes(elf_sp, tag)
-        # ---- 自检①：两次链接的 .text 逐字节相同（否则黄金轨迹与 DUT 映像不同源）----
-        for a, b in by.items():
-            if (a - BASE) < 0x1000 and by_sp.get(a - BASE + SPIKE_BASE) != b:
-                die("%s .text 在两次链接间不一致 @0x%x（两 .ld 的相对段偏移不同？）"
-                    % (fname, a))
+        if not no_gold:
+            elf_sp = "/tmp/back2_%s_spike.elf" % tag
+            run([LD, "--no-relax", "-T", os.path.join(HERE, "back2_lockstep_spike.ld"),
+                 "-o", elf_sp, obj])
+            by_sp = image_bytes(elf_sp, tag)
+            # ---- 自检①：两次链接的 .text 逐字节相同（否则黄金轨迹与 DUT 映像不同源）----
+            for a, b in by.items():
+                if (a - BASE) < 0x1000 and by_sp.get(a - BASE + SPIKE_BASE) != b:
+                    die("%s .text 在两次链接间不一致 @0x%x（两 .ld 的相对段偏移不同？）"
+                        % (fname, a))
         # ---- 自检②：.text 必须从 BASE 起连续、且映像不越界 ----
         if BASE not in by:
             die("%s: 映像不含 BASE=0x%x（入口不在 .text 首？）" % (fname, BASE))
@@ -197,17 +207,22 @@ def main() -> int:
         hi = max(by) + 1
         n_w = (hi - BASE + 3) // 4
         words = words_from_bytes(by, BASE, hi)
-        pcs = golden_pcs(elf_sp, tag, isa)
-        _pcs2, rds, wds = golden_regs(elf_sp, tag)
-        #   ★ 自检④（本段新增）：两次解析必须逐条对齐（同一次 Spike 运行的两遍解析）
-        if (len(_pcs2) != len(pcs)) or any(a != b for a, b in zip(_pcs2, pcs)):
-            die("%s: 黄金 PC 轨迹两次解析不一致（%d vs %d）—— 解析器有问题"
-                % (fname, len(_pcs2), len(pcs)))
-        # ---- 自检③：黄金轨迹重定位（本口径下恒等）后就落在 .text 范围内 ----
-        pcs = [p - SPIKE_BASE + BASE for p in pcs]
-        if max(pcs) >= text_end:
-            die("%s: 黄金轨迹 PC 0x%x 越出 .text 末 0x%x（映像/轨迹不同源？）"
-                % (fname, max(pcs), text_end))
+        if no_gold:
+            #   ★ "仅映像"程序（p8_int）：跳过 Spike（时序相关 + CLINT 地址不同源）
+            pcs, rds, wds = [], [], []
+            sys.stderr.write("%s: **仅映像**（无黄金轨迹；判据见 TB 的 C8'）\n" % fname)
+        else:
+            pcs = golden_pcs(elf_sp, tag, isa)
+            _pcs2, rds, wds = golden_regs(elf_sp, tag)
+            #   ★ 自检④：两次解析必须逐条对齐（同一次 Spike 运行的两遍解析）
+            if (len(_pcs2) != len(pcs)) or any(a != b for a, b in zip(_pcs2, pcs)):
+                die("%s: 黄金 PC 轨迹两次解析不一致（%d vs %d）—— 解析器有问题"
+                    % (fname, len(_pcs2), len(pcs)))
+            # ---- 自检③：黄金轨迹重定位（本口径下恒等）后就落在 .text 范围内 ----
+            pcs = [p - SPIKE_BASE + BASE for p in pcs]
+            if max(pcs) >= text_end:
+                die("%s: 黄金轨迹 PC 0x%x 越出 .text 末 0x%x（映像/轨迹不同源？）"
+                    % (fname, max(pcs), text_end))
         if n_w > IMG_MAX:
             die("%s: 映像 %d 字 > IMG_MAX %d" % (fname, n_w, IMG_MAX))
         if len(pcs) > GOLD_MAX:
@@ -219,8 +234,11 @@ def main() -> int:
         reg_rd_all += rds + [0] * (GOLD_MAX - len(rds))
         reg_wd_all += wds + [0] * (GOLD_MAX - len(wds))
         gold_n.append(len(pcs))
-        sys.stderr.write("%s: img=%d words (0x%x..0x%x), golden=%d insns, last_pc=0x%x\n"
-                         % (fname, n_w, BASE, hi, gold_n[-1], pcs[-1]))
+        if not no_gold:
+            sys.stderr.write("%s: img=%d words (0x%x..0x%x), golden=%d insns, last_pc=0x%x\n"
+                             % (fname, n_w, BASE, hi, gold_n[-1], pcs[-1]))
+        else:
+            sys.stderr.write("%s: img=%d words (0x%x..0x%x)\n" % (fname, n_w, BASE, hi))
 
     out.append("// 本文件由 sim/unit/prog/gen_back2_lockstep_data.py 生成，请勿手改")
     out.append("// 真源：sim/unit/prog/back2_p{1..5}_*.S ＋ back2_lockstep{,_spike}.ld ＋ Spike --log-commits")

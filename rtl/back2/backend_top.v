@@ -124,6 +124,22 @@ module backend_top #(
     //     误判"乱序多写一次 x29"）。
     output wire [3:0]   commit_arch_we_o,
     // ---- 异常 / 统计 ----
+    //   ★ 2B-4 第 4a 段：**特权路径外部接口**（顶层 trap FSM ↔ 后端）
+    //     · trp_flush_v_i     ：外部请求冲刷（陷阱进入 / xRET 恢复；同拍退役头部异常项）
+    //     · trp_redirect_v/pc ：外部重定向（优先于内部 squash）——陷阱→mtvec、xRET→mepc
+    //     · trp_halt_o        ：观测（本轮之后不再用于"陷阱即停机"）
+    //     · xret_cmt_o        ：提交组 lane 0 是 mret/sret（顶层据此做特权恢复 + 重定向）
+    input  wire        trp_flush_v_i,
+    input  wire        trp_redirect_v_i,
+    input  wire [31:0] trp_redirect_pc_i,
+    output wire        trp_halt_o,
+    output wire        xret_cmt_o,
+    //   ★ 中断：CLINT MTIP 进 mip.MTIP；`irq_mti_w` = 本拍允许取 MTI（顶层据此重定向）
+    input  wire        mtip_i,
+    output wire        irq_mti_o,
+    output wire [31:0] mtvec_o,
+    output wire [31:0] mepc_o,
+    output wire [31:0] trap_valid_o_pc,       // 别名（保持 trap_valid_o 契约不变）
     output wire        trap_valid_o,
     output wire [31:0] trap_pc_o,
     output wire [3:0]  trap_cause_o,
@@ -212,6 +228,9 @@ module backend_top #(
     function [31:0] p_csrw;input [RB_W-1:0] p; begin p_csrw = p[`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB]; end endfunction
     function [11:0] p_csra;input [RB_W-1:0] p; begin p_csra = p[`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB]; end endfunction
     function [2:0]  p_csrop;input [RB_W-1:0] p;begin p_csrop= p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB]; end endfunction
+    //   ★ 2B-4 第 4a 段：载荷里的**原始指令位**（`decoder.tval_o = insn_i`，norvc）
+    //     —— xRET 识别与 CSR 立即数形式都靠它
+    function [31:0] p_tval;  input [RB_W-1:0] p;begin p_tval = p[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB]; end endfunction
     function [4:0]  p_ff;  input [RB_W-1:0] p; begin p_ff  = p[`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB]; end endfunction
     function [31:0] p_trtgt;input [RB_W-1:0] p;begin p_trtgt=p[`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB]; end endfunction
     function p_trtk;       input [RB_W-1:0] p; begin p_trtk = p[`BACK2_RB_TRTAKEN]; end endfunction
@@ -319,6 +338,12 @@ module backend_top #(
     reg  [`BACK2_LQ_IDX_W-1:0]  lq_of_rob  [0:127];
     wire [`BACK2_LQ_IDX_W-1:0]  lq_of_rob_r;
     wire [11:0] csr_raddr_w;
+    //   ★ 2B-4 第 4a 段：陷阱/中断 → CSR 硬件写路径（**声明必须早于下方 b2_csr 例化**，
+    //     否则 iverilog 会先建 1 位隐式网 ⇒ 32 位数据被静默截断）
+    wire        csr_mstatus_mie_w, csr_mie_mtie_w;
+    wire [31:0] csr_mstatus_w, csr_mie_w;
+    wire        trp_csr_enter_w, trp_csr_exit_w;
+    wire [31:0] trp_csr_pc_w, trp_csr_cause_w, trp_csr_tval_w;
 
 
 
@@ -485,7 +510,15 @@ module backend_top #(
         //     （`s1f`=1）⇒ 实测 `fcvt.s.w fs8,a4` 得 0xce820000（读的是 FP 口的垃圾），
         //     而 Spike/2A 得 0x40a00000（5.0）。
         wire fp_src1_int = is_opfp & ((f5 == `RV32GC_FP_F5_FMV_W_X) | (f5 == 5'b11010));
-        wire unsup   = (opt == 4'd5) | (opt == 4'd8) | (opt == 4'd10) | (opt == 4'd15);
+        //   ★★ 2B-4 第 4a 段：**ecall/ebreak/mret/sret 从 `unsup` 摘出**
+        //     · ecall/ebreak ⇒ 不再走"非法指令（cause 2）"，而在 `exc_w` 里带**真实 cause**
+        //       （11 = M 模式 ecall / 3 = breakpoint），提交点精确抛出（rob.v 头部 trap）；
+        //     · mret/sret ⇒ 不非法；执行期是 no-op，**提交点特权动作**由顶层 trap FSM 做
+        //       （读 mepc/mstatus + 重定向），识别方式见 `xret_cmt_o`；
+        //     · wfi 仍留 unsup（本里程碑不需要）。
+        wire is_sys_ok = ecall | ebreak | mret | sret;
+        wire unsup   = ((opt == 4'd8) & ~is_sys_ok) |
+                       (opt == 4'd5) | (opt == 4'd10) | (opt == 4'd15);
         wire illegal = ill_instr | (opt == 4'd15) | csr_ill | cbo_gate_ill;
         wire kill    = unsup | illegal;
 
@@ -527,8 +560,12 @@ module backend_top #(
                         (opt == 4'd11) ? `BACK2_Q_FPU :
                         (opt == 4'd12) ? `BACK2_Q_LSU :
                         (opt == 4'd4)  ? `BACK2_Q_LSU : `BACK2_Q_ALU0;
+        //   异常码优先级（提交点语义，AGENT.md §3.3）：**取指异常 > ecall/ebreak > 非法指令**。
+        //   （本段 priv 恒 M ⇒ ecall cause = 11；S/U 的 9/8 待 4b 接 csr_file 后按 priv 生成。）
         wire [3:0] exc_w = lane_fault_i[g] ? {1'b0, lane_fault_cause_i[g*5 +: 4]} :
-                           kill ? `BACK2_EXC_ILLEGAL : `BACK2_EXC_NONE;
+                           ecall  ? `BACK2_EXC_ECALL_M :
+                           ebreak ? `BACK2_EXC_BREAK :
+                           kill   ? `BACK2_EXC_ILLEGAL : `BACK2_EXC_NONE;
 
         // ★ 禁止"整段清零 + 逐段赋值"：wire 上的多条连续赋值是**多驱动**，同位宽
         //   的 0/1 冲突会在 iverilog/Vivado 下解析成 **x**（实测：PC/ARND 等所有含 1
@@ -736,7 +773,7 @@ module backend_top #(
                            rob_alloc_idx0 + 7'd1, rob_alloc_idx0};
     wire [3:0]  lsu_dr_ok_w;
     wire        disp_ok = (d1_v_q != {DISP_W{1'b0}}) & ~rn_i_busy & ~rn_f_busy &
-                          ~squash_v_w & ~flush_all_w & ~trap_halt_q &
+                          ~squash_v_w & ~flush_all_w &
                           rob_alloc_ready & free_i_ok & free_f_ok & iq_room_ok &
                           st_alloc_ok & ld_alloc_ok;
     assign disp_fire_w = disp_ok;
@@ -1272,7 +1309,16 @@ module backend_top #(
     //==========================================================================
     // 9. 提交（W1）：写回值读出 / 架构 RAT / 释放 / CSR / store 排空 / 训练 / 检查点
     //==========================================================================
-    assign cmt_ok = ~(squash_v_w | flush_all_w);
+    //   ★★ 2B-4 第 4a 段：**xRET 的"提交上报"例外**。
+    //     实测口径（/opt/riscv/bin/spike --log-commits，本段 §B4.4.2 登记）：
+    //       · 抛陷阱的那条指令（ecall/ebreak/非法）**不进**提交日志（Spike 只记
+    //         "exception ... epc"行）⇒ 本核也不上报（`slot_ok` 含 `~slot_exc`）；
+    //       · `mret` **进**提交日志（它正常退役）⇒ 本核必须上报那一拍，
+    //         否则提交 PC 流少一条、与黄金逐条比对必然分歧。
+    //     xret 拍 `flush_all` 同时为 1（冲刷年轻工作）⇒ 这里开一个"仅上报"的口子：
+    //     只放开 `cmt_ok`，所有**副作用**仍由各自的 `p_di/p_df/cmt_st_drain` 门控
+    //     （mret/sret 无目的寄存器、非访存 ⇒ 无副作用可泄漏）。
+    assign cmt_ok = ~squash_v_w & (~flush_all_w | (xret_cmt_o & trp_flush_v_i));
     //   ★ LQ 提交点释放的窗口宽度：`cmt_raw` 是 rob.v 的**前缀连续**提交链（第 i 槽可提交 ⇒
     //     前面全可提交）⇒ 条数 = popcount；冲刷/陷阱拍强制 0（不得释放未提交项）。
     assign cmt_n_w = cmt_ok ? ({2'b0, cmt_raw[0]} + {2'b0, cmt_raw[1]} +
@@ -1310,11 +1356,12 @@ module backend_top #(
     reg        csr_cmt_we;  reg [11:0] csr_cmt_addr; reg [31:0] csr_cmt_data;
     reg [2:0]  csr_cmt_op;   // ★ B29：提交级 CSR 操作码
     reg        ff_cmt_any;  reg [4:0]  ff_cmt_val;
+    reg [31:0] csr_cmt_insn;                 // 该 CSR 指令的原始编码（判 zimm 形式）
     integer    cw;
     always @(*) begin
         csr_cmt_we   = 1'b0;
         csr_cmt_addr = 12'h0;
-        csr_cmt_data = 32'h0; csr_cmt_op = 3'd0;
+        csr_cmt_data = 32'h0; csr_cmt_op = 3'd0; csr_cmt_insn = 32'h0;
         ff_cmt_any   = 1'b0;
         ff_cmt_val   = 5'h0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
@@ -1324,6 +1371,7 @@ module backend_top #(
                     csr_cmt_addr = p_csra(cmt_pay[cw*RB_W +: RB_W]);
                     csr_cmt_data = p_csrw(cmt_pay[cw*RB_W +: RB_W]);
                     csr_cmt_op   = p_csrop(cmt_pay[cw*RB_W +: RB_W]);   // ★ B29：提交级合成用
+                    csr_cmt_insn = p_tval (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4a：zimm 形式判定
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
                     ff_cmt_any = 1'b1;
@@ -1335,10 +1383,19 @@ module backend_top #(
     // fflags 累积写入（FPU 结果提交时），与 CSR 写并路：地址 0x001 用"读改写"
     wire        csr_we_w    = csr_cmt_we | ff_cmt_any;
     wire [11:0] csr_waddr_w = csr_cmt_we ? csr_cmt_addr : 12'h001;
-    //   ★ B29：提交级合成（W→src；S→old|src；C→old&~src；zimm 形式本里程碑不涉及，保留旧值语义）
-    wire [31:0] csr_cmt_new = (csr_cmt_op == 3'd1) ? csr_cmt_src :
-                              (csr_cmt_op == 3'd2) ? (csr_rdata_w | csr_cmt_src) :
-                                                     (csr_rdata_w & ~csr_cmt_src);
+    //   ★★ 2B-4 第 4a 段缺陷修复：**CSR 立即数形式（csrrwi/csrsi/csrrci）的源**。
+    //     载荷 `p_csrw` 存的是"被当成 rs1 重命名"的物理号，而立即数形式的 insn[19:15]
+    //     是 **zimm**（5 位立即数，不是寄存器号）⇒ 提交点从 PRF 读回的是**无关寄存器**
+    //     的内容：实测 `csrsi mstatus, 8`（p8_int）把 s0=mtvec 的值 0x8001_007c 写进了
+    //     mstatus（0x8001_00fc），MIE 位纯属巧合才对。
+    //     修法：用载荷 TVAL（原始指令位）判 funct3 —— `insn[14:13] != 0` 即 101/110/111
+    //     （csrrwi/csrsi/csrrci）⇒ 源取 `insn[19:15]` 零扩展。**不改 2A 译码器**。
+    wire        csr_cmt_zimm = (csr_cmt_insn[6:0] == 7'b1110_011) & (|csr_cmt_insn[14:13]);
+    wire [31:0] csr_cmt_src_e= csr_cmt_zimm ? {27'b0, csr_cmt_insn[19:15]} : csr_cmt_src;
+    //   ★ B29：提交级合成（W→src；S→old|src；C→old&~src）
+    wire [31:0] csr_cmt_new = (csr_cmt_op == 3'd1) ? csr_cmt_src_e :
+                              (csr_cmt_op == 3'd2) ? (csr_rdata_w | csr_cmt_src_e) :
+                                                     (csr_rdata_w & ~csr_cmt_src_e);
     wire [31:0] csr_wdata_w = csr_cmt_we ? (csr_cmt_addr == 12'h001 ?
                               (csr_cmt_new | ff_cmt_val) : csr_cmt_new)
                                          : (csr_ff_w | ff_cmt_val);
@@ -1395,7 +1452,12 @@ module backend_top #(
         .clk(clk), .rst_n(rst_n),
         .raddr(csr_raddr_w), .rdata(csr_rdata_w), .raddr_ill(),
         .frm_o(csr_frm_w), .fflags_o(csr_ff_w),
-        .we(csr_we_w), .waddr(csr_waddr_w), .wdata(csr_wdata_w)
+        .we(csr_we_w), .waddr(csr_waddr_w), .wdata(csr_wdata_w),
+        //   ★ 2B-4 第 4a 段：陷阱硬件写路径 + MTIP + 重定向读口
+        .trp_enter_v(trp_csr_enter_w), .trp_enter_pc(trp_csr_pc_w),
+        .trp_enter_cause(trp_csr_cause_w), .trp_enter_tval(trp_csr_tval_w),
+        .trp_exit_v(trp_csr_exit_w), .mtip_i(mtip_i),
+        .mtvec_o(mtvec_o), .mepc_o(mepc_o), .mstatus_o(csr_mstatus_w), .mie_o(csr_mie_w)
     );
 
     // ---- ROB ----
@@ -1431,6 +1493,7 @@ module backend_top #(
         .trap_valid(trap_v_rob), .trap_pc(trap_pc_o), .trap_cause(trap_cause_o),
         .trap_tval(trap_tval_o),
         .squash_valid(squash_v_w), .squash_idx(squash_idx_w), .flush_all(flush_all_w),
+        .trap_retire(trap_v_rob & trp_flush_v_i),
         .head_o(rob_head_w), .cnt_o(rob_cnt_w), .empty_o(), .head_done_o(), .head_exc_o(),
         .cmt_cnt_o(cnt_commit_o), .epoch_o(epoch_w)
     );
@@ -1500,18 +1563,65 @@ module backend_top #(
     assign restore_ck_id_w = u_ckid(x_i2_uop[2]);
     assign restore_rob_v_w = squash_v_w & ~u_ckv(x_i2_uop[2]);
     assign restore_rob_idx_w = x_i2_rob[2];
-    assign flush_all_w = trap_v_rob | trap_halt_q;
+    //   ★★ 2B-4 第 4a 段：**陷阱不再等于停机**。旧实现 `flush_all_w = trap_v_rob | trap_halt_q`
+    //     且 `trap_halt_q` 一经陷阱永久置位 ⇒ 无法进入 mtvec 处理程序（§B4.4.1 B1）。
+    //     新口径：陷阱拍由**顶层 trap FSM** 接管（记录 CSR + 重定向到 mtvec + 退役该项），
+    //     后端只负责"冲刷 + 重定向"两件事；`trap_halt_q` 保留为**观测**（不再参与 flush）。
+    assign flush_all_w = trap_v_rob | trp_flush_v_i;
+    assign trp_halt_o  = trap_halt_q;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) trap_halt_q <= 1'b0;
-        else if (trap_v_rob) trap_halt_q <= 1'b1;
+        else if (trap_v_rob) trap_halt_q <= 1'b1;      // 仅作观测（历史行为痕迹）
     end
 
-    assign redirect_valid_o    = squash_v_w;
-    assign redirect_pc_o       = squash_v_w ? bru_npc : 32'h0;
-    assign redirect_use_ckpt_o = squash_v_w & u_ckv(x_i2_uop[2]);
+    //   外部重定向优先于内部分支误判重定向（陷阱/xRET 与分支同拍时以特权路径为准，
+    //   见 AGENT.md §3.3"陷阱在副作用已落地指令之后取"与 2A `core_top`:1715 的 kill_young 口径）
+    assign redirect_valid_o    = trp_redirect_v_i | squash_v_w;
+    assign redirect_pc_o       = trp_redirect_v_i ? trp_redirect_pc_i :
+                                 (squash_v_w ? bru_npc : 32'h0);
+    assign redirect_use_ckpt_o = ~trp_redirect_v_i & squash_v_w & u_ckv(x_i2_uop[2]);
     assign redirect_ckpt_o     = u_ckid(x_i2_uop[2]);
     assign trap_valid_o        = trap_v_rob;
+    assign trap_valid_o_pc     = trap_pc_o;
+
+    //==========================================================================
+    //   ★★ 2B-4 第 4a 段：陷阱/中断 → CSR 硬件写路径的"事件组装"
+    //--------------------------------------------------------------------------
+    //   `trp_flush_v_i` 是顶层的**接受**脉冲（一拍），本模块据"这一拍是谁"决定
+    //   往 b2_csr 发进入/退出：
+    //     · 异常（头部 trap_v_rob）   ⇒ 进入：mepc/mcause/mtval/mstatus
+    //     · 中断（irq_mti_w）         ⇒ 进入：mcause = 0x8000_0007，mtval = 0
+    //     · xRET（提交点 mret/sret）  ⇒ 退出：mstatus.MIE/MPIE/MPP
+    //   mtval 口径（与 Spike 实测一致，见 §B4.4.2）：
+    //     cause 2（非法指令）⇒ 出错指令编码；cause 3（断点）⇒ 断点指令 PC；其余 ⇒ 0
+    //==========================================================================
+    //   中断判定（提交组边界采样）：MIE（mstatus）× MTIE（mie）× MTIP（CLINT）
+    //   ＋ ROB 非空（有"下一条未提交指令"可作 mepc）＋ 本拍不是异常/xRET 拍
+    wire irq_mti_w = csr_mstatus_mie_w & csr_mie_mtie_w & mtip_i &
+                     (rob_cnt_w != 8'h0) & ~trap_v_rob & ~xret_cmt_o;
+    assign irq_mti_o = irq_mti_w;
+    assign csr_mstatus_mie_w = csr_mstatus_w[3];
+    assign csr_mie_mtie_w    = csr_mie_w[7];
+
+    wire trp_is_exc_w  = trap_v_rob;
+    wire trp_is_irq_w  = irq_mti_w & ~trap_v_rob;
+    wire trp_is_xret_w = xret_cmt_o & ~trap_v_rob & ~irq_mti_w;
+
+    assign trp_csr_enter_w = trp_flush_v_i & (trp_is_exc_w | trp_is_irq_w);
+    assign trp_csr_exit_w  = trp_flush_v_i & trp_is_xret_w;
+    //   头部 PC：异常 = 该指令 PC；中断 = 最老未提交指令 PC（= 中断返回点）
+    assign trp_csr_pc_w    = trap_pc_o;
+    assign trp_csr_cause_w = trp_is_irq_w ? 32'h8000_0007 : {28'b0, trap_cause_o};
+    assign trp_csr_tval_w  = trp_is_irq_w                         ? 32'h0 :
+                             (trap_cause_o == `BACK2_EXC_ILLEGAL) ? trap_tval_o :
+                             (trap_cause_o == `BACK2_EXC_BREAK)   ? trap_pc_o : 32'h0;
+    //   ★ 提交点 xRET 识别：载荷 TVAL 字段 = **原始指令位**（decoder `tval_o = insn_i`，norvc）
+    //     ⇒ 直接按编码判定 mret(0x3020_0073) / sret(0x1020_0073)，**不需要新增载荷位**
+    //     （RB_W=416 已用满，见 back2_params.vh）。
+    wire [31:0] cmt0_tval = cmt_pay[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB];
+    assign xret_cmt_o = |cmt_raw & cmt_ok &
+                        ((cmt0_tval == 32'h3020_0073) | (cmt0_tval == 32'h1020_0073));
 
     //==========================================================================
     // 12. 提交训练 / 检查点释放 / RAS（前端衔接）

@@ -374,6 +374,11 @@ module tb_back2_lockstep_top #(
         .commit_valid_o(commit_valid), .commit_pc_o(commit_pc),
         .commit_arch_rd_o(commit_arch_rd), .commit_arch_rd_wdata_o(commit_arch_rd_wdata),
         .commit_arch_we_o(commit_arch_we),
+        //   ★ 2B-4 第 4a 段：backend_top 新增的特权/中断输入——
+        //     本 TB 是**纯后端直驱**（无 core_top_2b 的 trap FSM）⇒ 全部接常量：
+        //     不冲刷、不外部重定向、无 CLINT ⇒ 与加接口之前的行为逐拍等价。
+        .trp_flush_v_i(1'b0), .trp_redirect_v_i(1'b0), .trp_redirect_pc_i(32'h0),
+        .mtip_i(1'b0),
         .trap_valid_o(trap_valid), .trap_pc_o(trap_pc),
         .trap_cause_o(trap_cause), .trap_tval_o(trap_tval),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),

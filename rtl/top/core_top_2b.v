@@ -199,10 +199,17 @@ module core_top_2b (
     wire [3:0]  commit_arch_we;
     wire [31:0] cnt_commit, cnt_squash;
     wire [7:0]  dbg_stq_cnt_w;
-    //   ★ 占位：陷阱交付属第 4 段（本段只观测，不产生异常处理行为）
+    //   ★★ 2B-4 第 4a 段：**陷阱/中断交付已落地**（不再是占位）
     wire        trap_valid_w;
     wire [31:0] trap_pc_w, trap_tval_w;
     wire [3:0]  trap_cause_w;
+    wire        xret_cmt_w, irq_mti_w;
+    wire [31:0] csr_mtvec_w, csr_mepc_w;
+    //   ★ 陷阱 FSM 的**组合**出口（声明必须在 backend_top 例化之前；否则隐式 1 位网）
+    wire        be_trp_flush, be_trp_redirect_v, trp_halt_w;
+    wire [31:0] be_trp_redirect_pc;
+    //   ★★ 2B-4 第 4a 段（第 4 步）：**核内 CLINT MTIP**（2A `clint` 模块只读复用）
+    wire        clint_mtip_w, clint_msip_w;
 
     //==========================================================================
     // 2. 取指翻译（I-TLB / PTW）：**结构性就位，satp 占位 = Bare ⇒ 本段不启用**
@@ -482,6 +489,7 @@ module core_top_2b (
     wire        d_unc_w      = (d_mr_route != 3'd0) & (d_mr_unc | d_mr_xip | d_mr_no_axi) &
                                ~d_clint_plic;
 
+
     //   ★★ 组合环警告（本段踩过）：**不得**把 `l1d.cs_stall` 用在"是否发请求"的组合式里
     //      —— `cs_stall = access | cs_miss | (ms_state!=IDLE) | maint`，而 `access = cs_req`
     //      ⇒ `cs_req ← cs_stall ← access = cs_req` 成环（iverilog 判环 ⇒ 全网 x ⇒ 一条不提交）。
@@ -501,13 +509,49 @@ module core_top_2b (
     assign      d_ready_w  = d_idle & ~l1d_busy_w;   // 可接管新请求
     wire        d_start    = d_ready_w & lsu_req_v;
 
+    //--------------------------------------------------------------------------
+    // 4b.1 ★★ 核内 CLINT（2B-4 第 4a 段第 4 步）：MMIO 截获，**绝不发 AXI**
+    //--------------------------------------------------------------------------
+    //  口径与 2A `core_top.v:2405-2425` 逐条对齐：
+    //    · 窗口 = `RV32GC_CLINT_BASE`(0x1F00_0000) 起 64 KiB（`mmio_route` 判定），
+    //      送入 CLINT 的 `req_addr` 是**窗口内偏移**（2A 同式：减基址）；
+    //    · 单拍握手：请求在 `AD_WAIT` 拍呈现一次，CLINT 的 `resp_hit/resp_rdata`
+    //      同拍组合给出 ⇒ 读响应与写副作用都在该拍完成（`clint` 内部为组合读 +
+    //      时序寄存器，mtime 由 `aclk` 每拍 +1）；
+    //    · 本段**只接 CLINT**；PLIC 窗口的访问仍走"立即完成、读回 0 / 写丢弃"的
+    //      占位（`clint_hit=0` 时 `d_rsp_d_w=0`），不产生总线事务、不挂死
+    //      ⇒ 报告 §B4.4.4 登记为 4b/后续（PLIC 需 MEIP 优先级仲裁，属中断控制器范畴）。
+    //--------------------------------------------------------------------------
+    wire [31:0] clint_req_addr  = d_a_q - `RV32GC_CLINT_BASE;
+    wire        clint_req_vld   = (ad_st_q == AD_WAIT) & d_cp_q;
+    wire        clint_req_wr    = d_we_q;
+    wire [31:0] clint_req_wdata = d_d_q;
+    wire [3:0]  clint_req_strb  = d_strb_q;
+    wire [31:0] clint_rdata_w;
+    wire        clint_hit_w;
+
+    clint u_clint (
+        .aclk      (aclk),
+        .aresetn   (aresetn),
+        .req_valid (clint_req_vld),
+        .req_write (clint_req_wr),
+        .req_addr  (clint_req_addr),
+        .req_wdata (clint_req_wdata),
+        .req_wstrb (clint_req_strb),
+        .resp_rdata(clint_rdata_w),
+        .resp_hit  (clint_hit_w),
+        .msip_o    (clint_msip_w),
+        .mtip_o    (clint_mtip_w)
+    );
+
     // 请求发射：AD_REQ 拍恰好一次（重试时等 L1D 回到 IDLE）
     wire        l1d_cs_req_w = (ad_st_q == AD_REQ);
     wire [31:0] d_rdata_w    = d_unc_q ? d_unc_rdata_w : l1d_cs_rdata;
     assign      d_rsp_v_w    = (ad_st_q == AD_WAIT) & ~d_we_q &
                                (d_cp_q ? 1'b1 :
                                 d_unc_q ? d_unc_done_w : l1d_cs_ready);
-    assign      d_rsp_d_w    = d_cp_q ? 32'h0 : d_rdata_w;
+    //   CLINT 命中取 CLINT 读数据；窗口内未接部分（PLIC）仍回 0（占位，fail-safe）
+    assign      d_rsp_d_w    = d_cp_q ? (clint_hit_w ? clint_rdata_w : 32'h0) : d_rdata_w;
     assign      d_rsp_tag_w  = d_tag_q;
 
     l1d #(.OWNER_D_FILL(2'd1), .OWNER_WRBACK(2'd2)) u_l1d (
@@ -824,10 +868,49 @@ module core_top_2b (
         .commit_arch_we_o(commit_arch_we),
         .trap_valid_o(trap_valid_w), .trap_pc_o(trap_pc_w),
         .trap_cause_o(trap_cause_w), .trap_tval_o(trap_tval_w),
+        //   ★★ 2B-4 第 4a 段：特权/陷阱/中断路径（顶层 trap FSM ↔ 后端）
+        .trp_flush_v_i(be_trp_flush), .trp_redirect_v_i(be_trp_redirect_v),
+        .trp_redirect_pc_i(be_trp_redirect_pc), .trp_halt_o(trp_halt_w),
+        .xret_cmt_o(xret_cmt_w), .mtip_i(clint_mtip_w),
+        .irq_mti_o(irq_mti_w), .mtvec_o(csr_mtvec_w), .mepc_o(csr_mepc_w),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),
         .cnt_commit4_o(), .cnt_issue_o(),
         .dbg_rob_cnt_o(), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w)
     );
+
+    //==========================================================================
+    // 6b. ★★ 特权/陷阱/中断 FSM（2B-4 第 4a 段）
+    //--------------------------------------------------------------------------
+    //  口径（与 2A `trap_ctrl` 同精神，简化为"单拍组合交付"）：
+    //    · 交付点 = **ROB 头部**（`trap_valid_w`：最老指令已就绪且带异常码）
+    //      ⇒ 精确异常：更老的指令都已提交，更年轻的全部冲刷（后端 `flush_all`）。
+    //    · 三种事件共用一条"冲刷 + 重定向"通道，优先级
+    //        异常（头部精确） > xRET（提交点特权恢复） > MTI 中断（提交组边界采样）
+    //    · 重定向目标：
+    //        异常/中断 ⇒ mtvec（MODE=0 直接；MODE=1 向量 = base + 4×cause）
+    //        xRET      ⇒ mepc（mret/sret 语义；本段无 S 模式 ⇒ 只可能 mret）
+    //    · 全程**无状态**（不需要 pending 寄存器）：`trp_flush_v_i` 与
+    //      `trp_redirect_v_i` 同拍有效，与 2A `core_top.v:2619` 的
+    //      `redirect_exc_pc = trap_valid ? trap_redirect_pc : ...` 同构。
+    //      ⇒ 后端同一拍：清空 ROB/重命名/IQ/LSQ（flush_all）＋ 前端重定向取 mtvec/mepc。
+    //==========================================================================
+    wire        trp_exc_w  = trap_valid_w;                       // 头部精确异常
+    wire        trp_xret_w = xret_cmt_w & ~trap_valid_w;         // 提交点 mret/sret
+    wire        trp_irq_w  = irq_mti_w & ~trap_valid_w & ~xret_cmt_w;
+    wire        trp_take_w = trp_exc_w | trp_xret_w | trp_irq_w;
+
+    wire [1:0]  trp_mode_w   = csr_mtvec_w[1:0];
+    wire [31:0] trp_base_w   = {csr_mtvec_w[31:2], 2'b00};
+    wire [3:0]  trp_cause4_w = trp_exc_w ? trap_cause_w : 4'd7;   // 中断码 = MTI(7)
+    wire [31:0] trp_vect_w   = trp_base_w + {26'b0, trp_cause4_w, 2'b00};
+    wire [31:0] trp_target_w = (~trp_xret_w & (trp_mode_w == 2'b01)) ? trp_vect_w :
+                               (~trp_xret_w)                         ? trp_base_w :
+                                                                       csr_mepc_w;
+
+    assign be_trp_flush       = trp_take_w;
+    assign be_trp_redirect_v  = trp_take_w;
+    assign be_trp_redirect_pc = trp_target_w;
+    //   `trp_halt_w` = 后端观测（历史"陷阱即停机"痕迹；不再参与冲刷/派发门控）
 
     //==========================================================================
     // 7. 调试口（08 §4.4 口径）
