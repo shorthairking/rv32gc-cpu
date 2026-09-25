@@ -550,8 +550,9 @@ module tb_core_top_2b #(
                              n_maint_cmt, n_l1i_inval, n_tlb_sfence, n_l1d_inval);
                     $fflush();
                 end
-                //   ★ C12'（cbo.*）未挂回：p12_cbo 的数据安全检查未过（详见报告 §B4.16：
-                //     维护全冲刷丢掉**已提交但仍在排空**的 store ⇒ 后 3 次 load 读到 0）
+                //   ★ C12'（cbo.*）未挂回：见报告 §B4.17（冲刷后 STQ 转发失效 + 已提交 store
+                //     尚未排空 ⇒ 重新执行的 load 读到旧内存值）
+
 
 
             end else if (pid == 5) begin

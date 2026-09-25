@@ -630,7 +630,13 @@ module core_top_2b (
     //     它就是**已提交**的写，杀掉即丢数据（实测 p12：`cbo.clean/flush` 前后 4 次 load
     //     只有 1 次读到 0x55667788 —— 被杀的 store 从未落进 L1D/内存）。
     //     load 则相反：其请求者会被冲刷并重新执行 ⇒ kill 安全。
-    wire        d_kill_w = be_trp_flush & ~d_we_q;
+    //   ★★ p12 定案后的精确修法：kill **不得抢占"正在被接管的请求"**。
+    //     根因链：CDQ（已提交 store 排空 FIFO）在 `flush_all` 下**不会**被清 ✓（设计正确），
+    //     但当冲刷拍恰好与适配器"接管该 store"同拍时：LSQ 看到 `mem_req_valid & mem_req_ready`
+    //     成立 ⇒ **CDQ 已弹出该项**，而适配器被 kill ⇒ 该笔已提交写**从未落到 L1D**
+    //     ⇒ 后续同地址 load 读到内存旧值 0（实测 p12 idx10/12/13）。
+    //     `d_we_q` 在接管当拍尚未锁存 ⇒ 仅 `& ~d_we_q` 挡不住 ⇒ 必须再排除接管拍（`~d_start`）。
+    wire        d_kill_w = be_trp_flush & ~d_we_q & ~d_start;
     wire        d_idle     = (ad_st_q == AD_IDLE);
     assign      d_ready_w  = d_idle & ~l1d_busy_w;   // 可接管新请求
     wire        d_start    = d_ready_w & lsu_req_v;
