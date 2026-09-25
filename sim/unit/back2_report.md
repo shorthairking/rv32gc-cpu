@@ -2976,3 +2976,68 @@ K1 **不是**"重定向目标算错"（那已被证明每拍都对），也**不
 - 结论：**K1 未收敛**，但已从"重定向目标/在途旧块派发"两个候选排除，收窄到
   **"冻结/冲刷期间前端丢块"或"front4 redirect 未作废在途块"** 两类原因；下一步按 §B4.10.3
   的 5 条清单逐条打点，再决定是否给 `front4_top` 加 `hold_i`（小改 + 报告登记理由）。
+
+
+# 2B-4 K1 收口段（五条审计清单打点）—— **K1 根因定案：前端在 L1I 请求被门控期间产生"重叠、乱序取指块"**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 4b-2a-fix `9eb70f6`=tag `2B-4.9`）
+> 本段按 §B4.10.3 五条清单**逐条打点**，K1 根因已定案（证据见下），但**修法需要改动前端取指
+> FSM 的"冻结"语义**（不是 2A 那种 `fe_stall` 能覆盖的），超出"小改"范围 ⇒ 按任务书纪律停在
+> "整设计可编译 + 既有判据全绿"检查点：`rtl/top/core_top_2b.v` 保留维护冻结窗口 + `fe_stall` 接线，
+> p11/p12 仍为 WIP（未进生成器清单）。
+
+## B4.11.0 K1 根因定案（一句话）
+
+**K1 = 前端取指块序列失序**：在 `fence.i` 的 L1I 扫掠期间，本核只把**送进 L1I 的请求**门控为 0
+（`l1i_cs_req & ~fencei_busy`），却让前端继续按"请求已发出"推进内部簿记 ⇒ 扫掠结束后前端输出的
+块起点**重叠且乱序**（实测序列：`0x…040 → 0x…050 → 0x…044 → 0x…054 → 0x…064`：既回退重叠、
+又跳过 `0x…060` 所在的块）⇒ ROB 里的指令序与程序序不符 ⇒ PC 流丢/跳指令。
+
+## B4.11.1 五条审计清单打点结果（逐条）
+
+| # | 审计项 | 结论 | 证据 |
+|---|---|---|---|
+| ① | redirect 分支是否清 fetch-queue/输出寄存器 | **是**（不是 K1 根因） | `rtl/front4/ifetch4.v:669` `blk_valid = blk_ready_int & ~ckpt_stall & **~redirect_valid** & ~fault_hold_q`；`blk_fire = blk_valid & blk_ready`（`ifetch4.v:674`）⇒ 重定向拍块无效、且按 ready 推进 |
+| ② | redirect 后第一个请求是否被自己的 flush 误伤 | **否**（重定向目标每拍都正确，见 §B4.10.0 的 `[rdbg]`） | `[rdbg]`：`redir pc=0x8001c024 / 0x8001c034 / 0x8001c060` 均正确 |
+| ③ | 后端 `disp_ok=0` 拍前端是"保持"还是"丢弃"当前块 | **保持**（不是 K1 根因） | `[k1-blk]` 实测：`pc0=0x8001c034 mask=1111 rdy=0` 连续多拍**同一块反复呈现**（块被保持，未丢） |
+| ④ | 与 2A `kill_young`（`core_top.v:1715`）对照：缺"前端 hold" | **确认缺**，且 2A 的 hold 落点是**取指 FSM/pc_gen**（不是本核的 `fe_stall`） | 本核 `front4_top` 只有三个冻结口：`rst_hold`（取指停在 RESET_PC ✗）、`break_point`（对外契约口 ✗ 不能挪用）、`fe_stall`（只进 `freeze_in`：`front4_top.v:302`，**只冻预测器/检查点，不冻取指推进** ✗） |
+| ⑤ | fence.i 扫掠期间 `l1i_cs_req` 门控对取指队列的影响 | **就是 K1 根因** | `[k1-blk]` 失序序列（见 §B4.11.0）；本段把 `fe_stall` 接成 `fencei_busy \| maint_hold_w` 后**症状不变** ⇒ 证明 `fe_stall` 不足以冻结取指推进 |
+
+## B4.11.2 本段实施（保留在检查点内的改动）
+
+- `rtl/top/core_top_2b.v`：
+  1. 维护冻结窗口（4b-2a-fix 段引入，保留）：单拍维护（sfence/cbo）自提交拍起 `flush_all` 保持 4 拍、
+     窗口最后一拍才重定向；
+  2. `fe_stall` 接线（本段）：`.fe_stall(fencei_busy | maint_hold_w)` —— 虽不足以修 K1，但语义正确
+     （维护期间冻结预测器/检查点），且对既有判据零影响；
+  3. 块 PC 守卫**已回退**（实测无改善且有引入新阻塞风险）。
+- 判据：编译 **0 error**、`tb_core_top_2b` **PASS 80/80**、`regress.sh` **32/32**
+  （日志 `../.b2chk/regress_k1.log`）；`rtl/back2/backend_top.v` 与 `rtl/front4/*` **零改动**。
+
+## B4.11.3 K1 修复方案（下一步，按代价排序）
+
+**方案 A（推荐，最小且贴合 2A 口径）**：给 `ifetch4.v` 增加一个**真正的取指冻结**输入
+（例如 `fetch_hold_i`），语义 = "**不推进取指 FSM / 不作废当前组 / PC 不变**"（与 `rst_hold` 的区别
+是 PC 不变、与 `redirect_valid` 的区别是不清队列）。实现要点：
+- `ifetch4.v`：`blk_valid` 追加 `& ~fetch_hold_i`；把组推进（`blk_fire` 相关）与 `pc_q`/队列指针的
+  使能加 `& ~fetch_hold_i`；`l1i/取指请求`（`fu_req_valid` 等）加 `& ~fetch_hold_i`。
+- `front4_top.v`：把 `fetch_hold_i` 透传给 `ifetch4`（**小改**：1 个端口 + 1 处例化连线）。
+- `core_top_2b.v`：`.fetch_hold_i(fencei_busy | maint_hold_w)`；扫掠期间同时保持
+  `l1i_cs_vaddr` 切扫掠地址、`l1i_cs_req=0`（此时前端已真正冻结 ⇒ 不再失序）。
+- 判定：p11_maint 黄金 42 条逐条一致。
+
+**方案 B（不改前端，绕开 L1I 地址 mux）**：fence.i 改为"**先冻结后端 + 等 `l1i_idle`**，再逐 256 拍
+发 `inval_all`，**但不切 `cs_vaddr`**（改为只在扫掠期间把扫掠地址当作 *fetch 请求* 送进 L1I，
+即让前端"带着取指请求"走过 256 个 index）"——本质是借用前端请求通道做扫掠，实现更绕，不推荐。
+
+**方案 C（最保守）**：`fence.i` 仅在**取指空闲**时扫掠：连续 N 拍观察到 `l1i_idle & ~blk_valid`
+才启动扫掠；否则延迟（可能长时间无法启动，正确性优先）。可作为方案 A 落地前的临时口径。
+
+## B4.11.4 本段检查点状态
+
+- 编译 0 error；TB（既有 7 程序）**80/80**；`regress.sh` **32/32**；2A 零修改；未提交 git；
+  快照 `../.b2chk/*.s23`。
+- WIP：`sim/unit/prog/back2_p11_maint.S`（黄金 42 条已生成可复用）、`back2_p12_cbo.S`
+  （自记录 + 维护口探针；其合法性/维护口侧判据调试期已实测通过）。
+- 下一步：**方案 A**（`fetch_hold_i`，front4 小改 + 理由登记）→ 挂回 p11/p12 判据（TB 补丁形态见
+  §B4.10.2 与本次工作树历史）→ 继续 4b-2b/2c（D 侧翻译与 PTE A/D 写通路）。

@@ -397,7 +397,16 @@ module core_top_2b (
         .clk(aclk), .rst_n(aresetn), .rst_hold(1'b0),
         .redirect_valid(redirect_valid), .redirect_pc(redirect_pc),
         .redirect_use_ckpt(redirect_use_ckpt), .redirect_ckpt(redirect_ckpt),
-        .break_point(break_point), .fe_stall(1'b0),
+        //   ★★ 4b-2a-fix（K1 定案后修复）：**维护/扫掠期间冻结前端** ——
+        //     实测根因：fence.i 扫掠期间本核只把送进 L1I 的 `cs_req` 门控为 0，却让前端
+        //     继续跑 ⇒ 前端的"请求已发出"簿记与 L1I 实际受理不一致，扫掠结束后出现
+        //     **重叠、乱序的取指块**（实测：[k1-blk] 依次呈现 0x…040、0x…050、**0x…044**、
+        //     0x…054、0x…064 ⇒ 回退重叠并跳过一条维护指令所在块）⇒ PC 流丢/跳指令。
+        //     修法：复用 `front4_top` **既有**的 `fe_stall`（`freeze_in(fe_stall|break_point)`，
+        //     `front4_top.v:302`）在维护窗口/扫掠期间冻结前端（**无需改 front4**）：
+        //       · fence.i 扫掠（256 拍）：冻结 + L1I 地址切扫掠 + cs_req=0
+        //       · 单拍维护（sfence/cbo）的冻结窗口：冻结，窗口末尾再重定向
+        .break_point(break_point), .fe_stall(fencei_busy | maint_hold_w),
         .blk_valid(blk_valid), .blk_ready(blk_ready), .blk_mask(blk_mask),
         .blk_next_pc(blk_next_pc), .blk_taken(blk_taken),
         .lane_pc(lane_pc), .lane_pa(lane_pa), .lane_insn(lane_insn),
