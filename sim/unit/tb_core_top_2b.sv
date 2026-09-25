@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 10;
+    localparam integer NPROG  = 11;   // ★ 4b-2c 收口：+ p14_storepf（store 页错误精确化）
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -131,7 +131,9 @@ module tb_core_top_2b #(
         //   ★ 2B-4 第 4a 段：程序数 3→5（p7_trap / p8_int），16 KB 步进 ⇒ DDR3 窗口
         //     必须 ≥ 5×16 KB = 80 KB（原 64 KB 会让第 5 个程序的基址落到窗口外 →
         //     取指读到"未登记区域"的 0 ⇒ 立即非法指令陷阱）
-        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0002_8000),
+        //   ★ 4b-2c 收口：程序数 10→11（p14_storepf @0x8002_8000）⇒ 窗口放宽到 0x30000
+        //     （11×16 KB = 176 KB；否则第 11 个程序的取指被判"未登记区域"读 0）
+        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0003_0000),
         .UART_DATA_ADDR(32'h1FE0_01E0), .READ_LAT_DLY(0)
     ) u_mem (
         .clk(clk), .rst_n(rst_n),
@@ -323,7 +325,8 @@ module tb_core_top_2b #(
         integer m;
         begin
             @(negedge clk);
-            for (m = 0; m < 40960; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
+            //   ★ 4b-2c 收口：11 个程序窗口 ⇒ 清到 0x30000 字节（49152 字，含第 11 个程序）
+            for (m = 0; m < 49152; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
             for (m = 0; m < 1024;  m = m + 1) u_mem.xip_mem[m]  = 32'h0000_0013;
             u_mem.xip_mem[0] = 32'h0000_0013;   // 跳板由 load_prog 按基址重建
             u_mem.xip_mem[1] = 32'h0000_0013;
@@ -441,6 +444,7 @@ module tb_core_top_2b #(
         pidx[7] = 10; cmax_of[7] = P10_GOLD_N;  // p11_maint（0x1C000）
         pidx[8] = 11; cmax_of[8] = P11_GOLD_N;  // p12_cbo（0x20000）
         pidx[9] = 12; cmax_of[9] = P12_GOLD_N;  // p13_sv32（0x24000；Sv32 数据侧翻译）
+        pidx[10] = 13; cmax_of[10] = P13_GOLD_N; // p14_storepf（0x28000；**store 页错误精确化**）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -618,7 +622,9 @@ module tb_core_top_2b #(
             if ((pid != 3) && (pid != 5)) begin
                 //   ★ 4b-2c：p13_sv32 **故意**制造 2 次数据页错误（V=0 与 A=0）⇒ C5' 两条
                 //     "无陷阱"判据对它不适用（其异常由 C13' 逐项判定 —— 判据未放宽）
-                if (pid != 9) begin
+                //   ★ 4b-2c 收口：p14_storepf 故意制造 1 次 **store** 页错误（cause 15）
+                //     ⇒ 同 p13，其异常由 C15' 逐项判定（判据未放宽）
+                if ((pid != 9) && (pid != 10)) begin
                     chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
                     chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
                 end
@@ -737,8 +743,52 @@ module tb_core_top_2b #(
                              n_maint_st_push, n_maint_flush_cyc);
                     $fflush();
                 end
+                //   ============ C15'：store 页错误精确化（p14_storepf，4b-2c 收口）============
+            //   判据 = **程序自记录 + 硬编码期望**（与 C13' 同法）+ 通用的黄金比对（C1'/C3'
+            //   已逐条比过：提交流与 Spike 一致 ⇒ 故障指令**未提交**、无多余提交）。
+                if (pid == 10) begin
+                d_pc = 0; d_rd = 0; d_wd = 0; crk = 0;
+                for (k = 0; k < 1024; k = k + 1) begin
+                    //   handler 自记录：t3(x28)=mcause、t4(x29)=mtval、a6(x16)=mepc−(auipc PC)、a0(x10)=1
+                    if (rwe[k] && (rrd[k] == 5'd28) && (rwd[k] === 32'd15))         d_pc = d_pc + 1;
+                    if (rwe[k] && (rrd[k] == 5'd29) && (rwd[k] === 32'h4000_2000))  d_rd = 1;
+                    if (rwe[k] && (rrd[k] == 5'd16) && (rwd[k] === 32'd4))          d_wd = 1;
+                    if (rwe[k] && (rrd[k] == 5'd10) && (rwd[k] === 32'd1))          crk = crk | 1;
+                    //   对照：译后 load（0x11223344）/ store→load（0xDEADBEEF）/ 直读 PA（0xDEADBEEF）
+                    if (rwe[k] && (rrd[k] == 5'd21) && (rwd[k] === 32'h1122_3344))  crk = crk | 2;
+                    if (rwe[k] && (rrd[k] == 5'd22) && (rwd[k] === 32'hDEAD_BEEF))  crk = crk | 4;
+                    if (rwe[k] && (rrd[k] == 5'd26) && (rwd[k] === 32'hDEAD_BEEF))  crk = crk | 8;
+                    //   故障 VA 证据：a5 = 0x4000_2000；PTE 回读（未映射页的 store 不得改动它）
+                    if (rwe[k] && (rrd[k] == 5'd15) && (rwd[k] === 32'h4000_2000))  crk = crk | 16;
+                end
+                chk(n_trap_p == 1, $sformatf("C15'-1 p14：恰好 1 次陷阱交付（store 页错误），实测 %0d", n_trap_p));
+                chk(trc_cause[0] == 4'd15, $sformatf("C15'-2 p14：mcause = 15（**store/AMO page fault**），实测 %0d", trc_cause[0]));
+                chk(d_pc == 1, "C15'-3 p14：handler 读回 mcause = 15（经 mtvec 精确交付，非 load/取指页错误）");
+                chk(d_rd == 1, "C15'-4 p14：mtval = 0x4000_2000（故障**虚拟**地址，未映射页）");
+                chk(d_wd == 1, "C15'-5 p14：**mepc = 故障 `sw` 的 PC**（handler 自证 mepc − auipc_PC = 4）");
+                chk((trc_pc[0] >= cur_base) && (trc_pc[0] < (cur_base + 32'h1000)),
+                    $sformatf("C15'-6 p14：陷阱 PC 落在程序映像内（实测 0x%08x，基址 0x%08x）", trc_pc[0], cur_base));
+                chk(((crk & 1) == 1),  "C15'-7 p14：陷阱精确返回后继续执行（a0 = 1）");
+                chk(((crk & 2) == 2),  "C15'-8 p14：对照——译后 load 读到 0x11223344（翻译链正常）");
+                chk(((crk & 6) == 6),  "C15'-9 p14：对照——译后 store→load 一致（0xDEADBEEF，0x4000_0100 未被故障影响）");
+                chk(((crk & 8) == 8),  "C15'-10 p14：关 MPRV 直读 PA = 0xDEADBEEF（译后 store 真的落地 L1D）");
+                chk(((crk & 16) == 16),"C15'-11 p14：故障 VA 自记录 = 0x4000_2000（a5）");
+                //   ★★ **精确性/无副作用**（最强判据）：故障 `sw` **从未提交**
+                //     （⇒ 它没有写任何存储、没有任何已提交状态被污染），而它的**后继指令已提交**
+                //     （⇒ 陷阱落在故障指令处、执行连续）。用 TB 侧捕获的陷阱 PC（= mepc）核对
+                //     提交轨迹 `rpc[]`，不依赖寄存器自记录。
+                d_pc = 0; d_rd = 0;
+                for (k = 0; k < 1024; k = k + 1) begin
+                    if (rpc[k] == trc_pc[0])                    d_pc = 1;   // 出现 ⇒ 故障项被提交（违规）
+                    if (rpc[k] == (trc_pc[0] + 32'd4))          d_rd = 1;   // 后继已提交（精确）
+                end
 
-
+                chk(d_pc == 0, "C15'-12 p14：**故障 `sw` 从未提交**（精确陷阱 ⇒ 未写任何存储、未污染已提交状态）");
+                chk(d_rd == 1, "C15'-13 p14：故障指令的**后继已提交**（陷阱精确、执行连续）");
+                $display("   [C15'] store 页错误精确化：cause=%0d mtval=0x%08x trap_pc=0x%08x（mepc 自证 ✓、故障 `sw` 未提交 ✓、后继已提交 ✓）；对照 0x11223344/0xDEADBEEF/0xDEADBEEF ✓",
+                         trc_cause[0], 32'h4000_2000, trc_pc[0]);
+                $fflush();
+                end
             end else if (pid == 5) begin
                 //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============
                 //   判据：三条异常各自落到 base + 4×cause 的**不同槽**（由槽内标记经写回轨迹背书）。

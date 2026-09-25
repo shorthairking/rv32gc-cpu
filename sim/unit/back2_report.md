@@ -4257,3 +4257,86 @@ t=13625 ... mact=1                                            ← 维护动作�
   与 `../.b2chk/*.good`（反证前后还原用）。
 * **下一步（登记）**：①store 页错误精确化（cause 15 + mtval=VA + 独立小用例；本步已具备
   `cdq_bad` 钩子与 `st_xlate_fault` 通路）；②L1D 维护写回 + `cbo.flush` INVAL；③L1I 侧 PIPT 复核。
+
+---
+
+# B4.26 store 页错误精确化（2B-4 第 4b-2c 段收尾）
+
+> 起点 = 母代理已验收提交 `937b783`（tag 2B-4.24）。
+> **结论**：store 到未映射页 ⇒ 经数据适配器的执行期翻译发现故障后，以 **cause 15
+> （store/AMO page fault）+ mtval = 故障 VA** 在**故障指令处精确抛出**（mepc = 该 `sw`、
+> 故障 `sw` **从未提交**、其后继指令正常提交），且**不写任何存储**。
+> 检查点：`tb_core_top_2b` **141/141 PASS**（122 + 第 11 个程序的通用判据 6 + C15' 13）；
+> `regress.sh` **32/32 PASS**（§B4.26.5）；2A 零修改；未提交 git。
+
+## B4.26.1 实现（LSQ 侧：提交门 + 精确异常通道）
+
+| 机制 | 落点 | 说明 |
+|---|---|---|
+| **提交窗"翻译定妥"门** | `lsq_simple.v` §0b：`stq_win_w`（窗口：`age < W`）/ `stq_blk_w`（窗内且**未按当前上下文定妥**且未判坏）⇒ `dr_room_ok &= ~stq_blk_any_w` | `dr_room_ok` 回送 `rob.v` 的 `mem_wr_ready` ⇒ 窗口内有未定妥的 store 时**提交前缀链在该 store 处停住**（= 精确的前提：异常必须在提交前被记到该 ROB 项上）。判据只用**寄存器态**（`stq_*`/`rob_head`）⇒ 与提交链**无组合环** ✓ |
+| **"按当前上下文"** | 同上：`~st_xlate_en \| (stq_pv & stq_ctx == 当前 ctx)` | 上下文（`{priv,SUM,MXR}`）变了 ⇒ 判为未定妥 ⇒ 由扫描**按新上下文重译** —— 这正是 §B4.25 登记的"E1 上下文偏旧"边界的收口（提交序 CSR 状态是唯一权威） |
+| **STQ 扫描** | §3.4：候选 = `stq_blk_w`（与提交门**同源**） | 保证"门挡住的项一定有人去翻译"（**无死锁**），且天然限定为"马上要提交的那几条"（不给投机项打投机异常）。优先级：E1 预翻译 > STQ 扫描（窗内）> CDQ 扫描（fail-safe） |
+| **精确异常通道** | §3.4/§3.5：`stx_flt_rep_w = stx_done_w & ~src & flt & 项仍在 STQ & 在窗内` ⇒ 复用既有 `exc_valid_o/rob/cause/tval` 端口 | cause **15**、tval = `stq_a[idx]`（**VA**）、rob = `stq_rob[idx]`（该 store 的 ROB 项）⇒ ROB 置 EXC ⇒ `slot_ok` 含 `~slot_exc` ⇒ **该 store 不提交、在头部抛精确陷阱**（与 load 的 cause 13 同一通道，按"store 优先"确定优先级） |
+| **判坏/兜底** | `stq_bad`（新） | 只有**窗内**的 STQ 源故障才判坏（⇒ 精确陷阱 + 解提交阻塞）；窗口外（投机）不判坏，等进窗后按当时上下文重译。CDQ 源故障仍走 `cdq_bad`（只弹出不写）—— 提交门之后该路径应**不可达**（登记为边界） |
+
+## B4.26.2 实现（core_top_2b 侧：`d_stx_q` 必须是**贯穿事务**的状态标志）
+
+逐拍探针（`[p14-cyc]`）抓出的**真实死循环根因**：`d_stx_q` 原按"单拍脉冲"每拍默认清零
+⇒ 它只在 `AD_XLATE` 那一拍为 1，进 `AD_TR` 后为 **0**，后果两条：
+
+1. `AD_TR` 的**故障**分支走"普通访存"路径 ⇒ **不回 `stx_done/stx_fault`** ⇒ LSQ 永远等不到
+   结果 ⇒ 提交门永久阻塞；而 LSQ 的扫描又不停重发 ⇒ **反复重译死循环**
+   （实测：`ptw_st=6 done=1 flt=1 own=0` 而适配器 `ad=5 d_stx=0`，PTW 每 ~50 拍重启一轮）。
+2. `d_acc_w` 退化成 **load** ⇒ 翻译事务的 TLB 查询/PTW 遍历按**读权限**判 ⇒ 权限结论错。
+
+修法：`d_stx_q` 改为**接受拍置位、各出口分支清零**（`AD_XLATE` 命中/权限错、`AD_TR` 有结果
+三处），**取消默认清零**；并**显式复位**（`d_stx_q/d_stx_ctx_q/stx_pa_q/stx_done_q/stx_flt_q`）
+—— 否则不再是 x 兜底的对象：首次实测 `d_stx_q` 悬空为 **x**，`d_kill_w`/`d_acc_w` 随之成 x
+⇒ **p12 的 C12' 直接红**（`L1D clean_all ≥ 2` 实测 1）。
+
+## B4.26.3 新增用例（`back2_p14_storepf.S` + TB 第 11 个程序槽）
+
+* **程序**：自建两级页表（**绝对地址** root=0x8002_A000 / l1=0x8002_B000，见下）、
+  4 MB 恒等大页覆盖自身；开 MPRV=1/MPP=S + satp=Sv32；译后 load/store/load 对照；
+  **`sw` 到未映射 VA 0x4000_2000（l1[2] 显式清零 ⇒ V=0）**；handler 自记录
+  `mcause/mtval/mepc`（`sub a6, mepc, s8` 自证 mepc = 故障 `sw`）后 `mepc+=4; mret`；
+  收尾把自记录值送入写回轨迹。
+* **判据 C15'（13 项）**：①恰好 1 次陷阱 ②**mcause = 15** ③handler 读回 mcause = 15
+  ④**mtval = 0x4000_2000**（故障 VA）⑤**mepc = 故障 `sw` 的 PC**（handler 自证差值 = 4）
+  ⑥陷阱 PC 落在映像内 ⑦陷阱精确返回后继续（a0=1）⑧⑨⑩对照：译后 load / store→load /
+  直读 PA 三条数据链正常 ⑪故障 VA 自记录 ⑫**故障 `sw` 从未提交**（`mepc ∉ 提交轨迹`
+  ⇒ 未写任何存储、未污染已提交状态）⑬**其后继指令已提交**（陷阱精确、执行连续）。
+* **黄金**：本程序**有 Spike 黄金**（78 条）——通用 C1'（提交 PC 流）/C3'（写回寄存器轨迹）
+  与 Spike **逐条一致** ⇒ "提交流与黄金一致"的直接证据，同时反证"故障指令未被提交、
+  无多余提交"。★ 取绝对地址的原因：TB 的寄存器轨迹比对只能补偿"未做算术的 PC 相对量"
+  （`+gold_delta`）；`la` 得到的基址若再经 `srli/slli` 造 PTE，位移会把 delta 一起缩放
+  ⇒ 无法补偿（实测 C3' 在第 11 条红）；改用 `li` 绝对地址后 DUT 与 Spike 执行**同一组
+  立即数** ⇒ 轨迹逐位一致。
+* **TB 改动**：`NPROG 10→11`、`pidx[10]=13 / cmax_of[10]=P13_GOLD_N`、`DDR3_LIMIT
+  0x28000→0x30000`（第 11 个窗口 0x8002_8000）、`clear_mem` 清到 49152 字、C5' 的
+  "无陷阱"豁免扩到 pid 10（其异常由 C15' 逐项判定 —— 判据未放宽）。
+
+## B4.26.4 反证/边界登记
+
+| # | 边界 | 状态 |
+|---|---|---|
+| 1 | **OoO CSR 可见性（比 §B4.25 登记的更宽：**load 侧同样中招**）** | **实测踩到并登记**：p14 里 `csrw mstatus,MPRV=0` 之后紧跟的 **load** 在更老的 `csrw` 提交**之前**执行 ⇒ 按**旧的** MPRV=1/MPP=U 去翻译（而该段本应 Bare 直读 PA）⇒ **误报 load 页错误（cause 13）**（实测 `lsu_exc_v=1 cause=13 tval=0x8002b100`）。**程序侧规避**（不改判据）：让访存**地址**数据依赖于一条 `csrr mstatus`（CSR 指令只在 ROB 头发射 ⇒ 其数据依赖者必然晚于更老 CSR 写的提交）。**RTL 侧根治**需 ①CSR 写串行化互锁 或 ②load 侧也按"提交序上下文"重译 —— 属后续段。 |
+| 2 | CDQ 源翻译故障（项**已提交**） | 仍走 fail-safe"只弹出不写、不报异常"（不精确）；提交门落地后该路径**不可达**（登记）。 |
+| 3 | 提交门代价 | 窗内 store 的翻译未回时该 store 不提交（最坏一次页表遍历延迟）；语义不变（维护流程本就等 CDQ 排空）。 |
+| 4 | 窗口外（投机）翻译故障 | **不判坏、不报异常**（上下文可能偏旧 ⇒ 不打投机异常）；进提交窗后按当时上下文重译再判。 |
+| 5 | 门/扫描同源 | `stx_s_v = stq_blk_w`（同一表达式）⇒ "门挡住的项必被扫到"，**无死锁** ✓ |
+
+## B4.26.5 检查点（本会话实测）
+
+* 编译 **0 error**；`tb_core_top_2b` **141/141 PASS**（`../.b2chk/final_p14.log`）：
+  `[C15'] store 页错误精确化：cause=15 mtval=0x40002000 trap_pc=0x800280cc（mepc 自证 ✓、
+  故障 sw 未提交 ✓、后继已提交 ✓）；对照 0x11223344/0xDEADBEEF/0xDEADBEEF ✓`
+  + `[C13'] Sv32：12 项全过` + `[C14'] … = 1 次` + `检查项合计 141 项全部满足`。
+* `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c12.log`）。
+* 改动文件：`rtl/back2/lsq_simple.v`、`rtl/top/core_top_2b.v`、
+  `sim/unit/tb_core_top_2b.sv`、`sim/unit/prog/back2_p14_storepf.S`（新）、
+  `sim/unit/prog/gen_back2_lockstep_data.py`（PROGS + p14）、
+  `sim/unit/prog/back2_lockstep_data.svh`（重生成：仅 slot 13 变化 ✓ 已核对）。
+  2A 零修改；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s42`。
+* **下一步（登记）**：①CSR 可见性互锁（边界 1，RTL 根治）；②L1D 维护写回 + `cbo.flush` INVAL；
+  ③L1I 侧 PIPT 复核。

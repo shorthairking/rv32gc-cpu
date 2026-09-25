@@ -928,9 +928,21 @@ module core_top_2b (
             d_a_q <= 32'h0; d_va_q <= 32'h0; d_d_q <= 32'h0; d_strb_q <= 4'h0;
             d_tag_q <= {`BACK2_MEM_TAG_W{1'b0}};
             m_tr_src_q <= 1'b1;             // 复位后 PTW 归取指侧（与旧行为一致）
+            //   ★★ (b)：翻译事务状态/结果寄存器**必须显式复位** —— 原先靠"每拍默认清零"
+            //     兜底，改用"贯穿事务的状态标志"后该兜底消失 ⇒ 不复位会一直是 **x**
+            //     （实测：p12 的 C12' 因 `d_kill_w`/`d_acc_w` 含 x 而红）。
+            d_stx_q <= 1'b0; d_stx_ctx_q <= 4'h0;
+            stx_pa_q <= 32'h0; stx_done_q <= 1'b0; stx_flt_q <= 1'b0;
         end else begin
-            //   ★★ (b)：纯翻译事务标志与完成脉冲的**默认值**（单拍脉冲，见各分支置位）
-            d_stx_q    <= 1'b0;
+            //   ★★ (b)：完成/故障是**单拍脉冲**（默认清零，各分支置位）。
+            //     ★ `d_stx_q` **不能**在这里默认清零 —— 它是**贯穿整个翻译事务**的状态标志
+            //       （AD_IDLE 接受 → AD_XLATE →（缺失）AD_TR → AD_PTE/AD_PTER → … → 完成），
+            //       只在"接受"拍置位、在各条出口分支清零（见 AD_XLATE/AD_TR）。
+            //       实测教训：若按"单拍"默认清零，则进 AD_TR 后 `d_stx_q=0` ⇒
+            //       ① `d_acc_w` 退化成 **load**（TLB/PTW 按读权限判 ⇒ 权限结论错）；
+            //       ② `AD_TR` 的**故障**分支走"普通访存"路径 ⇒ 不回 `stx_done/fault`
+            //          ⇒ LSQ 永远等不到结果、提交门永久阻塞（p14 实测：PTW 遍历
+            //          `st=6 done=1 flt=1` 而适配器 `ad=5 d_stx=0` ⇒ 反复重译死循环）。
             stx_done_q <= 1'b0;
             stx_flt_q  <= 1'b0;
             //   ★ 4b-2b：PTW 归属 —— 请求被**接受**的那一拍记录归属（2A `m_tr_src_q` 同法）
@@ -977,7 +989,8 @@ module core_top_2b (
                 AD_XLATE: begin
                     //   TLB 口 1 当拍出结果（纯组合）
                     if (d_tlb_hit) begin
-                        //   ★★ (b)：纯翻译事务 ⇒ 只回 PA，不进访存级
+                        //   ★★ (b)：纯翻译事务 ⇒ 只回 PA，不进访存级（事务在本拍结束）
+                        d_stx_q <= 1'b0;
                         if (d_stx_q) begin
                             stx_pa_q   <= d_tlb_pa;
                             stx_done_q <= 1'b1;
@@ -989,9 +1002,9 @@ module core_top_2b (
                             ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
                         end
                     end else if (d_tlb_perm_fault) begin
-                        //   ★★ (b)：store 翻译权限错 ⇒ 回"故障"（LSQ 侧作废该项、不写、
-                        //     不悬挂）。store 页错误的**精确上报**（cause 15 + mtval + 独立
-                        //     用例）是紧随其后的另一步，本步不做（口径登记在报告）。
+                        //   ★★ (b)：store 翻译权限错 ⇒ 回"故障"（事务在本拍结束；
+                        //     LSQ 据此按 cause 15 精确上报 / 作废该项，见 `lsq_simple` §3.4）
+                        d_stx_q <= 1'b0;
                         if (d_stx_q) begin
                             stx_flt_q  <= 1'b1;
                             stx_done_q <= 1'b1;
@@ -1020,6 +1033,7 @@ module core_top_2b (
                         d_pte_ret_q <= 1'b1;
                         ad_st_q     <= AD_PTE;
                     end else if (ptw_req_done & ~ptw_owner_fetch_w) begin
+                        d_stx_q <= 1'b0;        // 遍历有结果 ⇒ 纯翻译事务本拍结束
                         if (ptw_fault) begin
                             //   ★★ (b)：store 翻译遍历故障 ⇒ 回"故障"（作废不写；见 AD_XLATE）
                             if (d_stx_q) begin

@@ -74,6 +74,11 @@ PROGS = [
     #   ★ 2B-4 第 4b-2c 段：**Sv32 数据侧翻译**（两级页表 / 两次精确页错误含 A=0 的 SVADE /
     #     A/D 回读 / sfence 重映射）。**仅映像、无黄金**：判据由 TB 的 C13'（12 条）给出。
     ("back2_p13_sv32.S",   "P13", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei", True),
+    #   ★ 2B-4 第 4b-2c 段收口：**store 页错误精确化**（cause 15 + mtval=VA + mepc=故障指令 +
+    #     不污染已提交状态）。**有 Spike 黄金**：程序只用 MPRV/Sv32 的架构语义（PTE 的 A/D
+    #     预置为 1 ⇒ 不触碰 Spike 的 Svadu/SVADE 差异；无 sfence/cbo/中断/CLINT 形态）
+    #     ⇒ 提交 PC 流与写回寄存器轨迹应与 Spike 逐条一致。
+    ("back2_p14_storepf.S", "P14", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"
