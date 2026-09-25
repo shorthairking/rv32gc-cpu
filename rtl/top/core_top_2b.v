@@ -1405,6 +1405,8 @@ module core_top_2b (
         //   ★ 4b-1a：CSR 文件接口（本体在下方 §6c 例化）
         .csr_raddr_o(csr_raddr_w), .csr_rdata_i(csr_rdata_w),
         .csr_frm_i(csr_frm_w), .csr_fflags_i(csr_ff_w),
+        //   ★ 4b-3(2/2)：当前特权级 ⇒ `backend_top` 按它生成 ecall 的 cause（8/9/11）
+        .priv_i(csr_priv_2),
         .csr_we_o(csr_we_w), .csr_waddr_o(csr_waddr_w), .csr_wdata_o(csr_wdata_w),
         .xret_kind_o(xret_kind_w),
         .cbo_perm_i(cbo_perm_w), .maint_kind_o(maint_kind_w), .maint_cmt_o(maint_cmt_w),

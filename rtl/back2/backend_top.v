@@ -160,6 +160,9 @@ module backend_top #(
     input  wire [31:0] csr_rdata_i,
     input  wire [2:0]  csr_frm_i,
     input  wire [4:0]  csr_fflags_i,
+    //   ★★ 4b-3(2/2)：当前特权级（来自 `priv_ctrl`）——用于 **ecall 的 cause 按 priv 生成**
+    //     （ISA：8 = U / 9 = S / 11 = M；见 §7 的 `ecall_cause_w`）
+    input  wire [1:0]  priv_i,
     output wire        csr_we_o,
     output wire [11:0] csr_waddr_o,
     output wire [31:0] csr_wdata_o,
@@ -515,6 +518,11 @@ module backend_top #(
     integer di;
     genvar  g;
     generate
+    //   ★ ecall 的 cause（按当前特权级；ISA：8=U / 9=S / 11=M）——放在 generate 之外，
+    //     供各 lane 的 `exc_w` 引用（同一时刻所有 lane 的 priv 相同）。
+    wire [3:0] ecall_cause_w = (priv_i == `RV32GC_PRIV_M) ? `BACK2_EXC_ECALL_M :
+                               (priv_i == `RV32GC_PRIV_S) ? `BACK2_EXC_ECALL_S :
+                                                            `BACK2_EXC_ECALL_U;
     for (g = 0; g < DISP_W; g = g + 1) begin : g_d1
         wire [31:0] insn = lane_insn_i[g*32 +: 32];
         wire [4:0]  rs1f = insn[19:15];
@@ -628,10 +636,17 @@ module backend_top #(
                         (opt == 4'd11) ? `BACK2_Q_FPU :
                         (opt == 4'd12) ? `BACK2_Q_LSU :
                         (opt == 4'd4)  ? `BACK2_Q_LSU : `BACK2_Q_ALU0;
+        //   ecall 的 cause（按当前特权级；见下）
         //   异常码优先级（提交点语义，AGENT.md §3.3）：**取指异常 > ecall/ebreak > 非法指令**。
         //   （本段 priv 恒 M ⇒ ecall cause = 11；S/U 的 9/8 待 4b 接 csr_file 后按 priv 生成。）
+        //   ★★ 4b-3(2/2)：`ecall` 的 cause 由 **priv** 决定（ISA：8 = U / 9 = S / 11 = M）。
+        //     ⚠ 口径更正：任务书写"S 下 ecall ⇒ scause=8"与 ISA 相反 —— `EXC_ECALL_U=8`（U 模式）、
+        //       `EXC_ECALL_S=9`（S 模式）；本实现按 ISA。
+        //     为什么可在**派发期**取 priv：priv 只在 trap/xret 提交点变化，而 `priv_ctrl` 对
+        //     "priv 变化"发 `flush_req`（`priv_ctrl.v:155`）⇒ 任何跨越 priv 变化的年轻指令都会被
+        //     冲掉 ⇒ 能活到提交的 ecall，其派发期 priv == 提交期 priv ✓（无需提交点重算）。
         wire [3:0] exc_w = lane_fault_i[g] ? {1'b0, lane_fault_cause_i[g*5 +: 4]} :
-                           ecall  ? `BACK2_EXC_ECALL_M :
+                           ecall  ? ecall_cause_w :
                            ebreak ? `BACK2_EXC_BREAK :
                            kill   ? `BACK2_EXC_ILLEGAL : `BACK2_EXC_NONE;
 

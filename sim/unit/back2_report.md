@@ -4613,3 +4613,66 @@ MPRV=1/MPP=U 翻译（对 U=0 的恒等大页 ⇒ 误报 load 页错误 cause 13
 * **下一轮建议顺序**：①读 `trap_ctrl`/`priv_ctrl` 核对 `sret`/`ecall-from-S`/委托投递；②写 p15_priv.S +
   生成器项 + 黄金（Spike 的 S 模式可比）；③TB 第 12 槽 + 判据（含 PLIC：TB 驱动 `intrpt` 某针、
   程序 claim/complete 自记录）；④反证（断开 `irq_meip` 必红）。
+
+---
+
+# B4.31 4b-3(2/2)·S 模式链核对 + ecall cause 按 priv（p15_priv：**本轮未完成**）
+
+> 起点 = 母代理已验收提交 `1010be6`（tag 2B-4.29）。
+> 检查点：`tb_core_top_2b` **148/148 PASS**；`regress.sh` **32/32 PASS**；2A 零修改；未提交 git。
+
+## B4.31.1 ① 核对结论：**S 模式链在 RTL 侧已基本就位**，唯一缺口 = ecall 的 cause（已最小适配）
+
+| 能力 | 现状（核对位置） | 结论 |
+|---|---|---|
+| 委托投递 | `trap_ctrl`：`exc_delegated = exc_valid & src_lower_m & medeleg[exc_cause]`（`trap_ctrl.v:149-150`）；S 级中断 `mideleg` + `irq_visible(...)` 带"委托者级屏蔽"（`:162-185`） | **已支持** ✓ |
+| sret / mret 进 S | `priv_ctrl`：`xret_kind` 00=sret/01=mret；`xret_target = mret ? MPP : (sret ? SPP ? S : U)`（`priv_ctrl.v:140-145`），并做 mstatus/sstatus 的 MIE/SPIE 等字段更新（`:198-217`） | **已支持** ✓ |
+| priv 变化的一致性 | `priv_ctrl.flush_req = (trap_valid \| xret_valid) & (priv_next != priv_r)`（`:155`） | **已支持** ✓（并且它是本段 ecall cause 可在派发期取 priv 的依据） |
+| S 模式取指/访存翻译 | `core_top_2b`：`f_xlate_on_w = (csr_priv_2 != M)` ⇒ S/U 自动开启取指翻译 | **已支持** ✓ |
+| S 模式 CSR | `csr_file`：`sstatus/sie/sip/sepc/scause/stval/stvec` 与 `medeleg/mideleg` 输出均已接 | **已支持** ✓ |
+| **ecall 的 cause** | `backend_top.v:634` 旧式 `ecall ? \`BACK2_EXC_ECALL_M :` —— **硬编码 11（M）** ⇒ S 模式 ecall 会被误报成 M 模式 ecall | **缺口 → 本段修复** |
+
+### 最小适配（diff）
+```verilog
+// backend_top：新增输入 + ecall cause 按 priv 生成
++ input  wire [1:0]  priv_i,                     // 当前特权级（来自 priv_ctrl）
++ wire [3:0] ecall_cause_w = (priv_i == `RV32GC_PRIV_M) ? `BACK2_EXC_ECALL_M :
++                            (priv_i == `RV32GC_PRIV_S) ? `BACK2_EXC_ECALL_S :
++                                                         `BACK2_EXC_ECALL_U;
+- ecall ? `BACK2_EXC_ECALL_M :
++ ecall ? ecall_cause_w :
+// core_top_2b：.priv_i(csr_priv_2)
+```
+**理由（为何可在派发期取 priv，无需提交点重算）**：priv 只在 trap/xret 提交点变化，而 `priv_ctrl`
+对"priv 变化"发 `flush_req` ⇒ 任何**跨越 priv 变化**的年轻指令都会被冲掉 ⇒ 能活到提交的 ecall，
+其"派发期 priv" == "提交期 priv" ✓。
+
+★ **口径更正（任务书笔误）**：任务书写"S 下 ecall 委托回 S 处理（**scause=8**）"与 ISA 相反 ——
+`RV32GC_EXC_ECALL_U = 5'd8`（**U 模式**）、`RV32GC_EXC_ECALL_S = 5'd9`（**S 模式**）、`_M = 11`。
+本实现按 **ISA**（S 模式 ecall ⇒ cause **9**）；下一轮 p15 的判据请按 9 写。
+
+## B4.31.2 ②③④⑤ p15_priv：**本轮未完成**（预算见底，落点已定案）
+
+* **必须"无黄金"**（新增设计输入）：Spike **不建模 PLIC** ⇒ 含 `claim/complete` 的 p15 无法逐条黄金比对
+  ⇒ 按任务书 ④ 的口径走"**程序自记录 + 硬编码期望**"（与 p8/p12/p13 同法），生成器 PROGS 项末位置 no-golden。
+* 落点清单（下一轮照此施工）：
+  1. `sim/unit/prog/back2_p15_priv.S`（`.option norvc`）：M 建栈/装 mtvec+stvec/装 medeleg(mideleg)
+     → `mret` 进 S（`mstatus.MPP=S`）→ S 下 `ecall`（**cause 9**，经 medeleg 委托回 S ⇒ `scause=9`、
+     `sepc` 自记录）→ `sret` 返回 → 非法指令（`.word 0`）→ M 处理（cause 2、mtval=指令字）→
+     PLIC：TB 驱动某针 `intrpt` ⇒ MEIP ⇒ M 取中断（cause 11）→ 处理程序经 PLIC 窗口
+     （`0x1F10_0000+0x0020_0004+4*ctx`）**claim/complete** 自记录 → 回 M 结束（tohost）。
+  2. 生成器 PROGS 项（no-golden）+ 重生成 `.svh`；TB `NPROG 11→12`、`pidx[11]=14`、
+     `DDR3_LIMIT 0x30000→0x34000`、`clear_mem` 同步放宽；C16' 判据块（自记录 + 硬编码期望）。
+  3. TB 侧 PLIC 测试中断源：按程序阶段驱动 `intrpt`（例如程序写一个"准备"标志/到固定 PC 时拉高某针）。
+  4. 反证：`core_top_2b` 的 `.irq_meip(plic_meip_w)` 临时断开 ⇒ C16' 的 PLIC 项必红，反证后还原。
+* **为什么未做**：②③④⑤ 是"新程序 + 无黄金口径 + 生成器 + TB 槽 + PLIC 中断源 + 判据 + 反证"的整链，
+  属独立一轮工作量；在剩余预算内开工只会留下红判据/半成品 ⇒ 按任务书"停在全绿检查点"的口径，
+  本轮只交付可独立验证的 ①（含一处真实 RTL 缺口的最小修复）并保持 148/148 + 32/32。
+
+## B4.31.3 检查点
+
+* 改动：`rtl/back2/backend_top.v`（`priv_i` 端口 + `ecall_cause_w`）、`rtl/top/core_top_2b.v`
+  （`.priv_i(csr_priv_2)` 一行）、`sim/unit/back2_report.md`。**2A 零修改**；`scripts/regress.sh` 未动；
+  未提交 git；快照 `../.b2chk/*.s47`（含 `backend_top.v.pre4`）。
+* 编译 0 error；`tb_core_top_2b` **148/148 PASS**（M 模式 ecall 仍为 cause 11 ⇒ p7/p9 判据零回退）；
+  `regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c18.log`）。
