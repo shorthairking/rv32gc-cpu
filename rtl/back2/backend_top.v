@@ -471,6 +471,9 @@ module backend_top #(
     wire [3:0]  cmt_raw, cmt_st_drain, cmt_st_ckpt, cmt_st_branch;
     wire [COMMIT_W*RB_W-1:0] cmt_pay;
     wire        cmt_ok;
+    //   ★ 4b-2c(2/2)："维护 op 已提交但整机冲刷仍在进行"（冻结窗口/等排空）——
+    //     供 store 排空入队判据使用（见 §9 的 `cmt_ok_st_w`）
+    wire        maint_pend_hold_w = maint_cmt_o | (|maint_lane_oh);
     wire [DISP_W*RB_W-1:0] rob_pay_w;
     wire        trap_v_rob, flush_all_w, squash_v_w;
     wire [6:0]  rob_head_w, squash_idx_w;
@@ -1411,7 +1414,16 @@ module backend_top #(
         assign cmt_f_pd[cc*PW_F +: PW_F] = p_pdf(p);
         assign rel_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
         assign rel_f_pd[cc*PW_F +: PW_F] = p_pdfo(p);
-        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok & ~cmt_hold_w[cc];
+        //   ★★ 4b-2c(2/2) 根因修复：**维护/陷阱/xRET 的整机冲刷不得抑制"更老 store"
+        //     的 CDQ 排空入队**（否则已提交写静默丢失——实测 p13：PTE 更新 store 与紧随的
+        //     `sfence.vma` 同组/相邻，store 已提交但从未进 CDQ ⇒ l1[0] 仍是旧 PTE）。
+        //     口径：入队许可 = "在本拍提交前缀内（`cmt_st_drain`）× 未被维护 lane 掩码
+        //     挡住（`~cmt_hold_w`，只掩**更年轻** lane）× 未被 squash"，**不再无条件乘
+        //     `cmt_ok`**；`cmt_ok` 仅在"维护/xRET 冻结窗口"里为 0，而那正是更老 store
+        //     仍可能需要入队的拍。
+        wire cmt_ok_st_w = ~squash_v_w & (cmt_ok | (trp_flush_v_i & ((|maint_lane_oh) | (|xret_lane_oh) |
+                                                                     maint_pend_hold_w)));
+        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
         assign lsu_dr_idx[cc*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = p_stq(p);
     end
     endgenerate

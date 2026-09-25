@@ -3918,3 +3918,54 @@ t=13737 pte_rv=1  [p13-pte] pa=0x80027000 data=0x20009cc7   ← ★ 二级 PTE �
 * **下一步（按优先级）**：①修 §B4.22.1 定案的"同组 store 漏排空"（真 RTL 缺陷，影响任何
   "store 紧跟维护/陷阱/xRET"的程序），修完可去掉 p13 里的 6 条 nop 规避；
   ②store page fault 精确化（§B4.20.3 设计）；③L1D 维护写回 + `cbo.flush` INVAL 合并；④L1I 侧 PIPT 复核。
+
+---
+
+# B4.23 同组更老 store 漏排空：根因修复尝试与探针定案（2B-4 第 4b-2c 段）
+
+> 起点 = 母代理已验收提交 `2d2428c`=tag `2B-4.21`。
+> 结论：**修法已按任务书落地（`cmt_ok` 解耦 + 掩码口径），但"store 紧跟 sfence"原始形态
+> 仍失败 ⇒ 抑制点不在 `cmt_ok/cmt_hold_w`**。已把候选缩小到"从未入队 / 入队后丢失"两支，
+> 并给出一步探针；检查点保持 **121/121 + regress 32/32**（p13 暂留 6 条 `nop` 规避）。
+
+## B4.23.1 已落地的根因修法（diff 摘要）
+
+```verilog
+// rtl/back2/backend_top.v §9（原）：
+assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok & ~cmt_hold_w[cc];
+// （新）：更老 store 的排空入队**不再无条件乘 `cmt_ok`**（`cmt_ok` 只在整机冲刷拍为 0，
+//        而那正是"更老 store 仍需入队"的拍）：
+wire cmt_ok_st_w = ~squash_v_w & (cmt_ok | (trp_flush_v_i &
+                     ((|maint_lane_oh) | (|xret_lane_oh) | maint_pend_hold_w)));
+assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
+```
+`maint_pend_hold_w = maint_cmt_o | (|maint_lane_oh)`（"维护已提交/整机冲刷在进行"）。
+
+**实测结论**：去掉 p13 的 6 条 `nop`（恢复"PTE 更新 store 紧跟 `sfence.vma`"原始形态）后
+`C13'-9` **仍失败**（同 VA 仍读旧页）⇒ 该修法**不是**充分条件：`lsu_dr_valid` 在原式下
+本来就应该为 1（维护提交拍 `cmt_ok=1`，且 `cmt_hold_w` 只掩更年轻 lane），
+⇒ **抑制点不在这两个门**。
+
+## B4.23.2 候选收窄与一步探针（下一步）
+
+按现有数据（`a=0x80027000 we=1` 全日志检索：更新写**完全缺失**；store 提交轨迹可见）：
+
+| 分支 | 含义 | 判别探针（store 提交拍逐拍打印） |
+|---|---|---|
+| **(i) 从未入队** | `dr_valid/dr_take` 为 0，或 `cdq_tail/cdq_cnt` 不增 | `u_dut.u_back.u_lsu.dr_take`、`dr_push_n`、`cdq_tail`、`cdq_cnt`、`cmt_st_drain`、`lsu_dr_valid` |
+| **(ii) 入队后丢失** | `cdq_cnt` 增了但 `cdq_a[tail]` 不是 0x8002_7000，或 `cdq_cnt` 随后被清/回退 | 同上 + `cdq_a[cdq_tail]`、`cdq_v[]`、`cdq_head`、`flush_all`/`squash` |
+
+**优先怀疑**（供下一段先看）：LSQ `flush_all` 分支（`lsq_simple.v:637-639`）在同拍清空**整张 STQ**
+（`stq_v/av/dv/ret`），而 CDQ 入队在同拍从 `stq_a/stq_d/stq_msk[dr_idx]` **拷贝**——
+若 `flush_all` 与入队同拍且**指针/回收**（`:783-787` 的 STQ 队头回收）也参与，则可能出现
+"拷贝到了但项被回收/覆盖"的竞态；探针 (ii) 可直接判定。
+
+## B4.23.3 检查点状态与下一步
+
+* 编译 **0 error**；`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b2c4.log`）；2A 零修改；未提交 git；
+  快照 `../.b2chk/*.s35`。
+* p13 **暂留 6 条 `nop` 规避**（否则 C13'-9 红）——规避注里已写明"RTL 根因待修；已试修法不足"。
+* **下一步**：①按 §B4.23.2 探针判定 (i)/(ii)，再定点修；修好后去掉 `nop` 并重跑 121；
+  ②store page fault 精确化（§B4.20.3 设计，本段因预算未做）；③L1D 维护写回 + `cbo.flush` INVAL；
+  ④L1I 侧 PIPT 复核。
