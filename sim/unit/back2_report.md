@@ -2701,3 +2701,120 @@ iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ipc.vvp -s tb_back2_ipc "${RTL[@]}
 ③ PTE A/D 写通路（`pte_ad_update/pte_ad_pa/pte_ad_data` → §5 AXI 引擎单 beat 写，回 `pte_ad_done`）；
 ④ `sfence.vma` / `cbo.*` / `fence.i` 接提交点（`tlb.sfence_*`、L1I `inval_all`、L1D `clean_all/inval_all`）；
 ⑤ 新程序 `back2_p9_sv32.S`（两级页表 + A/D 置位 + sfence 重映射 + PTE-PMP 拒绝）。
+
+
+# 2B-4 第 4b-2 段（Sv32 全链路）—— **接口勘察 + 可执行方案**（本段未改 RTL）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 4b-1 收官
+> `f6f1d73`=tag `2B-4.7`，**本轮零代码改动**）
+> 任务：①D 侧 TLB 口接线 + LSU VA/PA 分离 ②PTW 串行复用（数据优先 + `m_tr_src`）
+> ③PTE A/D 更新写通路 ④`satp` 生效 + I 侧翻译核对 ⑤`sfence.vma`/`cbo.*`/`fence.i` 接提交点
+> ⑥新程序 `back2_p11_sv32.S`。
+> **预算见底 ⇒ 按任务书停在"整设计可编译 + 既有判据全绿"检查点**：本段交付**逐条勘察结论
+> （附 file:line 与新发现的 3 个硬阻塞）+ 分阶段落地方案 + p11 设计与比对口径**，
+> 让下一段可以直接照抄执行（§B4.6 → 4b-1 的"勘察→落地"两步走在本项目已验证有效）。
+
+## B4.8.0 结论（一句话）
+
+**Sv32 的"结构性骨架"已就位（TLB/PTW/`satp`→`sv32_en`/`pte_ad_*` 端口都在），但有三处硬阻塞
+必须先解**：①`sfence.vma` 与 `cbo.*` 在**当前后端被判非法指令**（`OPT_SYS(8)` 不在 4a 的
+`is_sys_ok` 白名单、`OPT_CBO(10)` 直接落 `unsup`）——**不先修这两条，p11 里任何 `sfence.vma`
+都会变成陷阱**；②D 侧 TLB 查询口与 LSU 的 VA/PA 路径完全未接（`cs_vaddr = cs_paddr = d_a_q`）；
+③A/D 写通路缺一个"与 PTE 读同源"的写口（2A 走 L1D 存储口，而本核 PTE **读**走 §5 AXI 引擎
+⇒ 照抄 2A 会读到陈旧 PTE，必须把 A/D 写做成 §5 引擎的第 7 个来源）。
+
+## B4.8.1 勘察结论（逐条 file:line）
+
+| # | 项 | 现状 | 依据 |
+|---|---|---|---|
+| 1 | **I 侧翻译** | 结构就位：`tlb` 口 2 + `ptw` 取指源已接；`sv32_en` 已接 `csr_file.satp_o`（4b-1c） | `core_top_2b.v:282`（`sv32_en`）、`:312`（`ptw.req_valid = sv32_en & ~f_tlb_hit & tr_req_valid`）、`:314`（`ptw.satp`） |
+| 2 | **D 侧翻译** | **完全未接**：`tlb` 口 1 恒空闲（`lookup_valid(1'b0)`、`hit_o()/perm_fault_o()/pa_o()` 悬空）；L1D 看到的是 `d_a_q`，而 `d_a_q` 就是 VA（Bare 下同值） | `core_top_2b.v:251-255`、`:624`（`.cs_paddr(d_a_q), .cs_vaddr(d_a_q)`）、`:651`（`d_a_q <= lsu_req_a`） |
+| 3 | **PTW 串行复用** | 只有取指源；`ptw.kill` 恒 0（无冲刷）；无 `m_tr_src` 归属 | `core_top_2b.v:270-290`（`u_ptw`）、2A `core_top.v:1587-1595`（`m_tr_src_q`）、`:1790-1797`（`m_ptw_req_valid`/`m_tr_is_fetch`）、`:1988`（`f_tr_walk_done`） |
+| 4 | **PTE 读** | 走 **§5 AXI 引擎**单 beat（`IOWN_PTE`，`:707` 附近的读拍分发 + `g_pte` 仲裁） | `core_top_2b.v` §5（`IOWN_PTE`/`g_pte`）|
+| 5 | **PTE A/D 写** | `pte_ad_done` 恒 0（fail-closed）；`pte_ad_update/pte_ad_pa/pte_ad_data` 已从 PTW 引出但**无人消费** | `core_top_2b.v:295-301`；2A 的实现走 **L1D 存储口**：`core_top.v:3888-3894`（`M_S_PADW/M_S_PADX` + `m_ptw_ad_done_q <= 1'b1`）、`:1835`（`.pte_ad_done(m_ptw_ad_done_q)`） |
+| 6 | **`sfence.vma`** | 译码为 `OPT_SYS(4'd8)`（`is_system & sys_priv_impl`）⇒ 后端 `is_sys_ok = ecall\|ebreak\|mret\|sret`（4a）**不含它** ⇒ **当前按非法指令处理** | `rtl/decode/decoder.v:110-124`（OPT 表）、`:611-614`；`backend_top.v` 的 `is_sys_ok`/`unsup`（4a 段） |
+| 7 | **`cbo.*`** | 译码为 `OPT_CBO(4'd10)` ⇒ 直接落 `unsup`（`unsup` 含 `opt==4'd10`）⇒ **非法**；且译码侧 `menvcfg_cbie/cbcfe`、`senvcfg_*` 输入未接（2A 从 `csr_file` 引） | `decoder.v:118`；`backend_top.v` `unsup`；2A `core_top.v:1031-1040`（`menvcfg_cbie = csr_menvcfg[5:4]` 等） |
+| 8 | **`fence`/`fence.i`** | `OPT_FENCE(4'd9)` **不在 `unsup`** ⇒ 今天按合法 no-op 执行，但**无维护副作用**：`l1i.inval_all`、`l1d.inval_all/clean_all` 全 tie 0 | `decoder.v:117`；`core_top_2b.v:439`（L1I `.inval_all(1'b0)`）、`:572`（L1D `.inval_all(1'b0), .clean_all(1'b0)`） |
+| 9 | **`priv/SUM/MXR`** | `priv_ctrl` 已给 `priv_o/eff_priv_o/sum_o/mxr_o`，但 `tlb.lookup*_priv/sum/mxr`、`ptw.req_sum/req_mxr` 仍是常量（`PRIV_M`/`1'b0`） | `core_top_2b.v:256-260`、`:314` |
+| 10 | **Spike 侧口径（本轮实测）** | `--isa=rv32imac_zicsr_zifencei` 下：`sfence.vma`(0x12000073)/`fence.i`(0x0000100f) **正常提交**；写 `satp=0x8009_2345`（MODE=1）后**翻译立即生效**（探针程序的下一条 load 触发 page fault ⇒ 日志止于 `sfence.vma`）⇒ **p11 可黄金比对** | 探针 `/tmp/sv32exp/t.log`、`/tmp/sv32exp/s.log` |
+
+## B4.8.2 落地方案（建议切成 4b-2a / 2b / 2c，每步后跑同一套判据）
+
+### 4b-2a（**先决条件**：把维护操作放出来 + 接维护口，不碰 LSU 数据通路）
+
+1. **`sfence.vma` 合法性**：`backend_top` 的 `is_sys_ok` 增加 `sfence`（译码 `sfence_vma_o`；
+   2A 对 U 模式的非法判定已有 `de_sfence_vma & priv==U` 口径，本核 priv 恒 M ⇒ 直接放行）。
+2. **`cbo.*` 合法性**：把 `opt==4'd10` 从 `unsup` 摘出，并**照 2A 接译码门控**：把 `csr_file.menvcfg_o/senvcfg_o`
+   引到 `front4_top`/`decoder` 的 `menvcfg_cbie/cbcfe`、`senvcfg_cbie/cbcfe`（`core_top.v:1031-1040` 同法），
+   否则 `cbo_gate_ill` 仍会把它判非法。
+3. **提交点识别 + 维护动作**（`core_top_2b`，与 4a 的 xRET 识别同法：载荷 **TVAL = 原始指令位**）：
+   - `fence.i`（`0x0000_100F`）⇒ 触发 L1I **全阵列失效**（2A 用"逐组扫描 + 前端冻结"：
+     `fencei_busy/fencei_idx_q/fencei_hold`，`core_top.v:304-312/882-903/949`）
+   - `sfence.vma`（`insn[31:25]==7'b0001001 & insn[14:12]==3'b000 & opcode==0x73`）
+     ⇒ `tlb.sfence_valid` + `sfence_va/asid/all_va/all_asid`（RS1=x0 ⇒ all_va、RS2=x0 ⇒ all_asid；
+     2A `core_top.v:1759`）+ `satp_we/satp_asid_new`（写 satp 时刷 ASID）
+   - `cbo.clean/flush/inval` ⇒ L1D `clean_all`/`clean_all`/`inval_all`（2A `core_top.v:2160-2169`；
+     INVAL 在 CBIE=01 下降级为 FLUSH 的口径见 `decoder.cbo_downgrade_o`）
+   - **必须同时冲刷更年轻的工作并重定向**：这些指令"生效于提交点"，而更年轻的指令可能已经
+     用旧 TLB/旧缓存行投机执行过 ⇒ 复用 4a 的 `trp_flush_v_i` + 重定向到**头部 PC + 4**
+     （2A 对应 `kill_young`/`sfence_sync_pending`，`core_top.v:362/1715/1799`），并沿用
+     `cmt_ok` 的"xRET 上报"口子让该指令照常计入提交流。
+4. 判据：既有 80 项不回退（Bare 下维护操作无架构副作用，但**必须**仍然提交且 PC 流不变）
+   + 新程序 `back2_p11_maint.S`（`sfence.vma`/`fence.i` 各来几次，Spike `--isa=..._zifencei`
+   逐条比 PC/写回）⇒ **Spike 可比性已实测确认**（§B4.8.1-10）。
+
+### 4b-2b（**核心**：D 侧翻译 + PTW 串行复用）
+
+5. `tlb` 口 1 接数据侧：`lookup_valid/lookup_va(=VA)/lookup_acc(acc)/lookup_priv(eff_priv)/lookup_sum/sum/mxr`
+   → `hit_o/perm_fault_o/pa_o`；`core_top_2b` 的 LSU 适配器新增 `AD_XLATE` 级：
+   - 命中 ⇒ `d_pa <= pa`，L1D/AXI 用 **PA**；`d_va_q` 留作异常 `tval`（2A 口径：mtval 恒 **VA**，
+     `core_top.v:349/489/3194`）；
+   - 未命中 ⇒ 发 PTW（与取指源**数据优先**仲裁 + `m_tr_src` 归属寄存器，2A `core_top.v:1587-1595/1790-1797`）；
+   - 失败 ⇒ 按访问类型给 cause **12/13/15**、`tval = VA`（2A `:489` 还有一条 cbo 专用改写：
+     LOAD_PAGE_FAULT ⇒ STORE_PAGE_FAULT）。
+6. `satp` 变更的同步：`csr_file` 写 satp 时刷 TLB（`satp_we`），并沿用 4b-2a 的"冲刷 + 重定向"。
+7. 判据：p11 的"经翻译的取指 + load/store 全链对 + page fault 序列"。
+
+### 4b-2c（A/D 写通路）
+
+8. **写口选型（本段结论）**：把 `ptw.pte_ad_update/pte_ad_pa/pte_ad_data` 接到 **§5 AXI 引擎**，
+   新增第 7 个请求源 `IOWN_PADW`（单 beat 写，优先级建议排在 `d_unc` 之后、PTE 读之前），
+   完成后单拍脉冲 `pte_ad_done`。**理由**：本核 PTE **读**已走 §5 引擎（`IOWN_PTE`），
+   若照抄 2A 走 L1D 存储口，PTE 读（AXI）与 A/D 写（L1D）不同源 ⇒ 后续读可能命中陈旧副本；
+   同源可保证"写完再读必见新值" ✓。同时在 4b-2c 把 `pte_ad_done` 的 fail-closed 注释更新为
+   "已实现"，并把 A/D 置位口径登记（A=1、D=1 仅对叶 PTE 且首次访问；2A 由 PTW 给出
+   `pte_ad_data`，本核**照抄 PTW 输出**不改语义）。
+9. 判据：p11 中"PTE A/D 由硬件置位后回读 = 1"（页表项初始 A=D=0）。
+
+### 4b-2d（p11 程序与口径）
+
+10. `back2_p11_sv32.S`（`.option norvc`，`-march=rv32ima_zicsr_zifencei`、Spike
+    `--isa=rv32imac_zicsr_zifencei`）：数据段建**两级页表**（root/leaf，页表项 V/R/W/X/U 明确，
+    A/D **初始 0** 供 4b-2c 检查）→ 写 `satp`（MODE=1）→ `sfence.vma` → 经翻译取指与
+    load/store（对一个映射页 + 一个未映射页）→ 自记录：`mcause/mtval/mepc` 序列、
+    PTE 回读值、`sfence` 后重映射（改 PTE 指向另一物理页再 `sfence.vma` ⇒ 读到新值）。
+    **口径**：页表内容与期望值**程序自记录 + 硬编码**（Spike 侧 `satp` 生效已实测 ✓，
+    但两级页表的物理地址分配/PTE 值由程序固定写出 ⇒ 两侧可比）；逐条 PC/写回仍走现有黄金框架。
+11. TB 侧：p11 的页表与数据段要落在 TB 的 DDR3 窗口内（现 128 KB、别名窗口 `a[31:20]==0x800`、
+    装载索引 `a[19:2]`），第 8 个程序基址 = `0x8001_C000`（需把 DDR3 窗口提到 160 KB 或把
+    步进改小 —— **登记为 TB 侧待办**，与 §B4.4.4-D3 同类）。
+
+## B4.8.3 阻塞点（本段停在检查点的理由，逐条）
+
+| # | 阻塞 | 影响 |
+|---|---|---|
+| H1 | `sfence.vma`/`cbo.*` 当前**非法**（§B4.8.1-6/7） | 不先修，p11 一执行 `sfence.vma` 就变陷阱，Sv32 判据全不可达 |
+| H2 | D 侧翻译要**插入 LSU 适配器状态机**（新增 `AD_XLATE` 级 + 未命中→PTW→重试），直接改 L1D/AXI 的地址与握手路径 | 现有 80 项（尤其 p3/p6 的访存与 AXI 流量判据）会被牵连，必须逐拍核对；预算内无法保证一次到位 |
+| H3 | A/D 写口选型需与 PTE 读**同源**（本核与 2A 不同：2A 走 L1D，本核走 AXI），属**设计决策 + 新引擎源** | 需改 §5 引擎仲裁与写拍 W 数据源（第 7 源），并复核所有既有 AXI 计数判据 |
+| H4 | p11 的页表/数据段需要 TB 侧更大的 DDR3 窗口与第 8 个程序槽 | TB 基建改动（与 §B4.4.4-D3 同类），必须与 p11 同批做 |
+| H5 | Spike 侧 Sv32 的 S 模式/异常口径仍需逐项核对（cause 12/13/15 与 `mtval=VA` 已按 2A 口径，但 p11 的期望值必须硬编码登记） | 比对口径需在报告中登记（任务书已允许"自记录 + 硬编码"） |
+
+## B4.8.4 本段检查点状态
+
+- **本轮零 RTL 改动**（工作树 = 母代理已验收的 `f6f1d73`，`git status` 干净）；
+  基线复验：编译 0 error、`tb_core_top_2b` **PASS 80/80**（日志 `../.b2chk/base_4b2.log`）、
+  `regress.sh` **32/32**（母代理亲跑；本轮未改文件 ⇒ 不变）。
+- 勘察新增的三条**硬阻塞**（H1/H2/H3）与"Spike 维护操作/Sv32 生效"两条实测口径，
+  都已写进 §B4.8.1/§B4.8.2，可直接作为 4b-2a 的开工清单。
+- 下一步建议：**4b-2a 先行**（维护操作合法化 + 维护口接线 + `p11_maint.S`），
+  它是 4b-2b/2c 的**先决条件**且不碰 LSU 数据通路 ⇒ 风险最低、判据最清晰。
