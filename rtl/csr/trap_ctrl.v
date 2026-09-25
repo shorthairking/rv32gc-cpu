@@ -166,11 +166,20 @@ module trap_ctrl (
         input [4:0]  code;
         begin
             // 挂起 & 使能
+            //   ★★ G1 修复（2B-4 第 4b-3 段，母代理裁决："放开 2A 一行"+理由）：
+            //     **M 级中断在下特权级恒开放** —— ISA（machine.adoc, mstatus.MIE/SIE 与中断取用
+            //     条件）："an interrupt i will trap to M-mode if ... the privilege mode is less
+            //     than M, **or** mstatus.MIE=1" ⇒ `priv < M` 时 M 级中断**不受 MIE/SIE 掩蔽**。
+            //     旧式对"非 M 特权级"一律取 SIE ⇒ S 模式下已使能的 MEI 被误屏蔽（实测 p15：
+            //     `mip.MEIP=1 & mie.MEIE=1 & mstatus.MIE=1` 仍不投递；置 `sstatus.SIE=1` 才投递）。
+            //     M 级（is_s_irq=0）：(priv==M) ? MIE : 1'b1
+            //     S 级（is_s_irq=1）：(priv==M) ? 0   : SIE   （M 模式下该中断不可见，见委托门控）
+            //     —— 最小加法：只改"全局使能"一项的取值口径，其余（挂起/使能/委托门控）不变。
             irq_visible = mip_v[code] & mie_v[code] &
-                          // 全局使能：M 模式看 MIE；S/U 模式看 SIE
-                          // （norm:mstatus_mie_sie_op2）
-                          ( (cur_priv == PRIV_M) ? mstatus_v[`RV32GC_MSTATUS_MIE_BIT]
-                                                 : mstatus_v[`RV32GC_MSTATUS_SIE_BIT] ) &
+                          ( is_s_irq ? ((cur_priv == PRIV_M) ? 1'b0
+                                                             : mstatus_v[`RV32GC_MSTATUS_SIE_BIT])
+                                     : ((cur_priv == PRIV_M) ? mstatus_v[`RV32GC_MSTATUS_MIE_BIT]
+                                                             : 1'b1) ) &
                           // 委托门控：被委托给 S 的中断**不在 M 模式取**
                           // （norm:trap_del_intr_priv_lvl）；未被委托的中断恒进 M
                           ( is_s_irq ? ((cur_priv != PRIV_M) ? mideleg_v[code] : 1'b0)

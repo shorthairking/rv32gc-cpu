@@ -4725,3 +4725,66 @@ MPRV=1/MPP=U 翻译（对 U=0 的恒等大页 ⇒ 误报 load 页错误 cause 13
   重生成 `sim/unit/prog/back2_lockstep_data.svh`（仅新增 slot 14）、`rtl/top/core_top_2b.v`（`trap_we` 分组修复）、
   本报告。**TB 未改**（已回退）；**2A 零修改**；`scripts/regress.sh` 未动；未提交 git；
   快照 `../.b2chk/*.s48`（含 `tb_core_top_2b.sv.p15` = 带回 p15 槽的版本，供下一轮直接恢复）。
+
+---
+
+# B4.33 G1/G2 修复（p15 链再进一步）+ 新缺口 G4 登记
+
+> 起点 = 母代理已验收提交 `6e6fe65`（tag 2B-4.31）。
+> 检查点：`tb_core_top_2b` **148/148 PASS**；`regress.sh` **32/32 PASS**；未提交 git。
+
+## B4.33.1 G1 修复（2A `trap_ctrl.v`，母代理预授权一行）+ 实测验证
+
+```verilog
+- ( (cur_priv == PRIV_M) ? mstatus_v[MIE] : mstatus_v[SIE] )           // 旧：非 M 一律看 SIE
++ ( is_s_irq ? ((cur_priv == PRIV_M) ? 1'b0 : mstatus_v[SIE])          // S 级：M 模式下不可见
++            : ((cur_priv == PRIV_M) ? mstatus_v[MIE] : 1'b1) )         // M 级：**下特权级恒开放**
+```
+**理由（ISA）**：machine.adoc 的中断取用条件为"priv < M **或** mstatus.MIE=1"
+⇒ M 级中断在下特权级不受 MIE/SIE 掩蔽；旧式在 S 模式下用 SIE 掩蔽 MEI ✗。
+**实测验证** ✓：p15 里 S 模式等 MEI，修复后**无需任何程序侧 SIE 规避**即投递
+（探针：M handler `csrr mcause` → `0x8000000b` = MEI ✓，此前恒不投递）。
+**回归面**：只改"全局使能"取值，且 M 模式下两种写法同为 MIE ⇒ 既有流程逐位等价 ✓（148 项零回退）。
+
+## B4.33.2 G2 修复（**2B 侧 1 行**：位宽截断）+ 实测验证
+
+**根因**：`core_top_2b` 把 `trap_ctrl.trap_we` 声明成 **1 bit** ⇒ 截断掉 S 组使能
+（`trap_ctrl.v:308-309` 的 `trap_we[0]=M 组 / trap_we[1]=S 组` 由 `wr_m/wr_s` 按 `trap_target` 驱动）
+⇒ **委托到 S 的陷阱一个 CSR 都不写**（sepc/scause/stval 恒 0）⇒ S handler 读到 0、`sret` 返回 PC=0，S 链整条断 ✗。
+（上一段 §B4.32 我把 G2 记成"csr_file 读译码"是**误判** —— 读译码本就覆盖 `SEPC/SCAUSE`（`csr_file.v:832-833`）；
+真正原因是**写口位宽截断**。）
+```verilog
+- wire        tc_trap_valid, tc_trap_is_int, tc_trap_we;        // 1 bit ✗
++ wire        tc_trap_valid, tc_trap_is_int;
++ wire [3:0]  tc_trap_we;                                       // 4 bit 分组使能（原样透传）
+- .trap_we(tc_trap_we_g)                                        // 自造分组（基于被截断的 bit0）✗
++ .trap_we(tc_trap_we)                                          // ✓
+```
+**实测验证** ✓：S handler 现在读到 `scause = 9` ✓、`sepc = 0x8002c078`（ecall 的 PC）✓，`+4` 计算正确 ✓
+（修复前两者恒 0）。
+**回归面**：M 目标陷阱的 `trap_we` 仍是 `4'b0001`（与旧的"1 bit + 高位补 0"逐位相同）✓ 148 项零回退。
+
+## B4.33.3 新缺口 **G4**（本轮定案，未修）：委托陷阱未置 `sstatus.SPP`（或软件 `csrw sepc` 不生效）
+
+修复 G1/G2 后 p15 的 S 链继续推进，暴露出下一处：
+```
+[p15-tr] #0 cause=9 pc=0x8002c078 tgt=0x8002c0ec   ← 委托到 S ✓（G2 修好后再无 cause=8 重复陷阱）
+[p15-tr] #1 cause=8 pc=0x8002c078 tgt=0x8002c0a8   ← 同一 ecall 又以 **cause 8（U 模式 ecall）** 重入 M ✗
+[p15-rg] #30 x28=0x00000009  #31 x30=0x8002c078  #32 x30=0x8002c07c   ← S handler 自记录正确 ✓
+```
+⇒ `sret` 返回时**特权级变成了 U**（SPP=0 ⇒ `priv_ctrl` 的 `xret_target = SPP ? S : U`）且返回 PC 仍是
+ecall 本身（0x8002c078）⇒ 两种可能：①**委托陷阱没有把 SPP 置成 S**（trap 入口的 `mstatus_set`
+对 S 目标的 SPP/SPIE 字段处理）；②软件 `csrw sepc` 未生效（返回 PC 未更新）。
+**下一轮定点**：探针 `trap_ctrl` 的 `mstatus_set`（S 目标的 SPP/SPIE 位）、`csr_file.trap_we` 在
+S 目标拍的实际值、以及 `csrw sepc` 的写路径（`wen/waddr` 与 `priv` 门控）。
+
+## B4.33.4 检查点
+
+* 改动（相对 `6e6fe65`）：`rtl/csr/trap_ctrl.v`（G1 一行，预授权）、`rtl/top/core_top_2b.v`
+  （G2 位宽 1 行 + 删自造分组）、`sim/unit/prog/back2_p15_priv.S`（+ 生成器项 + `.svh` slot 14，未接入 TB）、
+  本报告。**TB 未改**（带 p15 槽的版本留在 `../.b2chk/tb_core_top_2b.sv.p15`）。
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**（`../.b2chk/final_148b.log`）；
+  `regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c20.log`）。
+* 快照 `../.b2chk/*.s49`（含 `trap_ctrl.v.pre`）。
+* **下一步**：G4 定位（见 §B4.33.3）→ 修好后恢复 `tb_core_top_2b.sv.p15`、补 C16' 判据
+  （`trc_cause` 序列 9/2/11、`mtval`/`mepc`、PLIC claim=5、结束标记）+ 反证（断开 `.irq_meip` 必红）。
