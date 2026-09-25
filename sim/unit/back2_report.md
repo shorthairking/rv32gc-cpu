@@ -3041,3 +3041,73 @@ K1 **不是**"重定向目标算错"（那已被证明每拍都对），也**不
   （自记录 + 维护口探针；其合法性/维护口侧判据调试期已实测通过）。
 - 下一步：**方案 A**（`fetch_hold_i`，front4 小改 + 理由登记）→ 挂回 p11/p12 判据（TB 补丁形态见
   §B4.10.2 与本次工作树历史）→ 继续 4b-2b/2c（D 侧翻译与 PTE A/D 写通路）。
+
+
+# 2B-4 K1 修法 A 落地段 —— **front4 冻结门控已实现（零影响）**；K1 残余缺陷定位到"维护拍提交上报/冲刷交互"
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 K1 定案 `ec082d5`=tag `2B-4.10`）
+> 本段按方案 A 实施：`rtl/front4/ifetch4.v` 两处冻结门控 + 复用既有 `fe_stall`（**未新增端口**）、
+> `core_top_2b` 接 `fencei_busy | maint_hold_w`。**K1 仍未收敛**，但本段拿到**决定性新证据**：
+> 失败块正是**含维护指令本身的那一块**，且该维护指令**确实被执行并检测到**（重定向目标正确）——
+> 说明残余缺陷在"维护拍的**提交上报**与冲刷的交互"，而非取指路径。按任务书纪律停在
+> "整设计可编译 + 既有判据全绿"检查点（p11/p12 仍为 WIP，判据未放宽）。
+
+## B4.12.1 方案 A 实现（diff 摘要 + 影响面登记）
+
+| 文件 | 改动 | 理由 |
+|---|---|---|
+| `rtl/front4/ifetch4.v` | ① `l1i_req_valid` 追加 `& ~freeze_all`；② `unc_req_valid`（XIP 直连）同口径追加 `& ~freeze_all`；③ **`blk_valid` 追加 `& ~freeze_all`** | 原式里 `f1_accept = ~freeze_all & …` 只冻 F1→F2 推进，而**块消费**（`head_adv_valid = blk_fire`）与**取指请求**都不受冻 ⇒ 冻结期间"块被消费但流水不推进/请求照发"，与顶层把 `l1i_cs_req` 门控为 0 相撞 ⇒ 前端输出重叠、乱序块（K1 根因） |
+| `rtl/top/core_top_2b.v` | `.fe_stall(fencei_busy \| maint_hold_w)`（4b-2a-fix 段已接，本段确认语义） | 复用 front4 **既有** `fe_stall`（→ `freeze_in` → `freeze_all`），**无需新增端口**（比原计划"新增 `fetch_hold_i`"更小） |
+| **影响面** | `freeze_in`（`fe_stall`）在既有 7 个程序里**恒 0**（本核只把它接成 `fencei_busy \| maint_hold_w`，既有程序无维护操作）；`fault_hold_q` 与 `break_point` 的语义不变（前者本就该"冻结不呈现块"，后者是对外调试口） | 实测：`tb_core_top_2b` **PASS 80/80**、`regress.sh` **32/32**（`../.b2chk/regress_k1a.log`）⇒ 对既有判据**零影响** |
+
+## B4.12.2 K1 残余缺陷的新证据（决定性）
+
+把 `p11_maint` 放在**第一个程序槽**（自身基址 `0x8000_0000`，BTB/缓存全新）复测 ⇒ **同一相对失败点**
+（`idx 20: 设计 0x…60 vs 黄金 0x…50`）⇒ **排除**"跨程序陈旧预测器/缓存状态"这一候选。
+
+维护事件打点（`[mdbg]`，p11 置首运行）：
+```
+t=7525000  maint kind=2 pc=0x8000005c           ← sfence 在 0x5c，**被正确检测**
+t=7565000  redir pc=0x80000060 flush=1 hold=1   ← 冻结窗口末端重定向到 0x60（**目标正确**）
+```
+提交轨迹（`[p11-trace]`）：
+```
+idx=19 pc=0x8000004c  ← 上一条（la t1 的 addi）
+idx=20 pc=0x80000060  ← ★ 直接跳到维护指令的下一条
+```
+⇒ **丢失的正是含维护指令的那一块 `0x50..0x5c`（4 条）**：`0x50/0x54/0x58` 是分隔用的 addi，
+`0x5c` 是 `sfence.vma`。而该 sfence **确实执行并被检测**（否则不会产生到 0x60 的重定向）⇒
+残余缺陷是：**维护拍（含维护指令的那个提交组）没能把这一组上报为已提交**，
+随后冻结窗口把 ROB 清空、重定向到 0x60 ⇒ 报告流里整块消失、程序从 0x60 继续。
+
+**与现有机制的对应**（下一步的第一手排查点）：
+1. `maint_cmt_o` 的口子在 `cmt_ok = ~squash & (~flush_all | ((xret|maint)&trp_flush))`，
+   而 `maint_cmt_o` 由 lane 扫描（`cmt_raw & ~squash`）产生；若该拍 `squash_v_w` 或
+   `trp_flush_v_i` 的**相位**与扫描不一致，整组就会 `cmt_ok=0` ⇒ 不上报。
+2. `cmt_hold_w` 的"更年轻 lane hold"是按 `maint_lane_idx` 算的；若维护指令在较老的 lane，
+   更年轻的 lane 被 hold（正确，它们会重执行），但**不能让更老的 lane 也消失**——
+   需要确认 `cmt_raw_m` 对更老 lane 恒等。
+3. `blk_bad=4`（本段新增的"块首 PC 回退"计数）说明前端**仍有**越序块呈现 ⇒ 即使冻结门控到位，
+   仍需按 §B4.10.3 的第 1/5 条继续查（fetch-queue 与 L1I 响应的簿记）。
+
+## B4.12.3 下一步（最小可判定实验，一步即可定位）
+
+1. **打点维护拍**：在维护检测拍同时打印
+   `cmt_ok / cmt_raw / cmt_raw_m / maint_lane_idx / squash_v_w / trp_flush_v_i / flush_all_w /
+   commit_valid_o / maint_kind_w`（一次仿真即可判定是"整组 cmt_ok=0"还是"掩码把老 lane 也吃掉"）。
+2. 按结论二选一：
+   - 若为**相位/口子问题** ⇒ 把维护拍的上报改为"**无条件上报该组最老到维护指令之间的 lane**"
+     （即 `cmt_ok` 对该拍强制为 1，并由 `cmt_hold_w` 只挡更年轻的 lane）；
+   - 若为**掩码问题** ⇒ 修正 `cmt_hold_w`（用 `maint_lane_idx` 的"最老者优先"索引，或在扫描里
+     同时记录最老维护 lane 与最老 xRET lane 的分组优先级）。
+3. 再挂回 p11/p12（生成器 2 条 PROGS + TB 的 C11'/C12'，检查项 80→80+9：C11' 5 条 + C12' 4 条；
+   DDR3 窗口 160 KB、第 8/9 槽、`[k1-blk]` 块序计数与维护口探针——本段工作树历史里补丁形态完整可复用）。
+
+## B4.12.4 本段检查点状态
+
+- 编译 **0 error**；`tb_core_top_2b`（既有 7 程序）**PASS 80/80**；`regress.sh` **32/32**；
+  2A 零修改；`rtl/top/core_top_2b.v` 与 `rtl/back2/*` 本段零改动（仅 `rtl/front4/ifetch4.v` 三处门控）；
+  未提交 git；快照 `../.b2chk/*.s24`。
+- WIP：`back2_p11_maint.S`（黄金 42 条）、`back2_p12_cbo.S`（自记录 + 维护口探针）。
+- 结论：**K1 未收敛**，但已把范围压缩到"维护拍提交上报/冲刷交互"（3 条具体排查点）+
+  "前端越序块（`blk_bad=4`）"，并且 front4 的冻结门控（方案 A）已落地且零影响。

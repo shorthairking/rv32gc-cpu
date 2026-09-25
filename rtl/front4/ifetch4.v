@@ -398,10 +398,23 @@ module ifetch4 #(
     wire f4_is_xip = ((f4_pa_q[31:20] & XIP_HI20_MSK) == XIP_HI20_VAL) |
                      (f4_pa_q[31:16] == XIP_ALIAS_HI16);
 
-    assign l1i_req_valid = f4_v_q & ~f4_is_xip & ~f4_rsp_ok & ~fault_hold_q & ~redirect_valid;
+    //   ★★ 2B-4 K1 修法 A（母代理授权的前端小改，理由与影响面见报告 §B4.12.3）：
+    //     **冻结期间必须停止发取指请求**。原式缺 `~freeze_all` ⇒ 本核在 fence.i 扫掠期把
+    //     "送进 L1I 的请求"门控为 0（`l1i_cs_req & ~fencei_busy`）、前端却继续按
+    //     "请求已发出"推进/重发 ⇒ 扫掠结束后前端输出**重叠、乱序的取指块**（K1 根因，
+    //     实测 `[k1-blk] 0x…040 → 0x…050 → 0x…044 → 0x…054 → 0x…064`）。
+    //     加 `~freeze_all`（= `fe_stall | break_point | fault_hold_q`）后，冻结期间前端
+    //     **不推进、不重发、PC 不变**（与 `rst_hold` 的区别：PC 不变；与 `redirect_valid`
+    //     的区别：不清队列）⇒ 成为"真正的取指 hold"。
+    //     ★ 影响面：`freeze_in`(`fe_stall`) 在既有程序里恒 0（本核只把它接成
+    //     `fencei_busy | maint_hold_w`，既有 7 程序无维护操作）⇒ **对既有判据零影响**。
+    assign l1i_req_valid = f4_v_q & ~f4_is_xip & ~f4_rsp_ok & ~fault_hold_q & ~redirect_valid
+                           & ~freeze_all;
     assign l1i_req_addr  = f4_pa_q;                        // PIPT：查表地址 = PA
     assign l1i_req_line  = {f4_pa_q[31:5], 5'b00000};      // 行基址（填充用）
-    assign unc_req_valid = f4_v_q &  f4_is_xip & ~f4_rsp_ok & ~fault_hold_q & ~redirect_valid;
+    //   ★ K1 修法 A：直连（XIP）请求同口径加冻结门控（冻结期间不发任何取指请求）
+    assign unc_req_valid = f4_v_q &  f4_is_xip & ~f4_rsp_ok & ~fault_hold_q & ~redirect_valid
+                           & ~freeze_all;
     assign unc_req_pa    = f4_pa_q;
 
     //==========================================================================
@@ -666,7 +679,14 @@ module ifetch4 #(
     wire       blk_ready_int = (grp_mask != 4'h0) & (m3 | blk_term | ~can_grow);
     wire       ckpt_stall = blk_ready_int & grp_taken & ckpt_full;
 
-    assign blk_valid    = blk_ready_int & ~ckpt_stall & ~redirect_valid & ~fault_hold_q;
+    //   ★★ K1 修法 A（关键一处）：**冻结期间不得呈现/消费块**。
+    //     原式缺 `~freeze_all` ⇒ 冻结时 `f1_accept = ~freeze_all & …` 已停住 F1→F2 推进，
+    //     但块仍可被 `blk_ready` 消费（`head_adv_valid = blk_fire`）⇒ **块消费与取指推进
+    //     脱钩** ⇒ 前端输出重叠/乱序块（K1 根因实测序列 `0x…040 → 0x…050 → 0x…044 → …`）。
+    //     加 `~freeze_all` 后冻结期间：不推进、不消费、不发请求、PC 不变 = 真正的取指 hold。
+    //     ★ 影响面：`freeze_in`(`fe_stall`) 在既有程序恒 0 ⇒ 对既有判据零影响。
+    assign blk_valid    = blk_ready_int & ~ckpt_stall & ~redirect_valid & ~fault_hold_q
+                          & ~freeze_all;
     assign blk_mask     = grp_mask;
     assign blk_taken    = grp_taken & ~ckpt_stall;
     assign blk_next_pc  = grp_taken ? grp_tgt : next_va;
