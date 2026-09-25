@@ -290,6 +290,9 @@ module core_top_2b (
     wire [1:0]  tc_trap_target;
     wire [31:0] tc_redirect_pc, tc_trap_cause, tc_trap_tval, tc_trap_epc, tc_trap_pc;
     wire [31:0] tc_trap_epc_i, tc_trap_cause_i, tc_trap_tval_i;
+    //   ★ 陷阱 CSR 写的**分组**（见下方 `csr_file` 例化处的说明）：S 目标 ⇒ 写 S 组，否则 M 组
+    wire [3:0]  tc_trap_we_g = tc_trap_we ? ((tc_trap_target == `RV32GC_PRIV_S) ? 4'b0010 : 4'b0001)
+                                          : 4'b0000;
     wire        rob_any_w = (dbg_rob_cnt_w != 7'd0);
     //   ★ 裁决①：ecall 的 mtval 按 **Spike = 0**（2A 是 PC，偏差登记在册）；
     //     断点 cause 3 取 PC（Spike 实测口径）；非法指令由 trap_ctrl 用 commit_insn 覆盖；
@@ -1435,7 +1438,11 @@ module core_top_2b (
         .rdata_w(), .byp_wdata(32'h0), .byp_rdata(),
         .priv(csr_priv_2), .chk_addr(12'h0), .chk_illegal(), .chk_ro_write(),
         .mstatus_o(csr_mstatus_raw), .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
-        .trap_we(tc_trap_we), .trap_epc_i(tc_trap_epc_i), .trap_cause_i(tc_trap_cause_i),
+        //   ★★ 4b-3(2/2)：`trap_we` 是**4 bit 分组使能**（bit0 = M 组 mepc/mcause/mtval、
+        //     bit1 = S 组 sepc/scause/stval —— 见 `csr_file` 端口注）。旧式只驱动 1 bit（bit0）
+        //     ⇒ **委托到 S 的陷阱也写 M 组**：`scause` 恒 0、`sepc` 不更新（实测 p15：S handler
+        //     读到 scause=0）✗。按 `trap_ctrl.trap_target`（目的特权级）分组 ✓
+        .trap_we(tc_trap_we_g), .trap_epc_i(tc_trap_epc_i), .trap_cause_i(tc_trap_cause_i),
         .trap_tval_i(tc_trap_tval_i), .trap_data_i(32'h0),
         .irq_msip(clint_msip_w), .irq_mtip(clint_mtip_w), .irq_meip(plic_meip_w),
         .irq_stip(1'b0), .irq_seip(plic_seip_w),

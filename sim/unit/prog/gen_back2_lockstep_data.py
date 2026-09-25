@@ -79,6 +79,9 @@ PROGS = [
     #     预置为 1 ⇒ 不触碰 Spike 的 Svadu/SVADE 差异；无 sfence/cbo/中断/CLINT 形态）
     #     ⇒ 提交 PC 流与写回寄存器轨迹应与 Spike 逐条一致。
     ("back2_p14_storepf.S", "P14", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei"),
+    #   ★ 2B-4 第 4b-3 段（2/2）：**S 模式完整链 + PLIC**。**仅映像、无黄金**：Spike 不建模 PLIC
+    #     ⇒ 含 claim/complete 的整链无法逐条比对；判据由 TB 的 C16'（程序自记录 + 硬编码期望）给出。
+    ("back2_p15_priv.S",   "P15", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei", True),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"

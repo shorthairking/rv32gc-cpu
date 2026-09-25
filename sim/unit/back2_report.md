@@ -4676,3 +4676,52 @@ MPRV=1/MPP=U 翻译（对 U=0 的恒等大页 ⇒ 误报 load 页错误 cause 13
   未提交 git；快照 `../.b2chk/*.s47`（含 `backend_top.v.pre4`）。
 * 编译 0 error；`tb_core_top_2b` **148/148 PASS**（M 模式 ecall 仍为 cause 11 ⇒ p7/p9 判据零回退）；
   `regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c18.log`）。
+
+---
+
+# B4.32 p15_priv（S 模式链 + PLIC）：**未完成**（开工后定案出两处更深的 S 模式缺口，已回到全绿检查点）
+
+> 起点 = 母代理已验收提交 `fa208fa`（tag 2B-4.30）。检查点：`tb_core_top_2b` **148/148 PASS**；
+> `regress.sh` **32/32 PASS**；2A 零修改；未提交 git。
+
+## B4.32.1 已建成的部分（可复用，未接入 TB 判据）
+
+* **`sim/unit/prog/back2_p15_priv.S`（已写，`.option norvc`）**：M 装 `mtvec/stvec/medeleg`(bit9) +
+  PMP 全放行 + PLIC（priority[5]/enable[ctx0]/threshold[ctx0]）→ `mret 进 S` → S 下 `ecall`
+  （委托回 S）→ `sret` → 非法指令 → PLIC MEI（claim/complete）→ 回 M 收尾；自记录约定见文件头。
+* **生成器 PROGS 末位（已加，no-golden）**：`("back2_p15_priv.S","P15",...,True)` + 重生成
+  `.svh`（`P_NUM=15`，slot 14；**已核对只新增 slot 14**）。
+* **实测已工作的链路**（诊断跑，非判据）：委托到 S 的陷阱**确实投递到 S handler**
+  （`trc_cause[0]=9`、`trp_tgt`=stvec ✓）；`sret` **正确返回** sepc+4（⇒ 下一条 `.word 0` 触发
+  `cause=2`，`mtval=0`、`mepc`=故障指令 PC ✓ 自记录值全部正确）；PLIC 侧 `intrpt→meip_o→mip.MEIP`
+  链路**通**（实测 `meip=1 & mip=0x800 & mie=0x800`）。
+
+## B4.32.2 定案出的两处更深缺口（**本轮未修**，附判据与落点）
+
+| # | 缺口 | 证据 | 归属/修法 |
+|---|---|---|---|
+| **G1** | **M 级中断在 S 模式被 SIE 掩蔽**：`trap_ctrl.irq_visible` 的"全局使能"对**非 M 特权级一律取 `mstatus.SIE`**，而 ISA 规定 **M 级中断在下特权级恒开放**（`priv < M` 不受 MIE/SIE 掩蔽） | p15：S 模式等 MEI，`mip.MEIP=1 & mie.MEIE=1 & MIE=1` 却**不投递**；把 `sstatus.SIE` 置 1 后立刻投递（程序侧已加规避 `csrsi sstatus,2`） | **2A `rtl/csr/trap_ctrl.v`（禁改）** ⇒ 本轮**程序侧规避 + 登记修法**：`irq_visible` 的全局使能应按 `is_s_irq` 分派（M 级：`(priv==M) ? MIE : 1'b1`；S 级：`(priv==M) ? 0 : SIE`） |
+| **G2** | **S 模式 CSR 的"软件读"返回 0**：S handler 里 `csrr t3, scause` → **0**、`csrr t5, sepc` → **0**（但硬件侧 sepc 值正确 —— `sret` 用它返回到了 sepc+4 ✓）⇒ 读路径（或 S CSR 的读地址译码）有缺口 | `[p15-all] #30 x28=0 / #31 x30=0`（PC 落在 s_handler 内）；同时 M 侧 `mcause/mtval` 读取**正常**（`#30 x28=2 / #33 x29=0` ✓） | **待定**（2B `core_top_2b` 的 `csr_raddr_w`/读回路径 or 2A `csr_file` 的 S CSR 读译码）；需下一轮专项定位（探针：`csr_raddr_w`、`csr_rdata_w`、`priv`、uop 的 csr 地址字段） |
+| G3（已修，保留） | `csr_file.trap_we` 是**4 bit 分组使能**（bit0=M 组 mepc/mcause/mtval、bit1=S 组 sepc/scause/stval），旧式只驱动 1 bit ⇒ 委托到 S 的陷阱也写 M 组 | `csr_file` 端口注（§4.2） | `core_top_2b` 已按 `tc_trap_target` 分组：`tc_trap_we_g = tc_trap_we ? (target==S ? 4'b0010 : 4'b0001) : 0` ✓（对既有 M-only 流程**逐位等价**，故 148 项零影响） |
+
+## B4.32.3 本轮收口动作（回到全绿检查点）
+
+* **TB 已回退**到已验收状态（`git checkout sim/unit/tb_core_top_2b.sv` ⇒ `NPROG=11`、无 p15 槽、
+  DDR3_LIMIT/clear_mem 复原）：避免"接入 p15 却不写判据"的**覆盖空洞**（跑而不判 = 假绿）。
+* **保留**：`back2_p15_priv.S`、生成器 PROGS 项与重生成的 `.svh`（slot 14，未被 TB 使用 ⇒ 零影响）、
+  以及 `core_top_2b` 的 `trap_we` 分组修复（G3，M-only 等价 ⇒ 无回退）。
+* 未落地：`core_top_2b` 的 PLIC/中断侧若需为 S 模式再改（等 G1/G2 定案后一并做）；TB 第 12 槽与 C16' 判据；
+  反证（断开 `irq_meip`）。
+* **下一轮建议顺序**：①定位 G2（S CSR 读回 0）—— 优先查 `csr_raddr_w` 与 `csr_file` 的读译码是否按 `priv` 门控；
+  ②G1 需用户/母代理裁决是否放开 2A 修改（1 行 `irq_visible` 分派）或继续程序侧规避并登记；
+  ③两项定了再接 p15 槽 + C16'（判据：`trc_cause[0]=9`、M 侧 `cause=2/11`、`mtval`/`mepc`、claim 值=5、
+  结束标记）+ 反证。
+
+## B4.32.4 检查点
+
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**（`../.b2chk/final_148.log`）；
+  `regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c19.log`）。
+* 改动（相对 `fa208fa`）：新增 `sim/unit/prog/back2_p15_priv.S`、`gen_back2_lockstep_data.py`（1 项）、
+  重生成 `sim/unit/prog/back2_lockstep_data.svh`（仅新增 slot 14）、`rtl/top/core_top_2b.v`（`trap_we` 分组修复）、
+  本报告。**TB 未改**（已回退）；**2A 零修改**；`scripts/regress.sh` 未动；未提交 git；
+  快照 `../.b2chk/*.s48`（含 `tb_core_top_2b.sv.p15` = 带回 p15 槽的版本，供下一轮直接恢复）。
