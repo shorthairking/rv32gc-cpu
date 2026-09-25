@@ -104,12 +104,12 @@ _start:
     slli  t1, t1, 10
     ori   t1, t1, 0xC7
     sw    t1, 0(s1)                 /* l1[0] → root 页 */
-    /*   ★ 规避（RTL 根因已用探针收窄，待修）：PTE 更新 store 与紧随的 `sfence.vma` 相邻时
-     *     **该 store 从未进入 CDQ**（探针实证：t≈1350x-1362x 区间 `dr_any` 恒 0、`cdq_cnt` 恒 0），
-     *     而维护提交拍 t=13625 前后出现一笔"被 kill 的译后访问"（`ad=5 → ad=0`）。
-     *     已排除：入队许可（已去 `cmt_ok`）、CDQ 指针/记账逻辑、`ptw_kill_w`（已改为只打断取指侧）。
-     *     下一步：打印 `cmt_st_drain/lsu_dr_valid/dr_take` 与 `stq_ret/stq_head_q` 判定
-     *     "提交拍是否真的产生了 `cmt_st_drain`"（即该 store 是否在 ROB 的提交前缀链里）。 */
+    /*   ★ 规避（根因已定位到"排空期翻译被维护脉冲中止"，待修）：PTE 更新 store 与紧随的
+     *     `sfence.vma` 相邻时——探针实证 **入队正常**（t=13512 `st_drain=0001 drv=0001
+     *     take=0001` 同组入队成功），但该 store 排空时的**在途翻译**（t=13623 `ad=5 need=1
+     *     va=0x80027000`）在维护动作脉冲（t=13625 `mact=1`）前后被中止（t=13624 `ad→0`）
+     *     ⇒ 写丢失、PTE 仍旧值。下一步修法：数据侧（已提交 store）在途翻译不得被整机冲刷
+     *     中止（kill 保护范围扩到 `AD_XLATE/AD_TR` 的 store，或排空改用已定址 PA）。 */
     nop; nop; nop; nop; nop; nop
     sfence.vma                      /* TLB 全失效（单地址空间口径，§B4.9.4） */
     li    t1, 0x00020800

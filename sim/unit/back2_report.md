@@ -4082,3 +4082,23 @@ assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
 * **下一步（唯一）**：打印提交拍 `cmt_st_drain/lsu_dr_valid/dr_take/dr_idx` + ROB `cmt_chain`
   ⇒ 判定"该 store 是否在提交前缀链里"（若不在，问题在 `slot_ok/slot_st_ok` 与维护 lane 的
   同组判定；若在，则回到 `dr_take` 与 `cdq_wp` 的同拍写入）。
+### B4.24.7 提交拍探针（本轮）：**入队已正常，丢失点定位到"排空期翻译被中止"**
+
+```
+t=13512 raw=1111 chain=1111 st_drain=0001 drv=0001 take=0001 | st_ok=1111 room=1 hold=1100 mact=0 flush=1
+t=13513 raw=0000 chain=0000 st_drain=0000 drv=0000 take=0000 | ... mact=1 flush=1
+t=13623 ... cdq(cnt=0 h=7 t=7) | ad=5 need=1 va=0x80027000   ← 该 store 排空时的**在途翻译**
+t=13624 ... cdq(cnt=0 h=7 t=7) | ad=0 need=1 va=0x80027000   ← 被中止（AD_TR → IDLE）
+t=13625 ... mact=1                                            ← 维护动作脉冲
+```
+* **①入队已修复且被实证**：t=13512 与 `sfence.vma` **同组**（`hold=1100` = 维护 lane 在 1）
+  的 PTE store `st_drain=0001 / drv=0001 / take=0001` ⇒ **同组更老 store 完成 CDQ 入队** ✓
+  （此即任务书 ③ 要求的硬断言形态，可直接在 TB 里断言此组合）。
+* **②丢失点最终定位**：该 store 入队后**当拍/次拍即被排空**（`cdq_cnt` 由 1 归 0），
+  排空时因 `MPRV=1` 需翻译（`ad=5, need=1, va=0x80027000`），而在维护动作脉冲前后
+  该在途翻译被中止（`ad → 0`），适配器不再持有该写 ⇒ **已提交写丢失**。
+* **修法方向（下一步，二选一）**：**(a)** 把 `d_kill_w` 的保护范围扩到"`AD_XLATE/AD_TR` 中的
+  **store**"（当前 `~d_we_q & ~d_start` 未覆盖"已被接管但尚未进入 AD_REQ"的 store 翻译拍）；
+  **(b)** 排空路径不翻译（CDQ/STQ 项携带已定址 PA）——与 §B4.20.3 的 store 页错误精确化同一改动。
+* **检查点**：`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121e.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b2c8.log`）；p13 仍带 6 条 `nop` 规避（判据未放宽）。

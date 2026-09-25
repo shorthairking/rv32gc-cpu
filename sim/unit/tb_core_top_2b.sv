@@ -223,6 +223,15 @@ module tb_core_top_2b #(
                      u_dut.u_back.u_lsu.cdq_cnt, u_dut.u_back.u_lsu.cdq_head, u_dut.u_back.u_lsu.cdq_tail,
                      u_dut.ad_st_q, u_dut.d_xlat_need_w, u_dut.d_va_q,
                      u_dut.ptw_req_done, u_dut.ptw_fault, u_dut.m_tr_src_q);
+        //   ★★ B4.24.7 探针：**提交拍**的 store 排空链（判该 store 是否在 ROB 提交前缀链里）
+        if (DBG_P13 && (cur_p == 12) && (k1_tick > 12400) && (k1_tick < 14000) &&
+            (u_dut.be_trp_flush | (|u_dut.u_back.cmt_st_drain) | (|u_dut.u_back.lsu_dr_valid)))
+            $display("   [st] t=%0d raw=%b chain=%b st_drain=%b drv=%b take=%b idx=%b | st_ok=%b room=%b hold=%b mact=%b flush=%b",
+                     k1_tick, u_dut.u_back.cmt_raw, u_dut.u_back.u_rob.cmt_chain,
+                     u_dut.u_back.cmt_st_drain, u_dut.u_back.lsu_dr_valid,
+                     u_dut.u_back.u_lsu.dr_take, u_dut.u_back.lsu_dr_idx,
+                     u_dut.u_back.u_rob.slot_st_ok, u_dut.u_back.lsu_dr_room_w,
+                     u_dut.u_back.cmt_hold_w, u_dut.maint_act_q, u_dut.be_trp_flush);
         if (DBG_K1 && (cur_p == 10) && ((k1_tick % 1000) == 0) && (k1_tick > 3000))
             $display("   [k1i] plo=%b phi=%b pgn=%b npv=%b bufcnt=%0d grpm=%b m3=%b term=%b xip=%b | pva0=0x%08x pva1=0x%08x nva=0x%08x rsp=%b f4v=%b",
                      u_dut.u_front.u_ifetch4.push_lo_ok, u_dut.u_front.u_ifetch4.push_hi_ok,
