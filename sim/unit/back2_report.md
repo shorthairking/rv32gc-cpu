@@ -3969,3 +3969,51 @@ assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
 * **下一步**：①按 §B4.23.2 探针判定 (i)/(ii)，再定点修；修好后去掉 `nop` 并重跑 121；
   ②store page fault 精确化（§B4.20.3 设计，本段因预算未做）；③L1D 维护写回 + `cbo.flush` INVAL；
   ④L1I 侧 PIPT 复核。
+
+---
+
+# B4.24 同组更老 store 漏排空：抑制点排除到 `lsu_dr_valid` 之后（2B-4 第 4b-2c 段续）
+
+> 起点 = 母代理已验收提交 `5f9d588`=tag `2B-4.22`。
+> 结论：**两次定点修法（`cmt_ok` 解耦 → 彻底去掉冲刷门）均不足以治愈**；结合代码定案，
+> **丢失点已被排除到 `lsu_dr_valid` 之后**（CDQ 入队/记账路径）。检查点保持 **121/121 + regress 32/32**；
+> p13 暂留 6 条 `nop` 规避。
+
+## B4.24.1 逐拍/代码定案（(i) vs (ii)）
+
+* **`cmt_st_drain` 不含任何 flush/squash 门**（`rob.v:213` = `cmt_chain & slot_store`，
+  而 `cmt_chain` 只是 `slot_ok` 的**前缀链**，`rob.v:175-178`）⇒ 维护/陷阱/xRET 拍，
+  "更老的已提交 store" 的 `cmt_st_drain` **仍为 1**。
+* 原式 `lsu_dr_valid = cmt_st_drain & cmt_ok & ~cmt_hold_w` 中 `cmt_ok` 含 `~squash_v_w`
+  与 `~flush_all_w` ⇒ 该拍入队被抹掉（**这是本段第一处修法**：改为
+  `cmt_ok_st_w = ~squash_v_w & (cmt_ok | (trp_flush_v_i & ((|maint_lane_oh)|(|xret_lane_oh)|maint_pend_hold_w)))`）。
+* **反证**：去掉 `nop` 后仍失败 ⇒ 继续收紧为 **`lsu_dr_valid[cc] = cmt_st_drain[cc] & ~cmt_hold_w[cc]`**
+  （排空入队只看"前缀链里的 store"+"不被维护 lane 掩码挡住"，**彻底不乘任何冲刷门**）。
+* **仍失败** ⇒ 判定：**不是 (i) 的入队许可问题**（该式此时恒允许），而是 **(ii)-型：
+  入队许可之后、CDQ 记账/排空路径上丢失**。下一处探针（下一步唯一动作）：
+  在维护提交拍逐拍打印 `u_dut.u_back.u_lsu.dr_take / dr_push_n / cdq_wp / cdq_head / cdq_tail /
+  cdq_cnt / cdq_v[] / dr_idx`——即可判定"未真正写入（`dr_take=0`）"还是"写入后被队列指针/回收吃掉"。
+
+## B4.24.2 已落地的修法（保留：语义正确、回归全绿）
+
+```verilog
+// rtl/back2/backend_top.v §9
+- assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok & ~cmt_hold_w[cc];
++ assign lsu_dr_valid[cc] = cmt_st_drain[cc] & ~cmt_hold_w[cc];
+```
+**理由**：`cmt_st_drain` 天然只含**已提交前缀**里的 store，整机冲刷不可能让更老项变成未提交
+⇒ 入队不应再乘 `cmt_ok`（原式会在维护/陷阱/xRET 拍丢掉更老 store 的排空入队）。
+**该修法本身是对的**（覆盖维护/陷阱/xRET 三种冲刷形态），只是**不是本残留的充分修法**。
+
+## B4.24.3 判据升级（③）与本段状态
+
+* **判据升级未落地**：计划新增的硬断言"维护冲刷拍同组更老 store 完成 CDQ 入队"
+  （采样 `be_trp_flush & |lsu_dr_valid` 计数 ≥1，反证=临时恢复旧式必 FAIL）因预算见底未实施；
+  **现有 C13'-9 已是该缺陷形态的端到端判据**（重映射生效 ⇐ PTE 更新 store 必须已排空到 L1D），
+  本段两次"无 nop 形态"失败即该判据在起作用（**未放宽**）。
+* 编译 **0 error**；`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121b.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b2c5.log`）；2A 零修改；未提交 git；快照 `../.b2chk/*.s36`。
+* **下一步（唯一动作）**：按 §B4.24.1 末段探针判定 (ii) 的具体点（候选：CDQ 写指针与 `cdq_head`
+  同拍冲突 / `cdq_v[wp]` 写入被随后语句覆盖 / 排空握手在该拍被 `maint_act_q` 挡住），
+  修后**去掉 `nop`** 重跑 121；随后 ②store page fault 精确化、③L1D 维护写回 + `cbo.flush` INVAL、
+  ④L1I 侧 PIPT 复核。

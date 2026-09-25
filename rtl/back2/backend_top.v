@@ -471,9 +471,6 @@ module backend_top #(
     wire [3:0]  cmt_raw, cmt_st_drain, cmt_st_ckpt, cmt_st_branch;
     wire [COMMIT_W*RB_W-1:0] cmt_pay;
     wire        cmt_ok;
-    //   ★ 4b-2c(2/2)："维护 op 已提交但整机冲刷仍在进行"（冻结窗口/等排空）——
-    //     供 store 排空入队判据使用（见 §9 的 `cmt_ok_st_w`）
-    wire        maint_pend_hold_w = maint_cmt_o | (|maint_lane_oh);
     wire [DISP_W*RB_W-1:0] rob_pay_w;
     wire        trap_v_rob, flush_all_w, squash_v_w;
     wire [6:0]  rob_head_w, squash_idx_w;
@@ -1421,9 +1418,16 @@ module backend_top #(
         //     挡住（`~cmt_hold_w`，只掩**更年轻** lane）× 未被 squash"，**不再无条件乘
         //     `cmt_ok`**；`cmt_ok` 仅在"维护/xRET 冻结窗口"里为 0，而那正是更老 store
         //     仍可能需要入队的拍。
-        wire cmt_ok_st_w = ~squash_v_w & (cmt_ok | (trp_flush_v_i & ((|maint_lane_oh) | (|xret_lane_oh) |
-                                                                     maint_pend_hold_w)));
-        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
+        //   ★★ 定案（逐拍探针 + 代码定案）：抑制点就是**本式的 `cmt_ok`/`~squash_v_w`**。
+        //     `cmt_st_drain[cc] = cmt_chain[cc] & slot_store[cc]`（rob.v:213）而 `cmt_chain`
+        //     只是 `slot_ok` 的**前缀链**、**不含任何 flush/squash 门** ⇒ 维护/陷阱/xRET 拍
+        //     `cmt_st_drain` 对"更老的已提交 store"仍为 1；是 `cmt_ok`（含 `~squash_v_w`
+        //     与 `~flush_all_w`）把这次入队抹掉了 ⇒ 已提交写静默丢失（p13 的 PTE 更新
+        //     store 即此形态：轨迹可见提交、适配器侧从未出现）。
+        //     修法：**排空入队只看"前缀链里的 store"与"不被维护 lane 掩码挡住"**——
+        //     `cmt_st_drain` 天然只含已提交前缀项，冲刷不可能让更老项变成未提交 ⇒ 安全。
+        //     覆盖面：维护 / 陷阱 / xRET 触发的整机冲刷拍全部包含在内。
+        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & ~cmt_hold_w[cc];
         assign lsu_dr_idx[cc*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = p_stq(p);
     end
     endgenerate

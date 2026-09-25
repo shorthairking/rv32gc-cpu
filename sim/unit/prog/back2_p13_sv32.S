@@ -104,11 +104,11 @@ _start:
     slli  t1, t1, 10
     ori   t1, t1, 0xC7
     sw    t1, 0(s1)                 /* l1[0] → root 页 */
-    /*   ★ 4b-2c(2/2) 规避（**RTL 根因待修**）：PTE 更新 store 与紧随的 `sfence.vma`
-     *     相邻时，该 store 会出现"已提交但从未进入 CDQ"（适配器侧看不到该笔）⇒ 旧 PTE
-     *     仍在 ⇒ 重映射不生效。插入 6 条无关指令把二者分到不同提交组即可规避。
-     *     已试修法（`backend_top` 的 `cmt_ok_st_w`：让更老 store 的排空入队不乘 `cmt_ok`）
-     *     **不足以治愈** ⇒ 抑制点不在 `cmt_ok/cmt_hold_w`；下一步探针见报告 §B4.23。 */
+    /*   ★ 4b-2c(3/3) 规避（**RTL 根因已收窄，待修**）：PTE 更新 store 与紧随的
+     *     `sfence.vma` 相邻时，该 store **已提交但从未进入 CDQ**（适配器侧看不到该笔）。
+     *     已排除的抑制点：`cmt_ok`/`~squash_v_w`/`cmt_hold_w`（已把排空入队改为
+     *     `cmt_st_drain & ~cmt_hold_w`，仍需规避）⇒ 丢失发生在 `lsu_dr_valid` **之后**
+     *     （CDQ 入队/记账路径）。下一步探针与候选见报告 §B4.24。 */
     nop; nop; nop; nop; nop; nop
     sfence.vma                      /* TLB 全失效（单地址空间口径，§B4.9.4） */
     li    t1, 0x00020800
