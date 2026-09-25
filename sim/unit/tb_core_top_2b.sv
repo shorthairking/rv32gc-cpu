@@ -603,6 +603,7 @@ module tb_core_top_2b #(
                 end
 
 
+
             end else if (pid == 5) begin
                 //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============
                 //   判据：三条异常各自落到 base + 4×cause 的**不同槽**（由槽内标记经写回轨迹背书）。

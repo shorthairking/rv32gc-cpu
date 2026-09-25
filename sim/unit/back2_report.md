@@ -3708,3 +3708,80 @@ idx=47  pc=0x80024140  csrr t5,mepc   → 0x800240b4   ← 故障指令 PC（精
   （9 槽 / 103 项），TB 的 C13' 块已摘除（源码在 `.s31wip` 快照内）。
 * 一句话：**D 侧翻译与 PTW 串行复用的结构已就位且既有判据零回退；p13 的 Sv32 端到端判据
   被"PTE 读绕过 L1D（遍历不连贯）"卡住 —— 修法已定位到 4b-2c 的两条路线。**
+
+---
+
+# B4.20 PTE 读连贯性 + A/D 口径 + store 页错误（2B-4 第 4b-2c 段）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已验收提交的 `4050001`=tag `2B-4.18`）
+> 结论：**PTE 读已改经 L1D（第一优先达成，阻塞点解除）**；顺带定案并修掉一个真实的**缓存口径缺陷**
+> （VIPT 伪命中/别名 ⇒ 改 PIPT）与一个 **PTW 中止缺口**（冲刷必须 kill 遍历）；
+> **A/D 口径按 2A = SVADE=1（软件置位，无硬件写通路）**；`tb_core_top_2b` **103/103**、
+> `regress.sh` **32/32**、2A 零修改。p13 仍未挂回：12 项判据中 **11 项已过**，唯一残留是
+> **`sfence.vma` 后重映射未生效（TLB 保留旧翻译）**，已定位到"flush 与 fill 的交叠"这一处，
+> 留给下一段收口。
+
+## B4.20.1 已完成（RTL 主线）
+
+| # | 内容 | 落点与关键口径 |
+|---|---|---|
+| ① | **PTE 读经 L1D**（第一优先） | `core_top_2b.v`：新增 `AD_PTE`/`AD_PTER` 两级 —— PTE 读**借数据适配器 + L1D 端口**完成（`pte_req_ready = pte_rd_go_w`、`pte_resp_valid/data` 取自 L1D 读命中拍）；入口两处：`AD_IDLE`（取指侧遍历，数据侧空闲）与 `AD_TR`（数据侧遍历期间嵌套服务，读完回 `AD_TR`）；PTE 地址是 **PA、不再翻译**，且 `AD_PTE` 拍**强制 `cs_we=0`**（否则会拿上一笔 store 的数据写 PTE 行）；`AD_PTER` 等 L1D 自填后重发。**AXI 侧删除该源**（`g_pte=0`，XIP/L1I 填充不再被 PTE 读抑制） |
+| ② | **L1D 改 PIPT**（本段实测抓出的真实缺陷） | 原 `cs_vaddr = {PA[31:12], VA[11:0]}`（物理 tag + 虚拟 index）与 Bare 路径**不同源**：Bare 用 PA 同时定 index/tag，Sv32 用 VA 定 index ⇒ 同一 PA 因访问路径不同落到**不同组**（实测：译后 load 命中到别的数据槽 0x55667788，而非自己的 0x11223344）。**定案：index 与 tag 同源取 PA**（本 L1D 几何 256 组 × 32 B：index=addr[12:5]、tag=addr[31:13]）⇒ 同一 PA 恒同一行、VA 重映射 ⇒ PA 变 ⇒ 必然 miss。Bare 下与旧实现逐位相同 |
+| ③ | **PTW 中止（kill）缺口** | `ptw_kill_w` 除"数据优先抢占取指遍历"外，**加 `be_trp_flush`**（陷阱/xRET/维护整机冲刷）—— 2A `m_kill_fsm = trap_valid \| xret_redirect \| fencei_hold \| …` 同口径。否则适配器被 kill 后不再回 PTE 响应 ⇒ PTW 永停 `S_L1_W/S_L0_W` ⇒ 全网挂死 |
+| ④ | **A/D 口径（按 2A 定案：SVADE=1）** | `rtl/csr/ptw.v:50-58`：`SVADE=1` 是**默认且 2A core_top 明确采用** ⇒ A=0（或写且 D=0）**直接 page-fault 交软件置位**，**不存在硬件 A/D 写通路**（`pte_ad_done` 仅 SVADE=0 时可达）。⇒ 母代理任务书 ③ 的"§5 引擎第 7 源"**按 2A 口径不需要做**；p13 的 A/D 判据改为"程序置位 + 回读一致"+"A=0 ⇒ 页错误（不挂死）"，**判据更强**（实测两次页错误 cause 均为 13、mtval 分别为 0x4000_1000/0x4000_2000 ✓） |
+| ⑤ | **p13 判据（12 项中 11 项已过）** | 见 §B4.20.2：两级页表翻译链、两次精确页错误、`mtval`=VA、直读 PA 一致、PTE A/D 回读一致、精确返回 —— 均已实测通过 |
+
+## B4.20.2 p13 实测（未挂回）：11/12 过，唯一残留 = sfence 后重映射
+
+```
+idx=49  lw s5  (VA 0x4000_0100 → PA l1 页+0x100) = 0x11223344   ✔ 翻译后 load
+idx=53  lw s6  （译后 store→load）              = 0xDEADBEEF   ✔
+idx=55/56  mcause=13, mtval=0x4000_1000（V=0 未映射）           ✔ 精确页错误 #1
+idx=63/64  mcause=13, mtval=0x4000_2000（**A=0 ⇒ SVADE**）      ✔ 精确页错误 #2
+idx=85  lw s10 （关 MPRV 直读 PA）              = 0xDEADBEEF   ✔
+idx=86  lw s11 （PTE 回读）                     = 0x2000_9CC7  ✔ A/D 置位回读一致
+idx=81  lw s9  （**sfence 重映射后**同 VA）      = 0xDEADBEEF ✘ 期望 0x55667788
+[维护计数] maint=2 tlb_sfence=2 l1d_inval=0 l1d_clean=0
+```
+
+* **PTE 读连贯性已达成**（①的证据）：`[p13-pte]` 打点显示遍历读到的正是程序写入的 PTE
+  （`0x80026400→0x2000_9C01`、`0x80027000→0x2000_9CC7`、`0x80027008→0x2000_9C07`），
+  A=0 的那笔因此**正确判页错误**（而非像 4b-2b 时读到内存旧值/挂死）。
+* **唯一残留**：`sfence.vma` **已提交且两次 flush 脉冲都发出**（`maint=2 tlb_sfence=2`），
+  但重映射后的 load 仍得到旧翻译 ⇒ **TLB 保留了旧表项**，且其后**没有任何 PTE 读**
+  （打点无新记录）⇒ 不是"重填后再次陈旧"，而是"flush 未真正清掉该表项"。
+  最可疑点：`tlb.v:375-384` 的 **flush 与 fill 在同一 always 块、fill 覆盖 flush**
+  （注释自述"失效优先，填充覆盖"）⇒ 只要该 VPN 的 walk 恰在 flush 拍回填，旧表项即复活。
+  **下一步（一步判定实验）**：在 flush 脉冲拍打印 `tlb` 内部 `v_bit[i]/vpn[i]` 与该拍
+  `fill_valid/fill_va`（或对同一 VA 前后各放一次 sfence 并观察 TLB 命中计数
+  `hit_count_o/miss_count_o`），即可判定"未清"还是"清了又被同拍回填"。
+
+## B4.20.3 遗留与下一步
+
+1. **sfence 后重映射**（上述唯一残留）—— 建议先做 §B4.20.2 的一步判定实验；若判定为
+   "fill 覆盖 flush"，修法是在 `tlb.v` 的 flush 分支后**禁止同拍 fill 写同一 VPN**
+   （属 2A 文件 ⇒ 需母代理批准的最小加法，或改为"flush 延后一拍生效"的 2B 侧规避）。
+2. **store page fault 精确化**（任务书 ②，本段未做）：本核 store 在**提交点之后**才排空
+   （CDQ ⇒ 适配器）⇒ 翻译/页错误发生在提交后，**不精确**。设计（供下一段）：
+   · 在 LSU 的执行期（E1 地址生成后）为 store 发一路"**翻译专用**"请求（`st_xlate_*`：
+     VA + we + ROB 索引），适配器复用 `AD_XLATE/AD_TR` 服务；
+   · 把翻译得到的 **PA 写入 STQ 项**（`stq_pa`），CDQ 排空口直接用 PA（不再翻译）；
+   · 该路请求返回页错误 ⇒ 经 LSQ 的 `exc_*` 通道（cause 15 = store page fault、tval=VA）
+     精确上报 —— 与 4b-2b 已建成的 `upd_exc` 通路同构。
+3. **L1D 维护写回**（任务书 ① 后半，本段未做）：`clean_all` 只清 dirty、`inval_all` 只清 valid，
+   都**不写回**（§B4.18 在册）。**本段已使 PTE 读经 L1D ⇒ 页表写在遍历中可见，该缺口不再阻塞
+   Sv32**；它仍然影响 `cbo.clean/flush` 的内存可见性与 `cbo.flush` 的 INVAL 部分
+   （建议与 §B4.18 的 flush INVAL 合并为同一处 2A 最小加法）。
+4. **L1I 侧同类风险**：L1I 也是 VIPT（取指地址若为 PA、index 取 VA 会同类不同源）；本段只改了
+   L1D 的数据口，L1I 的译后取指路径建议下一段按同一 PIPT 口径复核（fence.i 已能兜底失效）。
+
+## B4.20.4 本段检查点状态
+
+* 编译 **0 error**；`tb_core_top_2b` **103/103 PASS**（`../.b2chk/final_103_c.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b2c.log`）；2A 文件**零修改**（`l1d.v` 未动）；
+  未提交 git；快照 `../.b2chk/*.s32`（含 WIP：`tb_core_top_2b.sv.s32wip`、`back2_p13_sv32.S.s32wip`）。
+* 改动文件：`rtl/top/core_top_2b.v`（AD_PTE/AD_PTER + PTE 读经 L1D + PIPT + `ptw_kill` 补冲刷 +
+  `cs_we` 屏蔽）；TB/生成器**已还原到 p12/p13 未挂回态**（9 槽 / 103 项）。
+* 一句话：**PTE 读连贯性达成（第一优先完成），并顺带修掉 VIPT 伪命中与 PTW 中止两个真实缺陷；
+  A/D 按 2A 口径定案为软件置位（不做硬件写通路）；p13 仅剩"sfence 后 TLB 未清干净"一项，
+  已收窄到 flush/fill 交叠并给出一判定实验。**

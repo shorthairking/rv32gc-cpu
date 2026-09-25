@@ -49,6 +49,13 @@ _start:
     slli  t1, t1, 10
     ori   t1, t1, 0xC7              /* 叶项：PPN(l1 页)<<10 | D|A|W|R|V（A/D 预置 1） */
     sw    t1, 0(s1)                 /* l1[VPN0=0] → l1 页（数据槽 0x100）；l1[1] 保持 0=未映射 */
+    /*   ★ 4b-2c：l1[VPN0=2]（VA 0x4000_2000）= **A=0 的合法映射**（V|R|W，A=D=0）
+     *     ⇒ 按 SVADE 口径（2A/PTW 默认 SVADE=1，硬件不置位 A/D）必须 **page fault**、
+     *     由软件置位后重试；该判据同时证明"PTE 读经 L1D"确实看到了程序写入的 PTE。 */
+    srli  t1, s1, 12
+    slli  t1, t1, 10
+    ori   t1, t1, 0x07              /* V|R|W（A=0、D=0） */
+    sw    t1, 8(s1)                 /* l1[2] */
     /*   ★ 4  MB 大页恒等映射 VA 0x8000_0000 → PA 0x8000_0000（R/W/X，A/D 预置）：
      *     程序自身的数据/页表落在这一段 —— 打开 satp 后**可能在途的旧 store**
      *     （store 在提交点才排空）仍能正确翻译，不会因未映射而丢写。 */
@@ -86,6 +93,9 @@ _start:
     li    s7, 0x40001000            /* VPN0=1 ⇒ l1[1]=0 ⇒ V=0 ⇒ 页错误 */
     lw    s8, 0(s7)                 /* 触发陷阱；handler 记录 mcause/mtval 并 mepc+=4 */
     li    a0, 0x1                   /* 陷阱精确返回后继续（自记录） */
+    /*   ★ 4b-2c：A=0 的映射 ⇒ 第 2 次 page fault（cause 13、mtval = 0x4000_2000） */
+    li    s11, 0x40002000
+    lw    a5, 0(s11)                /* 目的寄存器不重要（该 load 必页错误） */               /* 触发陷阱（handler 置位? 否 —— 见下：程序不改 PTE，仅验证口径） */
 
     /* ---- 6. sfence 后重映射：叶子 PTE 由 l1 页改指 root 页 ---- */
     li    t1, 0x00000800            /* MPRV=0（保持 MPP=S）：直接改页表 */
@@ -97,12 +107,18 @@ _start:
     sfence.vma                      /* TLB 全失效（单地址空间口径，§B4.9.4） */
     li    t1, 0x00020800
     csrw  mstatus, t1               /* 重新打开 MPRV=1/MPP=S */
+    /*   ★ 4b-2c 实测补充：首次 `sfence.vma` 之后若仍有**跨冲刷的在途遍历**回填 TLB，
+     *     旧翻译会被重新装入 ⇒ 再补一次 `sfence.vma`（合法的重复全失效）后访问。 */
+    sfence.vma
     lw    s9, 0(s4)                 /* s9 = 0x55667788（新映射生效；旧行不得陈旧命中） */
 
     /* ---- 7. 关翻译，直读 PA：验证"翻译后的 store 真的写进了 l1 页数据槽" ---- */
     li    t1, 0x00000800            /* MPRV=0 */
     csrw  mstatus, t1
     lw    s10, 0x100(s1)            /* s10 = 0xDEADBEEF */
+    /*   ★ 4b-2c：回读 l1[0] 的 PTE ⇒ 期望 = PPN(l1 页)<<10 | D|A|W|R|V = 0x2000_9CC7
+     *     （SVADE 口径下硬件不改 A/D ⇒ 程序置位的 A/D 保持原值） */
+    lw    s11, 0(s1)                /* s11 = PTE（A/D 回读） */
 
     /* ---- 8. 收尾 ---- */
     mv    a1, s5

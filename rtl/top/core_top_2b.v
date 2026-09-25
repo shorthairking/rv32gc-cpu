@@ -367,6 +367,11 @@ module core_top_2b (
     //   ★ 4b-2b：状态码扩到 3 bit（新增 AD_XLATE/AD_TR —— 2 bit 会截断成 0/1 与 IDLE/REQ 撞车）
     localparam [2:0] AD_IDLE = 3'd0, AD_REQ = 3'd1, AD_WAIT = 3'd2, AD_RETRY = 3'd3;
     localparam [2:0] AD_XLATE = 3'd4, AD_TR = 3'd5;     // ★ 4b-2b：数据侧翻译两级
+    //   ★★ 4b-2c：**PTE 读经 L1D**（同一缓存层次 ⇒ 页表写在遍历中可见）
+    //     · `AD_PTE`  ：借 L1D 端口读 PTE（地址是 **PA**，不再翻译）
+    //     · `AD_PTER` ：该 PTE 行缺失 ⇒ 等 L1D 自填完成（`idle`）后重发
+    //     · 数据侧在 `AD_TR` 等遍历、取指侧遍历时适配器空闲 ⇒ 两处都可进 `AD_PTE`
+    localparam [2:0] AD_PTE = 3'd6, AD_PTER = 3'd7;
 
     reg [2:0]   ad_st_q;
     reg         d_we_q;
@@ -399,10 +404,18 @@ module core_top_2b (
 
     //   PTW 请求仲裁（数据优先；取指在途被抢占时 `kill`）
     wire        ptw_req_ready_w;
+    //   ★★ 4b-2c：PTE 读的"宿主" = 数据适配器（借 L1D 端口）；见 §2c 说明
+    reg  [31:0] d_pte_pa_q;                 // 本笔 PTE 的物理地址
+    reg         d_pte_ret_q;                // 读完回哪：1 = 回 AD_TR（数据侧遍历）
     wire        d_ptw_want_w = (ad_st_q == AD_TR);
     wire        f_ptw_want_w = sv32_en & f_xlate_on_w & tr_req_valid & ~f_tlb_hit;
     wire        ptw_free_w   = ptw_req_ready_w;              // PTW 空闲（可接受新请求）
-    wire        ptw_kill_w   = d_ptw_want_w & ~ptw_free_w & ptw_owner_fetch_w;
+    //   ★★ 4b-2c：`kill` 还需覆盖**整机冲刷**（陷阱/xRET/维护）—— 否则适配器被 kill 后
+    //     不再回 PTE 响应，PTW 会永远停在 S_L1_W/S_L0_W（`req_ready` 恒 0 ⇒ 全网挂死）。
+    //     2A `m_kill_fsm = trap_valid | xret_redirect | fencei_hold | sfence_sync_pending`
+    //     同口径（core_top.v:1793-1796）。
+    wire        ptw_kill_w   = (d_ptw_want_w & ~ptw_free_w & ptw_owner_fetch_w) |
+                               be_trp_flush;
     wire        ptw_req_v_w  = d_ptw_want_w | (f_ptw_want_w & ~d_ptw_want_w);
     wire [31:0] ptw_req_va_w = d_ptw_want_w ? d_va_q : tr_req_va;
 
@@ -771,7 +784,14 @@ module core_top_2b (
     );
 
     // 请求发射：AD_REQ 拍恰好一次（重试时等 L1D 回到 IDLE）
-    wire        l1d_cs_req_w = (ad_st_q == AD_REQ);
+    //   ★★ 4b-2c：`AD_PTE` 也用同一端口做 PTE 读（地址=PA：paddr/vaddr 都给 PA，
+    //     index 段即物理索引 ⇒ 与数据侧"物理 tag + 虚拟 index"的口径一致）
+    wire        l1d_cs_req_w = (ad_st_q == AD_REQ) | (ad_st_q == AD_PTE);
+    wire [31:0] l1d_cs_a_w   = (ad_st_q == AD_PTE) ? d_pte_pa_q : d_a_q;
+    //   PTE 读接受判据：适配器空闲（或正等遍历）且 L1D 空闲
+    wire        pte_rd_go_w  = ((ad_st_q == AD_IDLE) | (ad_st_q == AD_TR)) &
+                               ptw_pte_req_valid & l1d_idle &
+                               ~((ad_st_q == AD_IDLE) & d_start);
     wire [31:0] d_rdata_w    = d_unc_q ? d_unc_rdata_w : l1d_cs_rdata;
     //   ★★ 4b-2b：**数据侧翻译故障**（TLB 权限错 / PTW 故障）⇒ 以"正常响应 + err=1"
     //     回一笔（tag 仍是该 load 的标签）⇒ LSQ 标 done+异常 ⇒ ROB 精确抛页错误。
@@ -790,13 +810,23 @@ module core_top_2b (
 
     l1d #(.OWNER_D_FILL(2'd1), .OWNER_WRBACK(2'd2)) u_l1d (
         .clk(aclk), .rst_n(aresetn),
-        .cs_req(l1d_cs_req_w), .cs_we(d_we_q), .cs_wstrb(d_strb_q),
-        //   ★★ 4b-2b：L1D 是 **VIPT**（`cs_vaddr` 同时出 index 与 tag，见 l1d.v:112-113/480-481）
-        //     ⇒ Sv32 下必须把**物理 tag** 送进去（否则同一 VA 重映射后命中旧行 ⇒ 陈旧数据）：
-        //       tag 段用 PA[31:12]（页对齐标签）、index 段用 VA[11:0]（本 L1D 几何：
-        //       128 组 × 32 B 行 ⇒ index = VA[11:5]、tag = addr[31:12]）。
-        //     Bare（VA==PA）时该复合式与 `d_a_q` 逐位相同 ⇒ 既有行为不变。
-        .cs_paddr(d_a_q), .cs_vaddr({d_a_q[31:12], d_va_q[11:0]}), .cs_wdata(d_d_q),
+        //   ★ PTE 读恒为**读**：`AD_PTE` 拍必须屏蔽 `d_we_q`（否则会拿上一笔 store 的
+        //     数据/使能去写 PTE 行 —— 静默破坏页表）
+        .cs_req(l1d_cs_req_w), .cs_we((ad_st_q == AD_PTE) ? 1'b0 : d_we_q),
+        .cs_wstrb(d_strb_q),
+        //   ★★ 4b-2b/2c：L1D 是 **VIPT**（`cs_vaddr` 同时出 index 与 tag，见 l1d.v:112-113/480-481）
+        //     ⇒ Sv32 下必须把**物理 tag** 送进去（否则同一 VA 重映射后命中旧行 ⇒ 陈旧数据）。
+        //   ★★ 4b-2c 定案（p13 两轮实测抓出）：**index 与 tag 必须同源 = 都用 PA**（PIPT）。
+        //     本 L1D 几何 = 256 组 × 32 B 行：index = addr[12:5]、tag = addr[31:13]
+        //     （`l1d.v:42-44`）。若 index 取 VA、tag 取 PA，则**同一个 PA 会因访问路径不同
+        //     落到不同组**：Bare 访问（VA==PA）落到 [PA12:5]，而 Sv32 翻译后访问落到 [VA12:5]
+        //     ⇒ 两次访问互不可见 + 伪命中（实测：译后 load 命中到根页数据槽 0x55667788，
+        //     而非它自己的 0x11223344；重映射后仍读旧值）。
+        //     全 PA（PIPT）后：index/tag 都由 PA 决定 ⇒ 同一 PA 恒同一行 ✓、
+        //     VA 重映射 ⇒ PA 变 ⇒ index/tag 变 ⇒ 必然 miss（不陈旧命中）✓。
+        //     Bare（VA==PA）下与旧实现逐位相同 ⇒ 既有判据零影响。
+        .cs_paddr(l1d_cs_a_w), .cs_vaddr(l1d_cs_a_w),
+        .cs_wdata(d_d_q),
         .cs_ready(l1d_cs_ready), .cs_rdata(l1d_cs_rdata),
         .cs_miss(l1d_cs_miss), .cs_stall(l1d_cs_stall), .cs_wr_done(l1d_cs_wr_done),
         .fill_req(l1d_fill_req), .fill_paddr(l1d_fill_paddr), .fill_owner(l1d_fill_owner),
@@ -827,7 +857,12 @@ module core_top_2b (
                 ad_st_q <= AD_IDLE;
             end else case (ad_st_q)
                 AD_IDLE: begin
-                    if (d_start) begin
+                    if (pte_rd_go_w) begin
+                        //   ★ 4b-2c：取指侧遍历的 PTE 读（数据侧空闲）
+                        d_pte_pa_q  <= ptw_pte_req_pa;
+                        d_pte_ret_q <= 1'b0;
+                        ad_st_q     <= AD_PTE;
+                    end else if (d_start) begin
                         d_we_q   <= lsu_req_we;
                         d_d_q    <= lsu_req_d;
                         d_strb_q <= lsu_req_strb;
@@ -858,9 +893,25 @@ module core_top_2b (
                         ad_st_q <= AD_TR;               // 缺失 ⇒ 向 PTW 发请求
                     end
                 end
+                AD_PTE: begin
+                    //   ★ 4b-2c：PTE 读（L1D 读命中 ⇒ 当拍回响应；缺失 ⇒ 等自填后重发）
+                    if (l1d_cs_ready) begin
+                        ad_st_q <= d_pte_ret_q ? AD_TR : AD_IDLE;
+                    end else if (l1d_cs_miss) begin
+                        ad_st_q <= AD_PTER;
+                    end
+                end
+                AD_PTER: begin
+                    if (l1d_idle) ad_st_q <= AD_PTE;
+                end
                 AD_TR: begin
                     //   等本笔遍历结束（归属必须是数据侧 —— 取指侧的 done 不算）
-                    if (ptw_req_done & ~ptw_owner_fetch_w) begin
+                    if (pte_rd_go_w) begin
+                        //   ★ 4b-2c：数据侧遍历期间的 PTE 读（读完回 AD_TR 继续等）
+                        d_pte_pa_q  <= ptw_pte_req_pa;
+                        d_pte_ret_q <= 1'b1;
+                        ad_st_q     <= AD_PTE;
+                    end else if (ptw_req_done & ~ptw_owner_fetch_w) begin
                         if (ptw_fault) begin
                             ad_st_q <= AD_IDLE;         // 本拍已回"带错响应"
                         end else begin
@@ -924,12 +975,13 @@ module core_top_2b (
     wire        g_wrbk = i_free &  l1d_wb_req;
     wire        g_dfil = i_free & ~l1d_wb_req &  l1d_fill_req;
     wire        g_dunc = i_free & ~l1d_wb_req & ~l1d_fill_req & (d_unc_rd | d_unc_wr);
-    wire        g_pte  = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
-                         ptw_pte_req_valid;
+    //   ★★ 4b-2c：**PTE 读不再走 AXI**（改经 L1D）⇒ 本引擎删去该源（`g_pte` 恒 0），
+    //     且 XIP/L1I 填充**不再**被 PTE 读抑制（原先的 `~ptw_pte_req_valid` 项一并删掉）。
+    wire        g_pte  = 1'b0;
     wire        g_xipf = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
-                         ~ptw_pte_req_valid & xip_req_go;
+                         xip_req_go;
     wire        g_ifil = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
-                         ~ptw_pte_req_valid & ~xip_req_go & l1i_fill_req;
+                         ~xip_req_go & l1i_fill_req;
 
     wire        i_req_v   = g_wrbk | g_dfil | g_dunc | g_pte | g_xipf | g_ifil;
     wire        i_req_wr  = g_wrbk | d_unc_wr;
@@ -951,7 +1003,8 @@ module core_top_2b (
     assign l1d_fill_accepted = i_fire & (i_own_new == IOWN_DFIL);
     assign l1i_fill_accepted = i_fire & (i_own_new == IOWN_IFIL);
     assign l1d_wb_accepted   = i_fire & (i_own_new == IOWN_WRBK);
-    assign pte_req_ready_w   = i_fire & (i_own_new == IOWN_PTE);
+    //   ★★ 4b-2c：PTE 读握手改由**数据适配器**给（见 §2c / AD_PTE）
+    assign pte_req_ready_w   = pte_rd_go_w;
 
     // R 拍：`r_fire_w` = R 握手拍
     wire        r_fire_w = rvalid & rready;
@@ -1015,8 +1068,9 @@ module core_top_2b (
     assign l1i_fill_data     = rdata;
     assign l1i_fill_word_idx = i_cnt_q;
     assign l1i_fill_done     = r_fire_w & (i_own_q == IOWN_IFIL) & (i_cnt_q == i_last_q);
-    assign pte_resp_valid_w  = r_fire_w & (i_own_q == IOWN_PTE);
-    assign pte_resp_data_w   = rdata;
+    //   ★★ 4b-2c：PTE 读响应来自 L1D（不再是 AXI 读数据）
+    assign pte_resp_valid_w  = (ad_st_q == AD_PTE) & l1d_cs_ready;
+    assign pte_resp_data_w   = l1d_cs_rdata;
 
     // ---- 写拍分发（L1D 写回：逐字取行缓冲；uncached store：单 beat）----
     assign l1d_wb_word_idx = i_cnt_q;
