@@ -98,20 +98,15 @@ _start:
     li    a0, 0x1                   /* 陷阱精确返回后继续（自记录）*/
 
     /* ---- 6. 关翻译，直读 PA：确认"未污染 + 译后 store 已落地" ----
-     *   ★★ **CSR 可见性串行化**（本程序实测踩到，属 RTL 已知边界，见报告 §B4.26.5）：
-     *     本核 CSR 只在提交点更新，而访存的翻译上下文在**执行期**读取 ⇒ 若下面的 load
-     *     在 `csrw mstatus` 提交**之前**执行，会按**旧的** MPRV=1/MPP=U 去翻译（而这段
-     *     代码本应"Bare 直读 PA"）⇒ 误报 load 页错误。修法（程序侧、不改判据）：
-     *     让访存地址**数据依赖**于一条 `csrr mstatus`（CSR 指令只在 ROB 头发射 ⇒ 其数据
-     *     依赖者必然晚于更老的 `csrw` 提交）。 */
+     *   ★★ 本段（`csrw mstatus` 后**紧跟**两条 load）**就是"CSR 写后紧跟访存"的独立用例**：
+     *     修复前 load 会在 `csrw` 提交前执行、按旧的 MPRV=1/MPP=U 翻译（对 U=0 的恒等大页
+     *     ⇒ 误报 load 页错误 cause 13、陷阱计数变 2 ⇒ C15'-1 红）；修复后由 RTL 互锁
+     *     （`backend_top` 的 `csr_pend_q`/`csr_ld_block_w`）保证年轻 load 等更老的 CSR 提交。
+     *     故此处**不再需要**任何程序侧串行化（原 `csrr/andi/add` 依赖链已删除）。 */
     li    t1, 0x00000800            /* MPRV=0 */
     csrw  mstatus, t1
-    csrr  t2, mstatus               /* ★ 串行化读（ROB 头执行）*/
-    andi  t2, t2, 0                 /* t2 = 0（依赖 CSR 读回值）*/
-    add   s2, s1, t2                /* s2 = s1（地址依赖链）*/
-    lw    s10, 0x100(s2)            /* s10 = 0xDEADBEEF（译后 store 落地）*/
-    add   s3, s1, t2                /* s3 = s1 */
-    lw    s11, 0(s3)                /* s11 = PTE 回读（未映射页的 store 不得改动它）*/
+    lw    s10, 0x100(s1)            /* s10 = 0xDEADBEEF（译后 store 落地）*/
+    lw    s11, 0(s1)                /* s11 = PTE 回读（未映射页的 store 不得改动它）*/
 
     /* ---- 7. 收尾：把自记录值送进写回轨迹（供 TB 硬编码判据 + 黄金比对）---- */
     mv    a1, s5                    /* a1 = 0x11223344 */

@@ -4498,3 +4498,71 @@ t=13625 ... mact=1                                            ← 维护动作�
   未提交 git；快照 `../.b2chk/*.s44`。
 * **边界更新**：① L1I `inval_all` 已接 ✓（该边界关闭）；② CSR 可见性 load 侧**仍开放**（见 §B4.28.3，
   比 §B4.26.4 的描述更精确：窗口是"CSR 执行之前"，不是"执行→提交"之间）。
+
+---
+
+# B4.29 CSR 可见性 load 侧根治（ROB 年龄比较互锁）+ p14 去规避
+
+> 起点 = 母代理已验收提交 `0e353d6`（tag 2B-4.27）。**边界 §B4.28.3 / §B4.26.4 边界 1：关闭** ✓
+> 检查点：`tb_core_top_2b` **148/148 PASS**（p14 **已去程序侧规避**）；`regress.sh` **32/32 PASS**；
+> 2A 零修改；未提交 git；快照 `../.b2chk/*.s45`。
+
+## B4.29.1 互锁 diff（`rtl/back2/backend_top.v`，两处）
+
+**① 跟踪寄存器 + 发射门**（声明在 §9 发射门之前，driver 在 CSR 提交区）：
+```verilog
+reg        csr_pend_q;      // 有"最老未提交 CSR 指令"
+reg  [6:0] csr_pend_rob_q;  // 它的 ROB 索引
+wire [6:0] csr_age_w      = (i4_sel_rob - csr_pend_rob_q) & 7'h7F;          // 年龄窗口算术（B27 口径）
+wire       csr_ld_block_w = csr_pend_q & (csr_age_w != 7'h0) & (csr_age_w < 7'h40);
+wire lsu_ld_block = u_is_ld(i4_sel_uop) & (~lsu_iss_ok_w | csr_ld_block_w);  // 追加"更老 CSR 在途"
+```
+`u_iq4` 的 `.iss_ready(~lsu_ld_block)` 不变 ⇒ **只挡 load**（store 的地址生成不能被挡，见该处既有注释）。
+
+**② 跟踪时序**（放在 `csr_cmt_we` 定义之后的 CSR 提交区）：
+* **派发**（`disp_ok`，块内 lane 0 最老）：本块有 CSR 且当前无在途 ⇒ 记下其 ROB 索引（`rob_alloc_idx0 + lane`）；
+* **清除**：`flush_all_w` 整机冲刷 / 该 CSR 被 `squash_v_w` 冲掉（年龄比较，B27 口径）/ **该 CSR 已提交**（`csr_cmt_we` ⇒ CSR 状态已更新）；
+* 同一拍"清 + 派发"：派发赋值在后 ⇒ 覆盖为新的那条 ✓。
+
+**为什么必须是"年龄比较"而不是"exec→commit 窗口"**：CSR 指令虽只在 ROB 头执行（`al0_csr_blk`），
+但**年轻 load 可以在它执行之前**就发射（CSR 在 ALU0 等 ROB 头；load 在 LSU 队列只要操作数就绪即可发，
+两者无数据依赖）⇒ 只在 exec→commit 窗口挡 load 无效。本互锁按"候选 load 是否比最老未提交 CSR 更年轻"
+判定，覆盖整个"派发→提交"窗口 ✓。
+
+## B4.29.2 ③ p14 去程序侧规避（独立用例 = 该段本身）
+
+`back2_p14_storepf.S` §6 恢复自然形态（删除原来的 `csrr mstatus; andi t2,t2,0; add s2,s1,t2` 依赖链）：
+```asm
+    li    t1, 0x00000800            /* MPRV=0 */
+    csrw  mstatus, t1
+    lw    s10, 0x100(s1)            /* ★ csrw 后**紧跟** load —— 本用例的核心 */
+    lw    s11, 0(s1)
+```
+该段即"CSR 写后紧跟访存"的独立用例：修复前这两条 load 会在 `csrw` 提交前执行、按旧的
+MPRV=1/MPP=U 翻译（对 U=0 的恒等大页 ⇒ 误报 load 页错误 cause 13、陷阱变 2 次）⇒ `C15'-1` 必红。
+判据沿用 C15' 13 项（**未放宽**）＋通用 C1'/C3' 黄金比对（映像已重生成，golden=74 条）。
+
+## B4.29.3 反证（必红后还原，日志留证）
+
+把 `csr_ld_block_w` 临时接成 `1'b0` ⇒
+`FAIL: 程序 10 第 62 条 PC=0x80028110 期望 0x800280e0` + `FAIL: C1' 程序 10`（提交 PC 流偏离 Spike 黄金：
+多了一次 load 页错误陷阱）—— `../.b2chk/csr_counterproof.log`（退出码 1）⇒ 互锁**确实**在起作用 ✓ 已还原。
+
+## B4.29.4 时序变化登记（p8/p10）
+
+**无判据变化**：`tb_core_top_2b` **148/148**（含 C8' 的固定拍数判据、C10' 的 CSR 轨迹判据）与
+`regress.sh` **32/32** 全绿，**没有**出现需要按规程重定的性能类判据 —— 原因：互锁只在"更老的 CSR
+指令**已派发但未提交**"这一短窗口内挡年轻 load（CSR 指令通常很快到 ROB 头 ⇒ 1~2 拍量级），
+且只挡**比它年轻**的 load（更老的 load 照常）✓ 故 p8（中断时序）/p10（大量 CSR）时序未发生可观测变化。
+
+## B4.29.5 检查点
+
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**（`../.b2chk/i2.log`：`[C15'] … ✓` +
+  `检查项合计 148 项全部满足`）；反证日志 `../.b2chk/csr_counterproof.log`（红）。
+* `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c16.log`）。
+* 改动：`rtl/back2/backend_top.v`（互锁两处）、`sim/unit/prog/back2_p14_storepf.S`（去规避）、
+  `sim/unit/prog/back2_lockstep_data.svh`（重生成：仅 slot 13 变化 ✓ 已核对）、`sim/unit/back2_report.md`。
+  **2A 零修改**；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s45`（含 `backend_top.v.pre3`）。
+* **边界关闭**：CSR 可见性（load 侧）✓ —— §B4.26.4 边界 1 / §B4.28.3 关闭。
+* **剩余登记**：L1D/L1I 无复位、跨程序陈旧行（TB 侧递进基址规避）；cbo.inval 破坏性语义（Zicbom 允许）；
+  store 侧上下文仍按"提交拍权威判定 + 提交门 + 重译"（§B4.25/§B4.26）—— 与本互锁互补。

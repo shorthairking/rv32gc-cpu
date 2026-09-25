@@ -999,7 +999,18 @@ module backend_top #(
     //     必须放行，否则队头 store 永远算不出地址 ⇒ STQ 永远存在未定址项 ⇒ `iss_ok`
     //     恒 0 ⇒ 自锁（实测：程序尾 `sw x31,0(x30)` 停在 ROB 头 `hdone=0`、LSU 队列
     //     `sel=1/iss=0`、`stq=1`、后端永久停顿）。q4_ready 供观察，iss_ready 用新判据。
-    wire lsu_ld_block = u_is_ld(i4_sel_uop) & ~lsu_iss_ok_w;
+    //   ★★ 4b-2c 收尾（CSR 可见性 load 侧根治）：**更老的未提交 CSR 指令在途时，年轻 load
+    //     不得发射**。机理：CSR 只在提交点更新，而访存的翻译上下文在执行期读取；CSR 指令虽
+    //     "只在 ROB 头执行"（`al0_csr_blk`），但年轻 load 可以在它执行**之前**就发射（两者属
+    //     不同队列、无数据依赖）⇒ load 会按旧的 MPRV/priv 翻译（实测 p14：误报 cause 13）。
+    //     判据：`csr_pend_q`（有未提交 CSR）+ 候选 load 的 ROB 比它**更年轻**（年龄窗口算术，
+    //     B27 口径：`(a-b)&0x7F` ∈ (0, 64) 即"a 在 b 之后、且未绕环"）。
+    //     跟踪寄存器/组合信号在此声明（driver 见 §12 后的 CSR 提交区）。
+    reg        csr_pend_q;      // 有"最老未提交 CSR 指令"
+    reg  [6:0] csr_pend_rob_q;  // 它的 ROB 索引
+    wire [6:0] csr_age_w      = (i4_sel_rob - csr_pend_rob_q) & 7'h7F;
+    wire       csr_ld_block_w = csr_pend_q & (csr_age_w != 7'h0) & (csr_age_w < 7'h40);
+    wire lsu_ld_block = u_is_ld(i4_sel_uop) & (~lsu_iss_ok_w | csr_ld_block_w);
     wire [2:0] q4_ready = ~lsu_ld_block;
     wire [2:0] q5_ready = fpu_free_w ? 3'd1 : 3'd0;
 
@@ -1484,6 +1495,38 @@ module backend_top #(
         end
     end
     // fflags 累积写入（FPU 结果提交时），与 CSR 写并路：地址 0x001 用"读改写"
+    //   ★★ CSR 可见性互锁的**跟踪**（见 §9 发射门处的声明/说明）
+    //     · 派发（`disp_ok` 块内 lane 0 最老）：本块有 CSR 且当前无在途 ⇒ 记下它的 ROB 索引；
+    //     · 清除：整机冲刷 / 该 CSR 被 squash / 它**已提交**（CSR 状态已更新 ⇒ 年轻访存可放行）；
+    //     · 同一拍"清 + 派发"：后面的派发赋值覆盖 ⇒ 取新的那条（块内最老）✓
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            csr_pend_q     <= 1'b0;
+            csr_pend_rob_q <= 7'h0;
+        end else begin
+            if (flush_all_w) begin
+                csr_pend_q <= 1'b0;
+            end else if (squash_v_w && csr_pend_q &&
+                         (((csr_pend_rob_q - rob_head_w) & 7'h7F) >
+                          ((squash_idx_w - rob_head_w) & 7'h7F))) begin
+                csr_pend_q <= 1'b0;                     // 该 CSR 在冲刷点之后 ⇒ 已不存在
+            end else if (csr_cmt_we) begin
+                csr_pend_q <= 1'b0;                     // 该 CSR 已提交 ⇒ CSR 状态已更新
+            end
+            if (disp_ok) begin
+                if (d1_v_q[0] & u_is_csr(d1_uop_q[0]) & ~csr_pend_q) begin
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0;
+                end else if (d1_v_q[1] & u_is_csr(d1_uop_q[1]) & ~csr_pend_q) begin
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd1;
+                end else if (d1_v_q[2] & u_is_csr(d1_uop_q[2]) & ~csr_pend_q) begin
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd2;
+                end else if (d1_v_q[3] & u_is_csr(d1_uop_q[3]) & ~csr_pend_q) begin
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd3;
+                end
+            end
+        end
+    end
+
     wire        csr_we_w    = csr_cmt_we | ff_cmt_any;
     wire [11:0] csr_waddr_w = csr_cmt_we ? csr_cmt_addr : 12'h001;
     //   ★★ 2B-4 第 4a 段缺陷修复：**CSR 立即数形式（csrrwi/csrsi/csrrci）的源**。
