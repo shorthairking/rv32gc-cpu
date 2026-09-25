@@ -3443,3 +3443,168 @@ idx=11 cbo.flush → idx=12/13 lw s3/s4 → 0 ✗
   TB/生成器/黄金与母代理验收态一致（p12 未挂回）⇒ 既有 91 项与锁步 57 项零回退。
 - 一句话：**CDQ 口径无需修改（首选修法被排除）；两支 kill 修法也被排除；根因改判为
   "冲刷清 STQ 后转发消失 × 已提交 store 尚未排空"的内存序缺口**，已给出两套修法与挂回判据。
+
+---
+
+# B4.18 内存序缺口修复 + p12 挂回收口（2B-4 第 4b-2a 段收口）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 p12 再定案 `3c6884b`=tag `2B-4.16`）
+> 结论：**§B4.17 的根因改判被本段波形证据推翻** —— 真正根因是 **`cbo.*` 动作码解码错误**
+> （按 `funct3` 区分，而真实编码 `funct3` 恒为 `010`、动作码在 `imm12[1:0]`）⇒ 三条 cbo 全被
+> 当成 `flush` ⇒ 顶层对**每次** cbo 同时拉 `inval_all`+`clean_all` ⇒ 2A L1D 走 inval 优先
+> ⇒ **整个 L1D 被"无写回失效"** ⇒ 已落地的脏 store 数据丢失。修掉解码 + 落实修法 1
+> （维护等"数据通道排空"再发动作）+ 保守 flush 口径后：**p12 4 次 load 全部读到 0x55667788**，
+> 判据 **91 → 103 项全绿**（9 程序；其中 C12' 4 项），`regress.sh` **32/32**，2A 文件**零修改**。
+
+## B4.18.1 定案证据（修复前：p12 维护脉冲波形，一次实验即判决）
+
+`DBG_P12=1` 打点（`sim/unit/tb_core_top_2b.sv`，默认关）：逐拍打印
+`ad_st_q / d_we_q / cs_req / cs_miss / l1d_cs_wr_done | inv_all / clean_all / l1d.maint_q /
+maint_clean_q / maint_idx_q / l1d.idle | be_trp_flush / dr_empty / dr_any / dr_fire`。
+
+```
+t=8858 st=0 a=0x00000000 | inv=1 cln=1 mq=0 mc=0 midx=0   idle=1 | flush=1 cdqe=1 drany=0   ← cbo.inval 提交拍
+t=8859 st=0              | inv=0 cln=0 mq=1 mc=0 midx=0   idle=0 | 扫描开始：mc=0 = **inval 模式**（inval 优先）
+t=8966 st=0              | inv=0 cln=0 mq=1 mc=0 midx=107 idle=0 | flush=0 cdqe=0 drany=1   ← store 卡在 CDQ（L1D 扫描中不排空）
+t=9116 st=1 we=1 a=0x80021000 csreq=1 ...                        ← 扫描结束，适配器接管该 store
+t=9117 st=2 we=1 miss=1                                          ← 写缺失 ⇒ L1D 自填
+t=9129 st=1 we=1 csreq=1                                         ← 填完重发
+t=9130 st=2 we=1 **wdone=1**                                     ← ★ store 写**已落进 L1D**（脏行）
+t=9132 st=1 we=0 csreq=1 a=0x80021000                            ← 紧随的 load 请求
+t=9137 st=0 a=0x80021000 | **inv=1 cln=1** mq=0 midx=255 idle=1 | flush=1 **cdqe=1 drany=0** ← cbo.clean 提交拍
+t=9410 st=0 a=0x80021000 | **inv=1 cln=1** mc=1 midx=255 idle=1 | flush=1 cdqe=1 drany=0   ← cbo.flush 提交拍
+```
+
+三条判决性事实：
+
+1. **三次 cbo 的维护脉冲全是 `inv=1 cln=1`**（inval+clean 同时拉高）⇒ 2A L1D
+   `maint_clean_q <= clean_all & ~inval_all` ⇒ **`mc=0`（inval 优先）** ⇒
+   `way_maint` 对全阵列 `wr_valid=0` ⇒ **无写回、整块失效**。
+2. **cbo.clean 提交拍 `cdqe=1 / drany=0`** ⇒ 该 store **早已从 CDQ 排空**（`wdone=1` 于 t=9130）
+   ⇒ **§B4.17"已提交 store 尚未排空"的改判被证伪**；数据丢失发生在 L1D **内部**。
+3. 失效之后再执行的 `lw s2/s3/s4` 必然 miss ⇒ 从内存取回旧值 **0**（内存里从未有过该数据：
+   2A L1D 的 clean 只清 dirty、无写回通道）⇒ 与"4 次 load 只有 1 次对"逐条吻合。
+
+## B4.18.2 根因（`cbo.*` 动作码解码错误，工具链实证 + 2A 口径背书）
+
+```
+$ riscv32-unknown-linux-gnu-objdump -d p12.elf
+80000010: 0004200f   cbo.inval (s0)      ← funct3=010, imm12[1:0]=00
+80000024: 0014200f   cbo.clean (s0)      ← funct3=010, imm12[1:0]=01
+8000002c: 0024200f   cbo.flush (s0)      ← funct3=010, imm12[1:0]=10
+```
+
+* **真实编码**：`cbo.*` = MISC-MEM(opcode 0x0F) + **`funct3 = 010`** + 动作码在 **`imm12[1:0]`
+  = `insn[21:20]`**（0=inval / 1=clean / 2=flush，`insn[31:22]=0`）。2A 译码器同口径：
+  `rtl/decode/decoder.v:361-369`「cbo.*：opcode=MISC-MEM、**f3=010**、f7=0000000、
+  **rs2 ∈ {inval,clean,flush}**」⇒ `cbo_valid_o` 本就正确。
+* **旧实现（本段修掉）**：`backend_top.maint_kind_f` 用 `t[14:12] == 000/001/010` 区分
+  inval/clean/flush ⇒ 前两支**永不命中**、第三支**恒命中** ⇒ 三条 cbo **全部**返回 `kind=5`
+  （"flush"）⇒ 顶层 `maint_l1d_inval_w = cbo & (kind != 4)`、`maint_l1d_clean_w = cbo & (kind != 3)`
+  对 `kind=5` **同时为 1** ⇒ 就是 B4.18.1 观测到的 `inv=1 cln=1`。
+* **同源的第二个偏差**：`cbo_ill_perm` 也按 `tval[14:12]==000` 判 inval ⇒ 永远走"需 CBCFE=1"
+  分支 ⇒ `menvcfg.CBIE=01` 且 `CBCFE=0` 时**合法的 `cbo.inval` 会被误判非法**。
+  p12 的 `menvcfg=0x70`（两位全开）把该偏差掩盖了，本段一并修正。
+
+## B4.18.3 修法 diff（4 处，均在 2B 范围内；2A 文件零修改）
+
+1. **`rtl/back2/backend_top.v` `maint_kind_f`**：cbo 三支改为
+   `(t[6:0]==7'h0F) & (t[14:12]==3'b010) & (t[19:15]!=0) & (t[31:22]==10'b0) & (t[21:20]==2'b00/01/10)`
+   ⇒ `kind = 3/4/5`（inval/clean/flush）；`fence.i`(1)/`sfence.vma`(2) 两支保持不变（不冲突）。
+2. **`rtl/back2/backend_top.v` `cbo_ill_perm`**：动作码改取 `tval[21:20]` ——
+   `==0`（inval）判 `cbo_perm_i[0]`（CBIE≠0），否则判 `cbo_perm_i[1]`（CBCFE=1）。
+3. **`rtl/back2/lsq_simple.v`**：新增输出 `dr_empty_o = ~dr_any`（`iss_ok` **未改**，仍为 `~any_unk_w`）
+   —— 只把"CDQ 空"这一事实引到后端/顶层做冲刷闸门。
+4. **`rtl/top/core_top_2b.v`（修法 1 落实）**：
+   * `backend_top.cdq_empty_o` → `cdq_empty_w`；维护 FSM 判据
+     **`maint_drain_w = cdq_empty_w & (ad_st_q == AD_IDLE)`**（CDQ 空 **且** 适配器无在途访问
+     ⇒ 最后一笔 store 的**写已落进 L1D**，因为适配器只在 `cs_wr_done` 那拍才回 IDLE）；
+   * 维护已提交但未排空 ⇒ `maint_wait_cdq_q=1`（期间 `be_trp_flush` 保持、前端冻结、
+     PC 保持），排空后**先发单拍动作脉冲 `maint_act_q`**，再走原 4 拍冻结窗口 + 末尾重定向；
+   * **动作码必须锁存**（`maint_kind_save_q`）：`maint_kind_w` 只在提交拍有效，动作脉冲在下一拍
+     ⇒ 实测用 `maint_kind_w` 会让动作码退化成 0（p11 的 2 次 sfence 维护动作全丢、`n_tlb_sfence=0`）；
+   * 维护口由动作脉冲驱动：`inval = act & (kind==3)`、`clean = act & (kind>=4)`、
+     `tlb_sfence = act & (kind==2)`；`fence.i` 路径不动（只刷 L1I，与数据序无关）；
+   * 加固：`d_ready_w = d_idle & ~l1d_busy_w & ~maint_act_q` —— 实测三次维护脉冲里两次与
+     "适配器接管一笔新访问"同拍（`st=AD_REQ/csreq=1`）⇒ 该访问会在下一拍与维护扫描第 0 组
+     （tag 写口 / dirty 清口）重叠 ⇒ 用 `~maint_act_q` 挡掉这一拍的接管。
+
+### 口径登记（保守 flush，**不放松任何判据**）
+
+`cbo.flush` 的 **INVAL 部分本段不实现**（`maint_l1d_inval_w` 只在 `kind==3` 拉高）：
+2A `l1d.v` 维护口只有 `inval_all`（清 valid，**不写回**）与 `clean_all`（清 dirty，保留 valid/数据）
+两条路，**没有"维护写回"通道** ⇒ 真 flush 必然丢掉已提交脏行（p12 实测 s3/s4 = 0）。
+本核为单核、无外部缓存代理（无 DMA/无多核共享）⇒ 取"**数据不丢**"的保守语义：flush 只 clean。
+**待办**：2A L1D 增加"维护写回"（逐组把脏路走既有 `wb_req` 通道）后，flush 才补 INVAL 并重挂判据。
+
+## B4.18.4 修复后波形与计数（同一实验，同一天平）
+
+```
+t=8861 | inv=1 cln=0 mq=0 mc=0 midx=0   idle=1 | flush=1 cdqe=1 drany=0   ← cbo.inval（只失效）
+t=9141 | inv=0 cln=1 mq=0 mc=0 midx=255 idle=1 | flush=1 cdqe=1 drany=0   ← cbo.clean（只清 dirty）
+t=9402 | inv=0 cln=1 mq=0 mc=1 midx=255 idle=1 | flush=1 cdqe=1 drany=0   ← cbo.flush（保守：只 clean）
+```
+
+* `[C12']` 计数：`维护提交 3 次；L1D inval 1 / clean 2 次；全程无陷阱；4 次 load 数据正确`
+  （= `[C12']` 四项判据原文）。
+* p12 提交轨迹：`sw 0x55667788` → `lw s1 = 0x55667788` → `cbo.clean` → `lw s2 = 0x55667788`
+  → `cbo.flush` → `lw s3 = lw s4 = 0x55667788`（4/4）。
+  逐条轨迹（`DBG_P12=1`）中 `rd ∈ {9,18,19,20}` 的写回**恰好 4 条**：
+  `idx=8 pc=0x8002_0020 wd=0x5566_7788`（`lw s1`）、`idx=10 pc=0x8002_0028`（`lw s2`）、
+  `idx=12 pc=0x8002_0030`（`lw s3`）、`idx=13 pc=0x8002_0034`（`lw s4`）
+  ⇒ `crk >= 4` 判据**没有"重执行掩盖错值"的余地**（4 次观测全对才算过）。
+* p11 维护程序基线 **42/42 条黄金**、TLB 失效 2 次、L1I 扫掠 512 拍、L1D 失效 0
+  ⇒ `sfence.vma` **不动 L1D** 的 K1'' 口径未回退。
+
+## B4.18.5 延迟代价登记（修法 1 的成本，实测）
+
+* 机制：维护提交 → （CDQ 排空 + 适配器空闲）→ 动作脉冲（+1 拍寄存）→ 4 拍冻结窗口 → 重定向。
+* 上界：`CDQ 深度(4) + 适配器在途(≤1 笔，含缺失自填的若干拍) + 1`；**只影响维护延迟，不影响语义**
+  （维护只需"更老的已提交 store 已落地"这一序关系）。
+* 实测：p11 `1033 → 1035` 拍（+2 拍）；p12 在固定 4000 拍窗口内提交 **429 → 432** 条
+  （修复后不再被误失效打断，重执行次数减少）。
+* 极端情形（维护紧跟在写缺失的 store 之后）：动作要等该 store 的 fill + 重发完成
+  （实测 t=9116→9137 共 21 拍）⇒ 登记为"最坏数十拍量级"，不设上限断言。
+
+## B4.18.6 判据（91 → 103 项，p12 挂回）
+
+* 生成器 `PROGS` 加回 `("back2_p12_cbo.S","P12","rv32ima_zicsr_zicbom","rv32imac_zicsr_zicbom",True)`
+  （第 5 元素 `True` = **仅映像、无 Spike 黄金**：Spike 不支持 Zicbom，口径见 §B4.15.4）；
+  TB `NPROG=9`、`pidx[8]=11`、第 9 槽基址 `0x20000`、`C12'` 四项判据：
+  ① 全程无陷阱（cbo 合法性门控生效）② `L1D inval_all ≥ 1` ③ `clean_all ≥ 2`
+  ④ 4 次 load 全部读到 `0x55667788`（数据安全）。
+* 实测：`tb_core_top_2b` **103/103 PASS**（`../.b2chk/final_103.log`）——
+  91 项既有判据 + 第 9 槽新增 12 项（C1'/C2' 各 1、C3' 2、C4' 2、C5' 2、**C12' 4**）。
+  既有 8 程序的 PC/写回/AXI 基线与上一检查点逐项一致（p1 449/161、p3 462/126、p6 1077/366、
+  p7 755/89、p8 4000/523、p9 843/92、p10 179/45、p11 1035/42）。
+* `./scripts/regress.sh`（脚本**未改**）：见 §B4.18.8 日志。
+
+## B4.18.7 遗留与风险（本段未做，均已定位）
+
+1. **`cbo.flush` 的 INVAL 部分未实现**（保守口径，见 B4.18.3 登记）——结构阻塞点是 2A L1D
+   缺"维护写回"通道；影响面：单核 + 无外部代理场景下不可观测；一旦引入 DMA/多核共享内存
+   必须先补。
+2. **2A L1D 的 `clean_all` 只清 dirty、不写回内存**（`l1d.v:288/338` `maint_dirty_clr`）⇒
+   `cbo.clean` 后内存可能滞后于缓存；若该行随后被逐出，写回会被跳过（脏位已清）⇒
+   数据丢失。本段只保证"cache 内数据不丢"（p12 判据即此口径）。**建议下一段**：
+   把"clean"实现为"逐组对脏路发 `wb_req` 后清 dirty"，与上面第 1 条同一处改动。
+3. 维护动作与同拍接管请求的竞争已用 `~maint_act_q` 挡住；维护扫描期间 `l1d_idle=0`
+   ⇒ 适配器不会接管新请求（`d_ready_w = d_idle & ~l1d_busy_w`）⇒ 无重叠。
+4. `cbo.zero`（`imm12=4`，属 Zicboz）由 2A 译码器判非法（`decoder.v:367-369`），本段不变。
+5. `menvcfg.CBIE=01` 的 INVAL→FLUSH 降级仍未实现（§B4.9.4 在册），本段只修正了许可位判据。
+
+## B4.18.8 本段检查点状态
+
+* 编译 **0 error**；`tb_core_top_2b` **103/103 PASS**（`../.b2chk/final_103.log`）；
+  `regress.sh` **32/32 PASS**（`总数=32 运行=32 通过=32 跳过=0 失败=0`，
+  `../.b2chk/regress_p12fix.log`，含 `tb_core_top_2b`/`tb_back2_lockstep`/`tb_back2_ipc`）；
+  判据文件可复现：`python3 sim/unit/prog/gen_back2_lockstep_data.py` 的输出与仓库内
+  `back2_lockstep_data.svh` **逐字节一致**；2A 文件**零修改**；未提交 git；快照 `../.b2chk/*.s30`。
+* 改动文件：`rtl/back2/backend_top.v`（cbo 解码 + 许可位 + `cdq_empty_o`）、
+  `rtl/back2/lsq_simple.v`（`dr_empty_o`）、`rtl/top/core_top_2b.v`（维护等排空 + 动作脉冲 +
+  锁存 + `~maint_act_q` 加固）、`sim/unit/tb_core_top_2b.sv`（第 9 槽 + C12' + `DBG_P12` 默认 0）、
+  `sim/unit/prog/gen_back2_lockstep_data.py` + `back2_lockstep_data.svh`（p12 挂回）。
+  `rtl/cache/l1d.v`、`rtl/cache/l1i.v`、`scripts/regress.sh` **未改**。
+* 一句话：**p12 的内存序缺口已收口** —— 根因是 `cbo.*` 动作码解码（funct3 vs imm12[1:0]），
+  叠加"维护不等已提交 store 排空"的序缺口；两处都已修，p12 4/4 数据正确、判据 103 项全绿，
+  遗留的 `flush` INVAL 与 L1D 维护写回登记为下一段的 2A 侧改动。

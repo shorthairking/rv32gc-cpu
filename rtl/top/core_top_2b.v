@@ -237,16 +237,37 @@ module core_top_2b (
     wire        maint_fencei_w = maint_cmt_w & (maint_kind_w == 3'd1);
     wire        maint_sfence_w = maint_cmt_w & (maint_kind_w == 3'd2);
     wire        maint_cbo_w    = maint_cmt_w & (maint_kind_w >= 3'd3);
+    //   ★★ 2B-4 内存序缺口修复（修法 1）：维护动作**等"数据通道排空"再发**。
+    //      `maint_wait_cdq_q`：维护已提交但排空未完 ⇒ 挂起（保持冲刷与冻结）；
+    //      `maint_kind_save_q`：挂起期间锁存动作码（提交脉冲只有一拍）；
+    //      `maint_act_q`：**排空后发出的单拍动作脉冲**（维护口全部由它驱动）。
+    reg         maint_wait_cdq_q;
+    reg  [2:0]  maint_kind_save_q;
+    reg         maint_act_q;
+    //   ★★ 注意：动作码**必须用锁存值** `maint_kind_save_q` —— `maint_act_q` 是在
+    //     "提交拍之后"（立即路径下一拍 / 排空后那一拍）才拉高的，而 `maint_kind_w`
+    //     只在提交拍有效（下一拍就归 0）⇒ 用 `maint_kind_w` 会让动作码退化成 0
+    //     （实测：p11 的 2 次 sfence 维护动作全部丢失，`n_tlb_sfence` 计数 = 0）。
+    wire [2:0]  maint_kind_act_w = maint_kind_save_q;
     //   维护口（TB 可探针）
     wire        maint_l1i_inval_w  = fencei_busy;                       // fence.i 扫掠期间拉高
     //   ★ K1'' 修正：**sfence.vma 不动 L1D**（本核 L1D 为物理索引/标签 ⇒ VA 重映射无需
     //     失效数据缓存；失效反而丢脏数据——实测 p11 第 12 条 load 读到 0 而非 0x11223344）。
     //     只有 cbo.inval / cbo.flush 才失效 L1D（Zicbom 的 INVAL 本就是破坏性的）。
-    wire        maint_l1d_inval_w  = (maint_cbo_w & (maint_kind_w != 3'd4)); // inval / flush
-    wire        maint_l1d_clean_w  = maint_cbo_w & (maint_kind_w != 3'd3);   // cbo.clean / flush
+    //   ★★ p12 根因修正：动作码判据必须是 **3=inval / 4=clean / 5=flush**（imm12[1:0] 口径，
+    //      见 backend_top `maint_kind_f`）。原先按 `funct3` 区分 ⇒ 三条 cbo 全落 flush
+    //      ⇒ 每次 cbo 都 `inval_all`+`clean_all` ⇒ L1D 无写回整体失效 ⇒ store 数据丢失。
+    //   ★★ 口径登记（conservative flush）：`cbo.flush` 的 **INVAL 部分本段不实现** ——
+    //      2A L1D 维护口只有"清 valid（inval_all）/清 dirty（clean_all）"两条路，
+    //      **没有维护写回通道** ⇒ 真 flush 会丢已提交脏行（实测 p12 第 12/13 条 load
+    //      读到 0）。本核为单核、无外部缓存代理 ⇒ 取"数据不丢"的保守语义：flush 只 clean。
+    //      待 2A L1D 维护写回通道落地后再补 INVAL（报告 §B4.18 待办）。
+    wire        maint_l1d_inval_w  = maint_act_q & (maint_kind_act_w == 3'd3);   // cbo.inval
+    wire        maint_l1d_clean_w  = maint_act_q & (maint_kind_act_w >= 3'd4);   // clean/flush
     //   （fence.i **不刷 TLB** —— 它只管指令缓存；sfence.vma 才刷 TLB，2A 同口径）
-    wire        maint_tlb_sfence_w = maint_sfence_w;
+    wire        maint_tlb_sfence_w = maint_act_q & (maint_kind_act_w == 3'd2);
     wire [6:0]  dbg_rob_cnt_w;
+    wire        cdq_empty_w;        // ★ 修法 1：已提交 store 全部排空（LSQ→backend→本层）
     //   ★★ 2B-4 第 4b-1b 段：2A `csr_file`+`priv_ctrl`+`trap_ctrl` 替换 `b2_csr`
     wire [31:0] csr_mtvec_o, csr_stvec_o, csr_medeleg_o, csr_mideleg_o;
     wire [31:0] csr_mie_o, csr_mip_o, csr_mepc_o, csr_sepc_o, csr_satp_o;
@@ -638,7 +659,12 @@ module core_top_2b (
     //     `d_we_q` 在接管当拍尚未锁存 ⇒ 仅 `& ~d_we_q` 挡不住 ⇒ 必须再排除接管拍（`~d_start`）。
     wire        d_kill_w = be_trp_flush & ~d_we_q & ~d_start;
     wire        d_idle     = (ad_st_q == AD_IDLE);
-    assign      d_ready_w  = d_idle & ~l1d_busy_w;   // 可接管新请求
+    //   ★★ p12 收口加固（实测波形抓出）：维护动作脉冲那一拍**不得再接管新请求**。
+    //     若维护脉冲与"适配器接管一笔新访问"同拍，则该访问会在下一拍与 L1D 维护扫描
+    //     的第 0 组写入重叠（tag 写口/dirty 清口同组竞争）⇒ 落进 L1D 的 store 可能被
+    //     维护扫描的 dirty 清零吃掉（数据在、dirty 丢 ⇒ 后续逐出丢数据）。实测：三次
+    //      维护脉冲里两次都有 `st=AD_REQ/csreq=1`（load）同拍 ⇒ 必须挡。
+    assign      d_ready_w  = d_idle & ~l1d_busy_w & ~maint_act_q;
     wire        d_start    = d_ready_w & lsu_req_v;
 
     //--------------------------------------------------------------------------
@@ -1016,7 +1042,8 @@ module core_top_2b (
         .maint_pc_o(maint_pc_w), .maint_rdy_i(l1d_idle),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),
         .cnt_commit4_o(), .cnt_issue_o(),
-        .dbg_rob_cnt_o(dbg_rob_cnt_w), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w)
+        .dbg_rob_cnt_o(dbg_rob_cnt_w), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w),
+        .cdq_empty_o(cdq_empty_w)
     );
 
     //==========================================================================
@@ -1155,23 +1182,51 @@ module core_top_2b (
     //   ★★ 4b-2a-fix（K1）：单拍维护操作（sfence/cbo）改为**"冻结窗口 + 末尾重定向"** ——
     //     提交拍起保持 `flush_all` 4 拍（把前端在途块与已派发项彻底排空），窗口最后一拍
     //     才发重定向 ⇒ 不再出现"夹在中间的块被二次冲刷丢掉"（K1 实测症状）
-    wire        maint_take_w = maint_sfence_w | maint_cbo_w;
+    wire        maint_take_w = (maint_sfence_w | maint_cbo_w) & maint_drain_w;
     reg  [2:0]  maint_wait_q;
     reg  [31:0] maint_pc_save_q;
     wire        maint_hold_w  = (maint_wait_q != 3'd0);
+    //   ★★ 2B-4 内存序缺口修复（修法 1）：**整机冲刷等 CDQ 排空 + 适配器空闲再生效**。
+    //     · `cdq_empty_w`：`lsq_simple` 的已提交 store 排空 FIFO 为空（`~dr_any` 引到顶层）；
+    //     · `ad_st_q == AD_IDLE`：数据适配器无在途访问 ⇒ 最后一笔 store 的**写已落进 L1D**
+    //       （适配器只在 `cs_wr_done`/写完成那拍才回 IDLE）⇒ 二者相与才是"真的排空"。
+    //     若 cbo/sfence 提交拍尚未排空：先挂起（`maint_wait_cdq_q`，期间保持冲刷+冻结前端），
+    //     排空后**先发维护动作脉冲（`maint_act_q`）**，再走 4 拍冻结窗口 + 末尾重定向。
+    //     · 代价（登记口径）：维护提交到重定向之间多等 ≤ CDQ 深度 + 适配器在途拍（本核
+    //       CDQ 深度 4、适配器最多 1 笔在途 ⇒ 最坏 ~5 拍量级），只影响维护延迟、不影响语义。
+    wire        maint_drain_w = cdq_empty_w & (ad_st_q == AD_IDLE);
+    wire        maint_pend_w  = maint_take_w | maint_wait_cdq_q;
     wire        maint_redir_w = (maint_wait_q == 3'd1);        // 窗口最后一拍才重定向
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
-            maint_wait_q <= 3'd0; maint_pc_save_q <= 32'h0;
-        end else if (maint_take_w) begin
-            maint_wait_q    <= 3'd4;
-            maint_pc_save_q <= maint_pc_w + 32'd4;
-        end else if (maint_hold_w) begin
-            maint_wait_q <= maint_wait_q - 3'd1;
+            maint_wait_q <= 3'd0; maint_pc_save_q <= 32'h0; maint_wait_cdq_q <= 1'b0;
+            maint_kind_save_q <= 3'd0; maint_act_q <= 1'b0;
+        end else begin
+            maint_act_q <= 1'b0;                    // 单拍脉冲：默认清零
+            if (maint_wait_cdq_q) begin
+                //   等排空：排空后**发维护动作**并进入 4 拍冻结窗口
+                if (maint_drain_w) begin
+                    maint_wait_cdq_q <= 1'b0;
+                    maint_wait_q     <= 3'd4;
+                    maint_act_q      <= 1'b1;
+                end
+            end else if ((maint_sfence_w | maint_cbo_w) & ~maint_drain_w) begin
+                //   维护操作已提交但数据通道未排空 ⇒ 挂起（继续冲刷、保持 PC、锁存动作码）
+                maint_wait_cdq_q  <= 1'b1;
+                maint_kind_save_q <= maint_kind_w;
+                maint_pc_save_q   <= maint_pc_w + 32'd4;
+            end else if (maint_take_w) begin
+                maint_wait_q      <= 3'd4;
+                maint_pc_save_q   <= maint_pc_w + 32'd4;
+                maint_kind_save_q <= maint_kind_w;   // ★ 动作码锁存（下一拍脉冲用）
+                maint_act_q       <= 1'b1;
+            end else if (maint_hold_w) begin
+                maint_wait_q <= maint_wait_q - 3'd1;
+            end
         end
     end
 
-    assign be_trp_flush       = trp_take_w | fencei_pend_w | maint_take_w | maint_hold_w;
+    assign be_trp_flush       = trp_take_w | fencei_pend_w | maint_pend_w | maint_hold_w;
     assign be_trp_redirect_v  = trp_take_w | maint_redir_w | (fencei_busy_q & ~fencei_busy);
     assign be_trp_redirect_pc = trp_take_w          ? trp_target_w :
                                 maint_redir_w       ? maint_pc_save_q :

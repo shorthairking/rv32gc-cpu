@@ -70,6 +70,7 @@ PROGS = [
     #     全部读回值进写回轨迹 ⇒ 与 Spike 黄金逐条比。
     ("back2_p10_csr.S",    "P10", "rv32ima_zicsr",  "rv32imac_zicsr"),
     ("back2_p11_maint.S",  "P11", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei"),
+    ("back2_p12_cbo.S",    "P12", "rv32ima_zicsr_zicbom", "rv32imac_zicsr_zicbom", True),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"

@@ -181,7 +181,9 @@ module backend_top #(
     output wire [31:0] cnt_issue_o,
     output wire [6:0]  dbg_rob_cnt_o,
     output wire [23:0] dbg_iq_cnt_o,
-    output wire [7:0]  dbg_stq_cnt_o
+    output wire [7:0]  dbg_stq_cnt_o,
+    //   ★ 2B-4 修法 1：CDQ 空（已提交 store 全部落地）—— 顶层据此推迟整机冲刷
+    output wire        cdq_empty_o
 );
 
     //==========================================================================
@@ -556,9 +558,14 @@ module backend_top #(
         //     menvcfg/senvcfg 到译码器，那两位是悬空 ⇒ 直接用会引入 x）
         wire unsup   = ((opt == 4'd8) & ~is_sys_ok) |
                        (opt == 4'd5) | (opt == 4'd15);
-        //   cbo 动作码：funct3=000 ⇒ inval（需 CBIE≠0）；001/010 ⇒ clean/flush（需 CBCFE=1）
-        wire cbo_ill_perm = cbo_valid & ((tval[14:12] == 3'b000) ? ~cbo_perm_i[0]
-                                                                : ~cbo_perm_i[1]);
+        //   ★★ p12 修正：cbo 的**动作码在 imm12[1:0]（bits[21:20]）**，funct3 恒为 010
+        //      （不是 000/001/010 —— 旧式把 `cbo.inval` 也当成"需 CBCFE"的 clean/flush）
+        //      ⇒ menvcfg.CBIE=01 且 CBCFE=0 时，**合法的 `cbo.inval` 会被误判非法**。
+        //      p12 因 `menvcfg=0x70`（CBIE=11、CBCFE=1 两位全开）未暴露该偏差，本段一并修正。
+        wire [1:0] cbo_op = tval[21:20];
+        wire cbo_ill_perm = cbo_valid &
+                            ((cbo_op == 2'b00) ? ~cbo_perm_i[0]      // inval：需 CBIE≠0
+                                               : ~cbo_perm_i[1]);    // clean/flush：需 CBCFE=1
         //   ★ 4b-2a：cbo 指令的 `ill_instr` 必须屏蔽掉——译码器内部的 `cbo_gate_ill` 由
         //     menvcfg/senvcfg 驱动，而本核前端未接那两位（悬空 z）⇒ 它会给出 x；
         //     本核改用 `cbo_ill_perm`（由顶层从 `csr_file.menvcfg_o` 译出的两位许可）判。
@@ -1247,6 +1254,7 @@ module backend_top #(
         .st_done_valid(lsu_st_done_v), .st_done_rob(lsu_st_done_rob),
         .st_done_epoch(lsu_st_done_ep),
         .stq_cnt_o(dbg_stq_cnt_o), .cnt_load_o(), .cnt_store_o(), .cnt_fwd_o(),
+        .dr_empty_o(cdq_empty_o),
         .cnt_stq_stall_o()
     );
 
@@ -1658,12 +1666,26 @@ module backend_top #(
                     ? 3'd1 :                               // fence.i（0x0000_100F）
                 (t[6:0] == 7'h73) & (t[14:12] == 3'b000) & (t[31:25] == 7'b0001_001)
                     ? 3'd2 :                               // sfence.vma（0x1200_0073 起）
-                (t[6:0] == 7'h0F) & (t[14:12] == 3'b000) & (t[19:15] != 5'd0) & (t[31:25] == 7'b0)
-                    ? 3'd3 :                               // cbo.inval
-                (t[6:0] == 7'h0F) & (t[14:12] == 3'b001) & (t[19:15] != 5'd0) & (t[31:25] == 7'b0)
-                    ? 3'd4 :                               // cbo.clean
-                (t[6:0] == 7'h0F) & (t[14:12] == 3'b010) & (t[19:15] != 5'd0) & (t[31:25] == 7'b0)
-                    ? 3'd5 : 3'd0;                         // cbo.flush
+                //   ★★ 2B-4 内存序缺口修复（p12 波形定位，**本段根因**）：
+                //      `cbo.*` 的**真实编码**是 `funct3 = 010`（bits[14:12]），
+                //      **动作码在 imm12[1:0] = bits[21:20]**（0=inval / 1=clean / 2=flush，
+                //      bits[31:22] = 0）。工具链实证（`objdump -d` 三条 cbo）：
+                //        cbo.inval(s0)=0x0004_200F  cbo.clean(s0)=0x0014_200F
+                //        cbo.flush(s0)=0x0024_200F  —— 三者 funct3 **全为 010**。
+                //      旧实现误按 `funct3 = 000/001/010` 区分动作 ⇒ 三条 cbo **全部**落进
+                //      "flush" 分支（kind=5）⇒ 顶层对每次 cbo 同时拉 `inval_all`+`clean_all`
+                //      ⇒ 2A L1D 走 inval 优先（`maint_clean_q = clean_all & ~inval_all`）
+                //      ⇒ **整个 L1D 被"无写回失效"** ⇒ p12 的已提交 store 数据丢失
+                //      （实测波形：三次 cbo 的维护脉冲全是 `inv=1 cln=1`，见报告 §B4.18）。
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b010) & (t[19:15] != 5'd0) &
+                (t[31:22] == 10'b0) & (t[21:20] == 2'b00)
+                    ? 3'd3 :                               // cbo.inval（imm12=0）
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b010) & (t[19:15] != 5'd0) &
+                (t[31:22] == 10'b0) & (t[21:20] == 2'b01)
+                    ? 3'd4 :                               // cbo.clean（imm12=1）
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b010) & (t[19:15] != 5'd0) &
+                (t[31:22] == 10'b0) & (t[21:20] == 2'b10)
+                    ? 3'd5 : 3'd0;                         // cbo.flush（imm12=2）
         end
     endfunction
     reg  [3:0]  xret_lane_oh, maint_lane_oh;

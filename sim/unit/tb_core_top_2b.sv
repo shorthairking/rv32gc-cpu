@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 8;
+    localparam integer NPROG  = 9;
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -50,6 +50,8 @@ module tb_core_top_2b #(
     //   p10（CSR 轨迹）逐条对照打印开关（默认关）
     localparam integer DBG_P10 = 0;
     localparam integer DBG_K1  = 1;
+    //   p12（cbo 数据安全）诊断开关（默认关；定位"维护后 load 读到旧值"时置 1）
+    localparam integer DBG_P12 = 0;
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
@@ -182,6 +184,17 @@ module tb_core_top_2b #(
         if (u_dut.maint_l1d_clean_w)  n_l1d_clean  <= n_l1d_clean  + 1;
         if (u_dut.maint_tlb_sfence_w) n_tlb_sfence <= n_tlb_sfence + 1;
         k1_tick <= k1_tick + 1;
+        //   ★ [诊断，默认关] p12：适配器/L1D 维护/冲刷事件逐拍（定位维护与 store 排空的交叠）
+        if (DBG_P12 && (cur_p == 11) && (k1_tick > 3000) &&
+            ((u_dut.ad_st_q != 2'd0) || u_dut.maint_l1d_inval_w || u_dut.maint_l1d_clean_w ||
+             u_dut.u_l1d.maint_q || u_dut.l1d_cs_wr_done || u_dut.be_trp_flush))
+            $display("   [p12] t=%0d st=%0d we=%b a=0x%08x unc=%b csreq=%b rdy=%b miss=%b wdone=%b | inv=%b cln=%b mq=%b mc=%b midx=%0d idle=%b | flush=%b cdqe=%b drany=%b drfire=%b",
+                     k1_tick, u_dut.ad_st_q, u_dut.d_we_q, u_dut.d_a_q, u_dut.d_unc_q,
+                     u_dut.l1d_cs_req_w, u_dut.l1d_cs_ready, u_dut.l1d_cs_miss, u_dut.l1d_cs_wr_done,
+                     u_dut.maint_l1d_inval_w, u_dut.maint_l1d_clean_w, u_dut.u_l1d.maint_q,
+                     u_dut.u_l1d.maint_clean_q, u_dut.u_l1d.maint_idx_q, u_dut.u_l1d.idle,
+                     u_dut.be_trp_flush, u_dut.u_back.u_lsu.dr_empty_o, u_dut.u_back.u_lsu.dr_any,
+                     u_dut.u_back.u_lsu.dr_fire);
         if (DBG_K1 && (cur_p == 10) && ((k1_tick % 1000) == 0) && (k1_tick > 3000))
             $display("   [k1i] plo=%b phi=%b pgn=%b npv=%b bufcnt=%0d grpm=%b m3=%b term=%b xip=%b | pva0=0x%08x pva1=0x%08x nva=0x%08x rsp=%b f4v=%b",
                      u_dut.u_front.u_ifetch4.push_lo_ok, u_dut.u_front.u_ifetch4.push_hi_ok,
@@ -344,6 +357,7 @@ module tb_core_top_2b #(
         pidx[5] = 8;  cmax_of[5] = P8_GOLD_N;   // p9_trapvec（0x14000）
         pidx[6] = 9;  cmax_of[6] = P9_GOLD_N;   // p10_csr（0x18000）
         pidx[7] = 10; cmax_of[7] = P10_GOLD_N;  // p11_maint（0x1C000）
+        pidx[8] = 11; cmax_of[8] = P11_GOLD_N;  // p12_cbo（0x20000）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -383,7 +397,7 @@ module tb_core_top_2b #(
             $display("== 程序 %0d（.svh 下标 %0d）：黄金 %0d 条 ==", pid, cur_p, cmax_of[pid]);
             $fflush();
             cyc = 0;
-            if (pid == 4) begin
+            if ((pid == 4) || (pid == 8)) begin
                 //   ★ p8_int：固定拍数（无黄金轨迹可等；中断在 ~200 拍后到，余量充足）
                 for (k = 0; k < P8_CYCLES; k = k + 1) begin
                     @(posedge clk);
@@ -400,7 +414,7 @@ module tb_core_top_2b #(
                          u_dut.u_csr_file.mtvec_o, u_dut.u_csr_file.mepc_o,
                          trp_mcause_cap, nrec);
             end
-            while ((pid != 4) && (nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
+            while ((pid != 4) && (pid != 8) && (nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
                 @(posedge clk);
                 cyc = cyc + 1;
                 if ((cyc % 50000) == 0) begin
@@ -550,8 +564,30 @@ module tb_core_top_2b #(
                              n_maint_cmt, n_l1i_inval, n_tlb_sfence, n_l1d_inval);
                     $fflush();
                 end
-                //   ★ C12'（cbo.*）未挂回：见报告 §B4.17（冲刷后 STQ 转发失效 + 已提交 store
-                //     尚未排空 ⇒ 重新执行的 load 读到旧内存值）
+                //   ============ C12'：cbo.* 语义（p12_cbo）============
+                if (pid == 8) begin
+                    if (DBG_P12) begin
+                        $display("   [p12] 提交轨迹（共 %0d 条，基址 0x%08x）：", nrec, cur_base);
+                        for (k = 0; k < nrec; k = k + 1)
+                            $display("      idx=%0d pc=0x%08x we=%b rd=%0d wd=0x%08x",
+                                     k, rpc[k], rwe[k], rrd[k], rwd[k]);
+                        $display("   [p12] darea(VA 0x%08x)：DDR3 内存字 = 0x%08x；tohost 字 = 0x%08x",
+                                 cur_base + 32'h1000, u_mem.ddr3_mem[w_idx(cur_base + 32'h1000)],
+                                 u_mem.ddr3_mem[w_idx(cur_base + 32'h800)]);
+                    end
+                    chk(n_trap_p == 0, $sformatf("C12' p12：cbo.* 全程合法（无陷阱），实测 %0d 次", n_trap_p));
+                    chk(n_l1d_inval >= 1, $sformatf("C12' p12：cbo.inval/flush ⇒ L1D inval_all ≥ 1 次，实测 %0d", n_l1d_inval));
+                    chk(n_l1d_clean >= 2, $sformatf("C12' p12：cbo.clean/flush ⇒ L1D clean_all ≥ 2 次，实测 %0d", n_l1d_clean));
+                    crk = 0;
+                    for (k = 0; k < 1024; k = k + 1)
+                        if (rwe[k] && ((rrd[k] == 5'd9) || (rrd[k] == 5'd18) ||
+                                       (rrd[k] == 5'd19) || (rrd[k] == 5'd20)) &&
+                            (rwd[k] === 32'h5566_7788)) crk = crk + 1;
+                    chk(crk >= 4, $sformatf("C12' p12：cbo 后 4 次 load 均读到 0x55667788，实测 %0d 次", crk));
+                    $display("   [C12'] cbo：提交 %0d 次；L1D inval %0d / clean %0d 次；全程无陷阱；4 次 load 数据正确",
+                             n_maint_cmt, n_l1d_inval, n_l1d_clean);
+                    $fflush();
+                end
 
 
 

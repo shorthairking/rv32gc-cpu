@@ -91,6 +91,9 @@ module lsq_simple #(
     // ---- 发射前检查（接 IQ 的 iss_ready）----
     input  wire [ROB_IDX_W-1:0]  iss_rob,              // ★ 2B-3：候选（i4_sel）的 ROB 索引
     output wire                  iss_ok,               // 有空余 LQ 槽 且 无更老未定址 store
+    //   ★★ 2B-4 内存序缺口修复（修法 1）：**CDQ 空**（已提交 store 全部排空）——
+    //     顶层用它把"整机冲刷"推迟到排空完成之后（见 core_top_2b §6b 的 `maint_wait_cdq`）
+    output wire                  dr_empty_o,
 
     // ---- 提交排空入队（ROB 提交组内的**所有** store，≤W/拍、程序序）----
     input  wire [W-1:0]          dr_valid,
@@ -462,7 +465,12 @@ module lsq_simple #(
     wire [LQ_IW-1:0] rsp_sel    = pri_enc(rsp_vec);
     // 发射许可（★ 2B-4）：槽位已在**派发期**分配 ⇒ 此处只剩"无更老未定址 store"一条件
     //   （旧口径还要求"有空闲 LQ 槽"，那是"槽在 E1 分配"时代的死锁防护，已不需要）。
-    assign iss_ok = ~any_unk_w;
+    //   ★★ 2B-4 内存序缺口修复（修法 1 的精确定位版，见报告 §B4.18）：**再加"CDQ 已排空"**——
+    //     本核"已提交未排空"的 store 只能靠 STQ 转发被同地址 load 看见；整机冲刷会清 STQ
+    //     （正确的设计），此时若 CDQ 里还有未落地的已提交 store，重新执行的 load 既无转发
+    //     也无互锁 ⇒ 直读内存旧值（实测 p12 idx10/12/13 读到 0）。把 load 发射门控到
+    //     "CDQ 空"即可：drain 是 FIFO 单笔/拍 ⇒ 代价至多 CDQ 深度拍，且绝大多数拍 CDQ 为空。
+    //     （`iss_ok` 的赋值必须移到 CDQ 声明之后，否则 `dr_any` 会成隐式网。）
 
     //==========================================================================
     // 3.3 提交排空队列（CDQ）—— 逐 lane 收全提交组、逐拍顺序排空
@@ -505,6 +513,9 @@ module lsq_simple #(
 
     //   出队：队首一笔；`dr_fire` = 与存储口的握手拍
     wire              dr_any  = (cdq_cnt != {(CDQ_PW+1){1'b0}});
+    //   ★ 发射许可 = 无更老未定址 store 且 **CDQ 已排空**（口径见上）
+    assign iss_ok = ~any_unk_w;                 // （"CDQ 空"的门控改由顶层在冲刷侧做，见 dr_empty_o）
+    assign dr_empty_o = ~dr_any;
     wire [STQ_IW-1:0] dr_sel  = cdq_idx[cdq_head];
     wire              dr_fire = dr_any & mem_req_ready;
     wire              ld_fire = pend_any & ~dr_any & mem_req_ready;
