@@ -77,6 +77,19 @@ module tb_core_top_2b #(
         end
     endtask
 
+    //   ★★ 效果级探针（fence.i）：直接数 L1I tag 阵列里"仍为 valid"的路数
+    //     （`cache_tag_array.tagv_q[i][0]` = valid 位）。扫掠结束 1 拍后必须为 0。
+    function integer l1i_vld_cnt;
+        integer i2;
+        begin
+            l1i_vld_cnt = 0;
+            for (i2 = 0; i2 < 256; i2 = i2 + 1)
+                l1i_vld_cnt = l1i_vld_cnt
+                    + u_dut.u_l1i.g_way[0].u_tag.tagv_q[i2][0]
+                    + u_dut.u_l1i.g_way[1].u_tag.tagv_q[i2][0];   // L1I = **2 路**
+        end
+    endfunction
+
     //==========================================================================
     // 1. DUT：core_top_2b（48 契约端口；数据侧已接 L1D，无占位端口）
     //==========================================================================
@@ -188,6 +201,11 @@ module tb_core_top_2b #(
     //   ★ 4b-1b：中断判定归 `trap_ctrl` ⇒ 监视 `trap_valid & trap_is_int`
     wire irq_live_w = u_dut.tc_trap_valid & u_dut.tc_trap_is_int;
     integer n_maint_cmt, n_l1i_inval, n_l1d_inval, n_l1d_clean, n_tlb_sfence;
+    //   ★★ 4b-2c 收尾：fence.i **效果级**证据 —— L1I 行填充次数（`l1i_fill_accepted` 计数）
+    //     与"扫掠结束沿"采样：扫掠后取指必须重新经 AXI 取指 ⇒ 填充计数必增（见 C11'-e1）
+    integer n_l1i_fill, n_fencei_sweep, fill_at_sweep_end;
+    integer l1i_vld_left, sw_i;
+    reg     fencei_busy_tb_q, fencei_done_tb_q;
     //   ★★ (b) 硬断言计数器（报告 §B4.25）：维护冲刷拍"同组更老 store 完成 CDQ 入队"
     //     · 判据口径（与 §B4.24.7 探针的 `[st]` 组合同源）：
     //       该拍 `be_trp_flush=1` 且维护 lane 掩码有效（`|maint_lane_oh`，探针里即
@@ -205,6 +223,20 @@ module tb_core_top_2b #(
         if (u_dut.maint_l1d_inval_w)  n_l1d_inval  <= n_l1d_inval  + 1;
         if (u_dut.maint_l1d_clean_w)  n_l1d_clean  <= n_l1d_clean  + 1;
         if (u_dut.maint_tlb_sfence_w) n_tlb_sfence <= n_tlb_sfence + 1;
+        //   ★★ fence.i 效果级采样：L1I 行填充（= 真的一笔取指 AXI 读突发）+ 扫掠结束沿
+        if (u_dut.l1i_fill_accepted) n_l1i_fill <= n_l1i_fill + 1;
+        fencei_busy_tb_q <= u_dut.fencei_busy;
+        if (fencei_busy_tb_q && !u_dut.fencei_busy) begin
+            n_fencei_sweep    <= n_fencei_sweep + 1;
+            fill_at_sweep_end <= n_l1i_fill;
+            fencei_done_tb_q  <= 1'b1;          // 延后 1 拍再抽查（最后一次清 valid 已落地）
+        end else begin
+            fencei_done_tb_q  <= 1'b0;
+        end
+        //   ★★ 效果级抽查：扫掠结束后 L1I **全阵列 valid 必须为 0**（直接查 tag 阵列；
+        //     `cache_tag_array.tagv_q[i][0]` = valid 位）。反证：断开 `inval_all`（旧接法）
+        //     ⇒ 阵列里仍全是旧行 ⇒ 本项必红（这是区分"只切索引"与"真失效"的判据）。
+        if (fencei_done_tb_q) l1i_vld_left <= l1i_vld_cnt();
         //   ★★ (b) 硬断言：维护冲刷拍，同组更老 store 必须完成 CDQ 入队（见上方计数器注）
         //     两级判定（缺一不可）：
         //       ① **组合许可**：`dr_take` 必须覆盖"必须入队"的 lane（抓"入队许可被冲刷门抹掉"）；
@@ -471,6 +503,7 @@ module tb_core_top_2b #(
             n_trap_p = 0; trap_seen_q = 1'b0; n_irq_p = 0; irq_seen_q = 1'b0;
             irq_target_q = 32'h0; trp_mcause_cap = 32'h0;
             n_maint_cmt = 0; n_l1i_inval = 0; n_l1d_inval = 0; n_l1d_clean = 0; n_tlb_sfence = 0;
+            n_l1i_fill = 0; n_fencei_sweep = 0; fill_at_sweep_end = 0; l1i_vld_left = 0;
             for (k = 0; k < 8; k = k + 1) begin
                 trc_cause[k] = 4'h0; trc_pc[k] = 32'h0; trp_tgt[k] = 32'h0;
             end
@@ -661,6 +694,16 @@ module tb_core_top_2b #(
                     chk(n_maint_cmt == 4, $sformatf("C11' p11：维护操作提交 4 次（2×fence.i + 2×sfence.vma），实测 %0d", n_maint_cmt));
                     chk(n_l1i_inval >= 512, $sformatf("C11' p11：L1I 全阵列扫掠脉冲 ≥ 512（2×256），实测 %0d", n_l1i_inval));
                     chk(n_tlb_sfence >= 2, $sformatf("C11' p11：TLB 失效 ≥ 2 次（sfence.vma），实测 %0d", n_tlb_sfence));
+                    //   ★★ 4b-2c 收尾（fence.i 效果级判据）：扫掠**真正清了 L1I valid**
+                    //     —— 扫掠结束后的取指必须重新经 AXI 取指（L1I 行填充计数必增）。
+                    //     机制：`inval_all = fencei_busy` + 扫掠索引走 `cs_vaddr` ⇒ 256 拍扫完整阵列；
+                    //     反证：把 `inval_all` 断开（旧接法）⇒ 该行仍驻留 ⇒ 取指命中、无填充 ⇒ 本项红。
+                    chk(n_fencei_sweep >= 2, $sformatf("C11'-e0 p11：观察到 2 次 fence.i 扫掠结束沿，实测 %0d", n_fencei_sweep));
+                    chk(l1i_vld_left == 0,
+                        $sformatf("C11'-e2 p11：**fence.i 扫掠后 L1I 全阵列 valid = 0**（直接查 tag 阵列；残留 %0d 位）", l1i_vld_left));
+                    chk(n_l1i_fill > fill_at_sweep_end,
+                        $sformatf("C11'-e1 p11：**fence.i 真正失效 L1I**（末次扫掠结束后取指重新经 AXI 取指：L1I 行填充 %0d → %0d）",
+                                  fill_at_sweep_end, n_l1i_fill));
                     $display("   [C11'] 维护：提交 %0d 次；L1I 扫掠 %0d 拍、TLB 失效 %0d 次、L1D 失效 %0d（sfence 不动 L1D）；PC 流/写回 = Spike 黄金",
                              n_maint_cmt, n_l1i_inval, n_tlb_sfence, n_l1d_inval);
                     $fflush();

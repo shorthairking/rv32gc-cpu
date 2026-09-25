@@ -737,8 +737,14 @@ module core_top_2b (
         .fill_accepted(l1i_fill_accepted),
         .fill_valid(l1i_fill_valid), .fill_data(l1i_fill_data),
         .fill_word_idx(l1i_fill_word_idx), .fill_done(l1i_fill_done),
-        //   ★ 维护（fence.i / cbo.inval）：本段无 CSR 提交源 ⇒ 恒 0（第 4 段接）
-        .inval_all(1'b0),
+        //   ★★ 4b-2c 收尾：**fence.i 的 L1I 失效口接通**。
+        //     本核的 fence.i = "冻结 256 拍 + 每拍一组、该组索引由 `l1i_cs_vaddr` 给出"的扫掠
+        //     （见 §4a 的 `fencei_busy/fencei_idx_q`），而 L1I 的失效写口判据正是
+        //     `inval_all ? va_index`（`l1i.v`：`wr_en(inval_all | way_fill_tag)`）
+        //     ⇒ 扫掠期间保持 `inval_all=fencei_busy` 即**恰好扫完整阵列**（256 组）。
+        //     旧接法 `.inval_all(1'b0)` ⇒ 扫掠只切索引、**并未真正清 valid** ⇒ fence.i 语义
+        //     不完整（此前 TB 用"每程序递进基址"规避同 tag 陈旧命中，见 p11 头注）。
+        .inval_all(fencei_busy),
         .idle(l1i_idle)
     );
 

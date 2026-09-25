@@ -4433,3 +4433,68 @@ t=13625 ... mact=1                                            ← 维护动作�
   **2A 其余零修改**；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s43`（含 `l1d.v.pre`）。
 * **下一步（登记）**：①L1I `.inval_all(fencei_busy)` + fence.i 效果判据（§B4.27.3）；
   ②CSR 可见性互锁（§B4.26.4 边界 1）；③L1I/L1D 复位与跨程序陈旧行（TB 侧已用递进基址规避）。
+
+---
+
+# B4.28 L1I inval_all 接线 + fence.i 效果级判据（② CSR 可见性 load 侧：**未完成，见表末**）
+
+> 起点 = 母代理已验收提交 `6bdc5eb`（tag 2B-4.26）。
+> 检查点：`tb_core_top_2b` **148/148 PASS**；`regress.sh` **32/32 PASS**；2A 零修改。
+
+## B4.28.1 ① L1I `inval_all` 接线（一行）
+
+```verilog
+- .inval_all(1'b0),      // 旧：fence.i 扫掠只切索引、并未真正清 valid
++ .inval_all(fencei_busy),
+```
+**机理**：本核 `fence.i` = "冻结 256 拍 + 每拍一组、该组索引由 `l1i_cs_vaddr` 给出"的扫掠
+（`core_top_2b` §4a 的 `fencei_busy/fencei_idx_q`），而 L1I 的失效写口判据正是
+`inval_all ? va_index`（`l1i.v`：`wr_en(inval_all | way_fill_tag)`、`va_index = cs_vaddr[12:5]`）
+⇒ 扫掠期间保持 `inval_all = fencei_busy` **恰好扫完 256 组** ✓（无需新增状态/端口）。
+
+## B4.28.2 ① fence.i **效果级**判据（新增 3 项，含反证）
+
+* **`C11'-e0`**：观察到 2 次 fence.i 扫掠**结束沿**（`fencei_busy` 1→0，p11 共 3 次 fence.i）✓
+* **`C11'-e1`**（母代理点名的 AR/取指形式）：**末次扫掠结束之后，取指必须重新经 AXI 取指** ——
+  用 L1I 行填充接受计数（`l1i_fill_accepted`）自证：扫掠结束时采样 → 程序结束时必须增加 ✓
+* **`C11'-e2`（判别性判据，效果级）**：扫掠结束后延后 1 拍，**直接查 L1I 的 tag 阵列**
+  `u_l1i.g_way[0/1].u_tag.tagv_q[i][0]`（= valid 位，L1I 为 **2 路 × 256 组**）
+  ⇒ **全阵列 valid 必须为 0** ✓（实测"残留 0 位"）
+* **反证（必红后还原）**：把 `.inval_all` 改回 `1'b0` ⇒
+  `FAIL: C11'-e2 …（直接查 tag 阵列；残留 **12** 位）`（`../.b2chk/fencei_cp2.log`，退出码 1）
+  ⇒ 判据**确实**区分"只切索引"与"真失效" ✓ 已还原。
+  ★ 记录：`C11'-e1`（填充计数）**单独不判别**（断开 inval 时它仍会因"扫掠后取指落在未缓存行"
+  而增加）—— 故效果级判据以 `C11'-e2` 为准（这正是"判据要测效果、不测发起"的同一教训，
+  与 C11' 原有 `n_l1i_inval ≥ 512` 只数扫掠脉冲形成互补）。
+
+## B4.28.3 ② OoO CSR 可见性 load 侧 RTL 根治：**本轮未完成**（设计已定案，附理由）
+
+**为什么不能在预算内安全落地**（本轮实测 + 代码定案）：
+
+1. 现有机制只做到"**CSR 指令只在 ROB 头执行**"（`backend_top:991/1014` 的
+   `al0_csr_blk = i0_sel_v & u_is_csr(i0_sel_uop) & (i0_sel_rob != rob_head_w)` 门 ALU0 发射）。
+2. 但**危害窗口不在"执行→提交"之间**：年轻 load 可以在**更老的 CSR 指令执行之前**就发射/执行
+   （两者属不同队列：CSR 在 ALU0 等 ROB 头，load 在 LSU 队列只要操作数就绪即可发）
+   ⇒ 实测 p14 就是这种形态（load 按旧 `MPRV=1/MPP=U` 翻译 ⇒ 误报 cause 13）。
+3. ⇒ 正确的互锁必须是"**凡有更老的未提交 CSR 写，年轻 load 不得发射**"，即需要
+   **按 ROB 年龄比较**（候选 load 的 `i4_sel_rob` vs"最老未提交 CSR 写的 ROB 索引"），
+   而后者需要**派发侧挂钩**（记录最老 CSR 的 ROB 索引）+ 发射门改造 —— 涉及 backend_top 的
+   派发/提交/发射三处，且会改变 p10（大量 CSR）/p8（中断时序敏感、固定拍数判据）的时序
+   ⇒ 在"预算见底 + 必须停在既有判据全绿检查点"的约束下**不宜带病落地**。
+4. **现状**：p14 仍保留程序侧串行化（访存地址数据依赖 `csrr mstatus`，见该文件 §6 注释），
+   C15' 13 项全过 ✓（**判据未放宽**）；边界登记见 §B4.26.4 边界 1 与本段。
+5. **下一步定点修法（建议）**：①`backend_top` 增"最老未提交 CSR 写"的 ROB 索引寄存器
+   （派发时若空则记录、提交时清除，2 bit×7 或 7 bit 一个寄存器）；②发射门
+   `lsu_ld_block |= csr_older_pend_w & (i4_sel_rob 比它年轻)`（年龄比较，B27 口径禁掩码）；
+   ③配套：p14 去掉程序侧串行化 + 新增"CSR 写后紧跟 load"的独立小用例（反证 = 去掉互锁必红）。
+
+## B4.28.4 检查点
+
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**（`../.b2chk/f4.log`：
+  145 + fence.i 效果级新增 3 项，**既有 145 项零回退**）；反证日志 `../.b2chk/fencei_cp2.log`（红）。
+* `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c15.log`）。
+* 改动：`rtl/top/core_top_2b.v`（inval_all 一行）、`sim/unit/tb_core_top_2b.sv`（C11' 效果级 3 项 +
+  探针 function）、`sim/unit/back2_report.md`。**2A 零修改**；`scripts/regress.sh` 未动；
+  未提交 git；快照 `../.b2chk/*.s44`。
+* **边界更新**：① L1I `inval_all` 已接 ✓（该边界关闭）；② CSR 可见性 load 侧**仍开放**（见 §B4.28.3，
+  比 §B4.26.4 的描述更精确：窗口是"CSR 执行之前"，不是"执行→提交"之间）。
