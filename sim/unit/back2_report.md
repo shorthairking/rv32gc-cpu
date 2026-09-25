@@ -2818,3 +2818,94 @@ iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ipc.vvp -s tb_back2_ipc "${RTL[@]}
   都已写进 §B4.8.1/§B4.8.2，可直接作为 4b-2a 的开工清单。
 - 下一步建议：**4b-2a 先行**（维护操作合法化 + 维护口接线 + `p11_maint.S`），
   它是 4b-2b/2c 的**先决条件**且不碰 LSU 数据通路 ⇒ 风险最低、判据最清晰。
+
+
+# 2B-4 第 4b-2a 段（维护操作合法化 + 维护口）—— **RTL 已落地并入检查点；判据程序受 K1 阻塞**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 4b-2 勘察检查点
+> `2B-4.7` 之后；本段改 `rtl/back2/backend_top.v` + `rtl/top/core_top_2b.v`，**未改 TB/黄金**）
+> 任务：①`sfence.vma` 入白名单、`cbo.*` 摘出 `unsup`、`fence.i` 保持合法、menvcfg/senvcfg 门控
+> ②提交点识别维护操作并驱动 TLB/L1I/L1D 维护口 ③`p11_maint.S` 黄金比对。
+
+## B4.9.0 结论（一句话）
+
+**RTL 侧三项全部落地且编译零错误、既有 80 项判据 + regress 全绿**（维护操作合法化、
+维护口接线、提交点 lane 扫描识别、以及一个**实测抓出并修掉的整机停摆缺陷**）；
+但 `p11_maint.S` 的黄金比对**未达全绿**：定位到一个**新的竞态阻塞 K1**（维护操作的
+"冲刷 + 重定向"与前端在途取指/第二条维护操作相撞 ⇒ PC 流丢/跳指令），按任务书纪律停在
+"RTL 编译干净 + 既有判据全绿"检查点，`p11_maint.S`/`p12_cbo.S` 作为**WIP** 留在工作树
+（未进生成器清单，故不影响任何判据），K1 的定位证据与修法建议见 §B4.9.3。
+
+## B4.9.1 已落地（RTL，逐条带实现位置）
+
+| # | 内容 | 位置/口径 |
+|---|---|---|
+| 1 | **`sfence.vma` 合法化** | `backend_top.v` 的 `is_sys_ok = ecall \| ebreak \| mret \| sret \| sfence`（2A 只对 U 模式判非法；本核 priv 恒 M ⇒ 放行） |
+| 2 | **`cbo.*` 摘出 `unsup` + 按动作码精确门控** | `unsup` 去掉 `opt==4'd10`；新增输入 `cbo_perm_i[1:0] = {CBCFE, CBIE≠0}`（顶层从 `csr_file.menvcfg_o` 译出：`cbcfe = menvcfg[6]`、`cbie≠0 = \|menvcfg[5:4]`）；`cbo_ill_perm = cbo_valid & (funct3==000 ? ~cbie_ok : ~cbcfe_ok)`（照 2A `dec_csr.v:222-237`） |
+| 3 | **屏蔽译码器内部的 `cbo_gate_ill`** | 本核前端未把 menvcfg/senvcfg 接到译码器（那两位悬空 z）⇒ 直接用会引入 x；改为 `illegal = (ill_instr & ~cbo_valid) \| … \| cbo_ill_perm`（cbo 时 `x & 0 = 0`，非 cbo 时原样通过） |
+| 4 | **`fence.i` 保持合法 + 全阵列扫掠** | 照 2A（`core_top.v:885-905`）：8 bit 索引 256 拍，L1I 的 index 输入在扫掠期切到 `{19'b0, idx, 5'b00000}`、`cs_req` 加 `~fencei_busy` 门控、`inval_all = fencei_busy`；扫掠结束重定向到 `fence.i` 的下一条 |
+| 5 | **提交点识别（lane 扫描）** | `backend_top.v` 新增 `maint_kind_f()`（编码表：`0x0000_100F`=fence.i、`sfence.vma`=`opcode 0x73 & funct3 0 & funct7 0b0001001`、cbo 按 funct3 000/001/010 且 rs1≠0）、`xret_kind_f()`；**逐 lane 扫描提交组**（由高到低 ⇒ 最老者胜），输出 `maint_kind_o/maint_cmt_o/maint_pc_o` 与 `xret_kind_o` |
+| 6 | **更年轻的槽必须"不上报、不回写、不更新 ARAT"** | 触发冲刷的维护/xRET 槽之后更年轻的 lane 会被冲刷并**重新执行** ⇒ 新增 `cmt_hold_w/cmt_raw_m` 掩码，作用于 `commit_valid_o`、`cmt_i_we/rel_i_we/cmt_f_we/rel_f_we`、`lsu_dr_valid`、训练 FIFO 入队 |
+| 7 | **维护口接线** | `tlb.sfence_valid`（全失效：`all_va=1/all_asid=1`）、`tlb.satp_we = csr_we_w & (waddr==0x180)` + `satp_asid_new = wdata[30:22]`、L1I `inval_all`（扫掠）、L1D `inval_all/clean_all`（cbo.inval⇒inval、clean⇒clean、flush⇒两者；sfence⇒inval）、`maint_tlb_sfence_w`（**fence.i 不刷 TLB**） |
+| 8 | **★ 整机停摆缺陷（实测修掉）** | 现象：p11 的 `sfence.vma` 之后 PC 停在 0、**再无任何提交**。根因：sfence 触发 L1D `inval_all` 时，LSU↔L1D 适配器正停在 `AD_WAIT` 等一个不会到来的 `l1d_cs_ready` ⇒ `d_ready_w` 永久为 0 ⇒ 之后所有访存全挂。修法：给适配器补 `d_kill_w = be_trp_flush` 的 kill 分支（2A 对应 `m_kill_fsm`，`core_top.v:3749-3752`"异常 / fence.i 同步：放弃在途访存"）。修后维护操作后访存恢复正常 |
+
+## B4.9.2 验证台账（本轮）
+
+| 判据 | 结果 |
+|---|---|
+| 整设计编译 | **0 error**（`iverilog -g2012 -Wall`） |
+| `tb_core_top_2b`（既有 7 程序 80 项） | **PASS 80/80**（维护相关 RTL 对既有程序**零影响** ✓） |
+| `regress.sh` | **32/32 PASS**（日志 `../.b2chk/regress_4b2a.log`） |
+| `p11_maint.S` 黄金比对 | **未达全绿**（C1' 在 idx 20 分歧：`0x8001c060` vs 黄金 `0x8001c050`）⇒ 见 §B4.9.3 K1；程序文件作为 WIP 留在工作树，**未进生成器清单** ⇒ 不影响任何既有判据 |
+| 维护"合法性/端口"侧证据（调试期实测） | `sfence.vma`/`fence.i`/`cbo.*` 均**不再变陷阱**；`maint_cmt` 计数正确（5 次）；`maint_l1i_inval` = 256×N（扫掠）；`maint_tlb_sfence`/`maint_l1d_inval` 计数正确；cbo 程序（`p12_cbo.S`）在写 `menvcfg` 后 `n_trap = 0` |
+
+## B4.9.3 阻塞 K1（维护操作的冲刷/重定向竞态）—— 定位证据与修法建议
+
+**现象**：把维护操作**紧邻**放置时（`fence.i; lw; sfence.vma; …; fence.i; fence.i`），提交 PC 流出现
+"丢/跳指令"：先是 `idx 9: 0x8001c034`（跳过 `0x8001c024..0x8001c030`），把维护操作各自隔开 6 条无关
+指令后改善到 `idx 20: 0x8001c060 vs 黄金 0x8001c050`（跳过 4 条）。
+
+**调试证据**（`[rdbg]` 打印，逐次维护检测）：
+```
+[rdbg] maint kind=1 pc=0x8001c018 take_sf=0 redir_v=0 redir_pc=0x00000000 flush=0   ← fence.i
+[rdbg] maint kind=2 pc=0x8001c020 take_sf=1 redir_v=1 redir_pc=0x8001c024 flush=1   ← sfence#1（重定向正确）
+[rdbg] maint kind=2 pc=0x8001c030 take_sf=1 redir_v=1 redir_pc=0x8001c034 flush=1   ← sfence#2（重定向正确）
+```
+⇒ **每次维护操作的"目标 PC"都算对了**，问题在**执行顺序**：第 1 条 sfence 冲刷后重定向到
+`0x8001c024`，但 `0x8001c024..0x8001c030` 这几条**没有提交**，而下一条维护操作（sfence#2）
+却**已经被检测到**（说明它在 ROB 里执行过）⇒ 典型的"冲刷/重定向与在途取指块/已派发项的竞态"：
+第一次维护的 flush 只清了 ROB，但前端在收到重定向之前已经取回并**派发**了后续块（含第二条
+维护操作），第二次维护的 flush 又把夹在中间、尚未提交的指令整段丢掉。
+
+**修法建议（下一段，按代价排序）**
+1. **维护操作串行化（最小）**：在后端禁止"维护操作与任何更年轻指令同组提交"——即维护操作
+   进入提交窗口时，**只允许它自己提交**（为此扩展现有的 `cmt_hold_w`：只要提交组内含维护/xRET，
+   就 hold 掉它之后的所有 lane，并要求它位于 lane 0 才动作）。这样"重定向到 PC+4"与
+   "下一条指令重新取"严格串行，不再有中间段被二次 flush 吃掉。
+2. **维护后加 drain 窗口**：维护操作提交后，强制 `flush_all` 保持 N 拍（例如 4~8 拍）再发重定向
+   （与 `fence.i` 的 256 拍扫掠同构），确保前端在途块全部作废后再重新取指。
+3. **前端在途块的无效化口径**：核对 `front4_top` 在 `redirect_valid` 拍是否把**已取回但未派发**的
+   块全部作废（若否，则与 2A 的 `kill_young` 口径存在差异，需要在 `front4` 侧补——登记为跨模块待办）。
+
+**口径登记**：`p11_maint.S` 的黄金（Spike `--isa=rv32imac_zicsr_zifencei`，42 条）**已生成并可复用**；
+`p12_cbo.S`（Spike 不支持 Zicbom，实测即使 `--isa` 含 zicbom 也判非法）继续走"自记录 + 维护口探针"。
+
+## B4.9.4 cbo 口径表（本段实现）
+
+| 指令 | 编码（funct3 / rs2 / rs1） | 合法性（2A `dec_csr.v:222-237`） | 维护动作 |
+|---|---|---|---|
+| `cbo.inval` | 000 / 00000 / ≠0 | `CBIE≠0`（menvcfg[5:4]） | L1D `inval_all` |
+| `cbo.clean` | 001 / 00000 / ≠0 | `CBCFE=1`（menvcfg[6]） | L1D `clean_all` |
+| `cbo.flush` | 010 / 00000 / ≠0 | `CBCFE=1` | L1D `clean_all` + `inval_all` |
+| `fence.i` | 001 / 00000 / =0，`[31:20]=0` | 恒合法（Zifencei） | L1I 全阵列扫掠（256 拍）+ 冻结流水 |
+| `sfence.vma` | opcode 0x73 / 000 / funct7 `0b0001001` | M 模式恒合法（U 模式非法） | TLB 全失效 + L1D `inval_all` + 冲刷重定向 |
+| 未实现 | — | CBIE=01 的 **INVAL⇒FLUSH 降级**未实现（登记；本程序用 CBIE=11 不触发） | — |
+
+## B4.9.5 本段检查点状态
+
+- 改动文件：`rtl/back2/backend_top.v`（合法化 + lane 扫描 + hold 掩码）、`rtl/top/core_top_2b.v`
+  （维护口接线 + fence.i 扫掠 FSM + 适配器 kill）；**TB/黄金零改动**（保持母代理已验收的 80 项）。
+- WIP（未进生成器清单，工作树未跟踪）：`sim/unit/prog/back2_p11_maint.S`、`back2_p12_cbo.S`
+  ——K1 修复后可直接挂回（生成器加两条 PROGS 即可，黄金已在 `/tmp/back2_P11.spike.log` 口径下验证过可生成）。
+- 基线复验：编译 0 error、`tb_core_top_2b` **PASS 80/80**、`regress.sh` **32/32**。
+- 下一步：**4b-2a-fix（K1）** → 挂回 `p11_maint`（黄金 42 条）+ `p12_cbo`（自记录）→ 再进 4b-2b（D 侧翻译）。

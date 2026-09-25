@@ -150,6 +150,19 @@ module backend_top #(
     output wire [11:0] csr_waddr_o,
     output wire [31:0] csr_wdata_o,
     output wire [1:0]  xret_kind_o,
+    //--------------------------------------------------------------------------
+    //   ★★ 2B-4 第 4b-2a 段：**维护操作（fence.i / sfence.vma / cbo.\*）**
+    //--------------------------------------------------------------------------
+    //   · `cbo_perm_i = {cbcfe, cbie_nonzero}`（由顶层从 `csr_file.menvcfg_o` 译出，
+    //     照 2A `dec_csr.v:222-237` 的口径：CBIE=00 ⇒ cbo.inval 非法；CBCFE=0 ⇒
+    //     cbo.clean/flush 非法；CBIE=01 的 INVAL⇒FLUSH 降级本段不实现，见报告 §B4.9.4）
+    //   · `maint_kind_o`：**提交点 lane 0** 的维护动作码（载荷 TVAL = 原始指令位）
+    //       1=fence.i、2=sfence.vma、3=cbo.inval、4=cbo.clean、5=cbo.flush、0=非维护
+    //   · `maint_cmt_o`：本拍 lane 0 的维护操作**正在提交**（顶层据此驱动维护口 + 冲刷重定向）
+    input  wire [1:0]  cbo_perm_i,
+    output wire [2:0]  maint_kind_o,
+    output wire        maint_cmt_o,
+    output wire [31:0] maint_pc_o,          // 维护操作**自己**的 PC（重定向目标 = 它 +4）
     //   （原 `mtip_i`/`irq_mti_o`/`mtvec_o`/`mepc_o` 四个端口随 `b2_csr` 外移而删除；
     //     中断判定在 4b-1a 由顶层用 `csr_*_o` 复刻，4b-1b 起交给 `trap_ctrl`。）
     output wire [31:0] trap_valid_o_pc,       // 别名（保持 trap_valid_o 契约不变）
@@ -530,10 +543,22 @@ module backend_top #(
         //     · mret/sret ⇒ 不非法；执行期是 no-op，**提交点特权动作**由顶层 trap FSM 做
         //       （读 mepc/mstatus + 重定向），识别方式见 `xret_cmt_o`；
         //     · wfi 仍留 unsup（本里程碑不需要）。
-        wire is_sys_ok = ecall | ebreak | mret | sret;
+        //   ★ 4b-2a：`sfence.vma` 归 `OPT_SYS`，加进白名单（2A 只对 U 模式判非法；
+        //     本核 priv 恒 M ⇒ 直接放行）
+        wire is_sys_ok = ecall | ebreak | mret | sret | sfence;
+        //   ★ 4b-2a：`cbo.*`（opt 10）**摘出 `unsup`**；其合法性改由 `cbo_perm_i`
+        //     按动作码精确判定（不再用译码器内部的 `cbo_gate_ill` —— 本核前端未接
+        //     menvcfg/senvcfg 到译码器，那两位是悬空 ⇒ 直接用会引入 x）
         wire unsup   = ((opt == 4'd8) & ~is_sys_ok) |
-                       (opt == 4'd5) | (opt == 4'd10) | (opt == 4'd15);
-        wire illegal = ill_instr | (opt == 4'd15) | csr_ill | cbo_gate_ill;
+                       (opt == 4'd5) | (opt == 4'd15);
+        //   cbo 动作码：funct3=000 ⇒ inval（需 CBIE≠0）；001/010 ⇒ clean/flush（需 CBCFE=1）
+        wire cbo_ill_perm = cbo_valid & ((tval[14:12] == 3'b000) ? ~cbo_perm_i[0]
+                                                                : ~cbo_perm_i[1]);
+        //   ★ 4b-2a：cbo 指令的 `ill_instr` 必须屏蔽掉——译码器内部的 `cbo_gate_ill` 由
+        //     menvcfg/senvcfg 驱动，而本核前端未接那两位（悬空 z）⇒ 它会给出 x；
+        //     本核改用 `cbo_ill_perm`（由顶层从 `csr_file.menvcfg_o` 译出的两位许可）判。
+        //     `ill_instr & ~cbo_valid`：cbo 时恒 0（x & 0 = 0），非 cbo 时原样通过 ✓
+        wire illegal = (ill_instr & ~cbo_valid) | (opt == 4'd15) | csr_ill | cbo_ill_perm;
         wire kill    = unsup | illegal;
 
         wire rs1_used = ((opt == 4'd0) | (opt == 4'd1) | (opt == 4'd3) | (opt == 4'd4) |
@@ -1332,7 +1357,9 @@ module backend_top #(
     //     xret 拍 `flush_all` 同时为 1（冲刷年轻工作）⇒ 这里开一个"仅上报"的口子：
     //     只放开 `cmt_ok`，所有**副作用**仍由各自的 `p_di/p_df/cmt_st_drain` 门控
     //     （mret/sret 无目的寄存器、非访存 ⇒ 无副作用可泄漏）。
-    assign cmt_ok = ~squash_v_w & (~flush_all_w | (xret_cmt_o & trp_flush_v_i));
+    //   ★ 4b-2a：维护操作与 xRET 一样——它们**自己触发冲刷**（把更年轻的工作清掉），
+    //     但那条指令本身必须照常计入提交流 ⇒ 口子扩为 (xret | maint)
+    assign cmt_ok = ~squash_v_w & (~flush_all_w | ((xret_cmt_o | maint_cmt_o) & trp_flush_v_i));
     //   ★ LQ 提交点释放的窗口宽度：`cmt_raw` 是 rob.v 的**前缀连续**提交链（第 i 槽可提交 ⇒
     //     前面全可提交）⇒ 条数 = popcount；冲刷/陷阱拍强制 0（不得释放未提交项）。
     assign cmt_n_w = cmt_ok ? ({2'b0, cmt_raw[0]} + {2'b0, cmt_raw[1]} +
@@ -1343,7 +1370,7 @@ module backend_top #(
     generate
     for (cc = 0; cc < COMMIT_W; cc = cc + 1) begin : g_cmt
         wire [RB_W-1:0] p = cmt_pay[cc*RB_W +: RB_W];
-        assign commit_valid_o[cc] = cmt_raw[cc] & cmt_ok;
+        assign commit_valid_o[cc] = cmt_raw_m[cc] & cmt_ok;
         assign commit_pc_o[cc*32 +: 32] = p_pc(p);
         assign commit_arch_rd_o[cc*5 +: 5] = p_arn(p);
         assign commit_arch_we_o[cc] = p_di(p) | p_df(p);
@@ -1351,17 +1378,17 @@ module backend_top #(
         assign commit_arch_rd_wdata_o[cc*32 +: 32] =
             p_di(p) ? iprf_rd[(11+cc)*32 +: 32] :
             p_df(p) ? cval_f[31:0] : 32'h0;
-        assign cmt_i_we[cc]   = cmt_raw[cc] & cmt_ok & p_di(p);
+        assign cmt_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_di(p);
         assign cmt_i_arn[cc*5 +: 5] = p_arn(p);
         assign cmt_i_pd[cc*PW_I +: PW_I] = p_pdi(p);
-        assign rel_i_we[cc]   = cmt_raw[cc] & cmt_ok & p_di(p);
+        assign rel_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_di(p);
         assign rel_i_pd[cc*PW_I +: PW_I] = p_pdio(p);
-        assign cmt_f_we[cc]   = cmt_raw[cc] & cmt_ok & p_df(p);
+        assign cmt_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
         assign cmt_f_arn[cc*5 +: 5] = p_arn(p);
         assign cmt_f_pd[cc*PW_F +: PW_F] = p_pdf(p);
-        assign rel_f_we[cc]   = cmt_raw[cc] & cmt_ok & p_df(p);
+        assign rel_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
         assign rel_f_pd[cc*PW_F +: PW_F] = p_pdfo(p);
-        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok;
+        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok & ~cmt_hold_w[cc];
         assign lsu_dr_idx[cc*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = p_stq(p);
     end
     endgenerate
@@ -1610,11 +1637,75 @@ module backend_top #(
     //     ⇒ 直接按编码判定 mret(0x3020_0073) / sret(0x1020_0073)，**不需要新增载荷位**
     //     （RB_W=416 已用满，见 back2_params.vh）。
     wire [31:0] cmt0_tval = cmt_pay[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB];
-    //   ★ 4b-1a：xRET 种类引出（`priv_ctrl.xret_kind` 需要）：1 = mret、2 = sret
-    assign xret_kind_o = (cmt0_tval == 32'h3020_0073) ? 2'd1 :
-                         (cmt0_tval == 32'h1020_0073) ? 2'd2 : 2'd0;
-    assign xret_cmt_o = |cmt_raw & cmt_ok &
-                        ((cmt0_tval == 32'h3020_0073) | (cmt0_tval == 32'h1020_0073));
+    //   ★★ 4b-2a 缺陷修正（实测抓出）：xRET 与维护操作**可以在提交组的任意 lane**
+    //     （4a/4b 原实现只看 lane 0 的 `cmt0_tval` ⇒ 只要它们不在 lane 0 就识别不到：
+    //      实测 p11 的 `fence.i` 与 lane 0 的另一条指令同拍提交 ⇒ `maint_cmt` 恒 0）。
+    //     修法：**逐 lane 扫描提交组**（由高到低 ⇒ 最老者胜），用该 lane 自己的
+    //     载荷 TVAL 判定，并取出它自己的 PC 供重定向用。
+    function [1:0] xret_kind_f; input [31:0] t;
+        begin xret_kind_f = (t == 32'h3020_0073) ? 2'd1 :
+                            (t == 32'h1020_0073) ? 2'd2 : 2'd0; end
+    endfunction
+    function [2:0] maint_kind_f; input [31:0] t;
+        begin
+            maint_kind_f =
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b001) & (t[19:15] == 5'd0) & (t[31:20] == 12'h000)
+                    ? 3'd1 :                               // fence.i（0x0000_100F）
+                (t[6:0] == 7'h73) & (t[14:12] == 3'b000) & (t[31:25] == 7'b0001_001)
+                    ? 3'd2 :                               // sfence.vma（0x1200_0073 起）
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b000) & (t[19:15] != 5'd0) & (t[31:25] == 7'b0)
+                    ? 3'd3 :                               // cbo.inval
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b001) & (t[19:15] != 5'd0) & (t[31:25] == 7'b0)
+                    ? 3'd4 :                               // cbo.clean
+                (t[6:0] == 7'h0F) & (t[14:12] == 3'b010) & (t[19:15] != 5'd0) & (t[31:25] == 7'b0)
+                    ? 3'd5 : 3'd0;                         // cbo.flush
+        end
+    endfunction
+    reg  [3:0]  xret_lane_oh, maint_lane_oh;
+    reg  [1:0]  xret_lane_idx, maint_lane_idx;
+    reg  [1:0]  xret_kind_sel;
+    reg  [2:0]  maint_kind_sel;
+    reg  [31:0] maint_pc_sel;
+    integer     mw2;
+    //   ★ 组合环警告：本扫描**不得**用 `cmt_ok` 做门控 —— `cmt_ok` 里含
+    //     `(xret_cmt_o | maint_cmt_o)` 的"上报口子"，而那两个信号正是本扫描的输出
+    //     ⇒ 成环（实测：扫描看不到维护操作、重定向 PC 变 0）。
+    //     只用 `cmt_raw & ~squash_v_w`（前缀提交链 + 无分支误判冲刷）即可：
+    //     陷阱拍 `cmt_raw` 在异常槽及其后全 0 ⇒ 不会误识别更年轻的 xRET/维护操作。
+    always @(*) begin
+        xret_lane_oh = 4'h0;   xret_kind_sel  = 2'd0; xret_lane_idx  = 2'd0;
+        maint_lane_oh = 4'h0;  maint_kind_sel = 3'd0; maint_pc_sel = 32'h0;
+        maint_lane_idx = 2'd0;
+        for (mw2 = COMMIT_W-1; mw2 >= 0; mw2 = mw2 - 1) begin
+            if (cmt_raw[mw2] & ~squash_v_w) begin
+                if (xret_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W])) != 2'd0) begin
+                    xret_lane_oh  = 4'h1 << mw2[1:0];
+                    xret_lane_idx = mw2[1:0];
+                    xret_kind_sel = xret_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]));
+                end
+                if (maint_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W])) != 3'd0) begin
+                    maint_lane_oh  = 4'h1 << mw2[1:0];
+                    maint_lane_idx = mw2[1:0];
+                    maint_kind_sel = maint_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]));
+                    maint_pc_sel   = p_pc(cmt_pay[mw2*RB_W +: RB_W]);
+                end
+            end
+        end
+    end
+    assign xret_kind_o  = xret_kind_sel;
+    assign maint_kind_o = maint_kind_sel;
+    assign maint_pc_o   = maint_pc_sel;
+    assign xret_cmt_o  = |xret_lane_oh;
+    assign maint_cmt_o = |maint_lane_oh;
+    //   ★★ 4b-2a 缺陷修正（实测抓出）：触发冲刷的维护/xRET 操作**通常与更年轻的指令同组提交**
+    //     ——它们会被本次冲刷丢掉并**重新执行**，但 `cmt_ok` 的口子让整组都"上报提交"
+    //     ⇒ 那些更年轻的槽在 PC 流里出现**两次**（实测 p11 连续两条 `fence.i`：
+    //     第 17 条 `0x8001c03c` 重复出现）。
+    //     修法：比该槽更年轻的 lane **不上报、不回写、不更新 ARAT、不进训练 FIFO**
+    //     （它们在冲刷后重新执行；ROB 指针由 `flush_all` 分支接管，不受本掩码影响）。
+    wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << (maint_lane_idx + 2'd1)) :
+                            (|xret_lane_oh)  ? (4'hF << (xret_lane_idx  + 2'd1)) : 4'h0;
+    wire [3:0] cmt_raw_m  = cmt_raw & ~cmt_hold_w;
 
     //==========================================================================
     // 12. 提交训练 / 检查点释放 / RAS（前端衔接）
@@ -1632,7 +1723,7 @@ module backend_top #(
     always @(*) begin
         trq_acc = 2'd0;
         for (ti = 0; ti < COMMIT_W; ti = ti + 1) begin
-            trq_ok[ti] = cmt_st_branch[ti] & cmt_ok;
+            trq_ok[ti] = cmt_st_branch[ti] & cmt_ok & ~cmt_hold_w[ti];
             trq_ord[ti] = trq_acc;
             if (trq_ok[ti]) trq_acc = trq_acc + 2'd1;
         end

@@ -220,6 +220,28 @@ module core_top_2b (
     wire [2:0]  csr_frm_w = 3'h0;
     wire [4:0]  csr_ff_w  = 5'h0;
     wire [1:0]  xret_kind_w;
+    //   ★★ 2B-4 第 4b-2a 段：维护操作（fence.i / sfence.vma / cbo.*）
+    wire [2:0]  maint_kind_w;
+    wire        maint_cmt_w;
+    wire [31:0] maint_pc_w;
+    wire [31:0] csr_menvcfg_w;
+    wire [1:0]  cbo_perm_w = {csr_menvcfg_w[6], |csr_menvcfg_w[5:4]};   // {CBCFE, CBIE≠0}
+    //   fence.i 的"全阵列失效"扫掠（照 2A `core_top.v:885-905/3744-3749`：8 bit 索引
+    //   256 拍，每拍以 `{19'b0, idx, 5'b00000}` 作为 L1I 的 index 输入）
+    reg         fencei_busy, fencei_busy_q;
+    reg  [7:0]  fencei_idx_q;
+    reg  [31:0] fencei_pc_q;
+    wire        fencei_hold_w = fencei_busy | fencei_busy_q;
+    wire        maint_fencei_w = maint_cmt_w & (maint_kind_w == 3'd1);
+    wire        maint_sfence_w = maint_cmt_w & (maint_kind_w == 3'd2);
+    wire        maint_cbo_w    = maint_cmt_w & (maint_kind_w >= 3'd3);
+    //   维护口（TB 可探针）
+    wire        maint_l1i_inval_w  = fencei_busy;                       // fence.i 扫掠期间拉高
+    wire        maint_l1d_inval_w  = maint_sfence_w |                        // sfence.vma 刷 L1D
+                                     (maint_cbo_w & (maint_kind_w != 3'd4)); // cbo.inval / flush
+    wire        maint_l1d_clean_w  = maint_cbo_w & (maint_kind_w != 3'd3);   // cbo.clean / flush
+    //   （fence.i **不刷 TLB** —— 它只管指令缓存；sfence.vma 才刷 TLB，2A 同口径）
+    wire        maint_tlb_sfence_w = maint_sfence_w;
     wire [6:0]  dbg_rob_cnt_w;
     //   ★★ 2B-4 第 4b-1b 段：2A `csr_file`+`priv_ctrl`+`trap_ctrl` 替换 `b2_csr`
     wire [31:0] csr_mtvec_o, csr_stvec_o, csr_medeleg_o, csr_mideleg_o;
@@ -308,9 +330,13 @@ module core_top_2b (
         .fill_valid(ptw_fill_valid), .fill_va(ptw_fill_va), .fill_ppn(ptw_fill_ppn),
         .fill_perm(ptw_fill_perm), .fill_asid(9'h0),
         // ---- sfence.vma：本段无 CSR 提交源 ⇒ 恒无效（第 4 段接提交点）----
-        .sfence_valid(1'b0), .sfence_va(32'h0), .sfence_asid(9'h0),
+        //   ★ 4b-2a：sfence.vma ⇒ **全失效**（本核单地址空间/无 ASID，全刷恒正确；
+        //     2A 做精确 va/asid 匹配，见 `core_top.v:1759`；口径差异登记 §B4.9.4）
+        .sfence_valid(maint_tlb_sfence_w), .sfence_va(32'h0), .sfence_asid(9'h0),
         .sfence_all_va(1'b1), .sfence_all_asid(1'b1),
-        .satp_we(1'b0), .satp_asid_new(9'h0),
+        //   写 satp（0x180）⇒ 刷 ASID（2A 同法）
+        .satp_we(csr_we_w & (csr_waddr_w == 12'h180)),
+        .satp_asid_new(csr_wdata_w[30:22]),
         .hit_count_o(), .miss_count_o(), .flush_count_o()
     );
 
@@ -468,8 +494,10 @@ module core_top_2b (
     wire        axi_wdata_ready_w, axi_done_w;
     wire [2:0]  arlock_raw, awlock_raw;  // axi_master_ctrl 的 lock 为 3 bit（只用 [0]）
 
-    wire        l1i_cs_req = l1i_req_valid;
-    wire [31:0] l1i_cs_vaddr = l1i_req_addr;
+    //   ★ 4b-2a：fence.i 扫掠期间，L1I 的 index 输入切到扫掠地址、且**不接受取指请求**
+    //     （照 2A `core_top.v:901` 的 `l1i_cs_vaddr` mux 与 `:926` 的 `~fencei_busy` 门控）
+    wire        l1i_cs_req   = l1i_req_valid & ~fencei_busy;
+    wire [31:0] l1i_cs_vaddr = fencei_busy ? {19'b0, fencei_idx_q, 5'b00000} : l1i_req_addr;
 
     // 响应归属：记录"最近一次被 L1I 接受（~ready）的请求地址"
     reg         l1i_pend_q;
@@ -569,6 +597,12 @@ module core_top_2b (
     reg [`BACK2_MEM_TAG_W-1:0] d_tag_q;
 
     wire        l1d_busy_w = ~l1d_idle;              // FSM 非空闲（填充/写回/维护）
+    //   ★★ 4b-2a：**维护操作/陷阱/xRET 的冲刷拍必须放弃在途的数据侧访问**。
+    //     实测（p11 的 `sfence.vma` 后整机停摆）：sfence 触发 L1D `inval_all` 时适配器
+    //     正停在 `AD_WAIT` 等一个不会到来的 `l1d_cs_ready` ⇒ `d_ready_w` 永久为 0
+    //     ⇒ 之后所有访存全部挂住。2A 对应 `m_kill_fsm`（core_top.v:3749-3752 的
+    //     "异常 / fence.i 同步：放弃在途访存"）⇒ 本核给适配器补同样的 kill。
+    wire        d_kill_w = be_trp_flush;
     wire        d_idle     = (ad_st_q == AD_IDLE);
     assign      d_ready_w  = d_idle & ~l1d_busy_w;   // 可接管新请求
     wire        d_start    = d_ready_w & lsu_req_v;
@@ -633,7 +667,7 @@ module core_top_2b (
         .wb_word_idx(l1d_wb_word_idx), .wb_data(l1d_wb_data), .wb_done(l1d_wb_done),
         .wb_ready(l1d_wb_ready),
         //   ★ 占位：L1D 维护（fence.i / cbo.inval / clean）本段无 CSR 提交源 ⇒ 恒 0
-        .inval_all(1'b0), .clean_all(1'b0), .idle(l1d_idle)
+        .inval_all(maint_l1d_inval_w), .clean_all(maint_l1d_clean_w), .idle(l1d_idle)
     );
 
     // ---- 适配器时序 ----
@@ -644,7 +678,10 @@ module core_top_2b (
             d_a_q <= 32'h0; d_d_q <= 32'h0; d_strb_q <= 4'h0;
             d_tag_q <= {`BACK2_MEM_TAG_W{1'b0}};
         end else begin
-            case (ad_st_q)
+            //   ★ 4b-2a：维护/陷阱/xRET 冲刷 ⇒ 放弃在途访问（看上面 `d_kill_w` 的说明）
+            if (d_kill_w) begin
+                ad_st_q <= AD_IDLE;
+            end else case (ad_st_q)
                 AD_IDLE: begin
                     if (d_start) begin
                         d_we_q   <= lsu_req_we;
@@ -941,6 +978,8 @@ module core_top_2b (
         .csr_frm_i(csr_frm_w), .csr_fflags_i(csr_ff_w),
         .csr_we_o(csr_we_w), .csr_waddr_o(csr_waddr_w), .csr_wdata_o(csr_wdata_w),
         .xret_kind_o(xret_kind_w),
+        .cbo_perm_i(cbo_perm_w), .maint_kind_o(maint_kind_w), .maint_cmt_o(maint_cmt_w),
+        .maint_pc_o(maint_pc_w),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),
         .cnt_commit4_o(), .cnt_issue_o(),
         .dbg_rob_cnt_o(dbg_rob_cnt_w), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w)
@@ -970,7 +1009,7 @@ module core_top_2b (
         .irq_stip(1'b0), .irq_seip(1'b0),
         .cycle_i(cycle_cnt), .instret_i(instret_cnt),
         .pmp_cfg_o(pmp_cfg_flat), .pmp_addr_o(pmp_addr_flat), .satp_o(csr_satp_o),
-        .menvcfg_o(), .senvcfg_o(), .mcounteren_o(), .scounteren_o(),
+        .menvcfg_o(csr_menvcfg_w), .senvcfg_o(), .mcounteren_o(), .scounteren_o(),
         .mtvec_o(csr_mtvec_o), .stvec_o(csr_stvec_o),
         .medeleg_o(csr_medeleg_o), .mideleg_o(csr_mideleg_o),
         .mie_o(csr_mie_o), .mip_o(csr_mip_o), .mepc_o(csr_mepc_o), .sepc_o(csr_sepc_o)
@@ -1072,9 +1111,37 @@ module core_top_2b (
     wire [31:0] trp_target_w = tc_trap_valid ? tc_redirect_pc :
                                (xret_kind_w == 2'd2) ? csr_sepc_o : csr_mepc_o;
 
-    assign be_trp_flush       = trp_take_w;
-    assign be_trp_redirect_v  = trp_take_w;
-    assign be_trp_redirect_pc = trp_target_w;
+    //   ★★ 4b-2a：维护操作的"提交序执行"语义 ——
+    //     · fence.i：**冲刷流水并冻结 256 拍**（L1I 全阵列扫掠），扫掠结束后重定向到
+    //       fence.i 的下一条（`fencei_pc_q`）；冻结期间 `flush_all` 持续有效 ⇒ ROB/派发全停，
+    //       不会用旧行取指（2A 用 `fencei_hold` 冻结前端，`core_top.v:885-905/3742-3749`）
+    //     · sfence.vma / cbo.*：单拍完成（L1D 自身有维护 FSM 逐组扫描，`l1d.idle` 反映），
+    //       当拍冲刷 + 重定向到头部 PC+4
+    //     · 与陷阱/xRET 的优先级：陷阱 > xRET > fence.i 扫掠 > 维护单拍
+    wire        maint_take_w = maint_sfence_w | maint_cbo_w;
+    assign be_trp_flush       = trp_take_w | fencei_busy | maint_take_w;
+    assign be_trp_redirect_v  = trp_take_w | maint_take_w | (fencei_busy_q & ~fencei_busy);
+    assign be_trp_redirect_pc = trp_take_w          ? trp_target_w :
+                                maint_take_w        ? (maint_pc_w + 32'd4) :
+                                (fencei_busy_q & ~fencei_busy) ? fencei_pc_q :
+                                                      trp_target_w;
+
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            fencei_busy <= 1'b0; fencei_busy_q <= 1'b0;
+            fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
+        end else begin
+            fencei_busy_q <= fencei_busy;
+            if (maint_fencei_w) begin
+                fencei_busy <= 1'b1;
+                fencei_idx_q <= 8'd0;
+                fencei_pc_q  <= maint_pc_w + 32'd4;     // fence.i 的下一条（norvc ⇒ +4）
+            end else if (fencei_busy) begin
+                if (fencei_idx_q == 8'hFF) fencei_busy <= 1'b0;
+                fencei_idx_q <= fencei_idx_q + 8'd1;
+            end
+        end
+    end
     //   `trp_halt_w` = 后端观测（历史"陷阱即停机"痕迹；不再参与冲刷/派发门控）
 
     //==========================================================================
