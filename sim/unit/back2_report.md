@@ -3608,3 +3608,103 @@ t=9402 | inv=0 cln=1 mq=0 mc=1 midx=255 idle=1 | flush=1 cdqe=1 drany=0   ← cb
 * 一句话：**p12 的内存序缺口已收口** —— 根因是 `cbo.*` 动作码解码（funct3 vs imm12[1:0]），
   叠加"维护不等已提交 store 排空"的序缺口；两处都已修，p12 4/4 数据正确、判据 103 项全绿，
   遗留的 `flush` INVAL 与 L1D 维护写回登记为下一段的 2A 侧改动。
+
+---
+
+# B4.19 D 侧翻译 + PTW 串行复用（2B-4 第 4b-2b 段）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已验收提交的 `d5451b8`=tag `2B-4.17`）
+> 结论：**主线（D 侧 TLB 查询口 + PTW 串行复用 + 数据侧精确页错误通路）已落地**，编译零错误、
+> `tb_core_top_2b` **103/103**、`regress.sh` **32/32**、2A 零修改；**p13_sv32 未挂回（WIP）**，
+> 阻塞点已用波形铁证定位：**PTW 的 PTE 读走核内 AXI 直读、绕过 L1D ⇒ 读不到"已进 L1D
+> 但尚未写回内存"的页表项**。修法（PTE 读经 L1D / 维护写回）登记为 4b-2c 第一优先。
+
+## B4.19.1 已完成（RTL 主线，全部在本段落地并验证）
+
+| # | 内容 | 落点与关键口径 |
+|---|---|---|
+| ① | **D 侧 TLB 查询口（口 1）接通** | `core_top_2b.v` §2b：LSU 适配器新增 `AD_XLATE`（TLB 组合查询）/`AD_TR`（等 PTW）两级；状态码 2 bit→**3 bit**（2 bit 会把 `4/5` 截断成 `0/1` 与 IDLE/REQ 撞车——编译警告抓出） |
+| ② | **翻译使能判据（ISA 口径）** | `d_xlat_need_w = sv32_en & ((priv≠M) \| MPRV&(MPP≠M))`：**MPRV 仅在 MPP≠M 时生效**；Bare / 不满足 ⇒ **整级跳过**，逐拍与旧版相同 |
+| ③ | **路由与访问一律用 PA** | `d_route_a_w`（`AD_XLATE`/`AD_TR` 取翻译结果、其余取请求 VA）喂 `mmio_route`；`d_a_q` = PA、`d_va_q` = VA（异常 `mtval` 用 VA） |
+| ④ | **L1D 物理标签修正** | L1D 是 **VIPT**（`l1d.v:112-113/480-481` 用 `cs_vaddr` **同时**出 index 与 tag）⇒ 送 `cs_vaddr = {PA[31:12], VA[11:0]}`（物理 tag + 虚拟 index）。Bare 下与旧值逐位相同；Sv32 下才能保证"同 VA 重映射后不命中旧行"（sfence 重映射判据的前提） |
+| ⑤ | **PTW 串行复用（数据优先）** | `m_tr_src_q` 归属寄存器（0=数据/1=取指，2A `core_top.v:1587-1595` 同构）；数据请求抢占取指在途遍历时 `kill`（取指 `tr_req_valid` 电平保持 ⇒ 自动重发）；**取指的 done/fault 按归属过滤**（否则数据侧遍历完成会被误当取指完成） |
+| ⑥ | **取指翻译/保护不受 MPRV 影响** | ISA `norm:mstatusmprvinstxlatop`（2A `priv_ctrl.v:19` 亦明示）⇒ `sv32_translate_en = sv32_en & (csr_priv_2 != M)`、`lookup2_priv = csr_priv_2`（原先误用含 MPRV 语义的 `csr_eff_priv`）。实测不修的后果：M 模式 + MPRV=1 时**取指侧抢走 PTW 并做一笔错误遍历** |
+| ⑦ | **数据侧精确页错误通路** | `lsq_simple`：新增 `mem_rsp_err` 输入 + `exc_valid/rob/cause/tval` 输出（cause **13**、tval = **VA**、抑制 PRF 写口）；`backend_top`：接到 ROB 的 `upd_exc_*`（4a 起该口恒 0 未用）；`core_top_2b`：TLB 权限错 / PTW 故障时以"正常响应 + err=1"回一笔 ⇒ **异常位与 done 位同沿写入** ⇒ 下一拍 ROB 头部同时看到 done+exc ⇒ 精确抛陷阱且该指令不提交 |
+| ⑧ | **PTE 的 PMP 检查** | 沿用 4b-1b 的 `pmp_acc_xlat`（取指遍历 X / 数据 LOAD/STORE），本段未改 |
+| ⑨ | **sfence.vma 全失效** | 保持 §B4.9.4 登记口径（单地址空间 ⇒ `sfence_all_va/all_asid` 恒 1；精确 va/asid 属后续） |
+
+## B4.19.2 p13_sv32（WIP，**未挂回**）：已跑通的部分与决定性阻塞点
+
+`sim/unit/prog/back2_p13_sv32.S`（保留在树内，WIP）+ TB 的 C13'（8 项判据，
+快照 `../.b2chk/tb_core_top_2b.sv.s31wip`）已实现：两级页表（根/一级各占独立 4 KB 页）、
+4 MB 恒等大页覆盖程序自身、翻译后的 load/store/load、未映射 VA 的 load page fault、
+`sfence.vma` 后重映射、关 MPRV 直读 PA 复核。
+
+**已跑通（提交轨迹铁证）**：
+
+```
+idx=44  li s4,0x40000100                      ← 打开 MPRV=1/MPP=S + satp=Sv32(root) 之后
+idx=45  pc=0x80024138  csrr t3,mcause → 0x0000000d   ← ★ mcause = 13（load page fault）
+idx=46  pc=0x8002413c  csrr t4,mtval  → 0x40000100   ← ★ mtval = 故障 **虚拟**地址
+idx=47  pc=0x80024140  csrr t5,mepc   → 0x800240b4   ← 故障指令 PC（精确）
+```
+
+**阻塞点（决定性证据）**：PTW 的 PTE 读走**核内 AXI 直读**（`IOWN_PTE` 源，
+`core_top_2b.v:951/1015`），**绕过 L1D** ⇒ 读不到"已写入 L1D 脏行、尚未写回内存"的页表项：
+
+```
+[p13-pte] t=13030 pa=0x80026400 data=0x00000013   ← 根页表项地址读回 nop 填充（clear_mem）
+```
+
+程序刚用 `sw` 写进去的 `0x00009C01` 仍在 L1D 里 ⇒ 遍历把根项当"非叶 + PPN=0"⇒
+二级表读取失败 ⇒ 首次翻译即页错误（实测 4 次陷阱 = 反复重试）。
+本核既无"PTE 读经 L1D"通路，也无"维护写回"（§B4.18 在册）⇒ 页表写在遍历可见之前无法保证。
+
+**修法（4b-2c 第一优先，按代价排序）**：
+1. **PTE 读经 L1D**（首选）：把 PTE 读作为一路数据侧 load 走适配器/L1D 端口（新增请求源 +
+   响应回 PTW），使"页表写"与"遍历读"在同一缓存层次上连贯；
+2. 给 L1D 维护口补**写回**，由 `sfence.vma`（或 cbo.clean）强制回写页表行（与 §B4.18 的
+   flush INVAL 同一处 2A 改动）。
+
+## B4.19.3 本段实测回归与修法（新增输入口在"直驱 TB"里悬空 ⇒ x 传播）
+
+**症状**：`regress.sh` 首跑 `tb_back2_lockstep` FAIL（`C3 程序 1`：乱序核只提交 **24** 条后停摆
+200000 拍；2A 侧 1024 条）。逐段二分实测：HEAD（改动前）RTL 同一 TB **PASS**（77.55 ms 结束），
+本段 RTL 复现失败 ⇒ 回归由本段引入。
+
+**根因**：`lsq_simple` 新增输入 `mem_rsp_err`（数据侧带错响应）。`tb_back2_lockstep` 是
+**纯后端直驱 TB**（直接例化 `front4_top` + `backend_top`，不经 `core_top_2b`）⇒ 该新输入
+**未接**（悬空 z）⇒ `rsp_ok & mem_rsp_err = x` ⇒ `wb_dst_i/f` 里的 `x ? 0 : ld_di[...]`
+按位归并成 **x** ⇒ PRF 写口有效位/目的号变 x ⇒ 第一个带目的寄存器的 load 之后整核写回失效
+（前 24 条能提交，正是"第一次 load 响应"之前的指令数）。
+
+**修法**（1 行，中心化，防御性正确）：LSQ 内先净化 —— `wire rsp_err_w = (mem_rsp_err === 1'b1);`
+口径：**只有明确的 1 才算带错响应**，z/x/0 一律按正常响应处理。修后同一 TB **PASS**，
+`regress.sh` 全绿（见 §B4.19.5）。
+**教训（登记）**：给被"直驱 TB"直接例化的模块新增输入口时，必须①在模块内对输入做 z/x 净化，
+或②同步给所有直驱 TB 补 `1'b0` 拴接；否则悬空 z 会经 `?:`/算术传播成 x 并静默毁掉功能。
+
+## B4.19.4 遗留与下一步
+
+1. **PTE 读连贯性**（上述阻塞点）—— 4b-2c 第一优先；在此之前 Sv32 不能端到端可信。
+2. **store page fault 的精确性**：本核 store 在**提交点之后**才排空（CDQ ⇒ 适配器）⇒
+   翻译发生在提交后 ⇒ 页错误**不精确**（会丢写）。修法：**执行期 store 翻译**（PA 随
+   STQ/CDQ 项带入排空口），属 4b-2c。
+3. **A/D 硬件置位写通路未实现**（`pte_ad_done` 恒 0 ⇒ 若 PTE 的 A/D=0，PTW 会**挂死**，
+   fail-closed）：p13 采用"A/D 预置 1"绕开；硬件置位 + PTE 写回属 4b-2c。
+4. **取指翻译的端到端验证**未做（需进入 S 模式执行流 + 取指 PMP 接 `csr_file` 真值；
+   本段只把"取指翻译使能/特权级"的口径修正到位）。
+5. `cbo.flush` 的 INVAL、L1D 维护写回（§B4.18）仍在册；`menvcfg.CBIE=01` 降级未实现。
+
+## B4.19.5 本段检查点状态
+
+* 编译 **0 error**；`tb_core_top_2b` **103/103 PASS**（`../.b2chk/final_103_b.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b2b.log`）；2A 文件**零修改**；未提交 git；
+  快照 `../.b2chk/*.s31`（含 WIP 的 `tb_core_top_2b.sv.s31wip`、`back2_p13_sv32.S.s31`）。
+* 改动文件：`rtl/top/core_top_2b.v`（§2b 数据侧翻译 + PTW 仲裁 + 适配器两级 + 错误响应 +
+  L1D 物理 tag + 取指特权级口径）、`rtl/back2/lsq_simple.v`（`mem_rsp_err`/`exc_*`）、
+  `rtl/back2/backend_top.v`（`mem_rsp_err_i` + ROB `upd_exc` 接线）、
+  `sim/unit/prog/back2_p13_sv32.S`（WIP）；生成器与 `.svh` **已还原到 p12 挂回态**
+  （9 槽 / 103 项），TB 的 C13' 块已摘除（源码在 `.s31wip` 快照内）。
+* 一句话：**D 侧翻译与 PTW 串行复用的结构已就位且既有判据零回退；p13 的 Sv32 端到端判据
+  被"PTE 读绕过 L1D（遍历不连贯）"卡住 —— 修法已定位到 4b-2c 的两条路线。**

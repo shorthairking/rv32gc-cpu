@@ -183,7 +183,10 @@ module backend_top #(
     output wire [23:0] dbg_iq_cnt_o,
     output wire [7:0]  dbg_stq_cnt_o,
     //   ★ 2B-4 修法 1：CDQ 空（已提交 store 全部落地）—— 顶层据此推迟整机冲刷
-    output wire        cdq_empty_o
+    output wire        cdq_empty_o,
+    //   ★★ 2B-4 第 4b-2b 段：数据侧访存响应**带错**（TLB 权限错 / PTW 故障）——
+    //     顶层适配器以"正常响应 + err=1"回一笔 ⇒ LSQ 标 done+异常 ⇒ ROB `upd_exc`
+    input  wire        mem_rsp_err_i
 );
 
     //==========================================================================
@@ -1212,6 +1215,11 @@ module backend_top #(
     wire        lsu_st_done_v;
     wire [6:0]  lsu_st_done_rob;
     wire [EW-1:0] lsu_st_done_ep;
+    //   ★★ 4b-2b：数据侧精确异常（页错误）—— LSQ → ROB `upd_exc`
+    wire        lsu_exc_v;
+    wire [6:0]  lsu_exc_rob;
+    wire [3:0]  lsu_exc_cause;
+    wire [31:0] lsu_exc_tval;
     wire [31:0] lsu_addr = iprf_rd[8*32 +: 32] + u_imm(x_i2_uop[4]);
     wire [63:0] lsu_fpsrc = fprf_rd[3*64 +: 64];
     wire [31:0] lsu_wdata = (u_fpls(x_i2_uop[4]) & u_is_st(x_i2_uop[4])) ?
@@ -1247,7 +1255,9 @@ module backend_top #(
         .mem_req_wstrb(mem_req_wstrb_o), .mem_req_tag(mem_req_tag_o),
         .mem_req_ready(mem_req_ready_i),
         .mem_rsp_valid(mem_rsp_valid_i), .mem_rsp_rdata(mem_rsp_rdata_i),
-        .mem_rsp_tag(mem_rsp_tag_i),
+        .mem_rsp_tag(mem_rsp_tag_i), .mem_rsp_err(mem_rsp_err_i),
+        .exc_valid_o(lsu_exc_v), .exc_rob_o(lsu_exc_rob),
+        .exc_cause_o(lsu_exc_cause), .exc_tval_o(lsu_exc_tval),
         .wb_valid(lsu_wb_v), .wb_rob(lsu_wb_rob), .wb_epoch(lsu_wb_ep),
         .wb_dst_i(lsu_wb_di), .wb_dst_f(lsu_wb_df),
         .wb_pdest_i(lsu_wb_pdi), .wb_pdest_f(lsu_wb_pdf), .wb_data(lsu_wb_data),
@@ -1538,7 +1548,8 @@ module backend_top #(
         .upd_tr_valid(upd_tr_v), .upd_tr_idx(x_i2_rob[2]),
         .upd_tr_taken(bru_act_tk), .upd_tr_target(bru_target),
         .upd_ff_valid(upd_ff_v), .upd_ff_idx(fpu_if_rob), .upd_ff_flags(fpu_ff),
-        .upd_exc_valid(1'b0), .upd_exc_idx(7'd0), .upd_exc_code(4'd0), .upd_exc_tval(32'h0),
+        .upd_exc_valid(lsu_exc_v), .upd_exc_idx(lsu_exc_rob),
+        .upd_exc_code(lsu_exc_cause), .upd_exc_tval(lsu_exc_tval),
         //   ★ 2B-4：store 提交门 = LSQ 的 CDQ 余量（不再是"排空口空闲"）——
         //     同拍多 store 提交组全部入队、逐拍顺序排空；`mem_req_ready_i` 仍作为排空口
         //     本身的握手（在 lsq_simple 内使用）。

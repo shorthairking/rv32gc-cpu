@@ -117,6 +117,17 @@ module lsq_simple #(
     input  wire                  mem_rsp_valid,
     input  wire [31:0]           mem_rsp_rdata,
     input  wire [TAG_W-1:0]      mem_rsp_tag,
+    //   ★★ 2B-4 第 4b-2b 段：**带错响应**（数据侧翻译/页错误）。顶层适配器在
+    //     TLB 权限错 / PTW 故障时以"正常响应 + err=1"的形式回一笔（tag 仍是该 load 的
+    //     标签）⇒ 本模块把该 load 标成"已完成但带异常"、**不写回数据**，并把精确异常
+    //     （cause 13 = load page fault、tval = 该 load 的 VA）上报给 ROB 的 `upd_exc`。
+    input  wire                  mem_rsp_err,
+
+    // ---- 数据侧精确异常上报（→ backend_top → ROB `upd_exc_*`）----
+    output wire                  exc_valid_o,
+    output wire [ROB_IDX_W-1:0]  exc_rob_o,
+    output wire [3:0]            exc_cause_o,
+    output wire [31:0]           exc_tval_o,
 
     // ---- 写回（load 结果）----
     output wire                  wb_valid,
@@ -563,8 +574,23 @@ module lsq_simple #(
     assign wb_valid   = fwdp_v | rsp_ok;
     assign wb_rob     = fwdp_v ? fwdp_rob  : ld_rob[rsp_sel];
     assign wb_epoch   = fwdp_v ? fwdp_ep   : ld_ep[rsp_sel];
-    assign wb_dst_i   = fwdp_v ? fwdp_di   : ld_di[rsp_sel];
-    assign wb_dst_f   = fwdp_v ? fwdp_df   : ld_df[rsp_sel];
+    //   ★★ 4b-2b：带错响应**不得写回目的寄存器**（该 load 将以精确异常结束、
+    //     永不提交；抑制 PRF 写口是双保险）。转发路径（fwdp_v）不参与本判据。
+    //   ★★ 4b-2b-fix（实测回归抓出）：`mem_rsp_err` 必须用 `=== 1'b1` **净化**——
+    //     本模块被多处直接驱动 TB 例化，新增输入若在某个 TB 里**未接**（悬空 z），
+    //     `rsp_ok & mem_rsp_err` 会成 x ⇒ `wb_dst_i` 的 x 条件把写口变成 x
+    //     ⇒ 整核写回失效（实测 `tb_back2_lockstep` 第 1 个程序后停摆 24 条）。
+    //     口径：**只有明确的 1 才算"带错响应"**，z/x/0 一律按正常响应处理。
+    wire              rsp_err_w = (mem_rsp_err === 1'b1);
+    assign wb_dst_i   = fwdp_v ? fwdp_di   : (rsp_ok & rsp_err_w ? 1'b0 : ld_di[rsp_sel]);
+    assign wb_dst_f   = fwdp_v ? fwdp_df   : (rsp_ok & rsp_err_w ? 1'b0 : ld_df[rsp_sel]);
+    //   ★★ 4b-2b：数据侧精确异常上报。与 `wb_valid`（= 该 load 的 done）**同拍** ⇒
+    //     ROB 的 `upd_exc`（异常位）与写回（done 位）在同一沿写入 ⇒ 下一拍 ROB 头部
+    //     同时看到 done+exc ⇒ 精确抛陷阱、且该指令**没有**提交（见 rob.v:166/222）。
+    assign exc_valid_o = rsp_ok & rsp_err_w;
+    assign exc_rob_o   = ld_rob[rsp_sel];
+    assign exc_cause_o = 4'd13;                 // 13 = load page fault（数据侧唯一来源）
+    assign exc_tval_o  = ld_addr[rsp_sel];      // 口径：mtval = **虚拟地址**（E5）
     assign wb_pdest_i = fwdp_v ? fwdp_pi   : ld_pi[rsp_sel];
     assign wb_pdest_f = fwdp_v ? fwdp_pf   : ld_pf[rsp_sel];
     assign wb_data    = fwdp_v ? ext_load(fwdp_data, fwdp_off, fwdp_size, fwdp_uns)

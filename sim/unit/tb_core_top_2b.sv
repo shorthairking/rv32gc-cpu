@@ -52,6 +52,8 @@ module tb_core_top_2b #(
     localparam integer DBG_K1  = 1;
     //   p12（cbo 数据安全）诊断开关（默认关；定位"维护后 load 读到旧值"时置 1）
     localparam integer DBG_P12 = 0;
+    //   p13（Sv32 数据侧翻译）诊断开关（默认关）
+    localparam integer DBG_P13 = 0;
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
@@ -195,6 +197,17 @@ module tb_core_top_2b #(
                      u_dut.u_l1d.maint_clean_q, u_dut.u_l1d.maint_idx_q, u_dut.u_l1d.idle,
                      u_dut.be_trp_flush, u_dut.u_back.u_lsu.dr_empty_o, u_dut.u_back.u_lsu.dr_any,
                      u_dut.u_back.u_lsu.dr_fire);
+        //   ★ [诊断，默认关] p13：适配器翻译级 + PTW 归属/握手 + PTE 读口逐拍
+        if (DBG_P13 && (cur_p == 12) && (k1_tick > 3000) &&
+            ((u_dut.ad_st_q != 3'd0) || u_dut.ptw_req_v_w || u_dut.ptw_req_done))
+            $display("   [p13] t=%0d ad=%0d va=0x%08x a=0x%08x we=%b | sv32en=%b need=%b hit=%b pf=%b pa=0x%08x | ptwreq=%b rdy=%b done=%b flt=%b src=%b | pte_v=%b pte_pa=0x%08x pte_rv=%b",
+                     k1_tick, u_dut.ad_st_q, u_dut.d_va_q, u_dut.d_a_q, u_dut.d_we_q,
+                     u_dut.sv32_en, u_dut.d_xlat_need_w, u_dut.d_tlb_hit, u_dut.d_tlb_perm_fault,
+                     u_dut.d_tlb_pa, u_dut.ptw_req_v_w, u_dut.ptw_req_ready_w,
+                     u_dut.ptw_req_done, u_dut.ptw_fault, u_dut.m_tr_src_q,
+                     u_dut.ptw_pte_req_valid, u_dut.ptw_pte_req_pa, u_dut.pte_resp_valid_w);
+        if (DBG_P13 && (cur_p == 12) && u_dut.pte_resp_valid_w)
+            $display("      [p13-pte] t=%0d pa=0x%08x data=0x%08x", k1_tick, u_dut.ptw_pte_req_pa, u_dut.pte_resp_data_w);
         if (DBG_K1 && (cur_p == 10) && ((k1_tick % 1000) == 0) && (k1_tick > 3000))
             $display("   [k1i] plo=%b phi=%b pgn=%b npv=%b bufcnt=%0d grpm=%b m3=%b term=%b xip=%b | pva0=0x%08x pva1=0x%08x nva=0x%08x rsp=%b f4v=%b",
                      u_dut.u_front.u_ifetch4.push_lo_ok, u_dut.u_front.u_ifetch4.push_hi_ok,
@@ -588,7 +601,6 @@ module tb_core_top_2b #(
                              n_maint_cmt, n_l1d_inval, n_l1d_clean);
                     $fflush();
                 end
-
 
 
             end else if (pid == 5) begin

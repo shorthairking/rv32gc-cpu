@@ -336,20 +336,92 @@ module core_top_2b (
     //     4b-2 再把 D 侧 TLB 查询口、PTW 串行复用（数据优先）、PTE A/D 写通路、
     //     `sfence.vma`/`cbo.*` 接提交点补齐（见报告 §B4.5.3）。
     wire        sv32_en      = csr_satp_o[`RV32GC_SATP_MODE_BIT];
-    wire        sv32_done    = f_tlb_hit | ptw_req_done;
-    wire        sv32_fault   = f_tlb_perm_fault | ptw_fault;
+    //   ★★ 4b-2b：PTW 归属寄存器（0 = 数据侧 / 1 = 取指侧，2A `m_tr_src_q` 同构）。
+    //     取指侧的 done/fault 必须按归属过滤 —— 否则**数据侧遍历完成时会误当取指翻译完成**
+    //     （`ptw_req_done` 是共享的）。
+    reg         m_tr_src_q;
+    wire        ptw_owner_fetch_w = (m_tr_src_q == 1'b1);
+    //   ★★ 4b-2b：取指翻译/保护**不受 MPRV 影响**（norm:mstatusmprvinstxlatop；
+    //     2A `priv_ctrl.v:19/237-239` 亦明示）⇒ 取指侧必须用**当前特权级** `csr_priv_2`，
+    //     **不能**用含 MPRV 语义的 `csr_eff_priv`（否则 M 模式 + MPRV=1 时取指会被误翻译，
+    //     实测：p13 里取指侧抢走 PTW 并做了一笔错误的遍历）。
+    wire        f_xlate_on_w = (csr_priv_2 != `RV32GC_PRIV_M);
+    wire        sv32_done    = f_tlb_hit | (ptw_req_done & ptw_owner_fetch_w);
+    wire        sv32_fault   = f_tlb_perm_fault | (ptw_fault & ptw_owner_fetch_w);
     wire [31:0] sv32_paddr   = f_tlb_hit ? f_tlb_pa : ptw_pa_out;
+
+    //==========================================================================
+    // 2b. 数据侧翻译（2B-4 第 4b-2b 段）：TLB 口 1 + PTW 串行复用（数据优先）
+    //--------------------------------------------------------------------------
+    //  2A 口径（`core_top.v` §9.4.1 / `:1587-1595` / `:1790-1797`）：TLB 第一查询口给
+    //  数据侧（纯组合命中、零等待），**PTW 是单请求口、由 I/D 串行复用**，`m_tr_src_q`
+    //  记录"本笔遍历归谁"（0 = 数据侧 / 1 = 取指侧），完成时据此选择结果去向。
+    //  本核把数据侧翻译做在 LSU 适配器里（新增 `AD_XLATE` / `AD_TR` 两级状态）：
+    //    · 不需要翻译（satp = Bare，或 M 模式且未置 MPRV）⇒ **整级跳过**，逐拍与旧版相同
+    //    · 需要翻译：VA 送 TLB 口 1；命中 ⇒ 直接用 PA；缺失 ⇒ 向 PTW 发请求并等 `req_done`
+    //    · 权限错（TLB perm_fault）/ PTW 故障 ⇒ 以"正常响应 + err=1"回一笔给 LSQ
+    //      ⇒ 该 load 以**精确页错误**（cause 13、mtval = VA）结束（不写回数据）
+    //    · **数据优先**：数据请求到来时若 PTW 正被取指占用 ⇒ `kill` 取指遍历
+    //      （取指侧 `tr_req_valid` 是电平保持 ⇒ 释放后自动重发；与 2A 同法）
+    //==========================================================================
+    //   ★ 4b-2b：状态码扩到 3 bit（新增 AD_XLATE/AD_TR —— 2 bit 会截断成 0/1 与 IDLE/REQ 撞车）
+    localparam [2:0] AD_IDLE = 3'd0, AD_REQ = 3'd1, AD_WAIT = 3'd2, AD_RETRY = 3'd3;
+    localparam [2:0] AD_XLATE = 3'd4, AD_TR = 3'd5;     // ★ 4b-2b：数据侧翻译两级
+
+    reg [2:0]   ad_st_q;
+    reg         d_we_q;
+    reg         d_unc_q;                 // 该笔走 uncached 直通（AXI 单 beat）
+    reg         d_cp_q;                  // 该笔落 CLINT/PLIC 窗口（本段无总线事务，占位）
+    reg [31:0]  d_a_q, d_d_q;            // ★ `d_a_q` = **物理地址**（翻译后）
+    reg [31:0]  d_va_q;                  // ★ 4b-2b：翻译前的虚拟地址（异常 tval / 重发用）
+    reg [3:0]   d_strb_q;
+    reg [`BACK2_MEM_TAG_W-1:0] d_tag_q;
+
+    //   LSU 的存储口（先声明，§4b 使用）
+    wire        lsu_req_v, lsu_req_we;
+    wire [31:0] lsu_req_a, lsu_req_d;
+    wire [3:0]  lsu_req_strb;
+    wire [`BACK2_MEM_TAG_W-1:0] lsu_req_tag;
+
+    //   ★ 4b-2b：数据侧访问类型 / 有效特权级（MPRV=1 ⇒ 按 mstatus.MPP 判权限，2A 同口径）
+    wire        d_mprv_w      = csr_mstatus_raw[`RV32GC_MSTATUS_MPRV_BIT];
+    //   口径（ISA）：MPRV 只在 **MPP ≠ M** 时生效 —— MPP=M 时按"未置 MPRV"处理
+    //   （否则陷阱处理程序在 M 模式下会被误按 MPP 翻译）
+    wire        d_mprv_eff_w  = d_mprv_w & (csr_mstatus_raw[`RV32GC_MSTATUS_MPP_LSB +: 2]
+                                            != `RV32GC_PRIV_M);
+    wire [1:0]  d_eff_priv_w  = d_mprv_eff_w ? csr_mstatus_raw[`RV32GC_MSTATUS_MPP_LSB +: 2]
+                                             : csr_eff_priv;
+    wire [1:0]  d_acc_w       = d_we_q ? 2'b10 : 2'b01;      // 10=store / 01=load
+    wire        d_xlate_on_w  = (csr_eff_priv != `RV32GC_PRIV_M) | d_mprv_eff_w;
+    wire        d_xlat_need_w = sv32_en & d_xlate_on_w;
+    wire        d_tlb_hit, d_tlb_perm_fault;
+    wire [31:0] d_tlb_pa;
+
+    //   PTW 请求仲裁（数据优先；取指在途被抢占时 `kill`）
+    wire        ptw_req_ready_w;
+    wire        d_ptw_want_w = (ad_st_q == AD_TR);
+    wire        f_ptw_want_w = sv32_en & f_xlate_on_w & tr_req_valid & ~f_tlb_hit;
+    wire        ptw_free_w   = ptw_req_ready_w;              // PTW 空闲（可接受新请求）
+    wire        ptw_kill_w   = d_ptw_want_w & ~ptw_free_w & ptw_owner_fetch_w;
+    wire        ptw_req_v_w  = d_ptw_want_w | (f_ptw_want_w & ~d_ptw_want_w);
+    wire [31:0] ptw_req_va_w = d_ptw_want_w ? d_va_q : tr_req_va;
+
+    //   路由（MMIO/uncached 判定，2A `mmio_route`）必须吃**物理地址**：
+    //   翻译两级用各自的 PA；其余（Bare/空闲）用本拍请求 VA（= 旧行为，逐拍不变）
+    wire [31:0] d_route_a_w  = (ad_st_q == AD_XLATE) ? d_tlb_pa :
+                               (ad_st_q == AD_TR)    ? ptw_pa_out : lsu_req_a;
 
     tlb #(.ENTRIES(64), .AUTO_FLUSH_ON_ASID(0), .IDX_W(6)) u_tlb (
         .clk(aclk), .rst_n(aresetn),
-        // ---- 第一查询口（数据侧）：本段无数据侧翻译 ⇒ 恒空闲 ----
-        .lookup_valid(1'b0), .lookup_va(32'h0), .lookup_asid(9'h0),
-        .lookup_acc(2'b01), .lookup_priv(`RV32GC_PRIV_M),
-        .lookup_sum(1'b0), .lookup_mxr(1'b0),
-        .hit_o(), .perm_fault_o(), .pa_o(),
+        // ---- 第一查询口 = 数据侧（4b-2b 接通；`AD_XLATE` 拍纯组合命中）----
+        .lookup_valid(ad_st_q == AD_XLATE), .lookup_va(d_va_q), .lookup_asid(9'h0),
+        .lookup_acc(d_acc_w), .lookup_priv(d_eff_priv_w),
+        .lookup_sum(csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT]),
+        .lookup_mxr(csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]),
+        .hit_o(d_tlb_hit), .perm_fault_o(d_tlb_perm_fault), .pa_o(d_tlb_pa),
         // ---- 第二查询口 = 取指（2A §5.2.2/§9.4.1 同法）----
         .lookup2_valid(tr_req_valid), .lookup2_va(tr_req_va), .lookup2_asid(9'h0),
-        .lookup2_acc(2'b00), .lookup2_priv(`RV32GC_PRIV_M),
+        .lookup2_acc(2'b00), .lookup2_priv(csr_priv_2),   // ★ 取指：当前特权级（不含 MPRV）
         .lookup2_sum(1'b0), .lookup2_mxr(1'b0),
         .hit2_o(f_tlb_hit), .perm_fault2_o(f_tlb_perm_fault), .pa2_o(f_tlb_pa),
         .fill_valid(ptw_fill_valid), .fill_va(ptw_fill_va), .fill_ppn(ptw_fill_ppn),
@@ -367,12 +439,17 @@ module core_top_2b (
 
     ptw u_ptw (
         .clk(aclk), .rst_n(aresetn),
-        .kill(1'b0),
-        //   ★ 占位：Bare ⇒ 不发起遍历（`sv32_en=0`）；接法已按 2A 口径就位
-        .req_valid(sv32_en & ~f_tlb_hit & tr_req_valid),
-        .req_va(tr_req_va), .req_acc(2'b00), .req_priv(`RV32GC_PRIV_M),
-        .req_sum(1'b0), .req_mxr(1'b0), .satp(csr_satp_o),
-        .req_ready(), .req_done(ptw_req_done), .pa_o(ptw_pa_out),
+        //   ★★ 4b-2b：**数据优先**抢占（取指遍历被 kill 后会自动重发；见 §2b 说明）
+        .kill(ptw_kill_w),
+        //   ★★ 4b-2b：I/D **串行复用**同一请求口（2A `m_tr_src_q` 同构）——
+        //     数据侧在 `AD_TR` 期间占用；否则取指侧（且仅 S/U 模式）使用
+        .req_valid(ptw_req_v_w),
+        .req_va(ptw_req_va_w), .req_acc(d_ptw_want_w ? d_acc_w : 2'b00),
+        .req_priv(d_eff_priv_w),
+        .req_sum(d_ptw_want_w ? csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT] : 1'b0),
+        .req_mxr(d_ptw_want_w ? csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT] : 1'b0),
+        .satp(csr_satp_o),
+        .req_ready(ptw_req_ready_w), .req_done(ptw_req_done), .pa_o(ptw_pa_out),
         .fault_o(ptw_fault), .fault_cause_o(ptw_fault_cause), .fault_tval_o(ptw_fault_tval),
         .pte_req_valid(ptw_pte_req_valid), .pte_req_pa(ptw_pte_req_pa),
         .pte_req_ready(pte_req_ready_w),
@@ -471,7 +548,9 @@ module core_top_2b (
         .d2_pop_valid(d2_pop_valid), .d2_pop_addr(d2_pop_addr),
         .ras_repair_valid(ras_repair_valid), .ras_repair_addr(ras_repair_addr),
         // ---- MMU：本段 Bare（占位）；PMP 占位（全 0 + M ⇒ 放行）----
-        .sv32_translate_en(sv32_en), .sv32_translate_done(sv32_done),
+        //   ★★ 4b-2b：**取指翻译只在 S/U 模式启用**（M 模式取指恒不翻译；
+        //     MPRV 只影响取数侧 ⇒ 数据侧另由 `d_xlat_need_w` 判）
+        .sv32_translate_en(sv32_en & f_xlate_on_w), .sv32_translate_done(sv32_done),
         .sv32_translate_fault(sv32_fault), .sv32_translate_paddr(sv32_paddr),
         .tr_req_valid(tr_req_valid), .tr_req_va(tr_req_va),
         .priv(`RV32GC_PRIV_M), .pmpcfg_i({N_PMP*8{1'b0}}), .pmpaddr_i({N_PMP*32{1'b0}}),
@@ -605,16 +684,14 @@ module core_top_2b (
     //   ★ 本段 `cs_vaddr = cs_paddr`（Bare；`satp` 占位见 §2），第 4 段接 Sv32 后
     //     两者分离（tag/index 用 VA）。
     //==========================================================================
-    wire        lsu_req_v, lsu_req_we;
-    wire [31:0] lsu_req_a, lsu_req_d;
-    wire [3:0]  lsu_req_strb;
-    wire [`BACK2_MEM_TAG_W-1:0] lsu_req_tag;
+    //   （`lsu_req_*` 与适配器寄存器、`AD_*` 状态码已在 §2b 提前声明 —— TLB 口 1 要用）
 
     // ---- uncached 判定（2A `mmio_route` 只读复用；窗口口径不与 2A 分叉）----
+    //   ★★ 4b-2b：判定输入是**物理地址**（`d_route_a_w`：翻译两级取各自 PA，其余取请求 VA）
     wire [2:0]  d_mr_route;
     wire        d_mr_no_axi, d_mr_clint_plic, d_mr_xip, d_mr_unc, d_mr_cac;
     mmio_route u_mmio_route_d (
-        .pa_i(lsu_req_a), .route_o(d_mr_route), .no_axi_o(d_mr_no_axi),
+        .pa_i(d_route_a_w), .route_o(d_mr_route), .no_axi_o(d_mr_no_axi),
         .clint_plic_o(d_mr_clint_plic), .xip_direct_o(d_mr_xip),
         .axi_uncached_o(d_mr_unc), .axi_cached_o(d_mr_cac),
         .clint_hit_o(), .plic_hit_o(), .periph_hit_o()
@@ -630,16 +707,7 @@ module core_top_2b (
     //      —— `cs_stall = access | cs_miss | (ms_state!=IDLE) | maint`，而 `access = cs_req`
     //      ⇒ `cs_req ← cs_stall ← access = cs_req` 成环（iverilog 判环 ⇒ 全网 x ⇒ 一条不提交）。
     //      重试判据只用 **纯寄存器量**：`l1d.idle = (ms_state_q==MS_IDLE) & ~maint_q` ✓。
-    localparam [1:0] AD_IDLE = 2'd0, AD_REQ = 2'd1, AD_WAIT = 2'd2, AD_RETRY = 2'd3;
-
-    reg [1:0]   ad_st_q;
-    reg         d_we_q;
-    reg         d_unc_q;                 // 该笔走 uncached 直通（AXI 单 beat）
-    reg         d_cp_q;                  // 该笔落 CLINT/PLIC 窗口（本段无总线事务，占位）
-    reg [31:0]  d_a_q, d_d_q;
-    reg [3:0]   d_strb_q;
-    reg [`BACK2_MEM_TAG_W-1:0] d_tag_q;
-
+    //   （`AD_*` 状态码与适配器寄存器已在 §2b 提前声明）
     wire        l1d_busy_w = ~l1d_idle;              // FSM 非空闲（填充/写回/维护）
     //   ★★ 4b-2a：**维护操作/陷阱/xRET 的冲刷拍必须放弃在途的数据侧访问**。
     //     实测（p11 的 `sfence.vma` 后整机停摆）：sfence 触发 L1D `inval_all` 时适配器
@@ -705,9 +773,17 @@ module core_top_2b (
     // 请求发射：AD_REQ 拍恰好一次（重试时等 L1D 回到 IDLE）
     wire        l1d_cs_req_w = (ad_st_q == AD_REQ);
     wire [31:0] d_rdata_w    = d_unc_q ? d_unc_rdata_w : l1d_cs_rdata;
-    assign      d_rsp_v_w    = (ad_st_q == AD_WAIT) & ~d_we_q &
-                               (d_cp_q ? 1'b1 :
-                                d_unc_q ? d_unc_done_w : l1d_cs_ready);
+    //   ★★ 4b-2b：**数据侧翻译故障**（TLB 权限错 / PTW 故障）⇒ 以"正常响应 + err=1"
+    //     回一笔（tag 仍是该 load 的标签）⇒ LSQ 标 done+异常 ⇒ ROB 精确抛页错误。
+    //     · 只在 load 上精确（store 的翻译发生在提交后排空 ⇒ 见 §B4.19 登记）
+    wire        d_tlb_fault_cyc_w = (ad_st_q == AD_XLATE) & d_tlb_perm_fault;
+    wire        d_ptw_fault_cyc_w = (ad_st_q == AD_TR) & ptw_req_done &
+                                    ~ptw_owner_fetch_w & ptw_fault;
+    wire        d_rsp_err_w   = ~d_we_q & (d_tlb_fault_cyc_w | d_ptw_fault_cyc_w);
+    assign      d_rsp_v_w    = d_rsp_err_w |
+                               ((ad_st_q == AD_WAIT) & ~d_we_q &
+                                (d_cp_q ? 1'b1 :
+                                 d_unc_q ? d_unc_done_w : l1d_cs_ready));
     //   CLINT 命中取 CLINT 读数据；窗口内未接部分（PLIC）仍回 0（占位，fail-safe）
     assign      d_rsp_d_w    = d_cp_q ? (clint_hit_w ? clint_rdata_w : 32'h0) : d_rdata_w;
     assign      d_rsp_tag_w  = d_tag_q;
@@ -715,7 +791,12 @@ module core_top_2b (
     l1d #(.OWNER_D_FILL(2'd1), .OWNER_WRBACK(2'd2)) u_l1d (
         .clk(aclk), .rst_n(aresetn),
         .cs_req(l1d_cs_req_w), .cs_we(d_we_q), .cs_wstrb(d_strb_q),
-        .cs_paddr(d_a_q), .cs_vaddr(d_a_q), .cs_wdata(d_d_q),
+        //   ★★ 4b-2b：L1D 是 **VIPT**（`cs_vaddr` 同时出 index 与 tag，见 l1d.v:112-113/480-481）
+        //     ⇒ Sv32 下必须把**物理 tag** 送进去（否则同一 VA 重映射后命中旧行 ⇒ 陈旧数据）：
+        //       tag 段用 PA[31:12]（页对齐标签）、index 段用 VA[11:0]（本 L1D 几何：
+        //       128 组 × 32 B 行 ⇒ index = VA[11:5]、tag = addr[31:12]）。
+        //     Bare（VA==PA）时该复合式与 `d_a_q` 逐位相同 ⇒ 既有行为不变。
+        .cs_paddr(d_a_q), .cs_vaddr({d_a_q[31:12], d_va_q[11:0]}), .cs_wdata(d_d_q),
         .cs_ready(l1d_cs_ready), .cs_rdata(l1d_cs_rdata),
         .cs_miss(l1d_cs_miss), .cs_stall(l1d_cs_stall), .cs_wr_done(l1d_cs_wr_done),
         .fill_req(l1d_fill_req), .fill_paddr(l1d_fill_paddr), .fill_owner(l1d_fill_owner),
@@ -735,9 +816,12 @@ module core_top_2b (
         if (!aresetn) begin
             ad_st_q <= AD_IDLE;
             d_we_q <= 1'b0; d_unc_q <= 1'b0; d_cp_q <= 1'b0;
-            d_a_q <= 32'h0; d_d_q <= 32'h0; d_strb_q <= 4'h0;
+            d_a_q <= 32'h0; d_va_q <= 32'h0; d_d_q <= 32'h0; d_strb_q <= 4'h0;
             d_tag_q <= {`BACK2_MEM_TAG_W{1'b0}};
+            m_tr_src_q <= 1'b1;             // 复位后 PTW 归取指侧（与旧行为一致）
         end else begin
+            //   ★ 4b-2b：PTW 归属 —— 请求被**接受**的那一拍记录归属（2A `m_tr_src_q` 同法）
+            if (ptw_req_v_w & ptw_free_w) m_tr_src_q <= d_ptw_want_w ? 1'b0 : 1'b1;
             //   ★ 4b-2a：维护/陷阱/xRET 冲刷 ⇒ 放弃在途访问（看上面 `d_kill_w` 的说明）
             if (d_kill_w) begin
                 ad_st_q <= AD_IDLE;
@@ -745,13 +829,46 @@ module core_top_2b (
                 AD_IDLE: begin
                     if (d_start) begin
                         d_we_q   <= lsu_req_we;
-                        d_a_q    <= lsu_req_a;
                         d_d_q    <= lsu_req_d;
                         d_strb_q <= lsu_req_strb;
                         d_tag_q  <= lsu_req_tag;
-                        d_unc_q  <= d_unc_w;
-                        d_cp_q   <= d_clint_plic;
-                        ad_st_q  <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                        if (d_xlat_need_w) begin
+                            //   ★ 4b-2b：先做 VA→PA 翻译（`AD_XLATE` 拍 TLB 组合查询）
+                            d_va_q  <= lsu_req_a;
+                            ad_st_q <= AD_XLATE;
+                        end else begin
+                            d_a_q   <= lsu_req_a;
+                            d_va_q  <= lsu_req_a;   // Bare：VA==PA（cs_vaddr 的 index 段用）
+                            d_unc_q <= d_unc_w;
+                            d_cp_q  <= d_clint_plic;
+                            ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                        end
+                    end
+                end
+                AD_XLATE: begin
+                    //   TLB 口 1 当拍出结果（纯组合）
+                    if (d_tlb_hit) begin
+                        d_a_q   <= d_tlb_pa;
+                        d_unc_q <= d_unc_w;             // 路由按 **PA** 重算
+                        d_cp_q  <= d_clint_plic;
+                        ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                    end else if (d_tlb_perm_fault) begin
+                        ad_st_q <= AD_IDLE;             // 本拍已回"带错响应"（见 `d_rsp_err_w`）
+                    end else begin
+                        ad_st_q <= AD_TR;               // 缺失 ⇒ 向 PTW 发请求
+                    end
+                end
+                AD_TR: begin
+                    //   等本笔遍历结束（归属必须是数据侧 —— 取指侧的 done 不算）
+                    if (ptw_req_done & ~ptw_owner_fetch_w) begin
+                        if (ptw_fault) begin
+                            ad_st_q <= AD_IDLE;         // 本拍已回"带错响应"
+                        end else begin
+                            d_a_q   <= ptw_pa_out;
+                            d_unc_q <= d_unc_w;
+                            d_cp_q  <= d_clint_plic;
+                            ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                        end
                     end
                 end
                 AD_REQ: begin
@@ -1030,6 +1147,7 @@ module core_top_2b (
         .trap_valid_o(trap_valid_w), .trap_pc_o(trap_pc_w),
         .trap_cause_o(trap_cause_w), .trap_tval_o(trap_tval_w),
         //   ★★ 2B-4 第 4a 段：特权/陷阱/中断路径（顶层 trap FSM ↔ 后端）
+        .mem_rsp_err_i(d_rsp_err_w),
         .trp_flush_v_i(be_trp_flush), .trp_redirect_v_i(be_trp_redirect_v),
         .trp_redirect_pc_i(be_trp_redirect_pc), .trp_halt_o(trp_halt_w),
         .xret_cmt_o(xret_cmt_w),
