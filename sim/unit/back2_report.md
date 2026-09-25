@@ -4118,3 +4118,33 @@ t=13625 ... mact=1                                            ← 维护动作�
   `mem_req_addr = cdq_pa`（**不再翻译**）→ 页错误经现有 `exc_*`/`upd_exc` 以 **cause 15** 精确上报。
 * **检查点（本轮收口）**：`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121f.log`）；
   `regress.sh` **32/32 PASS**（`../.b2chk/regress_4b2c9.log`）；2A 零修改；未提交 git；快照 `../.b2chk/*.s39`。
+### B4.24.9 (b) 前三步的最小实现设计（本轮未施工：预算不足，避免留下半成品接口）
+
+**关键简化（本轮新推导，可大幅降低 (b) 的风险）**
+
+1. **`stq_a` 必须保持 VA**：store→load 转发按 `stq_a[si] == ld_addr` 比较（load 侧是 VA）⇒
+   **不能**把 PA 直接写进 `stq_a`；按任务书新增**独立字段** `stq_pa[]`（+ `stq_pv[]` 有效位）与
+   `cdq_pa[]`，排空口 `mem_req_addr = dr_fire ? cdq_pa[cdq_head] : ld_addr[pend_sel]` ✓。
+2. **排空口"不再翻译"只需一行使能改写**：到适配器的**store 必是已提交排空**（load 才可能来自
+   推测执行）⇒ 令 `d_xlat_need_w = sv32_en & d_xlate_on_w & ~lsu_req_we`
+   ⇒ store 排空恒用 PA（不再走 `AD_XLATE/AD_TR`）✓ —— 这正是本轮根因（排空期翻译被中止）的直接消除。
+3. **执行期翻译可搭在现成的 E1 点上**：`lsq_simple` 已在 store 地址+数据就绪时拉 `st_done_valid`
+   （= ROB done）⇒ 在同一拍发 `st_xlate_valid`（`va = 该 store 的地址`、`rob/idx`）即可，
+   无需新增"何时翻译"的判据；PA 在 `st_xlate_done` 时写入 `stq_pa[slot]`+`stq_pv[slot]`。
+4. **CDQ 侧零改动即可携带 PA**：入队时 `cdq_pa[wp] <= stq_pa[dr_idx]` 与现有
+   `cdq_a/cdq_d/cdq_m` 拷贝完全同构 ✓；`cdq_pa` 是唯一新增数组 ✓。
+5. **无 PA 的兜底（fail-safe）**：若某 store 的 `stq_pv=0`（例如执行期翻译尚未回）而它要排空，
+   则**该拍不排空**（`dr_fire` 加 `stq_pv[dr_sel]` 条件），等 PA 到齐再发 —— 避免"用 VA 当 PA"。
+
+**逐文件落点（下一步照此施工）**
+
+| 文件 | 改动 |
+|---|---|
+| `rtl/back2/lsq_simple.v` | 新增 `stq_pa/stq_pv/cdq_pa`；入队拷 PA；排空地址取 `cdq_pa` 且 `dr_fire` 加 `stq_pv` 门；新增 I/O：`st_xlate_valid/st_xlate_va/st_xlate_idx`（出）与 `st_xlate_ready/st_xlate_done/st_xlate_pa/st_xlate_fault`（入）；`st_xlate_valid` 于 `st_done_valid` 同拍拉高 |
+| `rtl/back2/backend_top.v` | 新增上述 7 个端口的顶层透传（透传到 `core_top_2b`） |
+| `rtl/top/core_top_2b.v` | ①`d_xlat_need_w &= ~lsu_req_we`（**排空不翻译**）；②适配器新增"执行期翻译"入口：`AD_IDLE & st_xlate_valid` → `AD_XLATE`（上下文标志 `d_stx_q`）→ 命中即回 `st_xlate_pa`，缺失走 `AD_TR`，完成后回写 PA 并置 `st_xlate_done`（**不进入 AD_REQ**，因为这不是访存而是纯翻译） |
+| `sim/unit/` | 去 p13 的 6 条 `nop`；新增硬断言（[st] 信号组合）；store 页错误小用例（下一步） |
+
+**结论**：本轮**未改动 RTL**（预算不足以"实现+验证"闭环，且半成品接口会让整设计不可编译 ⇒
+违反"停在整设计可编译+既有判据全绿"约束）。检查点保持：
+`tb_core_top_2b` **121/121 PASS**、`regress.sh` **32/32 PASS**（本会话实测日志见 §B4.24.8）。
