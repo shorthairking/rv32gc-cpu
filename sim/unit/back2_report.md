@@ -4017,3 +4017,20 @@ assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
   同拍冲突 / `cdq_v[wp]` 写入被随后语句覆盖 / 排空握手在该拍被 `maint_act_q` 挡住），
   修后**去掉 `nop`** 重跑 121；随后 ②store page fault 精确化、③L1D 维护写回 + `cbo.flush` INVAL、
   ④L1I 侧 PIPT 复核。
+### B4.24.4 CDQ 入队/记账路径复核（本段补做，收窄下一步）
+
+复核 `lsq_simple.v` 的入队/记账/出队三段（`495-522`、`763-787`）：
+
+* **入队许可**：`dr_room_ok = ((CDQ_N - cdq_cnt) >= W)`、`dr_take = dr_valid & room`
+  —— 只吃寄存器态、与提交链无环 ✓；且 `rob.v:168` 的 `slot_st_ok = ~store | mem_wr_ready`
+  意味着"store 能进提交前缀 ⇒ 入队余量本拍必为 1" ⇒ `dr_take` 与 `dr_valid` 等价 ✓。
+* **写指针/序号**：`dr_rank` 逐 lane 压缩（2 bit/lane，W=4 ⇒ 0..3 ✓）、`cdq_wp = cdq_tail + rank`
+  ✓、`cdq_tail += dr_push_n` ✓、`cdq_cnt += dr_push_n - dr_fire`（单条赋值合并 ✓）——
+  **未发现"写指针与 cdq_head 同拍冲突"或"cdq_v[wp] 被后续语句覆盖"的结构性缺陷**
+  （同一 always 内 `if (squash)` 只动 STQ/LQ 的更年轻项，不碰 `cdq_*`）。
+* ⇒ **候选收敛到"排空握手"一侧**：`dr_fire = dr_any & mem_req_ready`，而
+  `mem_req_ready = d_ready_w = d_idle & ~l1d_busy_w & ~maint_act_q`。下一步探针必须**同时**打印
+  `dr_any / mem_req_ready / d_idle / l1d_idle / maint_act_q` 与 `cdq_cnt/cdq_head/cdq_tail`
+  —— 判定"入队了但排空握手被挡（或 `d_ready_w` 长期为 0）"。
+* 另需一并核对：**该笔 store 排空时是否走了翻译**（`AD_XLATE` ⇒ PTW 遍历）而遍历失败/挂起
+  （若 MPRV 此刻为 1）；探针加打印 `ad_st_q / d_xlat_need_w / ptw_req_done / ptw_fault` 即可闭合。
