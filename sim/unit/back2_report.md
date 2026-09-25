@@ -4788,3 +4788,84 @@ S 目标拍的实际值、以及 `csrw sepc` 的写路径（`wen/waddr` 与 `pri
 * 快照 `../.b2chk/*.s49`（含 `trap_ctrl.v.pre`）。
 * **下一步**：G4 定位（见 §B4.33.3）→ 修好后恢复 `tb_core_top_2b.sv.p15`、补 C16' 判据
   （`trc_cause` 序列 9/2/11、`mtval`/`mepc`、PLIC claim=5、结束标记）+ 反证（断开 `.irq_meip` 必红）。
+
+---
+
+# B4.34 G4 定位与修复（`xret_kind` 编码口径）+ 剩一处（软件 `csrw sepc` 未生效）
+
+> 起点 = 母代理已验收提交 `d946871`（tag 2B-4.32）。
+> 检查点：`tb_core_top_2b` **148/148 PASS**；`regress.sh` **32/32 PASS**；未提交 git。
+
+## B4.34.1 G4 定案：**`xret_kind` 编码口径不一致**（真源在 `backend_top.xret_kind_f`）
+
+```verilog
+// backend_top.v:1763  —— 编码真源
+xret_kind_f = (t == 32'h3020_0073) ? 2'd1 :      // mret
+              (t == 32'h1020_0073) ? 2'd2 : 2'd0; // sret
+// core_top_2b.v:1553 —— PC mux 与之自洽（2 = sret ⇒ sepc）
+trp_target_w = ... (xret_kind_w == 2'd2) ? csr_sepc_o : csr_mepc_o;
+// priv_ctrl.v:140（旧）—— ✗ 按 00=sret / 01=mret 解码
+xret_target = (xret_kind == 2'b01) ? mpp_l : (xret_kind == 2'b00) ? (f_spp ? S : U) : U;
+```
+⇒ 真 `sret`（kind=**2**）落进 **default = PRIV_U**：①`sret` 恒回 U；②`xret_s`（`== 2'b00`）**永假**
+⇒ SPP/SPIE 恢复与 SIE 还原全不做。实测 p15（修复前）：S handler 后 `sret` 使特权级变 U
+⇒ 同一条 `ecall` 以 **cause 8（U 模式 ecall）** 重入 M ✗。
+
+**修法（`rtl/csr/priv_ctrl.v`，2 行；母代理预授权同类 ISA 正确性最小加法）**：
+```verilog
+- wire [1:0] xret_target = (xret_kind == 2'b01) ? mpp_l :
+-                          (xret_kind == 2'b00) ? (f_spp ? PRIV_S : PRIV_U) : PRIV_U;
++ wire [1:0] xret_target = (xret_kind == 2'b01) ? mpp_l :                     // mret
++                          (xret_kind == 2'b10) ? (f_spp ? PRIV_S : PRIV_U) : // sret
++                          PRIV_U;
+- wire xret_s = xret_valid && (xret_kind == 2'b00);
++ wire xret_s = xret_valid && (xret_kind == 2'b10);   // sret = 2（见 xret_kind_f）
+  wire xret_m = xret_valid && (xret_kind == 2'b01);   // mret 不变 ✓
+```
+**实测验证** ✓：修复后同一条 `ecall` 的重复陷阱 **cause 保持 9（S 模式 ecall）**（修复前是 8 = U 模式）
+⇒ `sret` 确实回到 **S** 且 S 侧 CSR 路径活着 ✓。
+**回归面**：既有 32 个程序**无 `sret`**（`mret`=kind 1 不变）⇒ 148 项/32 TB 零回退 ✓。
+
+## B4.34.2 剩余一处（**未修**）：S 模式软件 `csrw sepc` 不生效
+
+修复 G4 后 p15 进入**无限 ecall 循环**（`[p15-tr]` 连续 `cause=9 pc=0x8002c078`），根因：
+S handler 里 `csrw sepc, t5`（`#33`，wdata=0x8002c07c 已提交 ✓）**没有写进 sepc**
+⇒ `sret` 仍回到 ecall 本身（0x8002c078）⇒ 循环 ✗。
+已核对的读侧/硬件侧均正常（`scause=9`、`sepc` 初值 = trap 写入值 ✓），故缺口在**软件写通道**：
+`wr_sepc & sw_en` 未生效（`sw_en = wen & ~w_illegal`；`w_illegal = ~impl_hit | ~priv_ok | ro_write`，
+S 模式下 sepc 应合法）。
+**下一轮探针（1 次即可定案）**：S 目标/软件写拍打印 `wen`、`waddr`、`w_illegal`、`wr_sepc`、`sw_en`、
+`wval_final`、`priv`；判 `wen=0`（提交点 CSR 写使能）还是 `wr_sepc=0`（写地址译码）或 `w_illegal=1`（权限）。
+
+## B4.34.3 检查点
+
+* 改动（相对 `d946871`）：`rtl/csr/priv_ctrl.v`（G4 两行）、`sim/unit/prog/back2_p15_priv.S` +
+  生成器项 + `.svh` slot 14（未接入 TB）、本报告。**TB 未改**（带 p15 槽版本在 `../.b2chk/tb_core_top_2b.sv.p15`）。
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**；`regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c21.log`）。
+* 快照 `../.b2chk/*.s50`（含 `priv_ctrl.v.pre`）。
+* **下一步**：①定位并修 S 模式软件 `csrw sepc`（见 §B4.34.2 探针）→ ②恢复 p15 TB 槽 + 补 C16' 判据
+  （`trc_cause` 9/2/11、`mtval`/`mepc`、PLIC claim=5/complete、结束标记、no-golden 登记）→ ③反证
+  （断开 `.irq_meip` 必红）→ ④regress。
+
+## B4.34.4 ★ 更正与续查（本段末）：G4 的**正确落点在 2B 侧**，且 p15 又暴露一处新症状
+
+**更正 §B4.34.1**：我先把修法打在 2A `priv_ctrl.v`（把 sret 解码改成 `2'b10`）—— **错** ✗：
+`tb_csr_file` 与 2A `core_top.v`（`:68` / `:1418` / `:1679` / `:1694` / `:1709`）**一致采用
+"01 = mret / 00 = sret"** ⇒ **2A 口径才是权威**，`priv_ctrl` 的解码**本来就对** ✓。
+真正的偏差在 **2B 侧两处**（与 2A 相反）：
+* `backend_top.xret_kind_f`：把 sret 编成 `2'd2`（应为 `2'd0`）；
+* `core_top_2b:1553` 的 PC mux：`(xret_kind_w == 2'd2) ? csr_sepc_o : csr_mepc_o`（应为 `== 2'd0`）。
+（prv_ctrl 的改动**已还原**；`tb_csr_file` 的回归红正是该误改被抓住 —— 判据起作用 ✓）
+
+**已做的验证实验（临时改 2B 两处后实测，随后已还原）**：按 2A 口径对齐后，p15 的 S 链**明显推进**：
+```
+[p15-tr] #0 cause=9 pc=0x8002c078 tgt=0x8002c0ec     ← 委托到 S ✓
+[p15-all] #30 x28=9  #31 x30=0x8002c078  #32 x30=0x8002c07c   ← S handler 自记录全对 ✓
+[p15-tr] #1.. cause=2 pc=0x8002c100/104/108 …        ← sret 已能返回（不再回 U、不再 cause 8）✓
+```
+**但**新症状：`sret` 的落点/后续流不正确（在 0x8002c100+ 连续 illegal）⇒ 除编码对齐外，
+**S 侧 xret 的 PC 来源/落点**仍需与 2A `core_top.v:1709`（`xret_epc_pc = (kind==01) ? mepc : sepc`）
+逐条对齐后再验（另需一并核对 `sret` 的 SPP/SPIE 恢复是否已生效）。
+**下一轮落点（建议）**：①按 2A 口径改 `backend_top.xret_kind_f`（sret=2'd0）与 `core_top_2b:1553` 的
+PC mux；②对照 2A `core_top.v:1679-1709` 复核 2B 的 xret PC/特权级/CSR 更新三处；③再恢复 p15 TB 槽
++ C16' 判据 + 反证；④全量回归。**本轮为保证"全绿检查点"，上述 2B 改动已还原**（`rtl/` == `d946871`）。
