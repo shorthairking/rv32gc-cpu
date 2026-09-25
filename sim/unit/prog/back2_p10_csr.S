@@ -81,7 +81,14 @@ _start:
     li    t1, 0x1888
     and   a5, a5, t1                /* a5 = 0x00001800（只比 M 模式相关位） */
 
-    /* ---- 收尾：写 tohost（s1..s11 / a0..a5 已在写回轨迹里）---- */
+    /*   ★ `mcycle`/`minstret` **故意不纳入本程序**（口径登记，见报告 §B4.6.4-⑨）：
+     *     两者的**数值**与 Spike 不可比 —— Spike 的 mcycle 按"指令条数"递增
+     *     （实测第 40 条指令时 mcycle=0x28），本核按 **aclk 拍数**递增
+     *     （4 宽乱序提交 ⇒ 拍数 ≠ 条数）。任何 `csrr rd, mcycle` 都会把该数值写进
+     *     通用寄存器 ⇒ 必然与黄金分歧。Zicntr 的"链路已接活"判据由 TB 侧的
+     *     `cycle_cnt/instret_cnt` 活性检查承担（C10' 后两条）。 */
+
+    /* ---- 收尾：写 tohost（s1..s11 / a0..a5 / a6,a7 已在写回轨迹里）---- */
 1:  auipc x30, %pcrel_hi(tohost)
     addi  x30, x30, %pcrel_lo(1b)
     li    x31, 1
