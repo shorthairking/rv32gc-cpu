@@ -144,6 +144,27 @@ module lsq_simple #(
     output wire [ROB_IDX_W-1:0]  st_done_rob,
     output wire [`BACK2_EPOCH_W-1:0] st_done_epoch,
 
+    // ---- ★★ (b) store 地址翻译口（PA 化；§B4.24.9 第 2/3 条 + 上下文口径修正）----
+    //   动机（根因链 §B4.23/§B4.24 + 本轮实测修正）：旧形态下**已提交 store 的排空**才在
+    //   适配器里翻译 ⇒ 一次遍历同时受"维护冲刷"和"翻译上下文取错时刻"两个因素影响
+    //   （实测 p13：PTE 更新 store 在排空/预翻译时刻按 **MPRV=1 + MPP=U** 翻译 U=0 的页
+    //   ⇒ 页错误 ⇒ 已提交写静默丢失）。改为**执行期/提交期定址**、PA 随 STQ/CDQ 携带
+    //   ⇒ 排空口恒用 PA、**排空不再翻译**。
+    //   · 方向 ①（本模块 → 顶层适配器）：请求 + VA + 槽号 + **翻译上下文**
+    //   · 方向 ②（顶层适配器 → 本模块）：接受拍 / 完成拍 / PA / 故障
+    //   · `st_xlate_ctx` = {有效特权级[1:0], SUM, MXR}：**必须随请求携带**——
+    //     适配器/PTW 若用"当下"的 CSR 值做 TLB 查询与遍历，结果与该项应得的翻译无关。
+    input  wire                  st_xlate_en,        // 本拍执行的 store **需要**翻译（1）
+    input  wire [3:0]            st_xlate_ctx,       // 本拍翻译上下文 {priv,SUM,MXR}
+    output wire                  st_xlate_valid,     // 翻译请求（**保持**到 done）
+    output wire [31:0]           st_xlate_va,        // 该 store 的**虚拟**地址
+    output wire [STQ_IW-1:0]     st_xlate_idx,       // 目标下标（STQ 槽 **或** CDQ 项，见 §3.4）
+    output wire [3:0]            st_xlate_ctx_o,     // 该请求的翻译上下文（保持到 done）
+    input  wire                  st_xlate_ready,     // 适配器**接受**拍（锁存在途项）
+    input  wire                  st_xlate_done,      // 完成脉冲（1 拍，PA/故障有效）
+    input  wire [31:0]           st_xlate_pa,        // 译后**物理**地址
+    input  wire                  st_xlate_fault,     // 1 = 翻译故障（提交拍口径 ⇒ 作废不写）
+
     // ---- 观测 ----
     output wire [7:0]            stq_cnt_o,
     output wire [31:0]           cnt_load_o,
@@ -158,12 +179,23 @@ module lsq_simple #(
     reg                  stq_v   [0:STQ_N-1];
     reg                  stq_av  [0:STQ_N-1];        // 地址已生成（只写一次）
     reg                  stq_dv  [0:STQ_N-1];
-    reg  [31:0]          stq_a   [0:STQ_N-1];        // ★ 物理地址（唯一来源）
+    reg  [31:0]          stq_a   [0:STQ_N-1];        // ★ **虚拟地址**（E1 的 AGU 结果；
+                                                     //   转发比较 / 翻译请求的 VA 来源）
     reg  [31:0]          stq_d   [0:STQ_N-1];        // 已对位到字内字节道
     reg  [3:0]           stq_msk [0:STQ_N-1];
     reg  [ROB_IDX_W-1:0] stq_rob [0:STQ_N-1];
     reg                  stq_ret [0:STQ_N-1];
     reg  [STQ_IW-1:0]    stq_head_q, stq_tail_q;
+    //   ★★ (b) PA 化（§B4.24.9 第 1 条）：`stq_a` **必须保持 VA** —— store→load 转发按
+    //     `stq_a[si] == exe_addr` 比较，而 load 侧拿到的是 **VA** ⇒ 物理地址走**独立字段**：
+    //       · `stq_pa`：**E1 预翻译**结果（Bare/无需翻译时 = `stq_a`，即 VA=PA）
+    //       · `stq_pv`：该预翻译结果有效（E1 判定"无需翻译"⇒ 立即 1；需翻译 ⇒ 等 done）
+    //       · `stq_ctx`：该次预翻译使用的**上下文** {priv,SUM,MXR}（提交拍据此判可否沿用）
+    //     注：预翻译只是**加速**；**权威判定在提交拍**（见 §3.4 头注），故预翻译失败
+    //     （`st_xlate_fault`）**不置任何"坏"位**、只保持 `stq_pv=0`（未定）。
+    reg  [31:0]          stq_pa  [0:STQ_N-1];
+    reg                  stq_pv  [0:STQ_N-1];
+    reg  [3:0]           stq_ctx [0:STQ_N-1];
 
     wire [7:0] age_rob  = (exe_rob - rob_head) & 7'h7F;      // E1 项年龄（转发窗口）
     //   ★★ 2B-3 第 6 段第二步：**发射闸门必须按"候选（i4_sel）"判年龄**。
@@ -497,10 +529,14 @@ module lsq_simple #(
     //     而 `flush_all`（陷阱）清 STQ 时已提交的 store 仍能落地（架构上必须可见）。
     //   · 入队余量判据只用**寄存器态**（`cdq_cnt`）⇒ 与 rob.v 的提交链无组合环。
     reg  [STQ_IW-1:0] cdq_idx [0:CDQ_N-1];
-    reg  [31:0]       cdq_a   [0:CDQ_N-1];
+    reg  [31:0]       cdq_a   [0:CDQ_N-1];       // ★ (b)：**VA**（E1 值；CDQ 源翻译请求用）
+    reg  [31:0]       cdq_pa  [0:CDQ_N-1];       // ★ (b)：**PA**（排空口唯一地址来源）
     reg  [31:0]       cdq_d   [0:CDQ_N-1];
     reg  [3:0]        cdq_m   [0:CDQ_N-1];
     reg  [CDQ_N-1:0]  cdq_v;
+    reg  [CDQ_N-1:0]  cdq_pv;                    // ★ (b)：该笔 PA 已定（可排空）
+    reg  [CDQ_N-1:0]  cdq_bad;                   // ★ (b)：该笔翻译故障（作废：不写只弹出）
+    reg  [3:0]        cdq_ctx [0:CDQ_N-1];       // ★ (b)：该笔的**提交拍**翻译上下文
     reg  [CDQ_PW:0]   cdq_cnt;
     reg  [CDQ_PW-1:0] cdq_head, cdq_tail;
 
@@ -522,21 +558,103 @@ module lsq_simple #(
         assign cdq_wp[gv] = cdq_tail + dr_rank[2*gv +: 2];
     endgenerate
 
-    //   出队：队首一笔；`dr_fire` = 与存储口的握手拍
+    //==========================================================================
+    // 3.4 ★★ (b) store 地址翻译引擎（§B4.24.9 第 2/3/5 条 + 上下文口径修正）
+    //--------------------------------------------------------------------------
+    //  【为什么"上下文"必须随请求携带，且权威判定在**提交拍**】（本段实测根因，报告 §B4.25）
+    //    · 一次 store 翻译的正确性取决于三件事：VA 对、**翻译上下文对**、遍历结果可信。
+    //      上下文 = {有效特权级, SUM, MXR}。本核 CSR **只在提交点更新**（`csr_file` 写口在
+    //      提交级）⇒ 与"该 store 在程序序上那一刻"一致的唯一时刻就是**它的提交拍**。
+    //      · 取 **E1 拍**的上下文 ⇒ 偏旧（更老的 CSR 写尚未提交）。实测 p13：
+    //        PTE 更新 store（VA 0x80027000）在 `csrw mstatus`（MPRV=0）**之前**投机执行
+    //        ⇒ 用 MPRV=1/MPP=U 翻译 ⇒ 该页 U=0 ⇒ 页错误 ⇒ 已提交写被静默丢弃。
+    //      · 取 **排空拍**的上下文 ⇒ 偏新（更年轻的 CSR 写已提交）。p13 原始形态即此：
+    //        排空时 MPRV 已被后面的 `csrw` 重新置 1 ⇒ 同样错译/丢写。
+    //    · ⇒ 本引擎三条口径：
+    //      ① **E1 拍发一次"预翻译"请求**（照简化 ③：搭在现成的 `st_done_valid` 拍，
+    //         `st_xlate_en=0` 时直接 `stq_pv=1, stq_pa=VA`）；该请求**未当拍被接受即放弃**
+    //         （一次性、不重发）——它只是**加速**，结果仅当提交拍上下文一致时才沿用；
+    //      ② **提交拍（CDQ 入队）权威判定**：`st_xlate_en`（提交序上下文）为 0 ⇒
+    //         `cdq_pa=VA, cdq_pv=1`，**无条件覆盖**预翻译结果；
+    //      ③ 提交拍需要翻译而预翻译不可用/上下文不一致 ⇒ `cdq_pv=0`，由 **CDQ 扫描**
+    //         用**入队时锁存的 `cdq_ctx`** 重译 —— 这也是"排空永不悬挂"的活性保证
+    //         （已提交项无论如何都能拿到 PA；`flush_all` 清 STQ 也不影响 CDQ 项）。
+    //    · 来源判别（`stx_src_q`）：STQ 源（只可能来自 ①）⇒ 只写回 `stq_*`；
+    //      CDQ 源 ⇒ 只写回该 **CDQ 阵列项**（`stx_idx_q` 即 CDQ 下标）。二者不交叉，
+    //      从而不会把"新占用者"的翻译结果写进"旧 CDQ 项"（槽号在 `flush_all` 后会复用）。
+    //    · 预翻译**失败不置坏位**（只留 `stq_pv=0`）；只有 **CDQ 源**的故障才置
+    //      `cdq_bad`（提交拍口径 ⇒ 可信）⇒ 才走"作废不写"兜底。
+    //==========================================================================
+    reg  [STQ_IW-1:0] stx_idx_q;                 // 在途目标下标（接受拍锁存）
+    reg  [31:0]       stx_va_q;                  // 在途 VA（接受拍锁存）
+    reg  [3:0]        stx_ctx_q;                 // 在途翻译上下文（接受拍锁存）
+    reg               stx_act_q;                 // 在途标志
+    reg               stx_src_q;                 // 0 = 源为 STQ 槽 / 1 = 源为 CDQ 项
+
+    //   ① E1 拍预翻译请求（一次性，优先于 CDQ 候选）
+    //   ★★ (b) 新增输入的**悬空净化**（`=== 1'b1` 口径）——与 `mem_rsp_err` 同一教训：
+    //     本模块被多处**直接驱动**的 TB 例化（`tb_back2_lsq_fwd`；`tb_back2_lockstep`
+    //     经 `backend_top`）在本段**不接**新口 ⇒ 输入为 **z** ⇒ `~st_xlate_en` 与
+    //     `ready/done` 参与的条件会成 x ⇒ 排空门 `cdq_pv|cdq_bad` 变 x ⇒ 整核挂死
+    //     （实测：`tb_back2_lockstep` 程序 0 提交条数不增、C3 红）。
+    //     口径：**只有明确的 1 才算"需要翻译/接受/完成/故障"**；z/x/0 一律按 0
+    //     ⇒ 等价于 "Bare（PA=VA）、无翻译请求"，与新增端口之前的行为**逐拍一致**。
+    //     （`st_xlate_pa` 只在 `done=1` 被采样，而 `done` 需 `stx_act_q` ⇒ 悬空时不可达。）
+    wire stx_en_w    = (st_xlate_en    === 1'b1);
+    wire stx_ready_w = (st_xlate_ready === 1'b1);
+    wire stx_dn_w    = (st_xlate_done  === 1'b1);
+    wire stx_flt_w   = (st_xlate_fault === 1'b1);
+    wire stx_e1_w = exe_valid & exe_is_store & stx_en_w;
+    //   ③ CDQ 候选（已提交、PA 未定、未判坏）
+    wire [CDQ_N-1:0] stx_c_v;
+    generate
+    for (gv = 0; gv < CDQ_N; gv = gv + 1) begin : g_stx_c
+        assign stx_c_v[gv] = cdq_v[gv] & ~cdq_pv[gv] & ~cdq_bad[gv];
+    end
+    endgenerate
+    wire              stx_c_any = |stx_c_v;
+    //   CDQ 候选复用 `pri_enc`（32 宽口径）：高位补 0 ⇒ 结果即最低有效候选的下标
+    wire [OUT_N-1:0]  stx_c_pad = {{(OUT_N-CDQ_N){1'b0}}, stx_c_v};
+    wire [STQ_IW-1:0] stx_c_enc = pri_enc(stx_c_pad);
+    wire [STQ_IW-1:0] stx_c_idx = {{(STQ_IW-CDQ_PW){1'b0}}, stx_c_enc[CDQ_PW-1:0]};
+    wire              stx_sel_v   = stx_e1_w | stx_c_any;
+    wire              stx_sel_src = ~stx_e1_w;               // 1 = CDQ 源
+    wire [STQ_IW-1:0] stx_sel_idx = stx_e1_w ? exe_stq_idx : stx_c_idx;
+    wire [31:0]       stx_sel_va  = stx_e1_w ? exe_addr    : cdq_a[stx_c_idx];
+    wire [3:0]        stx_sel_ctx = stx_e1_w ? st_xlate_ctx : cdq_ctx[stx_c_idx];
+
+    assign st_xlate_valid = stx_act_q | stx_sel_v;
+    assign st_xlate_idx   = stx_act_q ? stx_idx_q : stx_sel_idx;
+    assign st_xlate_va    = stx_act_q ? stx_va_q  : stx_sel_va;
+    assign st_xlate_ctx_o = stx_act_q ? stx_ctx_q : stx_sel_ctx;
+    //   接受拍（在途时不再接受新的：适配器在翻译期间不会给 ready）
+    wire   stx_accept_w   = st_xlate_valid & stx_ready_w & ~stx_act_q;
+    //   完成拍（只在"有在途项"时认；冲刷打断后的**迟到 done** 一律忽略）
+    wire   stx_done_w     = stx_dn_w & stx_act_q;
+
+    //   出队：队首一笔；
     wire              dr_any  = (cdq_cnt != {(CDQ_PW+1){1'b0}});
-    //   ★ 发射许可 = 无更老未定址 store 且 **CDQ 已排空**（口径见上）
+    //   ★★ (b) 排空握手三态（§B4.24.9 第 5 条的兜底口径）：
+    //     · `dr_ok`  ：该笔 PA 已到齐 ⇒ **真发存储写**（地址 = `cdq_pa`，不再翻译）
+    //     · `dr_bad` ：该笔翻译故障 ⇒ **只弹出、不写**（等于旧形态的"静默丢弃"，但
+    //                  **不悬挂**；store 页错误的精确化是紧随其后的另一步，本步不做）
+    //     · 二者皆 0（PA 在途）⇒ **本拍不排空**（`dr_fire=0`），等 PA 到齐再发
+    //   `ld_fire` 仍以 `~dr_any` 门控 ⇒ "排空优先、排空未完不发 load"的既有内存序不变。
+    wire              dr_ok   = cdq_pv [cdq_head];
+    wire              dr_bad  = cdq_bad[cdq_head];
     assign iss_ok = ~any_unk_w;                 // （"CDQ 空"的门控改由顶层在冲刷侧做，见 dr_empty_o）
     assign dr_empty_o = ~dr_any;
     wire [STQ_IW-1:0] dr_sel  = cdq_idx[cdq_head];
-    wire              dr_fire = dr_any & mem_req_ready;
+    wire              dr_fire = dr_any & mem_req_ready & (dr_ok | dr_bad);   // 离队
+    wire              dr_issue= dr_any & mem_req_ready &  dr_ok;             // 真发写
     wire              ld_fire = pend_any & ~dr_any & mem_req_ready;
 
-    assign mem_req_valid = dr_fire | ld_fire;
-    assign mem_req_wen   = dr_fire;
-    assign mem_req_addr  = dr_fire ? cdq_a[cdq_head]   : ld_addr[pend_sel];
-    assign mem_req_wdata = dr_fire ? cdq_d[cdq_head]   : 32'h0;
-    assign mem_req_wstrb = dr_fire ? cdq_m[cdq_head]   : 4'h0;
-    assign mem_req_tag   = dr_fire ? {TAG_W{1'b1}}     : ld_tag[pend_sel];
+    assign mem_req_valid = dr_issue | ld_fire;
+    assign mem_req_wen   = dr_issue;
+    assign mem_req_addr  = dr_issue ? cdq_pa[cdq_head]  : ld_addr[pend_sel];
+    assign mem_req_wdata = dr_issue ? cdq_d[cdq_head]   : 32'h0;
+    assign mem_req_wstrb = dr_issue ? cdq_m[cdq_head]   : 4'h0;
+    assign mem_req_tag   = dr_issue ? {TAG_W{1'b1}}     : ld_tag[pend_sel];
 
     // ---- 写回：响应到达 或（部分/全部）转发 + 响应 合并 ----
     wire [31:0] wb_word = mem_rsp_rdata;
@@ -617,6 +735,9 @@ module lsq_simple #(
             cnt_ld_q <= 32'h0; cnt_st_q <= 32'h0; cnt_fwd_q <= 32'h0; cnt_stall_q <= 32'h0;
             cdq_cnt <= {(CDQ_PW+1){1'b0}}; cdq_head <= {CDQ_PW{1'b0}}; cdq_tail <= {CDQ_PW{1'b0}};
             cdq_v   <= {CDQ_N{1'b0}};
+            cdq_pv  <= {CDQ_N{1'b0}}; cdq_bad <= {CDQ_N{1'b0}};
+            stx_act_q <= 1'b0; stx_src_q <= 1'b0; stx_idx_q <= {STQ_IW{1'b0}};
+            stx_va_q  <= 32'h0; stx_ctx_q <= 4'h0;
             fwdp_v <= 1'b0; fwdp_rob <= {ROB_IDX_W{1'b0}}; fwdp_ep <= {`BACK2_EPOCH_W{1'b0}};
             fwdp_di <= 1'b0; fwdp_df <= 1'b0; fwdp_pi <= {PDW_I{1'b0}};
             fwdp_pf <= {PDW_F{1'b0}}; fwdp_data <= 32'h0; fwdp_size <= 3'h0;
@@ -625,6 +746,7 @@ module lsq_simple #(
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0;
                 stq_a[si] <= 32'h0; stq_d[si] <= 32'h0; stq_msk[si] <= 4'h0;
                 stq_rob[si] <= {ROB_IDX_W{1'b0}}; stq_ret[si] <= 1'b0;
+                stq_pa[si] <= 32'h0; stq_pv[si] <= 1'b0; stq_ctx[si] <= 4'h0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
@@ -635,6 +757,40 @@ module lsq_simple #(
                 ld_hm[si] <= 4'h0; ld_hd[si] <= 32'h0; ld_tag[si] <= {TAG_W{1'b0}};
             end
         end else if (flush_all) begin
+            //   ★★ (b) 收口（本段实测根因，报告 §B4.25）：**已提交 store 的 CDQ 入队
+            //     不受整机冲刷影响**。
+            //     现象：p13 的 PTE 更新 store 与 `sfence.vma` **同组提交**，提交拍
+            //     `be_trp_flush/flush_all=1` ⇒ 旧实现直接走本分支 ⇒ **整个 §4.5 入队被跳过**
+            //     （`dr_take` 组合为 1 但 `cdq_cnt/cdq_tail` 不动，实测 t=13512
+            //      `take=0001` → t=13513 `cnt=0 t=7`）⇒ 已提交写**从未落地**、`l1[0]` 永为旧 PTE。
+            //     论证：`dr_valid`（`backend_top` 的 `cmt_st_drain & ~cmt_hold_w`）在本拍为 1
+            //     意味着该 store **已在提交前缀链内**（= 架构上已提交）⇒ 它的写**必须可见**，
+            //     与本拍是否同时冲刷无关（`cmt_st_drain` 本身不含任何 flush 门）。
+            //     做法：本分支**照做入队**（拷贝读的是本拍仍有效的 STQ 寄存器态 ✓），
+            //     然后照旧清 STQ/LQ（已提交项的数据已随 CDQ 带走 ⇒ 不丢）。
+            for (si = 0; si < W; si = si + 1) begin
+                if (dr_take[si]) begin
+                    cdq_v  [cdq_wp[si]] <= 1'b1;
+                    cdq_idx[cdq_wp[si]] <= dr_idx[si*STQ_IW +: STQ_IW];
+                    cdq_a  [cdq_wp[si]] <= stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    //   PA 判定口径与 §4.5 正常分支**逐字相同**（提交拍权威；见 §3.4 头注）
+                    cdq_pa [cdq_wp[si]] <= stx_en_w ? stq_pa [dr_idx[si*STQ_IW +: STQ_IW]]
+                                                    : stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_pv [cdq_wp[si]] <= ~stx_en_w |
+                                           (stq_pv[dr_idx[si*STQ_IW +: STQ_IW]] &
+                                            (stq_ctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx));
+                    cdq_bad[cdq_wp[si]] <= 1'b0;
+                    cdq_ctx[cdq_wp[si]] <= st_xlate_ctx;
+                    cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
+                end
+            end
+            if (dr_push_n != {(CDQ_PW+1){1'b0}}) begin
+                cdq_tail <= cdq_tail + dr_push_n[CDQ_PW-1:0];
+                cdq_cnt  <= cdq_cnt + dr_push_n;
+            end
+            //   注意：本分支**不**推进 CDQ 出队（下拍照常，`dr_fire` 侧不受影响）——
+            //   代价至多 1 拍，换取"最小改动 + 不触碰排空握手"。
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0; stq_ret[si] <= 1'b0;
             end
@@ -644,6 +800,10 @@ module lsq_simple #(
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
             fwdp_v <= 1'b0;
+            //   ★★ (b)：`flush_all` **不清** 在途翻译状态（`stx_act_q/...`）——
+            //     被冲刷的那笔翻译可以无害地跑完（STQ 写回有 `stq_v & ~stq_pv` 门，见 §4.5b），
+            //     而"已提交但 PA 未到"的项仍靠 **CDQ 源扫描**完成翻译并排空（活性保证）✓。
+            //     注意：CDQ 本身不受 `flush_all` 影响（既有设计口径，见 §3.3 头注）✓。
         end else begin
             // ---- 4.1 默认：清全转发直通项 ----
             fwdp_v <= 1'b0;
@@ -656,6 +816,11 @@ module lsq_simple #(
                         stq_av [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         stq_dv [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         stq_ret[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        //   ★★ (b)：新项尚无 PA（需翻译时必须等 `st_xlate_done`）；
+                        //     `stq_pa/stq_pv` 的真正判定在 E1（§4.3）—— 分配期只清状态。
+                        stq_pa [alloc_idx[si*STQ_IW +: STQ_IW]] <= 32'h0;
+                        stq_pv [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_ctx[alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
                         //   ★★ 2B-3 第 6 段第二步（报告 §B3.6.4 的必办项）：ROB 索引在
                         //     **分配期**即写入 ⇒ `stq_rob` 从这一刻起就是真年龄。
                         //     旧实现在 E1 才写 ⇒ "已分配未执行"的 store 里是上一占用者的
@@ -686,7 +851,17 @@ module lsq_simple #(
             if (exe_valid && exe_is_store) begin
                 stq_av[exe_stq_idx]  <= 1'b1;
                 stq_dv[exe_stq_idx]  <= 1'b1;
-                stq_a[exe_stq_idx]   <= exe_addr;                        // 物理地址唯一来源
+                stq_a[exe_stq_idx]   <= exe_addr;                        // ★ VA（转发/翻译源）
+                //   ★★ (b)：PA 化在 **E1 这一拍**定夺（§B4.24.9 简化 ③"不需要新增
+                //     '何时翻译'的判据"）：
+                //       · `st_xlate_en=0`（Bare / M 模式且未置 MPRV）⇒ VA=PA，**立即可排空**；
+                //       · `st_xlate_en=1` ⇒ `stq_pv=0`，由 §3.4 的引擎发翻译请求，
+                //         `st_xlate_done` 拍写回 `stq_pa` 并置 `stq_pv=1`。
+                //     这一步正是"排空期在途翻译"缺陷的消除点：PA 在**执行期**定下来，
+                //     排空只搬 PA，不再依赖维护/冲刷时刻的翻译状态。
+                stq_pa[exe_stq_idx]  <= exe_addr;
+                stq_pv[exe_stq_idx]  <= ~stx_en_w;
+                stq_ctx[exe_stq_idx] <= st_xlate_ctx;
                 stq_d[exe_stq_idx]   <= exe_wdata << {exe_addr[1:0], 3'b000};
                 stq_msk[exe_stq_idx] <= lmask_w;
                 //   `stq_rob` 已在**分配期**写入（§4.2）⇒ 此处不再重复写（唯一写点纪律）。
@@ -767,6 +942,19 @@ module lsq_simple #(
                     cdq_v  [cdq_wp[si]] <= 1'b1;
                     cdq_idx[cdq_wp[si]] <= dr_idx[si*STQ_IW +: STQ_IW];
                     cdq_a  [cdq_wp[si]] <= stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    //   ★★ (b)：PA 三件套随提交拷贝（与 `cdq_a/d/m` 同构），且**提交拍口径
+                    //     为权威**（§3.4 头注）：
+                    //       · 提交拍 `st_xlate_en=0`（Bare / M 模式）⇒ PA = **VA**（`stq_a`），
+                    //         `cdq_pv=1` —— 无条件覆盖 E1 预翻译结果；
+                    //       · 提交拍需翻译且 E1 预翻译成功、**上下文一致** ⇒ 沿用 `stq_pa`；
+                    //       · 否则 `cdq_pv=0` ⇒ 由 §3.4 的 CDQ 扫描用 `cdq_ctx` 重译。
+                    cdq_pa [cdq_wp[si]] <= stx_en_w ? stq_pa [dr_idx[si*STQ_IW +: STQ_IW]]
+                                                    : stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_pv [cdq_wp[si]] <= ~stx_en_w |
+                                           (stq_pv[dr_idx[si*STQ_IW +: STQ_IW]] &
+                                            (stq_ctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx));
+                    cdq_bad[cdq_wp[si]] <= 1'b0;      // 坏位只由 **CDQ 源**翻译故障置位
+                    cdq_ctx[cdq_wp[si]] <= st_xlate_ctx;
                     cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
                     cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
                 end
@@ -774,6 +962,8 @@ module lsq_simple #(
             if (dr_push_n != {(CDQ_PW+1){1'b0}}) cdq_tail <= cdq_tail + dr_push_n[CDQ_PW-1:0];
             if (dr_fire) begin
                 cdq_v[cdq_head] <= 1'b0;
+                cdq_pv[cdq_head] <= 1'b0;      // （同拍入队不会撞队头：见 §3.4 的 `cdq_wp` 论证）
+                cdq_bad[cdq_head] <= 1'b0;
                 cdq_head        <= cdq_head + 1'b1;
             end
             cdq_cnt <= cdq_cnt + dr_push_n - {{CDQ_PW{1'b0}}, dr_fire};
@@ -784,6 +974,37 @@ module lsq_simple #(
             if (!alloc_hits_head && (!stq_v[stq_head_q] | stq_ret[stq_head_q])) begin
                 stq_v[stq_head_q] <= 1'b0;
                 stq_head_q <= stq_head_q + 1'b1;
+            end
+
+            // ---- 4.5b ★★ (b) 执行期翻译握手（请求保持 → 接受锁存 → done 写回 PA）----
+            if (stx_accept_w) begin
+                stx_act_q <= 1'b1;
+                stx_idx_q <= stx_sel_idx;
+                stx_va_q  <= stx_sel_va;
+                stx_ctx_q <= stx_sel_ctx;
+                stx_src_q <= stx_sel_src;
+            end else if (stx_done_w) begin
+                stx_act_q <= 1'b0;
+            end
+            if (stx_done_w) begin
+                if (stx_src_q == 1'b0) begin
+                    //   STQ 源（E1 预翻译）：**只记成功**——`stq_v & ~stq_pv` 门槛兼作"该项
+                    //   仍属于本次请求"的校验（冲刷后槽被清 ⇒ 自动丢弃迟到结果）。
+                    //   故障**不置坏位**：预翻译上下文可能偏旧，权威判定在提交拍（§3.4）。
+                    if (stq_v[stx_idx_q] & ~stq_pv[stx_idx_q] & ~stx_flt_w) begin
+                        stq_pa [stx_idx_q] <= st_xlate_pa;
+                        stq_pv [stx_idx_q] <= 1'b1;
+                    end
+                end else begin
+                    //   CDQ 源（**提交拍口径**）：`stx_idx_q` 即 CDQ **阵列下标** —— 该下标在
+                    //   在途期间稳定（`cdq_pv=0` ⇒ 不会被弹出，故不会被新入队覆盖）；
+                    //   故障此时才作废（`cdq_bad` ⇒ 只弹出、不写，排空不悬挂）。
+                    if (cdq_v[stx_idx_q] & ~cdq_pv[stx_idx_q]) begin
+                        cdq_pa [stx_idx_q] <= st_xlate_pa;
+                        cdq_pv [stx_idx_q] <= ~stx_flt_w;
+                        cdq_bad[stx_idx_q] <=  stx_flt_w;
+                    end
+                end
             end
 
             // ---- 4.6 冲刷 ----

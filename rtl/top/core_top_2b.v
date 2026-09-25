@@ -381,6 +381,14 @@ module core_top_2b (
     reg [31:0]  d_va_q;                  // ★ 4b-2b：翻译前的虚拟地址（异常 tval / 重发用）
     reg [3:0]   d_strb_q;
     reg [`BACK2_MEM_TAG_W-1:0] d_tag_q;
+    //   ★★ (b)：**执行期 store 翻译事务**（纯翻译，不是访存）——
+    //     `d_stx_q=1` 期间适配器借 `AD_XLATE/AD_TR` 做 VA→PA，完成即回 `st_xlate_done`
+    //     并**不进 `AD_REQ`**（不碰 L1D/AXI 的数据通路）。
+    reg         d_stx_q;
+    reg  [3:0]  d_stx_ctx_q;             // 该翻译事务的上下文（接受拍锁存）
+    reg  [31:0] stx_pa_q;                // 译后 PA
+    reg         stx_done_q;              // 完成单拍脉冲
+    reg         stx_flt_q;               // 翻译故障单拍脉冲（与 done 同拍）
 
     //   LSU 的存储口（先声明，§4b 使用）
     wire        lsu_req_v, lsu_req_we;
@@ -396,9 +404,38 @@ module core_top_2b (
                                             != `RV32GC_PRIV_M);
     wire [1:0]  d_eff_priv_w  = d_mprv_eff_w ? csr_mstatus_raw[`RV32GC_MSTATUS_MPP_LSB +: 2]
                                              : csr_eff_priv;
-    wire [1:0]  d_acc_w       = d_we_q ? 2'b10 : 2'b01;      // 10=store / 01=load
+    wire [1:0]  d_acc_w       = d_stx_q ? 2'b10 :             // ★ 翻译事务按 **store** 查权限
+                               (d_we_q ? 2'b10 : 2'b01);      // 10=store / 01=load
     wire        d_xlate_on_w  = (csr_eff_priv != `RV32GC_PRIV_M) | d_mprv_eff_w;
-    wire        d_xlat_need_w = sv32_en & d_xlate_on_w;
+    //   ★★ (b) 排空路径**不翻译**（§B4.24.9 简化 ②，本段根因的直接消除点）：
+    //     · 到适配器的 **store 请求必是"已提交 store 的排空"**（LSQ 里 store 只经 CDQ
+    //       的 `dr_issue` 出口，见 `lsq_simple.v` §3.3/§3.4）⇒ 它的地址已是**PA**
+    //       （执行期 E1 定址、随 STQ/CDQ 携带）⇒ 整级跳过 `AD_XLATE/AD_TR`；
+    //     · load 仍可能来自推测执行 ⇒ 照旧翻译（`~lsu_req_we`）。
+    //     旧形态（`sv32_en & d_xlate_on_w` 不分区）在 p13 实测为：PTE 更新 store 的排空
+    //     走了 `AD_TR`（`ad=5 need=1 va=0x80027000`）⇒ 按"排空拍"的 CSR 上下文翻译，
+    //     而该上下文已被更年轻的 `csrw mstatus`（MPRV 重新置 1）+ `mret`（MPP→U）改过
+    //     ⇒ 以 U 模式翻译 U=0 的页 ⇒ 页错误 ⇒ 已提交写静默丢失。
+    //     **根因修正见报告 §B4.25.1**（§B4.24.8 的"被维护脉冲 kill"定案与实测不符：
+    //     当时 `d_kill_w=0`、`ptw_kill_w=0`；且入队那一拍还被 `lsq_simple` 的
+    //     `flush_all` 分支整段吞掉）。
+    wire        d_xlat_need_w = sv32_en & d_xlate_on_w & ~lsu_req_we;
+    //   ---- ★★ (b) 执行期 store 翻译口（LSQ ↔ 本适配器；§B4.24.9 简化 ③）----
+    //   `st_xlate_en_w`：E1 拍"本笔 store 需要翻译"（与上面同式，不含 `~lsu_req_we`）
+    //     ⇒ LSQ 在 E1 拍据此决定 `stq_pv`，**无需新增"何时翻译"的判据**。
+    wire        st_xlate_en_w = sv32_en & d_xlate_on_w;
+    //   ★★ 翻译上下文 {有效特权级[1:0], SUM, MXR} —— **必须随请求携带**：适配器/PTW 若用
+    //     "当下"的 CSR 值做 TLB 查询与遍历，得到的 PA 与该项应得的翻译无关（实测根因：
+    //     p13 的 PTE 更新 store 被按 MPRV=1+MPP=U 翻译 ⇒ U=0 页 ⇒ 页错误 ⇒ 已提交写丢失）。
+    wire [3:0]  st_xlate_ctx_w = {d_eff_priv_w,
+                                  csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT],
+                                  csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]};
+    wire        st_xlate_valid_w;
+    wire [31:0] st_xlate_va_w;
+    wire [`BACK2_STQ_IDX_W-1:0] st_xlate_idx_w;
+    wire [3:0]  st_xlate_ctx_in_w;               // 请求携带的上下文（LSQ → 适配器）
+    wire        st_xlate_ready_w, st_xlate_done_w, st_xlate_fault_w;
+    wire [31:0] st_xlate_pa_w;
     wire        d_tlb_hit, d_tlb_perm_fault;
     wire [31:0] d_tlb_pa;
 
@@ -450,9 +487,11 @@ module core_top_2b (
         .clk(aclk), .rst_n(aresetn),
         // ---- 第一查询口 = 数据侧（4b-2b 接通；`AD_XLATE` 拍纯组合命中）----
         .lookup_valid(ad_st_q == AD_XLATE), .lookup_va(d_va_q), .lookup_asid(9'h0),
-        .lookup_acc(d_acc_w), .lookup_priv(d_eff_priv_w),
-        .lookup_sum(csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT]),
-        .lookup_mxr(csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]),
+        .lookup_acc(d_acc_w),
+        //   ★★ (b)：翻译事务用**随请求携带**的上下文（否则"当下"CSR 值会把 PA 判错）
+        .lookup_priv(d_stx_q ? d_stx_ctx_q[3:2] : d_eff_priv_w),
+        .lookup_sum (d_stx_q ? d_stx_ctx_q[1]   : csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT]),
+        .lookup_mxr (d_stx_q ? d_stx_ctx_q[0]   : csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]),
         .hit_o(d_tlb_hit), .perm_fault_o(d_tlb_perm_fault), .pa_o(d_tlb_pa),
         // ---- 第二查询口 = 取指（2A §5.2.2/§9.4.1 同法）----
         .lookup2_valid(tr_req_valid), .lookup2_va(tr_req_va), .lookup2_asid(9'h0),
@@ -482,9 +521,13 @@ module core_top_2b (
         //     数据侧在 `AD_TR` 期间占用；否则取指侧（且仅 S/U 模式）使用
         .req_valid(ptw_req_v_w),
         .req_va(ptw_req_va_w), .req_acc(d_ptw_want_w ? d_acc_w : 2'b00),
-        .req_priv(d_eff_priv_w),
-        .req_sum(d_ptw_want_w ? csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT] : 1'b0),
-        .req_mxr(d_ptw_want_w ? csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT] : 1'b0),
+        //   ★★ (b)：数据侧遍历用**随请求携带**的上下文（store 翻译事务取 `d_stx_ctx_q`，
+        //     load 取"当下"有效特权级 —— load 的翻译发生在执行期，语义即"当下"）
+        .req_priv(d_stx_q ? d_stx_ctx_q[3:2] : d_eff_priv_w),
+        .req_sum(d_ptw_want_w ? (d_stx_q ? d_stx_ctx_q[1]
+                                          : csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT]) : 1'b0),
+        .req_mxr(d_ptw_want_w ? (d_stx_q ? d_stx_ctx_q[0]
+                                          : csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]) : 1'b0),
         .satp(csr_satp_o),
         .req_ready(ptw_req_ready_w), .req_done(ptw_req_done), .pa_o(ptw_pa_out),
         .fault_o(ptw_fault), .fault_cause_o(ptw_fault_cause), .fault_tval_o(ptw_fault_tval),
@@ -762,7 +805,7 @@ module core_top_2b (
     //     成立 ⇒ **CDQ 已弹出该项**，而适配器被 kill ⇒ 该笔已提交写**从未落到 L1D**
     //     ⇒ 后续同地址 load 读到内存旧值 0（实测 p12 idx10/12/13）。
     //     `d_we_q` 在接管当拍尚未锁存 ⇒ 仅 `& ~d_we_q` 挡不住 ⇒ 必须再排除接管拍（`~d_start`）。
-    wire        d_kill_w = be_trp_flush & ~d_we_q & ~d_start;
+    wire        d_kill_w = be_trp_flush & ~d_we_q & ~d_start & ~d_stx_q;
     wire        d_idle     = (ad_st_q == AD_IDLE);
     //   ★★ p12 收口加固（实测波形抓出）：维护动作脉冲那一拍**不得再接管新请求**。
     //     若维护脉冲与"适配器接管一笔新访问"同拍，则该访问会在下一拍与 L1D 维护扫描
@@ -816,6 +859,18 @@ module core_top_2b (
     wire        pte_rd_go_w  = ((ad_st_q == AD_IDLE) | (ad_st_q == AD_TR)) &
                                ptw_pte_req_valid & l1d_idle &
                                ~((ad_st_q == AD_IDLE) & d_start);
+    //   ★★ (b)：**执行期 store 翻译请求的接受拍** —— 适配器空闲、且本拍没有更高优先的
+    //     工作（PTE 读服务在途遍历 > 访存请求（含排空）> 纯翻译）。
+    //     注意：不需要 `~d_stx_need_w` 之类分支 —— LSQ 只在"该 store 在 E1 拍被判定为
+    //     需要翻译"时才把项留在 `stq_pv=0` 并发出请求 ⇒ 收到请求就**必须真翻译**
+    //     （否则 MPRV/satp 中途变化会让 PA 退化成 VA）。
+    //     `~stx_done_q`：完成脉冲那一拍不再接受（避免同一请求被二次接受）。
+    wire        st_xlate_go_w = (ad_st_q == AD_IDLE) & st_xlate_valid_w &
+                                ~d_start & ~pte_rd_go_w & ~stx_done_q;
+    assign      st_xlate_ready_w = st_xlate_go_w;      // 接受拍（LSQ 据此锁存在途项）
+    assign      st_xlate_done_w  = stx_done_q;         // 完成脉冲（1 拍）
+    assign      st_xlate_pa_w    = stx_pa_q;           // 译后 PA
+    assign      st_xlate_fault_w = stx_flt_q;          // 翻译故障（本步兜底：作废不写）
     wire [31:0] d_rdata_w    = d_unc_q ? d_unc_rdata_w : l1d_cs_rdata;
     //   ★★ 4b-2b：**数据侧翻译故障**（TLB 权限错 / PTW 故障）⇒ 以"正常响应 + err=1"
     //     回一笔（tag 仍是该 load 的标签）⇒ LSQ 标 done+异常 ⇒ ROB 精确抛页错误。
@@ -823,7 +878,7 @@ module core_top_2b (
     wire        d_tlb_fault_cyc_w = (ad_st_q == AD_XLATE) & d_tlb_perm_fault;
     wire        d_ptw_fault_cyc_w = (ad_st_q == AD_TR) & ptw_req_done &
                                     ~ptw_owner_fetch_w & ptw_fault;
-    wire        d_rsp_err_w   = ~d_we_q & (d_tlb_fault_cyc_w | d_ptw_fault_cyc_w);
+    wire        d_rsp_err_w   = ~d_we_q & ~d_stx_q & (d_tlb_fault_cyc_w | d_ptw_fault_cyc_w);
     assign      d_rsp_v_w    = d_rsp_err_w |
                                ((ad_st_q == AD_WAIT) & ~d_we_q &
                                 (d_cp_q ? 1'b1 :
@@ -874,6 +929,10 @@ module core_top_2b (
             d_tag_q <= {`BACK2_MEM_TAG_W{1'b0}};
             m_tr_src_q <= 1'b1;             // 复位后 PTW 归取指侧（与旧行为一致）
         end else begin
+            //   ★★ (b)：纯翻译事务标志与完成脉冲的**默认值**（单拍脉冲，见各分支置位）
+            d_stx_q    <= 1'b0;
+            stx_done_q <= 1'b0;
+            stx_flt_q  <= 1'b0;
             //   ★ 4b-2b：PTW 归属 —— 请求被**接受**的那一拍记录归属（2A `m_tr_src_q` 同法）
             if (ptw_req_v_w & ptw_free_w) m_tr_src_q <= d_ptw_want_w ? 1'b0 : 1'b1;
             //   ★ 4b-2a：维护/陷阱/xRET 冲刷 ⇒ 放弃在途访问（看上面 `d_kill_w` 的说明）
@@ -893,26 +952,51 @@ module core_top_2b (
                         d_tag_q  <= lsu_req_tag;
                         if (d_xlat_need_w) begin
                             //   ★ 4b-2b：先做 VA→PA 翻译（`AD_XLATE` 拍 TLB 组合查询）
+                            //   ★★ (b)：此分支现在**只服务 load**（store 排空带 PA ⇒
+                            //     `d_xlat_need_w` 被 `~lsu_req_we` 关掉）
                             d_va_q  <= lsu_req_a;
                             ad_st_q <= AD_XLATE;
                         end else begin
+                            //   Bare，或 ★(b) **已提交 store 的排空**（`lsu_req_a` 已是 PA）
                             d_a_q   <= lsu_req_a;
                             d_va_q  <= lsu_req_a;   // Bare：VA==PA（cs_vaddr 的 index 段用）
                             d_unc_q <= d_unc_w;
                             d_cp_q  <= d_clint_plic;
                             ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
                         end
+                    end else if (st_xlate_go_w) begin
+                        //   ★★ (b)：**执行期 store 翻译事务**（纯翻译，不进 AD_REQ）——
+                        //     复用 `AD_XLATE/AD_TR` 两级 + 现有 PTW 串行复用/PTE 读通路，
+                        //     完成即回 `st_xlate_pa/done`（PA 由 LSQ 写回 STQ/CDQ）。
+                        d_va_q      <= st_xlate_va_w;
+                        d_stx_ctx_q <= st_xlate_ctx_in_w;
+                        d_stx_q     <= 1'b1;
+                        ad_st_q     <= AD_XLATE;
                     end
                 end
                 AD_XLATE: begin
                     //   TLB 口 1 当拍出结果（纯组合）
                     if (d_tlb_hit) begin
-                        d_a_q   <= d_tlb_pa;
-                        d_unc_q <= d_unc_w;             // 路由按 **PA** 重算
-                        d_cp_q  <= d_clint_plic;
-                        ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                        //   ★★ (b)：纯翻译事务 ⇒ 只回 PA，不进访存级
+                        if (d_stx_q) begin
+                            stx_pa_q   <= d_tlb_pa;
+                            stx_done_q <= 1'b1;
+                            ad_st_q    <= AD_IDLE;
+                        end else begin
+                            d_a_q   <= d_tlb_pa;
+                            d_unc_q <= d_unc_w;             // 路由按 **PA** 重算
+                            d_cp_q  <= d_clint_plic;
+                            ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                        end
                     end else if (d_tlb_perm_fault) begin
-                        ad_st_q <= AD_IDLE;             // 本拍已回"带错响应"（见 `d_rsp_err_w`）
+                        //   ★★ (b)：store 翻译权限错 ⇒ 回"故障"（LSQ 侧作废该项、不写、
+                        //     不悬挂）。store 页错误的**精确上报**（cause 15 + mtval + 独立
+                        //     用例）是紧随其后的另一步，本步不做（口径登记在报告）。
+                        if (d_stx_q) begin
+                            stx_flt_q  <= 1'b1;
+                            stx_done_q <= 1'b1;
+                        end
+                        ad_st_q <= AD_IDLE;             // load：本拍已回"带错响应"（见 `d_rsp_err_w`）
                     end else begin
                         ad_st_q <= AD_TR;               // 缺失 ⇒ 向 PTW 发请求
                     end
@@ -937,7 +1021,17 @@ module core_top_2b (
                         ad_st_q     <= AD_PTE;
                     end else if (ptw_req_done & ~ptw_owner_fetch_w) begin
                         if (ptw_fault) begin
-                            ad_st_q <= AD_IDLE;         // 本拍已回"带错响应"
+                            //   ★★ (b)：store 翻译遍历故障 ⇒ 回"故障"（作废不写；见 AD_XLATE）
+                            if (d_stx_q) begin
+                                stx_flt_q  <= 1'b1;
+                                stx_done_q <= 1'b1;
+                            end
+                            ad_st_q <= AD_IDLE;         // load：本拍已回"带错响应"
+                        end else if (d_stx_q) begin
+                            //   ★★ (b)：纯翻译事务完成 ⇒ 只回 PA，不进访存级
+                            stx_pa_q   <= ptw_pa_out;
+                            stx_done_q <= 1'b1;
+                            ad_st_q    <= AD_IDLE;
                         end else begin
                             d_a_q   <= ptw_pa_out;
                             d_unc_q <= d_unc_w;
@@ -1219,6 +1313,12 @@ module core_top_2b (
         .mem_req_ready_i(d_ready_w),
         .mem_rsp_valid_i(d_rsp_v_w), .mem_rsp_rdata_i(d_rsp_d_w),
         .mem_rsp_tag_i(d_rsp_tag_w),
+        //   ★★ (b) 执行期 store 翻译口（LSQ ↔ 本层数据适配器；§B4.24.9）
+        .st_xlate_en_i(st_xlate_en_w), .st_xlate_ctx_i(st_xlate_ctx_w),
+        .st_xlate_valid_o(st_xlate_valid_w), .st_xlate_va_o(st_xlate_va_w),
+        .st_xlate_idx_o(st_xlate_idx_w), .st_xlate_ctx_o(st_xlate_ctx_in_w),
+        .st_xlate_ready_i(st_xlate_ready_w), .st_xlate_done_i(st_xlate_done_w),
+        .st_xlate_pa_i(st_xlate_pa_w), .st_xlate_fault_i(st_xlate_fault_w),
         .commit_valid_o(commit_valid), .commit_pc_o(commit_pc),
         .commit_arch_rd_o(commit_arch_rd), .commit_arch_rd_wdata_o(commit_arch_rd_wdata),
         .commit_arch_we_o(commit_arch_we),

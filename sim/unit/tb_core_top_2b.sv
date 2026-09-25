@@ -57,6 +57,10 @@ module tb_core_top_2b #(
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
+    reg [3:0] maint_must_push;      // ★★ (b) 硬断言用：本拍"必须入队"的更老 store lane 掩码
+    reg       maint_push_chk_q;     //    入队落地核对（延后 1 拍）
+    reg [2:0] maint_tail_chk_q;     //    该拍的 CDQ 尾指针
+    reg [2:0] maint_pushn_chk_q;    //    该拍应入队的笔数
 
     integer n_checks;
     task automatic chk(input cond, input string msg);
@@ -178,6 +182,16 @@ module tb_core_top_2b #(
     //   ★ 4b-1b：中断判定归 `trap_ctrl` ⇒ 监视 `trap_valid & trap_is_int`
     wire irq_live_w = u_dut.tc_trap_valid & u_dut.tc_trap_is_int;
     integer n_maint_cmt, n_l1i_inval, n_l1d_inval, n_l1d_clean, n_tlb_sfence;
+    //   ★★ (b) 硬断言计数器（报告 §B4.25）：维护冲刷拍"同组更老 store 完成 CDQ 入队"
+    //     · 判据口径（与 §B4.24.7 探针的 `[st]` 组合同源）：
+    //       该拍 `be_trp_flush=1` 且维护 lane 掩码有效（`|maint_lane_oh`，探针里即
+    //       `hold=1100` 形态）；凡 **未被维护掩码挡住**（`~cmt_hold_w`）且**已在提交
+    //       前缀链内**（`cmt_st_drain`）的 store，**必须**当拍完成入队（`dr_take`）。
+    //     · 反证（必须 FAIL）：把 `backend_top` 的入队许可临时恢复为旧式
+    //       `cmt_st_drain & cmt_ok & ~cmt_hold_w`（`cmt_ok` 在冲刷拍为 0）⇒ 本断言立即红。
+    integer n_maint_flush_cyc, n_maint_st_push;
+    initial begin n_maint_flush_cyc = 0; n_maint_st_push = 0;
+                  maint_push_chk_q = 1'b0; maint_tail_chk_q = 3'h0; maint_pushn_chk_q = 3'h0; end
     integer k1_tick; initial k1_tick = 0;
     always @(posedge clk) if (rst_n) begin
         if (u_dut.maint_cmt_w)        n_maint_cmt  <= n_maint_cmt  + 1;
@@ -185,6 +199,37 @@ module tb_core_top_2b #(
         if (u_dut.maint_l1d_inval_w)  n_l1d_inval  <= n_l1d_inval  + 1;
         if (u_dut.maint_l1d_clean_w)  n_l1d_clean  <= n_l1d_clean  + 1;
         if (u_dut.maint_tlb_sfence_w) n_tlb_sfence <= n_tlb_sfence + 1;
+        //   ★★ (b) 硬断言：维护冲刷拍，同组更老 store 必须完成 CDQ 入队（见上方计数器注）
+        //     两级判定（缺一不可）：
+        //       ① **组合许可**：`dr_take` 必须覆盖"必须入队"的 lane（抓"入队许可被冲刷门抹掉"）；
+        //       ② **入队落地**：CDQ 写指针（`cdq_tail`）必须真的前进 —— 抓"许可为 1 但整机
+        //          冲刷分支把入队语句整段跳过"（本段实测的真实形态：`take=1` 而 `cnt/tail` 不动）。
+        //          用"尾指针至少前进 push_n"（模 8 比较）⇒ 容忍下拍又有新入队，不容忍被吞。
+        if (u_dut.be_trp_flush && (|u_dut.u_back.maint_lane_oh)) begin
+            maint_must_push = u_dut.u_back.cmt_st_drain & ~u_dut.u_back.cmt_hold_w;
+            n_maint_flush_cyc <= n_maint_flush_cyc + 1;
+            if (maint_must_push != 4'h0) begin
+                if ((maint_must_push & ~u_dut.u_back.u_lsu.dr_take) != 4'h0) begin
+                    $display("FAIL: [硬断言] 维护冲刷拍同组更老 store 未获 CDQ 入队许可：st_drain=%b hold=%b drv=%b take=%b",
+                             u_dut.u_back.cmt_st_drain, u_dut.u_back.cmt_hold_w,
+                             u_dut.u_back.lsu_dr_valid, u_dut.u_back.u_lsu.dr_take);
+                    $fatal(1, "TB_CORE_TOP_2B 判据不满足");
+                end else begin
+                    maint_push_chk_q  <= 1'b1;
+                    maint_tail_chk_q  <= u_dut.u_back.u_lsu.cdq_tail;
+                    maint_pushn_chk_q <= u_dut.u_back.u_lsu.dr_push_n[2:0];
+                end
+            end
+        end else if (maint_push_chk_q) begin
+            maint_push_chk_q <= 1'b0;
+            if (((u_dut.u_back.u_lsu.cdq_tail - maint_tail_chk_q) & 3'h7) < maint_pushn_chk_q) begin
+                $display("FAIL: [硬断言] 维护冲刷拍同组更老 store 的 CDQ 入队**未落地**（尾指针未前进）：tail %0d→%0d，应至少 +%0d",
+                         maint_tail_chk_q, u_dut.u_back.u_lsu.cdq_tail, maint_pushn_chk_q);
+                $fatal(1, "TB_CORE_TOP_2B 判据不满足");
+            end else begin
+                n_maint_st_push <= n_maint_st_push + 1;
+            end
+        end
         k1_tick <= k1_tick + 1;
         //   ★ [诊断，默认关] p12：适配器/L1D 维护/冲刷事件逐拍（定位维护与 store 排空的交叠）
         if (DBG_P12 && (cur_p == 11) && (k1_tick > 3000) &&
@@ -677,8 +722,19 @@ module tb_core_top_2b #(
                     chk(((crk & 8) == 8), "C13'-10 p13：关 MPRV 直读 PA 与译后 store 一致（0xDEADBEEF）");
                     chk(((crk & 16) == 16), "C13'-11 p13：PTE 回读 = 重映射后的新 PTE 0x2000_98C7（A/D 置位保持；PTE 读经 L1D 的直接证据）");
                     chk(((crk & 32) == 32), "C13'-12 p13：陷阱精确返回后继续执行（a0 = 1）");
+                    //   ============ C14'：(b) 硬断言（维护冲刷拍的同组更老 store 入队）============
+                    //   本项**独立于 C13' 的 12 项**（不动既有判据口径/编号），专测"同组更老
+                    //   store 漏排空"缺陷的最后一环：p13 的 PTE 更新 store 与 `sfence.vma`
+                    //   **同组提交**，提交拍 `be_trp_flush=1` ⇒ 旧实现该拍的入队被整机冲刷
+                    //   分支吞掉（`take` 组合为 1 但 CDQ 计数不动）⇒ 已提交写丢失。
+                    //   反证：临时恢复旧式许可（`& cmt_ok`）⇒ 本项必 FAIL（日志留证）。
+                    chk(n_maint_st_push >= 1,
+                        $sformatf("C14' p13：**维护冲刷拍同组更老 store 完成 CDQ 入队**（(b) 硬断言；实测 %0d 次 / 维护冲刷拍 %0d 拍）",
+                                  n_maint_st_push, n_maint_flush_cyc));
                     $display("   [C13'] Sv32：12 项全过（维护计数 maint=%0d tlb_sfence=%0d；PTE 回读 = 重映射后新 PTE 0x2000_98C7）",
                              n_maint_cmt, n_tlb_sfence);
+                    $display("   [C14'] (b) 硬断言：维护冲刷拍同组更老 store 完成 CDQ 入队 = %0d 次（维护冲刷拍 %0d 拍，`hold` 掩码有效）",
+                             n_maint_st_push, n_maint_flush_cyc);
                     $fflush();
                 end
 

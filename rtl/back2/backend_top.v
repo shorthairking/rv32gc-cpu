@@ -113,6 +113,20 @@ module backend_top #(
     input  wire        mem_rsp_valid_i,
     input  wire [31:0] mem_rsp_rdata_i,
     input  wire [`BACK2_MEM_TAG_W-1:0] mem_rsp_tag_i,
+    // ---- ★★ (b) 执行期 store 地址翻译口（LSQ ↔ 顶层适配器；§B4.24.9 透传）----
+    //   本层只做**透传**（LSQ 在 `u_lsu`，适配器在 `core_top_2b`）：
+    //   · `_i` 方向 = 顶层 → LSQ；`_o` 方向 = LSQ → 顶层
+    //   · 「排空不翻译」的判据在顶层（`d_xlat_need_w &= ~lsu_req_we`），本层不参与
+    input  wire        st_xlate_en_i,        // 本拍（E1/提交拍）该 store 需要翻译（顶层口径）
+    input  wire [3:0]  st_xlate_ctx_i,       // 翻译上下文 {priv[1:0], SUM, MXR}（顶层口径）
+    output wire        st_xlate_valid_o,     // 翻译请求（保持到 done）
+    output wire [31:0] st_xlate_va_o,        // 该 store 的 VA
+    output wire [`BACK2_STQ_IDX_W-1:0] st_xlate_idx_o,   // 目标下标（STQ 槽 / CDQ 项）
+    output wire [3:0]  st_xlate_ctx_o,       // 该请求的翻译上下文（随请求携带）
+    input  wire        st_xlate_ready_i,     // 适配器接受拍
+    input  wire        st_xlate_done_i,      // 完成脉冲
+    input  wire [31:0] st_xlate_pa_i,        // 译后 PA
+    input  wire        st_xlate_fault_i,     // 翻译故障（本步兜底：作废不写）
     // ---- 提交流（锁步比对）----
     output wire [3:0]  commit_valid_o,
     output wire [127:0] commit_pc_o,
@@ -1256,6 +1270,12 @@ module backend_top #(
         .mem_req_ready(mem_req_ready_i),
         .mem_rsp_valid(mem_rsp_valid_i), .mem_rsp_rdata(mem_rsp_rdata_i),
         .mem_rsp_tag(mem_rsp_tag_i), .mem_rsp_err(mem_rsp_err_i),
+        //   ★★ (b)：执行期 store 翻译口（透传到 `core_top_2b` 的数据适配器）
+        .st_xlate_en(st_xlate_en_i), .st_xlate_ctx(st_xlate_ctx_i),
+        .st_xlate_valid(st_xlate_valid_o), .st_xlate_va(st_xlate_va_o),
+        .st_xlate_idx(st_xlate_idx_o), .st_xlate_ctx_o(st_xlate_ctx_o),
+        .st_xlate_ready(st_xlate_ready_i), .st_xlate_done(st_xlate_done_i),
+        .st_xlate_pa(st_xlate_pa_i), .st_xlate_fault(st_xlate_fault_i),
         .exc_valid_o(lsu_exc_v), .exc_rob_o(lsu_exc_rob),
         .exc_cause_o(lsu_exc_cause), .exc_tval_o(lsu_exc_tval),
         .wb_valid(lsu_wb_v), .wb_rob(lsu_wb_rob), .wb_epoch(lsu_wb_ep),

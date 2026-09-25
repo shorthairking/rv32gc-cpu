@@ -4148,3 +4148,112 @@ t=13625 ... mact=1                                            ← 维护动作�
 **结论**：本轮**未改动 RTL**（预算不足以"实现+验证"闭环，且半成品接口会让整设计不可编译 ⇒
 违反"停在整设计可编译+既有判据全绿"约束）。检查点保持：
 `tb_core_top_2b` **121/121 PASS**、`regress.sh` **32/32 PASS**（本会话实测日志见 §B4.24.8）。
+
+---
+
+# B4.25 (b) 排空 PA 化：施工落地 + **根因修正**（2B-4 第 4b-2c 段收口）
+
+> 起点 = 母代理已验收提交 `ed02587`（§B4.24.9 设计落档）。
+> **结论：缺陷已修，p13 的 6 条 `nop` 规避已删除**（恢复"PTE 更新 store 紧跟 `sfence.vma`"原始形态）。
+> 检查点：`tb_core_top_2b` **122/122 PASS**（121 + 新增硬断言 1 项，未回退）、
+> `regress.sh` 见 §B4.25.6；2A 零修改；未提交 git；快照 `../.b2chk/*.s40` 与 `*.good`。
+
+## B4.25.1 根因修正：**不是"排空期在途翻译被维护脉冲 kill"，而是两处独立缺陷叠加**
+
+§B4.24.8 的定案（"维护脉冲把在途翻译 kill 掉"）**与实测不符**。本轮用 PTW 内部探针
+（`st / pte_q / leaf_ok / perm_granted / acc_r / priv_r`，一次性诊断，收工已删）逐拍定位，定案为：
+
+| # | 缺陷 | 证据（本会话实测） |
+|---|---|---|
+| **①** | **翻译上下文取错时刻**：一次 store 翻译的正确性取决于 `{有效特权级, SUM, MXR}`，而本核 CSR **只在提交点更新**。旧形态在**排空拍**取值 ⇒ 偏新（更年轻的 `csrw mstatus` 已提交）；照 §B4.24.9 在 **E1 拍**取值 ⇒ 偏旧（更老的 `csrw` 尚未提交）。p13 的 PTE 更新 store（VA `0x80027000`）两处都错：E1 时 `MPRV` 已被更年轻的写重新置 1、`MPP` 因 `mret` 变 U ⇒ 按 **U 模式**翻译 U=0 的页 ⇒ **页错误** ⇒ 已提交写被静默丢弃。 | PTW 探针：`mstatus=0x00020080`（`MPRV=1, MPP=00=U`）、`priv_r=00`、`perm_granted=0`、`fault_cause=13`；而**并非** `kill`（`ptw_kill_w=0`、`d_kill_w=0`：`d_we_q=1` 早已置位）。 |
+| **②** | **CDQ 入队被"整机冲刷分支"整段吞掉**：`lsq_simple` 的时序块是 `if (!rst_n) … else if (flush_all) … else <正常更新>`，而**入队语句只在正常分支里**。当提交拍恰好与维护冲刷同拍（p13：PTE 更新 store 与 `sfence.vma` **同组提交**），`flush_all=1` ⇒ 入队语句根本不执行 ⇒ **许可组合为 1、CDQ 计数/尾指针不动**（已提交写丢失）。 | `[st]`/`[dr]` 探针：`t=13512 st_drain=0001 drv=0001 take=0001 hold=1100 flush=1` → `t=13513 cdq(cnt=0 h=7 t=7)`（`cnt` 未变）。**§B4.24.7 把该现象读成"入队已正常"是误判**——当时只看组合信号，未核对 CDQ 寄存器态。 |
+
+**顺带修正 §B4.24.2 的口径**：`lsu_dr_valid` 的 `& cmt_ok` 项在该拍**并不抑制**入队——
+`cmt_ok = ~squash & (~flush_all | ((xret_cmt_o|maint_cmt_o) & trp_flush_v_i))`
+而维护提交拍 `maint_cmt_o=1 & trp_flush_v_i=1` ⇒ `cmt_ok=1`。**反证 B**（临时恢复 `& cmt_ok`）
+实测 **122/122 仍 PASS** ⇒ 该式在该场景**不是**抑制点（它仍是正确的收紧，保留）。
+
+## B4.25.2 实现（五条简化照做 + 两处必要修正）
+
+* **stq_a 保持 VA**；新增 `stq_pa/stq_pv/stq_ctx`（E1 预翻译结果 + 其上下文）与
+  `cdq_pa/cdq_pv/cdq_bad/cdq_ctx`（提交拍口径 + 排空自足）✓ 简化 ①/④。
+* **排空不翻译**：`d_xlat_need_w = sv32_en & d_xlate_on_w & ~lsu_req_we`（一行）——
+  到适配器的 store 必是已提交排空、地址已是 PA ⇒ 整级跳过 `AD_XLATE/AD_TR` ✓ 简化 ②。
+* **E1 搭 `st_done_valid` 拍发 `st_xlate_valid`** ✓ 简化 ③；该请求**未当拍被接受即放弃**
+  （一次性预翻译，只作加速）。
+* **提交拍（CDQ 入队）权威判定**（本轮新增，修根因 ①）：
+  `cdq_pa <= st_xlate_en ? stq_pa : stq_a`、`cdq_pv <= ~st_xlate_en | (stq_pv & (stq_ctx==ctx))`
+  ⇒ 提交序上下文说"无需翻译"时**无条件** PA=VA（覆盖预翻译）；需要翻译而预翻译不可用/上下文不一致
+  ⇒ `cdq_pv=0`，由 **CDQ 扫描**用入队时锁存的 `cdq_ctx` 重译（**排空不悬挂**的活性保证）。
+* **翻译上下文随请求携带**（本轮新增，修根因 ①）：端口 `st_xlate_ctx_i/o`（4 bit =
+  `{priv[1:0], SUM, MXR}`），适配器在接受拍锁存 `d_stx_ctx_q`，**TLB 查询口与 PTW 请求**都用它
+  （而不是"当下"CSR 值）；`d_acc_w` 对翻译事务恒按 **store** 查权限。
+* **兜底**：`dr_fire = dr_any & mem_req_ready & (dr_ok | dr_bad)`（PA 未定 ⇒ **该拍不排空**）；
+  `dr_issue = … & dr_ok`（真发写）⇒ 地址恒取 `cdq_pa` ✓ 简化 ⑤。
+  翻译故障只由 **CDQ 源**置 `cdq_bad`（提交拍口径可信）⇒ 该笔**只弹出、不写、不悬挂**；
+  store 页错误的**精确上报**（cause 15 + mtval + 独立用例）仍属另一步（未做，口径登记）。
+* **修根因 ②**：`flush_all` 分支内**照做 CDQ 入队**（拷贝读本拍仍有效的 STQ 寄存器态），
+  再做原有的 STQ/LQ 清理；该分支不推进出队（下拍照常，代价 ≤1 拍）。
+* `d_kill_w` 增加 `& ~d_stx_q`、`d_rsp_err_w` 增加 `& ~d_stx_q`：**纯翻译事务**不受整机冲刷
+  中止、也不产生"带错响应"（它不是访存；否则会给 LSQ 回一笔 tag 不明的错误响应）。
+* **新增口的悬空净化（必做，实测抓到）**：`lsq_simple` 被多处 TB **直接驱动**例化
+  （`tb_back2_lsq_fwd` 直接例化；`tb_back2_lockstep` 经 `backend_top`），本段**不改**这些 TB
+  ⇒ 新口悬空为 **z** ⇒ `~st_xlate_en` / `ready` / `done` 参与的条件成 x ⇒ 排空门
+  `cdq_pv|cdq_bad` 变 x ⇒ 整核挂死。首次全量回归实测：**31/32**（`tb_back2_lockstep`
+  C3 "程序 0 提交条数 ≥ 黄金条数" 红）。修法（与既有 `mem_rsp_err` 同一教训与口径）：
+  新输入一律 `=== 1'b1` 净化（`stx_en_w/stx_ready_w/stx_dn_w/stx_flt_w`），
+  **只有明确的 1 才算"需要翻译/接受/完成/故障"**，z/x/0 ⇒ 等价于"Bare、无翻译请求"
+  （与新增端口前的行为逐拍一致）✓ 复跑 32/32。
+
+## B4.25.3 判据（母代理任务书 0–4 逐条）
+
+| # | 判据 | 实测 |
+|---|---|---|
+| 0 | 基线编译 0 error + `TB_CORE_TOP_2B: PASS`（121 项） | ✔（`../.b2chk/base121.log`，改动前实测） |
+| 1 | 五条简化落地（+2 处修正） | ✔ 见 §B4.25.2；文件 = `lsq_simple.v` / `backend_top.v` / `core_top_2b.v` |
+| 2 | **去 p13 的 6 条 `nop`** 后 PASS、C13' 12 项全过、总检查项不回退 | ✔ `TB_CORE_TOP_2B: PASS`、`[C13'] Sv32：12 项全过（maint=2 tlb_sfence=2）`、**122 项**（121 + 新增 1） |
+| 3 | 新增硬断言（维护冲刷拍同组更老 store 完成 CDQ 入队）+ 反证 | ✔ TB **C14'**；反证 A 见 §B4.25.4 |
+| 4 | `./scripts/regress.sh` 32/32 | ✔ 见 §B4.25.6 |
+
+**硬断言形态（TB `C14'`，两级判定）**：维护冲刷拍（`be_trp_flush & |maint_lane_oh`）内
+① `dr_take` 必须覆盖 `cmt_st_drain & ~cmt_hold_w`（组合许可）；
+② **CDQ 尾指针必须真的前进**（`((cdq_tail' - cdq_tail) & 7) >= dr_push_n`）——
+第 ② 条正是抓根因 ② 的形态（许可为 1 但入队被吞）。
+实测：`[C14'] … = 1 次（维护冲刷拍 5 拍）`，即 `st_drain=0001 & drv=0001 & take=0001 & hold=1100`
+那一拍（t=13512）**确实入队落地**。
+
+## B4.25.4 反证（两份，日志留证）
+
+* **反证 A（真实抑制点，必红）**：临时撤掉 `flush_all` 分支里的入队 ⇒
+  `FAIL: [硬断言] 维护冲刷拍同组更老 store 的 CDQ 入队**未落地**（尾指针未前进）：tail 7→7，应至少 +1`
+  （`../.b2chk/counterproofA.log`，退出码 1）⇒ 断言**确实**检测该缺陷 ✓ 已还原。
+* **反证 B（口径修正，记录用）**：临时恢复旧式许可 `lsu_dr_valid = cmt_st_drain & cmt_ok & ~cmt_hold_w`
+  ⇒ **122/122 PASS**（`../.b2chk/counterproofB.log`）——与 §B4.24.2/§B4.24.7 的推断相反，
+  该拍 `cmt_ok=1`，故它不是本残留的抑制点（真实抑制点在 `lsq_simple` 的冲刷分支）✓ 已还原。
+
+## B4.25.5 与 §B4.24.9 设计表的差异（逐条说明，均为"修根因必需"）
+
+| 项 | §B4.24.9 设计 | 实际落地 | 理由 |
+|---|---|---|---|
+| 端口数 | 7（`st_xlate_valid/va/idx` + `ready/done/pa/fault`） | **10**（+`st_xlate_en`、+`st_xlate_ctx` 入、+`st_xlate_ctx_o` 出） | `st_xlate_en`：E1/提交拍"是否需要翻译"的判据必须由顶层给；`ctx`：**翻译上下文必须随请求携带**，否则遍历/权限用"当下"CSR 值 ⇒ PA 不可信（根因 ①） |
+| 翻译时机 | 仅 E1 拍 | E1 **预翻译**（一次性）+ **提交拍权威判定**（+CDQ 扫描兜底） | 只有提交拍与"该 store 的程序序时刻"一致（CSR 按序提交）；E1/排空拍都会取错上下文（根因 ①） |
+| `dr_fire` 门 | `stq_pv[dr_sel]` | `cdq_pv[cdq_head] \| cdq_bad[cdq_head]`（`dr_issue` 才真写） | CDQ 项必须**自足**：`flush_all` 会清 STQ 并复用槽号 ⇒ 排空口读 STQ 字段会被"新占用者"污染；`cdq_bad` 保证故障项**不悬挂** |
+| `stq_bad` | （未列） | **取消**（故障只由 CDQ 源置 `cdq_bad`） | E1 预翻译上下文可能偏旧 ⇒ 其故障**不可信**，不得据此作废已提交写 |
+| 入队 | 沿用既有 | `flush_all` 分支内**也做入队** | 根因 ②（同组更老 store 被整机冲刷分支吞掉） |
+
+## B4.25.6 检查点（本会话实测）
+
+* 编译 **0 error**（命令见任务书判据 0；仅既有的 `-Wall` 信息性告警）。
+* `tb_core_top_2b` **122/122 PASS**：`../.b2chk/final_122.log`
+  （`[C13'] Sv32：12 项全过（maint=2 tlb_sfence=2）` + `[C14'] … = 1 次` +
+  `检查项合计 122 项全部满足` + `TB_CORE_TOP_2B: PASS`）。
+* `./scripts/regress.sh` **32/32 PASS**：`../.b2chk/regress_b2c11.log`
+  （`== regress.sh：总数=32 运行=32 通过=32 跳过=0 失败=0` + `REGRESS: 32/32 PASS`）。
+  ★ 首次跑为 **31/32**（`tb_back2_lockstep`）——根因与修法见 §B4.25.2 的"悬空净化"条目，
+  净化后复跑全绿（`../.b2chk/regress_b2c10.log` 为红、`…b2c11.log` 为绿，两份均留）。
+* p13 的 6 条 `nop` **已删除**（`sim/unit/prog/back2_p13_sv32.S`），映像经
+  `gen_back2_lockstep_data.py` 重生成（差异恰为 6 条 `nop` 与随之位移的地址常量）。
+* 2A 零修改；未提交 git；快照 `../.b2chk/{lsq_simple.v,backend_top.v,core_top_2b.v,tb_core_top_2b.sv,back2_p13_sv32.S,back2_report.md}.s40`
+  与 `../.b2chk/*.good`（反证前后还原用）。
+* **下一步（登记）**：①store 页错误精确化（cause 15 + mtval=VA + 独立小用例；本步已具备
+  `cdq_bad` 钩子与 `st_xlate_fault` 通路）；②L1D 维护写回 + `cbo.flush` INVAL；③L1I 侧 PIPT 复核。
