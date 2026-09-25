@@ -53,7 +53,7 @@ module tb_core_top_2b #(
     //   p12（cbo 数据安全）诊断开关（默认关；定位"维护后 load 读到旧值"时置 1）
     localparam integer DBG_P12 = 0;
     //   p13（Sv32 数据侧翻译）诊断开关（默认关）
-    localparam integer DBG_P13 = 0;
+    localparam integer DBG_P13 = 1;
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
@@ -214,6 +214,15 @@ module tb_core_top_2b #(
             $display("   [tlbflush] t=%0d sfence=1 fill_valid=%b fill_va=0x%08x fill_ppn=0x%06x | hit=%0d miss=%0d flush=%0d",
                      k1_tick, u_dut.ptw_fill_valid, u_dut.ptw_fill_va, u_dut.ptw_fill_ppn,
                      u_dut.u_tlb.hit_cnt, u_dut.u_tlb.miss_cnt, u_dut.u_tlb.flush_cnt);
+        //   ★★ B4.24.5 探针：维护冲刷窗口内的**排空握手 / CDQ 记账 / 排空期翻译**
+        if (DBG_P13 && (cur_p == 12) && (k1_tick > 12000) && (k1_tick < 14200) &&
+            (u_dut.be_trp_flush | u_dut.u_back.u_lsu.dr_any))
+            $display("   [dr] t=%0d flush=%b mact=%b dr_any=%b rdy=%b cdq(cnt=%0d h=%0d t=%0d) | ad=%0d need=%b va=0x%08x done=%b flt=%b own=%b",
+                     k1_tick, u_dut.be_trp_flush, u_dut.maint_act_q,
+                     u_dut.u_back.u_lsu.dr_any, u_dut.u_back.u_lsu.mem_req_ready,
+                     u_dut.u_back.u_lsu.cdq_cnt, u_dut.u_back.u_lsu.cdq_head, u_dut.u_back.u_lsu.cdq_tail,
+                     u_dut.ad_st_q, u_dut.d_xlat_need_w, u_dut.d_va_q,
+                     u_dut.ptw_req_done, u_dut.ptw_fault, u_dut.m_tr_src_q);
         if (DBG_K1 && (cur_p == 10) && ((k1_tick % 1000) == 0) && (k1_tick > 3000))
             $display("   [k1i] plo=%b phi=%b pgn=%b npv=%b bufcnt=%0d grpm=%b m3=%b term=%b xip=%b | pva0=0x%08x pva1=0x%08x nva=0x%08x rsp=%b f4v=%b",
                      u_dut.u_front.u_ifetch4.push_lo_ok, u_dut.u_front.u_ifetch4.push_hi_ok,

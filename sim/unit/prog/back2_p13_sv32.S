@@ -104,11 +104,12 @@ _start:
     slli  t1, t1, 10
     ori   t1, t1, 0xC7
     sw    t1, 0(s1)                 /* l1[0] → root 页 */
-    /*   ★ 4b-2c(3/3) 规避（**RTL 根因已收窄，待修**）：PTE 更新 store 与紧随的
-     *     `sfence.vma` 相邻时，该 store **已提交但从未进入 CDQ**（适配器侧看不到该笔）。
-     *     已排除的抑制点：`cmt_ok`/`~squash_v_w`/`cmt_hold_w`（已把排空入队改为
-     *     `cmt_st_drain & ~cmt_hold_w`，仍需规避）⇒ 丢失发生在 `lsu_dr_valid` **之后**
-     *     （CDQ 入队/记账路径）。下一步探针与候选见报告 §B4.24。 */
+    /*   ★ 规避（RTL 根因已用探针收窄，待修）：PTE 更新 store 与紧随的 `sfence.vma` 相邻时
+     *     **该 store 从未进入 CDQ**（探针实证：t≈1350x-1362x 区间 `dr_any` 恒 0、`cdq_cnt` 恒 0），
+     *     而维护提交拍 t=13625 前后出现一笔"被 kill 的译后访问"（`ad=5 → ad=0`）。
+     *     已排除：入队许可（已去 `cmt_ok`）、CDQ 指针/记账逻辑、`ptw_kill_w`（已改为只打断取指侧）。
+     *     下一步：打印 `cmt_st_drain/lsu_dr_valid/dr_take` 与 `stq_ret/stq_head_q` 判定
+     *     "提交拍是否真的产生了 `cmt_st_drain`"（即该 store 是否在 ROB 的提交前缀链里）。 */
     nop; nop; nop; nop; nop; nop
     sfence.vma                      /* TLB 全失效（单地址空间口径，§B4.9.4） */
     li    t1, 0x00020800

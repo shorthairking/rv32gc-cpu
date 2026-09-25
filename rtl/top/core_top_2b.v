@@ -414,6 +414,15 @@ module core_top_2b (
     //     不再回 PTE 响应，PTW 会永远停在 S_L1_W/S_L0_W（`req_ready` 恒 0 ⇒ 全网挂死）。
     //     2A `m_kill_fsm = trap_valid | xret_redirect | fencei_hold | sfence_sync_pending`
     //     同口径（core_top.v:1793-1796）。
+    //   ★★ 4b-2c(4/4) 定案修复（探针证据：[dr] t=13623 `ad=5 need=1 va=0x80027000`
+    //     ⇒ 已提交 store 的排空正在**翻译**；t=13625 维护动作脉冲 `mact=1` 把该遍历 kill 掉
+    //     ⇒ 适配器随即回 IDLE、CDQ 已空 ⇒ **该笔已提交写被丢弃**、PTE 仍是旧值）。
+    //     口径：**整机冲刷只打断"取指侧"的在途遍历**——取指是推测、冲掉后自动重发；
+    //     而**数据侧的遍历服务于已提交的 store 排空**，kill 掉即丢已提交写（架构可见性破坏）。
+    //     数据侧遍历在 `AD_TR` 是电平保持，会自然走到 `req_done`；维护流程不依赖它结束。
+    //   ★ 实测（本段）：把整机冲刷的 kill 限定为"仅取指侧"反而使 p13 的
+    //     `nop` 形态从绿转红（数据侧在途遍历跨过 flush 完成 ⇒ 旧翻译被回填）
+    //     ⇒ **撤回**该尝试，保持与已验收提交一致的 `| be_trp_flush` 口径。
     wire        ptw_kill_w   = (d_ptw_want_w & ~ptw_free_w & ptw_owner_fetch_w) |
                                be_trp_flush;
     //   ★★ 4b-2c 定案（一步判定实验结论）：**冲刷前启动的遍历不得回填 TLB**。

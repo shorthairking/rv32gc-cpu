@@ -4061,3 +4061,24 @@ assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
   | **(B) 排空期翻译挂起**：`MPRV=1` ⇒ store 排空走 `AD_XLATE/AD_TR`，而 `ptw_kill_w |= be_trp_flush` 打断其遍历 | `ad=4/5`、`need=1`、`done=0` 且 `cdq_cnt` 不增（store 栏位被占住） | ①`ptw_kill_w` 只打断**取指侧**遍历（数据侧在 `AD_TR` 电平保持、可自恢复），或②CDQ 项携带**已定址 PA**（提交前定址）⇒ 排空不再翻译（与 §B4.20.3 的 "PA 入 STQ/CDQ" 同一改动） |
 * **建议**：若为 (B)，②与"store page fault 精确化"（§B4.20.3）是**同一处改动**，一次做完更省；
   若为 (A)，改动只在 `core_top_2b` 的 `d_ready_w`/`mem_req_ready` 拆分（约 3 行）。
+### B4.24.6 探针实测（本轮）：排空握手与 CDQ 记账数据 + (B) 修法尝试结果
+
+* **探针（`[dr]`，DBG_P13 门控）关键窗口**（无 nop 形态）：
+  ```
+  t=13513 flush=1 mact=1 dr_any=0 rdy=0 cdq(cnt=0 h=7 t=7) | ad=0 need=0 va=0x80027100   ← 第 1 次 sfence 动作脉冲
+  t=13623 flush=1 mact=0 dr_any=0 rdy=0 cdq(cnt=0 h=7 t=7) | ad=5 need=1 va=0x80027000   ← 一笔"译后访问"在途
+  t=13624 flush=1 mact=0 dr_any=0 rdy=1 cdq(cnt=0 h=7 t=7) | ad=0 need=1 va=0x80027000   ← 该笔被 kill（ad→0）
+  t=13625 flush=1 mact=1 dr_any=0 rdy=0 cdq(cnt=0 h=7 t=7) | ad=0 need=1 va=0x80027000   ← 第 2 次 sfence 动作脉冲
+  ```
+* **两条硬结论**：①**PTE 更新 store 从未进入 CDQ**——t≈13100 之后 `dr_any` 恒 0、`cdq_cnt` 恒 0
+  （入队许可已去 `cmt_ok`、指针/记账逻辑已复核无缺陷）⇒ 需再探"提交拍是否真产生 `cmt_st_drain`"
+  （即该 store 是否在 ROB 提交前缀链里）：打印 `cmt_st_drain/lsu_dr_valid/dr_take`；
+  ②维护动作脉冲（`mact=1`）前后确有"被 kill 的译后访问"（`ad=5 → ad=0`），与旧存疑吻合。
+* **本段修法尝试（已撤回）**：把 `ptw_kill_w` 的整机冲刷项限定为"仅取指侧"（`& ptw_owner_fetch_w`）
+  —— 实测**使 `nop` 形态从绿转红**（数据侧在途遍历跨过 flush 完成 ⇒ 旧翻译被回填）
+  ⇒ 已按 `git` 口径撤回，RTL 恢复与已验收提交 `367d963` 一致。
+* **检查点**：`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121d.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_4b2c7.log`）；p13 仍带 6 条 `nop` 规避（判据未放宽）。
+* **下一步（唯一）**：打印提交拍 `cmt_st_drain/lsu_dr_valid/dr_take/dr_idx` + ROB `cmt_chain`
+  ⇒ 判定"该 store 是否在提交前缀链里"（若不在，问题在 `slot_ok/slot_st_ok` 与维护 lane 的
+  同组判定；若在，则回到 `dr_take` 与 `cdq_wp` 的同拍写入）。
