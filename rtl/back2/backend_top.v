@@ -134,11 +134,24 @@ module backend_top #(
     input  wire [31:0] trp_redirect_pc_i,
     output wire        trp_halt_o,
     output wire        xret_cmt_o,
-    //   ★ 中断：CLINT MTIP 进 mip.MTIP；`irq_mti_w` = 本拍允许取 MTI（顶层据此重定向）
-    input  wire        mtip_i,
-    output wire        irq_mti_o,
-    output wire [31:0] mtvec_o,
-    output wire [31:0] mepc_o,
+    //--------------------------------------------------------------------------
+    //   ★★ 2B-4 第 4b-1a 段：**CSR 文件搬到顶层**（行为等价重构，判据必须 79/79 不变）
+    //--------------------------------------------------------------------------
+    //   本模块从此只保留三类 CSR 接口（不再内含 `b2_csr`）：
+    //     · 读口：`csr_raddr_o` → 顶层 CSR 文件 → `csr_rdata_i`（组合，执行拍）
+    //     · 写口：`csr_we_o/csr_waddr_o/csr_wdata_o`（提交点合成值，见 §B29/D5a/D5b）
+    //     · 陷阱写口：`csr_trp_*`（4a 自造的"进入/退出"事件；4b-1b 换 `trap_ctrl` 后删除）
+    //   另需回灌两个**读侧派生量**：`csr_frm_i`（FPU 舍入模式）、`csr_fflags_i`（fcsr.fflags）
+    output wire [11:0] csr_raddr_o,
+    input  wire [31:0] csr_rdata_i,
+    input  wire [2:0]  csr_frm_i,
+    input  wire [4:0]  csr_fflags_i,
+    output wire        csr_we_o,
+    output wire [11:0] csr_waddr_o,
+    output wire [31:0] csr_wdata_o,
+    output wire [1:0]  xret_kind_o,
+    //   （原 `mtip_i`/`irq_mti_o`/`mtvec_o`/`mepc_o` 四个端口随 `b2_csr` 外移而删除；
+    //     中断判定在 4b-1a 由顶层用 `csr_*_o` 复刻，4b-1b 起交给 `trap_ctrl`。）
     output wire [31:0] trap_valid_o_pc,       // 别名（保持 trap_valid_o 契约不变）
     output wire        trap_valid_o,
     output wire [31:0] trap_pc_o,
@@ -321,9 +334,10 @@ module backend_top #(
     //     语义变更：store 提交**不再**要求"排空口当拍空闲"，只要求 CDQ 放得下一整组
     //     （≤4 笔）；排空口按 FIFO 逐拍把已提交的 store 落地（单端口、单笔在途不变）。
     wire        lsu_dr_room_w;
-    wire [31:0] csr_rdata_w;
-    wire [2:0]  csr_frm_w;
-    wire [4:0]  csr_ff_w;
+    //   ★ 4b-1a：CSR 文件在顶层 ⇒ 下面三个量改由端口驱动（内部使用点**零改动**）
+    wire [31:0] csr_rdata_w = csr_rdata_i;
+    wire [2:0]  csr_frm_w   = csr_frm_i;
+    wire [4:0]  csr_ff_w    = csr_fflags_i;
     wire [`BACK2_STQ_IDX_W-1:0] stq_of_rob_r;
     reg         trap_halt_q;
     reg         mdu_if_v, fpu_if_v;
@@ -338,12 +352,12 @@ module backend_top #(
     reg  [`BACK2_LQ_IDX_W-1:0]  lq_of_rob  [0:127];
     wire [`BACK2_LQ_IDX_W-1:0]  lq_of_rob_r;
     wire [11:0] csr_raddr_w;
-    //   ★ 2B-4 第 4a 段：陷阱/中断 → CSR 硬件写路径（**声明必须早于下方 b2_csr 例化**，
-    //     否则 iverilog 会先建 1 位隐式网 ⇒ 32 位数据被静默截断）
-    wire        csr_mstatus_mie_w, csr_mie_mtie_w;
-    wire [31:0] csr_mstatus_w, csr_mie_w;
-    wire        trp_csr_enter_w, trp_csr_exit_w;
-    wire [31:0] trp_csr_pc_w, trp_csr_cause_w, trp_csr_tval_w;
+    assign csr_raddr_o = csr_raddr_w;
+    //   ★ 4b-1a：写口与陷阱写口引出（`csr_we_w/csr_waddr_w/csr_wdata_w` 见 §7 提交级合成）
+    assign csr_we_o    = csr_we_w;
+    assign csr_waddr_o = csr_waddr_w;
+    assign csr_wdata_o = csr_wdata_w;
+
 
 
 
@@ -1456,20 +1470,10 @@ module backend_top #(
         if (DBG_CSR && rst_n && csr_we_w)
             $display("[csr-cmt t=%0t] we=%b addr=0x%03x wdata=0x%08x (cmt_we=%b cmt_addr=0x%03x cmt_data=0x%08x) mscratch=0x%08x",
                      $time, csr_we_w, csr_waddr_w, csr_wdata_w,
-                     csr_cmt_we, csr_cmt_addr, csr_cmt_data, u_csr.mscratch_q);
+                     csr_cmt_we, csr_cmt_addr, csr_cmt_data);
     end
 
-    b2_csr u_csr (
-        .clk(clk), .rst_n(rst_n),
-        .raddr(csr_raddr_w), .rdata(csr_rdata_w), .raddr_ill(),
-        .frm_o(csr_frm_w), .fflags_o(csr_ff_w),
-        .we(csr_we_w), .waddr(csr_waddr_w), .wdata(csr_wdata_w),
-        //   ★ 2B-4 第 4a 段：陷阱硬件写路径 + MTIP + 重定向读口
-        .trp_enter_v(trp_csr_enter_w), .trp_enter_pc(trp_csr_pc_w),
-        .trp_enter_cause(trp_csr_cause_w), .trp_enter_tval(trp_csr_tval_w),
-        .trp_exit_v(trp_csr_exit_w), .mtip_i(mtip_i),
-        .mtvec_o(mtvec_o), .mepc_o(mepc_o), .mstatus_o(csr_mstatus_w), .mie_o(csr_mie_w)
-    );
+    //   ★ 4b-1a：`b2_csr` 已搬到 `core_top_2b`（CSR 文件不再内嵌于后端）
 
     // ---- ROB ----
     assign upd_tr_v = x_i2_v[2] & u_is_br(x_i2_uop[2]);
@@ -1596,41 +1600,19 @@ module backend_top #(
     assign trap_valid_o        = trap_v_rob;
     assign trap_valid_o_pc     = trap_pc_o;
 
-    //==========================================================================
-    //   ★★ 2B-4 第 4a 段：陷阱/中断 → CSR 硬件写路径的"事件组装"
-    //--------------------------------------------------------------------------
-    //   `trp_flush_v_i` 是顶层的**接受**脉冲（一拍），本模块据"这一拍是谁"决定
-    //   往 b2_csr 发进入/退出：
-    //     · 异常（头部 trap_v_rob）   ⇒ 进入：mepc/mcause/mtval/mstatus
-    //     · 中断（irq_mti_w）         ⇒ 进入：mcause = 0x8000_0007，mtval = 0
-    //     · xRET（提交点 mret/sret）  ⇒ 退出：mstatus.MIE/MPIE/MPP
-    //   mtval 口径（与 Spike 实测一致，见 §B4.4.2）：
-    //     cause 2（非法指令）⇒ 出错指令编码；cause 3（断点）⇒ 断点指令 PC；其余 ⇒ 0
-    //==========================================================================
-    //   中断判定（提交组边界采样）：MIE（mstatus）× MTIE（mie）× MTIP（CLINT）
-    //   ＋ ROB 非空（有"下一条未提交指令"可作 mepc）＋ 本拍不是异常/xRET 拍
-    wire irq_mti_w = csr_mstatus_mie_w & csr_mie_mtie_w & mtip_i &
-                     (rob_cnt_w != 8'h0) & ~trap_v_rob & ~xret_cmt_o;
-    assign irq_mti_o = irq_mti_w;
-    assign csr_mstatus_mie_w = csr_mstatus_w[3];
-    assign csr_mie_mtie_w    = csr_mie_w[7];
+    //   ★★ 2B-4 第 4b-1c 段：4a 自造的"陷阱 CSR 事件组装"（`trp_is_*`/`trp_csr_*`）**已删净**——
+    //     陷阱 CSR（mepc/mcause/mtval/mstatus）的落地全部改由顶层 `trap_ctrl.trap_we/
+    //     trap_epc_i/trap_cause_i/trap_tval_i` → `csr_file` 承担（2A 口径，含委托判定）。
+    //     本模块只保留：精确陷阱**观测输出**（trap_*_o）、xRET 提交点识别（xret_cmt_o/
+    //     xret_kind_o）、以及"外部冲刷 + 重定向"骨架（trp_flush_v_i/trp_redirect_*_i）。
 
-    wire trp_is_exc_w  = trap_v_rob;
-    wire trp_is_irq_w  = irq_mti_w & ~trap_v_rob;
-    wire trp_is_xret_w = xret_cmt_o & ~trap_v_rob & ~irq_mti_w;
-
-    assign trp_csr_enter_w = trp_flush_v_i & (trp_is_exc_w | trp_is_irq_w);
-    assign trp_csr_exit_w  = trp_flush_v_i & trp_is_xret_w;
-    //   头部 PC：异常 = 该指令 PC；中断 = 最老未提交指令 PC（= 中断返回点）
-    assign trp_csr_pc_w    = trap_pc_o;
-    assign trp_csr_cause_w = trp_is_irq_w ? 32'h8000_0007 : {28'b0, trap_cause_o};
-    assign trp_csr_tval_w  = trp_is_irq_w                         ? 32'h0 :
-                             (trap_cause_o == `BACK2_EXC_ILLEGAL) ? trap_tval_o :
-                             (trap_cause_o == `BACK2_EXC_BREAK)   ? trap_pc_o : 32'h0;
     //   ★ 提交点 xRET 识别：载荷 TVAL 字段 = **原始指令位**（decoder `tval_o = insn_i`，norvc）
     //     ⇒ 直接按编码判定 mret(0x3020_0073) / sret(0x1020_0073)，**不需要新增载荷位**
     //     （RB_W=416 已用满，见 back2_params.vh）。
     wire [31:0] cmt0_tval = cmt_pay[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB];
+    //   ★ 4b-1a：xRET 种类引出（`priv_ctrl.xret_kind` 需要）：1 = mret、2 = sret
+    assign xret_kind_o = (cmt0_tval == 32'h3020_0073) ? 2'd1 :
+                         (cmt0_tval == 32'h1020_0073) ? 2'd2 : 2'd0;
     assign xret_cmt_o = |cmt_raw & cmt_ok &
                         ((cmt0_tval == 32'h3020_0073) | (cmt0_tval == 32'h1020_0073));
 

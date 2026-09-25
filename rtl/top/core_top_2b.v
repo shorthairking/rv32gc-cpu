@@ -205,6 +205,49 @@ module core_top_2b (
     wire [3:0]  trap_cause_w;
     wire        xret_cmt_w, irq_mti_w;
     wire [31:0] csr_mtvec_w, csr_mepc_w;
+    //   ★★ 2B-4 第 4b-1a 段：**CSR 文件搬到顶层**（行为等价重构）
+    //     后端只留"读口/写口/陷阱写口"三类接口；CSR 寄存器本体在本层例化。
+    wire [11:0] csr_raddr_w;
+    wire [31:0] csr_rdata_w;
+    wire        csr_we_w;
+    wire [11:0] csr_waddr_w;
+    wire [31:0] csr_wdata_w;
+    //   ★★ 4b-1c：`csr_frm_w`/`csr_ff_w`（FPU 舍入模式 / fcsr.fflags 回灌）在 4a 由 `b2_csr`
+    //     输出；换成 2A `csr_file` 后它没有对应的**读侧派生输出**（2A 的 FPU 走 `csr_file`
+    //     自己的 fcsr 视图，FP 集成时再接）。本核 `core_top_2b` 尚无 FP 程序/FP 提交路径
+    //     （TB 七个程序全整数）⇒ 先接 `frm = RNE(0)`、`fflags = 0`（= fcsr 复位值，语义正确），
+    //     并把"软件写 frm 对 FPU 可见"列入 FP 集成待办（报告 §B4.6.4-⑩）。
+    wire [2:0]  csr_frm_w = 3'h0;
+    wire [4:0]  csr_ff_w  = 5'h0;
+    wire [1:0]  xret_kind_w;
+    wire [6:0]  dbg_rob_cnt_w;
+    //   ★★ 2B-4 第 4b-1b 段：2A `csr_file`+`priv_ctrl`+`trap_ctrl` 替换 `b2_csr`
+    wire [31:0] csr_mtvec_o, csr_stvec_o, csr_medeleg_o, csr_mideleg_o;
+    wire [31:0] csr_mie_o, csr_mip_o, csr_mepc_o, csr_sepc_o, csr_satp_o;
+    wire [31:0] csr_mstatus_raw;
+    wire [1:0]  csr_priv_2, csr_eff_priv;
+    wire [31:0] mstatus_set, mstatus_clr;
+    wire [N_PMP*8-1:0]  pmp_cfg_flat;
+    wire [N_PMP*32-1:0] pmp_addr_flat;
+    reg  [63:0] cycle_cnt, instret_cnt;
+    wire        tc_trap_valid, tc_trap_is_int, tc_trap_we;
+    //   ★ `trap_ctrl.trap_target` 是**目的特权级**（送 `priv_ctrl`），不是 PC！
+    //     陷阱入口 PC 是 `redirect_pc`（= `trap_pc`，含 Direct/Vectored 合成）
+    wire [1:0]  tc_trap_target;
+    wire [31:0] tc_redirect_pc, tc_trap_cause, tc_trap_tval, tc_trap_epc, tc_trap_pc;
+    wire [31:0] tc_trap_epc_i, tc_trap_cause_i, tc_trap_tval_i;
+    wire        rob_any_w = (dbg_rob_cnt_w != 7'd0);
+    //   ★ 裁决①：ecall 的 mtval 按 **Spike = 0**（2A 是 PC，偏差登记在册）；
+    //     断点 cause 3 取 PC（Spike 实测口径）；非法指令由 trap_ctrl 用 commit_insn 覆盖；
+    //     其余（取指/访存异常）沿用载荷 TVAL（= 故障 VA）。
+    wire [31:0] exc_tval_adapt_w =
+        (trap_cause_w == `BACK2_EXC_BREAK)                        ? trap_pc_w :
+        ((trap_cause_w == `BACK2_EXC_ECALL_M) |
+         (trap_cause_w == `BACK2_EXC_ECALL_S) |
+         (trap_cause_w == `BACK2_EXC_ECALL_U))                    ? 32'h0 :
+                                                                    trap_tval_w;
+    wire [2:0]  cmt_num_w = {2'b0, commit_valid[0]} + {2'b0, commit_valid[1]} +
+                            {2'b0, commit_valid[2]} + {2'b0, commit_valid[3]};
     //   ★ 陷阱 FSM 的**组合**出口（声明必须在 backend_top 例化之前；否则隐式 1 位网）
     wire        be_trp_flush, be_trp_redirect_v, trp_halt_w;
     wire [31:0] be_trp_redirect_pc;
@@ -241,7 +284,11 @@ module core_top_2b (
 
     //   ★ 占位：satp = 0（Bare）、无 Sv32 ⇒ 取指直通（VA=PA）。
     //     第 4 段把 `satp` 换成 csr_file 的真值并接 `sv32_translate_*` 控制器。
-    wire        sv32_en      = 1'b0;                  // ★ 占位（Bare）
+    //   ★★ 4b-1c：`satp` 改接 `csr_file.satp_o`（4b-2 的 Sv32 全链路从这条线开始）。
+    //     复位后 `satp = 0` ⇒ MODE=0（Bare）⇒ `sv32_en = 0` ⇒ **行为与替换前逐拍相同**；
+    //     4b-2 再把 D 侧 TLB 查询口、PTW 串行复用（数据优先）、PTE A/D 写通路、
+    //     `sfence.vma`/`cbo.*` 接提交点补齐（见报告 §B4.5.3）。
+    wire        sv32_en      = csr_satp_o[`RV32GC_SATP_MODE_BIT];
     wire        sv32_done    = f_tlb_hit | ptw_req_done;
     wire        sv32_fault   = f_tlb_perm_fault | ptw_fault;
     wire [31:0] sv32_paddr   = f_tlb_hit ? f_tlb_pa : ptw_pa_out;
@@ -273,7 +320,7 @@ module core_top_2b (
         //   ★ 占位：Bare ⇒ 不发起遍历（`sv32_en=0`）；接法已按 2A 口径就位
         .req_valid(sv32_en & ~f_tlb_hit & tr_req_valid),
         .req_va(tr_req_va), .req_acc(2'b00), .req_priv(`RV32GC_PRIV_M),
-        .req_sum(1'b0), .req_mxr(1'b0), .satp(32'h0),
+        .req_sum(1'b0), .req_mxr(1'b0), .satp(csr_satp_o),
         .req_ready(), .req_done(ptw_req_done), .pa_o(ptw_pa_out),
         .fault_o(ptw_fault), .fault_cause_o(ptw_fault_cause), .fault_tval_o(ptw_fault_tval),
         .pte_req_valid(ptw_pte_req_valid), .pte_req_pa(ptw_pte_req_pa),
@@ -291,12 +338,29 @@ module core_top_2b (
         .fill_ppn(ptw_fill_ppn), .fill_perm(ptw_fill_perm)
     );
 
-    //   PTE 取也要过 PMP（08 §5.4 ④）；本段 PMP 上下文占位（全 0 + M ⇒ 放行）
+    //   ★ 4b-1b：PTW 的访问类型 → PMP 检查类型（**逐字照抄 2A** `core_top.v:471-479`，
+    //     不改 2A 文件；功能等价于"取指遍历的 PTE 按 X、数据侧按 LOAD/STORE"）
+    function [1:0] pmp_acc_xlat;
+        input [1:0] acc_ptw;
+        begin
+            case (acc_ptw)
+                2'b00:   pmp_acc_xlat = 2'd2;   // 取指 ⇒ X
+                2'b01:   pmp_acc_xlat = 2'd0;   // load ⇒ LOAD
+                2'b10:   pmp_acc_xlat = 2'd1;   // store ⇒ STORE
+                default: pmp_acc_xlat = 2'd3;   // 保留
+            endcase
+        end
+    endfunction
+
+    //   PTE 取也要过 PMP（08 §5.4 ④）；4b-1b 起接 `csr_file` 的 pmp_cfg/pmp_addr 真值
     pmp_check #(.PMP_ENTRIES(N_PMP)) u_pmp_pte (
         .clk(aclk), .rst_n(aresetn),
-        .cfg_i({N_PMP*8{1'b0}}), .addr_i({N_PMP*32{1'b0}}),
+        .cfg_i(pmp_cfg_flat), .addr_i(pmp_addr_flat),
         .acc_pa_i(ptw_pmp_req_addr), .acc_bytes_i(5'd4),
-        .acc_priv_i(ptw_pmp_req_priv), .acc_type_i(2'b00),   // 取指口径（X）
+        .acc_priv_i(ptw_pmp_req_priv),
+        //   ★ 4b-1b：按母代理裁决**照抄 2A**（`core_top.v:1855` + `:471-479`）：
+        //     `pmp_acc_xlat(ptw_pmp_req_acc)` —— 取指遍历的 PTE 按 X、数据侧按 LOAD/STORE
+        .acc_type_i(pmp_acc_xlat(ptw_pmp_req_acc)),
         .allow_o(ptw_pmp_ok), .fault_cause_o(), .hit_o(), .hit_idx_o(), .denied_by_full_o()
     );
 
@@ -871,12 +935,114 @@ module core_top_2b (
         //   ★★ 2B-4 第 4a 段：特权/陷阱/中断路径（顶层 trap FSM ↔ 后端）
         .trp_flush_v_i(be_trp_flush), .trp_redirect_v_i(be_trp_redirect_v),
         .trp_redirect_pc_i(be_trp_redirect_pc), .trp_halt_o(trp_halt_w),
-        .xret_cmt_o(xret_cmt_w), .mtip_i(clint_mtip_w),
-        .irq_mti_o(irq_mti_w), .mtvec_o(csr_mtvec_w), .mepc_o(csr_mepc_w),
+        .xret_cmt_o(xret_cmt_w),
+        //   ★ 4b-1a：CSR 文件接口（本体在下方 §6c 例化）
+        .csr_raddr_o(csr_raddr_w), .csr_rdata_i(csr_rdata_w),
+        .csr_frm_i(csr_frm_w), .csr_fflags_i(csr_ff_w),
+        .csr_we_o(csr_we_w), .csr_waddr_o(csr_waddr_w), .csr_wdata_o(csr_wdata_w),
+        .xret_kind_o(xret_kind_w),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),
         .cnt_commit4_o(), .cnt_issue_o(),
-        .dbg_rob_cnt_o(), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w)
+        .dbg_rob_cnt_o(dbg_rob_cnt_w), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w)
     );
+
+    //==========================================================================
+    // 6c. ★★ CSR 文件（2B-4 第 4b-1a 段：从 `backend_top` 搬到本层）
+    //--------------------------------------------------------------------------
+    //  本阶段**行为等价**：仍是 4a 的 `b2_csr` 过渡栈（4b-1b 才换 2A 的
+    //  `csr_file`+`priv_ctrl`+`trap_ctrl`），只是寄存器本体与写口在本层。
+    //  读写口语义与 4a 完全一致：
+    //    · 读口组合（执行拍；CSR 指令只在 ROB 头发射 ⇒ 读到的是已提交状态）
+    //    · 写口在提交点（`csr_we_w/csr_waddr_w/csr_wdata_w` 由后端提交级合成）
+    //    · 陷阱进入/退出由后端的 `csr_trp_*` 事件驱动（4a 口径）
+    //==========================================================================
+    //   ★★ 4b-1b：CSR 全集 + 特权状态 + 陷阱决策（2A 模块只读例化，接法照 `rtl/top/core_top.v`）
+    csr_file u_csr_file (
+        .clk(aclk), .rst_n(aresetn),
+        .raddr(csr_raddr_w), .rdata(csr_rdata_w), .wen(csr_we_w),
+        .waddr(csr_waddr_w), .wdata(csr_wdata_w), .w_illegal(1'b0),
+        .rdata_w(), .byp_wdata(32'h0), .byp_rdata(),
+        .priv(csr_priv_2), .chk_addr(12'h0), .chk_illegal(), .chk_ro_write(),
+        .mstatus_o(csr_mstatus_raw), .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
+        .trap_we(tc_trap_we), .trap_epc_i(tc_trap_epc_i), .trap_cause_i(tc_trap_cause_i),
+        .trap_tval_i(tc_trap_tval_i), .trap_data_i(32'h0),
+        .irq_msip(clint_msip_w), .irq_mtip(clint_mtip_w), .irq_meip(1'b0),
+        .irq_stip(1'b0), .irq_seip(1'b0),
+        .cycle_i(cycle_cnt), .instret_i(instret_cnt),
+        .pmp_cfg_o(pmp_cfg_flat), .pmp_addr_o(pmp_addr_flat), .satp_o(csr_satp_o),
+        .menvcfg_o(), .senvcfg_o(), .mcounteren_o(), .scounteren_o(),
+        .mtvec_o(csr_mtvec_o), .stvec_o(csr_stvec_o),
+        .medeleg_o(csr_medeleg_o), .mideleg_o(csr_mideleg_o),
+        .mie_o(csr_mie_o), .mip_o(csr_mip_o), .mepc_o(csr_mepc_o), .sepc_o(csr_sepc_o)
+    );
+
+    priv_ctrl u_priv_ctrl (
+        .clk(aclk), .rst_n(aresetn),
+        .trap_valid(tc_trap_valid), .trap_target(tc_trap_target),
+        .xret_valid(xret_cmt_w), .xret_kind(xret_kind_w),
+        .mstatus_i(csr_mstatus_raw),
+        .csr_wen(csr_we_w), .csr_waddr(csr_waddr_w), .csr_wdata(csr_wdata_w),
+        .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
+        .priv_o(csr_priv_2), .eff_priv_o(csr_eff_priv),
+        .mprv_o(), .sum_o(), .mxr_o(), .mpp_o(),
+        .tvm_o(), .tw_o(), .tsr_o(), .fetch_priv_is_m_o(),
+        .flush_req(), .priv_next_o()
+    );
+
+    //   ★ 适配层（"ROB 头当 W 拍"）：
+    //     · commit_valid/commit_pc = ROB 头（最老未提交指令）
+    //     · 裁决②：commit_pc_next **= commit_pc** —— 本核取点在头部**提交前**，
+    //       "下一条未执行指令"就是头部本身（2A 是 W 已提交，故其 pc_next = pc+4）
+    //     · exc_valid 与 commit_valid 相与（2A `core_top.v:2571-2579` 的教训：裸 exc_valid
+    //       会在槽被清空后逐拍重复取同一次陷阱）
+    //     · exc_tval 按裁决① 适配（ecall→0 / 断点→PC / 其余→载荷 TVAL）
+    //     · mie 按 ROB 非空掩码 ⇒ ROB 空时不取中断（无"下一条未执行指令"）
+    trap_ctrl u_trap_ctrl (
+        .commit_valid (rob_any_w),
+        .commit_pc    (trap_pc_w),
+        .commit_pc_next(trap_pc_w),
+        .commit_insn  (trap_tval_w),
+        .exc_valid    (trap_valid_w & rob_any_w),
+        .exc_cause    ({1'b0, trap_cause_w}),
+        .exc_tval     (exc_tval_adapt_w),
+        .exc_is_fetch (1'b0),          // 裁决④：本核载荷暂无取指异常标记（待办）
+        .priv         (csr_priv_2),
+        .medeleg      (csr_medeleg_o),
+        .mideleg      (csr_mideleg_o),
+        .mip          (csr_mip_o),
+        .mie          (csr_mie_o & {32{rob_any_w}}),
+        .mstatus_i    (csr_mstatus_raw),
+        .mtvec        (csr_mtvec_o),
+        .stvec        (csr_stvec_o),
+        .trap_valid   (tc_trap_valid),
+        .trap_is_int  (tc_trap_is_int),
+        .trap_target  (tc_trap_target),
+        .trap_cause   (tc_trap_cause),
+        .trap_tval    (tc_trap_tval),
+        .trap_epc     (tc_trap_epc),
+        .trap_pc      (tc_trap_pc),
+        .trap_we      (tc_trap_we),
+        .trap_epc_i   (tc_trap_epc_i),
+        .trap_cause_i (tc_trap_cause_i),
+        .trap_tval_i  (tc_trap_tval_i),
+        .trap_data_i  (),              // trap_ctrl 的输出（csr_file 侧那份按 2A 接 0）
+        .trap_wr_m_epc(), .trap_wr_m_cause(), .trap_wr_m_tval(),
+        .trap_wr_s_epc(), .trap_wr_s_cause(), .trap_wr_s_tval(),
+        .redirect_pc  (tc_redirect_pc)
+    );
+    //   ★ 4b-1c：`irq_mti_w` 保留为**观测口**（= 本拍真的在交付中断）；判定本体在 `trap_ctrl`
+    assign irq_mti_w = tc_trap_valid & tc_trap_is_int;
+
+    //   ★ mcycle/minstret（Zicntr；4b-1c 的读回单调性判据用）
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            cycle_cnt   <= 64'h0;
+            instret_cnt <= 64'h0;
+        end else begin
+            cycle_cnt   <= cycle_cnt + 64'd1;
+            instret_cnt <= instret_cnt + {61'b0, cmt_num_w};
+        end
+    end
 
     //==========================================================================
     // 6b. ★★ 特权/陷阱/中断 FSM（2B-4 第 4a 段）
@@ -894,27 +1060,17 @@ module core_top_2b (
     //      `redirect_exc_pc = trap_valid ? trap_redirect_pc : ...` 同构。
     //      ⇒ 后端同一拍：清空 ROB/重命名/IQ/LSQ（flush_all）＋ 前端重定向取 mtvec/mepc。
     //==========================================================================
-    wire        trp_exc_w  = trap_valid_w;                       // 头部精确异常
-    wire        trp_xret_w = xret_cmt_w & ~trap_valid_w;         // 提交点 mret/sret
-    wire        trp_irq_w  = irq_mti_w & ~trap_valid_w & ~xret_cmt_w;
-    wire        trp_take_w = trp_exc_w | trp_xret_w | trp_irq_w;
+    //   ★ 4b-1b：异常与中断统一来自 `trap_ctrl.trap_valid`（含取中断判定），xRET 仍取提交点
+    wire        trp_exc_w  = tc_trap_valid & ~tc_trap_is_int;    // 同步异常
+    wire        trp_xret_w = xret_cmt_w & ~tc_trap_valid;        // 提交点 mret/sret
+    wire        trp_irq_w  = tc_trap_valid & tc_trap_is_int;     // 中断
+    wire        trp_take_w = tc_trap_valid | trp_xret_w;
 
-    wire [1:0]  trp_mode_w   = csr_mtvec_w[1:0];
-    wire [31:0] trp_base_w   = {csr_mtvec_w[31:2], 2'b00};
-    //   ★★ 2B-4 第 4b 段（第一步）**缺陷修正 4a-D4**：MODE=1（Vectored）下
-    //      **只有中断**取 `BASE + 4×cause`；**同步异常一律回 BASE**
-    //      （依据：`docs/design/06-csr-privilege.md §3.2`（本仓口径逐字同 ISA 手册）：
-    //        "MODE=1（Vectored）：**同步异常** pc ← BASE ；**中断** pc ← BASE + 4×cause"）。
-    //      4a 段实现把异常也做了向量化 ⇒ 与 Spike / 2A 口径**不一致**；
-    //      本轮用 p9_trapvec（MODE=1 + ecall/非法/ebreak）**实测抓住**：
-    //      Spike 落 `vbase+0`、本核落 `vbase+44`。
-    //   · 合成口径取 2A `csr_file` 的式：`BASE(低 8 位 0) | (cause << 2)`
-    //     （Vectored 下 2A 要求 BASE 256 B 对齐，正是为了省掉加法器）；
-    //   · 中断码：本段只有 MTI(7)；`BASE + 4×7 = BASE + 0x1C`。
-    wire [3:0]  trp_cause4_w = 4'd7;                              // 中断码 = MTI(7)
-    wire [31:0] trp_vect_w   = {trp_base_w[31:8], 8'b00} | {26'b0, trp_cause4_w, 2'b00};
-    wire [31:0] trp_target_w = trp_irq_w ? ((trp_mode_w == 2'b01) ? trp_vect_w : trp_base_w) :
-                               trp_exc_w ? trp_base_w : csr_mepc_w;
+    //   ★★ 4b-1b/1c：目标合成（Direct/Vectored、委托、MTVEC/STVEC 选择）**全在 2A `trap_ctrl` 内**；
+    //     本层只做"谁优先"的选择：陷阱 > xRET(mepc/sepc)（4a 的 `trp_mode_w/trp_base_w/
+    //     trp_vect_w/trp_cause4_w` 合成已删净）
+    wire [31:0] trp_target_w = tc_trap_valid ? tc_redirect_pc :
+                               (xret_kind_w == 2'd2) ? csr_sepc_o : csr_mepc_o;
 
     assign be_trp_flush       = trp_take_w;
     assign be_trp_redirect_v  = trp_take_w;

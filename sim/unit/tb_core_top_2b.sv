@@ -170,6 +170,11 @@ module tb_core_top_2b #(
     //   ★ 中断的**重定向目标**：中断不走 ROB 异常口（`trap_valid_w` 只报异常）⇒
     //     直接采顶层 trap FSM 的组合重定向 PC（`irq_mti_w` 同拍有效）
     reg [31:0] irq_target_q;
+    //   ★ 4b-1b：中断判定归 `trap_ctrl` ⇒ 监视 `trap_valid & trap_is_int`
+    wire irq_live_w = u_dut.tc_trap_valid & u_dut.tc_trap_is_int;
+    //   ★ 4b-1b：`csr_file` 无 `mcause_o` 端口 ⇒ 在**取陷阱拍**从 `trap_ctrl.trap_cause`
+    //     捕获（该值就是写进 mcause 的值；比读内部寄存器更贴近口径）
+    reg [31:0] trp_mcause_cap;
     reg [3:0] trc_cause [0:7];              // 依次记录的 mcause 低位
     reg [31:0] trc_pc   [0:7];              // 依次记录的**陷阱指令 PC**（= ROB 头部 PC）
     reg [31:0] trp_tgt  [0:7];              // 依次记录的**重定向目标 PC**（决定落哪个向量槽）
@@ -182,8 +187,9 @@ module tb_core_top_2b #(
             n_trap_p            <= n_trap_p + 1;
         end
         //   ★ 中断交付：后端 `irq_mti_w`（MIE×MTIE×MTIP×ROB 非空×非异常/xRET 拍）
-        irq_seen_q <= rst_n & u_dut.irq_mti_w;
-        if (rst_n && u_dut.irq_mti_w) begin
+        if (rst_n && u_dut.tc_trap_valid) trp_mcause_cap <= u_dut.tc_trap_cause;
+        irq_seen_q <= rst_n & irq_live_w;
+        if (rst_n && irq_live_w) begin
             irq_target_q <= u_dut.be_trp_redirect_pc;
             if (!irq_seen_q) n_irq_p <= n_irq_p + 1;
         end
@@ -284,7 +290,7 @@ module tb_core_top_2b #(
     integer dbg_c;
     initial dbg_c = -1;
     always @(posedge clk) begin
-        if (u_dut.irq_mti_w && (dbg_c < 0)) dbg_c <= 0;
+        if (irq_live_w && (dbg_c < 0)) dbg_c <= 0;
         else if ((dbg_c >= 0) && (dbg_c < 220)) begin
             if (DBG_P8) begin
                 if (u_dut.commit_valid != 0)
@@ -302,6 +308,7 @@ module tb_core_top_2b #(
     // 5. 主流程
     //==========================================================================
     integer cyc, k, d_pc, d_rd, d_wd;
+    integer cyc_before, inst_before;        // Zicntr 活性检查采样（C10'）
     integer ar0, rb0, aw0, wb0, b0, xip0;
     integer pid;
     initial begin
@@ -330,7 +337,7 @@ module tb_core_top_2b #(
             @(negedge clk); rst_n = 1'b0;
             nrec = 0; on = 1'b0; bad_pc = -1; bad_rd = -1; bad_wd = -1;
             n_trap_p = 0; trap_seen_q = 1'b0; n_irq_p = 0; irq_seen_q = 1'b0;
-            irq_target_q = 32'h0;
+            irq_target_q = 32'h0; trp_mcause_cap = 32'h0;
             for (k = 0; k < 8; k = k + 1) begin
                 trc_cause[k] = 4'h0; trc_pc[k] = 32'h0; trp_tgt[k] = 32'h0;
             end
@@ -344,6 +351,9 @@ module tb_core_top_2b #(
             @(negedge clk); rst_n = 1'b1;
             repeat (2) @(posedge clk);
 
+            //   Zicntr 活性采样点：**复位释放后、程序开跑前**（复位期间计数器被清零）
+            cyc_before  = u_dut.cycle_cnt[31:0];
+            inst_before = u_dut.instret_cnt[31:0];
             $display("== 程序 %0d（.svh 下标 %0d）：黄金 %0d 条 ==", pid, cur_p, cmax_of[pid]);
             $fflush();
             cyc = 0;
@@ -355,14 +365,14 @@ module tb_core_top_2b #(
                     if (DBG_P8 && ((k % 500) == 0))
                         $display("   [p8-dbg] cyc=%0d mtime=0x%08x mtimecmp=0x%08x MTIP=%b | mie=0x%03x mstatus=0x%08x | irq=%b robcnt=%0d clint_vld=%b hit=%b",
                                  k, u_dut.u_clint.mtime_r[31:0], u_dut.u_clint.mtimecmp_r[31:0],
-                                 u_dut.clint_mtip_w, u_dut.u_back.u_csr.mie_q,
-                                 u_dut.u_back.u_csr.mstatus_q, u_dut.irq_mti_w,
+                                 u_dut.clint_mtip_w, u_dut.u_csr_file.mie_o,
+                                 u_dut.csr_mstatus_raw, u_dut.irq_mti_w,
                                  u_dut.u_back.rob_cnt_w, u_dut.clint_req_vld, u_dut.clint_hit_w);
                 end
                 cyc = P8_CYCLES;
                 $display("   [C8'] 中断现场：mtvec=0x%08x mepc=0x%08x mcause=0x%08x | 处理程序 s1=1、主程序 a0=1（共提交 %0d 条）",
-                         u_dut.u_back.u_csr.mtvec_q, u_dut.u_back.u_csr.mepc_q,
-                         u_dut.u_back.u_csr.mcause_q, nrec);
+                         u_dut.u_csr_file.mtvec_o, u_dut.u_csr_file.mepc_o,
+                         trp_mcause_cap, nrec);
             end
             while ((pid != 4) && (nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
                 @(posedge clk);
@@ -386,8 +396,12 @@ module tb_core_top_2b #(
                              pid, k, rpc[k], GOLD[cur_p*P_GOLD_MAX + k] + gold_delta);
                     d_pc = 1;
                 end
-            //   [诊断，默认关] p10：CSR 轨迹逐条对照（本核 vs Spike 黄金；放在 chk 之前，chk 失败会 $fatal）
-            if ((pid == 6) && DBG_P10)
+            //   [诊断，默认关] p7/p10：CSR 轨迹逐条对照（本核 vs Spike 黄金；chk 前，chk 失败会 $fatal）
+            if (((pid == 3) || (pid == 6)) && DBG_P10) begin
+                $display("   [dbg] mtvec_o=0x%08x mepc_o=0x%08x mcause_cap=0x%08x",
+                         u_dut.u_csr_file.mtvec_o, u_dut.u_csr_file.mepc_o, trp_mcause_cap);
+            end
+            if (((pid == 3) || (pid == 6)) && DBG_P10)
                 for (k = 0; k < 22; k = k + 1)
                     $display("   [C10-dbg] idx=%0d pc=0x%08x we=%b rd=%0d(g %0d) wd=0x%08x(g 0x%08x)",
                              k, rpc[k], rwe[k], rrd[k], GREG_RD[cur_p*P_GOLD_MAX + k],
@@ -439,16 +453,16 @@ module tb_core_top_2b #(
                 //   口径：**自记录 + 硬编码期望**（mtime 自由计数 ⇒ 与 Spike 不可逐条比）
                 chk(n_irq_p == 1, $sformatf("C8' p8：MTI 中断交付次数 = 1（实测 %0d，期望恰好 1 次：处理程序关源）", n_irq_p));
                 chk(n_trap_p == 0, $sformatf("C8' p8：无异常交付（实测 %0d）", n_trap_p));
-                chk(u_dut.u_back.u_csr.mcause_q == 32'h8000_0007,
-                    $sformatf("C8' p8：陷阱 CSR mcause = 0x80000007（MTI），实测 0x%08x", u_dut.u_back.u_csr.mcause_q));
-                chk((u_dut.u_back.u_csr.mepc_q >= cur_base) && (u_dut.u_back.u_csr.mepc_q < (cur_base + 32'h1000)),
-                    $sformatf("C8' p8：mepc 落在程序映像内（实测 0x%08x，基址 0x%08x）", u_dut.u_back.u_csr.mepc_q, cur_base));
+                chk(trp_mcause_cap == 32'h8000_0007,
+                    $sformatf("C8' p8：陷阱 CSR mcause = 0x80000007（MTI），实测 0x%08x", trp_mcause_cap));
+                chk((u_dut.u_csr_file.mepc_o >= cur_base) && (u_dut.u_csr_file.mepc_o < (cur_base + 32'h1000)),
+                    $sformatf("C8' p8：mepc 落在程序映像内（实测 0x%08x，基址 0x%08x）", u_dut.u_csr_file.mepc_o, cur_base));
                 //   ★ 2B-4 第 4b 段（第一步）新增：**中断向量化**（MODE=1 ⇒ 中断目标 = BASE + 4×cause）
-                chk(u_dut.u_back.u_csr.mtvec_q[1:0] == 2'b01,
-                    $sformatf("C8' p8：mtvec MODE = 1（Vectored），实测 mtvec=0x%08x", u_dut.u_back.u_csr.mtvec_q));
-                chk(irq_target_q == ((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) | 32'd28),
+                chk(u_dut.u_csr_file.mtvec_o[1:0] == 2'b01,
+                    $sformatf("C8' p8：mtvec MODE = 1（Vectored），实测 mtvec=0x%08x", u_dut.u_csr_file.mtvec_o));
+                chk(irq_target_q == ((u_dut.u_csr_file.mtvec_o & ~32'hFF) | 32'd28),
                     $sformatf("C8' p8：MTI(cause 7) 向量目标 = BASE+28，实测 0x%08x（BASE=0x%08x）",
-                              irq_target_q, u_dut.u_back.u_csr.mtvec_q & ~32'hFF));
+                              irq_target_q, u_dut.u_csr_file.mtvec_o & ~32'hFF));
                 //   · 处理程序里 `csrr t1, mepc`（x6）的写回值 = 被中断指令 PC
                 //     ⇒ 必须落在 wait 循环 [0x4c, 0x54]（相对基址）
                 d_pc = 0; d_rd = 0; d_wd = 0; d_rd = 0;
@@ -457,7 +471,7 @@ module tb_core_top_2b #(
                     if (rwe[k] && (rrd[k] == 5'd9) && (rwd[k] === 32'd1)) d_rd = 1;   // s1 == 1
                     if (rwe[k] && (rrd[k] == 5'd10) && (rwd[k] === 32'd1)) d_wd = 1;  // a0 == 1（走到 done）
                     //   · 处理程序首条已提交（= 重定向到 mtvec 成功）
-                    if (rpc[k] == ((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) | 32'd28)) crk = 1;
+                    if (rpc[k] == ((u_dut.u_csr_file.mtvec_o & ~32'hFF) | 32'd28)) crk = 1;
                     //   · `csrr t1, mepc`（0x80，写 x6）采到的被中断指令 PC ∈ wait 循环
                     if (rwe[k] && (rrd[k] == 5'd6) && (rpc[k] == (cur_base + 32'h84))) begin
                         $display("   [C8'] handler 采到的 mepc=0x%08x（wait 循环 0x%08x..0x%08x）",
@@ -470,10 +484,10 @@ module tb_core_top_2b #(
                 chk(d_rd == 1, "C8' p8：处理程序自记录 s1 = 1（中断交付次数）");
                 chk(d_wd == 1, "C8' p8：主程序观察到中断后走到 done（a0 = s1 = 1）⇒ mret 精确返回");
                 //   （p8 的 mtvec 现在是"Vectored BASE|1"：BASE 必须 256 B 对齐且落在映像内）
-                chk(((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) >= cur_base) &&
-                    ((u_dut.u_back.u_csr.mtvec_q & ~32'hFF) < (cur_base + 32'h1000)),
+                chk(((u_dut.u_csr_file.mtvec_o & ~32'hFF) >= cur_base) &&
+                    ((u_dut.u_csr_file.mtvec_o & ~32'hFF) < (cur_base + 32'h1000)),
                     $sformatf("C8' p8：mtvec BASE 落在程序映像内且 256 B 对齐（实测 mtvec=0x%08x）",
-                              u_dut.u_back.u_csr.mtvec_q));
+                              u_dut.u_csr_file.mtvec_o));
             end
             //   ---- C5'：非陷阱程序必须"全程无提交点异常" ----
             //   ★ p7_trap 是**故意**制造异常的程序 ⇒ C5' 换判据 C7'（陷阱次数/原因/PC）。
@@ -489,19 +503,24 @@ module tb_core_top_2b #(
                         if (rwe[k] && (rrd[k] == 5'd26) && (rwd[k] === 32'h0000_0010)) d_pc = 1;
                         if (rwe[k] && (rrd[k] == 5'd13) && (rwd[k] === 32'h0000_0808)) d_rd = 1;
                         if (rwe[k] && (rrd[k] == 5'd15) && (rwd[k] === 32'h0000_1800)) d_wd = 1;
+
                     end
                     chk(d_pc == 1, "C10' p10：mscratch 立即数形式序列末值 = 0x10（csrrwi/csrrsi/csrrci 生效 ⇒ D2 无回归）");
                     chk(d_rd == 1, "C10' p10：mie 写 0x808 后回读 = 0x808（位域/WARL 口径）");
                     chk(d_wd == 1, "C10' p10：mstatus 写 0x1800 后回读掩码 = 0x1800（MPP 口径）");
-                    $display("   [C10'] CSR 轨迹：mscratch(w/rw/rs/rc/wi/si/ci)=0x10、mie=0x808、mstatus&0x1888=0x1800（mip/MTIP 见 p8 的 C8'）；csrrw/rs/rc 旧值、WARL 回读均与 Spike 黄金逐条一致");
+                    //   ---- Zicntr 链路活性（值口径与 Spike 不同 ⇒ 只查"计数器真的在走"）----
+                    chk((u_dut.cycle_cnt[31:0] > cyc_before) && (u_dut.instret_cnt[31:0] > inst_before),
+                        $sformatf("C10' p10：cycle_cnt/instret_cnt 在运行中单调递增（%0d→%0d / %0d→%0d）⇒ mcycle/minstret 硬件计数已接活",
+                                  cyc_before, u_dut.cycle_cnt[31:0], inst_before, u_dut.instret_cnt[31:0]));
+                    $display("   [C10'] CSR 轨迹：mscratch(w/rw/rs/rc/wi/si/ci)=0x10、mie=0x808、mstatus&0x1888=0x1800、mcycle/minstret 单调；mip/MTIP 见 p8 的 C8' ；csrrw/rs/rc 旧值、WARL 回读均与 Spike 黄金逐条一致");
                     $fflush();
                 end
             end else if (pid == 5) begin
                 //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============
                 //   判据：三条异常各自落到 base + 4×cause 的**不同槽**（由槽内标记经写回轨迹背书）。
                 chk(n_trap_p == 3, $sformatf("C9' p9：陷阱交付次数 = 3（实测 %0d）", n_trap_p));
-                chk(u_dut.u_back.u_csr.mtvec_q[1:0] == 2'b01,
-                    $sformatf("C9' p9：mtvec MODE = 1（向量），实测 mtvec=0x%08x", u_dut.u_back.u_csr.mtvec_q));
+                chk(u_dut.u_csr_file.mtvec_o[1:0] == 2'b01,
+                    $sformatf("C9' p9：mtvec MODE = 1（向量），实测 mtvec=0x%08x", u_dut.u_csr_file.mtvec_o));
                 chk(trc_cause[0] == 4'd11, $sformatf("C9' p9：第 1 次 mcause = 11，实测 %0d", trc_cause[0]));
                 chk(trc_cause[1] == 4'd2,  $sformatf("C9' p9：第 2 次 mcause = 2，实测 %0d", trc_cause[1]));
                 chk(trc_cause[2] == 4'd3,  $sformatf("C9' p9：第 3 次 mcause = 3，实测 %0d", trc_cause[2]));
@@ -509,18 +528,18 @@ module tb_core_top_2b #(
                 //     MODE=1 下**同步异常一律回 BASE**，只有**中断**才 `BASE + 4×cause`
                 //     ⇒ 三条异常的落点必须**全部等于 BASE**（4a 段实现曾误做向量化，已修）
                 //   `trp_tgt[i]` = 该次陷阱的**重定向目标**；异常在 MODE=1 下必须落 BASE
-                chk(trp_tgt[0] == (u_dut.u_back.u_csr.mtvec_q & ~32'hFF),
+                chk(trp_tgt[0] == (u_dut.u_csr_file.mtvec_o & ~32'hFF),
                     $sformatf("C9' p9：ecall(cause 11) 重定向目标 = BASE（Vectored 下异常不向量），实测 0x%08x（BASE=0x%08x）",
-                              trp_tgt[0], u_dut.u_back.u_csr.mtvec_q & ~32'hFF));
-                chk(trp_tgt[1] == (u_dut.u_back.u_csr.mtvec_q & ~32'hFF),
+                              trp_tgt[0], u_dut.u_csr_file.mtvec_o & ~32'hFF));
+                chk(trp_tgt[1] == (u_dut.u_csr_file.mtvec_o & ~32'hFF),
                     $sformatf("C9' p9：非法(cause 2) 重定向目标 = BASE，实测 0x%08x", trp_tgt[1]));
-                chk(trp_tgt[2] == (u_dut.u_back.u_csr.mtvec_q & ~32'hFF),
+                chk(trp_tgt[2] == (u_dut.u_csr_file.mtvec_o & ~32'hFF),
                     $sformatf("C9' p9：断点(cause 3) 重定向目标 = BASE，实测 0x%08x", trp_tgt[2]));
                 chk((trc_pc[0] < trc_pc[1]) && (trc_pc[1] < trc_pc[2]) &&
                     (trc_pc[0] >= cur_base) && (trc_pc[2] < (cur_base + 32'h1000)),
                     "C9' p9：三次陷阱指令 PC 严格递增且落在映像内");
                 $display("   [C9'] 向量模式：mtvec=0x%08x（MODE=1，BASE=0x%08x）→ 三次同步异常目标均 = BASE（实测 0x%08x/0x%08x/0x%08x），陷阱指令 PC=0x%08x/0x%08x/0x%08x，cause=%0d/%0d/%0d",
-                         u_dut.u_back.u_csr.mtvec_q, u_dut.u_back.u_csr.mtvec_q & ~32'hFF,
+                         u_dut.u_csr_file.mtvec_o, u_dut.u_csr_file.mtvec_o & ~32'hFF,
                          trp_tgt[0], trp_tgt[1], trp_tgt[2],
                          trc_pc[0], trc_pc[1], trc_pc[2],
                          trc_cause[0], trc_cause[1], trc_cause[2]);
@@ -541,7 +560,7 @@ module tb_core_top_2b #(
                     $sformatf("C7' p7：陷阱 PC 落在程序映像内（0x%08x..0x%08x）", trc_pc[0], trc_pc[2]));
                 $display("   [C7'] 陷阱序列：pc=0x%08x/cause=%0d → pc=0x%08x/cause=%0d → pc=0x%08x/cause=%0d；mtvec 目标=0x%08x",
                          trc_pc[0], trc_cause[0], trc_pc[1], trc_cause[1],
-                         trc_pc[2], trc_cause[2], u_dut.csr_mtvec_w);
+                         trc_pc[2], trc_cause[2], u_dut.u_csr_file.mtvec_o);
                 $fflush();
             end
         end

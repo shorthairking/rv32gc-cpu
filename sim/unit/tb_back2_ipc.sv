@@ -172,6 +172,12 @@ module tb_back2_ipc;
     wire [23:0] dbg_iq_cnt;
     wire [7:0]  dbg_stq_cnt;
 
+    //   ★ 2B-4 第 4b-1c：直驱 TB 的 CSR 桩连线（**声明必须早于 backend_top 例化**，
+    //     否则 iverilog 先建 1 位隐式网 ⇒ 读数据被静默截断/悬空 ⇒ ROB 全 x）
+    wire [11:0] tb_csr_raddr;  wire [31:0] tb_csr_rdata;
+    wire        tb_csr_we;     wire [11:0] tb_csr_waddr;  wire [31:0] tb_csr_wdata;
+    wire [2:0]  tb_csr_frm;    wire [4:0]  tb_csr_fflags;
+
     backend_top u_back (
         .clk(clk), .rst_n(rst_n),
         .blk_valid_i(blk_valid), .blk_ready_o(blk_ready), .blk_mask_i(blk_mask),
@@ -215,8 +221,16 @@ module tb_back2_ipc;
         //   ★ 2B-4 第 4a 段：backend_top 新增的特权/中断输入——
         //     本 TB 是**纯后端直驱**（无 core_top_2b 的 trap FSM）⇒ 全部接常量：
         //     不冲刷、不外部重定向、无 CLINT ⇒ 与加接口之前的行为逐拍等价。
+        //   ★ 2B-4 第 4b-1c：4a 的三条 tie-off（不冲刷、不外部重定向）
         .trp_flush_v_i(1'b0), .trp_redirect_v_i(1'b0), .trp_redirect_pc_i(32'h0),
-        .mtip_i(1'b0),
+        //   ★ 2B-4 第 4b-1c：`backend_top` 的 CSR 文件已外移到 `core_top_2b`（那里用 2A
+        //     `csr_file`+`priv_ctrl`+`trap_ctrl`）。本 TB 是**纯后端直驱** ⇒ 就地给一份
+        //     `b2_csr` 过渡栈桩（同一模块、不违反"核内两套 CSR 不得并存"），
+        //     陷阱写路径接 0：本 TB 的程序不产生陷阱/中断（与加接口前行为一致）。
+        .csr_raddr_o(tb_csr_raddr), .csr_rdata_i(tb_csr_rdata),
+        .csr_frm_i(tb_csr_frm), .csr_fflags_i(tb_csr_fflags),
+        .csr_we_o(tb_csr_we), .csr_waddr_o(tb_csr_waddr), .csr_wdata_o(tb_csr_wdata),
+        .xret_kind_o(),
         .trap_valid_o(trap_valid), .trap_pc_o(trap_pc),
         .trap_cause_o(trap_cause), .trap_tval_o(trap_tval),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),
@@ -346,5 +360,17 @@ module tb_back2_ipc;
         $display("FAIL: TB 超时");
         $fatal(1, "TB_BACK2_IPC 超时");
     end
+
+
+    //   ★ 2B-4 第 4b-1c：直驱 TB 的 CSR 桩（实例见文件末尾；连线声明见例化之前）
+    b2_csr u_tb_csr (
+        .clk(clk), .rst_n(rst_n),
+        .raddr(tb_csr_raddr), .rdata(tb_csr_rdata), .raddr_ill(),
+        .frm_o(tb_csr_frm), .fflags_o(tb_csr_fflags),
+        .we(tb_csr_we), .waddr(tb_csr_waddr), .wdata(tb_csr_wdata),
+        .trp_enter_v(1'b0), .trp_enter_pc(32'h0), .trp_enter_cause(32'h0),
+        .trp_enter_tval(32'h0), .trp_exit_v(1'b0), .mtip_i(1'b0),
+        .mtvec_o(), .mepc_o(), .mstatus_o(), .mie_o()
+    );
 
 endmodule
