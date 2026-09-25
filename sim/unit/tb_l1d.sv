@@ -82,6 +82,8 @@ module tb_l1d_top;
     logic         wb_ready;
 
     logic         inval_all, clean_all, idle;
+    logic [31:0]  wb_paddr_seen;      // ★ C6：clean 写回观察（地址/数据）
+    logic [31:0]  wb_word2_seen;
 
     l1d dut (
         .clk (clk), .rst_n (rst_n),
@@ -344,20 +346,47 @@ module tb_l1d_top;
         @(posedge clk); #1;
         chk(idle === 1'b0, "C6 clean 扫描期间 idle 应为 0（维护占用）");
         @(negedge clk); clean_all = 1'b0;
-        // 等维护扫描完成：按对外口径用 idle 判定（原层次引用 dut.maint_q 已改）
+        //   ★★ 4b-2c 收尾：**clean_all 现在会把脏行真的写回**（维护扫描逐组查脏 → 复用
+        //     `MS_WB_CAP/MS_WB_BUS` 写回 → 写回完成才清该路 dirty）。因此本用例必须在扫描
+        //     期间**服务写回握手**（与 C4 同法），并核对"写回的是 A1 这一行、且带上了新数据"。
+        //     （旧判据 `clean 自身不应产生写回` 与架构口径相反，已按 Zicbom 语义更正。）
         begin
             integer g;
-            g = 0;
+            integer nwb;
+            g = 0; nwb = 0; wb_paddr_seen = 32'h0; wb_word2_seen = 32'h0;
             while (dut.idle !== 1'b1) begin
-                @(posedge clk);
+                if (wb_req === 1'b1) begin
+                    integer k;
+                    nwb = nwb + 1;
+                    if (nwb == 1) wb_paddr_seen = wb_paddr;
+                    @(negedge clk); wb_accepted = 1'b1;
+                    @(posedge clk); @(negedge clk); wb_accepted = 1'b0;
+                    while (wb_ready !== 1'b1) @(negedge clk);
+                    for (k = 0; k < 8; k = k + 1) begin
+                        @(negedge clk);
+                        wb_word_idx = k[4:0];
+                        wb_done     = (k == 7);
+                        @(posedge clk); #1;
+                        // ★ 与 C4 同一采样口径：idx=k 的数据在该迭代的 posedge 后有效；
+                        //   本用例的写入在 A1+4（= word 1）⇒ 取 k==1
+                        if ((nwb == 1) && (k == 1)) wb_word2_seen = wb_data;
+                    end
+                    @(negedge clk); wb_done = 1'b0;
+                    @(posedge clk); #1;
+                end else begin
+                    @(posedge clk);
+                end
                 g = g + 1;
-                if (g > 1000) begin
-                    $display("  [diag] clean 扫描未结束（idle 未回升）");
+                if (g > 20000) begin
+                    $display("  [diag] clean 扫描未结束（idle 未回升，已服务写回 %0d 笔）", nwb);
                     $fatal(1, "clean 扫描超时");
                 end
             end
             #1;
             chk(idle === 1'b1, "C6 clean 扫描结束后 idle 应为 1");
+            chk(nwb >= 1, "C6 clean_all **必须写回脏行**（Zicbom：clean = 写回）");
+            chk(wb_paddr_seen === A1, "C6 写回地址应为脏行 A1 的行基址");
+            chk(wb_word2_seen === 32'hAAAA_0000, "C6 写回数据应带出 A1 的新值（A1+4 = 0xAAAA_0000；真的写回，不是只清 dirty）");
         end
         repeat (2) @(posedge clk);
         // 现在替换 A1 不应产生写回：先访问 A0/A1 使其成为最久未用，
@@ -365,7 +394,8 @@ module tb_l1d_top;
         do_read(A1 + 32'h4);
         chk(cs_ready === 1'b1, "C6 clean 后 A1 仍应命中（clean 不失效）");
         chk(cs_rdata === 32'hAAAA_0000, "C6 clean 应保留数据");
-        chk(wb_req  === 1'b0, "C6 clean 自身不应产生写回");
+        //   ★ clean 之后 A1 **已不脏** ⇒ 本拍不应再有写回请求（"clean 清 dirty"的本质判据）
+        chk(wb_req  === 1'b0, "C6 clean 后 A1 已不脏（无残留写回请求）");
         drop_req(); repeat (2) @(posedge clk);
 
         //======================================================================

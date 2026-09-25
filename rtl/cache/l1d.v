@@ -163,6 +163,17 @@ module l1d #(
     reg                    maint_q;         // 维护扫描在途
     reg                    maint_clean_q;   // 1=clean（保留 valid/数据），0=inval（清 valid）
     reg [INDEX_BITS-1:0]   maint_idx_q;     // 当前扫描组索引
+    //   ★★ 4b-2c 收尾（cbo.clean/flush 补写回）：维护扫描也需要**读 tag** 才能知道
+    //     哪一路是脏的；写回**复用**填充/受害者那条"抓行(MS_WB_CAP) + 推总线(MS_WB_BUS)"
+    //     通路（不新增数据通路、不新增端口），故只需三个小寄存器：
+    //       · `maint_rd_q`  ：本组已发出 tag 读地址（下一拍数据有效）
+    //       · `maint_done_q`：本组**已写回**的路掩码（一组可能多路脏 ⇒ 逐路写回直到干净）
+    //       · `maint_wb_q`  ：本笔写回由维护扫描发起 ⇒ `wb_finish` 后回**扫描**而不是填充
+    //   另：`clean_all & inval_all` 同时有效 = **flush**（先写回再失效；见 `maint_flush_q`）
+    reg                    maint_rd_q;
+    reg  [WAYS-1:0]        maint_done_q;
+    reg                    maint_wb_q;
+    reg                    maint_flush_q;
     reg                    wb_active_q;     // 写回总线阶段在途
     reg [31:0]             wb_line_q;       // 在途写回行基址（物理地址）
     reg [WAY_W-1:0]        wb_way_q;        // 写回源路
@@ -285,7 +296,26 @@ module l1d #(
     // 抓行阶段用写回行的索引 + 抓行计数寻址受害者路数据
     // 抓行阶段：已与控制器握手，正在把受害者整行逐字读入行缓冲
     // clean 扫描：对当前组清 dirty（专用口，保留 valid/tag）
-    wire                  maint_dirty_clr = maint_q & maint_clean_q;
+    //   ★★ 维护写回（cbo.clean/flush）：逐组、逐路把**脏行**写回内存后才清 dirty。
+    //   · `maint_rd_en`：clean 扫描发 tag 读地址那一拍（下一拍 tag_rdata/tag_dirty 有效）
+    //    · `maint_dvec`：本组"有效 & 脏 & 尚未写回"的路掩码（用同步读回的数据，跨迭代稳定）
+    //    · `maint_adv_w`：本组已无脏路 ⇒ 本拍完成该组（清 dirty / flush 再失效）并前进
+    wire maint_flush_w  = clean_all & inval_all;         // flush = clean + inval
+    wire maint_rd_en    = maint_q & maint_clean_q & ~maint_rd_q & ~maint_wb_q;
+    wire [WAYS-1:0] maint_dvec = {tag_dirty[3], tag_dirty[2], tag_dirty[1], tag_dirty[0]} &
+                                 {tag_vld[3],   tag_vld[2],   tag_vld[1],   tag_vld[0]}   &
+                                 ~maint_done_q;
+    wire maint_adv_w    = maint_q & maint_clean_q & maint_rd_q & ~maint_wb_q & (maint_dvec == {WAYS{1'b0}});
+    wire [WAY_W-1:0] maint_way_w = maint_dvec[0] ? 2'd0 : maint_dvec[1] ? 2'd1 :
+                                   maint_dvec[2] ? 2'd2 : 2'd3;
+    wire [TAG_W-1:0] maint_tag_w = (maint_way_w == 2'd0) ? tag_rdata[0] :
+                                   (maint_way_w == 2'd1) ? tag_rdata[1] :
+                                   (maint_way_w == 2'd2) ? tag_rdata[2] : tag_rdata[3];
+    //   ★ 清 dirty：**该路写回完成那一拍**用它自己的 tag 位置回写（保留 tag/valid，只清 dirty）
+    //     —— 不用原来那个"整组清 dirty"的专用口：它一次清**全组 4 路**，若一组多路脏会把
+    //       还没写回的路也标干净（丢数据）；逐路清则天然支持"一组多路脏、逐路写回再清"。
+    wire                  maint_wb_fin_w = (ms_state_q == MS_WB_BUS) & wb_finish & maint_wb_q;
+    wire                  maint_dirty_clr = 1'b0;   // （原整组清 dirty 口不再使用，见上）
     wire                  cap_phase    = (ms_state_q == MS_WB_CAP) & wb_taken_q;
     // ★ 读地址用**本拍发出**的访问（rd_en 本拍），读数据下一拍到 ⇒ 与命中判定同拍。
     wire [INDEX_BITS-1:0] rd_index_sel = cap_phase ? wb_line_q[OFF_BITS +: INDEX_BITS]
@@ -306,7 +336,10 @@ module l1d #(
             // ★ 维护（inval/clean）：在扫描拍对**所有路**的 maint_idx_q 组写入。
             //   必须有独立的扫描索引；用访问索引或全局电平都会误写/漏写。
             // clean 走"只清 dirty"专用口（保留 tag/valid）；inval 走整项写（清 valid）
-            wire way_maint    = maint_q & ~maint_clean_q;
+            //   inval：破坏性失效；flush：在"该组脏行已全部写回"那一拍再失效（数据已落内存）
+            wire way_maint    = (maint_q & ~maint_clean_q) | (maint_adv_w & maint_flush_q);
+            //   ★ 维护写回完成 ⇒ 只清**这一路**的 dirty（保留 tag/valid；读口数据仍是本组读回的）
+            wire way_clr      = maint_wb_fin_w & (maint_way_w == gw[WAY_W-1:0]);
             // 抓行只读受害者路的数据（tag 不动）
             wire way_cap      = (ms_state_q == MS_WB_CAP) & (wb_way_q == gw[WAY_W-1:0]);
 
@@ -319,19 +352,22 @@ module l1d #(
                 .clk        (clk),
                 // ★ 维护（clean/inval）只允许改写"被寻址那一项"且必须保留其 tag；
                 //   若在无访问的拍上对全部路写 tag/valid，会破坏其它组的项（静默错）。
-                .wr_en      (way_fill_tag | way_st | way_maint),
-                .wr_addr    (way_maint    ? maint_idx_q
+                .wr_en      (way_fill_tag | way_st | way_maint | way_clr),
+                .wr_addr    ((way_maint | way_clr) ? maint_idx_q
                                           : (way_fill_tag ? fill_line_q[OFF_BITS +: INDEX_BITS]
                                                           : acc_index_q)),
-                .wr_tag     (way_fill_tag ? fill_line_q[31 -: TAG_W] : acc_tag_q),
+                .wr_tag     (way_fill_tag ? fill_line_q[31 -: TAG_W]
+                                          : (way_clr ? tag_rdata[gw] : acc_tag_q)),
                 // valid：inval 扫描清 0；其余（填充/store/clean）保持 1
                 .wr_valid   (way_fill_tag ? 1'b1
                                           : (way_maint ? 1'b0 : 1'b1)),
-                // dirty：维护扫描清 0；填充清 0；store 置 1
+                // dirty：inval/写回完成清 0；填充清 0；store 置 1
                 .wr_dirty   (way_fill_tag ? 1'b0
-                                          : (way_maint ? 1'b0 : 1'b1)),
-                .rd_en      (access),               // tag 只在访问拍读
-                .rd_addr    (va_index),
+                                          : ((way_maint | way_clr) ? 1'b0 : 1'b1)),
+                //   ★★ 维护 clean 扫描也要读 tag（判断哪一路脏 ⇒ 该写回哪一行）；
+                //     复用同一读口（维护期间访问被 stall ⇒ 无冲突）
+                .rd_en      (access | maint_rd_en),
+                .rd_addr    (maint_rd_en ? maint_idx_q : va_index),
                 .rd_tag_r   (tag_rdata[gw]),
                 .rd_valid_r (tag_vld[gw]),
                 .rd_dirty_r (tag_dirty[gw]),
@@ -429,6 +465,10 @@ module l1d #(
             maint_q       <= 1'b0;
             maint_clean_q <= 1'b0;
             maint_idx_q   <= {INDEX_BITS{1'b0}};
+            maint_rd_q    <= 1'b0;
+            maint_done_q  <= {WAYS{1'b0}};
+            maint_wb_q    <= 1'b0;
+            maint_flush_q <= 1'b0;
             wb_line_q     <= 32'h0;
             fill_way_q    <= {WAY_W{1'b0}};
             wb_way_q      <= {WAY_W{1'b0}};
@@ -440,7 +480,11 @@ module l1d #(
         end else if ((inval_all | clean_all) & ~maint_q) begin
             // 启动全阵列维护扫描（逐组进行；完成后自动退出并清 PLRU）
             maint_q       <= 1'b1;
-            maint_clean_q <= clean_all & ~inval_all;   // inval 优先
+            maint_clean_q <= clean_all;                // ★ clean/flush 都要"读 tag + 写回"
+            maint_flush_q <= clean_all & inval_all;    // ★ flush = clean + inval
+            maint_rd_q    <= 1'b0;
+            maint_done_q  <= {WAYS{1'b0}};
+            maint_wb_q    <= 1'b0;
             maint_idx_q   <= {INDEX_BITS{1'b0}};
             ms_state_q    <= MS_IDLE;
             fill_active_q <= 1'b0;
@@ -449,15 +493,55 @@ module l1d #(
             wb_taken_q    <= 1'b0;
             wb_want_q     <= 1'b0;
             cap_rd_q      <= {(WIDX_BITS+1){1'b0}};
-        end else if (maint_q) begin
-            // 维护扫描：本拍对 maint_idx_q 指向的组写所有路（清 dirty / 清 valid）
-            if (maint_idx_q == SETS[INDEX_BITS-1:0] - 1'b1) begin
-                maint_q     <= 1'b0;
-                plru_l0_q   <= {SETS{1'b0}};
-                plru_l1a_q  <= {SETS{1'b0}};
-                plru_l1b_q  <= {SETS{1'b0}};
+        //   ★★ 注意：维护扫描只在**写回 FSM 空闲**时推进（`ms_state_q == MS_IDLE`）——
+        //     维护发起的写回要复用 `MS_WB_CAP/MS_WB_BUS` 两态，而这两态的推进在下面
+        //     `case (ms_state_q)` 里 ⇒ 若扫描分支无条件抢占，写回永不推进（实测：
+        //     `wb_req` 常拉高、控制器反复对同一行发起写突发 ⇒ AW 计数暴涨 + 维护永不结束）。
+        end else if (maint_q & (ms_state_q == MS_IDLE)) begin
+            //------------------------------------------------------------------
+            // 维护扫描
+            //   · **inval**（破坏性，cbo.inval）：维持原有口径 —— 逐组一拍、清 valid
+            //   · **clean / flush**（cbo.clean / cbo.flush）：**先写回该组所有脏行**，
+            //     再清 dirty（flush 再失效）—— 见上方 `maint_dvec` 说明
+            //------------------------------------------------------------------
+            if (~maint_clean_q) begin
+                // ---- inval：本拍对 maint_idx_q 指向的组写所有路（清 valid/dirty）----
+                if (maint_idx_q == SETS[INDEX_BITS-1:0] - 1'b1) begin
+                    maint_q     <= 1'b0;
+                    plru_l0_q   <= {SETS{1'b0}};
+                    plru_l1a_q  <= {SETS{1'b0}};
+                    plru_l1b_q  <= {SETS{1'b0}};
+                end else begin
+                    maint_idx_q <= maint_idx_q + 1'b1;
+                end
+            end else if (maint_wb_q) begin
+                // ---- 本组某一路的写回在途：等 MS_WB_BUS 的 `wb_finish`（那里清 maint_wb_q）
+                //      此处**不动** maint_idx_q / maint_done_q（写回完成后回本分支重新判脏）
+            end else if (~maint_rd_q) begin
+                // ---- 发本组的 tag 读地址（下一拍 tag_rdata/tag_vld/tag_dirty 有效）----
+                maint_rd_q <= 1'b1;
+            end else if (maint_dvec != {WAYS{1'b0}}) begin
+                // ---- 本组还有"有效且脏且未写回"的路 ⇒ 复用受害者写回通路写它 ----
+                maint_done_q <= maint_done_q | ({{(WAYS-1){1'b0}}, 1'b1} << maint_way_w);
+                maint_wb_q   <= 1'b1;
+                wb_want_q    <= 1'b1;
+                wb_line_q    <= {maint_tag_w, maint_idx_q, {OFF_BITS{1'b0}}};
+                wb_way_q     <= maint_way_w;
+                wb_taken_q   <= 1'b0;
+                cap_rd_q     <= {(WIDX_BITS+1){1'b0}};
+                ms_state_q   <= MS_WB_CAP;      // 抓行（读该路整行）→ 推总线
             end else begin
-                maint_idx_q <= maint_idx_q + 1'b1;
+                // ---- 本组已无脏路 ⇒ 本拍完成该组（清 dirty 或 flush 失效）并前进 ----
+                maint_rd_q   <= 1'b0;
+                maint_done_q <= {WAYS{1'b0}};
+                if (maint_idx_q == SETS[INDEX_BITS-1:0] - 1'b1) begin
+                    maint_q     <= 1'b0;
+                    plru_l0_q   <= {SETS{1'b0}};
+                    plru_l1a_q  <= {SETS{1'b0}};
+                    plru_l1b_q  <= {SETS{1'b0}};
+                end else begin
+                    maint_idx_q <= maint_idx_q + 1'b1;
+                end
             end
         end else begin
             // ---- tag 读数据有效标志 ----
@@ -546,8 +630,11 @@ module l1d #(
                         wb_active_q <= 1'b0;
                         wb_taken_q  <= 1'b0;
                         wb_want_q   <= 1'b0;
+                        //   ★★ 维护扫描发起的写回：**回扫描**（清 maint_wb_q，让扫描重新判脏
+                        //     并继续下一路/下一组）—— **不**进填充（这不是缺失腾路）
+                        if (maint_wb_q) maint_wb_q <= 1'b0;
                         // 写回完成 ⇒ 转到填充（写分配：先腾路再填）
-                        ms_state_q  <= MS_FILL_REQ;
+                        ms_state_q  <= maint_wb_q ? MS_IDLE : MS_FILL_REQ;
                         // ★ 写回完成后要填的是**本笔请求的行**（pend_line_q），
                         //   而不是被写回的受害者行（wb_line_q）——后者已失效腾空。
                         fill_line_q <= pend_line_q;

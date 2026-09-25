@@ -262,8 +262,15 @@ module core_top_2b (
     //      **没有维护写回通道** ⇒ 真 flush 会丢已提交脏行（实测 p12 第 12/13 条 load
     //      读到 0）。本核为单核、无外部缓存代理 ⇒ 取"数据不丢"的保守语义：flush 只 clean。
     //      待 2A L1D 维护写回通道落地后再补 INVAL（报告 §B4.18 待办）。
-    wire        maint_l1d_inval_w  = maint_act_q & (maint_kind_act_w == 3'd3);   // cbo.inval
-    wire        maint_l1d_clean_w  = maint_act_q & (maint_kind_act_w >= 3'd4);   // clean/flush
+    //   ★★ 4b-2c 收尾：`cbo.flush` = **写回 + 失效**（Zicbom：flush 是 clean 的加强版，含 INVAL）。
+    //     实现口径：`inval_all & clean_all` **同时**有效 ⇒ L1D 走"flush 扫描"（逐组先写回脏行、
+    //     该组干净后再失效，见 `l1d.v` 的 `maint_flush_q`）；只 `clean_all` = cbo.clean；
+    //     只 `inval_all` = cbo.inval（**破坏性**：脏数据直接丢，符合 Zicbom 的 INVAL 语义）。
+    //     （旧口径：flush 只 clean 不失效 —— 因为当时 L1D 维护口没有写回通道，真 INVAL 会
+    //       丢已提交脏行 ⇒ 取"数据不丢"的保守语义；本段补上写回通道后按架构口径放开。）
+    wire        maint_l1d_inval_w  = maint_act_q & ((maint_kind_act_w == 3'd3) |
+                                                   (maint_kind_act_w == 3'd5));  // cbo.inval / cbo.flush
+    wire        maint_l1d_clean_w  = maint_act_q & (maint_kind_act_w >= 3'd4);   // cbo.clean / cbo.flush
     //   （fence.i **不刷 TLB** —— 它只管指令缓存；sfence.vma 才刷 TLB，2A 同口径）
     wire        maint_tlb_sfence_w = maint_act_q & (maint_kind_act_w == 3'd2);
     wire [6:0]  dbg_rob_cnt_w;

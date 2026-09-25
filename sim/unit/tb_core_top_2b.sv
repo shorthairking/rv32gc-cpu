@@ -42,6 +42,10 @@ module tb_core_top_2b #(
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
+    //   ★★ 4b-2c 收尾：p12 的 **cbo.clean/flush 现在会真的写回脏行**（L1D 维护写回，
+    //     见 `l1d.v` §maint）⇒ 单次 clean 的代价 = 256 组扫描 + **每条脏行一次 AXI 写突发**
+    //     （本 TB 里 L1D 跨程序保留上一批程序的脏行 ⇒ 实测 ~127 条 × ~40 拍 ≈ 5.5k 拍）。
+    //     故 p12 用独立的固定拍数（p8/p13 仍用 P8_CYCLES —— 它们的时长是**有意固定**的）。
     //   p8 诊断开关（默认关；定位"中断后为何长时间不派发"时置 1）：
     //   · 实测结论（报告 §B4.4.3）：中断/xRET 的 `flush_all` 触发 rename 的 free list
     //     重建 FSM（`rb_act`）逐拍扫描 NREG=96 项 ⇒ 约 96 拍 `busy=1` ⇒ 派发暂停
@@ -426,6 +430,8 @@ module tb_core_top_2b #(
     // 5. 主流程
     //==========================================================================
     integer cyc, k, d_pc, d_rd, d_wd;
+    integer cyc_fixed;
+    localparam integer P12_CYCLES = 16000;   // ★ 见上：p12 需覆盖"clean 全阵列写回"的代价
     integer cyc_before, inst_before;        // Zicntr 活性检查采样（C10'）
     integer ar0, rb0, aw0, wb0, b0, xip0;
     integer pid;
@@ -486,7 +492,8 @@ module tb_core_top_2b #(
             cyc = 0;
             if ((pid == 4) || (pid == 8) || (pid == 9)) begin
                 //   ★ p8_int：固定拍数（无黄金轨迹可等；中断在 ~200 拍后到，余量充足）
-                for (k = 0; k < P8_CYCLES; k = k + 1) begin
+                cyc_fixed = ((pid == 8) ? P12_CYCLES : P8_CYCLES);
+                for (k = 0; k < cyc_fixed; k = k + 1) begin
                     @(posedge clk);
                     //   [诊断，默认关] CLINT/CSR/中断判定现场（每 500 拍一条，共 8 条）
                     if (DBG_P8 && ((k % 500) == 0))
@@ -496,7 +503,7 @@ module tb_core_top_2b #(
                                  u_dut.csr_mstatus_raw, u_dut.irq_mti_w,
                                  u_dut.u_back.rob_cnt_w, u_dut.clint_req_vld, u_dut.clint_hit_w);
                 end
-                cyc = P8_CYCLES;
+                cyc = cyc_fixed;
                 $display("   [C8'] 中断现场：mtvec=0x%08x mepc=0x%08x mcause=0x%08x | 处理程序 s1=1、主程序 a0=1（共提交 %0d 条）",
                          u_dut.u_csr_file.mtvec_o, u_dut.u_csr_file.mepc_o,
                          trp_mcause_cap, nrec);
@@ -678,6 +685,15 @@ module tb_core_top_2b #(
                                        (rrd[k] == 5'd19) || (rrd[k] == 5'd20)) &&
                             (rwd[k] === 32'h5566_7788)) crk = crk + 1;
                     chk(crk >= 4, $sformatf("C12' p12：cbo 后 4 次 load 均读到 0x55667788，实测 %0d 次", crk));
+                    //   ★★ 4b-2c 收尾新增：**cbo.clean 真的把脏行写回内存**（AXI 写通道自证）
+                    //     —— 旧实现只清 dirty 不写回（数据只留在 L1D，逐出即丢）；
+                    //     现在维护扫描逐条脏行走既有写回通路 ⇒ AW/W/B 必须都有真实流量。
+                    chk((n_aw - aw0) > 0, $sformatf("C12'-w1 p12：cbo.clean **写回脏行** ⇒ AXI AW 有真实流量，实测 %0d", n_aw - aw0));
+                    chk((n_wb - wb0) > 0, $sformatf("C12'-w2 p12：cbo.clean 写回 ⇒ AXI W 有写数据拍，实测 %0d", n_wb - wb0));
+                    chk((n_b  - b0)  > 0, $sformatf("C12'-w3 p12：cbo.clean 写回 ⇒ AXI B 有写响应，实测 %0d", n_b - b0));
+                    //   ★★ cbo.flush = **写回 + 失效**：失效后同地址 load 必须**从内存重新取**
+                    //     （写回若没落到内存，这里必读到旧值 ⇒ 与上面"4 次 load 正确"互为印证）
+                    chk(n_l1d_inval >= 2, $sformatf("C12'-f1 p12：cbo.inval + cbo.flush ⇒ L1D inval_all ≥ 2 次（flush 含 INVAL），实测 %0d", n_l1d_inval));
                     $display("   [C12'] cbo：提交 %0d 次；L1D inval %0d / clean %0d 次；全程无陷阱；4 次 load 数据正确",
                              n_maint_cmt, n_l1d_inval, n_l1d_clean);
                     $fflush();

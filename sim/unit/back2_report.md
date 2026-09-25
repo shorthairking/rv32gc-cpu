@@ -4340,3 +4340,96 @@ t=13625 ... mact=1                                            ← 维护动作�
   2A 零修改；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s42`。
 * **下一步（登记）**：①CSR 可见性互锁（边界 1，RTL 根治）；②L1D 维护写回 + `cbo.flush` INVAL；
   ③L1I 侧 PIPT 复核。
+
+---
+
+# B4.27 L1D 维护写回 + cbo.flush INVAL + L1I PIPT 复核（2B-4 第 4b-2c 段收尾）
+
+> 起点 = 母代理已验收提交 `b8f21f3`（tag 2B-4.25）。
+> **结论**：`cbo.clean/flush` 现在**真的把脏行写回内存**（复用既有写回通路，无新数据通路/端口）；
+> `cbo.flush` = **写回 + 失效**（架构口径，旧"只 clean 不失效"的保守口径已不再需要）；
+> L1I **PIPT 复核通过、无需修改**（另登记一处同族缺口：L1I 的 `inval_all` 未接）。
+> 检查点：`tb_core_top_2b` **145/145 PASS**；`regress.sh` **32/32 PASS**（§B4.27.5）；2A 其余零修改。
+
+## B4.27.1 ① L1D 维护写回（`rtl/cache/l1d.v`，最小加法 + 理由）
+
+旧口径（`clean_all` 只清 dirty、不写回）：数据只留在 L1D，**一旦该行被逐出即永久丢失**
+（内存是旧值）⇒ 属"测试没抓到的潜在正确性缺陷"（p12 的 cbo 之后仍能读到正确数据，只是因为
+行还驻留在 cache 里）。补写回的最小加法（**不新增数据通路、不新增端口**）：
+
+| 加法 | 内容 | 理由 |
+|---|---|---|
+| tag 读口复用 | `.rd_en(access \| maint_rd_en)`、`.rd_addr(maint_rd_en ? maint_idx_q : va_index)` | 维护扫描原本**盲写**（不需要知道哪一路脏）；补写回就必须先**读 tag** 拿到 脏位 + 该行 tag。维护期间访问被 stall ⇒ 同口复用无冲突 |
+| 3 个寄存器 | `maint_rd_q`（本组读地址已发）/ `maint_done_q[WAYS]`（本组已写回的路）/ `maint_wb_q`（本笔写回来自维护） | 一组可能**多路脏** ⇒ 逐路写回直到干净；`maint_wb_q` 决定 `wb_finish` 后回**扫描**而不是进填充 |
+| 扫描子状态 | clean 扫描：发读 → 判"有效&脏&未写回"的路 → **复用 `MS_WB_CAP`/`MS_WB_BUS`** 写它 → 直到本组无脏路 → 前进 | 写回**完全复用**既有受害者通路（抓行 9 拍 + 推总线 8 beat + `wb_*` 握手），零新增数据路径 |
+| 逐路清 dirty | `way_clr[gw] = maint_wb_fin_w & (maint_way_w == gw)`：写回完成拍用**该路自己的 tag** 回写（保留 tag/valid，只清 dirty） | 原来的"整组清 dirty"专用口一次清 **4 路** ⇒ 一组多路脏时会把还没写回的路标干净（丢数据）。逐路清天然支持"一组多路脏、逐路写回再清" |
+| flush 模式 | `maint_flush_q = clean_all & inval_all`：逐组先写回脏行，**该组干净后**再 `way_maint` 失效 | flush = clean + inval；顺序必须是"先写回、后失效"，否则丢已提交脏行 |
+
+**过程中由实测抓出的两个实现级坑（都已在代码注释里写明）**：
+1. **维护分支抢占了写回 FSM 的推进**：原结构是 `else if (maint_q) <扫描> else <case(ms_state_q)>`
+   —— 维护写回要复用 `MS_WB_CAP/MS_WB_BUS`，而它们的推进在 `case` 里 ⇒ 扫描分支无条件抢占时
+   写回永不推进：`wb_req` 常拉高、控制器**反复对同一行发起写突发**（实测 AW=571、L1D 永不结束、
+   程序 16000 拍只提交 10 条）。修法：`else if (maint_q & (ms_state_q == MS_IDLE))` ——
+   扫描只在写回 FSM 空闲时推进。
+2. **清 dirty 必须逐路**（见上表）。
+
+## B4.27.2 ② cbo.flush 的 INVAL 上线（`rtl/top/core_top_2b.v`）
+
+```verilog
+- wire maint_l1d_inval_w = maint_act_q & (maint_kind_act_w == 3'd3);        // cbo.inval
++ wire maint_l1d_inval_w = maint_act_q & ((maint_kind_act_w == 3'd3) |
++                                         (maint_kind_act_w == 3'd5));     // cbo.inval / cbo.flush
+  wire maint_l1d_clean_w = maint_act_q & (maint_kind_act_w >= 3'd4);        // clean/flush
+```
+口径：**只 `inval_all`** = cbo.inval（**破坏性**，脏数据直接丢 —— Zicbom 语义允许）；
+**只 `clean_all`** = cbo.clean（写回、保留）；**两者同时** = cbo.flush（写回 + 失效）✓。
+旧注释里"flush 只 clean"的保守口径（因当时无写回通道）**已随写回落地而废止**。
+★ 可见性证据：p12 的 `cbo.flush` 之后同地址 4 次 load 仍读到正确值（0x55667788），
+而此时该行**已被失效** ⇒ 数据只能来自**内存**（= 写回真的落到了内存）✓。
+
+## B4.27.3 ③ L1I PIPT 复核：**无需修改**
+
+* `rtl/front4/ifetch4.v:413`：`assign l1i_req_addr = f4_pa_q;`（注释即"PIPT：查表地址 = PA"）
+  ⇒ L1I 的取指请求地址是**翻译后的物理地址** ✓
+* `core_top_2b` 例化：`.cs_paddr(l1i_req_addr), .cs_vaddr(l1i_cs_vaddr)` 且
+  `l1i_cs_vaddr = fencei_busy ? {19'b0, fencei_idx_q, 5'b00000} : l1i_req_addr`
+  ⇒ **index 与 tag 同源 = PA**（PIPT），不存在 L1D 那种"index 取 VA、tag 取 PA"的混用 ✓
+* XIP 旁路用 `cs_paddr`（物理窗口判定）✓；`fence.i` 扫掠用**物理索引**（低位补 0）驱动 `cs_vaddr` ✓
+  ⇒ 与 PIPT 口径自洽 ✓
+* **结论：无同款缺陷，不改 `l1i.v`** ✓
+
+**同时登记一处同族缺口（非 PIPT，趁复核发现，未在本轮改）**：
+`core_top_2b` 的 L1I 例化里 `.inval_all(1'b0)` —— **L1I 的失效口没接**，即 `fence.i` 的 256 拍扫掠
+只改了 `cs_vaddr`（索引）、并没有真正清 valid ⇒ **fence.i 不真正失效 L1I**。
+（现有 TB 之所以全绿：注释已登记"L1I 阵列无复位、`inval_all` 未接"，并用**每程序 16 KB 递进基址**
+规避"同 tag 陈旧命中"；C11' 的 `n_l1i_inval ≥ 512` 数的是 **核心侧扫掠脉冲**（`fencei_busy`），
+不是 L1I 实际失效效果 —— 属"判据测的是发起、不是效果"的口径缺口。）
+**修法（一行，待后续段连同 fence.i 语义一起做）**：`.inval_all(fencei_busy)` ——
+扫掠本就是"每拍一组 + 该组索引在 `cs_vaddr`"的设计，接上后 256 拍恰好扫完整阵列 ✓。
+
+## B4.27.4 ④ p12 判据扩展（`sim/unit/tb_core_top_2b.sv`）
+
+* **`C12'-w1/w2/w3`（新）**：`cbo.clean` 后 AXI **写通道有真实流量** —— `AW>0 & W>0 & B>0`
+  （写回自证；旧实现恒 0）。实测 `AW=2 / W=16 / B=2`（两条脏行 × 8 beat）✓
+* **`C12'-f1`（新）**：`n_l1d_inval ≥ 2`（cbo.inval + cbo.flush 各一次 ⇒ flush 确实含 INVAL）✓
+* 既有 `4 次 load 均读到 0x55667788` 在**真 flush（失效）** 之后依然全过 ⇒ 写回后数据可见性正确 ✓
+* p12 的固定拍数：新增 `P12_CYCLES = 16000`（p8/p13 仍用 `P8_CYCLES`）—— 理由：clean 现在会
+  **逐条写回脏行**，而本 TB 的 L1D 跨程序保留上一批程序的脏行（缓存无复位）⇒ 单次全阵列 clean
+  的代价 ~127 行 × ~28 拍（一次 AXI 写突发）。这是**真实代价**，不是判据放宽（判据只增不减）。
+
+## B4.27.5 检查点（本会话实测）
+
+* 编译 **0 error**；`tb_core_top_2b` **145/145 PASS**（`../.b2chk/m6.log`）：
+  `[C12'] cbo：提交 3 次；L1D inval 2 / clean 2 次；全程无陷阱；4 次 load 数据正确`
+  + `检查项合计 145 项全部满足`（141 + C12' 新增 4 项，**既有 141 项零回退**）。
+* `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c14.log`）。
+* ★ **`tb_l1d` 单元判据同步更正（判据只增不减）**：该 TB 的 C6 原写死
+  `chk(wb_req === 1'b0, "C6 clean 自身不应产生写回")` —— 与架构口径（Zicbom：clean = 写回）相反，
+  是本轮补写回后被它抓出来的**旧口径残留**。已改为更强的判据：clean 扫描期间**必须**服务写回握手且
+  **至少写回 1 笔**、写回地址 = 脏行 A1 的行基址、写回数据**真的带出新值**（A1+4 = 0xAAAA_0000），
+  并保留"clean 后 A1 已不脏 ⇒ 无残留写回请求"✓（现 `TB_L1D_UNIT: PASS`，33/33）。
+* 改动文件：`rtl/cache/l1d.v`（维护写回，最小加法）、`rtl/top/core_top_2b.v`（flush INVAL 一行）、
+  `sim/unit/tb_core_top_2b.sv`（C12' 扩展 + p12 拍数）、`sim/unit/back2_report.md`。
+  **2A 其余零修改**；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s43`（含 `l1d.v.pre`）。
+* **下一步（登记）**：①L1I `.inval_all(fencei_busy)` + fence.i 效果判据（§B4.27.3）；
+  ②CSR 可见性互锁（§B4.26.4 边界 1）；③L1I/L1D 复位与跨程序陈旧行（TB 侧已用递进基址规避）。
