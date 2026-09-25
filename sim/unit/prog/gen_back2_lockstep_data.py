@@ -64,6 +64,11 @@ PROGS = [
     #     三条异常落三个不同槽（cause 11/2/3 ⇒ base+44/+8/+12），槽标记进写回轨迹
     #     ⇒ 向量化目标算错必被黄金比对抓住。有 Spike 黄金（M 模式陷阱语义可比）。
     ("back2_p9_trapvec.S", "P9", "rv32ima_zicsr",   "rv32imac_zicsr"),
+    #   ★ 2B-4 第 4b-1 段：**CSR 读写轨迹**（替换 `b2_csr`→`csr_file` 的"先立后用"判据）——
+    #     只使用两种实现都有的 CSR（mscratch/mepc/mtvec/mcause/mtval/mie/mip/mstatus），
+    #     覆盖 csrw/csrr/csrrw/csrrs/csrrc + **立即数形式**（D2 回归保护），
+    #     全部读回值进写回轨迹 ⇒ 与 Spike 黄金逐条比。
+    ("back2_p10_csr.S",    "P10", "rv32ima_zicsr",  "rv32imac_zicsr"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"

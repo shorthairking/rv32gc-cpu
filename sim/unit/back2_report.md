@@ -2435,3 +2435,168 @@ vvp /tmp/ct2b.vvp | tail -12      # ⇒ TB_CORE_TOP_2B: PASS（**68 项**；含 
   `sim/unit/prog/back2_p9_trapvec.S`（新）、`sim/unit/prog/back2_p8_int.S`（向量表）、
   `sim/unit/prog/gen_back2_lockstep_data.py`（p9 条目）、`sim/unit/prog/back2_lockstep_data.svh`（再生成）。
 - 未提交 git；快照 `../.b2chk/*.s15`（本段最终态）、`../.b2chk/*.s14`（4a 收官态）。
+
+
+# 2B-4 第 4b-1 段（`b2_csr` → `csr_file` 替换）—— **CSR 轨迹判据落地 + 两处真实缺陷修正 + 端口级替换方案**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 4b 1/3 `c7fb923`=tag `2B-4.5`，**未提交新改动**）
+> 任务：实例化 2A `csr_file`+`priv_ctrl`+`trap_ctrl`+`pmp_check` 替换 `b2_csr`；删除 4a 自造 `trp_csr_*`；
+> 适配层三要点（ROB 头当 W 拍 / `exc_valid` 与 `commit_valid` 相与 / CSR 写数据 `rdata_w` 旁路 + 立即数形式取 `insn[19:15]`）。
+> **预算见底 ⇒ 按任务书停在"整设计可编译 + 既有判据全绿"检查点**，本段交付：
+> ①**CSR 读写轨迹判据**（新程序 `back2_p10_csr.S`，与 Spike 黄金逐条比）——判据②的 CSR 部分；
+> ②该判据**首轮就抓出两处真实缺陷并已修正**（D5a/D5b，都直接关系到本任务的适配层第③点）；
+> ③替换的**端口级接线表 + 删除清单（带行号）+ 与 2A 的八条口径差异登记**（含 1 条需母代理裁决）。
+
+## B4.6.0 结论（一句话）
+
+**新增的 CSR 轨迹判据把"CSR 立即数形式判定"和"提交点 CSR 源取 lane 0"两处真实缺陷当场抓出并修好
+（这正是本任务适配层第③点要落的两件事），`tb_core_top_2b` 从 68 项扩到 **79 项全绿**、p1/p3/p6/p7/p8/p9 无回退；
+`csr_file`+`trap_ctrl`+`priv_ctrl` 的实际替换**未做**——它是"两文件同改、约 250 行、含 1 条待裁决口径"的原子改动，
+预算内无法保证迭代到全绿，按任务书停在检查点，并留下可直接执行的**分阶段方案（4b-1a/1b/1c）**。**
+
+## B4.6.1 本段已完成（全部可复核）
+
+| 项 | 内容 | 证据 |
+|---|---|---|
+| **新判据程序 `back2_p10_csr.S`** | 只用"两种实现都具备"的 CSR（mscratch/mepc/mtvec/mcause/mtval/mie/mstatus），覆盖 `csrw`/`csrr`/`csrrw`/`csrrs`/`csrrc` + **立即数形式** `csrrwi`/`csrrsi`/`csrrci`；每个结果都进通用寄存器 ⇒ 与 **Spike 黄金逐条比** | 黄金 45 条；TB 输出 `[C10'] CSR 轨迹：mscratch(w/rw/rs/rc/wi/si/ci)=0x10、mie=0x808、mstatus&0x1888=0x1800；csrrw/rs/rc 旧值、WARL 回读均与 Spike 黄金逐条一致` |
+| **缺陷 D5a（4a 段 D2 修法自身写错）** | 立即数形式判据必须是 **funct3 最高位 `insn[14]`**；4a 写成 `\|insn[14:13]`，而 `csrrs`(010)/`csrrc`(011) 的 `[14:13]=2'b01` 也非零 ⇒ **寄存器形式被误判成立即数形式**，源操作数取成"寄存器号" | 实测：`csrrc s5,mscratch,t3` 落盘 `0x0F0F0F03`（用 0x1C 当源值），Spike 黄金 `0x0F0F0F00`；修后逐条一致（`rtl/back2/backend_top.v` 的 `csr_cmt_zimm`） |
+| **缺陷 D5b（B29 残留）** | 提交点 CSR 源固定用 **lane 0** 载荷的 `ps1i` 去读 PRF ⇒ CSR 指令不在 lane 0 时读到无关寄存器；改为用**该 CSR 指令自己**的 `ps1i`（新增 `csr_cmt_ps1i`，在提交组扫描里捕获） | 同上修复块；D5a+D5b 后 `csrrs`→`csrrc` 背靠背读改写链与黄金逐条一致（idx 9~16 全对） |
+| **判据扩展** | TB 程序数 6→7（新增 p10）；新增 **C10'** 3 条（mscratch 立即数序列末值 / mie 回读 / mstatus 掩码回读）；诊断打印改为 `DBG_P10` 门控 | **TB_CORE_TOP_2B: PASS，79/79 项**（`../.b2chk/final_4b1_run.log`） |
+| **既有判据不回退** | p1 449/161、p3 462/126、p6 1077/366（AW=2/W=16/B=2）、p7 755/89（陷阱 cause 11/2/3）、p8 4000/524（MTI 中断 1 次）、p9 843/92（MODE=1 异常回 BASE） | 同上日志；`regress.sh` 见 §B4.6.7 |
+| **`mip.MTIP` 复位口径实测** | Spike 的 CLINT `mtimecmp` 复位 **0** ⇒ 一上电 MTIP=1（`mip=0x80`）；2A/本核 `clint.v` 复位 `mtimecmp=0xFFFF_FFFF` ⇒ MTIP=0。**无法在程序内对齐**（本核 CLINT 在 `0x1F00_0000`、Spike 在 `0x0200_0000`）⇒ p10 不纳入 raw `mip` 读，MTIP 判据交由 p8 | p10 首轮实测 `FAIL: 程序 6 第 33 条 写回值=0x00000000 期望 0x00000080（rd=14）`；登记见 §B4.6.4-③ |
+
+## B4.6.2 适配层接线表（端口级，供 4b-1b 直接照抄）
+
+### (1) `backend_top`：把 CSR 文件"请出后端"（新端口 7 个，删除 6 个）
+
+| 端口 | 方向 | 驱动/来源 | 说明 |
+|---|---|---|---|
+| `csr_raddr_o[11:0]` | out | `= csr_raddr_w`（现有内部信号） | 与 4a 相同：`csr_cmt_we ? csr_cmt_addr : u_csra(csr_uop)` |
+| `csr_rdata_i[31:0]` | in | 顶层 `csr_file.rdata` | **内部 `csr_rdata_w` 由该输入直接赋值** ⇒ `a0_wb_data`/`csr_wdata_w` 等 5 处使用点**零改动** |
+| `csr_we_o` / `csr_waddr_o[11:0]` / `csr_wdata_o[31:0]` | out | `csr_we_w` / `csr_waddr_w` / `csr_wdata_w`（均现有） | 提交点写请求；`csr_wdata_w` 已含 `ff_cmt_val` 的 fflags 并路（保留） |
+| `xret_kind_o[1:0]` | out | 由提交组 lane 0 原始指令位判：`0x3020_0073→1`(mret)、`0x1020_0073→2`(sret) | `priv_ctrl.xret_kind` 需要；`cmt0_tval` 已在 4a 引入 |
+| **删** `mtip_i`/`irq_mti_o`/`mtvec_o`/`mepc_o`（4 个） | — | 中断判定改由顶层 `trap_ctrl` 用 `csr_file.mip/mie` 做；`mtvec/mepc` 顶层直接有 | 见 §B4.6.3 删除清单 |
+
+### (2) `core_top_2b`：实例化与接线（按 `rtl/top/core_top.v:2465/2540/2568` 同法）
+
+```verilog
+// ---- CSR 文件 + 特权状态 + 陷阱决策（2A 只读例化）----
+csr_file u_csr_file (
+  .clk(aclk), .rst_n(aresetn),
+  .raddr(csr_raddr_o), .rdata(csr_file_rdata), .wen(csr_we_o),
+  .waddr(csr_waddr_o), .wdata(csr_wdata_o), .w_illegal(1'b0),
+  .rdata_w(), .byp_wdata(32'h0), .byp_rdata(),
+  .priv(csr_priv_2), .chk_addr(12'h0), .chk_illegal(), .chk_ro_write(),
+  .mstatus_o(csr_mstatus_raw), .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
+  .trap_we(trap_we), .trap_epc_i(trap_epc_i), .trap_cause_i(trap_cause_i),
+  .trap_tval_i(trap_tval_i), .trap_data_i(32'h0),
+  .irq_msip(clint_msip_w), .irq_mtip(clint_mtip_w), .irq_meip(1'b0), .irq_stip(1'b0), .irq_seip(1'b0),
+  .cycle_i(cycle_cnt), .instret_i(instret_cnt),
+  .pmp_cfg_o(pmp_cfg_flat), .pmp_addr_o(pmp_addr_flat), .satp_o(csr_satp),
+  .menvcfg_o(), .senvcfg_o(), .mcounteren_o(), .scounteren_o(),
+  .mtvec_o(csr_mtvec), .stvec_o(csr_stvec), .medeleg_o(csr_medeleg), .mideleg_o(csr_mideleg),
+  .mie_o(csr_mie), .mip_o(csr_mip), .mepc_o(csr_mepc_o), .sepc_o(csr_sepc_o));
+
+priv_ctrl u_priv_ctrl (  /* 2A core_top.v:2540 同法 */
+  .clk(aclk), .rst_n(aresetn),
+  .trap_valid(trap_valid), .trap_target(trap_target),
+  .xret_valid(xret_cmt_w), .xret_kind(xret_kind_w),
+  .mstatus_i(csr_mstatus_raw), .csr_wen(csr_we_o), .csr_waddr(csr_waddr_o), .csr_wdata(csr_wdata_o),
+  .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
+  .priv_o(csr_priv_2), .eff_priv_o(csr_eff_priv), .mprv_o(), .sum_o(), .mxr_o(), .mpp_o(),
+  .tvm_o(), .tw_o(), .tsr_o(), .fetch_priv_is_m_o(), .flush_req(), .priv_next_o());
+
+trap_ctrl u_trap_ctrl (   /* "ROB 头当 W 拍"适配 —— 见 §B4.6.4-①② */
+  .commit_valid(rob_any_w), .commit_pc(trap_pc_w), .commit_pc_next(trap_pc_w), // ★ pc_next=pc
+  .commit_insn(trap_tval_w),                                                  // 载荷 TVAL = 原始指令位
+  .exc_valid(trap_valid_w), .exc_cause({1'b0, trap_cause_w}),
+  .exc_tval(exc_tval_adapted_w),                                              // ★ 见 §B4.6.4-①
+  .exc_is_fetch(1'b0),                                                        // 待办（本核载荷无 fetch 标记）
+  .priv(csr_priv_2), .medeleg(csr_medeleg), .mideleg(csr_mideleg),
+  .mip(csr_mip), .mie(csr_mie & {32{|dbg_rob_cnt_w}}),                        // ★ ROB 空 ⇒ 不取中断
+  .mstatus_i(csr_mstatus_raw), .mtvec(csr_mtvec), .stvec(csr_stvec),
+  .trap_valid(trap_valid), .trap_is_int(), .trap_target(trap_target),
+  .trap_cause(), .trap_tval(), .trap_epc(), .trap_pc(), .redirect_pc(),
+  .trap_we(trap_we), .trap_epc_i(trap_epc_i), .trap_cause_i(trap_cause_i),
+  .trap_tval_i(trap_tval_i), .trap_data_i(), .trap_wr_m_epc(), .trap_wr_m_cause(),
+  .trap_wr_m_tval(), .trap_wr_s_epc(), .trap_wr_s_cause(), .trap_wr_s_tval());
+
+// 4a 的"重定向/flush 骨架"整体保留，只换目标来源：
+assign be_trp_flush       = trap_valid | xret_cmt_w;
+assign be_trp_redirect_v  = be_trp_flush;
+assign be_trp_redirect_pc = trap_valid ? trap_target
+                            : ((xret_kind_w == 2'd1) ? csr_mepc_o : csr_sepc_o);
+```
+
+### (3) 计数器与 pmp
+
+```verilog
+reg [63:0] cycle_cnt, instret_cnt;
+always @(posedge aclk or negedge aresetn)
+  if (!aresetn) begin cycle_cnt <= 64'h0; instret_cnt <= 64'h0; end
+  else begin cycle_cnt <= cycle_cnt + 64'd1;
+             instret_cnt <= instret_cnt + {60'b0, cmt_n_o}; end   // 提交条数累加
+pmp_check u_pmp_pte ( ... .cfg_i(pmp_cfg_flat), .addr_i(pmp_addr_flat), ... );  // §B4.5.3 已就位，改接真值
+```
+> `pmp_check` 的**取指/数据侧**两份本轮不接（PMP 强制不在验收范围）；PTE 那份按母代理裁决照抄 2A 接线
+> （`acc_type_i(pmp_acc_xlat(ptw_pmp_req_acc))`，`core_top.v:1855` + `:471-479`）。
+
+## B4.6.3 删除清单（4b-1b 执行时逐条删，行号以 `c7fb923` 为准）
+
+| 文件 | 行 | 内容 | 处置 |
+|---|---|---|---|
+| `rtl/back2/backend_top.v` | 133-141 | `trp_flush_v_i/trp_redirect_v_i/trp_redirect_pc_i/trp_halt_o/xret_cmt_o/mtip_i/irq_mti_o/mtvec_o/mepc_o` | **保留** `trp_flush_v_i`/`trp_redirect_*_i`/`trp_halt_o`/`xret_cmt_o`（4a 骨架）；**删** `mtip_i`/`irq_mti_o`/`mtvec_o`/`mepc_o`，新增 §B4.6.2(1) 的 7 个端口 |
+| 同上 | 343-346 | `csr_mstatus_mie_w/csr_mie_mtie_w/trp_csr_enter_w/trp_csr_exit_w/trp_csr_pc_w/csr_mstatus_w/csr_mie_w` 声明 | **删**（连同 `trp_csr_tval_w`） |
+| 同上 | 1462-1472 | `b2_csr u_csr (...)` 例化 | **删**（`b2_csr.v` 文件保留但**不再例化** ⇒ 满足"两套 CSR 不得并存"） |
+| 同上 | 1600-1629 | `irq_mti_w`/`csr_mstatus_mie_w`/`csr_mie_mtie_w`/`trp_is_*`/`trp_csr_enter_w`/`trp_csr_exit_w`/`trp_csr_pc_w`/`trp_csr_cause_w`/`trp_csr_tval_w` | **全删**（陷阱 CSR 落地改由顶层 `trap_ctrl.trap_we/trap_epc_i/trap_cause_i/trap_tval_i` → `csr_file`） |
+| 同上 | 1458-1461 | `DBG_CSR` 块里 `u_csr.mscratch_q` 引用 | 删该字段（否则层次名悬空） |
+| 同上 | `wire [31:0] csr_rdata_w;` | 原由 `b2_csr` 驱动 | 改为 `assign csr_rdata_w = csr_rdata_i;`（5 处使用点零改动） |
+| `rtl/top/core_top_2b.v` | §6b（~900-917） | 4a 的 `trp_mode_w/trp_base_w/trp_cause4_w/trp_vect_w/trp_target_w` 目标合成 | **删**（目标改由 `trap_ctrl.trap_target`，其内部含 2A 的 Direct/Vectored 口径，与本核 §B4.5 的 D4 修正一致） |
+| 同上 | §6b | `irq_mti_w`/`xret_cmt_w` 的采样与 `trp_cause4_w=7` | `xret_cmt_w` 保留；中断判定改由 `trap_ctrl` 承担 |
+
+## B4.6.4 与 2A 的口径差异登记（8 条，其中 ①需裁决）
+
+| # | 项 | 2A 实测 | Spike / 本核现状 | 建议 |
+|---|---|---|---|---|
+| ① | **`mtval` for ecall**（★需裁决） | `core_top.v:3160-3162`：`e_exc_tval = de_ebreak ? de_pc : de_ecall ? de_pc : 0` ⇒ **ecall 的 mtval = PC** | Spike 实测 ecall ⇒ **0**（p7 黄金），ebreak ⇒ PC（两侧一致） | 适配层按 **Spike/4a**：`exc_tval = (cause==3) ? pc : (cause∈{8,9,11}) ? 0 : tval`（非法指令由 `trap_ctrl` 用 `commit_insn` 覆盖 ✓）。**若以 2A 为准 ⇒ p7 的 mtval 累加器判据必失败**（需母代理裁决；本段按"p7 不回退"优先，默认按 Spike，并在报告登记偏差） |
+| ② | **中断 `mepc`** | `trap_ctrl.v:243`：中断时 `epc = commit_pc_next`（2A 是"W 已提交、下一条未执行"） | 本核取点在 ROB 头**提交前** ⇒ "下一条未执行"**就是头部 PC** | 适配层驱动 `commit_pc_next = commit_pc`（头部 PC）⇒ 2A 的 `trap_epc` 自然等于头部 PC；否则 p8 的 `mepc ∈ wait 循环` 判据会失败（实测过 4a 的口径 = 头部 PC ✓） |
+| ③ | `mip.MTIP` 复位 | 2A `clint.v`：`mtimecmp` 复位 `0xFFFF_FFFF` ⇒ MTIP=0 | Spike：`mtimecmp` 复位 0 ⇒ **MTIP=1**（`mip=0x80`） | 无法程序内对齐（CLINT 地址不同源）⇒ p10 不纳入 raw `mip` 读；MTIP 判据由 p8 承担（已实测登记） |
+| ④ | PTE 隐式访存 PMP | `core_top.v:1855` + `:471-479`：`pmp_acc_xlat(ptw_pmp_req_acc)`（取指遍历 PTE 按 **X**、数据侧 LOAD/STORE） | 任务书曾写"恒 LOAD" | **按母代理裁决：照抄 2A**，不做臆改；文档差异已在 §B4.5.3-5 登记 |
+| ⑤ | `mstatus` FS/SD 合并层 | `core_top.v:2538-2552`：顶层持有一份 FS/SD 覆盖 `csr_file` 的对应位 | 本核 `core_top_2b` 无 FP 状态所有者（TB 七个程序全整数） | 4b-1b **先不搬**（搬了没有 FS 源、反而制造悬空语义），登记为"FP 集成时一并搬"；`csr_file` 自带的 FS 视图（`csr_file.v:671/698`）保持原样 |
+| ⑥ | `fflags` 累加 | 2A 在 `csr_file` 写口承接（`mw_csr_wdata`） | 本核 `b2_csr` 依赖 `ff_cmt_any/ff_cmt_val` 并路进 `csr_wdata_w` | 保留现有并路（`csr_wdata_o` 已含），替换后由 `csr_file` 写口落地 ✓ 行为不变 |
+| ⑦ | `mepc/mtvec` WARL | `csr_file` 有完整 WARL（mepc 低位对齐、mtvec MODE/对齐） | `b2_csr` 只掩 mepc bit0 | 替换后**自动对齐 2A**；p10 已覆盖 `mepc/mtvec` 回读（现以 `b2_csr` 口径全绿） |
+| ⑧ | `exc_is_fetch` | `trap_ctrl` 用 `exc_is_fetch` 区分取指异常（PMP/access-fault 改写 cause） | 本核 ROB 载荷**没有**"取指异常"标记（4a 的 `lane_fault_*` 只给 cause/tval） | 4b-1b 先接 `1'b0` 并登记；**取指异常落地**（`fetch_exc_*` → ROB 载荷标记位）列为 4b-1 的紧跟待办 |
+
+## B4.6.5 为什么本段停在检查点（阻塞点，逐条）
+
+| # | 阻塞点 | 说明 |
+|---|---|---|
+| G1 | **替换是"两文件同改"的原子改动** | `backend_top` 把 CSR 请出后端（新端口 + 删 `trp_csr_*`）与 `core_top_2b` 接入 `csr_file/priv_ctrl/trap_ctrl` 必须**同一次**落地，否则 `csr_rdata_i` 悬空 ⇒ 不存在"编译干净的半途状态"（这正是"两套 CSR 不得并存"的直接后果） |
+| G2 | **4 条口径必须先定**（§B4.6.4-①②③⑧） | 其中 ① 需要裁决（2A 的 ecall mtval=PC 与 p7 的 Spike 黄金直接冲突）；②⑧ 有明确技术解（已在接线表里给出） |
+| G3 | **逐步验证成本** | 每次编译 ~30 s、TB 全跑 ~80 s、regress ~20 min；预算见底 ⇒ 无法保证"改完即全绿"的迭代轮数 |
+| G4 | 回退成本已压到最低 | 本段快照 `../.b2chk/*.s16`（p10 全绿态）+ 母代理已提交的 `c7fb923` ⇒ 任何失败尝试都可一键回到绿态 |
+
+## B4.6.6 下一步：分阶段执行方案（建议 4b-1a → 4b-1b → 4b-1c）
+
+| 阶段 | 内容 | 判定（每阶段后必跑） |
+|---|---|---|
+| **4b-1a**（行为等价重构） | `backend_top` 端口化：加 §B4.6.2(1) 的 7 个端口、`csr_rdata_w` 改由输入赋值、删 `mtip_i/irq_mti_o/mtvec_o/mepc_o` 与 `trp_csr_*` 块；`core_top_2b` **把 `b2_csr` 实例搬到顶层**（同一实现、同一行为，只是位置变了 ⇒ 不违反"两套并存"）并接上 `csr_raddr_o/csr_rdata_i/csr_we_o/...` | 编译 0 error + **79/79 全绿**（纯搬运 ⇒ 必须逐项不变） |
+| **4b-1b**（换文件 + 接陷阱决策） | 顶层 `b2_csr` → `csr_file`+`priv_ctrl`+`trap_ctrl`+`pmp_check`（§B4.6.2 全部接线）；`be_trp_redirect_pc` 改由 `trap_target`/`mepc_o`/`sepc_o` 驱动；按 §B4.6.4-①②⑧ 做 `exc_tval` 适配与 `pc_next=pc`、`mie` 按 ROB 非空掩码；删 4a 的目标合成 | 79/79 全绿（p7/p9 的 mtval/mepc/cause 与 p10 的 CSR 轨迹是关键哨兵）+ 新增 `mcycle/minstret` 读回判据（CSR 全集判据，p10 追加一段：读 `mcycle/minstret` 只校验单调性，避开与 Spike 的计数起点差异） |
+| **4b-1c**（收尾清理） | 删 `b2_csr.v` 的残留引用与注释；`satp` 接 `sv32_en`（为 4b-2 铺路，仍保持 Bare）；把取指异常标记接进 ROB 载荷（§B4.6.4-⑧） | 编译 0 error + 79/79 + regress 32/32 |
+
+> 4b-2（Sv32 全链路）与 4b-3（PLIC+S 模式）见 §B4.5.3/§B4.5.4/§B4.5.5，依赖本段完成。
+
+## B4.6.7 本段检查点状态（可复核）
+
+```bash
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
+python3 sim/unit/prog/gen_back2_lockstep_data.py > sim/unit/prog/back2_lockstep_data.svh   # 黄金再生成（p10）
+mapfile -t RTL < <(find rtl -type f -name '*.v' | LC_ALL=C sort)
+iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/ct2b.vvp -s tb_core_top_2b "${RTL[@]}" sim/unit/tb_core_top_2b.sv
+vvp /tmp/ct2b.vvp | tail -12      # ⇒ TB_CORE_TOP_2B: PASS（**79 项**，含 C10' CSR 轨迹）
+./scripts/regress.sh              # ⇒ REGRESS: 32/32 PASS（日志 ../.b2chk/regress_4b1.log）
+```
+- 本段改动文件：`rtl/back2/backend_top.v`（D5a/D5b 修复）、`sim/unit/tb_core_top_2b.sv`（p10 + C10' + DBG_P10）、
+  `sim/unit/prog/back2_p10_csr.S`（新）、`sim/unit/prog/gen_back2_lockstep_data.py`（p10 条目）、
+  `sim/unit/prog/back2_lockstep_data.svh`（再生成）。
+- 未提交 git；快照：`../.b2chk/*.s16`（本段最终态，p10 全绿）、`*.s15`（4b 1/3 态）。

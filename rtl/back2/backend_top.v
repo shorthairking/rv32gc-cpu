@@ -1357,11 +1357,13 @@ module backend_top #(
     reg [2:0]  csr_cmt_op;   // ★ B29：提交级 CSR 操作码
     reg        ff_cmt_any;  reg [4:0]  ff_cmt_val;
     reg [31:0] csr_cmt_insn;                 // 该 CSR 指令的原始编码（判 zimm 形式）
+    reg [PW_I-1:0] csr_cmt_ps1i;             // 该 CSR 指令自己的 rs1 物理号（B29 残留清理）
     integer    cw;
     always @(*) begin
         csr_cmt_we   = 1'b0;
         csr_cmt_addr = 12'h0;
         csr_cmt_data = 32'h0; csr_cmt_op = 3'd0; csr_cmt_insn = 32'h0;
+        csr_cmt_ps1i = {PW_I{1'b0}};
         ff_cmt_any   = 1'b0;
         ff_cmt_val   = 5'h0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
@@ -1372,6 +1374,7 @@ module backend_top #(
                     csr_cmt_data = p_csrw(cmt_pay[cw*RB_W +: RB_W]);
                     csr_cmt_op   = p_csrop(cmt_pay[cw*RB_W +: RB_W]);   // ★ B29：提交级合成用
                     csr_cmt_insn = p_tval (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4a：zimm 形式判定
+                    csr_cmt_ps1i = p_csrw (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4b-1：本指令的 ps1i
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
                     ff_cmt_any = 1'b1;
@@ -1390,7 +1393,13 @@ module backend_top #(
     //     mstatus（0x8001_00fc），MIE 位纯属巧合才对。
     //     修法：用载荷 TVAL（原始指令位）判 funct3 —— `insn[14:13] != 0` 即 101/110/111
     //     （csrrwi/csrsi/csrrci）⇒ 源取 `insn[19:15]` 零扩展。**不改 2A 译码器**。
-    wire        csr_cmt_zimm = (csr_cmt_insn[6:0] == 7'b1110_011) & (|csr_cmt_insn[14:13]);
+    //   ★★ 2B-4 第 4b-1 段缺陷修正 **D5a**（由新增的 `back2_p10_csr.S` CSR 轨迹判据实测抓住）：
+    //     立即数形式的判据必须是 **funct3 的最高位 `insn[14]`**（101/110/111 = csrrwi/csrrsi/csrrci），
+    //     而 4a 段误写成 `|insn[14:13]` —— `csrrs`(funct3=010) 与 `csrrc`(011) 的
+    //     `insn[14:13] = 2'b01` 也非零 ⇒ **寄存器形式被误判成立即数形式**，
+    //     源操作数取成"寄存器号"而非寄存器值（实测：`csrrc s5,mscratch,t3` 用 0x1C 当源值，
+    //     落盘 `0x0F0F0F03`，而 Spike 黄金是 `0x0F0F0F00`）。
+    wire        csr_cmt_zimm = (csr_cmt_insn[6:0] == 7'b1110_011) & csr_cmt_insn[14];
     wire [31:0] csr_cmt_src_e= csr_cmt_zimm ? {27'b0, csr_cmt_insn[19:15]} : csr_cmt_src;
     //   ★ B29：提交级合成（W→src；S→old|src；C→old&~src）
     wire [31:0] csr_cmt_new = (csr_cmt_op == 3'd1) ? csr_cmt_src_e :
@@ -1417,7 +1426,9 @@ module backend_top #(
     //   提交拍直接 `PRF[ps1i]` 取值；不再从 `p_imm[19:15]` 反推（那是 CSR 地址 0x340，
     //   [19:15]=6 ⇒ ARAT[6] 恰为值 1 的寄存器，正是第 33 轮仍为 1 的原因）。
     wire [31:0] csr_cmt_src = iprf_rd[15*32 +: 32];
-    assign iprf_ra[15*PW_I +: PW_I] = p_csrw(cmt_pay[0 +: RB_W]);
+    //   ★ 4b-1：端口 15 的读地址取**该 CSR 指令自己**的 ps1i（4a 曾固定用 lane 0 的载荷
+    //     ⇒ CSR 指令不在 lane 0 时会读到无关寄存器；与 B29 同类，一并清掉）
+    assign iprf_ra[15*PW_I +: PW_I] = csr_cmt_ps1i;
     wire [31:0] csr_cmt_src_sel = csr_cmt_we ? csr_cmt_src : csr_cmt_src;   // 占位保持可读性
     assign csr_raddr_w = csr_cmt_we ? csr_cmt_addr : u_csra(csr_uop);
 

@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 6;
+    localparam integer NPROG  = 7;
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -47,6 +47,8 @@ module tb_core_top_2b #(
     //     重建 FSM（`rb_act`）逐拍扫描 NREG=96 项 ⇒ 约 96 拍 `busy=1` ⇒ 派发暂停
     //     （非死锁：重建结束即恢复，处理程序随后逐条提交）
     localparam integer DBG_P8 = 0;
+    //   p10（CSR 轨迹）逐条对照打印开关（默认关）
+    localparam integer DBG_P10 = 0;
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
@@ -313,6 +315,7 @@ module tb_core_top_2b #(
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
+        pidx[6] = 9; cmax_of[6] = P9_GOLD_N;    // p10_csr（CSR 读写轨迹：b2_csr→csr_file 的前置判据）
         cur_p = 0;
         rst_n = 1'b0;
         load_back2_data;
@@ -383,6 +386,12 @@ module tb_core_top_2b #(
                              pid, k, rpc[k], GOLD[cur_p*P_GOLD_MAX + k] + gold_delta);
                     d_pc = 1;
                 end
+            //   [诊断，默认关] p10：CSR 轨迹逐条对照（本核 vs Spike 黄金；放在 chk 之前，chk 失败会 $fatal）
+            if ((pid == 6) && DBG_P10)
+                for (k = 0; k < 22; k = k + 1)
+                    $display("   [C10-dbg] idx=%0d pc=0x%08x we=%b rd=%0d(g %0d) wd=0x%08x(g 0x%08x)",
+                             k, rpc[k], rwe[k], rrd[k], GREG_RD[cur_p*P_GOLD_MAX + k],
+                             rwd[k], GREG_WD[cur_p*P_GOLD_MAX + k]);
             chk(d_pc == 0, $sformatf("C1' 程序 %0d：提交 PC 流与 Spike 黄金逐条一致", pid));
             chk(nrec >= cmax_of[pid], $sformatf("C2' 程序 %0d：提交条数 ≥ 黄金条数", pid));
             // ---- C3' ----
@@ -471,6 +480,22 @@ module tb_core_top_2b #(
             if ((pid != 3) && (pid != 5)) begin
                 chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
                 chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
+                //   ============ C10'：CSR 读写轨迹（2B-4 第 4b-1 段前置判据）============
+                //   从写回轨迹里直接抓 CSR 读回值（C3' 已与 Spike 逐条比过；此处给可读证据）
+                if (pid == 6) begin
+                    d_pc = 0; d_rd = 0; d_wd = 0;                       // 复用为"命中标志"
+                    for (k = 0; k < 1024; k = k + 1) begin
+                        //   csrr s10, mscratch（末次读回 0x30）/ csrr a3, mie（0x888）/ mstatus&0x1888
+                        if (rwe[k] && (rrd[k] == 5'd26) && (rwd[k] === 32'h0000_0010)) d_pc = 1;
+                        if (rwe[k] && (rrd[k] == 5'd13) && (rwd[k] === 32'h0000_0808)) d_rd = 1;
+                        if (rwe[k] && (rrd[k] == 5'd15) && (rwd[k] === 32'h0000_1800)) d_wd = 1;
+                    end
+                    chk(d_pc == 1, "C10' p10：mscratch 立即数形式序列末值 = 0x10（csrrwi/csrrsi/csrrci 生效 ⇒ D2 无回归）");
+                    chk(d_rd == 1, "C10' p10：mie 写 0x808 后回读 = 0x808（位域/WARL 口径）");
+                    chk(d_wd == 1, "C10' p10：mstatus 写 0x1800 后回读掩码 = 0x1800（MPP 口径）");
+                    $display("   [C10'] CSR 轨迹：mscratch(w/rw/rs/rc/wi/si/ci)=0x10、mie=0x808、mstatus&0x1888=0x1800（mip/MTIP 见 p8 的 C8'）；csrrw/rs/rc 旧值、WARL 回读均与 Spike 黄金逐条一致");
+                    $fflush();
+                end
             end else if (pid == 5) begin
                 //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============
                 //   判据：三条异常各自落到 base + 4×cause 的**不同槽**（由槽内标记经写回轨迹背书）。
