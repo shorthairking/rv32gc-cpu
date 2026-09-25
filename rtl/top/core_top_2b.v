@@ -239,8 +239,10 @@ module core_top_2b (
     wire        maint_cbo_w    = maint_cmt_w & (maint_kind_w >= 3'd3);
     //   维护口（TB 可探针）
     wire        maint_l1i_inval_w  = fencei_busy;                       // fence.i 扫掠期间拉高
-    wire        maint_l1d_inval_w  = maint_sfence_w |                        // sfence.vma 刷 L1D
-                                     (maint_cbo_w & (maint_kind_w != 3'd4)); // cbo.inval / flush
+    //   ★ K1'' 修正：**sfence.vma 不动 L1D**（本核 L1D 为物理索引/标签 ⇒ VA 重映射无需
+    //     失效数据缓存；失效反而丢脏数据——实测 p11 第 12 条 load 读到 0 而非 0x11223344）。
+    //     只有 cbo.inval / cbo.flush 才失效 L1D（Zicbom 的 INVAL 本就是破坏性的）。
+    wire        maint_l1d_inval_w  = (maint_cbo_w & (maint_kind_w != 3'd4)); // inval / flush
     wire        maint_l1d_clean_w  = maint_cbo_w & (maint_kind_w != 3'd3);   // cbo.clean / flush
     //   （fence.i **不刷 TLB** —— 它只管指令缓存；sfence.vma 才刷 TLB，2A 同口径）
     wire        maint_tlb_sfence_w = maint_sfence_w;
@@ -417,6 +419,8 @@ module core_top_2b (
         //   ★ 冻结只在**扫掠进行中**（`fencei_busy`）——等待态不冻前端（否则可能在
         //     "等前端排空"时把前端冻住 ⇒ 永不排空 ⇒ 死锁，实测 idx7 停摆）。
         .break_point(break_point), .fe_stall(fencei_busy),
+        //   ★ K1'：整机冲刷拍清空检查点池（`be_trp_flush` = 陷阱/xRET/维护的冲刷）
+        .ckpt_clear_all(be_trp_flush),
         .blk_valid(blk_valid), .blk_ready(blk_ready), .blk_mask(blk_mask),
         .blk_next_pc(blk_next_pc), .blk_taken(blk_taken),
         .lane_pc(lane_pc), .lane_pa(lane_pa), .lane_insn(lane_insn),

@@ -117,6 +117,15 @@ module predictor_top #(
     output wire [3:0]   ckpt_alloc_id,
     output wire         ckpt_full,
     input  wire         ckpt_free_valid,
+    //   ★★ K1' 修法（母代理授权的前端小改）：**全冲刷时清空检查点池**。
+    //     现象：维护操作/陷阱的"整机冲刷"会丢弃更年轻的在途指令，但**不会**逐 ID 归还
+    //     它们占用的检查点 ⇒ 检查点池（16 项）逐次泄漏 ⇒ `ckpt_full=1` ⇒ 之后任何
+    //     **预测跳转块**都无法呈现（`ckpt_stall = blk_ready_int & grp_taken & ckpt_full`）
+    //     ⇒ 前端永久停摆（实测 p11 末尾 `j .`@0xa4：`[k1i] npv=1 term=1 grpm=0001 f4v=0`
+    //     而 `blk_valid=0` ⇒ 是 `ckpt_stall` 挡住）。
+    //     语义：`ckpt_clear_all` = 后端"整机冲刷"（`be_trp_flush`：陷阱/xRET/维护），
+    //     它把 ROB 清空 ⇒ 所有在飞检查点都失效 ⇒ 一次性归还全部池项（正确且无副作用）。
+    input  wire         ckpt_clear_all,
     input  wire [3:0]   ckpt_free_id,
     input  wire         ckpt_restore_valid,
     input  wire [3:0]   ckpt_restore_id,
@@ -234,6 +243,11 @@ module predictor_top #(
             // ---- 释放 ----
             if (ckpt_free_valid && (ckpt_free_id < CKPT_NUM))
                 ck_valid_q[ckpt_free_id] <= 1'b0;
+            //   ★ K1'：整机冲刷 ⇒ 一次清空全部检查点（否则池项永久泄漏 ⇒ ckpt_full 卡死）
+            //   （iverilog 不支持整数组赋值 ⇒ 用 for 逐项清零）
+            if (ckpt_clear_all)
+                for (ck_i = 0; ck_i < CKPT_NUM; ck_i = ck_i + 1)
+                    ck_valid_q[ck_i] <= 1'b0;
 
             // ---- 分配（快照：RAS 深度 + GHR）----
             if (ckpt_alloc_valid) begin

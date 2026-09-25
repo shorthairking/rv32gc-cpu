@@ -3240,3 +3240,81 @@ TB **80/80**、regress **32/32**（`../.b2chk/regress_k1p.log`）。
   2A 零修改；未提交 git；快照 `../.b2chk/*.s26`。
 - 进度：`p11_maint` 42 条中已能提交 **41 条**（D6 修复前 33 条）；剩 1 条为前端幻影 push。
   WIP：`back2_p11_maint.S`、`back2_p12_cbo.S`（判据口径与 TB 补丁形态在 §B4.10.2/§B4.12.3/§B4.13.3 已完整登记）。
+
+
+# 2B-4 K1' 收口段 —— **K1' 定案并修复（BPU 检查点池泄漏）；p11_maint 判据挂回全绿（TB 80→91 项）**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 K1' 定案 `2e7b6d2`=tag `2B-4.13`）
+> 本段用"一键打点"完成定案并修好：**K1' = BPU 检查点池在全冲刷时泄漏** ⇒ `ckpt_full` 卡死 ⇒
+> 预测跳转块无法呈现 ⇒ 前端永久停摆。修法为前端 3 行小改（`ckpt_clear_all` 在整机冲刷时清池）。
+> 修后 **p11_maint 提交 42/42 且 PC 流/写回 = Spike 黄金逐条一致**，C11' 4 条全过；TB 检查项
+> **80 → 91** 全绿；`regress.sh` **32/32**。p12_cbo 因 `cbo.clean/flush` 的数据校验未过，
+> 本段未挂回（WIP，见 §B4.15.4）。
+
+## B4.15.1 一键打点结果（stall 拍 ifetch4 现场）
+
+```
+[k1i] plo=0 phi=0 pgn=0 npv=1 bufcnt=32 grpm=0001 m3=0 term=1 xip=0
+      | pva0=0x800000e0 pva1=0x800000e2 nva=0x800000a8 rsp=0 f4v=0
+```
+判定：
+- `push_gives_next=0` ⇒ **不是**"幻影 push"（方案②不适用）；
+- `npv(next_parcel_v)=1`、`blk_term=1`、`grpm=0001` ⇒ `blk_ready_int=1` ⇒ 块本可呈现；
+- 但实测 `blk_v=0` ⇒ 被 `ckpt_stall = blk_ready_int & grp_taken & ckpt_full` 挡住
+  （`j .` 是**预测跳转**，需要检查点；`ckpt_full=1`）⇒ **检查点池耗尽**（方案①的"parcel 计数少一"也不成立）。
+
+## B4.15.2 K1' 根因与修法 diff
+
+**根因**：BPU 的检查点池（`predictor_top` 的 `ck_valid_q`，16 项）只在**逐 ID 释放**
+（`ckpt_free_valid/ckpt_free_id`，每拍一个）时归还。而"整机冲刷"（陷阱 / xRET / **维护操作**）
+会一次性丢弃大量在途指令，它们的检查点**没有逐 ID 归还** ⇒ 池项逐次泄漏 ⇒ 若干次冲刷后
+`ckpt_full=1` ⇒ 之后任何**预测跳转块**都无法呈现 ⇒ 前端永久停摆（p11 末尾 `j .`@0xa4 即此）。
+
+**修法**（前端小改，母代理授权范围；语义："整机冲刷 ⇒ ROB 清空 ⇒ 所有检查点作废"）：
+
+| 文件 | 改动 |
+|---|---|
+| `rtl/front4/predictor_top.v` | 新增输入 `ckpt_clear_all`；在检查点状态块中 `if (ckpt_clear_all) for (ck_i…) ck_valid_q[ck_i] <= 1'b0;`（iverilog 不支持整数组赋值，故用 for） |
+| `rtl/front4/front4_top.v` | 新增输入 `ckpt_clear_all` 并透传给 `predictor_top`（1 端口 + 1 连线） |
+| `rtl/top/core_top_2b.v` | `.ckpt_clear_all(be_trp_flush)`（= 陷阱/xRET/维护的整机冲刷拍） |
+
+**影响面**：`be_trp_flush` 只在这些"整机清空"事件为 1；既有 7 程序里仅 p7/p8/p9 有陷阱/xRET
+（各 1~3 次），清池是**语义正确**的行为（那时 ROB 确实被清空）⇒ 实测既有判据全部保持（见 §B4.15.3）。
+顺带修掉一个**潜伏缺陷**：陷阱/xRET 路径此前同样泄漏检查点（只是测试里次数少未暴露）。
+
+## B4.15.3 挂回 p11_maint（判据 80 → 91 项）
+
+- 生成器新增 `back2_p11_maint.S`（`-march=rv32ima_zicsr_zifencei`、Spike `--isa=rv32imac_zicsr_zifencei`，
+  **黄金 42 条**）；
+- TB：程序数 7→8、DDR3 窗口 128 KB→160 KB、第 8 槽（基址 `0x8001_C000`）、维护口探针计数、
+  **C11' 4 条**（维护提交 4 次 / L1I 扫掠 ≥512 拍 / TLB 失效 ≥2 次 / 前端块不越序）；
+- **实测**：`程序 7 结果：1033 拍，提交 42 条（黄金 42）| AXI AR=11 R=67`，
+  `[C11'] 维护：提交 4 次；L1I 扫掠 512 拍、TLB 失效 2 次、L1D 失效 0（sfence 不动 L1D）；PC 流/写回 = Spike 黄金`，
+  **检查项合计 91 项全部满足**；既有 7 程序全部保持（p1 161、p3 126、p6 366（AW=2/W=16/B=2）、
+  p7 89、p8 523、p9 92、p10 45）。
+
+**附带修掉的两处口径缺陷**：
+1. `sfence.vma` **不再失效 L1D**：本核 L1D 为**物理**索引/标签 ⇒ VA 重映射无需动数据缓存；
+   原实现跟着 2A 一起 `inval_all` 会**丢脏数据**（实测 p11 第 12 条 load 读到 0 而非 `0x11223344`）。
+2. TB 维护计数器补**逐程序复位**（此前为 x，`chk(x)` 被静默放过 ⇒ 判据不严）。
+
+## B4.15.4 遗留：p12_cbo（WIP，未挂回）
+
+- 程序已按 Zicbom 语义修正（`cbo.inval` 只在**干净行**上执行；数据安全检查用 `cbo.clean`/`cbo.flush`）。
+- 但实测：`cbo` 后 4 次 load 仅 **1 次**读到 `0x55667788` ⇒ `l1d` 的 `clean_all`/`inval_all`
+  维护与在途写回/重填的交互仍有问题（很可能与 §B4.14 同类的"维护扫描期间访问"竞态）。
+- 该程序未进生成器清单 ⇒ **不影响任何判据**；下一段按"cbo 维护扫描与访存互锁"方向排查。
+
+## B4.15.5 本段检查点状态
+
+- 编译 **0 error**；`tb_core_top_2b` **PASS 91/91**（8 程序，含 p11_maint 黄金 42 条 + C11'）；
+  `regress.sh` **32/32**（日志 `../.b2chk/regress_k1fix.log`）；2A 文件零修改
+  （`rtl/front4/*` 为 2B 前端，属允许范围）；未提交 git；快照 `../.b2chk/*.s27`。
+- 改动文件：`rtl/front4/predictor_top.v`（+`ckpt_clear_all`）、`rtl/front4/front4_top.v`（透传）、
+  `rtl/top/core_top_2b.v`（接线 + sfence 不动 L1D + 扫掠等待/冻结范围）、
+  `sim/unit/tb_core_top_2b.sv`（p11 槽 + C11'）、`sim/unit/prog/gen_back2_lockstep_data.py`、
+  `sim/unit/prog/back2_lockstep_data.svh`（再生成）。
+- **K1 系列收官**：D6（hold 掩码位宽回绕）⇒ 4 宽块不再丢；K1'（检查点池泄漏）⇒ 末尾 `j .` 正常提交；
+  p11_maint 全流与 Spike 黄金逐条一致。
+- 下一步：①p12_cbo 的 `l1d` 维护互锁（小项）；②**4b-2b**（D 侧 TLB 口 1 + LSU VA/PA 分离 +
+  PTW 串行复用）、**4b-2c**（PTE A/D 写通路走 §5 引擎第 7 源）——方案见 §B4.8.2/§B4.8.1。

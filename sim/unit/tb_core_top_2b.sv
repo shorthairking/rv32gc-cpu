@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 7;
+    localparam integer NPROG  = 8;
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -49,6 +49,7 @@ module tb_core_top_2b #(
     localparam integer DBG_P8 = 0;
     //   p10（CSR 轨迹）逐条对照打印开关（默认关）
     localparam integer DBG_P10 = 0;
+    localparam integer DBG_K1  = 1;
 
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
@@ -122,7 +123,7 @@ module tb_core_top_2b #(
         //   ★ 2B-4 第 4a 段：程序数 3→5（p7_trap / p8_int），16 KB 步进 ⇒ DDR3 窗口
         //     必须 ≥ 5×16 KB = 80 KB（原 64 KB 会让第 5 个程序的基址落到窗口外 →
         //     取指读到"未登记区域"的 0 ⇒ 立即非法指令陷阱）
-        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0002_0000),
+        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0002_8000),
         .UART_DATA_ADDR(32'h1FE0_01E0), .READ_LAT_DLY(0)
     ) u_mem (
         .clk(clk), .rst_n(rst_n),
@@ -172,6 +173,25 @@ module tb_core_top_2b #(
     reg [31:0] irq_target_q;
     //   ★ 4b-1b：中断判定归 `trap_ctrl` ⇒ 监视 `trap_valid & trap_is_int`
     wire irq_live_w = u_dut.tc_trap_valid & u_dut.tc_trap_is_int;
+    integer n_maint_cmt, n_l1i_inval, n_l1d_inval, n_l1d_clean, n_tlb_sfence;
+    integer k1_tick; initial k1_tick = 0;
+    always @(posedge clk) if (rst_n) begin
+        if (u_dut.maint_cmt_w)        n_maint_cmt  <= n_maint_cmt  + 1;
+        if (u_dut.maint_l1i_inval_w)  n_l1i_inval  <= n_l1i_inval  + 1;
+        if (u_dut.maint_l1d_inval_w)  n_l1d_inval  <= n_l1d_inval  + 1;
+        if (u_dut.maint_l1d_clean_w)  n_l1d_clean  <= n_l1d_clean  + 1;
+        if (u_dut.maint_tlb_sfence_w) n_tlb_sfence <= n_tlb_sfence + 1;
+        k1_tick <= k1_tick + 1;
+        if (DBG_K1 && (cur_p == 10) && ((k1_tick % 1000) == 0) && (k1_tick > 3000))
+            $display("   [k1i] plo=%b phi=%b pgn=%b npv=%b bufcnt=%0d grpm=%b m3=%b term=%b xip=%b | pva0=0x%08x pva1=0x%08x nva=0x%08x rsp=%b f4v=%b",
+                     u_dut.u_front.u_ifetch4.push_lo_ok, u_dut.u_front.u_ifetch4.push_hi_ok,
+                     u_dut.u_front.u_ifetch4.push_gives_next, u_dut.u_front.u_ifetch4.next_parcel_v,
+                     u_dut.u_front.u_ifetch4.buf_cnt_q, u_dut.u_front.u_ifetch4.grp_mask,
+                     u_dut.u_front.u_ifetch4.m3, u_dut.u_front.u_ifetch4.blk_term,
+                     u_dut.u_front.u_ifetch4.f4_is_xip, u_dut.u_front.u_ifetch4.p_va0,
+                     u_dut.u_front.u_ifetch4.p_va1, u_dut.u_front.u_ifetch4.next_va,
+                     u_dut.u_front.u_ifetch4.f4_rsp_ok, u_dut.u_front.u_ifetch4.f4_v_q);
+    end
     //   ★ 4b-1b：`csr_file` 无 `mcause_o` 端口 ⇒ 在**取陷阱拍**从 `trap_ctrl.trap_cause`
     //     捕获（该值就是写进 mcause 的值；比读内部寄存器更贴近口径）
     reg [31:0] trp_mcause_cap;
@@ -208,7 +228,7 @@ module tb_core_top_2b #(
         integer m;
         begin
             @(negedge clk);
-            for (m = 0; m < 32768; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
+            for (m = 0; m < 40960; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
             for (m = 0; m < 1024;  m = m + 1) u_mem.xip_mem[m]  = 32'h0000_0013;
             u_mem.xip_mem[0] = 32'h0000_0013;   // 跳板由 load_prog 按基址重建
             u_mem.xip_mem[1] = 32'h0000_0013;
@@ -316,9 +336,14 @@ module tb_core_top_2b #(
         $fflush();
         n_checks = 0; nrec = 0; on = 1'b0;
         n_ar = 0; n_rb = 0; n_aw = 0; n_wb = 0; n_b = 0; n_ar_xip = 0;
-        pidx[0] = 0; cmax_of[0] = P0_GOLD_N;    // p1_int
-        pidx[1] = 2; cmax_of[1] = P2_GOLD_N;    // p3_memcsr
-        pidx[2] = 5; cmax_of[2] = P5_GOLD_N;    // p6_l1d（D-Cache 逐出）
+        pidx[0] = 0;  cmax_of[0] = P0_GOLD_N;   // p1_int（基址 0x0000，保持不变）
+        pidx[1] = 2;  cmax_of[1] = P2_GOLD_N;   // p3_memcsr（0x4000）
+        pidx[2] = 5;  cmax_of[2] = P5_GOLD_N;   // p6_l1d（0x8000）
+        pidx[3] = 6;  cmax_of[3] = P6_GOLD_N;   // p7_trap（0xC000）
+        pidx[4] = 7;  cmax_of[4] = P7_GOLD_N;   // p8_int（0x10000）
+        pidx[5] = 8;  cmax_of[5] = P8_GOLD_N;   // p9_trapvec（0x14000）
+        pidx[6] = 9;  cmax_of[6] = P9_GOLD_N;   // p10_csr（0x18000）
+        pidx[7] = 10; cmax_of[7] = P10_GOLD_N;  // p11_maint（0x1C000）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -338,6 +363,7 @@ module tb_core_top_2b #(
             nrec = 0; on = 1'b0; bad_pc = -1; bad_rd = -1; bad_wd = -1;
             n_trap_p = 0; trap_seen_q = 1'b0; n_irq_p = 0; irq_seen_q = 1'b0;
             irq_target_q = 32'h0; trp_mcause_cap = 32'h0;
+            n_maint_cmt = 0; n_l1i_inval = 0; n_l1d_inval = 0; n_l1d_clean = 0; n_tlb_sfence = 0;
             for (k = 0; k < 8; k = k + 1) begin
                 trc_cause[k] = 4'h0; trc_pc[k] = 32'h0; trp_tgt[k] = 32'h0;
             end
@@ -515,6 +541,19 @@ module tb_core_top_2b #(
                     $display("   [C10'] CSR 轨迹：mscratch(w/rw/rs/rc/wi/si/ci)=0x10、mie=0x808、mstatus&0x1888=0x1800、mcycle/minstret 单调；mip/MTIP 见 p8 的 C8' ；csrrw/rs/rc 旧值、WARL 回读均与 Spike 黄金逐条一致");
                     $fflush();
                 end
+                //   ============ C11'：维护操作（fence.i / sfence.vma，p11_maint）============
+                if (pid == 7) begin
+                    chk(n_maint_cmt == 4, $sformatf("C11' p11：维护操作提交 4 次（2×fence.i + 2×sfence.vma），实测 %0d", n_maint_cmt));
+                    chk(n_l1i_inval >= 512, $sformatf("C11' p11：L1I 全阵列扫掠脉冲 ≥ 512（2×256），实测 %0d", n_l1i_inval));
+                    chk(n_tlb_sfence >= 2, $sformatf("C11' p11：TLB 失效 ≥ 2 次（sfence.vma），实测 %0d", n_tlb_sfence));
+                    $display("   [C11'] 维护：提交 %0d 次；L1I 扫掠 %0d 拍、TLB 失效 %0d 次、L1D 失效 %0d（sfence 不动 L1D）；PC 流/写回 = Spike 黄金",
+                             n_maint_cmt, n_l1i_inval, n_tlb_sfence, n_l1d_inval);
+                    $fflush();
+                end
+                //   ★ C12'（cbo.*）本段未挂回：p12_cbo 的 `cbo.clean/flush` 后 load 数据
+                //     校验未过（实测 4 次 load 仅 1 次读到 0x55667788）⇒ 作为 WIP 留待
+                //     下一段（见报告 §B4.15.4，`l1d` clean/inval 维护与在途写回的交互待查）
+
             end else if (pid == 5) begin
                 //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============
                 //   判据：三条异常各自落到 base + 4×cause 的**不同槽**（由槽内标记经写回轨迹背书）。

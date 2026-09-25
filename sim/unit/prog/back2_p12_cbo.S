@@ -20,21 +20,20 @@ _start:
     csrw  menvcfg, t0
 
     la    s0, darea
+    /*   ★ 口径修正：`cbo.inval` 是**破坏性**失效（Zicbom：INVAL 不写回）⇒ 必须在
+     *    "干净行"上执行（此处尚未写入数据），否则会把刚写入的脏数据丢掉。
+     *    `cbo.clean`（写回）与 `cbo.flush`（写回+失效）才是数据安全的。 */
+    cbo.inval (s0)                  /* funct3=000 ⇒ L1D inval_all（行干净，无副作用） */
     li    t0, 0x55667788
     sw    t0, 0(s0)
     lw    s1, 0(s0)                 /* s1 = 0x55667788 */
 
-    /* ---- 1. cbo.inval（funct3=000）⇒ L1D inval_all ---- */
-    cbo.inval (s0)
+    cbo.clean (s0)                  /* funct3=001 ⇒ L1D clean_all（写回脏行） */
     lw    s2, 0(s0)                 /* 0x55667788 */
 
-    /* ---- 2. cbo.clean（funct3=001）⇒ L1D clean_all ---- */
-    cbo.clean (s0)
+    cbo.flush (s0)                  /* funct3=010 ⇒ clean_all + inval_all */
     lw    s3, 0(s0)                 /* 0x55667788 */
-
-    /* ---- 3. cbo.flush（funct3=010）⇒ L1D clean_all + inval_all ---- */
-    cbo.flush (s0)
-    lw    s4, 0(s0)                 /* 0x55667788 */
+    lw    s4, 0(s0)                 /* 0x55667788（失效后重新取，数据仍在） */
 
     mv    a0, s1
     mv    a1, s2

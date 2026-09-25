@@ -60,6 +60,8 @@ module front4_top #(
     // 后端 → 前端：重定向（类别 A / C）
     //==================================================================
     input  wire        redirect_valid,
+    //   ★ K1'：整机冲刷（陷阱/xRET/维护）⇒ 清空检查点池（透传给 predictor_top）
+    input  wire        ckpt_clear_all,
     input  wire [31:0] redirect_pc,
     input  wire        redirect_use_ckpt, // 1 = 按检查点恢复（类别 A）
     input  wire [3:0]  redirect_ckpt,
@@ -275,6 +277,8 @@ module front4_top #(
         .train_ready(train_ready), .upd_busy(),
         .ckpt_alloc_valid(ckpt_alloc_valid), .ckpt_alloc_pc(32'h0),
         .ckpt_alloc_id(ckpt_alloc_id), .ckpt_full(ckpt_full),
+        //   ★ K1'：整机冲刷 ⇒ 清空检查点池（见 predictor_top 的 ckpt_clear_all 说明）
+        .ckpt_clear_all(ckpt_clear_all),
         .ckpt_free_valid(ckpt_free_valid), .ckpt_free_id(ckpt_free_id),
         .ckpt_restore_valid(ckpt_restore_used), .ckpt_restore_id(redirect_ckpt),
         .bpu_br_total(bpu_br_total), .bpu_br_mispred(bpu_br_mispred),
