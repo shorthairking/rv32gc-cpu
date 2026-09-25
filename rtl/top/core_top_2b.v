@@ -783,11 +783,12 @@ module core_top_2b (
     //   ★★ 4b-2b：判定输入是**物理地址**（`d_route_a_w`：翻译两级取各自 PA，其余取请求 VA）
     wire [2:0]  d_mr_route;
     wire        d_mr_no_axi, d_mr_clint_plic, d_mr_xip, d_mr_unc, d_mr_cac;
+    wire        d_mr_plic_hit;                       // ★ 4b-3：PLIC 窗口命中（mmio_route 已解码）
     mmio_route u_mmio_route_d (
         .pa_i(d_route_a_w), .route_o(d_mr_route), .no_axi_o(d_mr_no_axi),
         .clint_plic_o(d_mr_clint_plic), .xip_direct_o(d_mr_xip),
         .axi_uncached_o(d_mr_unc), .axi_cached_o(d_mr_cac),
-        .clint_hit_o(), .plic_hit_o(), .periph_hit_o()
+        .clint_hit_o(), .plic_hit_o(d_mr_plic_hit), .periph_hit_o()
     );
     //   ★ 本段：CLINT/PLIC 未接（第 4 段）⇒ 落到该窗口的访问**不产生总线事务**、
     //     立即"完成"（读回 0 / 写丢弃），避免挂死；报告 §B4.3.3 登记为占位。
@@ -842,7 +843,10 @@ module core_top_2b (
     //      ⇒ 报告 §B4.4.4 登记为 4b/后续（PLIC 需 MEIP 优先级仲裁，属中断控制器范畴）。
     //--------------------------------------------------------------------------
     wire [31:0] clint_req_addr  = d_a_q - `RV32GC_CLINT_BASE;
-    wire        clint_req_vld   = (ad_st_q == AD_WAIT) & d_cp_q;
+    //   ★★ 4b-3：核内 MMIO 现在有**两个**从设备（CLINT / PLIC）⇒ 按锁存地址 `d_a_q` 选
+    //     （`mmio_route` 的 `plic_hit_o` 反映的是**当拍端口地址**，不能用于已接管的访问）
+    wire        plic_sel_w      = (d_a_q >= `RV32GC_PLIC_HIT_LO) && (d_a_q < `RV32GC_PLIC_HIT_HI);
+    wire        clint_req_vld   = (ad_st_q == AD_WAIT) & d_cp_q & ~plic_sel_w;
     wire        clint_req_wr    = d_we_q;
     wire [31:0] clint_req_wdata = d_d_q;
     wire [3:0]  clint_req_strb  = d_strb_q;
@@ -861,6 +865,45 @@ module core_top_2b (
         .resp_hit  (clint_hit_w),
         .msip_o    (clint_msip_w),
         .mtip_o    (clint_mtip_w)
+    );
+
+    //==========================================================================
+    // 4b.3 ★★ PLIC（2A `plic` 只读例化）：外部中断链 MEIP/SEIP
+    //--------------------------------------------------------------------------
+    //  口径照 2A `core_top.v:557-570/1467`：
+    //    · `intrpt[7:0]` 平台引脚 → PLIC 源号映射：mac=5 / uart0=1 / spi=4 / nand=2 / dma=3
+    //      （[7:5] 不映射 = 0）；
+    //    · 寄存器窗口 `[0x1F10_0000, 0x1F50_0000)`（`mmio_route` 已解码为 `plic_hit_o`），
+    //      访问与 CLINT 同法：`AD_WAIT` 拍发一次 req、同拍组合回 resp（claim/complete 即
+    //      CLAIM_OFF 的读/写）；
+    //    · `meip_o`/`seip_o` ⇒ `csr_file` 的 `irq_meip`/`irq_seip`（中断取点仍在提交边界，
+    //      由既有 trap 链保证 mepc 精确 —— 与 MTIP 同口径）。
+    //==========================================================================
+    localparam [3:0] PLIC_SRC_MAC  = `RV32GC_INTRPT_SRC_MAC;    // 5
+    localparam [3:0] PLIC_SRC_UART = `RV32GC_INTRPT_SRC_UART;   // 1
+    localparam [3:0] PLIC_SRC_SPI  = `RV32GC_INTRPT_SRC_SPI;    // 4
+    localparam [3:0] PLIC_SRC_NAND = `RV32GC_INTRPT_SRC_NAND;   // 2
+    localparam [3:0] PLIC_SRC_DMA  = `RV32GC_INTRPT_SRC_DMA;    // 3
+    wire [31:0] plic_src_map_w = {4'd0, 4'd0, 4'd0,
+                                  PLIC_SRC_DMA, PLIC_SRC_NAND, PLIC_SRC_SPI,
+                                  PLIC_SRC_UART, PLIC_SRC_MAC};
+    wire [31:0] plic_rdata_w;
+    wire        plic_hit_w, plic_meip_w, plic_seip_w;
+
+    plic u_plic (
+        .aclk          (aclk),
+        .aresetn       (aresetn),
+        .src           (intrpt),
+        .intrpt_src_map(plic_src_map_w),
+        .req_valid     ((ad_st_q == AD_WAIT) & d_cp_q & plic_sel_w),
+        .req_write     (d_we_q),
+        .req_addr      (d_a_q - `RV32GC_PLIC_BASE),
+        .req_wdata     (d_d_q),
+        .req_wstrb     (d_strb_q),
+        .resp_rdata    (plic_rdata_w),
+        .resp_hit     (plic_hit_w),
+        .meip_o        (plic_meip_w),
+        .seip_o        (plic_seip_w)
     );
 
     // 请求发射：AD_REQ 拍恰好一次（重试时等 L1D 回到 IDLE）
@@ -897,7 +940,10 @@ module core_top_2b (
                                 (d_cp_q ? 1'b1 :
                                  d_unc_q ? d_unc_done_w : l1d_cs_ready));
     //   CLINT 命中取 CLINT 读数据；窗口内未接部分（PLIC）仍回 0（占位，fail-safe）
-    assign      d_rsp_d_w    = d_cp_q ? (clint_hit_w ? clint_rdata_w : 32'h0) : d_rdata_w;
+    //   ★ 4b-3：核内 MMIO 读数据 mux（窗口互斥 ⇒ 顺序无歧义；PLIC 未命中回 0 的既有口径不变）
+    wire [31:0] d_cp_rdata_w = plic_sel_w ? (plic_hit_w ? plic_rdata_w : 32'h0)
+                                          : (clint_hit_w ? clint_rdata_w : 32'h0);
+    assign      d_rsp_d_w    = d_cp_q ? d_cp_rdata_w : d_rdata_w;
     assign      d_rsp_tag_w  = d_tag_q;
 
     l1d #(.OWNER_D_FILL(2'd1), .OWNER_WRBACK(2'd2)) u_l1d (
@@ -1389,8 +1435,8 @@ module core_top_2b (
         .mstatus_o(csr_mstatus_raw), .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
         .trap_we(tc_trap_we), .trap_epc_i(tc_trap_epc_i), .trap_cause_i(tc_trap_cause_i),
         .trap_tval_i(tc_trap_tval_i), .trap_data_i(32'h0),
-        .irq_msip(clint_msip_w), .irq_mtip(clint_mtip_w), .irq_meip(1'b0),
-        .irq_stip(1'b0), .irq_seip(1'b0),
+        .irq_msip(clint_msip_w), .irq_mtip(clint_mtip_w), .irq_meip(plic_meip_w),
+        .irq_stip(1'b0), .irq_seip(plic_seip_w),
         .cycle_i(cycle_cnt), .instret_i(instret_cnt),
         .pmp_cfg_o(pmp_cfg_flat), .pmp_addr_o(pmp_addr_flat), .satp_o(csr_satp_o),
         .menvcfg_o(csr_menvcfg_w), .senvcfg_o(), .mcounteren_o(), .scounteren_o(),

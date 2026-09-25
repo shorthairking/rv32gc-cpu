@@ -4566,3 +4566,50 @@ MPRV=1/MPP=U 翻译（对 U=0 的恒等大页 ⇒ 误报 load 页错误 cause 13
 * **边界关闭**：CSR 可见性（load 侧）✓ —— §B4.26.4 边界 1 / §B4.28.3 关闭。
 * **剩余登记**：L1D/L1I 无复位、跨程序陈旧行（TB 侧递进基址规避）；cbo.inval 破坏性语义（Zicbom 允许）；
   store 侧上下文仍按"提交拍权威判定 + 提交门 + 重译"（§B4.25/§B4.26）—— 与本互锁互补。
+
+---
+
+# B4.30 4b-3·PLIC 例化接线（S 模式链 / p15：**本轮未完成，见表末**）
+
+> 起点 = 母代理已验收提交 `52b7a28`（tag 2B-4.28）。检查点：`tb_core_top_2b` **148/148 PASS**；
+> `regress.sh` **32/32 PASS**；2A 只读例化零修改；未提交 git。
+
+## B4.30.1 ① PLIC 例化接线（完成，`rtl/top/core_top_2b.v`）
+
+| 落点 | 内容 |
+|---|---|
+| 源映射 | 照 2A `core_top.v:557-570/1467`：`intrpt[7:0]` → 源号 `mac=5 / uart0=1 / spi=4 / nand=2 / dma=3`（`[7:5]` 不映射=0），常量取 `RV32GC_INTRPT_SRC_*` 宏（**不硬编码字面量**） |
+| 窗口 | `[0x1F10_0000, 0x1F50_0000)`；`mmio_route` 早已解码（`plic_hit_o`），本轮把它接出为 `d_mr_plic_hit`；**实际选窗用锁存地址** `d_a_q`（`plic_sel_w = d_a_q ∈ [PLIC_HIT_LO, PLIC_HIT_HI)`）—— 因为 `plic_hit_o` 反映的是**当拍端口地址**，不能用于已接管的访问 |
+| 访问 | 与 CLINT 同法：`AD_WAIT` 拍发一次 `req_*`（claim/complete 即 `CLAIM_OFF` 的读/写），同拍组合回 `resp_*`；`clint_req_vld` 拆出 `& ~plic_sel_w`（两窗口互斥），读数据 mux `plic_sel_w ? plic_rdata : clint_rdata` |
+| 中断链 | `.irq_meip(plic_meip_w)`、`.irq_seip(plic_seip_w)` 接入 `csr_file`（原 `1'b0` 占位）⇒ `mip.MEIP/SEIP` → `mie.MEIE` → **中断取点仍在提交边界**（与 MTIP/p8 同一条 trap 链 ⇒ mepc 精确口径不变） |
+
+实测：编译 0 error；`tb_core_top_2b` **148/148 PASS**（TB 的 `intrpt` 仍为 0 ⇒ 逐拍行为不变，
+无既有判据回退）；`regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c17.log`）。
+
+## B4.30.2 ②③ S 模式完整链 / p15_priv：**本轮未完成**（预算见底，附已完成核对的现状）
+
+**已核对到的现状（对下一轮直接可用）**：
+* CSR 侧**已就位**：`csr_file` 例化里 `medeleg_o/mideleg_o/sepc_o/stvec_o/sstatus/sie/sip/scause/stval`
+  等 S 模式 CSR 与 `priv` 输出都在（`core_top_2b:1392-1398`）；
+* **委托路径已接**：`trap_ctrl` 例化带 `.medeleg(csr_medeleg_o)` / `.mideleg(csr_mideleg_o)`
+  （`core_top_2b:1433-1434`）⇒ 委派判定在 RTL 侧已具备（**尚无用例行使**）；
+* `ecall-from-S` / `sret` / `mret 进 S`：**未核对**（需读 `trap_ctrl` 的 cause/返回路径 + `priv_ctrl`
+  的 `sret` 支持）——下一轮第一件事。
+* 缺件：**p15_priv.S**、生成器 PROGS 项与黄金、TB 第 12 个程序槽与判据、TB 侧 **PLIC 测试中断源**
+  （`intrpt` 由 TB 按程序阶段驱动，claim/complete 经 PLIC 窗口访问）——按本任务书 ④ 的口径，
+  PLIC 中断判据须走"程序自记录 + 硬编码期望"（Spike 无 PLIC，与 p8 同法登记）。
+
+**为什么未做**：本轮的预算是"停在全绿检查点"，而 ②③ 是"新程序（M→S 切换 → 委托 ecall → sret →
+非法指令 → PLIC 中断链）+ 生成器 + TB 槽 + 中断源驱动 + 判据"的整链，属**独立一轮**的工作量；
+在剩余预算内强行开工只会留下半成品接口（违反任务书的停止口径）⇒ 选择**只落地可独立验证的 ①**
+并保持 148/148 + 32/32 全绿。
+
+## B4.30.3 检查点与边界
+
+* 改动：`rtl/top/core_top_2b.v`（PLIC 例化接线 + MMIO 选窗/读 mux + MEIP/SEIP 接入）、
+  `sim/unit/back2_report.md`。**2A 零修改**（`plic`/`mmio_route`/`csr_file`/`trap_ctrl` 均只读例化）；
+  `scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s46`（含 `core_top_2b.v.pre3`）。
+* **新增边界（开放）**：PLIC 已接线但**无判据覆盖**（TB `intrpt=0`）；S 模式委托路径已接但**无用例**。
+* **下一轮建议顺序**：①读 `trap_ctrl`/`priv_ctrl` 核对 `sret`/`ecall-from-S`/委托投递；②写 p15_priv.S +
+  生成器项 + 黄金（Spike 的 S 模式可比）；③TB 第 12 槽 + 判据（含 PLIC：TB 驱动 `intrpt` 某针、
+  程序 claim/complete 自记录）；④反证（断开 `irq_meip` 必红）。
