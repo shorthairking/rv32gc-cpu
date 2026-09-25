@@ -3318,3 +3318,69 @@ TB **80/80**、regress **32/32**（`../.b2chk/regress_k1p.log`）。
   p11_maint 全流与 Spike 黄金逐条一致。
 - 下一步：①p12_cbo 的 `l1d` 维护互锁（小项）；②**4b-2b**（D 侧 TLB 口 1 + LSU VA/PA 分离 +
   PTW 串行复用）、**4b-2c**（PTE A/D 写通路走 §5 引擎第 7 源）——方案见 §B4.8.2/§B4.8.1。
+
+
+# 2B-4 p12_cbo 收口段 —— **定案：维护"全冲刷"丢掉"已提交但仍在排空"的 store（数据丢失）**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 K1' 修复 `01a686d`=tag `2B-4.14`）
+> 本段按三种修法方向排查 p12_cbo，**定案到一个比 cbo 更基础的数据正确性缺陷**：
+> 维护操作的"整机冲刷"会丢掉**已提交、尚在排空途中**的 store ⇒ 后 3 次 load 读到 0。
+> 该缺陷不在 cbo 语义、也不在 L1D 扫描，而在**冲刷 × store 排空（CDQ）**的交互。
+> 修法涉及 LSU/LSQ 的冲刷口径（预算内未收敛）⇒ 按纪律停在"整设计可编译 + 既有判据全绿"
+> 检查点：p12 未挂回（WIP），**p11_maint 与既有 91 项保持全绿**、regress 32/32。
+
+## B4.16.1 定案证据（p12 逐条提交轨迹）
+
+```
+idx=7  pc=0x8002001c we=0                  ← sw t0,0(s0)（0x55667788 写入）
+idx=8  pc=0x80020020 we=1 rd=9  wd=0x55667788   ← lw s1 ✔（store→load 转发）
+idx=9  pc=0x80020024 we=0                  ← cbo.clean（提交 ⇒ 维护全冲刷）
+idx=10 pc=0x80020028 we=1 rd=18 wd=0x00000000   ← lw s2 ✗（应为 0x55667788）
+idx=11 pc=0x8002002c we=0                  ← cbo.flush
+idx=12/13 pc=0x80020030/34 rd=19/20 wd=0x00000000 ← lw s3/s4 ✗
+```
+⇒ `lw s1` 靠 **store→load 转发**读到正确值（说明数值确实在流水里）；第一次 `cbo.clean` 的
+维护全冲刷之后，同一地址的 load 变成 0 ⇒ **那条已提交的 store 从未落进 L1D/内存**。
+
+## B4.16.2 已试修法与结论
+
+| # | 试法 | 结论 |
+|---|---|---|
+| 1 | cbo 维护**等 L1D 空闲**再启动（`maint_rdy_i = l1d_idle`，backend 侧对 cbo 门控 `maint_cmt_o`） | 未愈（计数正常：`maint=3, l1dinval=3, l1dclean=3`）⇒ 不是"扫描与在途访问相撞" |
+| 2 | 适配器 kill 排除 store（`d_kill_w = be_trp_flush & ~d_we_q`，避免杀"已提交的 store 排空"） | 未愈 ⇒ 丢失点不在适配器 |
+| 3 | **未试（下一步首选）**：冲刷**不得丢** CDQ 中"已提交待排空"的 store | 定案指向此处（store 在提交后才排空，冲刷把队列清了） |
+
+**保留在检查点内的本段改动**（均对既有判据零影响）：①`maint_rdy_i`（cbo 等 L1D 空闲，
+2A 风格的保守互锁，语义正确）；②`d_kill_w` 排除 store（避免杀已提交写，语义正确）。
+两处都保留：它们是修法 3 的前置正确性改进。
+
+## B4.16.3 下一步（修法 3 的具体落点）
+
+1. **定位排空队列的冲刷口径**：`lsq_simple`（`rtl/back2/lsq_simple.v`）的 CDQ 在
+   `flush_all` 下是否清空？若清空 ⇒ 改为"**只清未提交项，已提交待排空项继续排空**"
+   （CDQ 的语义本就是"已提交 store 的排空 FIFO"，架构上不得丢弃）。
+   判据：p12 4 次 load 数据全对 + 既有 91 项不回退 + 锁步 TB 57 项不回退。
+2. 若 CDQ 语义改造代价大，保守替代：**维护冲刷等排空清空**（`dbg_stq_cnt_o == 0` 且 CDQ 空
+   才允许 cbo 提交/冲刷），与 `fencei_wait_q` 同构；代价是 cbo 的延迟不确定，但正确性优先。
+3. 挂回 p12：生成器 1 条 PROGS + TB 的 C12'（4 条：无陷阱 / L1D inval ≥1 / clean ≥2 /
+   4 次 load 数据全对）+ 第 9 槽（0x20000，DDR3 窗口已 160 KB）⇒ 检查项 **91 → 95**。
+
+## B4.16.4 本段检查点状态
+
+- 编译 **0 error**；`tb_core_top_2b` **PASS 91/91**（8 程序；`../.b2chk/final_p12run.log`）；
+  `regress.sh` **32/32**（`../.b2chk/regress_p12.log`）；2A 零修改；未提交 git；快照 `../.b2chk/*.s28`。
+- 改动文件：`rtl/back2/backend_top.v`（`maint_rdy_i`）、`rtl/top/core_top_2b.v`
+  （`maint_rdy_i` 接线 + kill 排除 store）；TB/生成器/黄金与母代理验收态一致（p12 未挂回）。
+- **口径登记（cbo 语义表，本段复核）**：
+
+| 指令 | 合法性 | 维护动作（本核） | 数据安全 |
+|---|---|---|---|
+| `cbo.inval` | `menvcfg.CBIE≠0`（或 `senvcfg`） | L1D `inval_all`（**破坏性，不写回**） | 只在干净行上使用（Zicbom 语义） |
+| `cbo.clean` | `menvcfg.CBCFE=1` | L1D `clean_all`（写回） | 安全 |
+| `cbo.flush` | `menvcfg.CBCFE=1` | L1D `clean_all` + `inval_all` | 安全（先写回再失效） |
+| `sfence.vma` | M 模式恒合法 | **TLB 全失效**（本核 L1D 物理索引 ⇒ **不动 L1D**） | 安全 |
+| `fence.i` | Zifencei | L1I 全阵列扫掠（256 拍）+ 冻结前端 | 安全 |
+
+- 一句话：**p12 暴露的不是 cbo 缺陷，而是"维护全冲刷 × 已提交 store 排空"的数据丢失**——
+  这是比 cbo 更基础的正确性议题（同样会影响"冲刷时仍有 store 在排空"的其他场景），
+  已定案并给出两套修法；p11_maint（维护操作黄金判据）与既有 91 项保持全绿。

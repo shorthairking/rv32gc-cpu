@@ -550,9 +550,9 @@ module tb_core_top_2b #(
                              n_maint_cmt, n_l1i_inval, n_tlb_sfence, n_l1d_inval);
                     $fflush();
                 end
-                //   ★ C12'（cbo.*）本段未挂回：p12_cbo 的 `cbo.clean/flush` 后 load 数据
-                //     校验未过（实测 4 次 load 仅 1 次读到 0x55667788）⇒ 作为 WIP 留待
-                //     下一段（见报告 §B4.15.4，`l1d` clean/inval 维护与在途写回的交互待查）
+                //   ★ C12'（cbo.*）未挂回：p12_cbo 的数据安全检查未过（详见报告 §B4.16：
+                //     维护全冲刷丢掉**已提交但仍在排空**的 store ⇒ 后 3 次 load 读到 0）
+
 
             end else if (pid == 5) begin
                 //   ============ C9'：mtvec **向量模式**（MODE=1）实测（2B-4 第 4b 段第一步）============

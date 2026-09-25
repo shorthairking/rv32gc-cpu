@@ -625,7 +625,12 @@ module core_top_2b (
     //     正停在 `AD_WAIT` 等一个不会到来的 `l1d_cs_ready` ⇒ `d_ready_w` 永久为 0
     //     ⇒ 之后所有访存全部挂住。2A 对应 `m_kill_fsm`（core_top.v:3749-3752 的
     //     "异常 / fence.i 同步：放弃在途访存"）⇒ 本核给适配器补同样的 kill。
-    wire        d_kill_w = be_trp_flush;
+    //   ★★ p12 收口修正：**kill 不能杀"已提交的 store 排空"**。
+    //     本核的 store 是在**提交点**才被排空（CDQ）⇒ 一旦被适配器接管（`d_start`），
+    //     它就是**已提交**的写，杀掉即丢数据（实测 p12：`cbo.clean/flush` 前后 4 次 load
+    //     只有 1 次读到 0x55667788 —— 被杀的 store 从未落进 L1D/内存）。
+    //     load 则相反：其请求者会被冲刷并重新执行 ⇒ kill 安全。
+    wire        d_kill_w = be_trp_flush & ~d_we_q;
     wire        d_idle     = (ad_st_q == AD_IDLE);
     assign      d_ready_w  = d_idle & ~l1d_busy_w;   // 可接管新请求
     wire        d_start    = d_ready_w & lsu_req_v;
@@ -1002,7 +1007,7 @@ module core_top_2b (
         .csr_we_o(csr_we_w), .csr_waddr_o(csr_waddr_w), .csr_wdata_o(csr_wdata_w),
         .xret_kind_o(xret_kind_w),
         .cbo_perm_i(cbo_perm_w), .maint_kind_o(maint_kind_w), .maint_cmt_o(maint_cmt_w),
-        .maint_pc_o(maint_pc_w),
+        .maint_pc_o(maint_pc_w), .maint_rdy_i(l1d_idle),
         .cnt_commit_o(cnt_commit), .cnt_squash_o(cnt_squash),
         .cnt_commit4_o(), .cnt_issue_o(),
         .dbg_rob_cnt_o(dbg_rob_cnt_w), .dbg_iq_cnt_o(), .dbg_stq_cnt_o(dbg_stq_cnt_w)

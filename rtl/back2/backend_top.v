@@ -159,6 +159,11 @@ module backend_top #(
     //   · `maint_kind_o`：**提交点 lane 0** 的维护动作码（载荷 TVAL = 原始指令位）
     //       1=fence.i、2=sfence.vma、3=cbo.inval、4=cbo.clean、5=cbo.flush、0=非维护
     //   · `maint_cmt_o`：本拍 lane 0 的维护操作**正在提交**（顶层据此驱动维护口 + 冲刷重定向）
+    //   ★★ 2B-4 p12 收口：`maint_rdy_i` = 维护动作可以启动（顶层给 `l1d_idle`）。
+    //     cbo.* 的 L1D 维护扫描**必须等 L1D 空闲**：否则会与在途 store 排空/行填充相撞
+    //     （实测 p12：cbo 后 4 次 load 仅 1 次读到期望值）。sfence（只刷 TLB）与
+    //     fence.i（走 L1I 扫掠、自身等待）不受此门控。
+    input  wire        maint_rdy_i,
     input  wire [1:0]  cbo_perm_i,
     output wire [2:0]  maint_kind_o,
     output wire        maint_cmt_o,
@@ -1696,7 +1701,9 @@ module backend_top #(
     assign maint_kind_o = maint_kind_sel;
     assign maint_pc_o   = maint_pc_sel;
     assign xret_cmt_o  = |xret_lane_oh;
-    assign maint_cmt_o = |maint_lane_oh;
+    wire        maint_is_cbo_w = (maint_kind_sel == 3'd3) | (maint_kind_sel == 3'd4) |
+                                 (maint_kind_sel == 3'd5);
+    assign maint_cmt_o = |maint_lane_oh & (~maint_is_cbo_w | maint_rdy_i);
     //   ★★ 4b-2a 缺陷修正（实测抓出）：触发冲刷的维护/xRET 操作**通常与更年轻的指令同组提交**
     //     ——它们会被本次冲刷丢掉并**重新执行**，但 `cmt_ok` 的口子让整组都"上报提交"
     //     ⇒ 那些更年轻的槽在 PC 流里出现**两次**（实测 p11 连续两条 `fence.i`：
