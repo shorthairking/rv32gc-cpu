@@ -408,7 +408,15 @@ module core_top_2b (
         //     `front4_top.v:302`）在维护窗口/扫掠期间冻结前端（**无需改 front4**）：
         //       · fence.i 扫掠（256 拍）：冻结 + L1I 地址切扫掠 + cs_req=0
         //       · 单拍维护（sfence/cbo）的冻结窗口：冻结，窗口末尾再重定向
-        .break_point(break_point), .fe_stall(fencei_pend_w | maint_hold_w),
+        //   ★★ K1' 修正（实测）：**只有 fence.i 扫掠需要冻结前端**（因为要借用 L1I 的
+        //     index 输入做 256 拍全阵列失效）；sfence/cbo 只需后端冲刷 + L1D/TLB 维护，
+        //     不冻结前端。原因：在前端有在途 push（`l1i_pend_q`/`l1i_own`）时冻结它，
+        //     会留下"幻影 push_gives_next"——解冻后该块的 `can_grow=1` 但既无 parcel
+        //     也无在途响应 ⇒ 块永远拼不齐 ⇒ 该指令永不提交（实测 p11 末尾 `j .`@0xa4 停摆：
+        //     `[k1h] req_v=0 cs_req=0 pend=0 own=0 f4v=0 f4rsp=0 cangrow=1 fz=0`）。
+        //   ★ 冻结只在**扫掠进行中**（`fencei_busy`）——等待态不冻前端（否则可能在
+        //     "等前端排空"时把前端冻住 ⇒ 永不排空 ⇒ 死锁，实测 idx7 停摆）。
+        .break_point(break_point), .fe_stall(fencei_busy),
         .blk_valid(blk_valid), .blk_ready(blk_ready), .blk_mask(blk_mask),
         .blk_next_pc(blk_next_pc), .blk_taken(blk_taken),
         .lane_pc(lane_pc), .lane_pa(lane_pa), .lane_insn(lane_insn),
@@ -1172,11 +1180,13 @@ module core_top_2b (
             if (maint_fencei_w) begin
                 //   fence.i 提交拍：先存下"下一条 PC"；等 L1I 空闲后再扫掠
                 fencei_pc_q  <= maint_pc_w + 32'd4;
-                fencei_wait_q<= ~l1i_idle;
-                fencei_busy  <=  l1i_idle;
+                //   启动条件：L1I 空闲 **且** 顶层没有在途取指请求/响应（`l1i_pend_q`/
+                //   `l1i_own` 皆 0）⇒ 扫掠不会打断任何一笔在途取指，也就不会留下幻影 push
+                fencei_wait_q<= ~(l1i_idle & ~l1i_pend_q & ~l1i_own);
+                fencei_busy  <=  (l1i_idle & ~l1i_pend_q & ~l1i_own);
                 fencei_idx_q <= 8'd0;
             end else if (fencei_wait_q) begin
-                if (l1i_idle) begin
+                if (l1i_idle & ~l1i_pend_q & ~l1i_own) begin
                     fencei_wait_q <= 1'b0;
                     fencei_busy   <= 1'b1;
                     fencei_idx_q  <= 8'd0;

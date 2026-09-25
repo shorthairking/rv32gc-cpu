@@ -3176,3 +3176,67 @@ wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << maint_hold_sh) :
 - WIP：`back2_p11_maint.S`（黄金 42 条，修 D6 后 41/42）、`back2_p12_cbo.S`。
 - 一句话：**K1 的"丢 4 宽块"已定案并修掉（D6）；只剩 1 条末尾指令的前端取指响应问题（K1'）**，
   范围已缩到"某一行的取指握手"。
+
+
+# 2B-4 K1' 一步判定段 —— **定案：前端块拼装簿记留下"幻影 push"**（D6 修复后仅剩末尾 1 条）
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的 D6 修复 `84b2f25`=tag `2B-4.12`）
+> 本段按方案打点 `0x…a4` 行的取指握手，**K1' 已定案**，但修法涉及前端块拼装状态机
+> （比"冻结窗口/维护口"深一层），本段预算内未收敛 ⇒ 按任务书纪律停在"整设计可编译 +
+> 既有判据全绿"检查点（p11/p12 未挂回，判据未放宽）。
+
+## B4.14.1 判定实验原始证据（`[k1h]` 尾部打点）
+
+```
+[k1h] tick=200000 req_v=0 req_a=0x800000e0 cs_req=0 cs_rdy=0 cs_miss=0 rdata=0 own=0
+      | f4v=0 f4rsp=0 **cangrow=1** fz=0 pend=0 pa_q=0x800000e0
+```
+⇒ 结论：**既不是"请求未发出"也不是"响应丢失"**，而是**前端块拼装 FSM 的簿记不一致**：
+- 顶层与 L1I 侧**全空闲**（`req_v=0`、`cs_req=0`、`l1i_pend_q=0`、`l1i_own=0`）⇒ 没有任何在途取指；
+- 前端 `f4_v_q=0`、`f4_rsp_ok=0` ⇒ F4 级与响应位都空；
+- 但 **`can_grow=1`**（`can_grow = next_parcel_v | push_gives_next | f4_rsp_ok`）⇒ 前端仍然认为
+  "本块还能长、且某次 push 会送来下一个 parcel"，而该 push 既不在途、也不会再来
+  ⇒ `blk_ready_int = (grp_mask!=0) & (m3 | blk_term | ~can_grow) = 0` ⇒ 该块**永远拼不齐**、
+  该指令（`j .`@0xa4）永不提交、PC 停在该处。
+
+**触发条件**：该行 `0xa0..0xac` 恰是 `fence.i` 扫掠期间被失效的行之一 ⇒ 扫掠前后
+"前端已 push、L1I 行被失效"这一组合让 parcel/push 簿记丢了配对。
+
+## B4.14.2 本段试过的修法与结论（全部登记，均对既有判据零影响）
+
+| # | 试法 | 结果 |
+|---|---|---|
+| 1 | 扫掠前等 `l1i_idle`（`fencei_wait_q`） | 未愈（仍 41/42） |
+| 2 | 扫掠启动条件收紧为 `l1i_idle & ~l1i_pend_q & ~l1i_own`（前端取指请求彻底排空） | 未愈 |
+| 3 | 冻结只用于 fence.i 扫掠（`fe_stall = fencei_busy`），sfence/cbo 不再冻前端 | 未愈（回到 41/42；此前把等待态也纳入冻结会死锁在 idx7，已修正为只在扫掠中冻结） |
+| 4 | `l1i_req_valid`/`unc_req_valid`/`blk_valid` 加 `~freeze_all`（上一段已入） | 未愈（但语义正确，保留） |
+
+**保留在检查点内的本段改动**（`rtl/top/core_top_2b.v`）：`fencei_wait_q`/`fencei_pend_w` +
+"启动条件含前端排空" + "只在扫掠中冻结前端"。对既有 7 程序零影响（它们无维护操作）⇒
+TB **80/80**、regress **32/32**（`../.b2chk/regress_k1p.log`）。
+
+## B4.14.3 下一步（K1' 收口的两个可选方案，均已获母代理授权范围）
+
+**方案 ①（推荐，直击根因、影响面可控）**：给 `rtl/cache/l1i.v` 增加**专用维护 index 口**
+（如 `maint_idx_i[7:0]` + 复用现有 `inval_all`，维护时 index 取该口而非 `cs_vaddr`）：
+- 好处：扫掠**不再借用取指请求通道、不再切 `cs_vaddr`** ⇒ 前端在扫掠前后完全不受影响
+  （`l1i_cs_req` 也无需再门控），从根上消除"push 与失效行配对丢失"；
+- 影响面：`l1i.v` 1 个输入端口 + 1 处 index mux（**2A cache 文件的最小加法**，母代理已授权并需登记）；
+  `core_top_2b` 去掉 `l1i_cs_vaddr` 的扫掠 mux 与 `cs_req` 门控；`fe_stall` 仍保留（扫掠期间
+  冻结前端以便 L1I 空闲，可选）。
+
+**方案 ②（不动 l1i）**：在前端侧修"幻影 push"——在 `ifetch4.v` 中为 push/parcel 配对加
+超时/一致性恢复（例如：`can_grow` 里的 `push_gives_next` 需与实际在途 push 计数相与，
+无在途 push 时强制 `can_grow=0` 让块以当前 parcel 收尾）。改动更贴近根因但触及前端核心 FSM，
+需要更充分的回归（含 lockstep TB 的 57 项）。
+
+**先做的打点**（一步即可选定）：在停滞拍打印 `ifetch4` 内部
+`push_lo_ok/push_hi_ok/push_gives_next/next_parcel_v/buf_cnt_q/grp_mask/m3/blk_term/f4_is_xip`，
+确认是 `push_gives_next` 悬空（⇒ 方案 ②）还是 parcel 计数少一（⇒ 方案 ① 亦可解）。
+
+## B4.14.4 本段检查点状态
+
+- 编译 **0 error**；`tb_core_top_2b`（既有 7 程序）**PASS 80/80**；`regress.sh` **32/32**；
+  2A 零修改；未提交 git；快照 `../.b2chk/*.s26`。
+- 进度：`p11_maint` 42 条中已能提交 **41 条**（D6 修复前 33 条）；剩 1 条为前端幻影 push。
+  WIP：`back2_p11_maint.S`、`back2_p12_cbo.S`（判据口径与 TB 补丁形态在 §B4.10.2/§B4.12.3/§B4.13.3 已完整登记）。
