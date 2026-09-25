@@ -1118,11 +1118,29 @@ module core_top_2b (
     //     · sfence.vma / cbo.*：单拍完成（L1D 自身有维护 FSM 逐组扫描，`l1d.idle` 反映），
     //       当拍冲刷 + 重定向到头部 PC+4
     //     · 与陷阱/xRET 的优先级：陷阱 > xRET > fence.i 扫掠 > 维护单拍
+    //   ★★ 4b-2a-fix（K1）：单拍维护操作（sfence/cbo）改为**"冻结窗口 + 末尾重定向"** ——
+    //     提交拍起保持 `flush_all` 4 拍（把前端在途块与已派发项彻底排空），窗口最后一拍
+    //     才发重定向 ⇒ 不再出现"夹在中间的块被二次冲刷丢掉"（K1 实测症状）
     wire        maint_take_w = maint_sfence_w | maint_cbo_w;
-    assign be_trp_flush       = trp_take_w | fencei_busy | maint_take_w;
-    assign be_trp_redirect_v  = trp_take_w | maint_take_w | (fencei_busy_q & ~fencei_busy);
+    reg  [2:0]  maint_wait_q;
+    reg  [31:0] maint_pc_save_q;
+    wire        maint_hold_w  = (maint_wait_q != 3'd0);
+    wire        maint_redir_w = (maint_wait_q == 3'd1);        // 窗口最后一拍才重定向
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            maint_wait_q <= 3'd0; maint_pc_save_q <= 32'h0;
+        end else if (maint_take_w) begin
+            maint_wait_q    <= 3'd4;
+            maint_pc_save_q <= maint_pc_w + 32'd4;
+        end else if (maint_hold_w) begin
+            maint_wait_q <= maint_wait_q - 3'd1;
+        end
+    end
+
+    assign be_trp_flush       = trp_take_w | fencei_busy | maint_take_w | maint_hold_w;
+    assign be_trp_redirect_v  = trp_take_w | maint_redir_w | (fencei_busy_q & ~fencei_busy);
     assign be_trp_redirect_pc = trp_take_w          ? trp_target_w :
-                                maint_take_w        ? (maint_pc_w + 32'd4) :
+                                maint_redir_w       ? maint_pc_save_q :
                                 (fencei_busy_q & ~fencei_busy) ? fencei_pc_q :
                                                       trp_target_w;
 
