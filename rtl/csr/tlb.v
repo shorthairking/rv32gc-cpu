@@ -403,15 +403,25 @@ module tlb #(
                 // 若全有效 ⇒ 用 repl_ptr（最后赋值的那个覆盖）
                 if (all_valid) fill_idx = repl_ptr;
 
-                v_bit [fill_idx] <= 1'b1;
-                vpn   [fill_idx] <= fill_vpn;
-                asid_i[fill_idx] <= fill_asid;
-                g_bit [fill_idx] <= fp_g;
-                ppn   [fill_idx] <= fill_ppn;
-                perm_i[fill_idx] <= {fp_u, fp_x, fp_w, fp_r, 1'b0};
+                //   ★★ 2B-4 第 4b-2c 段**最小加法**（母代理预授权，理由登记）：
+                //     **flush 语义优先于 fill**。本块注释自述"失效优先，填充覆盖"，但实现顺序
+                //     是"先失效、后填充" ⇒ 同拍**同项**时刚被失效的表项又被装回来
+                //     （实测：p13 的 `sfence.vma` 已提交、两次 flush 脉冲均发出，重映射后同一
+                //     VA 仍命中旧翻译 ⇒ 读到旧页数据 0xDEADBEEF 而非新页 0x55667788）。
+                //     修法：本拍若 `fill_idx` 正是 flush 要清的项 ⇒ 本拍**不做填充**；该表项
+                //     保持无效，下一次查询 miss 后重新遍历（语义安全，且只在"flush 与 fill
+                //     同拍同项"这一冲突拍生效，其余逐拍不变）。
+                if (~(sfence_valid & way_do_flush[fill_idx])) begin
+                    v_bit [fill_idx] <= 1'b1;
+                    vpn   [fill_idx] <= fill_vpn;
+                    asid_i[fill_idx] <= fill_asid;
+                    g_bit [fill_idx] <= fp_g;
+                    ppn   [fill_idx] <= fill_ppn;
+                    perm_i[fill_idx] <= {fp_u, fp_x, fp_w, fp_r, 1'b0};
 
-                if (all_valid)
-                    repl_ptr <= repl_ptr + {{(IDX_W-1){1'b0}}, 1'b1};
+                    if (all_valid)
+                        repl_ptr <= repl_ptr + {{(IDX_W-1){1'b0}}, 1'b1};
+                end
             end
         end
     end

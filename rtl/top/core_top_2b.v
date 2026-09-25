@@ -416,6 +416,19 @@ module core_top_2b (
     //     同口径（core_top.v:1793-1796）。
     wire        ptw_kill_w   = (d_ptw_want_w & ~ptw_free_w & ptw_owner_fetch_w) |
                                be_trp_flush;
+    //   ★★ 4b-2c 定案（一步判定实验结论）：**冲刷前启动的遍历不得回填 TLB**。
+    //     实测（`[tlbflush]` 打点）：flush 拍 `fill_valid=0` ⇒ **不是"同拍 fill 覆盖 flush"**；
+    //     真相是"walk 的 PTE 读发生在 flush **之前**、其回填（`fill_valid`）落在 flush **之后**"
+    //     ⇒ 旧翻译被**装回**（实测重映射后同 VA 仍得旧页 0xDEADBEEF，且此后无新 PTE 读）。
+    //     修法（2B 侧、最小）：冲刷置位"本代际已冲刷"，新遍历被接受时清位；
+    //     回填只在"本代际未冲刷"时允许 ⇒ 跨冲刷的陈旧结果一律丢弃（该次查询继续走 PTW 重遍历）。
+    reg         ptw_flushed_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn)                    ptw_flushed_q <= 1'b0;
+        else if (be_trp_flush)           ptw_flushed_q <= 1'b1;
+        else if (ptw_req_v_w & ptw_free_w) ptw_flushed_q <= 1'b0;
+    end
+    wire        ptw_fill_ok_w = ~ptw_flushed_q;
     wire        ptw_req_v_w  = d_ptw_want_w | (f_ptw_want_w & ~d_ptw_want_w);
     wire [31:0] ptw_req_va_w = d_ptw_want_w ? d_va_q : tr_req_va;
 
@@ -437,7 +450,9 @@ module core_top_2b (
         .lookup2_acc(2'b00), .lookup2_priv(csr_priv_2),   // ★ 取指：当前特权级（不含 MPRV）
         .lookup2_sum(1'b0), .lookup2_mxr(1'b0),
         .hit2_o(f_tlb_hit), .perm_fault2_o(f_tlb_perm_fault), .pa2_o(f_tlb_pa),
-        .fill_valid(ptw_fill_valid), .fill_va(ptw_fill_va), .fill_ppn(ptw_fill_ppn),
+        //   ★ 4b-2c：跨冲刷的遍历结果不回填（见 `ptw_fill_ok_w`）
+        .fill_valid(ptw_fill_valid & ptw_fill_ok_w),
+        .fill_va(ptw_fill_va), .fill_ppn(ptw_fill_ppn),
         .fill_perm(ptw_fill_perm), .fill_asid(9'h0),
         // ---- sfence.vma：本段无 CSR 提交源 ⇒ 恒无效（第 4 段接提交点）----
         //   ★ 4b-2a：sfence.vma ⇒ **全失效**（本核单地址空间/无 ASID，全刷恒正确；

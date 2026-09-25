@@ -208,6 +208,12 @@ module tb_core_top_2b #(
                      u_dut.ptw_pte_req_valid, u_dut.ptw_pte_req_pa, u_dut.pte_resp_valid_w);
         if (DBG_P13 && (cur_p == 12) && u_dut.pte_resp_valid_w)
             $display("      [p13-pte] t=%0d pa=0x%08x data=0x%08x", k1_tick, u_dut.ptw_pte_req_pa, u_dut.pte_resp_data_w);
+        //   ★★ 4b-2c 一步判定实验：**flush 拍**打印"同拍是否正在填充 + fill 地址 +
+        //     TLB 命中/缺失计数" ⇒ 判定"未清"还是"清了又被同拍 fill 装回"。
+        if (DBG_P13 && u_dut.maint_tlb_sfence_w)
+            $display("   [tlbflush] t=%0d sfence=1 fill_valid=%b fill_va=0x%08x fill_ppn=0x%06x | hit=%0d miss=%0d flush=%0d",
+                     k1_tick, u_dut.ptw_fill_valid, u_dut.ptw_fill_va, u_dut.ptw_fill_ppn,
+                     u_dut.u_tlb.hit_cnt, u_dut.u_tlb.miss_cnt, u_dut.u_tlb.flush_cnt);
         if (DBG_K1 && (cur_p == 10) && ((k1_tick % 1000) == 0) && (k1_tick > 3000))
             $display("   [k1i] plo=%b phi=%b pgn=%b npv=%b bufcnt=%0d grpm=%b m3=%b term=%b xip=%b | pva0=0x%08x pva1=0x%08x nva=0x%08x rsp=%b f4v=%b",
                      u_dut.u_front.u_ifetch4.push_lo_ok, u_dut.u_front.u_ifetch4.push_hi_ok,
@@ -601,6 +607,7 @@ module tb_core_top_2b #(
                              n_maint_cmt, n_l1d_inval, n_l1d_clean);
                     $fflush();
                 end
+
 
 
 
