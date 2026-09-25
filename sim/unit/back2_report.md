@@ -4102,3 +4102,19 @@ t=13625 ... mact=1                                            ← 维护动作�
   **(b)** 排空路径不翻译（CDQ/STQ 项携带已定址 PA）——与 §B4.20.3 的 store 页错误精确化同一改动。
 * **检查点**：`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121e.log`）；
   `regress.sh` **32/32**（`../.b2chk/regress_4b2c8.log`）；p13 仍带 6 条 `nop` 规避（判据未放宽）。
+### B4.24.8 修法 (a) 实测（本轮）：不足以治愈，已撤回 ⇒ 下一步只走 (b)
+
+* **试的修法（a）**：`d_kill_w` 增加翻译保护
+  `d_xlat_guard_w = (ad_st_q∈{AD_XLATE,AD_TR,AD_PTE,AD_PTER})` ⇒
+  `d_kill_w = be_trp_flush & ~d_we_q & ~d_start & ~d_xlat_guard_w`。
+* **反证（无 nop 形态）**：**仍 FAIL**（`C13'-9`，且 `tlb_sfence` 计数由 2 变 1，说明该保护还扰动了
+  维护/翻译的时序）⇒ **撤回**，RTL 恢复与已验收提交一致。
+* **结论**：修法 (a)（kill 保护）**不能**治愈"排空期在途翻译被中止"这一形态；
+  按母代理优先级直接走 **(b) 排空路径不翻译**——CDQ/STQ 项携带**已定址 PA**、排空直用 PA，
+  与 store 页错误精确化（执行期 `st_xlate` + cause 15 + mtval=VA + 独立小用例）**同一次改动做完**。
+  (b) 需要的落点（供下一轮直接施工）：`lsq_simple` 增 `stq_pa/cdq_pa` 字段 + 执行期翻译请求口
+  （`st_xlate_valid/va/rob` ↔ `st_xlate_ready/pa/fault/cause`）→ `core_top_2b` 复用
+  `AD_XLATE/AD_TR` 服务该口（PA 写回 STQ）→ CDQ 入队时随提交拷贝 PA → 排空口
+  `mem_req_addr = cdq_pa`（**不再翻译**）→ 页错误经现有 `exc_*`/`upd_exc` 以 **cause 15** 精确上报。
+* **检查点（本轮收口）**：`tb_core_top_2b` **121/121 PASS**（`../.b2chk/final_121f.log`）；
+  `regress.sh` **32/32 PASS**（`../.b2chk/regress_4b2c9.log`）；2A 零修改；未提交 git；快照 `../.b2chk/*.s39`。
