@@ -3111,3 +3111,68 @@ idx=20 pc=0x80000060  ← ★ 直接跳到维护指令的下一条
 - WIP：`back2_p11_maint.S`（黄金 42 条）、`back2_p12_cbo.S`（自记录 + 维护口探针）。
 - 结论：**K1 未收敛**，但已把范围压缩到"维护拍提交上报/冲刷交互"（3 条具体排查点）+
   "前端越序块（`blk_bad=4`）"，并且 front4 的冻结门控（方案 A）已落地且零影响。
+
+
+# 2B-4 K1 一步判定实验段 —— **根因定案并修复一半：D6（`cmt_hold_w` 移位量 2 bit 回绕）**
+
+> 载体：`/home/shorthair/dsh/rv32-cpu/rv32gc-cpu`（dev，起点 = 母代理已提交的修法 A `af851d1`=tag `2B-4.11`）
+> 本段按要求做了"一步判定实验"并**定案**：K1 的"丢一个 4 宽块"来自 **`cmt_hold_w` 的移位量在
+> 2 bit 上下文中回绕**（`lane 3 + 1 = 0` ⇒ 掩码 = `4'hF` ⇒ **整组被 hold**）。修法为一行位宽修正，
+> 修复后 `p11_maint` 的提交数从 **33/42 → 41/42**、4 宽块不再丢失；**残余 1 条**（程序末尾的
+> `j .` @0xa4 不提交）另立案（K1'，见 §B4.13.3）。按任务书纪律停在"整设计可编译 + 既有判据
+> 全绿"检查点（p11/p12 未挂回，判据未放宽）。
+
+## B4.13.1 一步判定实验的原始证据（维护检测拍现场）
+
+```
+[k1m] kind=1 pc=0x80000018 | cmt_ok=1 cmt_raw=0011 cmt_raw_m=0011 lane=1 squash=0 trp_fl=0 flush_all=0 cmt_v=0011
+[k1m] kind=2 pc=0x8000002c | cmt_ok=1 cmt_raw=0001 cmt_raw_m=0001 lane=0 squash=0 trp_fl=1 flush_all=1 cmt_v=0001
+[k1m] kind=2 pc=0x8000005c | cmt_ok=1 cmt_raw=1111 cmt_raw_m=0000 lane=3 squash=0 trp_fl=1 flush_all=1 cmt_v=0000   ← ★ 整组被掩掉
+[k1m] kind=1 pc=0x8000007c | cmt_ok=1 cmt_raw=1111 cmt_raw_m=0000 lane=3 squash=0 trp_fl=0 flush_all=0 cmt_v=1111
+```
+⇒ 判定结果：**不是 (a) 相位/口子问题**（`cmt_ok` 恒 1 ✓、`trp_flush`/`flush_all` 相位正确 ✓），
+而是 **(b) 掩码问题**，且**只在 `maint_lane_idx == 3` 时发生**（lane 0/1/2 的掩码正确）。
+
+## B4.13.2 D6 缺陷与修法（diff）
+
+```verilog
+// 修前（backend_top.v）：移位量只有 2 bit ⇒ lane 3 时 3+1 回绕成 0 ⇒ 4'hF << 0 = 4'hF ⇒ 整组 hold
+wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << (maint_lane_idx + 2'd1)) :
+                        (|xret_lane_oh)  ? (4'hF << (xret_lane_idx  + 2'd1)) : 4'h0;
+// 修后：移位量扩到 3 bit（最大 4）⇒ lane 3 时移位 4 ⇒ 掩码 0（不 hold 任何 lane）
+wire [2:0] maint_hold_sh = {1'b0, maint_lane_idx} + 3'd1;
+wire [2:0] xret_hold_sh  = {1'b0, xret_lane_idx}  + 3'd1;
+wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << maint_hold_sh) :
+                        (|xret_lane_oh)  ? (4'hF << xret_hold_sh)  : 4'h0;
+```
+**为什么与观测症状完全吻合**：维护指令恰落在**满 4 宽提交组的第 4 个 lane** 时（最典型：4 条
+指令一块、维护指令是块尾）⇒ 整组（含**比它更老的 3 条**与它自己）从提交流消失 ⇒ 报告流里
+"丢一个 4 宽块"，而硬件侧维护动作照常发生（冲刷 + 重定向）⇒ 后续从 PC+4 继续 ⇒ 正是 K1 现象。
+修后实测：`cmt_raw_m=1111` ✓、提交数 **33 → 41**（黄金 42）✓、4 宽块不再丢失 ✓。
+
+## B4.13.3 残余缺陷 K1'（1 条指令）与下一步
+
+**现象**：`p11_maint` 现提交 41/42；缺的是程序末尾的 `j .`（`0xa4`）。`[k1tail]`（本段新增尾部诊断）：
+```
+[k1tail] blk_v=0 pc0=0x800000a4 rdy=1 | disp_ok=0 d1v=0000 rn_i=0 rn_f=0 fi=1 ff=1 iq=1 robcnt=0 fencei=0 maint_hold=0 tb_redir=0
+```
+⇒ 前端**停在该 PC、块呈现恒 0**，后端全空闲、无维护活动 ⇒ 前端在等一个"不会返回"的取指响应
+（该行 `0xa0..0xac` 含 `0xa4`，恰是 `fence.i` 扫掠被失效的行之一）。
+**已试而未愈**：①扫掠前等 `l1i_idle`（本段新增 `fencei_wait_q`，语义上更安全，保留）；
+②`l1i_req_valid`/`unc_req_valid`/`blk_valid` 加 `~freeze_all`（上一段，保留）。
+**下一步（精确打点建议）**：对 `0xa4` 那一行的取指握手打点 `l1i_req_valid/l1i_ready/l1i_miss/l1i_rdata`
+与前端 `f4_v_q/f4_rsp_ok/can_grow`，判定是"请求未发出"还是"响应丢失"；若为响应丢失，最小修法是
+**扫掠期间也保持 `cs_req` 通路**（把扫掠 index 从"取指请求通道"改由独立端口驱动——即给 `l1i`
+增加一个专用维护 index 口，属 l1i 小改），或**扫掠前把前端取指流水彻底排空**（等
+`l1i_idle & ~blk_valid` 连续 N 拍）。
+
+## B4.13.4 本段检查点状态
+
+- 编译 **0 error**；`tb_core_top_2b`（既有 7 程序）**PASS 80/80**；`regress.sh` **32/32**
+  （日志 `../.b2chk/regress_k1b.log`）；2A 零修改；未提交 git；快照 `../.b2chk/*.s25`。
+- 本段改动（均在 `rtl/`，对既有判据零影响——既有程序无维护操作）：
+  ①`rtl/back2/backend_top.v`：**D6 位宽修正**（`cmt_hold_w` 移位量 3 bit）；
+  ②`rtl/top/core_top_2b.v`：`fencei_wait_q`（扫掠前等 L1I 空闲）+ `fencei_pend_w`（冻结/冲刷窗口含等待态）。
+- WIP：`back2_p11_maint.S`（黄金 42 条，修 D6 后 41/42）、`back2_p12_cbo.S`。
+- 一句话：**K1 的"丢 4 宽块"已定案并修掉（D6）；只剩 1 条末尾指令的前端取指响应问题（K1'）**，
+  范围已缩到"某一行的取指握手"。

@@ -1703,8 +1703,18 @@ module backend_top #(
     //     第 17 条 `0x8001c03c` 重复出现）。
     //     修法：比该槽更年轻的 lane **不上报、不回写、不更新 ARAT、不进训练 FIFO**
     //     （它们在冲刷后重新执行；ROB 指针由 `flush_all` 分支接管，不受本掩码影响）。
-    wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << (maint_lane_idx + 2'd1)) :
-                            (|xret_lane_oh)  ? (4'hF << (xret_lane_idx  + 2'd1)) : 4'h0;
+    //   ★★ K1 根因（本段一步判定实验实测）：**移位量在 2 bit 上下文中回绕**。
+    //     原式 `4'hF << (maint_lane_idx + 2'd1)`：`maint_lane_idx` 只有 2 bit（0..3），
+    //     与 `2'd1` 相加仍是 2 bit ⇒ **lane 3 时 3+1 回绕成 0** ⇒ 掩码 = `4'hF`
+    //     ⇒ **整组（含更老的 lane 与维护指令本身）全被 hold** ⇒ 含维护指令的那一块
+    //     从提交流里整块消失（实测 `[k1m] kind=2 pc=0x…5c lane=3 cmt_raw=1111 cmt_raw_m=0000`，
+    //     正是 K1 的"丢一个 4 宽块"症状）。lane 0/1/2 的移位 1/2/3 正确 ⇒ 只有"维护指令
+    //     恰好落在第 4 个 lane"时才触发 ⇒ 与实测失败点（满 4 宽组）完全吻合。
+    //     修法：把移位量扩到 3 bit（最大 4）⇒ lane 3 时移位 4 ⇒ 掩码 0（不 hold 任何 lane）。
+    wire [2:0] maint_hold_sh = {1'b0, maint_lane_idx} + 3'd1;
+    wire [2:0] xret_hold_sh  = {1'b0, xret_lane_idx}  + 3'd1;
+    wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << maint_hold_sh) :
+                            (|xret_lane_oh)  ? (4'hF << xret_hold_sh)  : 4'h0;
     wire [3:0] cmt_raw_m  = cmt_raw & ~cmt_hold_w;
 
     //==========================================================================

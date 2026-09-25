@@ -229,9 +229,11 @@ module core_top_2b (
     //   fence.i 的"全阵列失效"扫掠（照 2A `core_top.v:885-905/3744-3749`：8 bit 索引
     //   256 拍，每拍以 `{19'b0, idx, 5'b00000}` 作为 L1I 的 index 输入）
     reg         fencei_busy, fencei_busy_q;
+    reg         fencei_wait_q;          // ★ K1：等 L1I 空闲再启动扫掠（避免打断在途请求）
     reg  [7:0]  fencei_idx_q;
     reg  [31:0] fencei_pc_q;
     wire        fencei_hold_w = fencei_busy | fencei_busy_q;
+    wire        fencei_pend_w = fencei_busy | fencei_wait_q | fencei_busy_q;
     wire        maint_fencei_w = maint_cmt_w & (maint_kind_w == 3'd1);
     wire        maint_sfence_w = maint_cmt_w & (maint_kind_w == 3'd2);
     wire        maint_cbo_w    = maint_cmt_w & (maint_kind_w >= 3'd3);
@@ -406,7 +408,7 @@ module core_top_2b (
         //     `front4_top.v:302`）在维护窗口/扫掠期间冻结前端（**无需改 front4**）：
         //       · fence.i 扫掠（256 拍）：冻结 + L1I 地址切扫掠 + cs_req=0
         //       · 单拍维护（sfence/cbo）的冻结窗口：冻结，窗口末尾再重定向
-        .break_point(break_point), .fe_stall(fencei_busy | maint_hold_w),
+        .break_point(break_point), .fe_stall(fencei_pend_w | maint_hold_w),
         .blk_valid(blk_valid), .blk_ready(blk_ready), .blk_mask(blk_mask),
         .blk_next_pc(blk_next_pc), .blk_taken(blk_taken),
         .lane_pc(lane_pc), .lane_pa(lane_pa), .lane_insn(lane_insn),
@@ -1146,23 +1148,39 @@ module core_top_2b (
         end
     end
 
-    assign be_trp_flush       = trp_take_w | fencei_busy | maint_take_w | maint_hold_w;
+    assign be_trp_flush       = trp_take_w | fencei_pend_w | maint_take_w | maint_hold_w;
     assign be_trp_redirect_v  = trp_take_w | maint_redir_w | (fencei_busy_q & ~fencei_busy);
     assign be_trp_redirect_pc = trp_take_w          ? trp_target_w :
                                 maint_redir_w       ? maint_pc_save_q :
                                 (fencei_busy_q & ~fencei_busy) ? fencei_pc_q :
                                                       trp_target_w;
 
+    //   ★★ K1 收口修正（实测）：**扫掠必须等 L1I 空闲再启动**。
+    //     现象：p11 最后一条指令（`j .` @0xa4）永不提交，`[k1tail]` 显示前端停在该 PC、
+    //     块呈现恒 0、后端全空闲 ⇒ 前端在等一个"永不返回"的取指响应。
+    //     根因：扫掠启动时若 L1I 仍有**在途请求/回填**，`l1i_cs_vaddr` 被切到扫掠地址 ⇒
+    //     在途那笔的响应与前端簿记对不上 ⇒ 前端挂死（`~freeze_all` 只防住"冻结期间新发请求"，
+    //     防不住"冻结前已发出、响应在途"的那一笔）。
+    //     修法：fence.i 提交后先进入 `fencei_wait_q`（期间保持冲刷 + 冻结前端 + 不发新请求），
+    //     等 `l1i_idle` 为 1 才真正开始 256 拍扫掠。
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
-            fencei_busy <= 1'b0; fencei_busy_q <= 1'b0;
+            fencei_busy <= 1'b0; fencei_busy_q <= 1'b0; fencei_wait_q <= 1'b0;
             fencei_idx_q <= 8'd0; fencei_pc_q <= 32'h0;
         end else begin
             fencei_busy_q <= fencei_busy;
             if (maint_fencei_w) begin
-                fencei_busy <= 1'b1;
+                //   fence.i 提交拍：先存下"下一条 PC"；等 L1I 空闲后再扫掠
+                fencei_pc_q  <= maint_pc_w + 32'd4;
+                fencei_wait_q<= ~l1i_idle;
+                fencei_busy  <=  l1i_idle;
                 fencei_idx_q <= 8'd0;
-                fencei_pc_q  <= maint_pc_w + 32'd4;     // fence.i 的下一条（norvc ⇒ +4）
+            end else if (fencei_wait_q) begin
+                if (l1i_idle) begin
+                    fencei_wait_q <= 1'b0;
+                    fencei_busy   <= 1'b1;
+                    fencei_idx_q  <= 8'd0;
+                end
             end else if (fencei_busy) begin
                 if (fencei_idx_q == 8'hFF) fencei_busy <= 1'b0;
                 fencei_idx_q <= fencei_idx_q + 8'd1;
