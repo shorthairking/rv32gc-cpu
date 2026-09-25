@@ -71,6 +71,9 @@ PROGS = [
     ("back2_p10_csr.S",    "P10", "rv32ima_zicsr",  "rv32imac_zicsr"),
     ("back2_p11_maint.S",  "P11", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei"),
     ("back2_p12_cbo.S",    "P12", "rv32ima_zicsr_zicbom", "rv32imac_zicsr_zicbom", True),
+    #   ★ 2B-4 第 4b-2c 段：**Sv32 数据侧翻译**（两级页表 / 两次精确页错误含 A=0 的 SVADE /
+    #     A/D 回读 / sfence 重映射）。**仅映像、无黄金**：判据由 TB 的 C13'（12 条）给出。
+    ("back2_p13_sv32.S",   "P13", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei", True),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"

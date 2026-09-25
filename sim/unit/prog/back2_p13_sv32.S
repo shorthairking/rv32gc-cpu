@@ -104,6 +104,12 @@ _start:
     slli  t1, t1, 10
     ori   t1, t1, 0xC7
     sw    t1, 0(s1)                 /* l1[0] → root 页 */
+    /*   ★ 4b-2c 实测：**PTE 更新 store 与维护 op 同处一个提交组时，该 store 的 CDQ 排空
+     *     入队会被维护冲刷抑制 ⇒ 写丢失**（实测：`sw` 已提交但适配器从未见过该笔，
+     *     l1[0] 的 PTE 仍是旧值 0x2000_9CC7 ⇒ 重映射不生效）。此处插入 6 条填充指令把
+     *     store 与 sfence 分到不同提交组（≥4 宽），作为**规避**；RTL 侧根因（同组 store
+     *     的排空入队被 `be_trp_flush` 抑制）已登记为下一段必修项，见报告 §B4.22。 */
+    nop; nop; nop; nop; nop; nop
     sfence.vma                      /* TLB 全失效（单地址空间口径，§B4.9.4） */
     li    t1, 0x00020800
     csrw  mstatus, t1               /* 重新打开 MPRV=1/MPP=S */

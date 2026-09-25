@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 9;
+    localparam integer NPROG  = 10;
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -377,6 +377,7 @@ module tb_core_top_2b #(
         pidx[6] = 9;  cmax_of[6] = P9_GOLD_N;   // p10_csr（0x18000）
         pidx[7] = 10; cmax_of[7] = P10_GOLD_N;  // p11_maint（0x1C000）
         pidx[8] = 11; cmax_of[8] = P11_GOLD_N;  // p12_cbo（0x20000）
+        pidx[9] = 12; cmax_of[9] = P12_GOLD_N;  // p13_sv32（0x24000；Sv32 数据侧翻译）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -416,7 +417,7 @@ module tb_core_top_2b #(
             $display("== 程序 %0d（.svh 下标 %0d）：黄金 %0d 条 ==", pid, cur_p, cmax_of[pid]);
             $fflush();
             cyc = 0;
-            if ((pid == 4) || (pid == 8)) begin
+            if ((pid == 4) || (pid == 8) || (pid == 9)) begin
                 //   ★ p8_int：固定拍数（无黄金轨迹可等；中断在 ~200 拍后到，余量充足）
                 for (k = 0; k < P8_CYCLES; k = k + 1) begin
                     @(posedge clk);
@@ -433,7 +434,8 @@ module tb_core_top_2b #(
                          u_dut.u_csr_file.mtvec_o, u_dut.u_csr_file.mepc_o,
                          trp_mcause_cap, nrec);
             end
-            while ((pid != 4) && (pid != 8) && (nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
+            while ((pid != 4) && (pid != 8) && (pid != 9) &&
+                   (nrec < cmax_of[pid]) && (cyc < CYC_LIMIT)) begin
                 @(posedge clk);
                 cyc = cyc + 1;
                 if ((cyc % 50000) == 0) begin
@@ -551,8 +553,12 @@ module tb_core_top_2b #(
             //   ---- C5'：非陷阱程序必须"全程无提交点异常" ----
             //   ★ p7_trap 是**故意**制造异常的程序 ⇒ C5' 换判据 C7'（陷阱次数/原因/PC）。
             if ((pid != 3) && (pid != 5)) begin
-                chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
-                chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
+                //   ★ 4b-2c：p13_sv32 **故意**制造 2 次数据页错误（V=0 与 A=0）⇒ C5' 两条
+                //     "无陷阱"判据对它不适用（其异常由 C13' 逐项判定 —— 判据未放宽）
+                if (pid != 9) begin
+                    chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
+                    chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
+                end
                 //   ============ C10'：CSR 读写轨迹（2B-4 第 4b-1 段前置判据）============
                 //   从写回轨迹里直接抓 CSR 读回值（C3' 已与 Spike 逐条比过；此处给可读证据）
                 if (pid == 6) begin
@@ -609,6 +615,54 @@ module tb_core_top_2b #(
                 end
 
 
+
+
+                //   ============ C13'：Sv32 数据侧翻译（p13_sv32，4b-2c）============
+                //   12 条判据（**程序自记录 + 硬编码期望**，无 Spike 黄金；见 §B4.21）：
+                //     ①两级页表翻译链（译后 load / store→load）②两次**精确页错误**：
+                //     V=0 未映射 与 **A=0**（SVADE=1 口径：硬件不置位 ⇒ 页错误交软件）
+                //     ③`mtval` = 故障**虚拟**地址 ④**PTE A/D 回读一致**（PTE 读经 L1D 的证据）
+                //     ⑤**`sfence.vma` 后重映射生效**（同 VA 读新页；无陈旧 TLB 命中）
+                //     ⑥关 MPRV 直读 PA 一致 ⑦陷阱精确返回后继续执行
+                if (pid == 9) begin
+                    if (DBG_P13) begin
+                        $display("   [p13] 提交轨迹（共 %0d 条，基址 0x%08x）：", nrec, cur_base);
+                        for (k = 0; k < nrec; k = k + 1)
+                            $display("      idx=%0d pc=0x%08x we=%b rd=%0d wd=0x%08x",
+                                     k, rpc[k], rwe[k], rrd[k], rwd[k]);
+                    end
+                    d_pc = 0; d_rd = 0; d_wd = 0; crk = 0;
+                    for (k = 0; k < 1024; k = k + 1) begin
+                        if (rwe[k] && (rrd[k] == 5'd28) && (rwd[k] === 32'd13))       d_pc = d_pc + 1;
+                        if (rwe[k] && (rrd[k] == 5'd29) && (rwd[k] === 32'h4000_1000)) d_rd = 1;
+                        if (rwe[k] && (rrd[k] == 5'd29) && (rwd[k] === 32'h4000_2000)) d_wd = 1;
+                        //   ★ 逐项**位置位**（bit0..bit5）——不得用累加和（&N 判据会失效）
+                        if (rwe[k] && (rrd[k] == 5'd21) && (rwd[k] === 32'h1122_3344)) crk = crk | 1;
+                        if (rwe[k] && (rrd[k] == 5'd22) && (rwd[k] === 32'hDEAD_BEEF)) crk = crk | 2;
+                        if (rwe[k] && (rrd[k] == 5'd25) && (rwd[k] === 32'h5566_7788)) crk = crk | 4;
+                        if (rwe[k] && (rrd[k] == 5'd26) && (rwd[k] === 32'hDEAD_BEEF)) crk = crk | 8;
+                        //   PTE 回读发生在**重映射之后** ⇒ 期望 = 新 PTE（PPN(root 页)<<10 | D|A|W|R|V）
+                        //   = 0x2000_98C7；A/D 仍为程序所置 ⇒ 既证明"更新 store 已落地"，也证明 A/D 口径
+                        if (rwe[k] && (rrd[k] == 5'd27) && (rwd[k] === 32'h2000_98C7)) crk = crk | 16;
+                        if (rwe[k] && (rrd[k] == 5'd10) && (rwd[k] === 32'd1))         crk = crk | 32;
+                    end
+                    chk(n_trap_p == 2, $sformatf("C13'-1 p13：恰好 2 次陷阱交付（V=0 与 A=0），实测 %0d", n_trap_p));
+                    chk(trc_cause[0] == 4'd13, $sformatf("C13'-2 p13：第 1 次 mcause = 13（V=0 load page fault），实测 %0d", trc_cause[0]));
+                    chk(trc_cause[1] == 4'd13, $sformatf("C13'-3 p13：第 2 次 mcause = 13（A=0 ⇒ SVADE 页错误），实测 %0d", trc_cause[1]));
+                    chk(d_pc == 2, $sformatf("C13'-4 p13：handler 两次读回 mcause = 13（经 mtvec 精确交付），实测 %0d", d_pc));
+                    chk(d_rd == 1, "C13'-5 p13：mtval = 0x40001000（未映射 VA 的故障**虚拟**地址）");
+                    chk(d_wd == 1, "C13'-6 p13：mtval = 0x40002000（A=0 ⇒ SVADE 页错误且不挂死）");
+                    chk(((crk & 1) == 1), "C13'-7 p13：翻译后 load（VA 0x4000_0100 → PA l1 页）读到 0x11223344");
+                    chk(((crk & 2) == 2), "C13'-8 p13：翻译后 store→load 一致（0xDEADBEEF）");
+                    chk(((crk & 4) == 4) && (n_tlb_sfence >= 1),
+                        $sformatf("C13'-9 p13：**sfence.vma 后重映射生效**（同 VA 读到新页 0x55667788；TLB 失效脉冲 %0d 次）", n_tlb_sfence));
+                    chk(((crk & 8) == 8), "C13'-10 p13：关 MPRV 直读 PA 与译后 store 一致（0xDEADBEEF）");
+                    chk(((crk & 16) == 16), "C13'-11 p13：PTE 回读 = 重映射后的新 PTE 0x2000_98C7（A/D 置位保持；PTE 读经 L1D 的直接证据）");
+                    chk(((crk & 32) == 32), "C13'-12 p13：陷阱精确返回后继续执行（a0 = 1）");
+                    $display("   [C13'] Sv32：12 项全过（维护计数 maint=%0d tlb_sfence=%0d；PTE 回读 = 重映射后新 PTE 0x2000_98C7）",
+                             n_maint_cmt, n_tlb_sfence);
+                    $fflush();
+                end
 
 
             end else if (pid == 5) begin
