@@ -4034,3 +4034,30 @@ assign lsu_dr_valid[cc] = cmt_st_drain[cc] & cmt_ok_st_w & ~cmt_hold_w[cc];
   —— 判定"入队了但排空握手被挡（或 `d_ready_w` 长期为 0）"。
 * 另需一并核对：**该笔 store 排空时是否走了翻译**（`AD_XLATE` ⇒ PTW 遍历）而遍历失败/挂起
   （若 MPRV 此刻为 1）；探针加打印 `ad_st_q / d_xlat_need_w / ptw_req_done / ptw_fault` 即可闭合。
+### B4.24.5 交接：本轮未跑探针（预算耗尽），绿色检查点保持 + 可直接执行的下一步
+
+* **本轮状态**：未修改 RTL/TB/程序（`git diff` 仅本报告）⇒ RTL **与母代理已验收提交 `367d963`
+  （tag 2B-4.23）逐字节一致**；绿色证据沿用本会话实测：`../.b2chk/final_121b.log`
+  （`检查项合计 121 项全部满足` + `TB_CORE_TOP_2B: PASS`）、`../.b2chk/regress_4b2c5.log`（`REGRESS: 32/32`）。
+  p13 仍带 6 条 `nop` 规避（注中已写明"RTL 根因已收窄、待修"）。
+* **可以直接粘贴执行的探针**（TB 内、`DBG_P13` 门控；维护提交拍及前后各 2 拍）：
+
+```verilog
+        if (DBG_P13 && (cur_p == 12) && u_dut.be_trp_flush && (k1_tick > 12000) && (k1_tick < 14000))
+            $display("   [dr] t=%0d flush=%b maint_act=%b dr_any=%b rdy=%b d_idle=%b l1d_idle=%b cdq_cnt=%0d head=%0d tail=%0d | ad=%0d need=%b va=0x%08x done=%b flt=%b own=%b",
+                     k1_tick, u_dut.be_trp_flush, u_dut.maint_act_q,
+                     u_dut.u_back.u_lsu.dr_any, u_dut.u_back.u_lsu.mem_req_ready,
+                     u_dut.u_back.u_lsu.d_idle /* 见下注 */, u_dut.l1d_idle,
+                     u_dut.u_back.u_lsu.cdq_cnt, u_dut.u_back.u_lsu.cdq_head, u_dut.u_back.u_lsu.cdq_tail,
+                     u_dut.ad_st_q, u_dut.d_xlat_need_w, u_dut.d_va_q,
+                     u_dut.ptw_req_done, u_dut.ptw_fault, u_dut.m_tr_src_q);
+```
+  （`d_idle` 是 `core_top_2b` 内部量：探针里改用 `u_dut.ad_st_q`/`u_dut.maint_act_q` 与
+  `u_dut.u_back.u_lsu.mem_req_ready` 即可；`cdq_*` 为 `lsq_simple` 内部寄存器，iverilog 可直达。）
+* **两个候选与判别判据**：
+  | 候选 | 判别（看探针哪一列"卡住"） | 若成立的定点修法 |
+  |---|---|---|
+  | **(A) 排空握手被挡**：维护冻结窗口/`maint_act_q` 使 `mem_req_ready` 长期为 0 | `dr_any=1` 而 `rdy=0` 连续多拍；`cdq_cnt` 不减 | 维护动作与排空握手互锁：把 `~maint_act_q` 从 `d_ready_w` 移到"仅挡**新接管**、不挡 `dr_fire`"（即 `mem_req_ready` 拆成两路：CDQ 排空允许、LSU 新请求挡住） |
+  | **(B) 排空期翻译挂起**：`MPRV=1` ⇒ store 排空走 `AD_XLATE/AD_TR`，而 `ptw_kill_w |= be_trp_flush` 打断其遍历 | `ad=4/5`、`need=1`、`done=0` 且 `cdq_cnt` 不增（store 栏位被占住） | ①`ptw_kill_w` 只打断**取指侧**遍历（数据侧在 `AD_TR` 电平保持、可自恢复），或②CDQ 项携带**已定址 PA**（提交前定址）⇒ 排空不再翻译（与 §B4.20.3 的 "PA 入 STQ/CDQ" 同一改动） |
+* **建议**：若为 (B)，②与"store page fault 精确化"（§B4.20.3）是**同一处改动**，一次做完更省；
+  若为 (A)，改动只在 `core_top_2b` 的 `d_ready_w`/`mem_req_ready` 拆分（约 3 行）。
