@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 11;   // ★ 4b-2c 收口：+ p14_storepf（store 页错误精确化）
+    localparam integer NPROG  = 12;   // ★ 4b-3(2/2)：+ p15_priv（S 模式链 + PLIC）
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -60,6 +60,15 @@ module tb_core_top_2b #(
     localparam integer DBG_P13 = 1;
 
     reg clk, rst_n;
+    //   ★★ 4b-3(2/2)：PLIC 测试中断源 —— p15 运行到等待循环后驱动 pin0（= mac_int ⇒ PLIC 源 5）
+    reg  [7:0]  intrpt_w;
+    integer     p15_cyc;
+    always @(posedge clk) begin
+        if ((cur_p != 14) || !rst_n) p15_cyc <= 0;
+        else                          p15_cyc <= p15_cyc + 1;
+        intrpt_w <= ((cur_p == 14) && (p15_cyc >= P15_IRQ_AT) &&
+                     (p15_cyc < (P15_IRQ_AT + P15_IRQ_LEN))) ? 8'h01 : 8'h00;
+    end
     initial begin clk = 1'b0; forever #(CLK_HALF_NS) clk = ~clk; end
     reg [3:0] maint_must_push;      // ★★ (b) 硬断言用：本拍"必须入队"的更老 store lane 掩码
     reg       maint_push_chk_q;     //    入队落地核对（延后 1 拍）
@@ -113,7 +122,7 @@ module tb_core_top_2b #(
     wire [4:0]  dbg_wnum_w;
 
     core_top_2b u_dut (
-        .aclk(clk), .intrpt(8'h00), .aresetn(rst_n),
+        .aclk(clk), .intrpt(intrpt_w), .aresetn(rst_n),
         .arid(arid), .araddr(araddr), .arlen(arlen), .arsize(arsize),
         .arburst(arburst), .arlock(arlock), .arcache(arcache), .arprot(arprot),
         .arvalid(arvalid), .arready(arready),
@@ -150,7 +159,8 @@ module tb_core_top_2b #(
         //     取指读到"未登记区域"的 0 ⇒ 立即非法指令陷阱）
         //   ★ 4b-2c 收口：程序数 10→11（p14_storepf @0x8002_8000）⇒ 窗口放宽到 0x30000
         //     （11×16 KB = 176 KB；否则第 11 个程序的取指被判"未登记区域"读 0）
-        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0003_0000),
+        //   ★ 4b-3(2/2)：程序数 11→12（p15_priv @0x8002_C000）⇒ 窗口放宽到 0x34000
+        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0003_4000),
         .UART_DATA_ADDR(32'h1FE0_01E0), .READ_LAT_DLY(0)
     ) u_mem (
         .clk(clk), .rst_n(rst_n),
@@ -361,8 +371,8 @@ module tb_core_top_2b #(
         integer m;
         begin
             @(negedge clk);
-            //   ★ 4b-2c 收口：11 个程序窗口 ⇒ 清到 0x30000 字节（49152 字，含第 11 个程序）
-            for (m = 0; m < 49152; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
+            //   ★ 4b-3(2/2)：12 个程序窗口 ⇒ 清到 0x34000 字节（53248 字）
+            for (m = 0; m < 53248; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
             for (m = 0; m < 1024;  m = m + 1) u_mem.xip_mem[m]  = 32'h0000_0013;
             u_mem.xip_mem[0] = 32'h0000_0013;   // 跳板由 load_prog 按基址重建
             u_mem.xip_mem[1] = 32'h0000_0013;
@@ -464,6 +474,10 @@ module tb_core_top_2b #(
     integer cyc, k, d_pc, d_rd, d_wd;
     integer cyc_fixed;
     localparam integer P12_CYCLES = 16000;   // ★ 见上：p12 需覆盖"clean 全阵列写回"的代价
+    //   ★ 4b-3(2/2)：p15 无黄金 ⇒ 固定拍数；TB 在 P15_IRQ_AT 拍驱动 intrpt[0]（保留 P15_IRQ_LEN 拍）
+    localparam integer P15_CYCLES  = 8000;
+    localparam integer P15_IRQ_AT  = 2500;
+    localparam integer P15_IRQ_LEN = 300;
     integer cyc_before, inst_before;        // Zicntr 活性检查采样（C10'）
     integer ar0, rb0, aw0, wb0, b0, xip0;
     integer pid;
@@ -483,6 +497,7 @@ module tb_core_top_2b #(
         pidx[8] = 11; cmax_of[8] = P11_GOLD_N;  // p12_cbo（0x20000）
         pidx[9] = 12; cmax_of[9] = P12_GOLD_N;  // p13_sv32（0x24000；Sv32 数据侧翻译）
         pidx[10] = 13; cmax_of[10] = P13_GOLD_N; // p14_storepf（0x28000；**store 页错误精确化**）
+        pidx[11] = 14; cmax_of[11] = P14_GOLD_N; // p15_priv（0x2C000；**S 模式链 + PLIC**，无黄金=固定拍数）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -523,9 +538,9 @@ module tb_core_top_2b #(
             $display("== 程序 %0d（.svh 下标 %0d）：黄金 %0d 条 ==", pid, cur_p, cmax_of[pid]);
             $fflush();
             cyc = 0;
-            if ((pid == 4) || (pid == 8) || (pid == 9)) begin
+            if ((pid == 4) || (pid == 8) || (pid == 9) || (pid == 11)) begin
                 //   ★ p8_int：固定拍数（无黄金轨迹可等；中断在 ~200 拍后到，余量充足）
-                cyc_fixed = ((pid == 8) ? P12_CYCLES : P8_CYCLES);
+                cyc_fixed = ((pid == 8) ? P12_CYCLES : ((pid == 11) ? P15_CYCLES : P8_CYCLES));
                 for (k = 0; k < cyc_fixed; k = k + 1) begin
                     @(posedge clk);
                     //   [诊断，默认关] CLINT/CSR/中断判定现场（每 500 拍一条，共 8 条）
@@ -664,7 +679,8 @@ module tb_core_top_2b #(
                 //     "无陷阱"判据对它不适用（其异常由 C13' 逐项判定 —— 判据未放宽）
                 //   ★ 4b-2c 收口：p14_storepf 故意制造 1 次 **store** 页错误（cause 15）
                 //     ⇒ 同 p13，其异常由 C15' 逐项判定（判据未放宽）
-                if ((pid != 9) && (pid != 10)) begin
+                //   ★ 4b-3(2/2)：p15_priv 故意制造 4 类陷阱（S ecall 委托 / 非法指令 / MEI）⇒ 同 p13/p14 豁免
+                if ((pid != 9) && (pid != 10) && (pid != 11)) begin
                     chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
                     chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
                 end
@@ -802,7 +818,97 @@ module tb_core_top_2b #(
                              n_maint_st_push, n_maint_flush_cyc);
                     $fflush();
                 end
-                //   ============ C15'：store 页错误精确化（p14_storepf，4b-2c 收口）============
+            //   ============ C16'：S 模式完整链 + PLIC 外部中断（p15_priv，4b-3(2/2) 收口）============
+            //   判据 = **程序自记录 + 硬编码期望**（与 C13'/C15' 同法）。
+            //   ★ **为何无 Spike 黄金**：Spike 不建模 PLIC（claim/complete 无对应模型）⇒
+            //     含 PLIC 的整链无法逐条黄金比对；本程序在 PROGS 里登记为"仅映像"（同 p8/p12/p13）。
+            //   本项覆盖的**端到端链**（任一处断裂都会掉项）：
+            //     M 装 mtvec/stvec/medeleg/PMP/PLIC → mret 进 S → S 下 ecall（cause 9 委托回 S，
+            //     scause=9/sepc=ecall PC）→ sret 回 sepc+4 → 非法指令（cause 2、mtval=0、
+            //     mepc=故障 PC）→ mret 回 S → 等 PLIC 中断 → MEI（cause 11，**mcause bit31=1**）
+            //     → claim 读回 5 → 关源 → complete 写回 5 → s3=1 跳出等待循环 → 收尾写 tohost。
+            if (pid == 11) begin
+                d_pc = 0; d_rd = 0; d_wd = 0; crk = 0;      // 复用为"命中标志"
+                for (k = 0; k < GMAX; k = k + 1) begin
+                    //   x28(t3)：S handler 读回 scause = 9 / M handler 读回 mcause = 2 / = 0x8000_000b
+                    if (rwe[k] && (rrd[k] == 5'd28) && (rwd[k] === 32'h0000_0009)) d_pc = 1;
+                    if (rwe[k] && (rrd[k] == 5'd28) && (rwd[k] === 32'h0000_0002)) d_rd = 1;
+                    if (rwe[k] && (rrd[k] == 5'd28) && (rwd[k] === 32'h8000_000b)) d_wd = 1;
+                    //   x29(t4)：非法指令的 mtval = 0（`.word 0` 的指令字）
+                    if (rwe[k] && (rrd[k] == 5'd29) && (rwd[k] === 32'h0000_0000)) crk = crk | 1;
+                    //   x31(t6) = PLIC claim 读回值 5（源 5 = mac_int）；x12(a2) = complete 写回值 5
+                    if (rwe[k] && (rrd[k] == 5'd31) && (rwd[k] === 32'd5)) crk = crk | 2;
+                    if (rwe[k] && (rrd[k] == 5'd12) && (rwd[k] === 32'd5)) crk = crk | 4;
+                    //   x10(a0)=1（非法指令陷阱后继续）/ x11(a1)=1（MEI 后继续）/ x19(s3)=1（等待循环跳出）
+                    if (rwe[k] && (rrd[k] == 5'd10) && (rwd[k] === 32'd1)) crk = crk | 8;
+                    if (rwe[k] && (rrd[k] == 5'd11) && (rwd[k] === 32'd1)) crk = crk | 16;
+                    if (rwe[k] && (rrd[k] == 5'd19) && (rwd[k] === 32'd1)) crk = crk | 32;
+                    //   x30(t5)：sepc/sepc+4/mepc/mepc+4/被中断 PC 自记录 —— 必须都落在程序映像内
+                    if (rwe[k] && (rrd[k] == 5'd30) &&
+                        (rwd[k] >= cur_base) && (rwd[k] < (cur_base + 32'h1000))) crk = crk | 64;
+                    //   x13(a3) = s3 = 1（收尾 epilogue 第一条 `mv a3, s3`）
+                    if (rwe[k] && (rrd[k] == 5'd13) && (rwd[k] === 32'd1)) crk = crk | 128;
+                    //   x30 = **tohost 地址**（`auipc/addi` 自算 = 基址 + 0x800）
+                    if (rwe[k] && (rrd[k] == 5'd30) && (rwd[k] === (cur_base + 32'h800))) crk = crk | 256;
+                end
+                //   ---- 陷阱/中断交付次数与现场 ----
+                chk(n_trap_p == 2, $sformatf("C16'-1 p15：恰好 2 次**异常**交付（委托 ecall / 非法指令），实测 %0d", n_trap_p));
+                chk(trc_cause[0] == 4'd9, $sformatf("C16'-2 p15：第 1 次 mcause = 9（**ecall-from-S 经 medeleg[9] 委托**），实测 %0d", trc_cause[0]));
+                chk(trc_cause[1] == 4'd2, $sformatf("C16'-3 p15：第 2 次 mcause = 2（非法指令，S 侧无委托 ⇒ 进 M），实测 %0d", trc_cause[1]));
+                chk(n_irq_p == 1, $sformatf("C16'-4 p15：**恰好 1 次中断交付（MEI）**（ISR 关源 ⇒ 电平源不重入），实测 %0d", n_irq_p));
+                chk((trc_pc[0] >= cur_base) && (trc_pc[0] < (cur_base + 32'h1000)),
+                    $sformatf("C16'-5 p15：委托 ecall 的陷阱 PC 落在程序映像内（实测 0x%08x，基址 0x%08x）", trc_pc[0], cur_base));
+                chk(trc_pc[1] == (trc_pc[0] + 32'd4),
+                    $sformatf("C16'-6 p15：**非法指令陷阱 PC = 委托 ecall 的下一条**（⇒ `sret` 精确返回 sepc+4，实测 0x%08x/0x%08x）",
+                              trc_pc[0], trc_pc[1]));
+                chk((trp_tgt[0] >= cur_base) && (trp_tgt[0] < (cur_base + 32'h1000)),
+                    $sformatf("C16'-7 p15：委托陷阱的重定向目标 = **stvec（S handler）**且落在映像内（实测 0x%08x）", trp_tgt[0]));
+                chk((trp_tgt[1] >= cur_base) && (trp_tgt[1] < (cur_base + 32'h1000)),
+                    $sformatf("C16'-8 p15：非法指令的重定向目标 = **mtvec（M handler）**且落在映像内（实测 0x%08x）", trp_tgt[1]));
+                //   ---- 处理程序自记录（**软件真正读到的值**）----
+                chk(d_pc == 1, "C16'-9 p15：S handler 读回 **scause = 9**（ecall-from-S 被委托到 S，而非 M）");
+                chk(d_rd == 1, "C16'-10 p15：M handler 读回 **mcause = 2**（非法指令；S 下无委托）");
+                chk(d_wd == 1, "C16'-11 p15：MEI handler 读回 **mcause = 0x8000_000b**（中断位 bit31 + cause 11）");
+                chk(((crk & 1) == 1), "C16'-12 p15：**mtval = 0**（非法指令字的自记录）");
+                chk(((crk & 2) == 2), "C16'-13 p15：**PLIC claim 读回 = 5**（源 5 = mac_int；claim 副作用清 pending）");
+                chk(((crk & 4) == 4), "C16'-14 p15：**PLIC complete 写回值 = 5**（claim/complete 同址回写）");
+                chk(((crk & 8) == 8), "C16'-15 p15：非法指令陷阱精确返回后继续执行（a0 = 1）");
+                chk(((crk & 16) == 16), "C16'-16 p15：**MEI 处理程序真正执行并返回 S**（a1 = 1；⇒ 中断重定向到 mtvec 生效）");
+                chk(((crk & 32) == 32), "C16'-17 p15：**MEI 处理程序置 s3 = 1 ⇒ S 等待循环跳出**（中断→处理→恢复的端到端证据）");
+                chk(((crk & 64) == 64), "C16'-18 p15：sepc/mepc 自记录全部落在程序映像内（陷阱现场与返回地址合法）");
+                //   ---- 收尾：主程序真的走出等待循环并执行 epilogue ----
+                //   ★ 为何不看 DDR3 里的 tohost 值：`.tohost` 落在 **cached** DDR3 窗口，
+                //     `sw` 提交后停在 L1D（写回式），DDR3 侧在维护/写回前观察不到
+                //     ⇒ 改用**程序自记录**证明收尾：epilogue 首条 `mv a3, s3`（a3=1）
+                //     与 `auipc/addi` 自算出的 tohost 地址（= 基址 + 0x800，与 `li x31,1`
+                //     的写值 1 一起构成"写 tohost=1"的完整软件证据）。
+                chk(((crk & 128) == 128), "C16'-19 p15：**主程序跳出等待循环并执行收尾**（epilogue `mv a3, s3` ⇒ a3 = 1）");
+                chk(((crk & 256) == 256), "C16'-20 p15：**收尾自算出 tohost 地址 = 基址 + 0x800**（`auipc/addi` 结果自记录）");
+                //   ---- 核内 CSR 终态（陷阱 CSR 的真实落地值）----
+                chk(u_dut.u_csr_file.mcause_r === 32'h8000_000b,
+                    $sformatf("C16'-21 p15：核内 mcause = 0x8000_000b（实测 0x%08x）", u_dut.u_csr_file.mcause_r));
+                chk(u_dut.u_csr_file.scause_r === 32'd9,
+                    $sformatf("C16'-22 p15：核内 scause = 9（**委托判定用 S 的 CSR 落地**，实测 0x%08x）", u_dut.u_csr_file.scause_r));
+                chk((u_dut.u_csr_file.mepc_r >= cur_base) && (u_dut.u_csr_file.mepc_r < (cur_base + 32'h1000)),
+                    $sformatf("C16'-23 p15：mepc = 被 MEI 打断的 S 等待循环内 PC（实测 0x%08x）", u_dut.u_csr_file.mepc_r));
+                chk(u_dut.csr_priv_2 == 2'b01,
+                    $sformatf("C16'-24 p15：终态特权级 = S（mret 恢复 MPP=S 且保持），实测 %b", u_dut.csr_priv_2));
+                //   ★ mret 的 mstatus 语义（ISA）：特权级 ← MPP(=S)、MIE ← MPIE、MPIE ← 1、
+                //     **MPP ← U（最低支持特权级）** ⇒ 终态 MPP=00 是**规格要求**，不是漏恢复。
+                chk((u_dut.csr_mstatus_raw[7] == 1'b1) && (u_dut.csr_mstatus_raw[3] == 1'b1) &&
+                    (u_dut.csr_mstatus_raw[12:11] == 2'b00),
+                    $sformatf("C16'-25 p15：mret 的 mstatus 语义（MIE←MPIE=1、MPIE←1、MPP←U=00），实测 mstatus=0x%08x",
+                              u_dut.csr_mstatus_raw));
+                //   ---- PLIC 侧终态：ISR 的"关源"写**真的落到 PLIC** ----
+                chk(u_dut.u_plic.enable_r[0][5] === 1'b0,
+                    "C16'-26 p15：PLIC enable[ctx0] bit5 = 0（**ISR 的关源写真的落到 PLIC 寄存器**）");
+                chk(u_dut.plic_meip_w === 1'b0,
+                    "C16'-27 p15：关源后 meip 已撤销（电平源保持高也不再请求 ⇒ 不重入）");
+                $display("   [C16'] S 模式链 + PLIC：scause=%0d/sepc+4→非法指令(cause 2,mtval=0)→MEI(mcause=0x%08x,claim=5,complete=5)→s3=1→tohost=1；异常 2 次 / 中断 1 次，终态 priv=S",
+                         u_dut.u_csr_file.scause_r, u_dut.u_csr_file.mcause_r);
+                $fflush();
+            end
+            //   ============ C15'：store 页错误精确化（p14_storepf，4b-2c 收口）============
             //   判据 = **程序自记录 + 硬编码期望**（与 C13' 同法）+ 通用的黄金比对（C1'/C3'
             //   已逐条比过：提交流与 Spike 一致 ⇒ 故障指令**未提交**、无多余提交）。
                 if (pid == 10) begin

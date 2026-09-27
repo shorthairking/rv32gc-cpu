@@ -907,7 +907,19 @@ module core_top_2b (
         .req_write     (d_we_q),
         .req_addr      (d_a_q - `RV32GC_PLIC_BASE),
         .req_wdata     (d_d_q),
-        .req_wstrb     (d_strb_q),
+        //   ★★ G4⑥ 缺陷修正（p15 实测抓出）：**读访问必须给出"整字字节使能"**。
+        //     · `plic.v` 的访问契约 = **只支持 32 位整字访问**：`resp_hit` 与所有读数据
+        //       都门控于 `strb_word_ok = (req_wstrb == 4'hF)`（`plic.v:214/233`）；
+        //     · 2B 的 LSQ 只在**排空 store** 时给真值：`mem_req_wstrb = dr_issue ? cdq_m
+        //       : 4'h0`（`lsq_simple.v:704`）⇒ load 时 `d_strb_q = 4'h0` ⇒ PLIC 判
+        //       `resp_hit=0` ⇒ 读恒回 0 **且 claim 无副作用**（实测 p15：claim `lw` 读回
+        //       `x31=0x0`、pending 未被清）。2A 无此问题 —— 它送的是按地址/宽度算出的
+        //       `m_store_strb`（`core_top.v:2207/3907`），**字访问恒 4'hF**。
+        //     · 修法：**读**（`d_we_q=0`）按 2A 字访问口径给 `4'hF`；写仍用真实字节使能
+        //       （PLIC 只支持整字写，半字/字节写本就应 `resp_hit=0` 被丢弃）。
+        //       只影响核内 MMIO 的 PLIC 从设备（CLINT 读不看 strb；L1D/AXI 的 wstrb 只在
+        //       写时有效）⇒ 既有判据零影响。
+        .req_wstrb     (d_we_q ? d_strb_q : 4'hF),
         .resp_rdata    (plic_rdata_w),
         .resp_hit     (plic_hit_w),
         .meip_o        (plic_meip_w),
@@ -1549,8 +1561,20 @@ module core_top_2b (
     //   ★★ 4b-1b/1c：目标合成（Direct/Vectored、委托、MTVEC/STVEC 选择）**全在 2A `trap_ctrl` 内**；
     //     本层只做"谁优先"的选择：陷阱 > xRET(mepc/sepc)（4a 的 `trp_mode_w/trp_base_w/
     //     trp_vect_w/trp_cause4_w` 合成已删净）
-    wire [31:0] trp_target_w = tc_trap_valid ? tc_redirect_pc :
-                               (xret_kind_w == 2'd2) ? csr_sepc_o : csr_mepc_o;
+    //   ★ G4②：**00 = sret ⇒ sepc**（2A `core_top.v:1709` 的 `xret_epc_pc` 同口径；
+    //     旧式误用 `2'd2`，与 `backend_top.xret_kind_f` 的旧编码"自洽地错"）
+    //   ★★ G4④（本轮实测抓出）：**同拍提交的 `csrw sepc/mepc` 必须旁路到 xret 重定向** ——
+    //     若 `csrw sepc` 与 `sret` 落在**同一 4 宽提交组**（实测 p15 就是），重定向是**组合**
+    //     读 `csr_sepc_o` ⇒ 读到的是**写前值** ⇒ `sret` 跳回旧 sepc（实测：handler 里 `+4`
+    //     被忽略、sret 回到 ecall 本身 ⇒ ecall↔handler 死循环）。口径照 2A 的 CSR 旁路
+    //     （`csr_file.byp_*`）：用**本拍提交的写值**（sepc/mepc 低位对齐）旁路；
+    //     只在"同拍写的正是该 xret 要用的那个 epc"时旁路（写别的 CSR 时不影响）✓
+    wire        xret_epc_byp_hit_w = csr_we_w &          // 提交点 CSR 写使能（含 fflags 口，waddr 过滤）
+                                     (((xret_kind_w == 2'd0) & (csr_waddr_w == 12'h141)) |
+                                      ((xret_kind_w != 2'd0) & (csr_waddr_w == 12'h341)));
+    wire [31:0] xret_epc_w = xret_epc_byp_hit_w ? {csr_wdata_w[31:1], 1'b0} :
+                             ((xret_kind_w == 2'd0) ? csr_sepc_o : csr_mepc_o);
+    wire [31:0] trp_target_w = tc_trap_valid ? tc_redirect_pc : xret_epc_w;
 
     //   ★★ 4b-2a：维护操作的"提交序执行"语义 ——
     //     · fence.i：**冲刷流水并冻结 256 拍**（L1I 全阵列扫掠），扫掠结束后重定向到

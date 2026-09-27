@@ -93,7 +93,9 @@ wait_irq:
     .align 2
 m_handler:
     csrr  t3, mcause
-    li    t4, 11
+    /*   ★ 中断的 mcause **bit31 = 1**（MEI = 0x8000_000B）⇒ 必须带中断位比较
+     *     （旧写法 `li t4,11; beq` 恒不成立 ⇒ MEI 走了"非法指令"分支 ⇒ 死等 ✗）*/
+    li    t4, 0x8000000B
     beq   t3, t4, mei_path
     /* --- cause 2：非法指令 --- */
     csrr  t4, mtval                 /* 期望 0x0000_0000（指令字）*/
@@ -103,11 +105,17 @@ m_handler:
     mret                            /* 回 S（继续 a0=1 之后）*/
 
 mei_path:
-    /* --- cause 11：PLIC 外部中断 —— claim → complete --- */
+    /* --- cause 11：PLIC 外部中断 —— claim → **关源** → complete --- */
+    /*   ★ 关源（enable[ctx0] bit5 ← 0）**必须**：TB 的电平型源在整个窗口内保持高，
+     *     若 ISR 只 claim/complete，`complete` 会按电平重挂 pending ⇒ **立刻二次 MEI**
+     *     （实测：第二次进入 ISR 时 claim 已回 0 ⇒ 行为不确定）。关源后 `cand_any=0`
+     *     ⇒ `meip` 撤销、不再重入（口径与 p8 的 C8' "处理程序关源"一致）。*/
     li    t0, 0x1F300004            /* claim/complete（ctx0）*/
     lw    t6, 0(t0)                 /* claim（期望 5）*/
+    li    t2, 0x1F102000            /* enable[ctx0] */
+    sw    x0, 0(t2)                 /* 关源：enable bit5 = 0 */
     sw    t6, 0(t0)                 /* complete（写回同一值）*/
-    mv    a2, t6                    /* 自记录 claim/complete 值 */
+    mv    a2, t6                    /* 自记录 claim/complete 值（= 5）*/
     li    s3, 1                     /* 通知 S 的等待循环跳出 */
     li    a1, 1                     /* MEI 后继续的标记 */
     csrr  t5, mepc                  /* 被中断的 PC（S 等待循环内）*/

@@ -4869,3 +4869,202 @@ S 模式下 sepc 应合法）。
 **下一轮落点（建议）**：①按 2A 口径改 `backend_top.xret_kind_f`（sret=2'd0）与 `core_top_2b:1553` 的
 PC mux；②对照 2A `core_top.v:1679-1709` 复核 2B 的 xret PC/特权级/CSR 更新三处；③再恢复 p15 TB 槽
 + C16' 判据 + 反证；④全量回归。**本轮为保证"全绿检查点"，上述 2B 改动已还原**（`rtl/` == `d946871`）。
+
+---
+
+# B4.35 G4 ①②③ 修复落地（xret 识别/编码/PC 三处对齐 2A）+ 剩一处（软件 `csrw sepc`）
+
+> 起点 = 母代理已验收提交 `d946871`（tag 2B-4.32）。检查点见 §B4.35.3。
+
+## B4.35.1 修复 diff（全在 **2B 侧**；2A 零修改）
+
+**① `backend_top.xret_kind_f`：sret 的编码回归 2A 口径**
+```verilog
+- (t == 32'h1020_0073) ? 2'd2 : 2'd0;      // ✗ 旧：sret = 2（与 2A/ tb_csr_file 相反）
++ (t == 32'h1020_0073) ? 2'd0 : 2'd0;      // ✓ sret = 0（2A：01=mret / 00=sret）
+```
+**② `core_top_2b` 的 xret 重定向 PC mux**
+```verilog
+- (xret_kind_w == 2'd2) ? csr_sepc_o : csr_mepc_o;   // ✗ 与 2A core_top.v:1709 相反
++ (xret_kind_w == 2'd0) ? csr_sepc_o : csr_mepc_o;   // ✓ 00=sret ⇒ sepc
+```
+**③ `backend_top`：xRET 的**识别**与**编码**分离（本轮新发现的第三处）**
+```verilog
++ function is_xret_f; input [31:0] t;
++     begin is_xret_f = (t == 32'h3020_0073) | (t == 32'h1020_0073); end   // mret | sret
++ endfunction
+- if (xret_kind_f(p_tval(...)) != 2'd0) begin      // ✗ 用"kind != 0"当识别判据
++ if (is_xret_f(p_tval(...))) begin                // ✓ 识别与编码分离（2A 同构：
+                                                  //   de_mret/de_sret 识别 + kind 只作数据）
+```
+**理由链（与 2A `core_top.v:1418/1679/1694/1709` 及 `tb_csr_file:68` 逐条对照）**：
+2A 的编码是 **01=mret / 00=sret**，且**识别用 `de_mret/de_sret` 独立信号**；2B 旧实现把 sret 编成 2
+（与 2A 相反）并用"kind != 0"识别 ⇒ 一旦 ①改成 2A 口径，③必须同时做，否则 `sret` **完全不被识别**
+（实测：改完 ①② 后 `sret` 变成"顺延 PC+4"落到 0x8002c100 的非法指令 ✗）。
+
+## B4.35.2 实测（p15，诊断跑）
+
+| 阶段 | 结果 |
+|---|---|
+| 只改 ①② | `sret` **不被识别** ⇒ 顺延 PC+4 ⇒ 0x8002c100 非法指令死循环 ✗（`[p15-tr] #1.. cause=2 pc=0x8002c100+`） |
+| 加 ③ 后 | `sret` **被识别且回到 S**（重复陷阱 cause 保持 **9**，不再是 8/U ✓）；S handler 自记录 `scause=9` ✓、`sepc=0x8002c078` ✓ |
+| 残留 | **仍在循环**：`sret` 落回 **ecall 本身**（0x8002c078）而非 sepc+4（0x8002c07c）⇒ **软件 `csrw sepc` 未生效**（与 §B4.34.2 同一缺口，独立于 xret 编码） |
+
+## B4.35.3 检查点与下一步
+
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**（`../.b2chk/final_148f.log`）；
+  `regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c22.log`）——①②③ 只影响 `sret`（既有 32 程序无 `sret`）
+  与 `mret`（kind=1 两条路径逐位等价）⇒ 零回退 ✓
+* 改动：`rtl/back2/backend_top.v`（①②③）、`rtl/top/core_top_2b.v`（②）、本报告。
+  p15 程序/生成器项/`.svh slot 14` 已在 `6e6fe65` ✓；带 p15 槽的 TB 版本在 `../.b2chk/tb_core_top_2b.sv.p15`。
+  **2A 零修改**；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s51`。
+* **唯一剩余缺口（下一轮）**：S 模式**软件 `csrw sepc` 未生效** ⇒ p15 在 ecall↔S handler 间循环。
+  探针（1 次定案）：软件写拍打印 `wen`、`waddr`、`w_illegal`、`wr_sepc`、`sw_en`、`wval_final`、`priv`。
+  ①若 `wen=0` ⇒ 提交点 CSR 写使能在 S 模式未拉高（backend_top `csr_cmt_we` 路径）；
+  ②若 `wr_sepc=0` ⇒ `csr_file` 写地址译码/`wr_*` 生成缺口；
+  ③若 `w_illegal=1` ⇒ 写权限判定（`priv_ge`/`csr_min_priv`）对 0x141 的取值缺口。
+* 其后：恢复 `tb_core_top_2b.sv.p15` + C16' 判据 + 反证（断开 `.irq_meip`）+ regress。
+
+---
+
+# B4.36 G4 收口：①②③④ 四处修复 + p15 的 S 链端到端打通（**PLIC→程序收尾差最后一环**）
+
+> 起点 = `d946871`（tag 2B-4.32）。**本段四处修复全部落地并回归验证**（§B4.36.3）。
+
+## B4.36.1 第 4 处修复 G4④：**同拍提交的 `csrw sepc/mepc` 未旁路到 xret 重定向**
+
+**实测根因**（探针 `[g4wr]`）：S handler 里 `csrw sepc, t5`（`wen=1, waddr=0x141,
+wdata=0x8002c07c, priv=01, wr_sepc=1, sw_en=1` ✓ 一切正常）与**紧随的 `sret` 落在同一 4 宽提交组**
+⇒ 重定向是**组合**读 `csr_sepc_o`（写前值）⇒ `sret` 跳回**旧 sepc**（= ecall 本身）
+⇒ `ecall ↔ S handler` 死循环。2A 有 CSR 旁路（`csr_file.byp_*`），2B 把 `.byp_wdata(32'h0)` 悬空 ✗。
+**修法（`core_top_2b`，2B 侧）**：
+```verilog
++ wire xret_epc_byp_hit_w = csr_we_w &                     // 提交点 CSR 写使能
++                          (((xret_kind_w == 2'd0) & (csr_waddr_w == 12'h141)) |   // sret ← sepc
++                           ((xret_kind_w != 2'd0) & (csr_waddr_w == 12'h341)));    // mret ← mepc
++ wire [31:0] xret_epc_w = xret_epc_byp_hit_w ? {csr_wdata_w[31:1], 1'b0} :      // 本拍写值（低位对齐）
++                          ((xret_kind_w == 2'd0) ? csr_sepc_o : csr_mepc_o);
++ wire [31:0] trp_target_w = tc_trap_valid ? tc_redirect_pc : xret_epc_w;
+```
+（只在"同拍写的正是该 xret 要用的那个 epc"时旁路 ⇒ 写别的 CSR 不受影响 ✓）
+
+## B4.36.2 p15 实测：S 链**端到端打通** ✓（PLIC→程序收尾的最后一环见 §B4.37）
+
+```
+[临时探针 p15-tr] #0 cause=9 pc=0x8002c078 tgt=0x8002c0ec   ← M→S（mret 进 S）后 S 下 ecall 委托回 S ✓
+[临时探针 p15-all] #30 x28=0x9  #31 x30=0x8002c078  #32 x30=0x8002c07c ← scause/sepc 软件读 ✓
+[临时探针 p15-tr] #1 cause=2 pc=0x8002c07c tgt=0x8002c0a8   ← sret 回到 sepc+4 = 非法指令 ✓ → M 处理 ✓
+[临时探针 p15-all] #35 x28=0x2  #38 x29=0x0  #39/#40 x30=0x8002c07c/080 ← mcause/mtval/mepc 全对 ✓
+[临时探针 p15-all] #43 x10=0x1                                ← mret 后继续执行（a0=1）✓
+[临时探针 p15-irq] c=2520 intrpt=1 meip=1 mip=0x800 mie=0x800 mstat=0x8a2 priv=M ← **MEI 已投递**（G1 ✓）
+```
+（上述探针为**本轮定位用**，收口时已从 TB 删除，替换为正式判据 C16' —— 见 §B4.37.3。）
+本轮继续定位出**两处新缺陷 ⑤⑥**（MEI 的 CSR 已写但跳不进 handler、claim 读回 0），
+以及**程序侧**一处笔误（中断的 `mcause` 含 bit31，MEI = `0x8000_000B`；旧写法 `beq t3,11`
+恒不成立 ⇒ MEI 曾走"非法指令"分支）。三者全部修复后 p15 收尾打通 → §B4.37。
+
+## B4.36.3 检查点（①②③④ 落地时的中间检查点）
+
+* 编译 **0 error**；`tb_core_top_2b` **148/148 PASS**（`../.b2chk/final_148g.log`）；
+  `regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c23.log`）。
+  ①②③④ 只影响 `sret`（既有 32 程序无 sret）与"同拍写 epc"这一组合 ⇒ 零回退 ✓
+* 改动：`rtl/back2/backend_top.v`（①②③）、`rtl/top/core_top_2b.v`（②④）、
+  `sim/unit/prog/back2_p15_priv.S`（mcause bit31 修正）+ `.svh` 重生成、本报告。
+  **2A 零修改**；`scripts/regress.sh` 未动；未提交 git；快照 `../.b2chk/*.s52`。
+
+---
+
+# B4.37 G4 收口（终）：⑤⑥ 两处新缺陷修复 + p15 正式判据 C16'（27 项）+ 反证
+
+> 本节把 §B4.36 的"最后一环"闭环：**p15 全链打通、C16' 27 项全绿、三组反证齐备、regress 32/32**。
+
+## B4.37.1 第 5 处修复 G4⑤：**整机冲刷拍同拍发射的 uop 未被作废**（"中断跳不进 handler"的真根因）
+
+**实测根因**（逐拍探针，TB 临时探针 `[p15-rc]`/`[p15-fl]`）：
+```
+[p15-rc] c=2506 iss=000100 flush=1 sq=0 x2v=0 | trp=1 trpv=1   ← 陷阱拍：IQ 同时刻发射了一项
+[p15-fl] c=2506 trap=1 int=1 flush=1 redir=1 tgt=0x8002c0a8 | fe_redir=1 fe_pc=0x8002c0a8  ← 前端已到 mtvec ✓
+[p15-rc] c=2507 sq=1 x2v=1 x2pc=0x8002c08c                    ← 下一拍该错路径项在 I2 "复活"
+[p15-fl] c=2507 fe_redir=1 fe_pc=0x8002c08c                   ← **分支误判重定向盖掉陷阱重定向**
+```
+* `iq.iss_valid` 是**组合**输出（`valid_q` 只在时钟沿被 `flush_all` 清空）⇒ **冲刷拍仍会选中一项**；
+  旧实现无条件把它装进 I2（`x_i2_v[xi] <= iq_iss_v[xi]`，`backend_top.v:1144`）⇒ 下一拍该错路径项
+  在 I2 里"复活"：若它是**控制转移**（本例是等待循环的 `beq`）且判定误判 ⇒ `squash_v_w` 再发一次
+  重定向，把前端从 **mtvec** 拉回被冲刷的旧路径 ⇒ **陷阱 CSR（mcause/mepc/mstatus）已落地、
+  但处理程序永不执行**（现象：priv 已变 M、`mepc=wait`、程序却继续在等待循环里跑、`s3` 恒 0）。
+**修法（`rtl/back2/backend_top.v`）**：
+```verilog
+-                x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi];
+-                if (iq_iss_v[xi]) begin
++                x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi] & ~flush_all_w;
++                if (iq_iss_v[xi] & ~flush_all_w) begin
+```
+口径与 `iq.v` §5.3"冲刷拍**不接受**新项"一致，只是补上**出队侧**（冲刷 ⇒ 在飞全杀，同拍发射同样属
+"冲刷点之后"的年轻项）。**反证**：去掉 `& ~flush_all_w` ⇒ `C16'-11`（MEI handler 读回
+`mcause=0x8000_000b`）立即 FAIL（`../.b2chk/p15_cp_nobflushgate.log`）；恢复即全绿。
+
+## B4.37.2 第 6 处修复 G4⑥：**读访问未给"整字字节使能"** ⇒ PLIC claim 读回 0
+
+**实测根因**：`plic.v` 的访问契约 = **只支持 32 位整字访问**（`resp_hit`/读数据全门控于
+`strb_word_ok = (req_wstrb == 4'hF)`，`plic.v:214/233`）；而 2B 的 LSQ 只在**排空 store** 时给真值
+（`mem_req_wstrb = dr_issue ? cdq_m : 4'h0`，`lsq_simple.v:704`）⇒ load 时 `d_strb_q=0`
+⇒ PLIC 判 `resp_hit=0` ⇒ **claim 读恒回 0 且 claim 无副作用**（pending 不清、complete 写 0）。
+2A 无此问题：它送的是按地址/宽度算出的 `m_store_strb`（`core_top.v:2207/3907`），**字访问恒 `4'hF`**。
+**修法（`rtl/top/core_top_2b.v`，只在 PLIC 从设备口）**：
+```verilog
+-        .req_wstrb     (d_strb_q),
++        .req_wstrb     (d_we_q ? d_strb_q : 4'hF),   // 读 = 2A 字访问口径；写仍用真实字节使能
+```
+**反证**：还原 `d_strb_q` ⇒ `C16'-13`（PLIC claim 读回 5）立即 FAIL（`../.b2chk/p15_cp_nostrb.log`）。
+
+## B4.37.3 p15 正式判据 **C16'（27 项）**：程序自记录 + 硬编码期望（无 Spike 黄金，口径登记）
+
+* **为何无黄金**：Spike 不建模 PLIC（claim/complete 无对应模型）⇒ 含 PLIC 的整链无法逐条比对；
+  `PROGS` 里 p15 与 p8/p12/p13 同法登记为"**仅映像**"（`gen_back2_lockstep_data.py`：`no_gold=True`）。
+* **程序侧修正**：ISR 现在按真实 ISR 口径 **claim → 关源（`enable[ctx0] bit5 ← 0`）→ complete**。
+  TB 的电平型源在整个窗口（2500~2800 拍）保持高，若不关源，`complete` 会按电平重挂 pending
+  ⇒ 立刻二次 MEI（实测第二次进入 ISR 时 claim 已回 0、行为不确定）⇒ 关源后 `cand_any=0`、不重入
+  （口径与 p8 的 C8'"处理程序关源"一致）。
+* **C16' 覆盖的端到端链**：M 装 `mtvec/stvec/medeleg/PMP/PLIC` → `mret` 进 S → S 下 `ecall`
+  （cause 9 **委托回 S**：`scause=9`/`sepc`=ecall PC）→ `sret` 回 `sepc+4` → **非法指令**
+  （cause 2、`mtval=0`、`mepc`=故障 PC）→ `mret` 回 S → 等 PLIC 中断 → **MEI**（cause 11，
+  `mcause` **bit31=1**）→ **claim 读回 5** → 关源 → **complete 写回 5** → `s3=1` 跳出等待循环
+  → 收尾 `auipc/addi` 自算 tohost 地址并写 `tohost=1`。
+* **27 项**（`sim/unit/tb_core_top_2b.sv`，全部 `chk`，任一项 FAIL 即 TB 红）：
+  异常/中断次数（`n_trap_p==2`、`n_irq_p==1`）；`trc_cause[0]=9`/`[1]=2`；`trc_pc[1]==trc_pc[0]+4`
+  （⇒ `sret` 精确返回 `sepc+4`）；重定向目标分别落在 stvec/mtvec 槽（映像内）；handler 自记录
+  `scause=9`/`mcause=2`/`mcause=0x8000_000b`；`mtval=0`；**claim=5**；**complete=5**；
+  `a0=1`/`a1=1`/`s3=1`；sepc/mepc 自记录全在映像内；收尾 `a3=1` 与 tohost 地址自记录；
+  核内 CSR 终态 `mcause=0x8000_000b`/`scause=9`/`mepc∈映像`；终态 `priv=S`；
+  `mret` 的 mstatus 语义（MIE←MPIE=1、MPIE←1、**MPP←U=00**，ISA 规定）；
+  PLIC 侧 `enable[0][5]=0`（**ISR 关源写真的落到 PLIC**）与 `meip=0`（不重入）。
+* **反证三组**（全部实测红→恢复绿）：
+  ① 断开 `.irq_meip(1'b0)` ⇒ `C16'-4`（中断交付次数=1）FAIL（`p15_counterproof.log`）；
+  ② 去掉 `~flush_all_w`（G4⑤）⇒ `C16'-11` FAIL（`p15_cp_nobflushgate.log`）；
+  ③ 还原 `.req_wstrb(d_strb_q)`（G4⑥）⇒ `C16'-13` FAIL（`p15_cp_nostrb.log`）。
+* 注：TB 的 `chk` 为 **fail-fast**（首项 FAIL 即 `$fatal`）⇒ 每份反证日志只打印**首条** FAIL 行。
+
+## B4.37.4 检查点（终态）
+
+* 编译 **0 error**（`iverilog -g2012 -Wall`，除 2 条既有 `fpu_cvt` implicit 告警外无新告警）；
+  `tb_core_top_2b` **181/181 PASS**（`../.b2chk/p15_c16c.log`，含 p15 + C16' 27 项）；
+  `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c24.log`）。
+* 改动汇总（**2A 零修改**、`scripts/regress.sh` 未动、未提交 git）：
+  `rtl/back2/backend_top.v`（G4①③⑤）、`rtl/top/core_top_2b.v`（G4②④⑥）、
+  `sim/unit/prog/back2_p15_priv.S` + `back2_lockstep_data.svh`（重生成）、
+  `sim/unit/tb_core_top_2b.sv`（p15 槽 + C16' 27 项 + p15 豁免 C5'）、本报告。
+  快照：`../.b2chk/*.s52`（①②③④ 阶段）、`*.s53`、`core_top_2b.v.s52`（终态 RTL）、
+  `tb_probe_squash.sv`（探针 TB 副本，仓库 TB 内无探针残留）。
+* **遗留/风险登记（未改，交母代理裁决）**：
+  1. **squash 拍同拍发射**：与 G4⑤ 同类但**不属冲刷**——`squash_v_w` 当拍 IQ 仍可能选中一项
+     （实测 12 个程序中共 10 次：p3_memcsr 7 次、p8_int 1 次、p15 2 次（其中 1 次进 BRU 槽 2）），
+     该项进入 I2 后若为控制转移且判误判，**可能在重定向后一拍再发一次重定向**。
+     现有两道护栏使其在全部 181 项判据下未表现：ROB 窗口判据（`age < rob_cnt`）挡住其提交、
+     epoch/检查点回滚挡住其写口 ⇒ 未观察到功能后果。建议修法（本轮**未做**，避免收口轮扩大 RTL 面）：
+     在 I2 装载口加"年轻于 squash 点即作废"的判据，口径照抄 `iq.v` 的 `squash_kill`
+     （`(iq_iss_rob[xi] - rob_head) > (squash_idx - rob_head)`）。
+  2. `.tohost` 落在 **cached** DDR3 窗口 ⇒ `sw` 提交后停在 L1D，DDR3 侧观察不到 ⇒ C16'-19/20
+     改用**程序自记录**（`a3=1` 与 tohost 地址）证明收尾（已在 TB 注释与本节写明）。
+  3. `csr_file.w_illegal` 在核内被接 `1'b0`（`csrr` 写回读值，无非法 CSR 判定）——既有登记项，
+     本轮未动。
+  4. `mret` 后 `mstatus.MPP=U` 是 **ISA 规定**（非漏恢复）：C16'-25 按语义判 `MIE=1/MPIE=1/MPP=00`。

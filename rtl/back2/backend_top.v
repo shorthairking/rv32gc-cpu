@@ -1140,9 +1140,20 @@ module backend_top #(
         if (!rst_n) begin
             for (xi = 0; xi < 6; xi = xi + 1) x_i2_v[xi] <= 1'b0;
         end else begin
+            //   ★★ G4⑤ 缺陷修正（p15 实测抓出）：**整机冲刷拍（`flush_all_w`）同拍发射的 uop
+            //     必须一并作废**。`iq.iss_valid` 是**组合**输出（`valid_q` 在时钟沿才被 `flush_all`
+            //     清空）⇒ 冲刷拍仍可能选中一项；旧实现无条件把它装进 I2（`x_i2_v<=iq_iss_v`），
+            //     下一拍该错路径项就在 I2 里"复活"：
+            //       · 若它是**控制转移**且判定误判 ⇒ `squash_v_w` 再发一次重定向，**盖掉**陷阱/中断
+            //         刚发出的 mtvec 重定向 ⇒ 前端被拉回被冲刷的旧路径、处理程序永不执行
+            //         （实测 p15：c=2506 `trp=1/trp_redirect=1` 目标 mtvec=0x8002_c0a8，同拍
+            //          `iq_iss_v=000100`；c=2507 `x_i2_v[2]=1` ⇒ `squash=1`、前端 PC 被改回
+            //          0x8002_c08c ⇒ MEI 的 mcause/mepc/mstatus 已写但**跳不进 handler**）。
+            //       · 非控制转移项同样属"冲刷点之后"的年轻项，按精确异常口径一律作废。
+            //     口径与 IQ 入队侧一致（`iq.v` §5.3 "冲刷拍不接受新项"），只是补上**出队侧**。
             for (xi = 0; xi < 6; xi = xi + 1) begin
-                x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi];
-                if (iq_iss_v[xi]) begin
+                x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi] & ~flush_all_w;
+                if (iq_iss_v[xi] & ~flush_all_w) begin
                     x_i2_uop[xi] <= iq_iss_uop[xi];
                     x_i2_rob[xi] <= iq_iss_rob[xi];
                     x_i2_ep[xi]  <= iq_iss_ep[xi];
@@ -1760,10 +1771,27 @@ module backend_top #(
     //      实测 p11 的 `fence.i` 与 lane 0 的另一条指令同拍提交 ⇒ `maint_cmt` 恒 0）。
     //     修法：**逐 lane 扫描提交组**（由高到低 ⇒ 最老者胜），用该 lane 自己的
     //     载荷 TVAL 判定，并取出它自己的 PC 供重定向用。
+    //   ★★ G4 修复（4b-3(2/2)，报告 §B4.34/§B4.35）：`xret_kind` 的**权威编码 = 2A 口径**
+    //     （`core_top.v:1418/1679/1694/1709` 与 `tb_csr_file:68` 一致）：**01 = mret / 00 = sret**。
+    //     旧式把 sret 编成 `2'd2` ✗ ⇒ 2A `priv_ctrl`（按 00=sret 解码）把真 sret 落进 default
+    //     = **PRIV_U**：`sret` 恒回 U、SPP/SPIE 恢复与 SIE 还原全不做（实测 p15：委托 ecall 后
+    //     sret 回 U ⇒ 同一条 ecall 以 cause 8 重入 M）。修法：sret → **2'd0**（与 2A 一致）。
+    //     注：`2'd0` 同时是"非 xret"的默认值 —— 与 2A `e_xret_kind = de_mret ? 01 : 00` 同构，
+    //     `kind` 只在 `xret_valid=1` 时被消费 ✓
     function [1:0] xret_kind_f; input [31:0] t;
-        begin xret_kind_f = (t == 32'h3020_0073) ? 2'd1 :
-                            (t == 32'h1020_0073) ? 2'd2 : 2'd0; end
+        begin xret_kind_f = (t == 32'h3020_0073) ? 2'd1 :      // mret
+                            (t == 32'h1020_0073) ? 2'd0 : 2'd0;  // sret（2A 口径）
+        end
     endfunction
+    //   ★★ G4③（报告 §B4.35）：xRET 的**识别**必须与 **kind 编码**分离 ——
+    //     2A 口径下 `sret` 的 kind = `2'd0`（见 `xret_kind_f` 注），故"`kind != 0`"**不能**
+    //     当识别判据：否则 `sret` 完全不被识别（既不重定向 ⇒ 顺延 PC+4 撞到非法指令，
+    //     也不做特权级/CSR 更新）。2A 的同构做法是"`de_mret/de_sret` 识别 + `kind` 只作数据"
+    //     （`core_top.v:1418` `e_xret_kind = de_mret ? 01 : 00`）⇒ 这里补一个纯识别函数。
+    function is_xret_f; input [31:0] t;
+        begin is_xret_f = (t == 32'h3020_0073) | (t == 32'h1020_0073); end
+    endfunction
+
     function [2:0] maint_kind_f; input [31:0] t;
         begin
             maint_kind_f =
@@ -1810,7 +1838,7 @@ module backend_top #(
         maint_lane_idx = 2'd0;
         for (mw2 = COMMIT_W-1; mw2 >= 0; mw2 = mw2 - 1) begin
             if (cmt_raw[mw2] & ~squash_v_w) begin
-                if (xret_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W])) != 2'd0) begin
+                if (is_xret_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]))) begin
                     xret_lane_oh  = 4'h1 << mw2[1:0];
                     xret_lane_idx = mw2[1:0];
                     xret_kind_sel = xret_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]));
