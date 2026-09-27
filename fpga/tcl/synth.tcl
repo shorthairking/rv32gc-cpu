@@ -46,6 +46,17 @@ set RTL_DIR    [file join $PROJ_ROOT rtl]
 set PKG_DIR    [file join $RTL_DIR pkg]
 set OUT_DIR    [file join $PROJ_ROOT fpga out]
 set TOP        "core_top"                 ;# 平台 soc_top.v 例化的核模块名（08 §4，48 端口契约）
+#   ★★ 2B-5（2026-09-27）：**可选**的顶层/产物标签覆盖（**不改 2A 默认行为**）：
+#     · 两个环境变量都为空/未设 ⇒ TOP=core_top、产物文件名与 2A 口径**逐字节相同**；
+#     · `RV32_SYNTH_TOP=core_top_2b` + `RV32_SYNTH_TAG=2b` ⇒ 综合 2B 顶层并把报告/检查点
+#       写成 `*_2b_<period>ns.*` / `post_synth_2b_<period>ns.dcp` ⇒ **不覆盖 2A 的留档**
+#       （2A 的 synth_16.667ns_*.rpt / synth_*.rpt 是对比基线，必须保留）。
+set TOP_TAG    ""                         ;# 产物文件名中缀（空 = 2A 口径）
+if {[info exists ::env(RV32_SYNTH_TOP)] && [string trim $::env(RV32_SYNTH_TOP)] ne ""} {
+    set TOP [string trim $::env(RV32_SYNTH_TOP)]
+    set TOP_TAG "_[string trim $::env(RV32_SYNTH_TAG)]"
+    if {$TOP_TAG eq "_"} { set TOP_TAG "_$TOP" }
+}
 set PART       "xc7a200tfbg676-2"         ;# AGENT.md §2 平台器件
 set CLK_PERIOD_NS 16.667                  ;# 60 MHz（M4 判据②）；100 MHz 余量参考传 10.0
 set IP_MACRO   "RV32GC_USE_VIVADO_IP"     ;# 宏名真源（08 §3.3 第 3 条）
@@ -247,7 +258,8 @@ proc rv32_apply_constraints {} {
 # 4. 报告落盘（M4 判据②③）
 #------------------------------------------------------------------------------
 proc rv32_report {tag} {
-    global OUT_DIR CLK_PERIOD_NS
+    global OUT_DIR CLK_PERIOD_NS TOP_TAG
+    set tag "${tag}${TOP_TAG}"          ;# ★ 2B-5：空标签时逐字等于 2A 口径
     # T3（2026-09-19）：文件名带周期（如 synth_16.667ns_utilization.rpt）⇒ 60 MHz 与
     #   100 MHz 两轮跑的**证据互不覆盖**；同时并列一份惯例名（synth_*.rpt / impl_*.rpt）
     #   供 M4 判据②③ 的固定路径引用（跑 100 MHz 前会把 60 MHz 的惯例名另存为
@@ -280,6 +292,9 @@ proc rv32_report {tag} {
 # 5. 综合主流程（被 impl.tcl 以 ::RV32_SYNTH_DEFS_ONLY 抑制）
 #------------------------------------------------------------------------------
 if {![info exists ::RV32_SYNTH_DEFS_ONLY]} {
+    #   ★ 2B-5：下游（synth_design 之后的报告/检查点）要用 TOP_TAG；本块在 proc 外，
+    #     故在这里显式引入全局名（空值时行为与 2A 逐字相同）。
+    global TOP_TAG
     if {[catch {
         rv32_read_design
         rv32_stage_xdc
@@ -296,9 +311,9 @@ if {![info exists ::RV32_SYNTH_DEFS_ONLY]} {
         #   目的：60 MHz 与 100 MHz 两轮跑**不可能互相污染**（impl.tcl 优先取
         #   post_synth_<period>ns.dcp，取不到才回退惯例名 post_synth.dcp）。
         #   两个文件的 netlist 与约束同源，只是周期不同（各带自己的 create_clock）。
-        set dcp [file join $OUT_DIR post_synth.dcp]
+        set dcp [file join $OUT_DIR "post_synth${TOP_TAG}.dcp"]
         write_checkpoint -force $dcp
-        set dcp_tag [file join $OUT_DIR [format "post_synth_%sns.dcp" $CLK_PERIOD_NS]]
+        set dcp_tag [file join $OUT_DIR [format "post_synth%s_%sns.dcp" $TOP_TAG $CLK_PERIOD_NS]]
         write_checkpoint -force $dcp_tag
         puts "== synth.tcl 完成：报告 $OUT_DIR/synth_*.rpt；检查点 $dcp（周期副本 $dcp_tag）"
         puts "== synth.tcl 提示：实现流程用 ./fpga/run_vivado_batch.sh fpga/tcl/impl.tcl $CLK_PERIOD_NS"

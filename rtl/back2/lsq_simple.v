@@ -238,6 +238,12 @@ module lsq_simple #(
 
     wire [STQ_N-1:0] stq_win_w;                  // 在提交窗口内（年龄 < W）
     wire [STQ_N-1:0] stq_blk_w;                  // 窗口内且"未按当前上下文定妥/未判坏"
+    //   ★★ 2B-5（综合）：`genvar` 必须在**首次使用之前**声明 ——
+    //     原位置在本文件中部（旧 267 行），而下方循环已先用 `gv`
+    //     ⇒ **iverilog 不报、Vivado 报** `[Synth 8-9502] generate loop index 'gv' is not
+    //     defined as a genvar` + `8-8891 'gv' is already declared`（首次 2B 综合实测）。
+    //     仅声明位置变化，**零行为差异**。
+    genvar gv, gb, gk, gj;
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqblk
         assign stq_win_w[gv] = stq_v[gv] & stq_av[gv] & ~stq_ret[gv] &
@@ -264,7 +270,6 @@ module lsq_simple #(
     //     连续赋值恒被求值，不依赖过程块的敏感表推断；语义与原循环逐项等价（下方逐处标注）。
     //   · 口径一次写死 **32 项**（`stq_v32` 高位补 0）⇒ 第 6 段把 STQ_N 从 16 扩到 32 时
     //     本节零改动（只需把高位来源从常量 0 换成 stq_v[16..31]）。
-    genvar gv, gb, gk, gj;
     wire [31:0] stq_v32;
     generate
     for (gv = 0; gv < 32; gv = gv + 1) begin : g_v32
@@ -629,8 +634,9 @@ module lsq_simple #(
     //   ★★ 4c(3/3)：每 lane 占的 CDQ 条数 = 1（普通）/ 2（8 B store）
     wire [1:0] dr_n [0:W-1];
     generate
-    for (gv = 0; gv < W; gv = gv + 1)
+    for (gv = 0; gv < W; gv = gv + 1) begin : g_drn
         assign dr_n[gv] = dr_take[gv] ? (stq_hi[dr_idx[gv*STQ_IW +: STQ_IW]] ? 2'd2 : 2'd1) : 2'd0;
+    end
     endgenerate
     wire [3*W-1:0] dr_rank;
     generate
@@ -642,8 +648,9 @@ module lsq_simple #(
     wire [CDQ_PW:0] dr_push_n = {{(CDQ_PW-2){1'b0}}, dr_rank[3*(W-1) +: 3]} + {1'b0, dr_n[W-1]};
     wire [CDQ_PW-1:0] cdq_wp [0:W-1];
     generate
-    for (gv = 0; gv < W; gv = gv + 1)
+    for (gv = 0; gv < W; gv = gv + 1) begin : g_wp
         assign cdq_wp[gv] = cdq_tail + dr_rank[3*gv +: 3];
+    end
     endgenerate
 
     //==========================================================================
