@@ -5212,3 +5212,47 @@ Spike 对"**置了 fflags 的 FP 行**"会多打一段 `c1_fflags 0x…`（实�
   组装 `m_fp_ld_wdata` `:3270`），含第二笔跨 4K 页重翻译与 8B 转发/重叠合并；
   **p17_fld_fsd 未创建**（不接入未实现通路，避免"蒙黄金"）。
 * D **算术**已随 p16 落地并进黄金（含 64 bit 写回值比对）。
+
+---
+
+# B4.40 4c(3/3) 起手：**D 访存（fld/fsd 8B）现状判定 + 拆笔实施方案**（本轮**未改 RTL**，停在"可编译 + 202 项全绿"检查点）
+
+## B4.40.1 现状：尺寸信息**已在流水里**，缺的是"8B 的一次访存"落地
+
+* **已就绪**：`decoder.mem_size_o` 对 `fld/fsd` 已给 **`3'd3`**（`decoder.v:671`：`is_loadfp|is_storefp ? (f3==FLW ? 2 : 3)`），
+  并原样进 uop 载荷 `BACK2_U_MSIZE=[62:60]`（`backend_top.v:672` → `lsq_simple` 的 `exe_size`）；
+  `fregfile` FLEN=64、`fpu.v` 双精度通路、`b2_csr` fcsr 均已在位（4c(1/3)(2/3)）。
+* **缺口（三处，均在 2B 侧）**：
+  1. `lsq_simple.v`：`ext_load(..., sz≥2)` **一律当 32 bit**（`:711-724`）；访存请求**单笔单拍**
+     （`mem_req_addr = dr_issue ? cdq_pa : ld_addr[pend_sel]`，`:702`）、响应 32 bit
+     （`wb_word = mem_rsp_rdata`，`:707`）⇒ 8B 只有低 4B。
+  2. `backend_top.v`：FP 装载写回是 **FLW 的 NaN-box 形态** ——
+     `fprf_wd = { fpu_wb_fdata, {32'hFFFF_FFFF, lsu_wb_data} }`（`:1794`），`lsu_wb_data` 仅 32 bit
+     ⇒ 无 FLD 的 64 bit 真值通道（ISA 口径：**FLD 不 box**，写整个 FLEN）。
+  3. 存储侧：STQ/CDQ 数据只有 **32 bit + 4 bit 掩码**（`stq_d[0:STQ_N-1]` `:184`、`cdq_d` `:573`）
+     ⇒ `fsd` 的高 4 B 无处存放；且**无** 8B 非对齐判据（全 2B 侧 grep 无 `misalign`）。
+* **2A 口径（须对齐的参照，`rtl/top/core_top.v`）**：`m_is_fp8/m_size8`（`:1623-1624`）
+  把 fld/fsd 拆成 **两相 4 B**（`m_hi_q`，`:1551`）；第二相地址 = **首拍 PA + 4**
+  （`m_pa_eff = m_pa_q + (m_hi_q ? 4 : 0)`，`:1640`）且**第二相不再翻译**
+  （`m_need_tr = satp_sv32 & ~m_eff_is_m & ~m_hi_q`，`:1626`）；存储数据 `m_store_w32` 按 `m_hi_q`
+  选 `em_fp_store[63:32]/[31:0]`（`:2205`）；装载组装 `m_fp_ld_wdata = {m_rd_hi_q, m_rd_data_q[31:0]}`（`:3270`）；
+  **非 8 字节对齐 ⇒ 异常**：`m_fp8_misalign = m_size8 & (m_va[2:0] != 3'b000)`（`:2218`），
+  且 8B 非对齐的 store **首拍不发写**（`:2225`）。
+
+## B4.40.2 拆笔实施方案（下一轮可直接执行；每步都可独立编译 + 判据验证）
+
+| 步 | 文件 | 改动 | 判据 |
+|---|---|---|---|
+| S1 | `lsq_simple.v` | 8B 非对齐判据（`exe_size==3'd3 & exe_addr[2:0]!=0`）⇒ 经**既有**精确异常口上报 cause 4(load)/6(store)、`tval=VA`（与 `exc_valid_o/exc_cause_o/exc_tval_o` 同构，`:756-762`） | p17 非对齐用例：DUT/Spike PC 流 + handler 自记录 cause/tval |
+| S2 | `lsq_simple.v` | 装载两拍：每项加 `beat_q`（2 bit/项）与 64 bit 组装寄存器；首拍 `addr`、次拍 `addr+4`（**用 VA+4 走完整翻译**——比 2A 的 `PA+4` 更严；**单页内逐位等价**，跨页时 2A 是"连续 PA"而本核会正确翻译下一页，差异登记）；两拍同 tag ⇒ 次拍响应到达才 `done` | p17 对齐 8B 往返 + 跨 4K 页用例（Spike 亦按页翻译，故黄金可比） |
+| S3 | `lsq_simple.v` | 8B store：E1 捕获 64 bit 数据（STQ 加 `stq_dh` 高字或改成 64 bit 字段），提交排空时**拆两条 CDQ 项**（低字 addr、高字 addr+4，掩码各 4'hF）；顺序即程序序 ⇒ 与 2A 的两相同序 | p17 对齐 fsd→fld 往返 + AXI AW/W 计数 |
+| S4 | `backend_top.v` | FLD 写回：新增 64 bit `lsu_wb_fdata` 通道，`fprf_wd` 对 8B 装载用 `{fpu_wb_fdata, lsu_wb_fdata64}`（**不 box**）；`fprf_we` 的 8B 条件同式 | p17 的 fld 写回值进黄金（4c2 已把 FP 写回值纳入 C3'） |
+| S5 | `lsq_simple.v` | 8B 转发/重叠合并：把现有 `ld_hd/ld_hm`（单字粒度，`:708-712`）扩成两拍各自合并（每拍仍按 4 B 字内字节道比较） | p17 "8B 覆盖转发"用例（store 低/高字分别被更年轻 store 覆盖后 fld 回读） |
+| S6 | `sim/unit/prog/back2_p17_fld_fsd.S` + 生成器 | 四组用例：①8B 对齐 fld/fsd 往返（含 `.data` 里 64 bit 位型）②`va[2:0]!=0` 非对齐 ⇒ cause 4/6 + tval ③跨 4K 页（0x…FFC 起始的对齐 8B、两页不同映射）④覆盖转发（fsd → 部分覆盖 store → fld） | Spike `--isa=rv32imafdc_zicsr` 黄金 + TB 自记录判据（C18'） |
+
+* **风险/工作量**：S2+S3 是本轮的主体（LSQ 加"两拍态"与"64 bit 存储数据"），S5 的转发合并次之；
+  建议按 S1→S2→S4→S6（先打通"对齐往返 + 异常"）再 S3→S5（存储与转发）分批接入，
+  每批都保持 `tb_core_top_2b` 全绿（**不接入半成品**、不放宽判据）。
+* **本轮结论**：按"预算见底 ⇒ 停在可编译 + 既有判据全绿"指令，**未改任何 RTL/TB**；
+  当前检查点 = `tb_core_top_2b` **202/202 PASS** + `regress.sh` **32/32 PASS**
+  （日志见 §B4.39.4；工作树仅本报告变更）。
