@@ -212,13 +212,67 @@ module core_top_2b (
     wire        csr_we_w;
     wire [11:0] csr_waddr_w;
     wire [31:0] csr_wdata_w;
-    //   ★★ 4b-1c：`csr_frm_w`/`csr_ff_w`（FPU 舍入模式 / fcsr.fflags 回灌）在 4a 由 `b2_csr`
-    //     输出；换成 2A `csr_file` 后它没有对应的**读侧派生输出**（2A 的 FPU 走 `csr_file`
-    //     自己的 fcsr 视图，FP 集成时再接）。本核 `core_top_2b` 尚无 FP 程序/FP 提交路径
-    //     （TB 七个程序全整数）⇒ 先接 `frm = RNE(0)`、`fflags = 0`（= fcsr 复位值，语义正确），
-    //     并把"软件写 frm 对 FPU 可见"列入 FP 集成待办（报告 §B4.6.4-⑩）。
-    wire [2:0]  csr_frm_w = 3'h0;
-    wire [4:0]  csr_ff_w  = 5'h0;
+    //   ★★ 4c(2/3)：**2B 侧 fcsr 保持器（fflags/frm/fcsr 完整提交通路）**
+    //     · 背景：2A `csr_file` 把 FFLAGS/FRM/FCSR 列入 `is_impl` 且给了 `wr_mask`
+    //       （`csr_file.v:253-255/383-385`），但**不持有寄存器**——读恒回 `32'h0`
+    //       （`:828-830` 注释"本模块不持有"），且 2A **冻结不可改** ⇒ 存储必须落在 2B 侧。
+    //     · 写侧：后端**早已**把"FPU 结果提交时的 fflags 累积"合成成一次地址 `0x001` 的
+    //       CSR 写（`backend_top.v:1514-1600`：`csr_we_w = csr_cmt_we | ff_cmt_any`、
+    //       `csr_waddr_w = csr_cmt_we ? csr_cmt_addr : 12'h001`、
+    //       `csr_wdata_w = ... | ff_cmt_val`，其中 RMW 读的是本层回灌的 `csr_ff_w`）
+    //       ⇒ 本层只需"**拦住这三个地址**（不给 2A）+ **自己落地** + **读侧覆盖** + **回灌**"。
+    //     · 读侧：`csrr fflags/frm/fcsr` 的值由本保持器提供（覆盖 2A 的恒 0）；
+    //       后端的 CSR 读改写（`csr_cmt_new`）也因此读到真值 ⇒ `csrrs/csrrc` 语义正确。
+    //     · FS/SD：任何 fcsr 写（含 FPU fflags 累积）⇒ `mstatus.FS=11(Dirty)`、`SD=1`
+    //       （以 2B 贡献 **OR 进** `mstatus_set`；2A 的 `csr_file` 自动由其 `mstat_fs`
+    //        合成只读 SD 位 —— 见 `csr_file.v:671-675`，**不改 2A**）。
+    //   ★★ 4c(2/3)：`priv_ctrl` 的 mstatus 置位/清除走私有线，顶层再 **OR 上 2B 侧 FS/SD 贡献**
+    //     （`csr_file` 的写入语义 `mstat_sw <= (mstat_sw & ~clr) | set` ⇒ set 优先 ⇒ Dirty 生效）
+    wire [31:0] priv_mset_w, priv_mclr_w;
+    wire [31:0] mstatus_set, mstatus_clr;
+    reg  [4:0]  fflags_r;
+    reg  [2:0]  frm_r;
+    localparam [11:0] CSR_FFLAGS_A = 12'h001;
+    localparam [11:0] CSR_FRM_A    = 12'h002;
+    localparam [11:0] CSR_FCSR_A   = 12'h003;
+    wire        csr_fp_rd_w = (csr_raddr_w == CSR_FFLAGS_A) |
+                              (csr_raddr_w == CSR_FRM_A)    |
+                              (csr_raddr_w == CSR_FCSR_A);
+    wire        csr_fp_wr_w = csr_we_w & ((csr_waddr_w == CSR_FFLAGS_A) |
+                                          (csr_waddr_w == CSR_FRM_A)    |
+                                          (csr_waddr_w == CSR_FCSR_A));
+    //   csr_file 的原始读数据（FP 三地址恒 0）另起一根线，`csr_rdata_w` 变成"覆盖后"的值
+    wire [31:0] csr_rdata_cf_w;
+    assign csr_rdata_w = (csr_raddr_w == CSR_FFLAGS_A) ? {27'b0, fflags_r}        :
+                         (csr_raddr_w == CSR_FRM_A)    ? {29'b0, frm_r}           :
+                         (csr_raddr_w == CSR_FCSR_A)   ? {24'b0, frm_r, fflags_r} : csr_rdata_cf_w;
+    //   写 2A：**滤掉** FP 三地址（2A 不持有，写进去是静默丢弃；这里显式分流）
+    wire        csr_cf_we_w = csr_we_w & ~csr_fp_wr_w;
+    //   FS/SD 贡献（`mstatus_set` 的 OR 项）：FS=11 Dirty（bits[14:13]）+ SD=1（bit31）
+    wire [31:0] fp_mset_w = csr_fp_wr_w ? ((32'h3 << `RV32GC_MSTATUS_FS_LSB) |
+                                           (32'h1 << `RV32GC_MSTATUS_SD_BIT)) : 32'h0;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            fflags_r <= 5'h0;                       // fcsr 复位值 = 0（RNE + 无 flag）
+            frm_r    <= 3'h0;
+        end else if (csr_fp_wr_w) begin
+            //   WARL 掩码按 2A `wr_mask` 口径（fflags=0x1F / frm=0x7 / fcsr[7:0]）
+            case (csr_waddr_w)
+                CSR_FFLAGS_A: fflags_r <= csr_wdata_w[4:0];
+                CSR_FRM_A:    frm_r    <= csr_wdata_w[2:0];
+                CSR_FCSR_A: begin
+                    fflags_r <= csr_wdata_w[4:0];
+                    frm_r    <= csr_wdata_w[7:5];
+                end
+                default: ;
+            endcase
+        end
+    end
+    //   回灌后端：FPU 的 DYN 舍入解析（`csr_frm_w`）与 fflags 累积的 RMW 基值（`csr_ff_w`）
+    wire [2:0]  csr_frm_w = frm_r;
+    wire [4:0]  csr_ff_w  = fflags_r;
+    assign mstatus_set = priv_mset_w | fp_mset_w;
+    assign mstatus_clr = priv_mclr_w;
     wire [1:0]  xret_kind_w;
     //   ★★ 2B-4 第 4b-2a 段：维护操作（fence.i / sfence.vma / cbo.*）
     wire [2:0]  maint_kind_w;
@@ -280,7 +334,7 @@ module core_top_2b (
     wire [31:0] csr_mie_o, csr_mip_o, csr_mepc_o, csr_sepc_o, csr_satp_o;
     wire [31:0] csr_mstatus_raw;
     wire [1:0]  csr_priv_2, csr_eff_priv;
-    wire [31:0] mstatus_set, mstatus_clr;
+    //   （`mstatus_set/clr` 的声明已上移到 4c(2/3) fcsr 块——本层要对它做 OR 贡献）
     wire [N_PMP*8-1:0]  pmp_cfg_flat;
     wire [N_PMP*32-1:0] pmp_addr_flat;
     reg  [63:0] cycle_cnt, instret_cnt;
@@ -1450,7 +1504,7 @@ module core_top_2b (
     //   ★★ 4b-1b：CSR 全集 + 特权状态 + 陷阱决策（2A 模块只读例化，接法照 `rtl/top/core_top.v`）
     csr_file u_csr_file (
         .clk(aclk), .rst_n(aresetn),
-        .raddr(csr_raddr_w), .rdata(csr_rdata_w), .wen(csr_we_w),
+        .raddr(csr_raddr_w), .rdata(csr_rdata_cf_w), .wen(csr_cf_we_w),
         .waddr(csr_waddr_w), .wdata(csr_wdata_w), .w_illegal(1'b0),
         .rdata_w(), .byp_wdata(32'h0), .byp_rdata(),
         .priv(csr_priv_2), .chk_addr(12'h0), .chk_illegal(), .chk_ro_write(),
@@ -1474,7 +1528,7 @@ module core_top_2b (
         .xret_valid(xret_cmt_w), .xret_kind(xret_kind_w),
         .mstatus_i(csr_mstatus_raw),
         .csr_wen(csr_we_w), .csr_waddr(csr_waddr_w), .csr_wdata(csr_wdata_w),
-        .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
+        .mstatus_set(priv_mset_w), .mstatus_clr(priv_mclr_w),
         .priv_o(csr_priv_2), .eff_priv_o(csr_eff_priv),
         .mprv_o(), .sum_o(), .mxr_o(), .mpp_o(),
         .tvm_o(), .tw_o(), .tsr_o(), .fetch_priv_is_m_o(),

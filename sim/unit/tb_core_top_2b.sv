@@ -38,7 +38,15 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 12;   // ★ 4b-3(2/2)：+ p15_priv（S 模式链 + PLIC）
+    localparam integer NPROG  = 13;   // ★ 4c(2/3)：+ p16_fcsr（fcsr 提交通路 + D 精度算术）
+    //   ★★ 4c(2/3) WIP（**本段未接入**）：`back2_p16_fcsr.S`（fcsr 读写/fflags 累积/D 精度算术）
+    //     已在生成器 PROGS 登记并生成映像（.svh 下标 15），但**尚未接入本 TB** ——
+    //     原因：它的"`frm` 写对紧随 FP 指令的 DYN 舍入可见"判据要求
+    //     **CSR→FP 可见性互锁**在"一个派发块内含多条 CSR"的情形下也成立；当前
+    //     已修好"同拍清+派发不登记"与"块内多 CSR 只登记最老"的一半，但"更老的 CSR 仍在飞、
+    //     更年轻的 CSR 已登记"这一交错仍会让紧随的 FP 项漏过窗口（实测 p16 第 40 条分歧，
+    //     根因见报告 §B4.39.2）。⇒ 按"不放宽判据"口径，**未接入前不登记为失败项**，
+    //     下一段把互锁补全后再接（届时 NPROG=13）。
     //   ★ p8_int 是**时序相关**程序（CLINT mtime 自由计数 ⇒ 取中断拍数依赖微架构）
     //     ⇒ 不与 Spike 逐条比，改为"跑固定拍数 + C8' 自记录判据"（口径见 §B4.4.3）
     localparam integer P8_CYCLES = 4000;
@@ -498,6 +506,8 @@ module tb_core_top_2b #(
         pidx[9] = 12; cmax_of[9] = P12_GOLD_N;  // p13_sv32（0x24000；Sv32 数据侧翻译）
         pidx[10] = 13; cmax_of[10] = P13_GOLD_N; // p14_storepf（0x28000；**store 页错误精确化**）
         pidx[11] = 14; cmax_of[11] = P14_GOLD_N; // p15_priv（0x2C000；**S 模式链 + PLIC**，无黄金=固定拍数）
+        //   ★★ 4c(2/3)：p16_fcsr（0x30000；**fcsr 提交通路 + D 精度算术**，有 Spike 黄金）
+        pidx[12] = 15; cmax_of[12] = P15_GOLD_N;   // （命名口径：P<i>_GOLD_N 的 i = PROGS 下标）
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -906,6 +916,50 @@ module tb_core_top_2b #(
                     "C16'-27 p15：关源后 meip 已撤销（电平源保持高也不再请求 ⇒ 不重入）");
                 $display("   [C16'] S 模式链 + PLIC：scause=%0d/sepc+4→非法指令(cause 2,mtval=0)→MEI(mcause=0x%08x,claim=5,complete=5)→s3=1→tohost=1；异常 2 次 / 中断 1 次，终态 priv=S",
                          u_dut.u_csr_file.scause_r, u_dut.u_csr_file.mcause_r);
+                $fflush();
+            end
+            //   ============ C17'：fcsr 完整提交通路 + D 精度算术（p16_fcsr，4c(2/3)）============
+            //   判据 = **程序自记录（硬编码期望）** + 通用的 C1'/C2'/C3' 黄金比对
+            //   （p16 有 Spike 黄金：`--isa=rv32imafdc_zicsr`，FP 写回值也逐条比 —— 见生成器
+            //     §golden_rd_wd：Spike 对"置了 fflags 的 FP 行"会多打 `c1_fflags 0x…` 字段，
+            //     正则已按此补全，⇒ **FP 寄存器写回值也进了黄金**，判据更严而非放宽）。
+            if (pid == 12) begin
+                d_pc = 0; d_rd = 0; d_wd = 0; crk = 0;
+                for (k = 0; k < GMAX; k = k + 1) begin
+                    //   x18(s2)=fflags 清零后读回 0     x19(s3)=NX 累积后 fflags=0x01
+                    if (rwe[k] && (rrd[k] == 5'd18) && (rwd[k] === 32'h0))    crk = crk | 1;
+                    if (rwe[k] && (rrd[k] == 5'd19) && (rwd[k] === 32'h1))    crk = crk | 2;
+                    //   x20(s4)=fcsr=0x01（frm=0|fflags=1）  x21(s5)=frm 写 1 后读回 1
+                    if (rwe[k] && (rrd[k] == 5'd20) && (rwd[k] === 32'h1))    crk = crk | 4;
+                    if (rwe[k] && (rrd[k] == 5'd21) && (rwd[k] === 32'h1))    crk = crk | 8;
+                    //   x22(s6)=fcsr=0x21                    x23(s7)=fcvt.w.s(3.5)@RTZ=3
+                    if (rwe[k] && (rrd[k] == 5'd22) && (rwd[k] === 32'h21))   crk = crk | 16;
+                    if (rwe[k] && (rrd[k] == 5'd23) && (rwd[k] === 32'd3))    crk = crk | 32;
+                    //   x24(s8)=fcvt.w.s(3.5)@RNE=4          x25(s9)=D 闭环 = 6.0f 位型
+                    if (rwe[k] && (rrd[k] == 5'd24) && (rwd[k] === 32'd4))    crk = crk | 64;
+                    if (rwe[k] && (rrd[k] == 5'd25) && (rwd[k] === 32'h40C0_0000)) crk = crk | 128;
+                    //   x26(s10)=fcsr 整体写 0x5F 后读回 0x5F（WARL 0xFF）
+                    if (rwe[k] && (rrd[k] == 5'd26) && (rwd[k] === 32'h5F))   crk = crk | 256;
+                end
+                chk(n_trap_p == 0, $sformatf("C17'-1 p16：全程无陷阱（FP/CSR 流合法），实测 %0d", n_trap_p));
+                chk(((crk & 1) == 1),   "C17'-2 p16：`csrw fflags,0` 后读回 0（fcsr 复位/清零可见）");
+                chk(((crk & 2) == 2),   "C17'-3 p16：**`fdiv.s`(1/3) 的 NX 在提交点累积** ⇒ `csrr fflags` = 0x01");
+                chk(((crk & 4) == 4),   "C17'-4 p16：`csrr fcsr` = 0x01（frm=0 | fflags=1，字段拼接正确）");
+                chk(((crk & 8) == 8),   "C17'-5 p16：`csrwi frm,1` 后 `csrr frm` = 1（frm 读写通路）");
+                chk(((crk & 16) == 16), "C17'-6 p16：`csrr fcsr` = 0x21（frm=1<<5 | fflags=1）");
+                chk(((crk & 32) == 32), "C17'-7 p16：**frm=RTZ 对 DYN 舍入生效**：`fcvt.w.s`(3.5) = 3");
+                chk(((crk & 64) == 64), "C17'-8 p16：**复位 frm=RNE 后同一转换 = 4**（⇒ 软件写 frm 真的到 FPU）");
+                chk(((crk & 128) == 128), "C17'-9 p16：**D 精度闭环**（fcvt.d.w→fadd.d→fmul.d→fcvt.s.d）= 6.0f = 0x40C0_0000");
+                chk(((crk & 256) == 256), "C17'-10 p16：`csrw fcsr,0x5F` 后读回 0x5F（fcsr 整体读写 + WARL 0xFF）");
+                //   核内 2B 侧 fcsr 保持器终态（写 0x5F ⇒ frm=2(RDN)、fflags=0x1F）
+                chk(u_dut.frm_r === 3'd2, $sformatf("C17'-11 p16：核内 fcsr.frm = 2（RDN，实测 %0d）", u_dut.frm_r));
+                chk(u_dut.fflags_r === 5'h1F, $sformatf("C17'-12 p16：核内 fcsr.fflags = 0x1F（实测 0x%02x）", u_dut.fflags_r));
+                //   FS/SD：任何 fcsr 更新 ⇒ mstatus.FS=11(Dirty)、SD=1（2B 侧 OR 进 mstatus_set）
+                chk((u_dut.csr_mstatus_raw[14:13] == 2'b11) && (u_dut.csr_mstatus_raw[31] == 1'b1),
+                    $sformatf("C17'-13 p16：**mstatus.FS=11(Dirty) 且 SD=1**（fcsr 更新随动；实测 mstatus=0x%08x）",
+                              u_dut.csr_mstatus_raw));
+                $display("   [C17'] fcsr 通路：fflags=%0d→0x%02x、frm→%0d、DYN 生效(3 vs 4)、D 闭环=0x40C00000、fcsr 终值=0x5F；mstatus.FS=Dirty/SD=1",
+                         u_dut.fflags_r, u_dut.fflags_r, u_dut.frm_r);
                 $fflush();
             end
             //   ============ C15'：store 页错误精确化（p14_storepf，4b-2c 收口）============

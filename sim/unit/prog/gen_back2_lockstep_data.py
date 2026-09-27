@@ -82,6 +82,12 @@ PROGS = [
     #   ★ 2B-4 第 4b-3 段（2/2）：**S 模式完整链 + PLIC**。**仅映像、无黄金**：Spike 不建模 PLIC
     #     ⇒ 含 claim/complete 的整链无法逐条比对；判据由 TB 的 C16'（程序自记录 + 硬编码期望）给出。
     ("back2_p15_priv.S",   "P15", "rv32ima_zicsr_zifencei", "rv32imac_zicsr_zifencei", True),
+    #   ★★ 4c(2/3)：**fcsr 完整提交通路 + D 精度算术**（fflags 累积 / frm 对 DYN 生效 /
+    #     fcsr 整体读写 / fcvt.d.w→fadd.d→fmul.d→fcvt.s.d 的 64 bit 闭环）。
+    #     有 Spike 黄金（`--isa=rv32imafdc_zicsr`）：FP 结果经 fmv.x.w 进整数寄存器 +
+    #     分支自检 ⇒ 任何 FP 计算/通路错误都会在 PC 流上分歧。
+    #     **不含 fld/fsd**（8B 访存拆笔属 4c(3/3)，见报告 §B4.39）。
+    ("back2_p16_fcsr.S",   "P16", "rv32imafd_zicsr",      "rv32imafdc_zicsr"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"
@@ -145,7 +151,14 @@ def golden_regs(elf, tag):
     · 行格式：`core 0: 3 0x<pc> (0x<insn>) [xN|fN] 0x<val> ...`；无写回则该条记 (0,0)
     · 与 golden_pcs 的**同一批行**（同一次 Spike 运行），故下标一一对应"""
     logf = "/tmp/back2_%s.spike.log" % tag
+    #   ★ 4c(2/3)：Spike 在"**设置了浮点 flag** 的 FP 指令"行里会多打一段
+    #     `<name_with_underscore> 0x<val>`（实测：`c1_fflags 0x00000001 f3 0xffffffff3eaaaaab`）
+    #     ⇒ 旧正则匹配不到后面的寄存器写回 ⇒ 黄金把该条记成"无写回 (0,0)"，而 DUT 的
+    #     `commit_arch_we`（= `dst_int | dst_fp`）为 1 ⇒ C3' 误报"多余写回"。
+    #     修法：允许**中间插入 0..n 个 `名字_带下划线 0x值` 字段**（后缀写回仍是 `xN`/`fN`，
+    #     故用"含下划线"把附加字段与寄存器写回区分开，避免把 `f2 0x…` 当成附加字段吃掉）。
     pat  = re.compile(r"^core\s+\d+:\s+\S+\s+0x([0-9a-fA-F]+)\s+\(0x([0-9a-fA-F]+)\)"
+                      r"(?:\s+[a-z][a-z_0-9]*_[a-z_0-9]+\s+0x[0-9a-fA-F]+)*"
                       r"(?:\s+([xf])(\d+)\s+0x([0-9a-fA-F]+))?")
     pcs, rds, wds = [], [], []
     prev = None

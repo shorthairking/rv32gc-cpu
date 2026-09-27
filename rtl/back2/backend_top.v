@@ -855,10 +855,25 @@ module backend_top #(
     assign st_alloc_rob = {rob_alloc_idx0 + 7'd3, rob_alloc_idx0 + 7'd2,
                            rob_alloc_idx0 + 7'd1, rob_alloc_idx0};
     wire [3:0]  lsu_dr_ok_w;
+    //   ★★ 4c(2/3)：**CSR 串行化**（本核 CSR 只在 ROB 头发射、提交点写 ⇒ 同一时刻只应有一条
+    //     "未提交 CSR"在飞）。原实现的待提交跟踪 `csr_pend_q` 只记**一条**（派发时
+    //     `~csr_pend_q` 才登记）⇒ **连续多条 CSR**（p16 的 `fsflags/frflags/fsrmi/frrm/frcsr`
+    //     序列）只有第一条被跟踪，后续 CSR 的"CSR→FP/load 可见性窗"完全失守（实测 p16：
+    //     `fsrm frm,0(RNE)` 在飞时，紧随的 `fcvt.w.s` 已按**旧 frm=RTZ** 执行 ⇒ 得 3 而非 4
+    //     ⇒ 自检跳 fail）。修法：**含 CSR 的块在"有未提交 CSR"期间不得派发** ⇒ 不变式
+    //     "至多一条未提交 CSR"成立，`csr_pend_q` 的年龄窗（load/FP 门）才可靠。
+    //     （死锁性：在飞的 CSR 一定比 D1 里的块**更老**，其发射不受本门影响 ⇒ 它提交后门即开。）
+    reg        csr_pend_q;      // 有"最老未提交 CSR 指令"
+    reg  [6:0] csr_pend_rob_q;  // 它的 ROB 索引（年龄窗原点）
+    wire       blk_has_csr_w = (d1_v_q[0] & u_is_csr(d1_uop_q[0])) |
+                               (d1_v_q[1] & u_is_csr(d1_uop_q[1])) |
+                               (d1_v_q[2] & u_is_csr(d1_uop_q[2])) |
+                               (d1_v_q[3] & u_is_csr(d1_uop_q[3]));
+    wire       csr_serial_w  = blk_has_csr_w & csr_pend_q;
     wire        disp_ok = (d1_v_q != {DISP_W{1'b0}}) & ~rn_i_busy & ~rn_f_busy &
                           ~squash_v_w & ~flush_all_w &
                           rob_alloc_ready & free_i_ok & free_f_ok & iq_room_ok &
-                          st_alloc_ok & ld_alloc_ok;
+                          st_alloc_ok & ld_alloc_ok & ~csr_serial_w;
     assign disp_fire_w = disp_ok;
     assign blk_ready_o = (d1_v_q == {DISP_W{1'b0}}) | disp_fire_w;
 
@@ -1021,12 +1036,34 @@ module backend_top #(
     //     判据：`csr_pend_q`（有未提交 CSR）+ 候选 load 的 ROB 比它**更年轻**（年龄窗口算术，
     //     B27 口径：`(a-b)&0x7F` ∈ (0, 64) 即"a 在 b 之后、且未绕环"）。
     //     跟踪寄存器/组合信号在此声明（driver 见 §12 后的 CSR 提交区）。
-    reg        csr_pend_q;      // 有"最老未提交 CSR 指令"
-    reg  [6:0] csr_pend_rob_q;  // 它的 ROB 索引
+
     wire [6:0] csr_age_w      = (i4_sel_rob - csr_pend_rob_q) & 7'h7F;
     wire       csr_ld_block_w = csr_pend_q & (csr_age_w != 7'h0) & (csr_age_w < 7'h40);
     wire lsu_ld_block = u_is_ld(i4_sel_uop) & (~lsu_iss_ok_w | csr_ld_block_w);
+    //   ★★ 4c(2/3)：**CSR→FP 可见性互锁**（与上面的 load 门同构、同一窗算术）——
+    //     FP 指令读的是**组合回灌**的 `csr_frm_w`（fcsr.frm，供 DYN 舍入解析）+ 提交点累积
+    //     fflags 的 RMW 基值 `csr_ff_w`；而 CSR 写只在**提交点**生效 ⇒ 若一条比该 CSR
+    //     **更年轻**的 FP 指令在它提交前发射/执行，就会用**旧 frm**（实测 p16：
+    //     `fsrmi frm,1(RTZ)` → `fcvt.w.s 3.5`(经 frm=RTZ)=3 ✓ → `fsrm frm,0(RNE)` →
+    //     紧随的 `fcvt.w.s` **仍按 RTZ 执行** ⇒ 得 3 而非 4 ⇒ 自检跳 fail、黄金在 #40 分歧）。
+    //     判据与 load 门逐字同构：候选 FP 项比"最老未提交 CSR"更年轻（`!= 0` 排除 CSR 自身、
+    //     `< 0x40` 为模 128 年龄窗内的"更年轻"）；更老的项不受影响 ⇒ CSR 仍能提交、
+    //     窗清空后 FP 恢复发射（**无死锁**：CSR 在 ROB 里更老且其发射不受 FP 影响）。
+    wire [6:0] csr_fp_age_w   = (i5_sel_rob - csr_pend_rob_q) & 7'h7F;
+    wire       csr_fp_block_w = csr_pend_q & (csr_fp_age_w != 7'h0) & (csr_fp_age_w < 7'h40);
+    //   ★★ 4c(2/3)：**DYN 舍入的 FP 项只在 ROB 头发射** —— `rm=111(DYN)` 时 FPU 的舍入模式
+    //     取自 `csr_frm_w`（fcsr.frm 的**提交点**回灌），而上面的年龄窗门只能挡住"年龄窗内
+    //     登记过的那条 CSR"；一个派发块可含**多条** CSR（p16 实测 `{fsrmi,frrm,frcsr}` 同块）
+    //     且"更老 CSR 仍在飞、更年轻 CSR 已登记"的交错会让窗失效 ⇒ 更年轻的 FP 项仍可能
+    //     用**旧 frm** 执行。最稳且与 2A 顺序语义一致的判据：DYN 项**等到它成为 ROB 头**
+    //     才发射 ⇒ 届时所有更老指令（含任何 CSR 写）都已提交 ⇒ 读到的 frm 必为已提交值 ✓
+    //     （无死锁：更老指令不依赖 FP 队列；静态 rm 的 FP 项不受此门限制）
+    wire       fpu_dyn_w   = (i5_sel_uop[`BACK2_U_RM_MSB:`BACK2_U_RM_LSB] == 3'b111);
+    wire       fpu_head_w  = (i5_sel_rob == rob_head_w);
+    wire       fpu_iss_ok_w = fpu_free_w & ~csr_fp_block_w & (~fpu_dyn_w | fpu_head_w);
     wire [2:0] q4_ready = ~lsu_ld_block;
+    //   注：`q5_ready` 是**派发侧容量**（只反映队列余量），**不得**并入发射门 ——
+    //   它会经写口仲裁影响派发，实测并入后 p16 第 12 条出现多余整数写回。
     wire [2:0] q5_ready = fpu_free_w ? 3'd1 : 3'd0;
 
     iq #(.DEPTH(`BACK2_IQ_ALU0_D), .DBG(DBG_IQ)) u_iq0 (
@@ -1122,7 +1159,7 @@ module backend_top #(
         .wr_rob(iq_wrob[5*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[5*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[5]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(fpu_free_w),
+        .rob_head(rob_head_w), .iss_ready(fpu_iss_ok_w),
         .iss_valid(iq_iss_v[5]), .iss_uop(iq_iss_uop[5]), .iss_rob(iq_iss_rob[5]),
         .iss_epoch(iq_iss_ep[5]), .iss_dead(iq_iss_dead[5]),
         .o_sel_v(i5_sel_v), .o_sel_uop(i5_sel_uop), .o_sel_rob(i5_sel_rob), .cnt_o()
@@ -1511,6 +1548,7 @@ module backend_top #(
     reg        csr_cmt_we;  reg [11:0] csr_cmt_addr; reg [31:0] csr_cmt_data;
     reg [2:0]  csr_cmt_op;   // ★ B29：提交级 CSR 操作码
     reg        ff_cmt_any;  reg [4:0]  ff_cmt_val;
+    reg [6:0]  csr_cmt_idx;                  // ★ 4c(2/3)：本拍提交的 CSR 的 ROB 索引
     reg [31:0] csr_cmt_insn;                 // 该 CSR 指令的原始编码（判 zimm 形式）
     reg [PW_I-1:0] csr_cmt_ps1i;             // 该 CSR 指令自己的 rs1 物理号（B29 残留清理）
     integer    cw;
@@ -1521,6 +1559,7 @@ module backend_top #(
         csr_cmt_ps1i = {PW_I{1'b0}};
         ff_cmt_any   = 1'b0;
         ff_cmt_val   = 5'h0;
+        csr_cmt_idx  = 7'h0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
             if (commit_valid_o[cw]) begin
                 if (p_csr(cmt_pay[cw*RB_W +: RB_W])) begin
@@ -1530,6 +1569,7 @@ module backend_top #(
                     csr_cmt_op   = p_csrop(cmt_pay[cw*RB_W +: RB_W]);   // ★ B29：提交级合成用
                     csr_cmt_insn = p_tval (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4a：zimm 形式判定
                     csr_cmt_ps1i = p_csrw (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4b-1：本指令的 ps1i
+                    csr_cmt_idx  = rob_head_w + cw[6:0];                // ★ 4c(2/3)：它的 ROB 索引
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
                     ff_cmt_any = 1'b1;
@@ -1555,16 +1595,35 @@ module backend_top #(
                           ((squash_idx_w - rob_head_w) & 7'h7F))) begin
                 csr_pend_q <= 1'b0;                     // 该 CSR 在冲刷点之后 ⇒ 已不存在
             end else if (csr_cmt_we) begin
+                //   ★★ 4c(2/3)：**只有"被跟踪的那条 CSR"提交才清** —— 一个派发块可含**多条**
+                //     CSR（实测 p16 的 `{fsrmi,frrm,frcsr}` 三连同块），更老的 CSR 提交时
+                //     若无条件清，会把"更年轻的在飞 CSR"的窗一起抹掉（实测：`frcsr` 在
+                //     c=210 提交 ⇒ 把 c=208 登记的 `fsrm` 窗清掉 ⇒ 紧随的 `fcvt.w.s` 用旧
+                //     frm 执行）。索引比较用提交级算出的 `csr_cmt_idx`（CSR 可在提交组任意 lane）。
                 csr_pend_q <= 1'b0;                     // 该 CSR 已提交 ⇒ CSR 状态已更新
             end
             if (disp_ok) begin
-                if (d1_v_q[0] & u_is_csr(d1_uop_q[0]) & ~csr_pend_q) begin
+                //   ★★ 4c(2/3) 缺陷修复（p16 实测抓出）：**登记条件不得含 `~csr_pend_q`** ——
+                //     它读的是"本拍之前"的寄存器值 ⇒ 在"**同一拍：老 CSR 提交（清）+ 新 CSR 块派发**"
+                //     的边界上，新 CSR **不会被登记**（旧值仍为 1）⇒ 紧随其后的 FP/load 可见性窗
+                //     完全失守（实测 p16：`fsrm frm,0` 与更老的 `frcsr` 提交同拍派发 ⇒ 未登记 ⇒
+                //     紧随的 `fcvt.w.s` 用**旧 frm=RTZ** 执行 ⇒ 得 3 而非 4 ⇒ 自检跳 fail）。
+                //     现在改为**无条件登记**（块内 lane 0 最老优先；后面的赋值天然覆盖前面的
+                //     ⇒ "清 + 派发"同拍取新登记的那条 ✓）。配合上面的 `csr_serial_w`
+                //     不变式（含 CSR 的块在有未提交 CSR 时不派发 ⇒ 至多一条未提交 CSR），
+                //     登记值不会被更年轻的 CSR 覆盖 ⇒ 年龄窗可靠。
+                //   ★ 4c(2/3)：**取块内"最年轻"的 CSR**（lane 3→0 扫描；lane 0 最老）——
+                //     一个块可含多条 CSR，只登记最老的那条会让块内更年轻的 CSR 完全不被
+                //     覆盖（实测 p16 的 `{fsrmi,frrm,frcsr}` 块）。登记最年轻者 + "只有它提交
+                //     才清" ⇒ 在其提交前，所有更年轻的 FP 项都被挡在发射口外 ✓（保守但正确：
+                //     块内更老的 CSR 也一定更早提交）。
+                if (d1_v_q[0] & u_is_csr(d1_uop_q[0])) begin
                     csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0;
-                end else if (d1_v_q[1] & u_is_csr(d1_uop_q[1]) & ~csr_pend_q) begin
+                end else if (d1_v_q[1] & u_is_csr(d1_uop_q[1])) begin
                     csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd1;
-                end else if (d1_v_q[2] & u_is_csr(d1_uop_q[2]) & ~csr_pend_q) begin
+                end else if (d1_v_q[2] & u_is_csr(d1_uop_q[2])) begin
                     csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd2;
-                end else if (d1_v_q[3] & u_is_csr(d1_uop_q[3]) & ~csr_pend_q) begin
+                end else if (d1_v_q[3] & u_is_csr(d1_uop_q[3])) begin
                     csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd3;
                 end
             end

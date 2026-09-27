@@ -5132,3 +5132,83 @@ wdata=0x8002c07c, priv=01, wr_sepc=1, sw_en=1` ✓ 一切正常）与**紧随的
 * **遗留**：② fcsr 保持器 + 读覆盖/写拦截 + FS/SD 合并层；③ LSQ 8B 拆笔（含跨页第二笔重翻译）+
   FP 64 bit 写回 + p16/p17 锁步程序与判据 —— 均已在 §B4.38.2/§B4.38.3 给出接入点与 2A 口径行号，
   可直接续做；本轮按"预算见底"指令**停在可编译 + 既有判据全绿**。
+
+---
+
+# B4.39 4c(2/3)：**fcsr 完整提交通路打通** + CSR→FP 可见性互锁 + p16 黄金判据（202/202）
+
+## B4.39.1 fcsr 通路 diff（`rtl/top/core_top_2b.v`，2B 侧保持器；**2A 零修改**）
+
+* **为何必须落在 2B 侧**：2A `csr_file` 把 `FFLAGS/FRM/FCSR` 列入 `is_impl` 且给了 `wr_mask`
+  （`csr_file.v:253-255/383-385`），但**不持有寄存器**——读恒回 `32'h0`（`:828-830`）；
+  2A 冻结 ⇒ 存储落在顶层。
+* **写侧早已就绪**：后端把"FPU 结果提交时的 fflags 累积"合成成一次**地址 `0x001` 的 CSR 写**
+  （`backend_top.v:1514-1600`：`csr_we_w = csr_cmt_we | ff_cmt_any`、`csr_waddr_w = … : 12'h001`、
+  `csr_wdata_w = … | ff_cmt_val`，RMW 读的正是本层回灌的 `csr_ff_w`）。
+* **本层新增**：`fflags_r[4:0]/frm_r[2:0]` 保持器 + 三地址（0x001/0x002/0x003）**读覆盖**
+  （`csr_rdata_w` = 保持器值，2A 的原始输出改名 `csr_rdata_cf_w`）+ **写拦截**
+  （`csr_cf_we_w = csr_we_w & ~csr_fp_wr_w` 才送 2A；FP 三地址落到保持器，WARL 掩码
+  `0x1F/0x7/0xFF` 与 2A 一致）+ **回灌** `csr_frm_w = frm_r`、`csr_ff_w = fflags_r`
+  （原为写死的 `3'h0/5'h0`，即 §B4.6.4-⑩ 待办）。
+* **FS/SD**：`fp_mset_w = csr_fp_wr_w ? (FS=11 | SD=1) : 0`，与 `priv_ctrl` 的贡献
+  **OR 进** `mstatus_set`（`priv_ctrl` 的置/清改接私有线 `priv_mset_w/priv_mclr_w`；
+  `csr_file` 的写语义 `(mstat_sw & ~clr) | set` ⇒ set 优先 ⇒ Dirty 生效，SD 由 2A 的
+  `mstat_fs` 自动合成只读位 `csr_file.v:671-675`）——**不改 2A**。
+
+## B4.39.2 CSR→FP 可见性互锁（`rtl/back2/backend_top.v`；p16 实测抓出的三处）
+
+**症状**：p16 里 `fsrmi frm,1(RTZ)` → `fcvt.w.s`(3.5)=3 ✓ → `fsrm frm,0(RNE)` → 紧随的
+`fcvt.w.s` 仍按 **旧 frm=RTZ** 执行得 3（期望 4）⇒ 自检跳 `fail`、黄金在 #40 分歧。
+**根因链（逐拍探针）**：CSR 写只在提交点生效，而 FP 项的 `rm=111(DYN)` 在**执行拍**组合读
+`csr_frm_w` ⇒ 比该 CSR **更年轻**的 FP 项若先执行就读到旧值。本核原有互锁只覆盖 load
+（`csr_ld_block_w`）。补三处：
+1. **`csr_pend_q` 登记条件去掉 `~csr_pend_q`**（旧式读的是"本拍之前"的值 ⇒
+   "**同一拍：老 CSR 提交（清）+ 新 CSR 块派发**"时新 CSR **不登记**）⇒ 改为无条件登记。
+2. **`csr_serial_w = blk_has_csr_w & csr_pend_q` 并入 `disp_ok`**（含 CSR 的块在"有未提交 CSR"
+   期间不派发）⇒ 不变式"至多一条未提交 CSR"成立，年龄窗可靠（死锁性：在飞 CSR 一定比 D1 块更老）。
+3. **`fpu_iss_ok_w = fpu_free_w & ~csr_fp_block_w & (~fpu_dyn_w | fpu_head_w)`** ——
+   **`rm=DYN` 的 FP 项只在 ROB 头发射**：一个派发块可含**多条** CSR（实测 p16 的
+   `{fsrmi,frrm,frcsr}` 三连同块），任何"只登记一条"的年龄窗都会被"更老 CSR 仍在飞、
+   更年轻 CSR 已登记"的交错击穿；"DYN 项等到成为 ROB 头"⇒ 届时所有更老指令（含 CSR 写）
+   都已提交 ⇒ 读到的 `frm` 必为已提交值（与 2A 顺序语义一致；静态 rm 的 FP 项不受限，无死锁）。
+   · 注：`q5_ready`（派发侧容量）**不得**并入该门（实测并入后 p16 第 12 条出现多余整数写回）。
+
+## B4.39.3 黄金解析补全（`gen_back2_lockstep_data.py`；判据**更严**而非放宽）
+
+Spike 对"**置了 fflags 的 FP 行**"会多打一段 `c1_fflags 0x…`（实测
+`core 0: 3 0x80000030 (0x1820f1d3) c1_fflags 0x00000001 f3 0xffffffff3eaaaaab`），
+旧正则因此匹配不到其后的寄存器写回 ⇒ 黄金记成"无写回 (0,0)"，而 DUT 的
+`commit_arch_we = dst_int | dst_fp` 为 1 ⇒ C3' 误报"多余写回"。修法：正则允许中间插入
+0..n 个"**含下划线**的 `名字 0x值`"字段（用下划线把附加字段与 `xN/fN` 写回区分开）。
+⇒ **FP 寄存器写回值（含 64 bit 低位）自此进入黄金逐条比对**，p4_fpu 与 p16 都在更严判据下通过。
+
+## B4.39.4 p16 判据明细（C17'，13 项）+ 检查点
+
+程序 `back2_p16_fcsr.S`（`PROGS` 登记：`rv32imafd_zicsr` / Spike `rv32imafdc_zicsr`；有黄金）：
+
+| 项 | 内容 |
+|---|---|
+| C17'-1 | 全程无陷阱（FP/CSR 流合法） |
+| C17'-2 | `csrw fflags,0` 后读回 0 |
+| C17'-3 | **`fdiv.s`(1/3) 的 NX 在提交点累积** ⇒ `csrr fflags` = 0x01 |
+| C17'-4/6 | `csrr fcsr` = 0x01 / 0x21（frm<<5 \| fflags 拼接） |
+| C17'-5 | `csrwi frm,1` 后 `csrr frm` = 1 |
+| C17'-7/8 | **frm 对 DYN 生效**：`fcvt.w.s`(3.5) 在 RTZ 下 = 3、复位 RNE 后 = 4 |
+| C17'-9 | **D 精度闭环**（`fcvt.d.w`→`fadd.d`→`fmul.d`→`fcvt.s.d`）= 6.0f = 0x40C0_0000 |
+| C17'-10 | `csrw fcsr,0x5F` 后读回 0x5F（fcsr 整体读写 + WARL 0xFF） |
+| C17'-11/12 | 核内保持器终态 `frm=2`(RDN)、`fflags=0x1F` |
+| C17'-13 | **`mstatus.FS=11(Dirty)` 且 `SD=1`**（fcsr 更新随动） |
+
+* 另加 p16 的通用黄金比对：**C1' PC 流 56/56**、C2' 条数、**C3' 写回号+写回值逐条一致**
+  （含 FP 写回值）。
+* **检查点**：`tb_core_top_2b` **202/202 PASS**（`../.b2chk/final_4c2_p16.log`）；
+  `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c26.log`）；编译 0 error。
+
+## B4.39.5 遗留（4c(3/3) 待办）
+
+* **③ D 访存（fld/fsd 8B）未做**：2B 访存仍是**单笔 32 bit**（`BACK2_U_MSIZE=[62:60]` 仅 1/2/4 B、
+  `lsq_simple` 单拍 32 bit 响应、FP 写回按 FLW 的 NaN-box）⇒ 需按 2A 口径拆两笔 4B
+  （`core_top.v:1623-1624/4007-4021/4147`、非对齐 `m_fp8_misalign = m_size8 & va[2:0]!=0` `:2218`、
+  组装 `m_fp_ld_wdata` `:3270`），含第二笔跨 4K 页重翻译与 8B 转发/重叠合并；
+  **p17_fld_fsd 未创建**（不接入未实现通路，避免"蒙黄金"）。
+* D **算术**已随 p16 落地并进黄金（含 64 bit 写回值比对）。
