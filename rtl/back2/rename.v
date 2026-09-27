@@ -326,6 +326,29 @@ module rename #(
     wire [FL_PTR_W-1:0] snap_fhead_w = fhead_q +
         {{(FL_PTR_W-3){1'b0}}, (ord_d[snap_lane[1:0]] + {2'b0, snap_ndst})};
     wire [LOG_PTR_W-1:0] snap_log_w  = log_wr_q + {{(LOG_PTR_W-3){1'b0}}, lg_after[snap_lane[1:0]]};
+    //   ★★ 2B-5 第 2 轮修正（p7_trap 深度敏感缺陷定案）：**当拍提交与 `flush_all` 同时发生时，
+    //     `rat_q <= arat_q` 会用**更新前**的架构映射**覆盖掉本拍提交的映射更新**（非阻塞赋值同拍取旧值）。
+    //     实测（p7_trap，浅队列配置）：`mret`（xRET）退休的同一拍，同组更老的
+    //     `xor s6,s6,t1` 也提交（`cmt_ok` 对 xRET/维护开口）⇒ `arat_q[22]` 本拍更新为 51，
+    //     但 `rat_q[22] <= arat_q[22]` 取到**旧值 49** ⇒ 流水重定向后 `s6` 映射到陈旧 preg 49
+    //     ⇒ 主程序 `xor a7,s5,s6` 读到 0x1800^0x0008=0x1808（黄金 0xffffe7dc）。
+    //     修法：flush 恢复改用 **`arat_next`（= 本拍提交后的架构映射）**。
+    //     （本拍跳过与扇出：掉陷阱帧 `cmt_ok=0`（无提交）⇒ `arat_next==arat_q`，行为不变；
+    //       分支误判帧 `cmt_ok=0` ⇒ 走 undo 路径，与本修正无交集）。
+    wire [PDW-1:0] arat_next [0:ARCH_N-1];
+    genvar ga;
+    generate
+    for (ga = 0; ga < ARCH_N; ga = ga + 1) begin : g_aratn
+        //   提交组内从高 lane（年轻）往低 lane 优先 ⇒ 同一 ARN 多次写时取**最年轻者**
+        assign arat_next[ga] =
+            (cmt_we[3] & (cmt_arn[3*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[3*PDW +: PDW] :
+            (cmt_we[2] & (cmt_arn[2*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[2*PDW +: PDW] :
+            (cmt_we[1] & (cmt_arn[1*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[1*PDW +: PDW] :
+            (cmt_we[0] & (cmt_arn[0*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[0*PDW +: PDW] :
+            arat_q[ga];
+    end
+    endgenerate
+
     wire [LOG_PTR_W-1:0] undo_tgt_w  = restore_valid ? ck_log[restore_id] : rb_log[restore_rob_idx];
     wire [FL_PTR_W-1:0]  undo_fhead_w= restore_valid ? ck_fhead[restore_id] : rb_fhead[restore_rob_idx];
 
@@ -484,7 +507,8 @@ module rename #(
             //------------------------------------------------------------------
             if (flush_all) begin
                 undo_act <= 1'b0;
-                for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) rat_q[j2] <= arat_q[j2];
+                //   ★ 2B-5 第 2 轮修正：用 `arat_next`（含本拍提交），而非旧 `arat_q`
+                for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) rat_q[j2] <= arat_next[j2];
                 for (j2 = 0; j2 < CKPT_N; j2 = j2 + 1) ck_val[j2] <= 1'b0;
                 log_wr_q <= {LOG_PTR_W{1'b0}};
                 fhead_q  <= {FL_PTR_W{1'b0}};

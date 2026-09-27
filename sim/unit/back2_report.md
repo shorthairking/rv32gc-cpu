@@ -5488,3 +5488,64 @@ ps1i/ps2i），而 `iq.v` 的唤醒口径是"**同拍唤醒即可选**"：生产
 1. ③ 只到"根因定位 + 反证"，**修复未做**（需要改 `rename.v` 的恢复路径，属 ≥1 轮）；
 2. ①② 未实施，故**本轮无综合增量数据**（未重跑 60 MHz，避免无变更的 1.5 h 空跑）；
 3. 浅队列配置当前**判据为红**（已回退到深队列的绿态）⇒ 任何"降深度/降窗口"方案以修好 ③ 为前提。
+
+---
+
+# B4.45 2B-5：**rename "恢复陈旧物理号"缺陷定案并修复**（xRET 拍同组提交的架构映射被 flush 恢复覆盖）
+
+## B4.45.1 机制定案（探针逐拍，浅队列配置）
+
+**现象**：浅队列（`IQ_ALU0/1_D=8`、`IQ_LSU_D=8`）下 `tb_core_top_2b` 程序 3（`p7_trap`）第 83 条
+C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指令 = `0x8000C050`
+`xor a7,s5,s6`（`../.b2chk/ren_probe.log` + `../.b2chk/p7_probe2.log`）：
+
+```
+[p7-ren] c=647 flush=1 sq=0 ... logwr=28 fhead=20 | rat21=44 rat22=51 | arat21=44 arat22=49 | cmt_we=0001
+[p7-ren] c=649 flush=0 ...                     | rat21=44 rat22=49 | arat21=44 arat22=51
+[p7-xor] c=751 lane=0 ps1i=44 ps2i=49 opa=0x00001800 opb=0x00000008   → 0x1808（错）
+```
+
+**根因**：`c=647` 是 **xRET（`mret`）退休拍**（`flush_all=1`），同拍**同组更老的 lane 也提交**
+（`cmt_we=0001`；`cmt_ok` 对 xRET/维护特意开口）。此时 `rename.v` 的 flush 分支执行
+`rat_q[j2] <= arat_q[j2]`，而 `arat_q` 的提交更新 `arat_q[…] <= cmt_pd` 是**同一 always 块的
+非阻塞赋值** ⇒ `rat_q` 取到的是**更新前**的 `arat_q`（`s6=49`），而架构真值是 `51`
+⇒ 重定向后 `s6` 映射到**陈旧物理号 49**（其内容是上一轮陷阱迭代的 `0x8`），`s5`(44) 同理仍是老的
+`0x1800` ⇒ 主程序 `xor a7` 得 `0x1808`。深队列只是让"xRET 与同组提交同拍"的巧合更罕见
+（故深配置一直绿）——**缺陷在深配置里同样存在**。
+
+## B4.45.2 修法 diff（`rtl/back2/rename.v`，单文件；无需改 `backend_top`）
+
+```verilog
++    wire [PDW-1:0] arat_next [0:ARCH_N-1];
++    generate for (ga = 0; ga < ARCH_N; ga = ga + 1) begin : g_aratn
++        assign arat_next[ga] =
++            (cmt_we[3] & (cmt_arn[3*ARN_W +: ARN_W] == ga)) ? cmt_pd[3*PDW +: PDW] :   // 组内自高 lane 起
++            (cmt_we[2] & (cmt_arn[2*ARN_W +: ARN_W] == ga)) ? cmt_pd[2*PDW +: PDW] :   // （年轻者胜）
++            (cmt_we[1] & (cmt_arn[1*ARN_W +: ARN_W] == ga)) ? cmt_pd[1*PDW +: PDW] :
++            (cmt_we[0] & (cmt_arn[0*ARN_W +: ARN_W] == ga)) ? cmt_pd[0*PDW +: PDW] :
++            arat_q[ga];
++    end endgenerate
+...
+     if (flush_all) begin
+-        for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) rat_q[j2] <= arat_q[j2];
++        for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) rat_q[j2] <= arat_next[j2];   // 含本拍提交
+```
+* 口径：`arat_next` = "本拍提交**之后**的架构映射"；组内同一 ARN 多次写时取**最年轻 lane**（提交组按程序序）。
+* 不影响其它路径：陷阱拍 `cmt_ok=0`（无提交）⇒ `arat_next == arat_q`，行为逐字不变；分支误判拍
+  `cmt_ok=0` ⇒ 走 undo 路径（本次未改）。
+* `ar_used_q <= ar_used_next` 与 `flist_q` 释放**本来就**在同拍执行 ✓ 不涉及本缺陷（回滚重建读的是下一拍的
+  `ar_used_q`，已含本拍更新）。
+
+## B4.45.3 反证与绿证
+
+| 配置 | 修前 | 修后 |
+|---|---|---|
+| **浅队列**（ALU0/1 8、LSU 8） | 程序 3 第 83 条 **C3' 红**（`0x1808` vs `0xffffe7dc`）；**恢复 PRF 写透后依旧红**（`../.b2chk/exp_shallow_wt.log`） | **219/219 PASS**（`fix_shallow_219.log`）+ **regress 32/32 PASS**（`regress_b2c32_shallow.log`） |
+| **深队列**（主配置 16/16/8/8/12/8） | 219/219（巧合更罕见） | **219/219**（`fix_deep_219.log`）+ `tb_back2_iq` **151/151** + `tb_back2_lockstep` **57/57**（`fix_deep_lockstep.log`）+ `regress.sh` **32/32**（`regress_b2c31.log`） |
+
+* 反证链完整：①"写透假设"被排除（恢复写透仍红）；②"依赖发射次序"被证实（深绿/浅红）；
+  ③根因被探针钉到具体拍与具体寄存器（`c=647` / `rat22: 51→49`）；④修后浅深双绿。
+* **浅队列配置登记为可用回归基线**（判据 = `tb_core_top_2b` 219/219 + `regress` 32/32，日志如上）；
+  **主配置仍保持深队列**（未做等效性证明，仅证明浅配置在修后可全绿 ⇒ 后续"降深度换面积"已解锁）。
+* 工作树：仅 `rtl/back2/rename.v` 变更（cp 快照 `../.b2chk/rename.v.pre_fix`）；`back2_params.vh` 已回深配置；
+  2A 零修改；未提交。
