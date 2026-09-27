@@ -5549,3 +5549,57 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
   **主配置仍保持深队列**（未做等效性证明，仅证明浅配置在修后可全绿 ⇒ 后续"降深度换面积"已解锁）。
 * 工作树：仅 `rtl/back2/rename.v` 变更（cp 快照 `../.b2chk/rename.v.pre_fix`）；`back2_params.vh` 已回深配置；
   2A 零修改；未提交。
+
+---
+
+# B4.46 2B-5 第 3 步①（窄位先行）：**ROB 窄控制表 `nq` 建立**（宽字段暂不动，四套判据深/浅双绿）
+
+## B4.46.1 窄表字段清单（`rtl/back2/rob.v`，`NQ_W = 45` bit/项，FF 阵列、组合读）
+
+| 位段 | 字段 | 来源（宽载荷） | 谁在用（本步已切到 `nq`） |
+|---|---|---|---|
+| `[0]` | `done` | （原 `done_q`） | 提交链 `slot_done` / `head_done_o` |
+| `[2:1]` | `epoch` | （原 `rep_q`） | 写回置 done 的 epoch 过滤 |
+| `[6:3]` | `exc[3:0]` | `BACK2_U_EXC_*` | `slot_exc` / `trap_cause` / `head_exc_o` |
+| `[7]` | `is_store` | `BACK2_UB_IS_STORE` | `slot_store`（LSQ 排空选择） |
+| `[8]` | `is_branch` | `BACK2_UB_IS_BRANCH` | `cmt_st_branch`（训练） |
+| `[9]` | `ckpt_valid` | `BACK2_UB_CKPT_VALID` | `cmt_st_ckpt`（检查点释放） |
+| `[10]/[11]` | `is_int_wen/is_fp_wen` | `BACK2_UB_RD_I_WEN/RD_F_WEN` | 提交写口/释放（第 2 步接） |
+| `[12]` | `is_csr` | `BACK2_UB_IS_CSR` | CSR 提交合成（第 2 步接） |
+| `[17:13]` | `arn[4:0]` | `BACK2_U_ARND_*` | 同上 |
+| `[24:18]/[30:25]` | `pdi[6:0]/pdf[5:0]` | `BACK2_U_PDIDST_*/PDFDST_*` | 释放/写回（第 2 步接） |
+| `[33:31]` | `csrop[2:0]` | `BACK2_U_CSROP_*` | CSR 提交合成（第 2 步接） |
+| `[34]` | `trtaken` | `BACK2_RB_TRTAKEN` | 分支训练（第 2 步接） |
+| `[39:35]/[44:40]` | `stq[4:0]/lq[4:0]` | `BACK2_RB_STQ_*/LQ_*` | LSQ 排空/释放（第 2 步接） |
+
+* 打包唯一真源 = `pack_nq(p, ep, dn)`（分配写与一致性自检共用 ⇒ 不会两处口径分叉）。
+* **本步已把 rob.v 自用的全部关键读切到 `nq`**：`slot_done`、`slot_exc`、`slot_store`、
+  `cmt_st_ckpt`、`cmt_st_branch`、`trap_cause`、`head_done_o`、`head_exc_o`、写回 epoch 比较
+  ⇒ 提交决策/前缀链/排空选择/陷阱判定**全部走 FF 组合读，零额外延迟**。
+* `pl_q[128]×416 bit` **本步不动**（宽字段仍在其中，属迁移期双写）；新增导出
+  `cmt_narrow[COMMIT_W*45]`（backend_top 暂未使用 ⇒ 零风险，供第 2 步改造消费者）。
+* FF 账（迁移期）：新增 `nq` 128×45 = **5 760 FF**，吸收原 `done_q`(128) + `rep_q`(256)
+  ⇒ 净 **+5 376 FF**；第 2 步把宽表搬 BRAM 时，这些字段从 `pl_q` 中删除 ⇒ 净转为负。
+* 一致性自检（`DBG_CSR` 门控，默认关 ⇒ 综合零成本）：逐项比对 `nq` 与 `pack_nq(pl_q)`
+  的**全部共享字段**（除 `done`，它本就在 `nq`）。
+
+## B4.46.2 绿证（深/浅双配置；含一致性自检）
+
+| 判据 | 深配置（主，16/16/8/8/12/8） | 浅配置（基线，8/8/8/8/8/8） |
+|---|---|---|
+| `tb_core_top_2b` | **219/219 PASS**（`../.b2chk/nq_deep_219.log`） | **219/219 PASS**（`nq_shallow_219.log`） |
+| `tb_back2_iq` | **151/151 PASS** | 由浅配置 regress 覆盖 ✓ |
+| `tb_back2_lockstep` | **57/57 PASS**（`nq_lockstep.log`） | 由浅配置 regress 覆盖 ✓ |
+| `regress.sh` | **32/32 PASS**（`regress_b2c33_nq_deep.log`） | **32/32 PASS**（`regress_b2c34_nq_shallow.log`） |
+| **窄/宽一致性自检**（强制打开跑完整 219 项） | **0 处 MISMATCH**（`nq_checker.log`；同轮仍 219/219） | — |
+
+* 编译零错误（`iverilog -g2012 -Wall`，无新 implicit 告警）；工作树仅 `rtl/back2/rob.v` 变更
+  （快照 `../.b2chk/rob.v.pre_nq`）；`back2_params.vh` 已回深配置；2A 零修改；未提交。
+
+## B4.46.3 第 2 步接口说明（宽字段入 BRAM 同步读）
+
+1. 宽表迁 BRAM 后，`pl_q` 只保留"数据型宽字段"（PC/TVAL/CSRW/TRTGT/FFLAGS + uop 其余位），
+   读口变**同步**（+1 拍）；此时 `cmt_narrow` 就是提交决策的**唯一**来源（本步已备好）；
+2. 受影响的四条延迟不敏感消费者（提交头陷阱 tval/PC、xRET、CSR 提交合成、分支训练）各打一拍，
+   用 `cmt_narrow` 做"是否要读宽字段"的判定；提交头宽读用"提前一拍预测头预读 + 失配重读"；
+3. `slot_idx/前缀链/`trap_valid` 均**不依赖**宽表 ⇒ BRAM 延迟不进入提交关键路径。

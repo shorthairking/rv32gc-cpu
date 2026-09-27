@@ -79,6 +79,10 @@ module rob #(
     input  wire                    mem_wr_ready,
     output wire [COMMIT_W-1:0]     cmt_valid,        // 本拍按程序序提交的槽（前缀连续）
     output wire [COMMIT_W*RB_W-1:0] cmt_payload,
+    //   ★★ 2B-5 第 3 步①（窄位先行）：**每 lane 的窄控制字**（组合读、零延迟）
+    //     —— 供第 2/3 步把宽字段改成 BRAM 同步读（+1 拍）后，提交决策/前缀链/排空选择
+    //     等**延迟敏感路径**仍走 FF 组合读。
+    output wire [COMMIT_W*NQ_W-1:0] cmt_narrow,
     output wire [COMMIT_W-1:0]     cmt_st_drain,     // 该槽为 store 且本拍排空
     output wire [COMMIT_W-1:0]     cmt_st_ckpt,      // 该槽携带检查点（释放用）
     output wire [COMMIT_W-1:0]     cmt_st_branch,    // 该槽是控制转移（训练用）
@@ -120,7 +124,55 @@ module rob #(
     // 0. 存储体与指针
     //==========================================================================
     reg  [RB_W-1:0]      pl_q  [0:ROB_N-1];
-    reg                  done_q[0:ROB_N-1];
+    //   ★★ 2B-5 第 3 步①：**窄控制表** `nq`（FF 阵列，组合读）
+    //     · 收编原 `done_q` + `rep_q`（epoch）+ 提交/前缀链/排空/陷阱判定所需的控制位与索引；
+    //     · **宽字段（PC/TVAL/CSRW/TRTGT/FFLAGS 等）仍在 `pl_q`**，本步不动；
+    //     · 本步将 rob.v **自用的关键读**（done/exc/is_store/ckpt/is_branch/trap_cause/epoch）
+    //       全部改走 `nq`（行为逐位等价），并导出 `cmt_narrow` 供下一步改造 backend_top。
+    //     字段布局（MSB→LSB）：
+    //       lq[4:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
+    //       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
+    localparam integer NQ_W      = 45;
+    localparam integer NQ_DONE   = 0;
+    localparam integer NQ_EP_L   = 1;      // [2:1]
+    localparam integer NQ_EXC_L  = 3;      // [6:3]
+    localparam integer NQ_STORE  = 7;
+    localparam integer NQ_BR     = 8;
+    localparam integer NQ_CKV    = 9;
+    localparam integer NQ_DI     = 10;
+    localparam integer NQ_DF     = 11;
+    localparam integer NQ_CSR    = 12;
+    localparam integer NQ_ARN_L  = 13;     // [17:13]
+    localparam integer NQ_PDI_L  = 18;     // [24:18]
+    localparam integer NQ_PDF_L  = 25;     // [30:25]
+    localparam integer NQ_CSROP_L= 31;     // [33:31]
+    localparam integer NQ_TRT    = 34;
+    localparam integer NQ_STQ_L  = 35;     // [39:35]
+    localparam integer NQ_LQ_L   = 40;     // [44:40]
+    reg  [NQ_W-1:0]      nq    [0:ROB_N-1];
+
+    //   打包：从宽载荷 + epoch + done 生成窄字（分配与一致性自检共用）
+    function [NQ_W-1:0] pack_nq;
+        input [RB_W-1:0] p; input [`BACK2_EPOCH_W-1:0] ep; input dn;
+        begin
+            pack_nq = { p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB],          // [44:40]
+                        p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB],        // [39:35]
+                        p[`BACK2_RB_TRTAKEN],                          // [34]
+                        p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB],      // [33:31]
+                        p[`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],    // [30:25]
+                        p[`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],    // [24:18]
+                        p[`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB],        // [17:13]
+                        p[`BACK2_UB_IS_CSR],                           // [12]
+                        p[`BACK2_UB_RD_F_WEN],                         // [11]
+                        p[`BACK2_UB_RD_I_WEN],                         // [10]
+                        p[`BACK2_UB_CKPT_VALID],                       // [9]
+                        p[`BACK2_UB_IS_BRANCH],                        // [8]
+                        p[`BACK2_UB_IS_STORE],                         // [7]
+                        p[`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB],          // [6:3]
+                        ep,                                            // [2:1]
+                        dn };                                          // [0]
+        end
+    endfunction
     //   ★ 项内 epoch 单独放一个 2 bit 小数组（而不是塞进 416 bit 载荷）：
     //     载荷内的字段要在"时钟块里按 7 个写回索引读" ⇒ iverilog 会展开成
     //     7×(128×416) 的组合读森林，仿真吞吐直接掉一个数量级（实测 ~12× 变慢）。
@@ -162,9 +214,9 @@ module rob #(
     generate
     for (gi = 0; gi < COMMIT_W; gi = gi + 1) begin : g_cmt
         assign slot_in_range[gi] = (cnt_q > gi);
-        assign slot_done[gi]     = done_q[slot_idx[gi]];
-        assign slot_exc[gi]      = |pl_q[slot_idx[gi]][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB];
-        assign slot_store[gi]    = pl_q[slot_idx[gi]][`BACK2_UB_IS_STORE];
+        assign slot_done[gi]     = nq[slot_idx[gi]][NQ_DONE];
+        assign slot_exc[gi]      = |nq[slot_idx[gi]][NQ_EXC_L +: 4];
+        assign slot_store[gi]    = nq[slot_idx[gi]][NQ_STORE];
         assign slot_st_ok[gi]    = ~slot_store[gi] | mem_wr_ready;
         assign slot_ok[gi]       = slot_in_range[gi] & slot_done[gi] & ~slot_exc[gi] & slot_st_ok[gi];
     end
@@ -210,18 +262,17 @@ module rob #(
     generate
     for (gi = 0; gi < COMMIT_W; gi = gi + 1) begin : g_cmtout
         assign cmt_payload[gi*RB_W +: RB_W] = pl_q[slot_idx[gi]];
+        assign cmt_narrow[gi*NQ_W +: NQ_W]  = nq[slot_idx[gi]];
         assign cmt_st_drain[gi] = cmt_chain[gi] & slot_store[gi];
-        assign cmt_st_ckpt[gi]  = cmt_chain[gi] &
-                                  pl_q[slot_idx[gi]][`BACK2_UB_CKPT_VALID];
-        assign cmt_st_branch[gi]= cmt_chain[gi] &
-                                  pl_q[slot_idx[gi]][`BACK2_UB_IS_BRANCH];
+        assign cmt_st_ckpt[gi]  = cmt_chain[gi] & nq[slot_idx[gi]][NQ_CKV];
+        assign cmt_st_branch[gi]= cmt_chain[gi] & nq[slot_idx[gi]][NQ_BR];
     end
     endgenerate
 
     // 异常：仅当该槽已完成且为头部（slot 0）
     assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0];
     assign trap_pc    = pl_q[slot_idx[0]][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB];
-    assign trap_cause = pl_q[slot_idx[0]][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB];
+    assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
     assign trap_tval  = pl_q[slot_idx[0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
 
     //==========================================================================
@@ -230,8 +281,8 @@ module rob #(
     assign head_o      = head_q;
     assign cnt_o       = cnt_q;
     assign empty_o     = (cnt_q == 0);
-    assign head_done_o = done_q[head_q];
-    assign head_exc_o  = pl_q[head_q][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB];
+    assign head_done_o = nq[head_q][NQ_DONE];
+    assign head_exc_o  = nq[head_q][NQ_EXC_L +: 4];
     assign cmt_cnt_o   = cmt_cnt_q;
     assign epoch_o     = epoch_q;
 
@@ -247,8 +298,7 @@ module rob #(
             epoch_q   <= {`BACK2_EPOCH_W{1'b0}};
             for (k = 0; k < ROB_N; k = k + 1) begin
                 pl_q[k]   <= {RB_W{1'b0}};
-                done_q[k] <= 1'b0;
-                rep_q[k]  <= {`BACK2_EPOCH_W{1'b0}};
+                nq[k]     <= {NQ_W{1'b0}};
             end
         end else begin
             // ---- 5.1 派发写入（新项：done 清零；仅真正派发拍 = alloc_fire）----
@@ -257,8 +307,8 @@ module rob #(
                     if (alloc_lane_valid[k] & (k < alloc_n)) begin
                         pl_q[idx_add(tail_w, k[ROB_IDX_W:0])]   <= alloc_payload[k*RB_W +: RB_W];
                         if (DBG_CSR) $display("[rob-alloc t=%0t] k=%0d idx=%0d pay_csrw=0x%08x", $time, k, idx_add(tail_w, k[ROB_IDX_W:0]), alloc_payload[k*RB_W + `BACK2_RB_CSRW_MSB -: 32]);
-                        rep_q[idx_add(tail_w, k[ROB_IDX_W:0])] <= alloc_epoch;
-                        done_q[idx_add(tail_w, k[ROB_IDX_W:0])] <= 1'b0;
+                        nq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
+                            pack_nq(alloc_payload[k*RB_W +: RB_W], alloc_epoch, 1'b0);
                     end
                 end
             end
@@ -274,8 +324,8 @@ module rob #(
             for (k = 0; k < WB_N; k = k + 1) begin
                 if (wb_valid[k] &&
                     (wb_epoch[k*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] ==
-                     rep_q[wb_rob_idx[k*ROB_IDX_W +: ROB_IDX_W]]))
-                    done_q[wb_rob_idx[k*ROB_IDX_W +: ROB_IDX_W]] <= 1'b1;
+                     nq[wb_rob_idx[k*ROB_IDX_W +: ROB_IDX_W]][NQ_EP_L +: `BACK2_EPOCH_W]))
+                    nq[wb_rob_idx[k*ROB_IDX_W +: ROB_IDX_W]][NQ_DONE] <= 1'b1;
             end
 
             // ---- 5.3 执行期字段回写 ----
@@ -284,12 +334,14 @@ module rob #(
                 if (DBG_CSR) $display("[rob-upd t=%0t] idx=%0d wdata=0x%08x", $time, upd_csr_idx, upd_csr_wdata);
             end
             if (upd_tr_valid) begin
+                nq[upd_tr_idx][NQ_TRT] <= upd_tr_taken;
                 pl_q[upd_tr_idx][`BACK2_RB_TRTAKEN] <= upd_tr_taken;
                 pl_q[upd_tr_idx][`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB] <= upd_tr_target;
             end
             if (upd_ff_valid) pl_q[upd_ff_idx][`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB]
                                    <= upd_ff_flags;
             if (upd_exc_valid) begin
+                nq[upd_exc_idx][NQ_EXC_L +: 4] <= upd_exc_code;
                 pl_q[upd_exc_idx][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB] <= upd_exc_code;
                 pl_q[upd_exc_idx][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB] <= upd_exc_tval;
             end
@@ -310,6 +362,21 @@ module rob #(
                 cnt_q  <= cnt_q - {5'b0, cmt_n_w}
                           + (alloc_fire ? {5'b0, alloc_n} : {(ROB_IDX_W+1){1'b0}});
                 if (cmt_chain[0]) cmt_cnt_q <= cmt_cnt_q + {29'b0, cmt_n_w};
+            end
+        end
+    end
+
+    //   ★ 2B-5 第 3 步①自检：窄表与宽载荷的共用字段必须**逐位一致**
+    //     （迁移期双写；任何漏写/写错位置都会在此报出）。默认关（综合零成本）。
+    integer nk;
+    reg [NQ_W-1:0] nq_chk;
+    always @(posedge clk) begin
+        if (DBG_CSR && rst_n) begin
+            for (nk = 0; nk < ROB_N; nk = nk + 1) begin
+                //   函数返回值不能直接做位选（iverilog）⇒ 先存临时变量
+                nq_chk = pack_nq(pl_q[nk], nq[nk][NQ_EP_L +: `BACK2_EPOCH_W], 1'b0);
+                if (nq[nk][NQ_W-1:1] !== nq_chk[NQ_W-1:1])
+                    $display("ROB-NQ-CHK MISMATCH: idx=%0d nq=0x%011x pl=0x%011x", nk, nq[nk], nq_chk);
             end
         end
     end
