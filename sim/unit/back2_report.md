@@ -5068,3 +5068,67 @@ wdata=0x8002c07c, priv=01, wr_sepc=1, sw_en=1` ✓ 一切正常）与**紧随的
   3. `csr_file.w_illegal` 在核内被接 `1'b0`（`csrr` 写回读值，无非法 CSR 判定）——既有登记项，
      本轮未动。
   4. `mret` 后 `mstatus.MPP=U` 是 **ISA 规定**（非漏恢复）：C16'-25 按语义判 `MIE=1/MPIE=1/MPP=00`。
+
+---
+
+# B4.38 4c 起手：① squash 拍同拍发射（遗留 1）已闭环；② fcsr / ③ D 扩展 = 现状与接入点（预算见底，停在"可编译 + 既有判据全绿"检查点）
+
+## B4.38.1 ① squash 拍同拍发射 —— **已修、已量化、已反证**
+
+* **修法**（`rtl/back2/backend_top.v`，I2 装载口）：新增年龄判据函数并并入 I2 使能
+  `i2_sq_kill_f(iss_rob) = squash_v_w & ({1'b0,(iss_rob-rob_head)} > {1'b0,(squash_idx-rob_head)})`
+  ⇒ `x_i2_v[xi] <= iq_iss_v & ~iq_iss_dead & ~flush_all_w & ~i2_sq_kill_f(iq_iss_rob[xi])`
+  （年龄以 **ROB 头为原点**取模、**零扩展 8 bit 比较** —— 口径逐字照抄 `iq.v:279-287` 的
+  `squash_kill`；更老的项/正在提交的前缀不受影响）。
+* **量化（探针口径 = 缺陷本身）**：`squash 拍发射 ∧ 该 lane 年轻于 squash 点 ∧ 当拍真的进了 I2`
+  （`x_i2_v` 每拍整表重载 ⇒ 与上一拍发射向量求交即"真的进 I2"）。
+  **修复后 12 个程序全 0 次**；去掉年龄门（= 仅 G4⑤ 的 flush 门）复现 **10 次**
+  （p3_memcsr 7 / p8_int 1 / p15 2，其中 1 次进 BRU 槽 2）⇒ 反证齐备。
+  探针 TB 副本：`../.b2chk/tb_probe_squash_final.sv`（仓库 TB 内无探针残留）。
+* **不回退**：`tb_core_top_2b` **181/181 PASS**（`../.b2chk/final_4c1_181.log`）；
+  `./scripts/regress.sh` **32/32 PASS**（`../.b2chk/regress_b2c25.log`）；编译 0 error。
+  快照 `../.b2chk/backend_top.v.s55`（= 修后终态）。
+
+## B4.38.2 ② fcsr 完整提交通路 —— **现状 / 缺口 / 接入点（未动代码，预算见底）**
+
+* **已有**：`backend_top` 已算出"提交点 FPU 结果的 fflags 累积"并按 **地址 0x001 读改写**方式
+  送 CSR 写口（`backend_top.v:1533-1560` 的 `ff_cmt_any/ff_cmt_val`）；FPU 侧读口 `csr_frm_i/csr_fflags_i`
+  已存在（`:158-162/379-380`），`fpu.v` 亦已消费 `frm`（DYN 解析）并产出 `fflags_we/fflags`（`:1272-1274`）。
+* **缺口（根因）**：2A `csr_file` 把 `FFLAGS/FRM/FCSR` 列入 `is_impl` 且给了 `wr_mask`
+  （`:253-255/383-385`），但**不持有寄存器**：读恒回 `32'h0`（`:828-830` 注释"本模块不持有"）；
+  且 2A **冻结不可改** ⇒ fcsr 存储必须落在 **2B 侧**。当前 `core_top_2b` 把回灌口写死：
+  `csr_frm_w = 3'h0; csr_ff_w = 0`（`:215-220`，原文即"FP 集成时再接"，登记 §B4.6.4-⑩）。
+* **接入点（下一轮最小实现）**：① 在 `core_top_2b` 增 2B 侧 `fcsr{fflags[4:0],frm[2:0]}` 保持器；
+  ② **读覆盖**：对 0x001/0x002/0x003 在 `csr_rdata_w` 上做 mux（2A 侧恒 0 ⇒ 不冲突）；
+  ③ **写拦截**：把这 3 个地址从送 2A 的 `csr_we_w` 上滤掉、落到本保持器（提交点语义不变，
+   `b2_csr` 过渡栈已删 ≠ 不能在本层重建）；④ fflags 累积并入（复用 `ff_cmt_val`，需加一根输出）；
+  ⑤ 回灌 `csr_frm_w/csr_ff_w` ⇒ FPU 的 DYN 舍入与 flag 累积闭环；
+  ⑥ **FS/SD**：以 2B 侧贡献 OR 进 `mstatus_set/mstatus_clr`（FS=11 Dirty、SD=1）—— `core_top_2b`
+  本就驱动这两个口，**不改 2A**。
+
+## B4.38.3 ③ D 扩展（fld/fsd 8B + D 算术）—— **现状 / 缺口 / 2A 口径**
+
+* **已有**：`fregfile` 已是 **FLEN=64**（`fregfile.v:36-55`）；`fpu.v` 有完整 **64 bit 双精度数据通路**
+  （`is_d`/`en_add_d`/`en_mul_d`/`ds_fmt_d`/`fcvt`，`:242-345`）；`decoder.v` 已解 `FLD/FSD`
+  （`f3` 001/011）与 `FCVT_*` 的 D 格式（`:420-421/445-448`）。
+* **缺口**：2B 访存是**单笔 32 bit**：uop 载荷只有 `BACK2_U_MSIZE=[62:60]`（1/2/4 B，`back2_params.vh:156-157`）、
+  `lsq_simple` 的 `mem_req` 只有 32 bit 数据/单拍响应（`lsq_simple.v:700-705`）、FP 写回按
+  `{32'hFFFF_FFFF, lsu_wb_data}`（FLW 的 NaN-box，非 64 bit 装载）⇒ **8B 需要"拆两笔 4B"**。
+* **2A 口径（须照抄）**：`m_is_fp8/m_size8`（`core_top.v:1623-1624`）把 fld/fsd 拆成
+  **lo/hi 两拍 4B**（`m_hi_q` 状态、`m_store_w32` 选高/低半、`:4007-4021/4147` 两拍时序）；
+  **非对齐判据 = `m_fp8_misalign = m_size8 & (m_va[2:0] != 3'b000)`**（`:2218`，8B 只允许 8 字节对齐，
+  否则抛 load/store 非对齐/页错误）；装载组装 `m_fp_ld_wdata = {m_rd_hi_q, m_rd_data_q[31:0]}`（`:3270`）。
+  2B 侧对应要做的：LSQ 增加 8B 事务（半笔状态 + 第二笔**跨 4K 页重翻译** + 8B 转发/重叠合并口径）、
+  FP 写回 64 bit 通道、以及 ROB/LSQ 载荷的"hi/lo 半笔"记账。
+* **程序侧（p16_fpu_fcsr / p17_fld_fsd）**：本轮**未创建**（预算见底，避免半成品污染判据）；
+  下一轮按既有 `PROGS` 口径登记（`rv32imafd_zicsr` / Spike `--isa=rv32imafdc_zicsr` 黄金，
+  fld/fsd 的 8B 边界用例：8 字节对齐、非 8 字节对齐、跨 4K 页、store→load 8B 覆盖转发）。
+
+## B4.38.4 检查点与遗留
+
+* **检查点（终态）**：编译 **0 error**；**181/181 PASS**；**regress 32/32 PASS**；
+  **2A 零修改**、`scripts/regress.sh` 未动、未提交 git；快照 `../.b2chk/backend_top.v.s55`、
+  `tb_probe_squash_final.sv`、`final_4c1_181.log`、`regress_b2c25.log`。
+* **遗留**：② fcsr 保持器 + 读覆盖/写拦截 + FS/SD 合并层；③ LSQ 8B 拆笔（含跨页第二笔重翻译）+
+  FP 64 bit 写回 + p16/p17 锁步程序与判据 —— 均已在 §B4.38.2/§B4.38.3 给出接入点与 2A 口径行号，
+  可直接续做；本轮按"预算见底"指令**停在可编译 + 既有判据全绿**。

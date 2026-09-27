@@ -1136,6 +1136,23 @@ module backend_top #(
     // 6. I2 寄存器 + E1 执行
     //==========================================================================
     integer xi;
+    //   ★★ 4c①（G4 收口登记的遗留 1）：**squash 拍同拍发射的"年轻项"必须一并作废** ——
+    //     与 G4⑤ 的 `flush_all_w` 门同理，只是作废范围限于"**年轻于 squash 点**"：
+    //     `iq.iss_valid` 是组合输出（`valid_q` 在时钟沿才被 `squash_kill` 清），故 squash 拍
+    //     仍可能选中一项；旧实现把它无条件装进 I2 ⇒ 下一拍该**错路径控制转移**在 I2 里复活，
+    //     其 `bru_mis` 会在重定向后一拍**再发一次重定向**（把前端拉到错路径取指）。
+    //     年龄判据照抄 `iq.v` 的 `squash_kill`：以 **ROB 头为原点**取模年龄，
+    //     "更年轻" ⇔ `age(项) > age(squash_idx)`；比较**零扩展到 8 bit**
+    //     （`rob_cnt=128` 时 7 bit 表示为 0 ⇒ 7 bit 比较会把"满窗口"误判成"空窗口"，
+    //      见 `iq.v:279-287` 的实测注释）。更老的项（含正在提交的前缀）不受影响 ✓
+    function i2_sq_kill_f;
+        input [6:0] iss_rob;
+        begin
+            i2_sq_kill_f = squash_v_w &
+                           ({1'b0, (iss_rob - rob_head_w)} >
+                            {1'b0, (squash_idx_w - rob_head_w)});
+        end
+    endfunction
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             for (xi = 0; xi < 6; xi = xi + 1) x_i2_v[xi] <= 1'b0;
@@ -1152,8 +1169,9 @@ module backend_top #(
             //       · 非控制转移项同样属"冲刷点之后"的年轻项，按精确异常口径一律作废。
             //     口径与 IQ 入队侧一致（`iq.v` §5.3 "冲刷拍不接受新项"），只是补上**出队侧**。
             for (xi = 0; xi < 6; xi = xi + 1) begin
-                x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi] & ~flush_all_w;
-                if (iq_iss_v[xi] & ~flush_all_w) begin
+                x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi] & ~flush_all_w &
+                              ~i2_sq_kill_f(iq_iss_rob[xi]);
+                if (iq_iss_v[xi] & ~flush_all_w & ~i2_sq_kill_f(iq_iss_rob[xi])) begin
                     x_i2_uop[xi] <= iq_iss_uop[xi];
                     x_i2_rob[xi] <= iq_iss_rob[xi];
                     x_i2_ep[xi]  <= iq_iss_ep[xi];
