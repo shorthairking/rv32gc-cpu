@@ -244,6 +244,33 @@
 //     放进 416 bit 载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
 //     载荷已无空闲位（[415:411] 已被 LQ 索引占用）。
 `define BACK2_RB_W           416
+//   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
+//     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）：
+//       lq[4:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
+//       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
+//       ── ② 新增： maint_kind[2:0] is_sret is_mret
+`define BACK2_NQ_W           50
+`define BACK2_NQ_DONE        0
+`define BACK2_NQ_EP_L        1
+`define BACK2_NQ_EXC_L       3
+`define BACK2_NQ_STORE       7
+`define BACK2_NQ_BR          8
+`define BACK2_NQ_CKV         9
+`define BACK2_NQ_DI          10
+`define BACK2_NQ_DF          11
+`define BACK2_NQ_CSR         12
+`define BACK2_NQ_ARN_L       13
+`define BACK2_NQ_PDI_L       18
+`define BACK2_NQ_PDF_L       25
+`define BACK2_NQ_CSROP_L     31
+`define BACK2_NQ_TRT         34
+`define BACK2_NQ_STQ_L       35
+`define BACK2_NQ_LQ_L        40
+`define BACK2_NQ_MK_L        45        // [47:45] maint_kind[2:0]
+`define BACK2_NQ_SRET        48
+`define BACK2_NQ_MRET        49
+//   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
+`define BACK2_CMT_CSR_W      79
 
 // ---- 标志位在 uop 内的绝对 bit 位置（= FLAGS_LSB + fl 序号）----
 `define BACK2_UB_RD_I_WEN    (`BACK2_U_FLAGS_LSB + `BACK2_FL_RD_I_WEN)

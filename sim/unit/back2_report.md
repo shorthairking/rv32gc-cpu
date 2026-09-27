@@ -5679,3 +5679,63 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
 * **遗留（第 2 步待做）**：§B4.47.2 的三项"读 lane 数"改造（组合、零流水，预计 ROB LUT -45%~-55%）⇒
   再做 §B4.47.3 的 4-bank BRAM 化（+4 RAMB，mux 侧再降）⇒ 最后按 §B4.47.4 打拍。
   **本轮 RTL 净变更 = 0**（预算见底，未开工；避免半成品破坏绿态）。
+
+---
+
+# B4.48 2B-5 第 3 步②-a：**三项读 lane 数改造**（①tval 预解码 ②CSR 单 lane 动态读口 ③trtaken 入 nq）
+
+> 检查点：深/浅双配置四套判据全绿 + 一致性自检 0 失配；**未碰 BRAM**（下一步）；
+> 工作树 = `rtl/back2/{back2_params.vh, rob.v, backend_top.v}` + 本报告。
+
+## B4.48.1 三项 diff
+
+**① tval 预解码（-108 bit 的 4-lane 宽读）**
+* `backend_top`：新增 `lane_pre[g] = {is_mret, is_sret, maint_kind[2:0]}`，由**派发期**的
+  `u_tval(lane_uop_fin[g])` 经既有 `is_xret_f/xret_kind_f/maint_kind_f` 译码（**与提交侧原先逐字同源**），
+  经新端口 `rob.alloc_pre[4×5]` 存入 `nq[49:45]`（`NQ_W 45→50`，+640 FF）。
+* `rob.v`：`pack_nq(p, ep, dn, pre)` 增 `pre` 形参（分配写与一致性自检共用，仍单一真源）。
+* `backend_top` 的 xRET/维护扫描：`is_xret_f(p_tval(cmt_pay[…]))` / `maint_kind_f(…)` ⇒ 改读
+  `cmt_narrow[…][MRET]/[SRET]/[MK]` ⇒ **不再有 4 lane × 32 bit 的指令字宽读**（`maint_pc_sel` 仍读该 lane 的 PC）。
+
+**② CSR 提交合成改单 lane 动态读口（-141 bit）**
+* `rob.v`：新端口 `input csr_lane_idx[6:0]` + `output csr_pay[78:0] =
+  {tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}`（`back2_params.vh: BACK2_CMT_CSR_W=79`），
+  由 `pl_q[csr_lane_idx]` **单索引**读出。
+* `backend_top`：CSR 扫描的判定改吃 `cmt_narrow[…][IS_CSR]`（记 `csr_cmt_lane`），
+  `csr_dyn_idx_w = rob_head_w + csr_cmt_lane` 送回 rob；`csr_cmt_{addr,data,op,insn,ps1i}`
+  全部改由 `csr_pay_w` 切片提供（`csr_cmt_ps1i = csr_pay_w[15 +: PW_I]`，与 4b-1 口径一致）。
+  ⇒ `csrw/csra/csrop/tval` 由"4 lane × 79 bit"降为"**1 lane × 79 bit**"。
+
+**③ 分支训练：`trtaken` 入 `nq`（-4 bit）；`trtgt` 保留 4 lane（如实报告）**
+* 已做：`tcp_tk[tc] = cmt_narrow[tc*NQ_W + NQ_TRT +: 1]`（`trtaken` 第 1 步已在 `nq`）⇒ 去掉 4 lane × 1 bit。
+* **未做（口径偏差登记）**：`trtgt[32]` 与预测元数据（`cls[3]/pred 位/btb/predtgt[27]` ≈ 33 bit）**必须保留 4 lane**
+  —— 训练 FIFO 的入队条件 `trq_ok[ti] = cmt_st_branch[ti] & …` 表明**一个提交组可含最多 4 条分支**
+ （4 宽取指四条分支同时提交），单 lane 动态读口**结构上无法覆盖** ⇒ 原估的 -99 bit 不成立
+  （若确需压缩，须把 trq 入队改成多拍串行或用 4 个窄口，属另一轮工作）。
+
+## B4.48.2 读口缩减表（按"被消费位宽 × 读它的 lane 数"）
+
+| 字段组 | 改造前 | 改造后 | 省 |
+|---|---|---|---|
+| `tval`（xRET/维护译码，4 lane） | 4×32 = 128 | 4×5(`nq` 标志) = 20 | **-108** |
+| `csrw/csra/csrop/tval`（CSR 合成，4 lane） | 4×79 = 316 | 1×79 = 79 | **-237**（含①后重复计入的 tval 部分） |
+| `trtaken`（训练，4 lane） | 4×1 = 4 | 4×1(`nq`) ⇒ 宽读 0 | **-4** |
+| `pc`（trace/maint） | 4×32 = 128 | 不变 | 0 |
+| `trtgt`+预测元数据（训练） | 4×33 = 132 | 不变（多分支/组） | 0 |
+| 窄控制（第 1 步已入 `nq`） | — | — | 步①已省 |
+
+## B4.48.3 绿证（深/浅双配置，含一致性自检）
+
+| 判据 | 深配置（主 16/16/8/8/12/8） | 浅配置（基线 8/8/8/8/8/8） |
+|---|---|---|
+| `tb_core_top_2b` | **219/219 PASS**（`../.b2chk/rl_deep_219.log`） | **219/219 PASS**（`rl_shallow_219.log`） |
+| `tb_back2_iq` | **151/151 PASS** | 由浅 regress 覆盖 ✓ |
+| `tb_back2_lockstep` | **57/57 PASS**（`rl_lockstep.log`） | 由浅 regress 覆盖 ✓ |
+| `regress.sh` | **32/32 PASS**（`regress_b2c35_rl_deep.log`） | **32/32 PASS**（`regress_b2c36_rl_shallow.log`） |
+| 窄/宽一致性自检（强制开） | **0 MISMATCH**（`rl_checker.log`，同轮 219/219） | — |
+
+* 编译零错误（`-Wall` 无新 implicit 告警）；**行为逐位不变**由"黄金比对全绿"证明
+  （219 项含 C1' PC 流 / C3' 写回值逐条比 Spike 黄金；lockstep 57 项 5 程序黄金）。
+* 迁移期账：`nq` +5 bit/项（=+640 FF，存预解码标志）；宽表 `pl_q` 未动。
+* **本轮不碰 BRAM**（按任务口径）；下一轮在"4 lane→1 lane"已就位的基础上做
+  4-bank BRAM（`bank = idx[1:0]`，连续索引天然落 4 个不同 bank）与 §B4.47.4 的打拍。

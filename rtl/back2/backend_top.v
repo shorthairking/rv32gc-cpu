@@ -467,6 +467,9 @@ module backend_top #(
     // 写回总线（0..5 六部件；6 = store 完成仅置 done）
     wire [6:0]      wb_v;
     wire [7*7-1:0]  wb_rob;
+    wire [COMMIT_W*`BACK2_NQ_W-1:0] cmt_narrow;  // ★ ROB 窄控制字（第 1 步已导出；本步接线并作为提交判定唯一依据）
+    wire [`BACK2_CMT_CSR_W-1:0] csr_pay_w;     // ★ ② 单 lane 动态 CSR 读口数据
+    wire [6:0]      csr_dyn_idx_w;            // ★ ② 其索引（提交组内 CSR lane 的绝对 ROB 索引）
     wire [7*EW-1:0] wb_ep;
     wire [5:0]      wbi_v;              // 整数写回有效（部件 0..5）
     wire [6*PW_I-1:0] wbi_tag;
@@ -875,6 +878,20 @@ module backend_top #(
                           rob_alloc_ready & free_i_ok & free_f_ok & iq_room_ok &
                           st_alloc_ok & ld_alloc_ok & ~csr_serial_w;
     assign disp_fire_w = disp_ok;
+    //   ★★ 2B-5 第 3 步②：**派发期预译码** xRET/维护标志（每 lane 5 bit）送给 ROB 存入 `nq`；
+    //     提交侧因此**不再需要**读 4 lane 的 32 bit 指令字来译码（那是 4×32=128 bit 的 128:1 mux）。
+    //     译码真源仍是本文件的 `is_xret_f/xret_kind_f/maint_kind_f`（与提交侧原来逐字一致）。
+    wire [4:0] lane_pre [0:DISP_W-1];
+    genvar gp5;
+    generate
+    for (gp5 = 0; gp5 < DISP_W; gp5 = gp5 + 1) begin : g_pre
+        wire [31:0] t5 = u_tval(lane_uop_fin[gp5]);
+        assign lane_pre[gp5] = { is_xret_f(t5) & (xret_kind_f(t5) == 2'd1),   // mret
+                                 is_xret_f(t5) & (xret_kind_f(t5) != 2'd1),   // sret
+                                 maint_kind_f(t5) };
+    end
+    endgenerate
+    wire [COMMIT_W*5-1:0] alloc_pre_w = { lane_pre[3], lane_pre[2], lane_pre[1], lane_pre[0] };
     assign blk_ready_o = (d1_v_q == {DISP_W{1'b0}}) | disp_fire_w;
 
     // ---- 最终 uop（填重命名结果）----
@@ -1558,6 +1575,8 @@ module backend_top #(
     reg [6:0]  csr_cmt_idx;                  // ★ 4c(2/3)：本拍提交的 CSR 的 ROB 索引
     reg [31:0] csr_cmt_insn;                 // 该 CSR 指令的原始编码（判 zimm 形式）
     reg [PW_I-1:0] csr_cmt_ps1i;             // 该 CSR 指令自己的 rs1 物理号（B29 残留清理）
+    //   ★★ 2B-5 第 3 步②：CSR lane 在提交组内的位置（供**单 lane 动态读口**索引）
+    reg [1:0]  csr_cmt_lane;
     integer    cw;
     always @(*) begin
         csr_cmt_we   = 1'b0;
@@ -1567,15 +1586,19 @@ module backend_top #(
         ff_cmt_any   = 1'b0;
         ff_cmt_val   = 5'h0;
         csr_cmt_idx  = 7'h0;
+        csr_cmt_lane = 2'd0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
             if (commit_valid_o[cw]) begin
-                if (p_csr(cmt_pay[cw*RB_W +: RB_W])) begin
+                //   ★ ②：判定改吃 `cmt_narrow` 的 `is_csr`（FF 组合读）；
+                //     宽字段（tval/csrw/csra/csrop）改由 rob.v 的**单 lane 动态读口** `csr_pay_w` 提供
+                if (cmt_narrow[cw*`BACK2_NQ_W + `BACK2_NQ_CSR]) begin
                     csr_cmt_we   = 1'b1;
-                    csr_cmt_addr = p_csra(cmt_pay[cw*RB_W +: RB_W]);
-                    csr_cmt_data = p_csrw(cmt_pay[cw*RB_W +: RB_W]);
-                    csr_cmt_op   = p_csrop(cmt_pay[cw*RB_W +: RB_W]);   // ★ B29：提交级合成用
-                    csr_cmt_insn = p_tval (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4a：zimm 形式判定
-                    csr_cmt_ps1i = p_csrw (cmt_pay[cw*RB_W +: RB_W]);   // ★ 4b-1：本指令的 ps1i
+                    csr_cmt_lane = cw[1:0];
+                    csr_cmt_addr = csr_pay_w[14:3];
+                    csr_cmt_data = csr_pay_w[46:15];
+                    csr_cmt_op   = csr_pay_w[2:0];
+                    csr_cmt_insn = csr_pay_w[78:47];
+                    csr_cmt_ps1i = csr_pay_w[15 +: PW_I];   // 同一字段（csrw）的低 PW_I 位（与 4b-1 口径一致）
                     csr_cmt_idx  = rob_head_w + cw[6:0];                // ★ 4c(2/3)：它的 ROB 索引
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
@@ -1585,6 +1608,9 @@ module backend_top #(
             end
         end
     end
+    //   ★ ②：单 lane 动态读口索引 = 提交组内 CSR lane 的**绝对 ROB 索引**
+    assign csr_dyn_idx_w = rob_head_w + {{5{1'b0}}, csr_cmt_lane};
+
     // fflags 累积写入（FPU 结果提交时），与 CSR 写并路：地址 0x001 用"读改写"
     //   ★★ CSR 可见性互锁的**跟踪**（见 §9 发射门处的声明/说明）
     //     · 派发（`disp_ok` 块内 lane 0 最老）：本块有 CSR 且当前无在途 ⇒ 记下它的 ROB 索引；
@@ -1731,6 +1757,8 @@ module backend_top #(
         .alloc_valid(disp_fire_w), .alloc_n(d1_n_w),
         .alloc_ready(rob_alloc_ready),
         .alloc_idx0(rob_alloc_idx0), .alloc_lane_valid(d1_v_q), .alloc_payload(rob_pay_w),
+        .alloc_pre(alloc_pre_w), .csr_lane_idx(csr_dyn_idx_w), .csr_pay(csr_pay_w),
+        .cmt_narrow(cmt_narrow),
         .alloc_epoch(epoch_w),
         .wb_valid(wb_v), .wb_rob_idx(wb_rob), .wb_epoch(wb_ep),
         .upd_csr_valid(1'b0), .upd_csr_idx(upd_csr_idx), .upd_csr_wdata(upd_csrw),   // ★ B29：值改由提交级现算
@@ -1926,15 +1954,17 @@ module backend_top #(
         maint_lane_idx = 2'd0;
         for (mw2 = COMMIT_W-1; mw2 >= 0; mw2 = mw2 - 1) begin
             if (cmt_raw[mw2] & ~squash_v_w) begin
-                if (is_xret_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]))) begin
+                //   ★ ②：预解码标志改吃 `nq`（每 lane 5 bit）—— 不再读 4 lane 的 32 bit 指令字去译码。
+                if (cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MRET] |
+                    cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_SRET]) begin
                     xret_lane_oh  = 4'h1 << mw2[1:0];
                     xret_lane_idx = mw2[1:0];
-                    xret_kind_sel = xret_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]));
+                    xret_kind_sel = cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MRET] ? 2'd1 : 2'd0;
                 end
-                if (maint_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W])) != 3'd0) begin
+                if (cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MK_L +: 3] != 3'd0) begin
                     maint_lane_oh  = 4'h1 << mw2[1:0];
                     maint_lane_idx = mw2[1:0];
-                    maint_kind_sel = maint_kind_f(p_tval(cmt_pay[mw2*RB_W +: RB_W]));
+                    maint_kind_sel = cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MK_L +: 3];
                     maint_pc_sel   = p_pc(cmt_pay[mw2*RB_W +: RB_W]);
                 end
             end
@@ -1998,7 +2028,9 @@ module backend_top #(
     for (tc = 0; tc < COMMIT_W; tc = tc + 1) begin : g_trf
         wire [RB_W-1:0] pp = cmt_pay[tc*RB_W +: RB_W];
         assign tcp_cond[tc] = t_cond(p_cls(pp));
-        assign tcp_tk[tc]   = p_trtk(pp);
+        //   ★ ③：`trtaken` 改吃 `nq`（每 lane 1 bit）；`trtgt` 与预测元数据保留 4 lane
+        //     （一个提交组可含**最多 4 条分支** ⇒ 单 lane 动态读口不能覆盖，见报告 §B4.48）
+        assign tcp_tk[tc]   = cmt_narrow[tc*`BACK2_NQ_W + `BACK2_NQ_TRT +: 1];
         assign tcp_ind[tc]  = t_ind(p_cls(pp));
         assign tcp_call[tc] = t_call(p_cls(pp));
         assign tcp_ret[tc]  = t_ret(p_cls(pp));
