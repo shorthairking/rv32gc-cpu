@@ -38,7 +38,7 @@ module tb_core_top_2b #(
     localparam [31:0] XIP_PC  = 32'h1C00_0000;     // RESET_PC
     localparam [31:0] STUB0   = 32'h800002b7;      // lui  x5, 0x80000
     localparam [31:0] STUB1   = 32'h00028067;      // jalr x0, 0(x5)
-    localparam integer NPROG  = 13;   // ★ 4c(2/3)：+ p16_fcsr（fcsr 提交通路 + D 精度算术）
+    localparam integer NPROG  = 14;   // ★ 4c(3/3)：+ p17_fld_fsd（D 访存 8 B 拆两笔）
     //   ★★ 4c(2/3) WIP（**本段未接入**）：`back2_p16_fcsr.S`（fcsr 读写/fflags 累积/D 精度算术）
     //     已在生成器 PROGS 登记并生成映像（.svh 下标 15），但**尚未接入本 TB** ——
     //     原因：它的"`frm` 写对紧随 FP 指令的 DYN 舍入可见"判据要求
@@ -168,7 +168,8 @@ module tb_core_top_2b #(
         //   ★ 4b-2c 收口：程序数 10→11（p14_storepf @0x8002_8000）⇒ 窗口放宽到 0x30000
         //     （11×16 KB = 176 KB；否则第 11 个程序的取指被判"未登记区域"读 0）
         //   ★ 4b-3(2/2)：程序数 11→12（p15_priv @0x8002_C000）⇒ 窗口放宽到 0x34000
-        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0003_4000),
+        //   ★ 4c(3/3)：程序数 13→14（p17_fld_fsd @0x8003_4000）⇒ 窗口放宽到 0x38000
+        .DDR3_BASE(32'h0000_0000), .DDR3_LIMIT(32'h0003_8000),
         .UART_DATA_ADDR(32'h1FE0_01E0), .READ_LAT_DLY(0)
     ) u_mem (
         .clk(clk), .rst_n(rst_n),
@@ -380,7 +381,7 @@ module tb_core_top_2b #(
         begin
             @(negedge clk);
             //   ★ 4b-3(2/2)：12 个程序窗口 ⇒ 清到 0x34000 字节（53248 字）
-            for (m = 0; m < 53248; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;
+            for (m = 0; m < 57344; m = m + 1) u_mem.ddr3_mem[m] = 32'h0000_0013;   // ★ 14×16 KB
             for (m = 0; m < 1024;  m = m + 1) u_mem.xip_mem[m]  = 32'h0000_0013;
             u_mem.xip_mem[0] = 32'h0000_0013;   // 跳板由 load_prog 按基址重建
             u_mem.xip_mem[1] = 32'h0000_0013;
@@ -508,6 +509,8 @@ module tb_core_top_2b #(
         pidx[11] = 14; cmax_of[11] = P14_GOLD_N; // p15_priv（0x2C000；**S 模式链 + PLIC**，无黄金=固定拍数）
         //   ★★ 4c(2/3)：p16_fcsr（0x30000；**fcsr 提交通路 + D 精度算术**，有 Spike 黄金）
         pidx[12] = 15; cmax_of[12] = P15_GOLD_N;   // （命名口径：P<i>_GOLD_N 的 i = PROGS 下标）
+        //   ★★ 4c(3/3)：p17_fld_fsd（0x34000；**D 访存 8 B 拆两笔**，有 Spike 黄金）
+        pidx[13] = 16; cmax_of[13] = P16_GOLD_N;
         pidx[3] = 6; cmax_of[3] = P6_GOLD_N;    // p7_trap（ecall/非法/ebreak→mtvec→mret）
         pidx[4] = 7; cmax_of[4] = P7_GOLD_N;    // p8_int（CLINT MTI 中断；无黄金=0）
         pidx[5] = 8; cmax_of[5] = P8_GOLD_N;    // p9_trapvec（mtvec MODE=1 向量模式）
@@ -690,7 +693,9 @@ module tb_core_top_2b #(
                 //   ★ 4b-2c 收口：p14_storepf 故意制造 1 次 **store** 页错误（cause 15）
                 //     ⇒ 同 p13，其异常由 C15' 逐项判定（判据未放宽）
                 //   ★ 4b-3(2/2)：p15_priv 故意制造 4 类陷阱（S ecall 委托 / 非法指令 / MEI）⇒ 同 p13/p14 豁免
-                if ((pid != 9) && (pid != 10) && (pid != 11)) begin
+                //   ★ 4c(3/3)：p17_fld_fsd 故意制造 2 次**非对齐**异常（cause 4/6）
+                //     ⇒ 同 p13/p14/p15，其异常由 C18' 逐项判定（判据未放宽）
+                if ((pid != 9) && (pid != 10) && (pid != 11) && (pid != 13)) begin
                     chk(u_dut.trap_valid_w == 1'b0, $sformatf("C5' 程序 %0d：全程无提交点异常", pid));
                     chk(n_trap_p == 0, $sformatf("C5' 程序 %0d：全程无陷阱交付", pid));
                 end
@@ -960,6 +965,36 @@ module tb_core_top_2b #(
                               u_dut.csr_mstatus_raw));
                 $display("   [C17'] fcsr 通路：fflags=%0d→0x%02x、frm→%0d、DYN 生效(3 vs 4)、D 闭环=0x40C00000、fcsr 终值=0x5F；mstatus.FS=Dirty/SD=1",
                          u_dut.fflags_r, u_dut.fflags_r, u_dut.frm_r);
+                $fflush();
+            end
+            //   ============ C18'：D 访存 8 B 拆两笔（p17_fld_fsd，4c(3/3)）============
+            //   判据 = **程序自记录（硬编码期望）** + C1'/C2'/C3' 的 Spike 黄金逐条比对
+            //   （含 FP 写回值；fld 的 64 bit 值经 `fsd`+`lw` 两半回读 ⇒ 高半也进黄金）。
+            if (pid == 13) begin
+                d_pc = 0; d_rd = 0; d_wd = 0; crk = 0;
+                for (k = 0; k < GMAX; k = k + 1) begin
+                    if (rwe[k] && (rrd[k] == 5'd18) && (rwd[k] === 32'h0))          crk = crk | 1;
+                    if (rwe[k] && (rrd[k] == 5'd19) && (rwd[k] === 32'h3FF8_0000))  crk = crk | 2;
+                    if (rwe[k] && (rrd[k] == 5'd20) && (rwd[k] === 32'd4))          crk = crk | 4;
+                    if (rwe[k] && (rrd[k] == 5'd21) && (rwd[k] === 32'd6))          crk = crk | 8;
+                    if (rwe[k] && (rrd[k] == 5'd22) && (rwd[k] === 32'd12))         crk = crk | 16;
+                    if (rwe[k] && (rrd[k] == 5'd23) && (rwd[k] === 32'h1122_3344))  crk = crk | 32;
+                    if (rwe[k] && (rrd[k] == 5'd24) && (rwd[k] === 32'h5566_7788))  crk = crk | 64;
+                    if (rwe[k] && (rrd[k] == 5'd25) && (rwd[k] === 32'h0))          crk = crk | 128;
+                    if (rwe[k] && (rrd[k] == 5'd26) && (rwd[k] === 32'hDEAD_BEEF))  crk = crk | 256;
+                end
+                chk(n_trap_p == 2, $sformatf("C18'-1 p17：恰好 2 次非对齐异常（fld + fsd），实测 %0d", n_trap_p));
+                chk(trc_cause[0] == 4'd4, $sformatf("C18'-2 p17：第 1 次 mcause = 4（**load address misaligned**，fld 的 va[2:0]!=0），实测 %0d", trc_cause[0]));
+                chk(trc_cause[1] == 4'd6, $sformatf("C18'-3 p17：第 2 次 mcause = 6（**store address misaligned**，fsd 的 va[2:0]!=0），实测 %0d", trc_cause[1]));
+                chk(((crk & 3) == 3),   "C18'-4 p17：**8 B 对齐 fld→fsd 往返**（低半 0 / 高半 0x3FF8_0000 = 1.5d）");
+                chk(((crk & 4) == 4),   "C18'-5 p17：handler 读到第 1 次 cause = 4（装载非对齐）");
+                chk(((crk & 8) == 8),   "C18'-6 p17：handler 读到第 2 次 cause = 6（存储非对齐）");
+                chk(((crk & 16) == 16), "C18'-7 p17：**mtval = VA**（自记录 mtval − darea = 12，与链接基址无关）");
+                chk(((crk & 32) == 32), "C18'-8 p17：**跨 4K 页 fld 的低半** = 0x1122_3344（第 1 页）");
+                chk(((crk & 64) == 64), "C18'-9 p17：**跨 4K 页 fld 的高半** = 0x5566_7788（第二拍 VA+4 ⇒ 下一页，完整翻译）");
+                chk(((crk & 128) == 128), "C18'-10 p17：**8 B 覆盖转发低半** = 0（来自未提交的 fsd）");
+                chk(((crk & 256) == 256), "C18'-11 p17：**8 B 覆盖转发高半** = 0xDEAD_BEEF（来自更年轻的 4 B store ⇒ 按字节道合并）");
+                $display("   [C18'] D 访存 8 B：往返 0/0x3FF80000、非对齐 cause 4/6 + mtval 偏移 12、跨页 0x11223344/0x55667788、覆盖转发 0/0xDEADBEEF；黄金 99 条逐条一致");
                 $fflush();
             end
             //   ============ C15'：store 页错误精确化（p14_storepf，4b-2c 收口）============

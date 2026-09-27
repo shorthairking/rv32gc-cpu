@@ -88,6 +88,11 @@ PROGS = [
     #     分支自检 ⇒ 任何 FP 计算/通路错误都会在 PC 流上分歧。
     #     **不含 fld/fsd**（8B 访存拆笔属 4c(3/3)，见报告 §B4.39）。
     ("back2_p16_fcsr.S",   "P16", "rv32imafd_zicsr",      "rv32imafdc_zicsr"),
+    #   ★★ 4c(3/3)：**D 访存（fld/fsd 8 B 拆两笔）**——
+    #     ① 8 B 对齐往返（fld 两拍 / fsd 拆两条 CDQ）② 非对齐 cause 4/6 + mtval
+    #     ③ 跨 4K 页第二笔（本核 VA+4 完整翻译）④ 8 B 覆盖转发（按字节道合并）。
+    #     有 Spike 黄金（`rv32imafdc_zicsr`）。
+    ("back2_p17_fld_fsd.S","P17", "rv32imafd_zicsr",      "rv32imafdc_zicsr"),
 ]
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "riscv32-unknown-linux-gnu-gcc"

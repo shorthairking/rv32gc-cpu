@@ -79,6 +79,8 @@ module lsq_simple #(
     input  wire [`BACK2_EPOCH_W-1:0] exe_epoch,
     input  wire [31:0]           exe_addr,
     input  wire [31:0]           exe_wdata,
+    //   ★★ 4c(3/3)：8 B store（fsd）的**高 4 B** 数据（低 4 B 走 `exe_wdata`）
+    input  wire [31:0]           exe_wdata_hi,
     input  wire [2:0]            exe_size,
     input  wire                  exe_unsign,
     input  wire                  exe_dst_i,
@@ -138,6 +140,11 @@ module lsq_simple #(
     output wire [PDW_I-1:0]      wb_pdest_i,
     output wire [PDW_F-1:0]      wb_pdest_f,
     output wire [31:0]           wb_data,
+    //   ★★ 4c(3/3)：8 B（fld）写回的高 4 B 与"本次是 64 bit 装载"标志 ——
+    //     FP RF 侧据此写**完整 FLEN 且不做 NaN-box**（ISA：FLD 不 box）；
+    //     ≤4 B 时 `wb_f64=0`、高半无意义（后端按 FLW 的 NaN-box 处理）。
+    output wire [31:0]           wb_data_hi,
+    output wire                  wb_f64,
 
     // ---- store E1 完成（地址+数据就绪 ⇒ ROB done）----
     output wire                  st_done_valid,
@@ -182,6 +189,11 @@ module lsq_simple #(
     reg  [31:0]          stq_a   [0:STQ_N-1];        // ★ **虚拟地址**（E1 的 AGU 结果；
                                                      //   转发比较 / 翻译请求的 VA 来源）
     reg  [31:0]          stq_d   [0:STQ_N-1];        // 已对位到字内字节道
+    //   ★★ 4c(3/3)：8 B store（fsd）的高 4 B（`stq_dh`）与“本项是 8 B”标志（`stq_hi`）
+    //     · 存储数据来自 FP RF 的 64 bit；高字对应 VA+4 的字（fsd 已保证 8 B 对齐 ⇒ 无字内偏移）
+    //     · 后端对外还是**单笔 4 B**（L1D/AXI 零改动）：提交排空时拆成**两条 CDQ 项**（低/ 高）
+    reg  [31:0]          stq_dh  [0:STQ_N-1];
+    reg                  stq_hi  [0:STQ_N-1];
     reg  [3:0]           stq_msk [0:STQ_N-1];
     reg  [ROB_IDX_W-1:0] stq_rob [0:STQ_N-1];
     reg                  stq_ret [0:STQ_N-1];
@@ -363,6 +375,11 @@ module lsq_simple #(
     wire [3:0] lmask_w = (exe_size == 3'd0) ? (4'h1 << exe_addr[1:0]) :
                          (exe_size == 3'd1) ? (4'h3 << exe_addr[1:0]) :
                                               (4'hF << exe_addr[1:0]);
+    //   ★★ 4c(3/3)：**8 字节道**掩码（8 B 访问用；非对齐的 8 B 已在 E1 判异常 ⇒ 此处恒 0xF..）
+    wire [7:0] lmask_w8 = (exe_size == 3'd3) ? 8'hFF :
+                          (exe_size == 3'd0) ? (8'h01 << exe_addr[2:0]) :
+                          (exe_size == 3'd1) ? (8'h03 << exe_addr[2:0]) :
+                                               (8'h0F << exe_addr[2:0]);
     //   ★★ 转发优先级**口径修正**（2B-3 规格 §6.2 / 本文件头注："取字内**最年轻**的更老匹配者"）：
     //      原循环用 `cur_age <= best_age`（初值 255）⇒ 实际取到 age **最小**者 = **最老** store
     //      —— 与规格相反（同字节两条更老 store 时应取更年轻者）。本段改为"取 age 最大者"
@@ -370,35 +387,45 @@ module lsq_simple #(
     //      即验此点。
     //   布局：4 字节 × 32 候选（gj ≥ STQ_N 恒 0）——扩到 32 槽时零改动。
     //   （所有中间网先声明后使用；连续赋值之间的先后次序无关。）
-    wire [4*32-1:0]    fw_match;
-    wire [4*32*8-1:0]  fw_age_c;             // 匹配 ⇒ 该 store 的 age；否则 0
-    wire [4*32*8-1:0]  fw_dat_c;             // 匹配 ⇒ 该字节数据；否则 0
-    wire [4*32-1:0]    fw_sel;               // 匹配 且 age == 该字节最优 age
-    wire [4*8-1:0]     fw_best;
-    wire [4*4*8*8-1:0] fw_ag_ch, fw_wd_ch;
-    wire [3:0]         fwd_hit_w;
-    wire [31:0]        fwd_data_w;
+    wire [8*32-1:0]    fw_match;
+    wire [8*32*8-1:0]  fw_age_c;             // 匹配 ⇒ 该 store 的 age；否则 0
+    wire [8*32*8-1:0]  fw_dat_c;             // 匹配 ⇒ 该字节数据；否则 0
+    wire [8*32-1:0]    fw_sel;               // 匹配 且 age == 该字节最优 age
+    wire [8*8-1:0]     fw_best;
+    wire [8*4*8*8-1:0] fw_ag_ch, fw_wd_ch;
+    wire [7:0]         fwd_hit_w;
+    wire [63:0]        fwd_data_w;
     generate
-    for (gb = 0; gb < 4; gb = gb + 1) begin : g_fw_b
-        wire [2:0] bl_w = {1'b0, exe_addr[1:0]} + gb[2:0];   // 字内字节道（3 bit：0..6）
-        wire       in_w = lmask_w[gb] & (bl_w < 3'd4);        // 该字节在本次访问内
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_b
+        //   ★★ 4c(3/3)：**每个字节用自己的地址**定位"哪个 4 B 字的哪一道" ——
+        //     8 B 访问的字节 4..7 落在下一个字（`addr+4`），旧实现在这里
+        //     `bl_w = exe_addr[1:0]+gb` 且 `bl_w < 4` ⇒ 后半被整体丢弃（8 B 前半也错位）。
+        wire [31:0] ba_w  = exe_addr + gb[31:0];      // 该字节的字节地址
+        wire [1:0]  bl_w  = ba_w[1:0];                // 字内字节道
+        wire        in_w  = lmask_w8[gb];             // 该字节在本次访问内
         for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_j
             if (gj < STQ_N) begin : g_fw_on
+                //   ★★ 4c(3/3)：8 B store 的**高字**也参与转发（字地址 = `stq_a+4`，
+                //     掩码恒 4'hF）；≤4 B store 时 `stq_hi=0` ⇒ 低字路径与旧实现逐位等价。
+                wire       fw_lo_w = (stq_a[gj][31:2] == ba_w[31:2]);
+                wire       fw_hi_w = stq_hi[gj] &
+                                     (({2'b0, stq_a[gj][31:2]} + 32'd1) == {2'b0, ba_w[31:2]});
                 assign fw_match[gb*32 + gj] =
-                       in_w & stq_v[gj] & stq_av[gj] & stq_msk[gj][bl_w] &
-                       (stq_a[gj][31:2] == exe_addr[31:2]) &
+                       in_w & stq_v[gj] & stq_av[gj] & (fw_lo_w | fw_hi_w) &
+                       (fw_lo_w ? stq_msk[gj][bl_w] : 1'b1) &
                        (((stq_rob[gj] - rob_head) & 7'h7F) < age_rob);
                 assign fw_age_c[(gb*32+gj)*8 +: 8] =
                        fw_match[gb*32 + gj] ? ((stq_rob[gj] - rob_head) & 7'h7F) : 8'h0;
                 assign fw_dat_c[(gb*32+gj)*8 +: 8] =
-                       fw_match[gb*32 + gj] ? stq_d[gj][8*bl_w +: 8] : 8'h0;
+                       fw_match[gb*32 + gj] ? (fw_hi_w ? stq_dh[gj][8*bl_w +: 8]
+                                                       : stq_d [gj][8*bl_w +: 8]) : 8'h0;
             end else begin : g_fw_off
                 assign fw_match[gb*32 + gj]       = 1'b0;
                 assign fw_age_c[(gb*32+gj)*8 +: 8] = 8'h0;
                 assign fw_dat_c[(gb*32+gj)*8 +: 8] = 8'h0;
             end
         end
-        //   best_age[b] = max over j（4 组 × 组内 8 项串行链 + 组间两级）
+        //   best_age[b] = max over j（8 组 × 组内 8 项串行链 + 组间两级归约）
         wire [7:0] bs01_w, bs23_w, bs_w;
         assign bs01_w = (fw_ag_ch[((gb*4+0)*8+7)*8 +: 8] >= fw_ag_ch[((gb*4+1)*8+7)*8 +: 8])
                         ? fw_ag_ch[((gb*4+0)*8+7)*8 +: 8] : fw_ag_ch[((gb*4+1)*8+7)*8 +: 8];
@@ -406,7 +433,7 @@ module lsq_simple #(
                         ? fw_ag_ch[((gb*4+2)*8+7)*8 +: 8] : fw_ag_ch[((gb*4+3)*8+7)*8 +: 8];
         assign bs_w   = (bs01_w >= bs23_w) ? bs01_w : bs23_w;
         assign fw_best[gb*8 +: 8] = bs_w;
-        //   命中位（与 lmask 无关：in_w 已并入 fw_match）
+        //   命中位（与掩码无关：in_w 已并入 fw_match）
         assign fwd_hit_w[gb] = |fw_match[gb*32 +: 32];
         //   胜者数据（唯一胜者 ⇒ 或归约等价于选择）
         assign fwd_data_w[gb*8 +: 8] =
@@ -415,13 +442,13 @@ module lsq_simple #(
     end
     endgenerate
     generate
-    for (gb = 0; gb < 4; gb = gb + 1) begin : g_fw_sel
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_sel
         for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_selj
             assign fw_sel[gb*32 + gj] = fw_match[gb*32 + gj] &
                                         (fw_age_c[(gb*32+gj)*8 +: 8] == fw_best[gb*8 +: 8]);
         end
     end
-    for (gb = 0; gb < 4; gb = gb + 1) begin : g_fw_ch
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_ch
         for (gk = 0; gk < 4; gk = gk + 1) begin : g_fw_chg
             assign fw_ag_ch[((gb*4+gk)*8 + 0)*8 +: 8] = fw_age_c[(gb*32 + gk*8 + 0)*8 +: 8];
             assign fw_wd_ch[((gb*4+gk)*8 + 0)*8 +: 8] = fw_sel[gb*32 + gk*8 + 0]
@@ -440,7 +467,8 @@ module lsq_simple #(
     end
     endgenerate
 
-    wire fwd_all_w = ((fwd_hit_w & lmask_w) == lmask_w);
+    //   ★★ 4c(3/3)：全转发判据按 **8 字节道**掩码（≤4 B 时高 4 道掩码为 0 ⇒ 与旧口径逐位等价）
+    wire fwd_all_w = ((fwd_hit_w & lmask_w8) == lmask_w8);
 
 
     //==========================================================================
@@ -475,9 +503,19 @@ module lsq_simple #(
     reg  [31:0]          ld_addr [0:OUT_N-1];
     reg  [2:0]           ld_size [0:OUT_N-1];
     reg                  ld_uns  [0:OUT_N-1];
-    reg  [3:0]           ld_hm   [0:OUT_N-1];
-    reg  [31:0]          ld_hd   [0:OUT_N-1];
+    //   ★★ 4c(3/3)：转发掩码/数据 **按 8 字节道**（8 B 访问要两个 4 B 字的转发合并）
+    reg  [7:0]           ld_hm   [0:OUT_N-1];
+    reg  [63:0]          ld_hd   [0:OUT_N-1];
     reg  [TAG_W-1:0]     ld_tag  [0:OUT_N-1];
+    //   ★★ 4c(3/3)：8 B（fld）两拍访问的状态
+    //     · `ld_hi`  ：本项是 8 B 访问
+    //     · `ld_beat`：首拍已完成（= 正在发/已发第二拍）
+    //     · `ld_lo`  ：首拍合并后的低 4 B（第二拍响应到达时与高 4 B 组装）
+    //     · `ld_mis` ：8 B 但 `va[2:0]!=0` ⇒ **非对齐**（cause 4，不访存）
+    reg                  ld_hi   [0:OUT_N-1];
+    reg                  ld_beat [0:OUT_N-1];
+    reg  [31:0]          ld_lo   [0:OUT_N-1];
+    reg                  ld_mis  [0:OUT_N-1];
 
     //--------------------------------------------------------------------------
     // 3.1b LQ 分配器（D3 派发期；与 §1.2 的 STQ 分配器**同构**：空闲前缀和 + 候选或归约）
@@ -582,21 +620,30 @@ module lsq_simple #(
     //   入队许可：余量 ≥ 一整组（W 笔）——保守，且与"本拍出队释放 1 项"无关（无环）
     //   ★★ (b2)：余量门 × **提交窗翻译定妥门**（见 §0b；回送 rob.v 的 `mem_wr_ready`
     //     ⇒ 窗口内有"未定妥"的 store 时，整条提交前缀链在该 store 处停住）
-    assign dr_room_ok = (((CDQ_N[CDQ_PW:0]) - cdq_cnt) >= W[CDQ_PW:0]) && !stq_blk_any_w;
+    //   ★★ 4c(3/3)：8 B store 会拆成**两条** CDQ 项 ⇒ 余量门改为“≥ 2W”（保守；
+    //     CDQ_N=8 时最坏 8 条同拍入队，余量不足则提交窗口等一拍，无死锁）
+    wire [CDQ_PW:0] dr_need_w = (W * 2);            // ★ 4c(3/3)：8 B store 最坏占 2 条
+    assign dr_room_ok = (((CDQ_N[CDQ_PW:0]) - cdq_cnt) >= dr_need_w) && !stq_blk_any_w;
     wire [W-1:0] dr_take = dr_valid & {W{dr_room_ok}};
     //   组内压缩序号（rank）：第 k 个被收下的 lane 写到 tail+k
-    wire [2*W-1:0] dr_rank;
+    //   ★★ 4c(3/3)：每 lane 占的 CDQ 条数 = 1（普通）/ 2（8 B store）
+    wire [1:0] dr_n [0:W-1];
+    generate
+    for (gv = 0; gv < W; gv = gv + 1)
+        assign dr_n[gv] = dr_take[gv] ? (stq_hi[dr_idx[gv*STQ_IW +: STQ_IW]] ? 2'd2 : 2'd1) : 2'd0;
+    endgenerate
+    wire [3*W-1:0] dr_rank;
     generate
     for (gv = 0; gv < W; gv = gv + 1) begin : g_drrank
-        if (gv == 0) assign dr_rank[0 +: 2] = 2'd0;
-        else         assign dr_rank[2*gv +: 2] = dr_rank[2*(gv-1) +: 2] + {1'b0, dr_take[gv-1]};
+        if (gv == 0) assign dr_rank[0 +: 3] = 3'd0;
+        else         assign dr_rank[3*gv +: 3] = dr_rank[3*(gv-1) +: 3] + {1'b0, dr_n[gv-1]};
     end
     endgenerate
-    wire [CDQ_PW:0] dr_push_n = {{CDQ_PW-1{1'b0}}, dr_rank[2*(W-1) +: 2]} + {1'b0, dr_take[W-1]};
+    wire [CDQ_PW:0] dr_push_n = {{(CDQ_PW-2){1'b0}}, dr_rank[3*(W-1) +: 3]} + {1'b0, dr_n[W-1]};
     wire [CDQ_PW-1:0] cdq_wp [0:W-1];
     generate
     for (gv = 0; gv < W; gv = gv + 1)
-        assign cdq_wp[gv] = cdq_tail + dr_rank[2*gv +: 2];
+        assign cdq_wp[gv] = cdq_tail + dr_rank[3*gv +: 3];
     endgenerate
 
     //==========================================================================
@@ -695,21 +742,30 @@ module lsq_simple #(
     wire [STQ_IW-1:0] dr_sel  = cdq_idx[cdq_head];
     wire              dr_fire = dr_any & mem_req_ready & (dr_ok | dr_bad);   // 离队
     wire              dr_issue= dr_any & mem_req_ready &  dr_ok;             // 真发写
-    wire              ld_fire = pend_any & ~dr_any & mem_req_ready;
+    //   ★ 4c(3/3)：非对齐的 8 B 项**不发访存请求**（由 `mis_v` 合成带错写回）
+    wire              ld_fire = pend_any & ~dr_any & mem_req_ready & ~ld_mis[pend_sel];
 
     assign mem_req_valid = dr_issue | ld_fire;
     assign mem_req_wen   = dr_issue;
-    assign mem_req_addr  = dr_issue ? cdq_pa[cdq_head]  : ld_addr[pend_sel];
+    //   ★★ 4c(3/3)：8 B（fld）**第二拍 = VA + 4** —— 走**完整翻译**（跨 4K 页时第二拍
+    //     落在下一页，须按该页自己的映射翻译；2A 的 `m_pa_eff = m_pa_q + 4`（连续物理地址）
+    //     是其简化，母代理裁决**不降级**：本核按 ISA 正确口径做，差异登记在报告 §B4.41）。
+    assign mem_req_addr  = dr_issue ? cdq_pa[cdq_head]  :
+                           (ld_addr[pend_sel] + (ld_beat[pend_sel] ? 32'd4 : 32'd0));
     assign mem_req_wdata = dr_issue ? cdq_d[cdq_head]   : 32'h0;
     assign mem_req_wstrb = dr_issue ? cdq_m[cdq_head]   : 4'h0;
     assign mem_req_tag   = dr_issue ? {TAG_W{1'b1}}     : ld_tag[pend_sel];
 
     // ---- 写回：响应到达 或（部分/全部）转发 + 响应 合并 ----
     wire [31:0] wb_word = mem_rsp_rdata;
-    wire [31:0] wb_merge = { ld_hm[rsp_sel][3] ? ld_hd[rsp_sel][31:24] : wb_word[31:24],
-                             ld_hm[rsp_sel][2] ? ld_hd[rsp_sel][23:16] : wb_word[23:16],
-                             ld_hm[rsp_sel][1] ? ld_hd[rsp_sel][15:8]  : wb_word[15:8],
-                             ld_hm[rsp_sel][0] ? ld_hd[rsp_sel][7:0]   : wb_word[7:0] };
+    //   ★★ 4c(3/3)：转发合并按“本拍对应的 4 字节”取 —— 8 B 访问的首拍取字节道 0..3、
+    //     次拍取 4..7（≤4 B 时 `ld_beat=0` ⇒ 恒取低半，与旧口径逐位等价）
+    wire [3:0]  hm_beat = ld_beat[rsp_sel] ? ld_hm[rsp_sel][7:4] : ld_hm[rsp_sel][3:0];
+    wire [31:0] hd_beat = ld_beat[rsp_sel] ? ld_hd[rsp_sel][63:32] : ld_hd[rsp_sel][31:0];
+    wire [31:0] wb_merge = { hm_beat[3] ? hd_beat[31:24] : wb_word[31:24],
+                             hm_beat[2] ? hd_beat[23:16] : wb_word[23:16],
+                             hm_beat[1] ? hd_beat[15:8]  : wb_word[15:8],
+                             hm_beat[0] ? hd_beat[7:0]   : wb_word[7:0] };
     function [31:0] ext_load(input [31:0] w, input [1:0] off, input [2:0] sz, input uns);
         reg [7:0]  b0;
         reg [15:0] h0;
@@ -725,21 +781,28 @@ module lsq_simple #(
         end
     endfunction
 
-    // 全转发项：E1 次拍直接写回（单寄存器直通）
+    // 全转发项：E1 次拍直接写回（单寄存器直通）；★ 4c(3/3) 起数据宽 64 bit（8 B 用）
+    wire        mis_v;                       // ★ 8 B 非对齐 ⇒ 合成一次带错写回（cause 4）
     reg         fwdp_v;
     reg [ROB_IDX_W-1:0] fwdp_rob;
     reg [`BACK2_EPOCH_W-1:0] fwdp_ep;
     reg         fwdp_di, fwdp_df;
     reg [PDW_I-1:0] fwdp_pi;
     reg [PDW_F-1:0] fwdp_pf;
-    reg [31:0]  fwdp_data;
+    reg [63:0]  fwdp_data;                   // ★ 4c(3/3)：8 B 全转发要 64 bit
     reg [2:0]   fwdp_size;
     reg [1:0]   fwdp_off;
     reg         fwdp_uns;
 
-    assign wb_valid   = fwdp_v | rsp_ok;
-    assign wb_rob     = fwdp_v ? fwdp_rob  : ld_rob[rsp_sel];
-    assign wb_epoch   = fwdp_v ? fwdp_ep   : ld_ep[rsp_sel];
+    //   ★★ 4c(3/3)：写回源三选一 —— 全转发 / 访存响应 / **8 B 非对齐合成（带错）**；
+    //     8 B 访问的**首拍响应不写回**（数据还没齐，等第二拍组装）
+    wire        rsp_wb_w     = rsp_ok & (~ld_hi[rsp_sel] | ld_beat[rsp_sel]);
+    //   非对齐 8 B：**不发访存请求**，直接合成一次“带错写回”（done+exc 同拍，与 rsp_err 同法）。
+    //   判据只吃 `pend` 选择结果 ⇒ 与既有优先级链同源、无新挂起态。
+    assign      mis_v        = pend_any & ld_mis[pend_sel] & ~dr_any;
+    assign wb_valid   = fwdp_v | rsp_wb_w | mis_v;
+    assign wb_rob     = fwdp_v ? fwdp_rob  : (mis_v ? ld_rob[pend_sel] : ld_rob[rsp_sel]);
+    assign wb_epoch   = fwdp_v ? fwdp_ep   : (mis_v ? ld_ep[pend_sel] : ld_ep[rsp_sel]);
     //   ★★ 4b-2b：带错响应**不得写回目的寄存器**（该 load 将以精确异常结束、
     //     永不提交；抑制 PRF 写口是双保险）。转发路径（fwdp_v）不参与本判据。
     //   ★★ 4b-2b-fix（实测回归抓出）：`mem_rsp_err` 必须用 `=== 1'b1` **净化**——
@@ -748,8 +811,8 @@ module lsq_simple #(
     //     ⇒ 整核写回失效（实测 `tb_back2_lockstep` 第 1 个程序后停摆 24 条）。
     //     口径：**只有明确的 1 才算"带错响应"**，z/x/0 一律按正常响应处理。
     wire              rsp_err_w = (mem_rsp_err === 1'b1);
-    assign wb_dst_i   = fwdp_v ? fwdp_di   : (rsp_ok & rsp_err_w ? 1'b0 : ld_di[rsp_sel]);
-    assign wb_dst_f   = fwdp_v ? fwdp_df   : (rsp_ok & rsp_err_w ? 1'b0 : ld_df[rsp_sel]);
+    assign wb_dst_i   = fwdp_v ? fwdp_di   : (((rsp_ok & rsp_err_w) | mis_v) ? 1'b0 : ld_di[rsp_sel]);
+    assign wb_dst_f   = fwdp_v ? fwdp_df   : (((rsp_ok & rsp_err_w) | mis_v) ? 1'b0 : ld_df[rsp_sel]);
     //   ★★ 4b-2b：数据侧精确异常上报。与 `wb_valid`（= 该 load 的 done）**同拍** ⇒
     //     ROB 的 `upd_exc`（异常位）与写回（done 位）在同一沿写入 ⇒ 下一拍 ROB 头部
     //     同时看到 done+exc ⇒ 精确抛陷阱、且该指令**没有**提交（见 rob.v:166/222）。
@@ -758,15 +821,32 @@ module lsq_simple #(
     //      而适配器内翻译事务与访存请求串行）：
     //       · cause 13 = load page fault（带错响应；mtval = 该 load 的 VA）
     //       · cause 15 = **store/AMO page fault**（本段新增；mtval = 该 store 的 VA）
-    assign exc_valid_o = (rsp_ok & rsp_err_w) | stx_flt_rep_w;
-    assign exc_rob_o   = stx_flt_rep_w ? stq_rob[stx_idx_q] : ld_rob[rsp_sel];
-    assign exc_cause_o = stx_flt_rep_w ? 4'd15 : 4'd13;
-    assign exc_tval_o  = stx_flt_rep_w ? stq_a[stx_idx_q] : ld_addr[rsp_sel];
-    assign wb_pdest_i = fwdp_v ? fwdp_pi   : ld_pi[rsp_sel];
-    assign wb_pdest_f = fwdp_v ? fwdp_pf   : ld_pf[rsp_sel];
-    assign wb_data    = fwdp_v ? ext_load(fwdp_data, fwdp_off, fwdp_size, fwdp_uns)
-                               : ext_load(wb_merge, ld_addr[rsp_sel][1:0],
-                                          ld_size[rsp_sel], ld_uns[rsp_sel]);
+    //   ★★ 4c(3/3)：新增两类**地址非对齐**精确异常（8 B 访问 `va[2:0]!=0`）：
+    //     · `mis_v`（load）  ⇒ cause 4 = load address misaligned，tval = VA
+    //     · `st_mis_w`（store）⇒ cause 6 = store/AMO address misaligned，tval = VA
+    //       （store 在 E1 当拍上报：其 ROB `done` 已由 `st_done_valid` 给出，故无需合成写回；
+    //         且置 `stq_bad` ⇒ 该项不排空、以精确陷阱结束 —— 与 store 页错误同法）
+    wire st_mis_w = exe_valid & exe_is_store & (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
+    assign exc_valid_o = (rsp_ok & rsp_err_w) | stx_flt_rep_w | mis_v | st_mis_w;
+    assign exc_rob_o   = mis_v    ? ld_rob[pend_sel] :
+                         st_mis_w ? exe_rob :
+                         stx_flt_rep_w ? stq_rob[stx_idx_q] : ld_rob[rsp_sel];
+    assign exc_cause_o = mis_v    ? 4'd4  :
+                         st_mis_w ? 4'd6  :
+                         stx_flt_rep_w ? 4'd15 : 4'd13;
+    assign exc_tval_o  = mis_v    ? ld_addr[pend_sel] :
+                         st_mis_w ? exe_addr :
+                         stx_flt_rep_w ? stq_a[stx_idx_q] : ld_addr[rsp_sel];
+    assign wb_pdest_i = fwdp_v ? fwdp_pi   : (mis_v ? {PDW_I{1'b0}} : ld_pi[rsp_sel]);
+    assign wb_pdest_f = fwdp_v ? fwdp_pf   : (mis_v ? {PDW_F{1'b0}} : ld_pf[rsp_sel]);
+    //   ★★ 4c(3/3)：8 B 装载 = `{高 4 B 合并值, 首拍锁存的低 4 B}`；ISA 口径 **FLD 不做
+    //     NaN-box**（后端据此写满 FLEN）。≤4 B 保持原 `ext_load` 语义 ⇒ 零回归。
+    assign wb_data    = fwdp_v ? ext_load(fwdp_data[31:0], fwdp_off, fwdp_size, fwdp_uns)
+                               : (ld_hi[rsp_sel] ? ld_lo[rsp_sel]
+                                                 : ext_load(wb_merge, ld_addr[rsp_sel][1:0],
+                                                            ld_size[rsp_sel], ld_uns[rsp_sel]));
+    assign wb_data_hi = fwdp_v ? fwdp_data[63:32] : wb_merge;
+    assign wb_f64     = fwdp_v ? (fwdp_size == 3'd3) : ld_hi[rsp_sel];
 
     assign st_done_valid = exe_valid & exe_is_store;
     assign st_done_rob   = exe_rob;
@@ -837,6 +917,26 @@ module lsq_simple #(
                     cdq_ctx[cdq_wp[si]] <= st_xlate_ctx;
                     cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
                     cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
+                    //   ★★ 4c(3/3)：8 B store ⇒ **高半另立一条 CDQ 项**（紧跟低半，
+                    //     程序序：低地址先发）。高半的 PA = 低半 PA + 4（**2A 同口径**：
+                    //     `core_top.v:1640` 的 `m_pa_eff = m_pa_q + (m_hi_q ? 4 : 0)`；虽然
+                    //     `stx_en_w` 下的页跨越 store 按 ISA 应分页翻译，但 2A 本身就是
+                    //     连续 PA 口径 ⇒ 本轮**与 2A 逐位一致**；该差异已登记（报告 §B4.41）。
+                    //     注：载入（fld）第二拍走 **VA+4 完整翻译**（母代理裁决）。
+                    if (stq_hi[dr_idx[si*STQ_IW +: STQ_IW]]) begin
+                        cdq_v  [cdq_wp[si] + 1'b1] <= 1'b1;
+                        cdq_idx[cdq_wp[si] + 1'b1] <= dr_idx[si*STQ_IW +: STQ_IW];
+                        cdq_a  [cdq_wp[si] + 1'b1] <= stq_a [dr_idx[si*STQ_IW +: STQ_IW]] + 32'd4;
+                        cdq_pa [cdq_wp[si] + 1'b1] <= (stx_en_w ? stq_pa[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                               : stq_a [dr_idx[si*STQ_IW +: STQ_IW]]) + 32'd4;
+                        cdq_pv [cdq_wp[si] + 1'b1] <= ~stx_en_w |
+                                                     (stq_pv[dr_idx[si*STQ_IW +: STQ_IW]] &
+                                                      (stq_ctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx));
+                        cdq_bad[cdq_wp[si] + 1'b1] <= 1'b0;
+                        cdq_ctx[cdq_wp[si] + 1'b1] <= st_xlate_ctx;
+                        cdq_d  [cdq_wp[si] + 1'b1] <= stq_dh[dr_idx[si*STQ_IW +: STQ_IW]];
+                        cdq_m  [cdq_wp[si] + 1'b1] <= 4'hF;
+                    end
                 end
             end
             if (dr_push_n != {(CDQ_PW+1){1'b0}}) begin
@@ -847,9 +947,11 @@ module lsq_simple #(
             //   代价至多 1 拍，换取"最小改动 + 不触碰排空握手"。
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0; stq_ret[si] <= 1'b0;
+                stq_hi[si] <= 1'b0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
+                ld_hi[si] <= 1'b0; ld_beat[si] <= 1'b0; ld_mis[si] <= 1'b0; ld_lo[si] <= 32'h0;
             end
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
@@ -874,6 +976,8 @@ module lsq_simple #(
                         //     `stq_pa/stq_pv` 的真正判定在 E1（§4.3）—— 分配期只清状态。
                         stq_pa [alloc_idx[si*STQ_IW +: STQ_IW]] <= 32'h0;
                         stq_pv [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_dh [alloc_idx[si*STQ_IW +: STQ_IW]] <= 32'h0;
+                        stq_hi [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         stq_ctx[alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
                         stq_bad[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         //   ★★ 2B-3 第 6 段第二步（报告 §B3.6.4 的必办项）：ROB 索引在
@@ -896,6 +1000,11 @@ module lsq_simple #(
                         ld_ex [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_req[lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_dn [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        //   ★ 4c(3/3)：8 B 两拍态与非对齐标志在分配期清零（E1 再填）
+                        ld_hi  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_beat[lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_mis [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_lo  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 32'h0;
                         ld_rob[lalloc_idx[si*LQ_IW +: LQ_IW]] <=
                                 lalloc_rob[si*ROB_IDX_W +: ROB_IDX_W];
                     end
@@ -917,9 +1026,14 @@ module lsq_simple #(
                 stq_pa[exe_stq_idx]  <= exe_addr;
                 stq_pv[exe_stq_idx]  <= ~stx_en_w;
                 stq_ctx[exe_stq_idx] <= st_xlate_ctx;
-                stq_bad[exe_stq_idx] <= 1'b0;
+                //   ★ 4c(3/3)：8 B store 且 `va[2:0]!=0` ⇒ 标坏（不排空、以 cause 6 精确陷阱结束）
+                stq_bad[exe_stq_idx] <= st_mis_w;
                 stq_d[exe_stq_idx]   <= exe_wdata << {exe_addr[1:0], 3'b000};
-                stq_msk[exe_stq_idx] <= lmask_w;
+                //   ★★ 4c(3/3)：8 B store —— 高字直存（fsd 已保证 8 B 对齐）；
+                //     非对齐的 8 B store 已置 `stq_bad`（不排空），此处的值无意义。
+                stq_dh[exe_stq_idx]  <= exe_wdata_hi;
+                stq_hi[exe_stq_idx]  <= (exe_size == 3'd3);
+                stq_msk[exe_stq_idx] <= (exe_size == 3'd3) ? 4'hF : lmask_w;
                 //   `stq_rob` 已在**分配期**写入（§4.2）⇒ 此处不再重复写（唯一写点纪律）。
                 //   实测语义：分配期写入的 rob == 该 store 的 E1 rob（同一 ROB 项）。
                 cnt_st_q <= cnt_st_q + 32'd1;
@@ -956,6 +1070,13 @@ module lsq_simple #(
                     ld_addr[exe_lq_idx] <= exe_addr;
                     ld_size[exe_lq_idx] <= exe_size;
                     ld_uns [exe_lq_idx] <= exe_unsign;
+                    //   ★★ 4c(3/3)：8 B（fld）两拍态 + 非对齐判据
+                    //     （`va[2:0]!=0` ⇒ cause 4；ISA 允许实现对 8 B 访问要求自然对齐，
+                    //      2A 同口径 `m_fp8_misalign` ⇒ 两核一致）
+                    ld_hi  [exe_lq_idx] <= (exe_size == 3'd3);
+                    ld_beat[exe_lq_idx] <= 1'b0;
+                    ld_mis [exe_lq_idx] <= (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
+                    ld_lo  [exe_lq_idx] <= 32'h0;
                     ld_hm  [exe_lq_idx] <= fwd_hit_w;
                     ld_hd  [exe_lq_idx] <= fwd_data_w;
                     //   ★ 槽号是 LQ_IW bit（LQ 32 ⇒ 5 bit）⇒ 必须零扩展到 TAG_W=6；
@@ -972,10 +1093,20 @@ module lsq_simple #(
             //     该项即退出请求口（`pend_vec`）与响应匹配（`rsp_vec` 要 `ld_req`）⇒
             //     写回只发生一次、不会被后到的响应重复触发。
             if (ld_fire) ld_req[pend_sel] <= 1'b1;
+            //   ★★ 4c(3/3)：8 B 访问**两拍** —— 首拍响应只锁存低 4 B 并**重新挂起**
+            //     （`ld_req<=0` ⇒ 回到 pend 队列，下次发 `VA+4`）；第二拍响应才 `ld_dn`。
             if (rsp_ok) begin
-                ld_req[rsp_sel] <= 1'b0;
-                ld_dn [rsp_sel] <= 1'b1;
+                if (ld_hi[rsp_sel] & ~ld_beat[rsp_sel]) begin
+                    ld_req [rsp_sel] <= 1'b0;
+                    ld_beat[rsp_sel] <= 1'b1;
+                    ld_lo  [rsp_sel] <= wb_merge;
+                end else begin
+                    ld_req[rsp_sel] <= 1'b0;
+                    ld_dn [rsp_sel] <= 1'b1;
+                end
             end
+            //   非对齐 8 B：合成带错写回的同拍标完成（不发访存）
+            if (mis_v) ld_dn[pend_sel] <= 1'b1;
             // ---- 4.4b 提交点释放（LQ 项；★ 2B-3 第 6 段第二步）----
             //   释放条件：该 LQ 项的 ROB 索引落在**本拍提交组** [head, head+cmt_n) 内。
             //   依据：提交组恒为"从 ROB 头起的连续若干项"（rob.v 的前缀链），故用**窗口算术**
@@ -988,6 +1119,10 @@ module lsq_simple #(
                     ld_req[si] <= 1'b0;
                     ld_dn [si] <= 1'b0;
                     ld_ex [si] <= 1'b0;
+                    ld_hi [si] <= 1'b0;
+                    ld_beat[si] <= 1'b0;
+                    ld_mis[si] <= 1'b0;
+                    ld_lo [si] <= 32'h0;
                 end
             end
             // ---- 4.5 提交排空：入队（全组）→ 出队（逐拍一笔）→ STQ 项回收 ----
@@ -1013,6 +1148,20 @@ module lsq_simple #(
                     cdq_ctx[cdq_wp[si]] <= st_xlate_ctx;
                     cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
                     cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
+                    if (stq_hi[dr_idx[si*STQ_IW +: STQ_IW]]) begin
+                        cdq_v  [cdq_wp[si] + 1'b1] <= 1'b1;
+                        cdq_idx[cdq_wp[si] + 1'b1] <= dr_idx[si*STQ_IW +: STQ_IW];
+                        cdq_a  [cdq_wp[si] + 1'b1] <= stq_a [dr_idx[si*STQ_IW +: STQ_IW]] + 32'd4;
+                        cdq_pa [cdq_wp[si] + 1'b1] <= (stx_en_w ? stq_pa[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                               : stq_a [dr_idx[si*STQ_IW +: STQ_IW]]) + 32'd4;
+                        cdq_pv [cdq_wp[si] + 1'b1] <= ~stx_en_w |
+                                                     (stq_pv[dr_idx[si*STQ_IW +: STQ_IW]] &
+                                                      (stq_ctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx));
+                        cdq_bad[cdq_wp[si] + 1'b1] <= 1'b0;
+                        cdq_ctx[cdq_wp[si] + 1'b1] <= st_xlate_ctx;
+                        cdq_d  [cdq_wp[si] + 1'b1] <= stq_dh[dr_idx[si*STQ_IW +: STQ_IW]];
+                        cdq_m  [cdq_wp[si] + 1'b1] <= 4'hF;
+                    end
                 end
             end
             if (dr_push_n != {(CDQ_PW+1){1'b0}}) cdq_tail <= cdq_tail + dr_push_n[CDQ_PW-1:0];

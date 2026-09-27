@@ -1318,6 +1318,9 @@ module backend_top #(
     wire [PW_I-1:0] lsu_wb_pdi;
     wire [PW_F-1:0] lsu_wb_pdf;
     wire [31:0] lsu_wb_data;
+    //   ★★ 4c(3/3)：8 B 装载（fld）的高 4 B 与“64 bit 装载”标志
+    wire [31:0] lsu_wb_data_hi;
+    wire        lsu_wb_f64;
     wire        lsu_st_done_v;
     wire [6:0]  lsu_st_done_rob;
     wire [EW-1:0] lsu_st_done_ep;
@@ -1330,6 +1333,9 @@ module backend_top #(
     wire [63:0] lsu_fpsrc = fprf_rd[3*64 +: 64];
     wire [31:0] lsu_wdata = (u_fpls(x_i2_uop[4]) & u_is_st(x_i2_uop[4])) ?
                             lsu_fpsrc[31:0] : iprf_rd[9*32 +: 32];
+    //   ★★ 4c(3/3)：FP store 的**高 4 B**（fsd 的 64 bit 数据上半）；非 FP store 恒 0
+    wire [31:0] lsu_wdata_hi = (u_fpls(x_i2_uop[4]) & u_is_st(x_i2_uop[4])) ?
+                               lsu_fpsrc[63:32] : 32'h0;
     lsq_simple #(.DBG(DBG_LSU)) u_lsu (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w),
         .squash(squash_v_w), .squash_idx(squash_idx_w), .rob_head(rob_head_w),
@@ -1342,7 +1348,7 @@ module backend_top #(
         .exe_valid(x_i2_v[4]), .exe_is_store(u_is_st(x_i2_uop[4])),
         .exe_is_fp(u_fpls(x_i2_uop[4])),
         .exe_rob(x_i2_rob[4]), .exe_epoch(x_i2_ep[4]),
-        .exe_addr(lsu_addr), .exe_wdata(lsu_wdata),
+        .exe_addr(lsu_addr), .exe_wdata(lsu_wdata), .exe_wdata_hi(lsu_wdata_hi),
         .exe_size(x_i2_uop[4][`BACK2_U_MSIZE_MSB:`BACK2_U_MSIZE_LSB]),
         .exe_unsign(x_i2_uop[4][`BACK2_U_MUNSIGN]),
         .exe_dst_i(u_di(x_i2_uop[4])), .exe_dst_f(u_df(x_i2_uop[4])),
@@ -1373,6 +1379,7 @@ module backend_top #(
         .wb_valid(lsu_wb_v), .wb_rob(lsu_wb_rob), .wb_epoch(lsu_wb_ep),
         .wb_dst_i(lsu_wb_di), .wb_dst_f(lsu_wb_df),
         .wb_pdest_i(lsu_wb_pdi), .wb_pdest_f(lsu_wb_pdf), .wb_data(lsu_wb_data),
+        .wb_data_hi(lsu_wb_data_hi), .wb_f64(lsu_wb_f64),
         .st_done_valid(lsu_st_done_v), .st_done_rob(lsu_st_done_rob),
         .st_done_epoch(lsu_st_done_ep),
         .stq_cnt_o(dbg_stq_cnt_o), .cnt_load_o(), .cnt_store_o(), .cnt_fwd_o(),
@@ -1791,7 +1798,11 @@ module backend_top #(
     assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob - rob_head_w)} < rob_cnt_w)),
                           (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob - rob_head_w)} < rob_cnt_w)) };
     assign fprf_wa    = { u_pdf(x_i2_uop[5]), lsu_wb_pdf };
-    assign fprf_wd    = { fpu_wb_fdata, {32'hFFFF_FFFF, lsu_wb_data} };  // flw NaN-box
+    //   ★★ 4c(3/3)：**FLD 不做 NaN-box** —— 8 B 装载写满 FLEN（ISA：只有 FLW 才 box）；
+    //     ≤4 B 装载保持 NaN-box ⇒ 既有 flw/整数装载零回归。
+    assign fprf_wd    = { fpu_wb_fdata,
+                          (lsu_wb_f & lsu_wb_f64) ? {lsu_wb_data_hi, lsu_wb_data}
+                                                  : {32'hFFFF_FFFF, lsu_wb_data} };
     assign fprf_we_ep = { fpu_if_ep, lsu_wb_ep };
 
     prf #(.NW(2), .NRD(8), .NREG(`BACK2_PRF_F_N), .PDW(PW_F), .DW(64)) u_prf_f (
