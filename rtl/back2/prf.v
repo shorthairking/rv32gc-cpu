@@ -58,29 +58,26 @@ module prf #(
     //--------------------------------------------------------------------------
     // 写优先旁路：逐级条件选择（后写口优先；物理寄存器在飞项唯一 ⇒ 实际最多 1 命中）
     //--------------------------------------------------------------------------
-    genvar gr, gw;
+    //   ★★ 2B-5（时序收敛）：**去掉写优先旁路** —— 读口只输出阵列值 `mem[raddr]`。
+    //     【为什么可以去】（结构论证 + TB 绿证）
+    //       · 本后端的**操作数全在 E1 读**（`iprf_ra[0..10]` = `x_i2_uop[*]` 的 ps1i/ps2i），
+    //         而 `iq.v` 的唤醒口径是“**同拍唤醒即可选**”：生产者在第 N 拍写回
+    //         ⇒ 消费者最早在 N 拍被**选中并发射** ⇒ 它在 **N+1 拍**才进入 `x_i2` 执行
+    //         ⇒ 读到的是已在 N→N+1 沿落地的 `mem` 值 ✓（无需同拍直通）。
+    //       · 同拍发射的两条（生产者+消费者）**不可能同拍执行**：消费者若在 N 拍发射，则它的源在 N-1 拍
+    //         已就绪 ⇒ 生产者已在 ≤N-1 拍写完 ⇒ `mem` 已是新值。
+    //       · 提交读口（`iprf_ra[11..15]` / `fprf_ra[4..7]`）读的是“该指令自己写的物理寄存器 /
+    //         CSR 的 rs1”，二者都已在提交前完成写回（提交前必须 `done`），且该 preg
+    //         在本指令提交前不会被重新分配 ⇒ 直接读 `mem` 正确 ✓。
+    //     【为什么必须去】：写优先旁路把 `wdata`（= 后端写回总线 `wbi_data`）与 `rdata`
+    //       直接连通，而 `rdata` 又经 ALU/BRU 回到 `wbi_data` ⇒ **真实组合环**（Vivado 实测：
+    //       101 条 `[Synth 8-326] inferred exception to break timing loop`，全部穿 `u_prf_ii_142/rdata[*]`
+    //       与 `u_backi_163/wbi_data[*]`）⇒ 时序驱动综合阶段反复迭代、超时无产物。
+    //     【绿证】三 TB + regress 全绿（见报告 §B4.42）。
+    genvar gr;
     generate
     for (gr = 0; gr < NRD; gr = gr + 1) begin : g_rd
-        wire [PDW-1:0] ra = raddr[gr*PDW +: PDW];
-        wire [DW-1:0]  rd;
-        assign rd = mem[ra];                 // 组合读（阵列读出）
-        // 逐写口旁路（assign 逐级 mux ⇒ 纯组合，无 always@(*) 多 reg 赋值）
-        wire [NW:0] hit;
-        //   ★ 旁路链是 NW+1 级（第 0 级 = 组合读原值，第 gw 级 = 过第 gw 个写口），
-        //     因此位宽必须是 **(NW+1)*DW**；写成 NW*DW 会让末级读 `dat[NW*DW +: DW]`
-        //     取到向量外的位 ⇒ iverilog 报 "selecting after vector" 并返回 **x**
-        //     （实测：PRF 读口全 x ⇒ ALU/BRU 操作数为 x ⇒ 提交数据全 x）。
-        wire [(NW+1)*DW-1:0] dat;
-        assign hit[0] = 1'b0;
-        assign dat[0*DW +: DW] = rd;
-        for (gw = 0; gw < NW; gw = gw + 1) begin : g_byp
-            assign hit[gw+1] = hit[gw] |
-                (we[gw] & wkeep[gw] & (waddr[gw*PDW +: PDW] == ra));
-            assign dat[(gw+1)*DW +: DW] =
-                (we[gw] & wkeep[gw] & (waddr[gw*PDW +: PDW] == ra)) ? wdata[gw*DW +: DW]
-                                                                   : dat[gw*DW +: DW];
-        end
-        assign rdata[gr*DW +: DW] = dat[NW*DW +: DW];
+        assign rdata[gr*DW +: DW] = mem[raddr[gr*PDW +: PDW]];
     end
     endgenerate
 

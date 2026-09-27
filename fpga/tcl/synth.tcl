@@ -60,6 +60,14 @@ if {[info exists ::env(RV32_SYNTH_TOP)] && [string trim $::env(RV32_SYNTH_TOP)] 
 set PART       "xc7a200tfbg676-2"         ;# AGENT.md §2 平台器件
 set CLK_PERIOD_NS 16.667                  ;# 60 MHz（M4 判据②）；100 MHz 余量参考传 10.0
 set IP_MACRO   "RV32GC_USE_VIVADO_IP"     ;# 宏名真源（08 §3.3 第 3 条）
+#   ★★ 2B-5：**可选的综合指令（directive）覆盖** —— 空值 = Vivado 默认配方（**2A 基线逐字不变**）。
+#     用例：`RV32_SYNTH_DIRECTIVE=RuntimeOptimized` —— 2B 核在**默认配方**下时序驱动阶段
+#     ~100 条组合环（PRF 写透）反复迭代、超时无产物（实测 90min/4h 两轮）；该指令以运行时为优先
+#     ⇒ 可在预算内出报告。**配方差异必须在报告与日志中显式标注**，不得与 2A 默认配方数据混标。
+set SYNTH_DIRECTIVE ""
+if {[info exists ::env(RV32_SYNTH_DIRECTIVE)] && [string trim $::env(RV32_SYNTH_DIRECTIVE)] ne ""} {
+    set SYNTH_DIRECTIVE [string trim $::env(RV32_SYNTH_DIRECTIVE)]
+}
 
 # ---- 参数解析（T3 2026-09-19：周期优先，兼容旧 [part] [period] 位次）----
 #   T3 验收判据按 `... synth.tcl 16.667` 调用 ⇒ argv0 优先解释为**周期**（与
@@ -302,8 +310,13 @@ if {![info exists ::RV32_SYNTH_DEFS_ONLY]} {
         # RV32GC_USE_VIVADO_IP（见 §0），故下面一行逐字等价于任务口径：
         #     synth_design -top core_top -part xc7a200tfbg676-2 -verilog_define RV32GC_USE_VIVADO_IP
         # （约束已在上面 read_xdc ⇒ 时序驱动综合；见 §3 坑⑦）
-        puts "== synth.tcl: synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS"
-        synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS
+        puts "== synth.tcl: synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS [expr {$SYNTH_DIRECTIVE ne "" ? "-directive $SYNTH_DIRECTIVE" : ""}]"
+        if {$SYNTH_DIRECTIVE ne ""} {
+            puts "== synth.tcl: ★ 非默认配方：-directive $SYNTH_DIRECTIVE（运行时优先；报告中必须标注配方差异）"
+            synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS -directive $SYNTH_DIRECTIVE
+        } else {
+            synth_design -top $TOP -part $PART -verilog_define $IP_MACRO -include_dirs $::RV32_INC_DIRS
+        }
         puts "== synth.tcl: 宏 $IP_MACRO 已定义（综合走 Vivado IP 分支；仿真回归从不定义该宏）"
         rv32_apply_constraints
         rv32_report synth

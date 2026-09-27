@@ -5301,3 +5301,84 @@ Spike 对"**置了 fflags 的 FP 行**"会多打一段 `c1_fflags 0x…`（实�
 2. 8 B 访问的**非对齐边界**只覆盖 `va[2:0]!=0`（与 2A 同）；`va[2:0]==0` 但**未 4 B 对齐**不可能出现（8 B 对齐蕴含 4 B 对齐）。
 3. 转发仍按**单字粒度 + 字节道**合并：8 B load 与"跨字的部分覆盖 store"组合已由 p17 用例④覆盖；
    AMO 与 8 B 的组合不在本核范围（本核无 8 B AMO）。
+
+---
+
+# B4.42 2B-5 第 1 段：**PRF 写透环路消除** + `core_top_2b` 首次综合（60 MHz / RuntimeOptimized）
+
+## B4.42.1 PRF 写透环路：修法 + 三 TB 绿证
+
+**根因**（Vivado 实测，非推断）：`rtl/back2/prf.v` 的读口带**写优先旁路**
+（`rdata = 写命中 ? wdata : mem[raddr]`），而 `wdata` 来自后端写回总线 `wbi_data`，
+`rdata` 又经 ALU/BRU 回到 `wbi_data` ⇒ **真实组合环**。默认配方下 Vivado 只能自动插
+`set_false_path` 打断：实测 **101 条** `[Synth 8-326] inferred exception to break timing loop`，
+全部穿过 `u_prf_ii_142/rdata[*]` 与 `u_backi_163/wbi_data[*]` ⇒ 时序驱动阶段反复迭代、
+90 min / 4 h 两轮均超时无产物。
+
+**修法**（`rtl/back2/prf.v`，读口只出阵列值）：
+```verilog
+-        assign rdata[gr*DW +: DW] = dat[NW*DW +: DW];      // 逐写口 mux 旁路链（NW+1 级）
++        assign rdata[gr*DW +: DW] = mem[raddr[gr*PDW +: PDW]];   // 只读阵列
+```
+**为何可以去掉（结构论证）**：本后端操作数**全在 E1 读**（`iprf_ra[0..10]` = `x_i2_uop[*]` 的
+ps1i/ps2i），而 `iq.v` 的唤醒口径是"**同拍唤醒即可选**"：生产者第 N 拍写回 ⇒ 消费者最早
+第 N 拍被选中并**发射** ⇒ 它第 **N+1** 拍才进 `x_i2` 执行 ⇒ 读到的已是 N→N+1 沿落地的
+`mem` 值 ✓；同拍发射的生产者/消费者**不可能同拍执行**（消费者若在 N 发射，其源在 N-1 就绪
+⇒ 生产者在 ≤N-1 拍已写完）。提交读口（`iprf_ra[11..15]`、`fprf_ra[4..7]`）读的是
+"该指令自己写的 preg / CSR 的 rs1"，二者在提交前必已写回，且该 preg 在提交前不会被重新分配 ✓。
+
+**绿证（改后全部复跑，逐项不回退）**：
+| TB | 结果 | 日志 |
+|---|---|---|
+| `tb_back2_iq` | **151/151 PASS** | 直接运行（输出 `== 检查项合计 151 项全部满足`） |
+| `tb_back2_lockstep` | **57/57 PASS**（提交 821 条 / 5 程序） | `../.b2chk/prf_fix_lockstep.log` |
+| `tb_core_top_2b` | **219/219 PASS** | `../.b2chk/prf_fix_219.log` |
+| `./scripts/regress.sh` | **32/32 PASS** | `../.b2chk/regress_b2c28.log` |
+**效果**：综合中的 PRF 环警告 **101 → 0**（残留 7 条见 §B4.42.3，均在别的结构上）。
+
+## B4.42.2 60 MHz 综合（`core_top_2b`，**RuntimeOptimized 配方，须与 2A 默认配方区分**）
+
+* **命令**（可复现）：`RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_TAG=2b RV32_SYNTH_DIRECTIVE=RuntimeOptimized ./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667`
+  ⇒ 日志 `../.b2chk/synth_2b_60d.log`（运行 1 h 26 min，`synth60d exit=0`）；
+  产物 `fpga/out/synth_2b_16.667ns_{timing_summary,utilization,utilization_hier}.rpt` +
+  `post_synth_2b_16.667ns.dcp`（**2A 基线文件未被覆盖**）。
+* **时序**（`report_timing_summary`）：**WNS = -59.146 ns**、**TNS = -2 183 399.629 ns**、
+  **失败端点 180 206**（Hold 0 违规、PW 0 违规）⇒ 16.667 ns 约束**远未满足**。
+* **面积**（vs 2A 基线，同一 part `xc7a200tfbg676-2`）：
+  | 资源 | 2A（默认配方） | **2B（本段）** | 变化 |
+  |---|---|---|---|
+  | Slice LUTs | 53 093（**39.45%**） | **393 744（292.53%）** | **7.42×**（**超出器件**） |
+  | Slice Registers | 23 310（8.66%） | **142 259（52.85%）** | 6.10× |
+  | F7 / F8 Muxes | 1 414 / 637 | 38 903 / 14 594 | 27.5× / 22.9× |
+  | Block RAM Tile | 12（3.29%） | 19（5.21%） | 1.58× |
+  | DSPs | 34（4.59%） | 34（4.59%） | 持平 |
+  | Bonded IOB | 315 | 306 | — |
+  | 时序 WNS | **+0.556 ns（0 失败）** | **-59.146 ns（180 206 失败）** | — |
+* **面积归属**（层次报告）：`u_back`(backend_top) = **364 775 LUT（占总 92.6%）**，其中
+  `u_rob` **133 034**、`u_ren_i`+`u_ren_f` **102 723**、`u_lsu` 47 157、`u_fpu` 23 312、
+  `u_prf_i` 20 716、`u_prf_f` 6 801；核外 `u_front` 18 488、`u_tlb` 3 032、`u_csr_file` 2 703、
+  `u_l1d` 2 509、`u_plic` 216。
+
+## B4.42.3 最差路径与残留环（为第 2 段准备）
+
+* **最差路径**（`Slack -59.146 ns`）：`u_plic/threshold_r_reg[1][1]/C` →
+  `u_back/x_i2_ep_reg[1][0]/CE`；`Data Path Delay = 75.468 ns`（logic 20.052 ns = 26.57%，
+  **route 55.416 ns = 73.43%**），**逻辑级数 127**（CARRY4×19/LUT6×47/LUT5×19/LUT4×16/…）。
+  注：本轮是**综合后、未布局**（net 全标 `unplaced`）⇒ route 占比被高估、`-59 ns` 是**上界式**估计；
+  真正的结论以面积为准（见下）。第二条为大负数路径在 FPU（`u_fma_d` 内部）。
+* **残留组合环 7 条**（PRF 之外的既有结构，第 2 段宜补显式例外/改握手）：
+  `i_0/ptw_req_ready_w`（PTW ready 握手）、`u_robi_134/cmt_chain_3[0]` 与 `O3820/O3821/O3822`
+  （ROB 提交链）、`u_backi_161/disp_ok`（派发许可）。
+* **100 MHz 轮次未跑**：母代理口径是"60 MHz WNS≥0 才跑" —— 实测 WNS = **-59.146 ns < 0**
+  ⇒ 条件不满足，且面积已 292%（器件装不下），100 MHz 数据无新增信息（约省 1.5 h）。
+
+## B4.42.4 结论与第 2 段建议
+
+1. **硬阻塞 = 面积**：2B 核 **292.53% LUT**（393 744 / 134 600），**在 xc7a200t 上无法布局布线**；
+   ROB（133 k LUT，128×416 bit 载荷的全宽读出/提交链）与两份 rename（103 k）是主因 ⇒
+   第 2 段（impl）之前必须先做**架构级面积压缩**（或换更大器件）；
+2. **时序不可比性登记**：本轮用 **RuntimeOptimized**（默认配方在 PRF 环下无法在 4 h 内出报告），
+   因此 WNS/面积**不得**与 2A 的默认配方数据混标；PRF 修好后默认配方已可重跑（残留环仅 7 条），
+   第 2 段可用默认配方补一次对标数据。
+3. **可复现检查点**：RTL 修法 + 脚本参数化（`RV32_SYNTH_TOP/TAG/DIRECTIVE`）+ 报告/检查点全部落盘，
+   §B4.42.2 的命令可逐字复跑。
