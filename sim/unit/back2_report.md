@@ -5850,3 +5850,69 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
 * 走法 B 的实施顺序（内部仍分小步提交绿证）：B1 例化 4×SDP IP + ifdef 行为模型（先只做"存/取一致"自检）⇒
   B2 宽字段存储切到 BRAM（写侧塌缩，读侧暂走"整字 BRAM 动态读"？不行——同步读会错拍 ⇒ 直接连窗口）⇒
   B3 窗口 + 预取/失配气泡上线（提交接口不变）⇒ B4 窄字段从 `pl_q` 删除收尾。
+
+---
+
+# B4.51 计划 B / **B1 完成**：`rob_wide_mem`（4 bank × SDP，XPM+行为模型双分支）+ 单测自检；★并纠正合并设计的一处**写口冲突**
+
+> 检查点：新增文件**未被现设计例化** ⇒ 四套判据不受影响（`b1_219.log`：219/219 PASS）；
+> 工作树 = `rtl/back2/rob_wide_mem.v`（新）+ `sim/unit/tb_back2_rob_wide_mem.sv`（新）+ 本报告。
+
+## B4.51.1 B1 交付：`rtl/back2/rob_wide_mem.v`
+
+* **结构**：`NW=4` bank × `BW=32` 项 × `DW=416` bit（13.3 kbit/bank ⇒ 每 bank 1 个 RAMB36）；
+  **每 bank 1 写口 + 1 读口**（Simple Dual Port，同步读 1 拍），写口带 bank 内偏移 `woff`（= `idx[6:2]`），
+  读口带 `roff`。端口口径：`we/wdata`（4 lane，索引连续 ⇒ bank=idx[1:0] 天然分散，**无写冲突**）、
+  `re/roff → rdata`（同步读 1 拍）。
+* **同拍写+读口径**：`WRITE_MODE_A="read_first"`（行为模型同口径：读旧值）。本设计满足前提——
+  窗口预取读的是"已写入 ≥1 拍"的旧项，新分配项当拍不读。
+* **IP 口径（AGENT.md §4.1/§4.2）**：综合分支 `ifdef RV32GC_USE_VIVADO_IP` 例化 **`xpm_memory_sdpram`**
+  （Vivado 原生 XPM 存储 IP，**无需生成 .xci、无需改 `synth.tcl`**）；仿真分支为**逐拍等价行为模型**
+  （与 `rtl/front4/front4_mem.v` 完全同构，宏名同款）。参数/端口名逐字对齐 Vivado 2023.2 XPM 源码。
+* **自检**（`parameter CHK`，默认关 ⇒ 综合零成本；行为分支内）：写后逐位比对，覆盖 bank 边界。
+
+## B4.51.2 B1 绿证：`tb_back2_rob_wide_mem`（新增单测）
+
+| 用例 | 内容 | 结果 |
+|---|---|---|
+| T1 | 4 bank 并行写（偏移 0）→ 同步读回 | errs=0 |
+| T2 | **连续索引跨 bank**（偏移 1） | errs=0 |
+| T3 | bank 内偏移边界（31） | errs=0 |
+| T4 | **随机 200 轮**（随机 mask/地址/数据，含同步读 1 拍延迟核对） | errs=0 |
+| — | 总判定 | **TB_ROB_WIDE_MEM: PASS** |
+* 现设计回归：`tb_core_top_2b` **219/219 PASS**（`../.b2chk/b1_219.log`，新文件未被例化 ⇒ 零影响）。
+* 行为模型+参考模型比较仅针对"已写过"的位置（真实 BRAM 上电内容未定义，设计侧由 ROB 的
+  `cnt_q`/`nq` 有效性保证"不读未写项" ⇒ 单测不把"未写=X"当错误）。
+
+## B4.51.3 ★ 合并设计的一处纠正：**更新口不能也写 BRAM**（写口冲突）
+
+* 原设计（§B4.49/§B4.50）假设"4 条派发写 + 5 个字段回写（`upd_csr/upd_tr/upd_ff/upd_exc`）都进 BRAM"。
+  **做不到**：bank 化后每 bank 只有 **1 个写口**，4 条派发写（连续索引）**已占满 4 个 bank 的写口**；
+  任一 `upd_*` 若同拍落到同一 bank ⇒ 冲突，而 SDP 无第二写口（TDP 也不够：最多 2 写/实例，且 8 写/拍
+  仍不可能）。
+* ⇒ **纠正后的合并设计**：
+  1. **BRAM 只存"派发期载荷"**（4 条 lane 写、每 bank 1 次 ⇒ 天然无冲突 ✓）；
+  2. **可更新字段独立成 FF 表 `updq[128]`**（`{CSRW 32, TVAL 32, TRTGT 32, TRTAKEN 1, FFLAGS 5}` = **102 bit**
+     ⇒ 13.1 k FF），沿用现有 5 个写源（FF 阵列写法不变 ⇒ 这部分的写 mux 成本仍在：128×102×~1.5 ≈ **19.6 k LUT**）；
+  3. 消费者改接：`csr_pay`（已是单 lane 动态口）→ 读 `updq`；训练 `trtgt/trtaken` → 读 `updq`（4 lane，33 bit）；
+     头 `trap_tval` → `updq[head]`；`ff` 累积 → `updq`（4 lane × 5 bit）；`tval` 的 xRET/维护判定**已由 `nq`
+     预解码标志承担**（第 3 步②-a）⇒ 不再需要 4 lane `tval`。
+* **成本重估（纠正后）**：写侧 = BRAM 写（4 bank × 416 bit × 4:1 lane 选 ≈ **3.3 k LUT**）+ `updq` 写 mux（≈19.6 k）
+  + CE/译码 ⇒ **≈23 k**（原 ~80 k）；读侧 = 窗口 8:1（≈3 k）+ `updq` 的 128:1（132+32+20+79 ≈ 263 bit ≈ **10 k**）
+  ⇒ 合计 ≈36 k。**ROB LUT 预计 133 k → 45~60 k**（FF：`updq` 13.1 k + 窗口 3.4 k + `nq` 5.8 k；
+  BRAM +4 RAMB36）。
+
+## B4.51.4 B2/B3/B4 落地要点（下一轮照此做）
+
+* **窗口**：`win_q[0:7] × 416 bit` + 每槽 `win_idx[2:0] × 7 bit` 标签（槽号 = `idx[2:0]`，标签存全索引）
+  ⇒ 命中判定 `win_idx[idx[2:0]] == idx`；提交/陷阱/CSR/训练**全部从窗口组合读**（8:1 mux，接口与逐拍对齐不变）。
+* **预取**：每拍用**预测头** `head_pred = head_q + cmt_n_w` 发 4 个 bank 读（`head_pred[1:0]` 选 bank、
+  `head_pred[6:2]` 偏移；连续 4 项 ⇒ 4 bank 各 1 读），**1 拍后**把数据写进对应槽并打上标签；
+  `flush`/`squash` 后预测头由新 `head_q` 重新起算（同拍预取下一拍所需）。
+* **失配气泡**：`win_ok = 4 个槽标签都命中`；`commit_valid_o &= win_ok`（**绝不交付错误 PC/tval**），
+  失配拍重发预取、下一拍恢复；气泡只影响吞吐（对 TB 判据无影响，历史已证冒泡不破坏 C1'/C3'）。
+* **B4**：`pl_q` 删除可更新字段（`updq` 已接）+ 载荷重编码收尾；随后跑 60 MHz 综合
+  （`RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_TAG=2b RV32_SYNTH_DIRECTIVE=RuntimeOptimized
+  ./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667`）报 ROB LUT/BRAM/全核面积。
+* **风险登记**：XPM 分支本轮到 B1 为止**只经 iverilog 行为分支验证**，其**语法/参数合法性待 B4 的综合
+  一并验证**（若报错，按 front4_mem.v 的既有参数清单逐项比对修正）。
