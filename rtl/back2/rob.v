@@ -129,7 +129,20 @@ module rob #(
     //==========================================================================
     // 0. 存储体与指针
     //==========================================================================
-    reg  [RB_W-1:0]      pl_q  [0:ROB_N-1];
+    //   ★★ B2：`pl_q` 已删（宽载荷改由 `rob_wide_mem` 承担：写侧 128 项 mux 塔缩为每 bank 1 个 4:1 选择）
+    reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（先存全字；B4 可按 100 bit 形态收窄）
+    reg  [ROB_IDX_W-1:0] win_idx [0:7];       // 每槽 7 bit 全索引标签
+    reg                  win_val [0:7];       // 每槽有效（复位/冲刷清零）
+    reg  [ROB_IDX_W-1:0] e_of_r_q[0:3];       // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
+    //   ★★ 危险修正（p11 实测）：BRAM 为 `read_first` ⇒ "同拍被写的项，当拍读到旧值"。
+    //     若预取地址正好是本拍刚分配的项（ROB 近空：清洗后 head≈tail），窗口会被填入**旧载荷**
+    //     但标签恰好命中 ⇒ 会交付错误 PC。修法：记下**上一拍的分配索引**，填充时若命中则
+    //     **丢弃本次填充并把该槽置为无效**（下一拍重读即可）；冲刷时也全部置无效。
+    reg  [ROB_IDX_W-1:0] alloc_idx_q[0:3];
+    reg  [3:0]           alloc_idx_v_q;
+    wire [RB_W-1:0]      pl_rdata[0:3];       // 4 bank 同步读回数据
+    wire [1:0]           wsel    [0:3];       // 写轮转：bank i 对应的 lane 序号 = (i - tail[1:0]) & 3
+    wire [1:0]           rsel    [0:3];       // 读轮转：读口 i 对应的项序号 = (i - head_pred[1:0]) & 3
     //   ★★ 2B-5 第 3 步①：**窄控制表** `nq`（FF 阵列，组合读）
     //     · 收编原 `done_q` + `rep_q`（epoch）+ 提交/前缀链/排空/陷阱判定所需的控制位与索引；
     //     · **宽字段（PC/TVAL/CSRW/TRTGT/FFLAGS 等）仍在 `pl_q`**，本步不动；
@@ -216,6 +229,53 @@ module rob #(
 
     wire [ROB_IDX_W-1:0] tail_w = idx_add(head_q, cnt_q);
 
+    //==========================================================================
+    // 1.5 ★ B2/B3：BRAM 写/读轮转 + 头部窗口
+    //==========================================================================
+    //   派发 4 条 lane 索引连续（tail..tail+3），提交/预取 4 项索引也连续（head..head+3）
+    //   ⇒ 两边都是 "{0,1,2,3} 的旋转"，bank=i 的写/读只需选择对应那一项。
+    wire [ROB_IDX_W-1:0] hpred_w = idx_add(head_q, {4'b0, cmt_n_w});
+    genvar gw;
+    generate
+    for (gw = 0; gw < 4; gw = gw + 1) begin : g_rot
+        assign wsel[gw] = gw[1:0] - tail_w[1:0];
+        assign rsel[gw] = gw[1:0] - hpred_w[1:0];
+    end
+    endgenerate
+
+    //   窗口读（提交组每 lane 一个 8:1 mux）+ 命中判定
+    wire [RB_W-1:0] win_rd [0:3];
+    wire [3:0]      win_lane_ok;
+    generate
+    for (gw = 0; gw < 4; gw = gw + 1) begin : g_winrd
+        wire [ROB_IDX_W-1:0] ei = idx_add(head_q, gw[ROB_IDX_W-1:0]);
+        assign win_rd[gw]      = win_q[ei[2:0]];
+        assign win_lane_ok[gw] = win_val[ei[2:0]] & (win_idx[ei[2:0]] == ei);
+    end
+    endgenerate
+
+    //   BRAM 实例（B1 交付的模块：4 bank × SDP，同步读）
+    wire [3:0]        bw_we;
+    wire [4*5-1:0]    bw_woff, bw_roff;
+    wire [4*RB_W-1:0] bw_wdata, bw_rdata;
+    generate
+    for (gw = 0; gw < 4; gw = gw + 1) begin : g_bw
+        //   （函数返回值不能直接做位选（iverilog）⇒ 先存临时线）
+        wire [ROB_IDX_W-1:0] wt = idx_add(tail_w,  {{5{1'b0}}, wsel[gw]});
+        wire [ROB_IDX_W-1:0] rt = idx_add(hpred_w, {{5{1'b0}}, rsel[gw]});
+        assign bw_we[gw]   = alloc_fire & alloc_lane_valid[wsel[gw]] & (wsel[gw] < alloc_n);
+        assign bw_woff[gw*5 +: 5] = wt[ROB_IDX_W-1:2];
+        assign bw_wdata[gw*RB_W +: RB_W] = alloc_payload[wsel[gw]*RB_W +: RB_W];
+        assign bw_roff[gw*5 +: 5] = rt[ROB_IDX_W-1:2];
+        assign pl_rdata[gw] = bw_rdata[gw*RB_W +: RB_W];
+    end
+    endgenerate
+
+    rob_wide_mem #(.NW(4), .BW(32), .DW(RB_W), .AW(ROB_IDX_W), .OW(5), .CHK(0)) u_wmem (
+        .clk(clk), .rst_n(rst_n),
+        .we(bw_we), .woff(bw_woff), .wdata(bw_wdata),
+        .re(4'hF),  .roff(bw_roff), .rdata(bw_rdata));
+
     // 提交链（先算，用于同拍释放余量）
     wire [COMMIT_W-1:0] slot_in_range;
     wire [COMMIT_W-1:0] slot_done;
@@ -242,7 +302,9 @@ module rob #(
         assign slot_exc[gi]      = |nq[slot_idx[gi]][NQ_EXC_L +: 4];
         assign slot_store[gi]    = nq[slot_idx[gi]][NQ_STORE];
         assign slot_st_ok[gi]    = ~slot_store[gi] | mem_wr_ready;
-        assign slot_ok[gi]       = slot_in_range[gi] & slot_done[gi] & ~slot_exc[gi] & slot_st_ok[gi];
+        //   ★ B3：窗口未命中 ⇒ 本 lane 不可提交（插一拍气泡；**绝不交付错误 PC/tval**）
+        assign slot_ok[gi]       = slot_in_range[gi] & slot_done[gi] & ~slot_exc[gi] & slot_st_ok[gi]
+                                 & win_lane_ok[gi];
     end
     endgenerate
 
@@ -285,7 +347,7 @@ module rob #(
     //==========================================================================
     generate
     for (gi = 0; gi < COMMIT_W; gi = gi + 1) begin : g_cmtout
-        assign cmt_payload[gi*RB_W +: RB_W] = merge_upd(pl_q[slot_idx[gi]], updq[slot_idx[gi]]);
+        assign cmt_payload[gi*RB_W +: RB_W] = merge_upd(win_rd[gi], updq[slot_idx[gi]]);
         assign cmt_narrow[gi*NQ_W +: NQ_W]  = nq[slot_idx[gi]];
         assign cmt_st_drain[gi] = cmt_chain[gi] & slot_store[gi];
         assign cmt_st_ckpt[gi]  = cmt_chain[gi] & nq[slot_idx[gi]][NQ_CKV];
@@ -294,8 +356,8 @@ module rob #(
     endgenerate
 
     // 异常：仅当该槽已完成且为头部（slot 0）
-    assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0];
-    assign trap_pc    = pl_q[slot_idx[0]][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB];
+    assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0] & win_lane_ok[0];
+    assign trap_pc    = win_q[slot_idx0[2:0]][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB];
     assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
     assign trap_tval  = updq[slot_idx[0]][`BACK2_UPD_TVAL_LSB +: 32];
 
@@ -305,8 +367,8 @@ module rob #(
     //   ★ ② CSR 提交合成**单 lane 动态读口**：只读被选中的那一项（而非 4 lane 全读）
     assign csr_pay = { updq[csr_lane_idx][`BACK2_UPD_TVAL_LSB +: 32],
                        updq[csr_lane_idx][`BACK2_UPD_CSRW_LSB +: 32],
-                       pl_q[csr_lane_idx][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB],
-                       pl_q[csr_lane_idx][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB] };
+                       win_q[csr_lane_idx[2:0]][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB],
+                       win_q[csr_lane_idx[2:0]][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB] };
 
     assign head_o      = head_q;
     assign cnt_o       = cnt_q;
@@ -326,8 +388,13 @@ module rob #(
             cnt_q     <= {(ROB_IDX_W+1){1'b0}};
             cmt_cnt_q <= 32'h0;
             epoch_q   <= {`BACK2_EPOCH_W{1'b0}};
+            for (k = 0; k < 8; k = k + 1) begin
+                win_q[k]   <= {RB_W{1'b0}};
+                win_idx[k] <= {ROB_IDX_W{1'b0}};
+                win_val[k] <= 1'b0;
+            end
+            for (k = 0; k < 4; k = k + 1) e_of_r_q[k] <= {ROB_IDX_W{1'b0}};
             for (k = 0; k < ROB_N; k = k + 1) begin
-                pl_q[k]   <= {RB_W{1'b0}};
                 nq[k]     <= {NQ_W{1'b0}};
                 updq[k]   <= {`BACK2_UPDQ_W{1'b0}};
             end
@@ -336,7 +403,6 @@ module rob #(
             if (alloc_fire) begin
                 for (k = 0; k < COMMIT_W; k = k + 1) begin
                     if (alloc_lane_valid[k] & (k < alloc_n)) begin
-                        pl_q[idx_add(tail_w, k[ROB_IDX_W:0])]   <= alloc_payload[k*RB_W +: RB_W];
                         if (DBG_CSR) $display("[rob-alloc t=%0t] k=%0d idx=%0d pay_csrw=0x%08x", $time, k, idx_add(tail_w, k[ROB_IDX_W:0]), alloc_payload[k*RB_W + `BACK2_RB_CSRW_MSB -: 32]);
                         nq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
                             pack_nq(alloc_payload[k*RB_W +: RB_W], alloc_epoch, 1'b0,
@@ -378,8 +444,33 @@ module rob #(
                 updq[upd_exc_idx][`BACK2_UPD_TVAL_LSB +: 32] <= upd_exc_tval;
             end
 
+            // ---- 5.35 ★ B3：头部窗口填充（上一拍发出的预取读在本拍到达）----
+            //   读口 i 对应项 `e_of_r_q[i]`（上一拍的 head_pred 算出）⇒ 写入槽 `[2:0]`、打全索引标签、置有效。
+            for (k = 0; k < 4; k = k + 1) begin
+                //   危险判定：该项是否在“读命令发出的那一拍”刚好被分配写入
+                if (alloc_idx_v_q[0] & (alloc_idx_q[0] == e_of_r_q[k]) |
+                    alloc_idx_v_q[1] & (alloc_idx_q[1] == e_of_r_q[k]) |
+                    alloc_idx_v_q[2] & (alloc_idx_q[2] == e_of_r_q[k]) |
+                    alloc_idx_v_q[3] & (alloc_idx_q[3] == e_of_r_q[k])) begin
+                    if (win_val[e_of_r_q[k][2:0]] & (win_idx[e_of_r_q[k][2:0]] == e_of_r_q[k]))
+                        win_val[e_of_r_q[k][2:0]] <= 1'b0;      // 旧内容不可用 ⇒ 置无效
+                end else begin
+                    win_q  [e_of_r_q[k][2:0]] <= pl_rdata[k];
+                    win_idx[e_of_r_q[k][2:0]] <= e_of_r_q[k];
+                    win_val[e_of_r_q[k][2:0]] <= 1'b1;
+                end
+            end
+            //   预取地址打拍（下一拍用它给读回的数据定标签）
+            for (k = 0; k < 4; k = k + 1) e_of_r_q[k] <= idx_add(hpred_w, {{5{1'b0}}, rsel[k]});
+            //   记下本拍分配的索引（下一拍用于上面的危险判定）
+            for (k = 0; k < 4; k = k + 1) begin
+                alloc_idx_q[k]   <= idx_add(tail_w, k[ROB_IDX_W-1:0]);
+                alloc_idx_v_q[k] <= alloc_fire & alloc_lane_valid[k] & (k < alloc_n);
+            end
+
             // ---- 5.4 指针推进（提交 / 冲刷 / 分配）----
             if (flush_all) begin
+                for (k = 0; k < 8; k = k + 1) win_val[k] <= 1'b0;   // ★ 冲刷后窗口不可信
                 cnt_q   <= {(ROB_IDX_W+1){1'b0}};
                 //   ★ 陷阱退役：头部异常项**弹出**（其余全清）；否则只清 cnt（原口径）
                 head_q  <= trap_retire ? idx_add(head_q, {{ROB_IDX_W-1{1'b0}}, 1'b1})
@@ -400,17 +491,30 @@ module rob #(
 
     //   ★ 2B-5 第 3 步①自检：窄表与宽载荷的共用字段必须**逐位一致**
     //     （迁移期双写；任何漏写/写错位置都会在此报出）。默认关（综合零成本）。
+    //   ★ B2 后自检口径：宽载荷已入 BRAM，改在**预取填充拍**对比：
+    //     读回的载荷拼出的窄字段 必须等于 `nq`（掩掉由 `upd_exc` 写的 `exc[3:0]`）。
     integer nk;
     reg [NQ_W-1:0] nq_chk;
     always @(posedge clk) begin
         if (DBG_CSR && rst_n) begin
-            for (nk = 0; nk < ROB_N; nk = nk + 1) begin
-                //   函数返回值不能直接做位选（iverilog）⇒ 先存临时变量
-                nq_chk = pack_nq(merge_upd(pl_q[nk], updq[nk]), nq[nk][NQ_EP_L +: `BACK2_EPOCH_W], 1'b0, nq[nk][NQ_MK_L +: 5]);
-                //   `exc[3:0]` 由 `upd_exc` 写入 `nq`（载荷里的对应位已不再写）⇒ 比对时掩掉该 4 bit
-                if ((nq[nk][NQ_W-1:NQ_EXC_L+4] !== nq_chk[NQ_W-1:NQ_EXC_L+4]) ||
-                    (nq[nk][NQ_EXC_L-1:1]    !== nq_chk[NQ_EXC_L-1:1]))
-                    $display("ROB-NQ-CHK MISMATCH: idx=%0d nq=0x%011x pl=0x%011x", nk, nq[nk], nq_chk);
+            for (nk = 0; nk < 4; nk = nk + 1) begin
+                //   仅在"本拍真的可用"时比对：
+                //     ① 该索引不是本拍/上拍刚分配的（read_first 会读到旧值）
+                //     ② 该项在 ROB 当前范围内（否则读到的是无效位）
+                //     ③ `trtaken` 与 `exc` 由 `upd_tr/upd_exc` 写入 `nq`（载荷侧不再更新）⇒ 掩掉
+                if (!(alloc_idx_v_q[0] & (alloc_idx_q[0] == e_of_r_q[nk]) |
+                      alloc_idx_v_q[1] & (alloc_idx_q[1] == e_of_r_q[nk]) |
+                      alloc_idx_v_q[2] & (alloc_idx_q[2] == e_of_r_q[nk]) |
+                      alloc_idx_v_q[3] & (alloc_idx_q[3] == e_of_r_q[nk])) &&
+                    (((e_of_r_q[nk] - head_q) & 7'h7F) < cnt_q)) begin
+                    nq_chk = pack_nq(pl_rdata[nk], nq[e_of_r_q[nk]][NQ_EP_L +: `BACK2_EPOCH_W], 1'b0,
+                                     nq[e_of_r_q[nk]][NQ_MK_L +: 5]);
+                    if ((nq[e_of_r_q[nk]][NQ_W-1:NQ_TRT+1]   !== nq_chk[NQ_W-1:NQ_TRT+1]) ||
+                        (nq[e_of_r_q[nk]][NQ_TRT-1:NQ_EXC_L+4] !== nq_chk[NQ_TRT-1:NQ_EXC_L+4]) ||
+                        (nq[e_of_r_q[nk]][NQ_EXC_L-1:1]        !== nq_chk[NQ_EXC_L-1:1]))
+                        $display("ROB-NQ-CHK MISMATCH: idx=%0d nq=0x%011x pay=0x%011x",
+                                 e_of_r_q[nk], nq[e_of_r_q[nk]], nq_chk);
+                end
             end
         end
     end

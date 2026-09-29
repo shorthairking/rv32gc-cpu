@@ -6092,3 +6092,66 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
 | `regress.sh` | **33/33 PASS**（`regress_b2c41_nqread_deep.log`） | **33/33 PASS**（`regress_b2c42_nqread_shallow.log`） |
 | 窄/宽一致性自检 | 在 regress 内的 219 上仍 0 失配 | — |
 * 编译零错误；工作树 = `rtl/back2/backend_top.v`（快照 `../.b2chk/backend_top.v.pre_nqread`）+ 本报告。
+
+---
+
+# B4.55 ★ B2 本体 + B3 **落地完成**：ROB 宽载荷入 BRAM + 头部窗口（预取/失配气泡）+ 侦破 read_first 同址危险
+
+> 检查点：**深/浅双配置全绿**（深 219/219 + iq 151 + lockstep 57 + regress **33/33**；浅 219/219 + regress **33/33**）
+> + **一致性自检 0 失配**（填充拍比对，强制打开跑完整 219）；工作树 = `rtl/back2/rob.v`（+ 本报告）。
+
+## B4.55.1 接线 diff（`rtl/back2/rob.v`）
+
+* **存储切换（B2）**：删除 `reg [RB_W-1:0] pl_q [0:ROB_N-1]`，改由 **`rob_wide_mem`**
+  （B1 交付；4 bank × 32 × 416，SDP 同步读）承担派发期载荷：
+  - **写口**：`bw_we[i] = alloc_fire & alloc_lane_valid[wsel[i]] & (wsel[i] < alloc_n)`，
+    `wsel[i] = i - tail[1:0]`（bank i 对应的 lane 序号）、`bw_woff[i] = (tail + wsel[i])[6:2]`、
+    `bw_wdata[i] = alloc_payload[wsel[i]*RB_W +: RB_W]` ⇒ **每 bank 每拍 1 次写、无仲裁**；
+  - 128 项的每表项写 mux 塔（含 4 条 lane 的数据选择）随之消失，只剩每 bank 一次 4:1 选择。
+* **头部窗口（B3）**：`win_q[0:7] × 416 bit` + `win_idx[0:7] × 7 bit`（全索引标签）+ `win_val[0:7]`；
+  槽号 = `idx[2:0]`；命中判定 `win_lane_ok[gi] = win_val[h+gi][2:0] & (win_idx[…]==h+gi)`；
+  提交侧读源改为窗口：`cmt_payload[gi] = merge_upd(win_rd[gi], updq[slot_idx[gi]])`、
+  `csr_pay` 的 `csra/csrop` 取 `win_q[csr_lane_idx[2:0]]`、`trap_pc = win_q[head[2:0]][PC]`。
+* **预取**：`hpred = head_q + cmt_n_w`；读口 i 读 bank i，其项序号 `rsel[i] = i - hpred[1:0]`、
+  偏移 `(hpred + rsel[i])[6:2]`；返回数据在**下一拍**按 `e_of_r_q[i]`（打拍后的项索引）写入槽并打标签/置有效。
+* **失配气泡**：`slot_ok[gi] &= win_lane_ok[gi]` ⇒ `cmt_chain` 全 0 ⇒ `commit_valid_o = 0`
+  （**绝不交付错误 PC/tval**），失配拍照发预取、下一拍恢复；`trap_valid` 另加 `win_lane_ok[0]` 门控；
+  `flush_all` 额外把 `win_val[*]` 全清。
+* **自检口径迁移**：`pl_q` 已删 ⇒ 自检改为**填充拍比对**：
+  `pack_nq(pl_rdata[i], …)`（BRAM 读回载荷 ⇒ 窄字段）必须等于 `nq[e_of_r_q[i]]`，
+  掩掉由 `upd_exc/upd_tr` 写的 `exc[6:3]`/`trtaken[34]`，并且仅在"该索引非本拍/上拍刚分配"
+  且"在 ROB 当前范围内"时比对（否则读到的本就是无效/旧值）。
+
+## B4.55.2 ★ 侦破并修复：`read_first` 的"同址同拍读写"危险（p11 实测）
+
+* **现象**：首版实现 219 在 程序 7（p11，维护/fence.i 密集）第 16 条 C1' 失败：
+  DUT PC `0x8001c02c` vs 黄金 `0x8001c040` ⇒ **窗口以"命中"状态交付了旧载荷**。
+* **机制**：`rob_wide_mem` 是同步读 + `read_first`（同址同拍读**旧值**）。当 ROB 近空
+  （陷阱/维护冲刷后 `head≈tail`）时，预取地址正好命中**当拍刚被分配写入**的项 ⇒ 读回该项
+  **上一次占用时的旧载荷**，而标签（全索引）恰好等于该项索引 ⇒ 命中判定成立 ⇒ 交付错 PC。
+* **修法（两层）**：①记下**上一拍的分配索引** `alloc_idx_q/alloc_idx_v_q`（4 项），填充时若
+  `e_of_r_q[k]` 命中其中任一项 ⇒ **丢弃本次填充**，并把该槽已有的同索引内容**置无效**
+  （`win_val <= 0`），下一拍重读即可；②`flush_all` 拍把 `win_val[*]` 全清。
+* 修复后 219 全绿（深/浅双配置）+ lockstep/regress 全绿 ⇒ 该危险已被关闭；
+  **结论：BRAM 化的窗口方案必须带"分配冲突丢弃 + 冲刷失效"两道保护**（已写入实现）。
+
+## B4.55.3 绿证
+
+| 判据 | 深配置（主 16/16/8/8/12/8） | 浅配置（基线 8/8/8/8/8/8） |
+|---|---|---|
+| `tb_core_top_2b` | **219/219 PASS**（`b2fix_219.log`） | **219/219 PASS**（`b2_shallow_219.log`） |
+| `tb_back2_iq` / `tb_back2_lockstep` | **151/151** / **57/57 PASS**（`b2_lockstep.log`） | 由浅 regress 覆盖 ✓ |
+| `regress.sh` | **33/33 PASS**（`regress_b2c43_b2_deep.log`） | **33/33 PASS**（`regress_b2c44_b2_shallow.log`） |
+| 一致性自检（填充拍，强制开） | **0 MISMATCH**（`b2_checker_final.log`，同轮 219/219） | — |
+* 编译零错误；`back2_params.vh` 已回深配置；2A 零修改；未提交。
+
+## B4.55.4 遗留（下一步）
+
+1. **短综合探针 + 完整 60 MHz 综合未跑**（预算见底）：须先跑 `RV32_SYNTH_TAG=2bprobe` 暴露
+   **XPM 分支**的参数/端口问题（B1 起只经 iverilog 行为分支验证），再跑完整 60 MHz
+   （`RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_TAG=2b RV32_SYNTH_DIRECTIVE=RuntimeOptimized`）
+   报 **ROB LUT（对比 133 k）/BRAM（对比 19）/全核面积**。
+2. **B4 收尾**：窗口按 §B4.53.1 的 **100 bit 位图**收窄（当前存全 416 bit，8 槽 = 3.3 k FF，
+   收窄后 ≈0.8 k FF）；`pl_q` 关联的窄字段（`nq` 已接管）在 BRAM 载荷中的冗余位可一并重编码。
+3. 性能观察：窗口失配会插气泡；本轮 219/lockstep 的**提交条数未变化**（lockstep 提交 821 条/5 程序），
+   说明常规路径几乎不失配。
