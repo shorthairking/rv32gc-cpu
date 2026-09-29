@@ -5975,3 +5975,120 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
    轮转写回对应槽并打标签）；`flush/squash` 后按新 `head_q` 重起算；
 4. 失配气泡：`win_ok =` 4 槽标签全命中 ⇒ `slot_ok[gi] &= win_lane_ok[gi]`（**绝不交付错误 PC/tval**）；
 5. 之后跑 60 MHz 综合（RuntimeOptimized 同配方）报 ROB LUT/BRAM/全核面积。
+
+---
+
+# B4.53 B2 本体 + B3：**实施规格定稿（可照抄落地）**——本轮未开工（预算见底，停在绿点）
+
+> 检查点：与 `ea02282` 一致（仅本报告）；深/浅双配置全绿 + 自检 0 失配（§B4.52.3）。
+> 本节把 §B4.52.4 的 5 条落成**逐字段位图 + 轮转表 + 时序协议 + 逐处改动清单**，
+> 使下一轮可以机械照做，不需要再设计。
+
+## B4.53.1 窗口字段位图（`WIN_W = 81` bit，均为**不可更新**字段）
+
+| WIN 位 | 来源（载荷位） | 字段 |
+|---|---|---|
+| `[31:0]` | `[265:234]` | `pc` |
+| `[34:32]` | `[26:24]` | `cls`（分支类别；训练判 cond/call/ret/ind） |
+| `[38:35]` | `[269:266]` | `{pred_taken, pred_selg, pred_gdir, pred_ldir}` |
+| `[40:39]` | `[271:270]` | `{btb_hit, btb_way}` |
+| `[67:41]` | `[201:170]` | `predtgt`（27 bit） |
+| `[74:68]` | `[125:119]` | `pdio`（整数旧映射，提交释放用） |
+| `[80:75]` | `[112:107]` | `pdfo`（浮点旧映射） |
+* 其余提交侧所需字段来源：窄控制 → `nq`（已就位）；`csrw/tval/trtgt/trtaken/ff` → `updq`（已就位）；
+  `csra/csrop`（不可更新但仅 CSR lane 单 lane 读）→ 继续走 `csr_pay` 的单 lane 动态口（读 `pl_q` 的
+  该 lane 的 2 个小字段，128:1 × 15 bit，代价极小，**可不入窗口**）。
+* ⇒ `cmt_payload[gi]`（416 bit/ lane，供 `backend_top` 一行不改）按"窗口 81 bit + `updq` 102 bit +
+  `nq` 窄位 + `csra/csrop` 单 lane"**重组**（纯布线，无 mux）。
+
+## B4.53.2 预取轮转表（4 bank × 1R ⇒ 每拍最多 4 个新项）
+
+* `head_pred = head_q + cmt_n_w`（当拍提交条数，来自既有 `cmt_n_w`）。
+* 要预取 4 项：`e_j = head_pred + j`（`j=0..3`），其 bank `b_j = e_j[1:0]`，偏移 `o_j = e_j[6:2]`。
+  因为 `e_j` 连续 ⇒ `{b_0,b_1,b_2,b_3}` 是 `{0,1,2,3}` 的一个**旋转**（由 `head_pred[1:0]` 决定）。
+* **读口映射**：读口 `i` 只连 bank `i` ⇒ 送 `roff[i] = o_j where b_j == i` ⇒ `roff[i] = (head_pred + ((i - head_pred[1:0]) & 3))[6:2]`
+  （实现：4 个 2 bit 轮转 + 4 个 5 bit 选择，纯组合）；返回 `rdata[i]` 即 `e_j`（`b_j == i`）的载荷。
+* **写槽映射**：`win_q[e_j[2:0]] <= rdata[i]`（`b_j == i`）⇒ 4 条赋值，`win_idx[e_j[2:0]] <= e_j`。
+  （同一个 `idx[2:0]` 槽在 8 项窗口内唯一 ✓；`win_idx` 存**7 bit 全索引**用于命中判定。）
+* **起算点**：`flush_all` ⇒ 用 `head_q`（冲刷后的头）重算；`squash_valid` ⇒ 用 `squash_idx - head_q` 后的
+  新 `head_q`（下一拍生效）重算；两者当拍即按"下一拍的头"发预取 ⇒ 不额外掉拍。
+
+## B4.53.3 时序协议（命中 / 失配 / 气泡）
+
+```
+周期 N   : 提交决策（nq 组合）→ 需要 win 的 81 bit + updq 的 102 bit
+           · win_ok(N) = (win_idx[h[2:0]]==h) & (win_idx[(h+1)[2:0]]==h+1) & ... (4 槽)
+           · win_lane_ok[gi] = (win_idx[(h+gi)[2:0]] == h+gi)
+           · slot_ok[gi] &= win_lane_ok[gi]      // 失配 ⇒ 该 lane 不可提交（整组冒泡）
+           · 同拍发下一次预取（head_pred = h + cmt_n_w）→ 数据在 N+1 落地
+周期 N+1 : 预取数据写入 win_q/win_idx ⇒ win_ok 恢复 ⇒ 提交继续
+```
+* **绝不交付错误数据**：`commit_valid_o`（=`cmt_chain`，由 `slot_ok` 派生）在失配拍为 0 ⇒ 对外
+  `commit_pc_o`/`commit_arch_rd_wdata_o` 等只在与 `commit_valid_o` 同拍有效时被采样（TB 口径如此）
+  ⇒ 失配拍不会有任何提交被"上报"，**PC/tval 不可能错**。气泡只影响吞吐。
+* 最坏情形（每拍提交 4 条 + 每拍冲刷交替）每事件损失 ≤1 拍；`flush/squash` 后 1 拍内窗口重建完成
+  （预取当拍发出）。
+* `cnt_q`/`slot_in_range` 语义不变（窗口只影响"数据是否就绪"，不影响范围判定）。
+
+## B4.53.4 逐处改动清单（`rtl/back2/rob.v`，按当前行号锚定）
+
+1. `pl_q` 声明 → 保留为**仅派发写**的 FF（本轮先不动存储本体，只切**读**来源为窗口；
+   下一步再把它整体换成 `rob_wide_mem` —— 这样每步都可独立验证绿）；
+   ★ 或**一步到位**：删 `pl_q`、例化 `rob_wide_mem`（`.we(alloc 命中 per bank)`、`.woff(tail[6:2] 轮转)`、
+   `.wdata(alloc_payload 轮转)`）+ `win_q[8]×81` / `win_idx[8]×7` / 预取读口。
+2. 新增窗口/标签/预取逻辑（§B4.53.1–3）。
+3. `cmt_payload[gi]` 组装改为"窗口 + `updq` + `nq` + `csra/csrop` 单 lane"。
+4. `slot_ok[gi] &= win_lane_ok[gi]`（一行）；`trap_*` 增加 `win_lane_ok[0]` 门控（`trap_valid` 已由
+   `slot_ok[0]` 派生 ⇒ 自动门控 ✓ 复核一次即可）。
+5. 自检块（`DBG_CSR` 门控）扩一条：窗口命中时 `win_q` 的 81 bit 必须等于 `merge_upd(pl_q/BRAM, updq)`
+   的对应位（迁移期双源一致性）。
+6. `rob_wide_mem` 例化（第 1 步到位时）：`.DW(416)`、`NW=4`、`BW=32`；写口 `we[i] = alloc_fire & lane j 存在 & (tail+j)[1:0]==i`。
+7. 回归：深/浅双配置四套判据 + 自检 0 失配 + `tb_back2_rob_wide_mem`（已在 regress 中）。
+
+## B4.53.5 风险与建议
+
+* **XPM 分支仍未过 Vivado**（B1 只经 iverilog 行为分支）：建议本轮改动落地后**先跑一次短综合**
+  （可只跑到 `synth_design` 阶段，用 `RV32_SYNTH_TAG=2bprobe`）以尽早暴露 XPM 参数/端口问题，
+  再跑完整 60 MHz 计时报告。
+* **建议分两步（风险最小）**：⑧-1 只做"窗口 + 预取 + 失配门控"，读源仍含 `pl_q`（**功能绿证**，
+  面积中性，§B4.50.1）；⑧-2 再把 `pl_q` 换成 `rob_wide_mem`（**面积兑现**）。理由：窗口/预取/气泡
+  是**语义改动**（可能引出新冒泡/边界问题），存储替换是**资源改动**（语义等价）；分开做能把
+  "语义 bug"与"资源 bug"的排查面各减一半。本轮预算见底，未开工。
+
+---
+
+# B4.54 B2/B3 第②-b 步（**零风险读源改造**）：窄字段改吃 `cmt_narrow`，宽载荷这 132 bit 的读 mux 消失
+
+> 检查点：深 219/219（`../.b2chk/nqread_219.log`）+ regress（见 §B4.54.3）+ 浅配置 219/regress；
+> `backend_top` 单文件改动（+`rob.v` 未动）。
+
+## B4.54.1 diff（`rtl/back2/backend_top.v`）
+
+* **提交组窄消费者改源**（`g_cmt` 生成块，原 `p_di/p_df/p_arn/p_pdi/p_pdf` 读 `cmt_pay`）：
+  新增 `wire [NQ_W-1:0] pn = cmt_narrow[cc*NQ_W +: NQ_W];`，
+  `commit_arch_rd_o / commit_arch_we_o / commit_arch_rd_wdata_o / cmt_i_we / cmt_i_arn / cmt_i_pd /
+   cmt_f_we / cmt_f_arn / cmt_f_pd / rel_i_we / rel_f_we` 一律改吃 `pn[...]`
+  （`BACK2_NQ_{DI,DF,ARN_L,PDI_L,PDF_L}`）。
+* **提交级 PRF 读地址**（`iprf_ra[11..14] = p_pdi(cmt_pay[…])`、`fprf_ra[4..7] = p_pdf(cmt_pay[…])`）
+  同样改吃 `cmt_narrow[…]`。
+* 保留仍读宽字的项：`commit_pc_o`（`p_pc`）、`rel_i_pd/rel_f_pd`（`p_pdio/p_pdfo`，**不在 `nq`**）、
+  `cmt0_tval`（在 `updq`）、训练块（`cls/pred/btb/predtgt/trtgt`）、RAS（`p_cls`）、
+  检查点释放（`p_ckid`）——这些属 ③ 窗口/B4 的范围。
+
+## B4.54.2 收益
+
+* **读侧**：`di/df/arn/pdi/pdf`（20 bit）× 4 lane = **80 bit**，加提交级 PRF 读地址复用
+  （`pdi/pdf` 13 bit × 4 = **52 bit**）⇒ **132 bit 的 128:1 读 mux 消失**（≈ 5 k LUT）。
+* **存储/写侧**：这 20 bit 在宽载荷里**不再被读** ⇒ Vivado 裁掉对应存储（128×20 = 2.5 k FF）
+  与其派发写 mux（≈ 128×20×0.8 ≈ 2 k LUT）⇒ 合计 **≈ 7 k LUT + 2.5 k FF**（保守估计）。
+* **零语义风险**：`nq` 与宽载荷的这 20 bit 由同一 `pack_nq(alloc_payload…, alloc_pre…)` 写入，
+  且既有**窄/宽一致性自检**（`DBG_CSR` 门控）逐位比对它们 ⇒ 读源切换不可能改值（本轮自检仍 0 失配）。
+
+## B4.54.3 绿证
+
+| 判据 | 深配置（主） | 浅配置（基线） |
+|---|---|---|
+| `tb_core_top_2b` | **219/219 PASS**（`nqread_219.log`） | **219/219 PASS**（`nqread_shallow_219.log`） |
+| `regress.sh` | **33/33 PASS**（`regress_b2c41_nqread_deep.log`） | **33/33 PASS**（`regress_b2c42_nqread_shallow.log`） |
+| 窄/宽一致性自检 | 在 regress 内的 219 上仍 0 失配 | — |
+* 编译零错误；工作树 = `rtl/back2/backend_top.v`（快照 `../.b2chk/backend_top.v.pre_nqread`）+ 本报告。

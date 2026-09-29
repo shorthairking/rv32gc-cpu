@@ -1529,23 +1529,27 @@ module backend_top #(
     generate
     for (cc = 0; cc < COMMIT_W; cc = cc + 1) begin : g_cmt
         wire [RB_W-1:0] p = cmt_pay[cc*RB_W +: RB_W];
+        //   ★★ 2B-5 第 3 步②-b：**窄字段改吃 `cmt_narrow`**（第 1 步已导出）。
+        //     `di/df/arn/pdi/pdf` 均在 `nq`（FF 窄表、组合读）⇒ 宽载荷的这些位**不再被读**，
+        //     Vivado 可相应裁掉其 128:1 读 mux 与存储（存储/mux 均只保留 `nq` 一份）。
+        wire [`BACK2_NQ_W-1:0] pn = cmt_narrow[cc*`BACK2_NQ_W +: `BACK2_NQ_W];
         assign commit_valid_o[cc] = cmt_raw_m[cc] & cmt_ok;
         assign commit_pc_o[cc*32 +: 32] = p_pc(p);
-        assign commit_arch_rd_o[cc*5 +: 5] = p_arn(p);
-        assign commit_arch_we_o[cc] = p_di(p) | p_df(p);
+        assign commit_arch_rd_o[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
+        assign commit_arch_we_o[cc] = pn[`BACK2_NQ_DI] | pn[`BACK2_NQ_DF];
         wire [63:0] cval_f = fprf_rd[(4+cc)*64 +: 64];
         assign commit_arch_rd_wdata_o[cc*32 +: 32] =
-            p_di(p) ? iprf_rd[(11+cc)*32 +: 32] :
-            p_df(p) ? cval_f[31:0] : 32'h0;
-        assign cmt_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_di(p);
-        assign cmt_i_arn[cc*5 +: 5] = p_arn(p);
-        assign cmt_i_pd[cc*PW_I +: PW_I] = p_pdi(p);
-        assign rel_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_di(p);
+            pn[`BACK2_NQ_DI] ? iprf_rd[(11+cc)*32 +: 32] :
+            pn[`BACK2_NQ_DF] ? cval_f[31:0] : 32'h0;
+        assign cmt_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DI];
+        assign cmt_i_arn[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
+        assign cmt_i_pd[cc*PW_I +: PW_I] = pn[`BACK2_NQ_PDI_L +: PW_I];
+        assign rel_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DI];
         assign rel_i_pd[cc*PW_I +: PW_I] = p_pdio(p);
-        assign cmt_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
-        assign cmt_f_arn[cc*5 +: 5] = p_arn(p);
-        assign cmt_f_pd[cc*PW_F +: PW_F] = p_pdf(p);
-        assign rel_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
+        assign cmt_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DF];
+        assign cmt_f_arn[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
+        assign cmt_f_pd[cc*PW_F +: PW_F] = pn[`BACK2_NQ_PDF_L +: PW_F];
+        assign rel_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DF];
         assign rel_f_pd[cc*PW_F +: PW_F] = p_pdfo(p);
         //   ★★ 4b-2c(2/2) 根因修复：**维护/陷阱/xRET 的整机冲刷不得抑制"更老 store"
         //     的 CDQ 排空入队**（否则已提交写静默丢失——实测 p13：PTE 更新 store 与紧随的
@@ -1796,10 +1800,10 @@ module backend_top #(
     assign iprf_ra[8*PW_I +: PW_I]  = u_ps1i(x_i2_uop[4]);
     assign iprf_ra[9*PW_I +: PW_I]  = u_ps2i(x_i2_uop[4]);
     assign iprf_ra[10*PW_I +: PW_I] = u_ps1i(x_i2_uop[5]);
-    assign iprf_ra[11*PW_I +: PW_I] = p_pdi(cmt_pay[0*RB_W +: RB_W]);
-    assign iprf_ra[12*PW_I +: PW_I] = p_pdi(cmt_pay[1*RB_W +: RB_W]);
-    assign iprf_ra[13*PW_I +: PW_I] = p_pdi(cmt_pay[2*RB_W +: RB_W]);
-    assign iprf_ra[14*PW_I +: PW_I] = p_pdi(cmt_pay[3*RB_W +: RB_W]);
+    assign iprf_ra[11*PW_I +: PW_I] = cmt_narrow[0*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
+    assign iprf_ra[12*PW_I +: PW_I] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
+    assign iprf_ra[13*PW_I +: PW_I] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
+    assign iprf_ra[14*PW_I +: PW_I] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
     //   ★ PRF 写口判据 = "写回所属 ROB 项仍在 ROB 窗口内"（不能用 epoch，理由见 prf.v）
     //     `(idx - head) mod 128 < cnt`；用 8 bit 比较以正确处理 cnt=128。
     assign iprf_we    = wbi_v & wbi_keep;
@@ -1819,10 +1823,10 @@ module backend_top #(
     assign fprf_ra[1*PW_F +: PW_F] = u_ps2f(x_i2_uop[5]);
     assign fprf_ra[2*PW_F +: PW_F] = u_ps3f(x_i2_uop[5]);
     assign fprf_ra[3*PW_F +: PW_F] = u_ps2f(x_i2_uop[4]);
-    assign fprf_ra[4*PW_F +: PW_F] = p_pdf(cmt_pay[0*RB_W +: RB_W]);
-    assign fprf_ra[5*PW_F +: PW_F] = p_pdf(cmt_pay[1*RB_W +: RB_W]);
-    assign fprf_ra[6*PW_F +: PW_F] = p_pdf(cmt_pay[2*RB_W +: RB_W]);
-    assign fprf_ra[7*PW_F +: PW_F] = p_pdf(cmt_pay[3*RB_W +: RB_W]);
+    assign fprf_ra[4*PW_F +: PW_F] = cmt_narrow[0*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
+    assign fprf_ra[5*PW_F +: PW_F] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
+    assign fprf_ra[6*PW_F +: PW_F] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
+    assign fprf_ra[7*PW_F +: PW_F] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob - rob_head_w)} < rob_cnt_w)),
                           (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob - rob_head_w)} < rob_cnt_w)) };
     assign fprf_wa    = { u_pdf(x_i2_uop[5]), lsu_wb_pdf };
