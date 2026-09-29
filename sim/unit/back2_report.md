@@ -5916,3 +5916,62 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
   ./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667`）报 ROB LUT/BRAM/全核面积。
 * **风险登记**：XPM 分支本轮到 B1 为止**只经 iverilog 行为分支验证**，其**语法/参数合法性待 B4 的综合
   一并验证**（若报错，按 front4_mem.v 的既有参数清单逐项比对修正）。
+
+---
+
+# B4.52 B2/B3 第一步：**`updq` 独立 FF 表落地**（写口冲突纠正的实体化；`pl_q` 只剩派发写）
+
+> 检查点：**深/浅双配置全绿**（深 219/219 + iq 151 + lockstep 57 + regress **33/33**；
+> 浅 219/219 + regress **33/33**）+ 窄/宽一致性自检 **0 MISMATCH** + `rob_wide_mem` 单测 PASS。
+
+## B4.52.1 diff（`rtl/back2/{back2_params.vh, rob.v}`）
+
+* **载荷可更新区间恰好连续**：`BACK2_RB_CSRW[335:304] / TVAL[367:336] / TRTGT[399:368] /
+  TRTAKEN[400] / FFLAGS[405:401]` ⇒ 合并成 **[405:304] = 102 bit**（新增
+  `BACK2_UPDQ_W=102`、`BACK2_UPD_PAY_LSB=304`、四个字段基址）。
+* **`updq[0:127] × 102`** 独立 FF 表：分配时 `updq[idx] <= alloc_payload[…][405:304]`；
+  4 个字段回写口**改为只写 `updq`**（`upd_csr → [31:0]`、`upd_tr → [95:64]+[96]`、
+  `upd_ff → [101:97]`、`upd_exc → [63:32]`）；`pl_q` 相应**不再被更新**。
+* **读取用 `merge_upd(pl, ud) = {pl[415:406], ud, pl[303:0]}`**（纯布线、零 mux）：
+  `cmt_payload[gi] = merge_upd(pl_q[slot], updq[slot])`、`csr_pay` 的 `tval/csrw` 两段改取 `updq`、
+  `trap_tval = updq[head][63:32]`。⇒ **对外接口与行为逐位不变**（`cmt_payload` 仍是 416 bit/ lane、
+  位域口径不变 ⇒ `backend_top` 一行未改）。
+* **自检口径同步**：`nq` 的 `exc[3:0]` 由 `upd_exc` 写（载荷对应位已不写）⇒ 比对时**掩掉该 4 bit**，
+  其余（含 `pack_nq(merge_upd(...))`）逐位比对不变。
+* **`sim/unit/tb_back2_rob_wide_mem.sv`**：PASS 锚点按 `scripts/regress.sh` 口径改为**恰好一行**
+  `TB_BACK2_ROB_WIDE_MEM: PASS`（该 TB 已被 regress **自动纳入**，见下）。
+
+## B4.52.2 收益定位（避免误读）
+
+* 本步把 `pl_q` 的 [405:304] 共 102 bit 的**每表项写 mux 从 5 源降到 4 源（只剩派发）**，
+  代价是新增 `updq`（128×102 FF）自身的 5 源写 mux ⇒ **本步净收益有限（≈ −5 k LUT 量级）**；
+* **真正的收益在下一步**：`pl_q` 现在已是**"只被派发写"的纯存储** ⇒ 可直接换成
+  `rob_wide_mem`（4 bank × SDP）**+ 头部窗口**：那时 `pl_q` 的 128 项写 mux（≈3 万 LUT 量级）
+  整体消失，只余每 bank 一个 4:1 写数据选择 + 窗口 8:1 读 ⇒ 这才是 §B4.51.3 估的
+  **ROB 133 k → 45~60 k** 的来源。
+
+## B4.52.3 绿证
+
+| 判据 | 深配置（主 16/16/8/8/12/8） | 浅配置（基线 8/8/8/8/8/8） |
+|---|---|---|
+| `tb_core_top_2b` | **219/219 PASS**（`../.b2chk/updq_219.log`） | **219/219 PASS**（`updq_shallow_219.log`） |
+| `tb_back2_iq` | **151/151 PASS** | 由浅 regress 覆盖 ✓ |
+| `tb_back2_lockstep` | **57/57 PASS**（`updq_lockstep.log`） | 由浅 regress 覆盖 ✓ |
+| `regress.sh` | **33/33 PASS**（`regress_b2c39_updq_deep.log`） | **33/33 PASS**（`regress_b2c40_updq_shallow.log`） |
+| `tb_back2_rob_wide_mem`（新，已入 regress） | **PASS** | **PASS** |
+| 窄/宽一致性自检（强制开） | **0 MISMATCH**（`updq_checker.log`，同轮 219/219） | — |
+
+* **regress 从 32 → 33**：`scripts/regress.sh` 自动发现 `sim/unit/*.sv` ⇒ 新单测被纳入（脚本未改）；
+  33/33 = 原 32 + 新单测全过 ⇒ 判据**更严**而非放宽。
+* 编译零错误；工作树 = `rtl/back2/{back2_params.vh, rob.v}` + `sim/unit/tb_back2_rob_wide_mem.sv`
+  （快照 `../.b2chk/*.pre_updq` / `*.s72`）；`back2_params.vh` 已回深配置；2A 零修改；未提交。
+
+## B4.52.4 剩余 diff（下一步：B2 本体 + B3）
+
+1. `pl_q` 存储 → `rob_wide_mem`（4 bank，写口按 `tail[1:0]` 轮转分配 4 条 lane）；
+2. `win_q[0:7]×81 bit`（提交侧真正消费的不可更新字段：`pc/cls/pred/btb/predtgt/pdio/pdfo`）
+   + 每槽 7 bit 全索引标签（槽号 = `idx[2:0]`）；提交/trap/CSR 单 lane/训练**全从窗口组合读**；
+3. 预取：`head_pred = head_q + cmt_n_w` 发 4 bank 读（连续 4 项 ⇒ 4 bank 各 1 读，读结果按 bank
+   轮转写回对应槽并打标签）；`flush/squash` 后按新 `head_q` 重起算；
+4. 失配气泡：`win_ok =` 4 槽标签全命中 ⇒ `slot_ok[gi] &= win_lane_ok[gi]`（**绝不交付错误 PC/tval**）；
+5. 之后跑 60 MHz 综合（RuntimeOptimized 同配方）报 ROB LUT/BRAM/全核面积。

@@ -116,8 +116,9 @@ module tb_back2_rob_wide_mem;
         end
         $display("== T4 随机 200 轮后累计 errs=%0d", errs);
 
-        if (errs == 0) $display("TB_ROB_WIDE_MEM: PASS");
-        else           $display("TB_ROB_WIDE_MEM: FAIL (%0d)", errs);
+        //   锚点口径（scripts/regress.sh）：恰好一行 `TB_BACK2_ROB_WIDE_MEM: PASS`
+        if (errs == 0) $display("TB_BACK2_ROB_WIDE_MEM: PASS");
+        else           $display("TB_BACK2_ROB_WIDE_MEM FAIL errs=%0d", errs);
         $finish;
     end
 endmodule

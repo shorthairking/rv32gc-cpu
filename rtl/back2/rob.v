@@ -157,6 +157,22 @@ module rob #(
     localparam integer NQ_LQ_L   = `BACK2_NQ_LQ_L;
     localparam integer NQ_MK_L   = `BACK2_NQ_MK_L;
     reg  [NQ_W-1:0]      nq    [0:ROB_N-1];
+    //   ★★ 2B-5 B2/B3 前置：**可更新字段独立 FF 表** `updq`（载荷的 [405:304] = 102 bit）
+    //     · 动机：BRAM 分 bank 后每 bank 只有 **1 个写口**，4 条派发写已占满 ⇒ 字段回写只能落在 FF 表；
+    //     · 本步先把它们**从 `pl_q` 的写入里拿走**（`pl_q` 只剩派发写：对应位自动被 Vivado 裁掉），
+    //       读取时用 `merge_upd()` 拼回原坐标 ⇒ **对外接口与行为逐位不变**；
+    //     · 这也是下一步“`pl_q` 整体换 `rob_wide_mem` + 头部窗口”的前提（到那时 `pl_q` 只剩派发写、可直接换成 DRAM）。
+    reg  [`BACK2_UPDQ_W-1:0] updq [0:ROB_N-1];
+
+    //   拼接：取 `pl_q` 的不可更新部分 + `updq` 的可更新部分（纯布线，无 mux）
+    function [RB_W-1:0] merge_upd;
+        input [RB_W-1:0] pl; input [`BACK2_UPDQ_W-1:0] ud;
+        begin
+            merge_upd = { pl[RB_W-1:`BACK2_UPD_PAY_LSB+`BACK2_UPDQ_W],
+                          ud,
+                          pl[`BACK2_UPD_PAY_LSB-1:0] };
+        end
+    endfunction
 
     //   打包：从宽载荷 + epoch + done 生成窄字（分配与一致性自检共用）
     function [NQ_W-1:0] pack_nq;
@@ -269,7 +285,7 @@ module rob #(
     //==========================================================================
     generate
     for (gi = 0; gi < COMMIT_W; gi = gi + 1) begin : g_cmtout
-        assign cmt_payload[gi*RB_W +: RB_W] = pl_q[slot_idx[gi]];
+        assign cmt_payload[gi*RB_W +: RB_W] = merge_upd(pl_q[slot_idx[gi]], updq[slot_idx[gi]]);
         assign cmt_narrow[gi*NQ_W +: NQ_W]  = nq[slot_idx[gi]];
         assign cmt_st_drain[gi] = cmt_chain[gi] & slot_store[gi];
         assign cmt_st_ckpt[gi]  = cmt_chain[gi] & nq[slot_idx[gi]][NQ_CKV];
@@ -281,14 +297,14 @@ module rob #(
     assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0];
     assign trap_pc    = pl_q[slot_idx[0]][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB];
     assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
-    assign trap_tval  = pl_q[slot_idx[0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
+    assign trap_tval  = updq[slot_idx[0]][`BACK2_UPD_TVAL_LSB +: 32];
 
     //==========================================================================
     // 4. 观测输出
     //==========================================================================
     //   ★ ② CSR 提交合成**单 lane 动态读口**：只读被选中的那一项（而非 4 lane 全读）
-    assign csr_pay = { pl_q[csr_lane_idx][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],
-                       pl_q[csr_lane_idx][`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB],
+    assign csr_pay = { updq[csr_lane_idx][`BACK2_UPD_TVAL_LSB +: 32],
+                       updq[csr_lane_idx][`BACK2_UPD_CSRW_LSB +: 32],
                        pl_q[csr_lane_idx][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB],
                        pl_q[csr_lane_idx][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB] };
 
@@ -313,6 +329,7 @@ module rob #(
             for (k = 0; k < ROB_N; k = k + 1) begin
                 pl_q[k]   <= {RB_W{1'b0}};
                 nq[k]     <= {NQ_W{1'b0}};
+                updq[k]   <= {`BACK2_UPDQ_W{1'b0}};
             end
         end else begin
             // ---- 5.1 派发写入（新项：done 清零；仅真正派发拍 = alloc_fire）----
@@ -324,6 +341,8 @@ module rob #(
                         nq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
                             pack_nq(alloc_payload[k*RB_W +: RB_W], alloc_epoch, 1'b0,
                                     alloc_pre[k*5 +: 5]);
+                        updq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
+                            alloc_payload[k*RB_W + `BACK2_UPD_PAY_LSB +: `BACK2_UPDQ_W];
                     end
                 end
             end
@@ -345,20 +364,18 @@ module rob #(
 
             // ---- 5.3 执行期字段回写 ----
             if (upd_csr_valid) begin
-                pl_q[upd_csr_idx][`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB] <= upd_csr_wdata;
+                updq[upd_csr_idx][`BACK2_UPD_CSRW_LSB +: 32] <= upd_csr_wdata;
                 if (DBG_CSR) $display("[rob-upd t=%0t] idx=%0d wdata=0x%08x", $time, upd_csr_idx, upd_csr_wdata);
             end
             if (upd_tr_valid) begin
                 nq[upd_tr_idx][NQ_TRT] <= upd_tr_taken;
-                pl_q[upd_tr_idx][`BACK2_RB_TRTAKEN] <= upd_tr_taken;
-                pl_q[upd_tr_idx][`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB] <= upd_tr_target;
+                updq[upd_tr_idx][`BACK2_UPD_TRTAKEN] <= upd_tr_taken;
+                updq[upd_tr_idx][`BACK2_UPD_TRTGT_LSB +: 32] <= upd_tr_target;
             end
-            if (upd_ff_valid) pl_q[upd_ff_idx][`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB]
-                                   <= upd_ff_flags;
+            if (upd_ff_valid) updq[upd_ff_idx][`BACK2_UPD_FFLAGS_LSB +: 5] <= upd_ff_flags;
             if (upd_exc_valid) begin
                 nq[upd_exc_idx][NQ_EXC_L +: 4] <= upd_exc_code;
-                pl_q[upd_exc_idx][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB] <= upd_exc_code;
-                pl_q[upd_exc_idx][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB] <= upd_exc_tval;
+                updq[upd_exc_idx][`BACK2_UPD_TVAL_LSB +: 32] <= upd_exc_tval;
             end
 
             // ---- 5.4 指针推进（提交 / 冲刷 / 分配）----
@@ -389,8 +406,10 @@ module rob #(
         if (DBG_CSR && rst_n) begin
             for (nk = 0; nk < ROB_N; nk = nk + 1) begin
                 //   函数返回值不能直接做位选（iverilog）⇒ 先存临时变量
-                nq_chk = pack_nq(pl_q[nk], nq[nk][NQ_EP_L +: `BACK2_EPOCH_W], 1'b0, nq[nk][NQ_MK_L +: 5]);
-                if (nq[nk][NQ_W-1:1] !== nq_chk[NQ_W-1:1])
+                nq_chk = pack_nq(merge_upd(pl_q[nk], updq[nk]), nq[nk][NQ_EP_L +: `BACK2_EPOCH_W], 1'b0, nq[nk][NQ_MK_L +: 5]);
+                //   `exc[3:0]` 由 `upd_exc` 写入 `nq`（载荷里的对应位已不再写）⇒ 比对时掩掉该 4 bit
+                if ((nq[nk][NQ_W-1:NQ_EXC_L+4] !== nq_chk[NQ_W-1:NQ_EXC_L+4]) ||
+                    (nq[nk][NQ_EXC_L-1:1]    !== nq_chk[NQ_EXC_L-1:1]))
                     $display("ROB-NQ-CHK MISMATCH: idx=%0d nq=0x%011x pl=0x%011x", nk, nq[nk], nq_chk);
             end
         end

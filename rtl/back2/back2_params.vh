@@ -271,6 +271,16 @@
 `define BACK2_NQ_MRET        49
 //   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
 `define BACK2_CMT_CSR_W      79
+//   ★★ 2B-5 B2/B3 前置（写口冲突纠正，报告 §B4.51.3）：可更新字段独立成 FF 表 `updq`
+//     · 它们在载荷里恰好是**连续区间 [405:304]**（CSRW/TVAL/TRTGT/TRTAKEN/FFLAGS = 102 bit）
+//       ⇒ 拼接只需 3 段：{pl[415:406], updq[101:0], pl[303:0]}
+`define BACK2_UPDQ_W         102
+`define BACK2_UPD_PAY_LSB    304        // 对应载荷位 [405:304]
+`define BACK2_UPD_CSRW_LSB   0          // updq[31:0]   = 载荷[335:304]
+`define BACK2_UPD_TVAL_LSB   32         // updq[63:32]  = 载荷[367:336]
+`define BACK2_UPD_TRTGT_LSB  64         // updq[95:64]  = 载荷[399:368]
+`define BACK2_UPD_TRTAKEN    96         // updq[96]     = 载荷[400]
+`define BACK2_UPD_FFLAGS_LSB 97         // updq[101:97] = 载荷[405:401]
 
 // ---- 标志位在 uop 内的绝对 bit 位置（= FLAGS_LSB + fl 序号）----
 `define BACK2_UB_RD_I_WEN    (`BACK2_U_FLAGS_LSB + `BACK2_FL_RD_I_WEN)
