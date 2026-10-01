@@ -403,7 +403,9 @@ module rob #(
             if (alloc_fire) begin
                 for (k = 0; k < COMMIT_W; k = k + 1) begin
                     if (alloc_lane_valid[k] & (k < alloc_n)) begin
+`ifndef RV32GC_USE_VIVADO_IP
                         if (DBG_CSR) $display("[rob-alloc t=%0t] k=%0d idx=%0d pay_csrw=0x%08x", $time, k, idx_add(tail_w, k[ROB_IDX_W:0]), alloc_payload[k*RB_W + `BACK2_RB_CSRW_MSB -: 32]);
+`endif
                         nq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
                             pack_nq(alloc_payload[k*RB_W +: RB_W], alloc_epoch, 1'b0,
                                     alloc_pre[k*5 +: 5]);
@@ -431,7 +433,9 @@ module rob #(
             // ---- 5.3 执行期字段回写 ----
             if (upd_csr_valid) begin
                 updq[upd_csr_idx][`BACK2_UPD_CSRW_LSB +: 32] <= upd_csr_wdata;
+`ifndef RV32GC_USE_VIVADO_IP
                 if (DBG_CSR) $display("[rob-upd t=%0t] idx=%0d wdata=0x%08x", $time, upd_csr_idx, upd_csr_wdata);
+`endif
             end
             if (upd_tr_valid) begin
                 nq[upd_tr_idx][NQ_TRT] <= upd_tr_taken;
@@ -490,9 +494,15 @@ module rob #(
     end
 
     //   ★ 2B-5 第 3 步①自检：窄表与宽载荷的共用字段必须**逐位一致**
-    //     （迁移期双写；任何漏写/写错位置都会在此报出）。默认关（综合零成本）。
+    //     （迁移期双写；任何漏写/写错位置都会在此报出）。
+    //   ★★ 2B-5 第 3 步②（自检 `ifdef` 化）：整个自检块只做 `$display`（无任何 RTL 语义），
+    //     但综合侧仍要解析 `if (DBG_CSR && ...)` 并在参数为 0 时做常量折叠。本步把它**整体**
+    //     收进 `` `ifndef RV32GC_USE_VIVADO_IP ``（综合入口 `synth_design` 显式定义该宏，
+    //     见 fpga/tcl/synth.tcl；iverilog/Verilator 回归从不定义 ⇒ 行为模型侧自检**保持等价**）
+    //     ⇒ 综合分支连语句都不存在，零残留、零依赖综合器的折叠能力。
     //   ★ B2 后自检口径：宽载荷已入 BRAM，改在**预取填充拍**对比：
     //     读回的载荷拼出的窄字段 必须等于 `nq`（掩掉由 `upd_exc` 写的 `exc[3:0]`）。
+`ifndef RV32GC_USE_VIVADO_IP
     integer nk;
     reg [NQ_W-1:0] nq_chk;
     always @(posedge clk) begin
@@ -518,5 +528,6 @@ module rob #(
             end
         end
     end
+`endif
 
 endmodule
