@@ -77,14 +77,18 @@
 //   ★ 2B-3 第 6 段第一步：SQ 16→32（索引宽度 4→5），LQ 4→32（在途表 → 32 项 LQ）。
 //     `BACK2_STQ_IDX_W` 只被 lsq_simple.v 与 backend_top.v 的 6 处位宽引用使用；
 //     LQ 深度改变只牵动 lsq_simple.v 内部与内存标签宽度（见 `BACK2_MEM_TAG_W`）。
+//   ★ 2B-5 L5（面积杠杆）：**LQ 32→16**（索引 5→4）——纯容量缩减，只降低"在飞 load
+//     数上限"，不改任何指令语义（槽位仍在 D3 派发期分配、提交点释放；转发/请求/响应
+//     逐拍逻辑全部按 `OUT_N`/`LQ_IW` 参数化，无字面宽度）。SQ 保持 32 不动。
 `define BACK2_STQ_N          32
 `define BACK2_STQ_IDX_W      5
-`define BACK2_LQ_N           32
-`define BACK2_LQ_IDX_W       5
+`define BACK2_LQ_N           16
+`define BACK2_LQ_IDX_W       4
 //   标签宽度 = log2(LQ_N) + 1：槽标签用 0..LQ_N-1（最高位恒 0），**store 提交排空的
-//   标签取全 1** ⇒ 恰好多留 1 bit 才不会与 31 号槽撞车（LQ_N=4 时 3 bit 的旧口径
-//   只是因为 2 bit 槽号 + 1 bit 分隔位；LQ 扩到 32 后必须同步 +1）。
-`define BACK2_MEM_TAG_W      6
+//   标签取全 1** ⇒ 恰好多留 1 bit 才不会与末号槽撞车（LQ_N=4 时 3 bit 的旧口径只是
+//   因为 2 bit 槽号 + 1 bit 分隔位；LQ_N=16 ⇒ 4 bit 槽号 + 1 bit 分隔位 = 5 bit；
+//   LQ_N=32 时曾同步为 6 bit）。
+`define BACK2_MEM_TAG_W      5
 `define BACK2_MEM_OUT_N      `BACK2_LQ_N     // 在途访存槽（MSHR 口径）= LQ 深度
 //   提交排空队列（CDQ）深度：rob.v 允许**同拍最多 4 条 store 提交**，而排空口每拍只发一笔
 //   ⇒ LSQ 必须能暂存"提交组内的其余 store"，否则它们会被提交却永不落地（2B-3 登记的
@@ -243,19 +247,28 @@
 //     与 STQ 字段同理：拼接式右对齐+高位零扩展 ⇒ 加在**最顶端**不影响其下任何字段位置。
 //     LQ 在 **D3 派发期**分配（程序序）、提交点释放 ⇒ load 的槽位不再依赖发射/执行顺序，
 //     队列级 `INORD_LOAD` 门不再承担"槽位序防死锁"职责（可安全置 0）。
-`define BACK2_RB_LQ_MSB      415
-`define BACK2_RB_LQ_LSB      411        // [415:411] load queue 项索引（≤32 项）
+//   ★ 2B-5 L5：LQ 32→16（索引 5→4）⇒ 顶端字段收窄 1 bit：**MSB 415→414、LSB 恒 411**，
+//     拼接式仍右对齐+高位零扩展 ⇒ 其下所有字段（STQ/TRTGT/FFLAGS/CSRW/TVAL/uop…）绝对
+//     位位置逐位不变；`[415]` 变为保留位，`BACK2_RB_W` 仍 416。
+//     ⚠ 不可写成 LSB 411→410：那会让字段跨进 [410]（= STQ 最高位），`p_lq` 取值将含 STQ
+//       位而丢掉 LQ 高位。
+`define BACK2_RB_LQ_MSB      414
+`define BACK2_RB_LQ_LSB      411        // [414:411] load queue 项索引（≤16 项）
 // ---- 项内 epoch ----
 //   ★ 不占载荷位域：由 rob.v 的独立 2 bit 小数组 `rep_q[]` 承载（原因见 rob.v §0：
 //     放进 416 bit 载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
-//     载荷已无空闲位（[415:411] 已被 LQ 索引占用）。
+//     ★ 2B-5 L5 后载荷 [415] 亦成为保留位（LQ 索引收窄为 [414:411]）。
 `define BACK2_RB_W           416
 //   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
 //     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）：
-//       lq[4:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
+//       lq[3:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
 //       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
 //       ── ② 新增： maint_kind[2:0] is_sret is_mret
-`define BACK2_NQ_W           50
+//   ★ 2B-5 L5：`lq` 字段随 LQ 索引 5→4 bit 收窄 1 bit。`lq` 位于 `stq` **之上** ⇒ 其下
+//     所有字段（stq/trtaken/csrop/pdf/pdi/arn/…/done）绝对位位置**逐位不变**；只有
+//     `lq` 之上的 `pre`（maint_kind/sret/mret）与 NQ_W 各下移 1：MK 45→44、SRET 48→47、
+//     MRET 49→48、**NQ_W 50→49**。（`lq` 自身 LSB 恒 40，字段区间 [43:40]。）
+`define BACK2_NQ_W           49
 `define BACK2_NQ_DONE        0
 `define BACK2_NQ_EP_L        1
 `define BACK2_NQ_EXC_L       3
@@ -271,10 +284,10 @@
 `define BACK2_NQ_CSROP_L     31
 `define BACK2_NQ_TRT         34
 `define BACK2_NQ_STQ_L       35
-`define BACK2_NQ_LQ_L        40
-`define BACK2_NQ_MK_L        45        // [47:45] maint_kind[2:0]
-`define BACK2_NQ_SRET        48
-`define BACK2_NQ_MRET        49
+`define BACK2_NQ_LQ_L        40        // lq 字段 LSB（2B-5 L5：区间 [43:40]，4 bit）
+`define BACK2_NQ_MK_L        44        // [46:44] maint_kind[2:0]
+`define BACK2_NQ_SRET        47
+`define BACK2_NQ_MRET        48
 //   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
 `define BACK2_CMT_CSR_W      79
 //   ★★ 2B-5 B2/B3 前置（写口冲突纠正，报告 §B4.51.3）：可更新字段独立成 FF 表 `updq`

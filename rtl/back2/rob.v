@@ -149,7 +149,7 @@ module rob #(
     //     · 本步将 rob.v **自用的关键读**（done/exc/is_store/ckpt/is_branch/trap_cause/epoch）
     //       全部改走 `nq`（行为逐位等价），并导出 `cmt_narrow` 供下一步改造 backend_top。
     //     字段布局（MSB→LSB）：
-    //       lq[4:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
+    //       lq[3:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
     //       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
     localparam integer NQ_W      = `BACK2_NQ_W;
     localparam integer NQ_DONE   = `BACK2_NQ_DONE;
@@ -191,8 +191,8 @@ module rob #(
     function [NQ_W-1:0] pack_nq;
         input [RB_W-1:0] p; input [`BACK2_EPOCH_W-1:0] ep; input dn; input [4:0] pre;
         begin
-            pack_nq = { pre,                                           // [49:45] {mret,sret,maint_kind}
-                        p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB],          // [44:40]
+            pack_nq = { pre,                                           // [48:44] {mret,sret,maint_kind}
+                        p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB],          // [43:40]（2B-5 L5：LQ 16 ⇒ 4 bit）
                         p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB],        // [39:35]
                         p[`BACK2_RB_TRTAKEN],                          // [34]
                         p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB],      // [33:31]

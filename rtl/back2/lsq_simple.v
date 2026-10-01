@@ -1,13 +1,14 @@
 //==============================================================================
-// rtl/back2/lsq_simple.v —— LSQ：**SQ 32 + LQ 32**（写回可乱序 / 提交点释放）
+// rtl/back2/lsq_simple.v —— LSQ：**SQ 32 + LQ 16**（写回可乱序 / 提交点释放）
 //==============================================================================
 // 项目  : rv32gc-cpu（阶段二 2B-3 第 6 段：SQ 16→32、LQ 4→32、真乱序边界）
 // 规格  : docs/design/03-out-of-order.md §6（LSQ 结构与访存序、load→store 转发、提交时
 //         释放）；2B-3 两步扩容的落地与实测见 sim/unit/back2_report.md §B3.7。
 //
 // 【本段口径（最终状态）】
-//   · **SQ 32 / LQ 32**：容量与位宽唯一真源 = `back2_params.vh`（`BACK2_STQ_N` /
-//     `BACK2_LQ_N`）；STQ 索引同时在 ROB 载荷 [410:406]（4→5 bit，见该文件"位域核对"注）。
+//   · **SQ 32 / LQ 16**：容量与位宽唯一真源 = `back2_params.vh`（`BACK2_STQ_N` /
+//     `BACK2_LQ_N`）；STQ 索引同时在 ROB 载荷 [410:406]（4→5 bit，见该文件"位域核对"注）；
+//     ★ 2B-5 L5：LQ 32→16（索引 4 bit、槽标签 5 bit），纯容量缩减、不改语义。
 //   · **发射**：LSU 单发射口，IQ-LSU 最老就绪优先；`INORD_LOAD`（队列级）与
 //     **精确 STQ 闸门**（§2.1）并联：更老 store **未定址** ⇒ 本 load 不可发射；
 //     更老 store 均已定址 ⇒ 放行（重叠字节由转发/合并兜住）。
@@ -37,8 +38,8 @@
 module lsq_simple #(
     parameter integer STQ_N    = `BACK2_STQ_N,
     parameter integer STQ_IW   = `BACK2_STQ_IDX_W,
-    parameter integer OUT_N    = `BACK2_MEM_OUT_N,   // LQ 深度（32）
-    parameter integer LQ_IW    = `BACK2_LQ_IDX_W,    // LQ 下标宽度（5）
+    parameter integer OUT_N    = `BACK2_MEM_OUT_N,   // LQ 深度（16）
+    parameter integer LQ_IW    = `BACK2_LQ_IDX_W,    // LQ 下标宽度（4）
     parameter integer TAG_W    = `BACK2_MEM_TAG_W,
     parameter integer ROB_IDX_W= `BACK2_ROB_IDX_W,
     parameter integer PDW_I    = `BACK2_PREG_I_W,
@@ -477,13 +478,13 @@ module lsq_simple #(
 
 
     //==========================================================================
-    // 3. LQ（load queue）：`OUT_N` 项在途表（2B-3 第 6 段第一步：4 → 32 项）
+    // 3. LQ（load queue）：`OUT_N` 项在途表（2B-3 第 6 段第一步：4 → 32 项；2B-5 L5：32 → 16）
     //==========================================================================
-    //   ★ 扩容口径（第 6 段两步的最终状态）：
-    //     · 深度 = `OUT_N` =`BACK2_MEM_OUT_N` =`BACK2_LQ_N` = 32（LQ 32）；
-    //     · 下标宽度 = `LQ_IW` =`BACK2_LQ_IDX_W` = 5；
+    //   ★ 容量口径（2B-5 L5 之后的最终状态）：
+    //     · 深度 = `OUT_N` =`BACK2_MEM_OUT_N` =`BACK2_LQ_N` = 16（LQ 16）；
+    //     · 下标宽度 = `LQ_IW` =`BACK2_LQ_IDX_W` = 4；
     //     · 槽标签 `ld_tag[slot] = slot`（最高位恒 0），**store 排空标签取全 1**
-    //       ⇒ `BACK2_MEM_TAG_W` 必须 ≥ LQ_IW+1（已同步 3→6），否则 31 号槽会与
+    //       ⇒ `BACK2_MEM_TAG_W` 必须 ≥ LQ_IW+1（LQ 16 时为 5），否则末号槽会与
     //       排空标签撞车（响应被误当 load 数据写回）。
     //     · 原实现把 4 个槽的 `ld_free/pend_vec/rsp_vec` **下标字面写死**，
     //       扩容时必须改为 generate + 优先级链（下 §3.2），语义逐项等价（最低序号优先）。
@@ -1086,7 +1087,7 @@ module lsq_simple #(
                     ld_lo  [exe_lq_idx] <= 32'h0;
                     ld_hm  [exe_lq_idx] <= fwd_hit_w;
                     ld_hd  [exe_lq_idx] <= fwd_data_w;
-                    //   ★ 槽号是 LQ_IW bit（LQ 32 ⇒ 5 bit）⇒ 必须零扩展到 TAG_W=6；
+                    //   ★ 槽号是 LQ_IW bit（LQ 16 ⇒ 4 bit）⇒ 必须零扩展到 TAG_W=5；
                     //     写 [TAG_W-1:0] 会取到向量外的位 ⇒ tag 为 **x** ⇒ 响应无法匹配（挂死）。
                     //     最高位恒 0 ⇒ 与 store 排空的"全 1"标签天然不撞车。
                     ld_tag [exe_lq_idx] <= {{(TAG_W-LQ_IW){1'b0}}, exe_lq_idx};

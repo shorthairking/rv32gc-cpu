@@ -108,7 +108,7 @@ module backend_top #(
     output wire [31:0] mem_req_addr_o,
     output wire [31:0] mem_req_wdata_o,
     output wire [3:0]  mem_req_wstrb_o,
-    output wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag_o,   // ★ 2B-3：随 LQ 扩容 3→6 bit
+    output wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag_o,   // ★ 2B-3 扩 3→6 bit；2B-5 L5 LQ 16 ⇒ 5 bit
     input  wire        mem_req_ready_i,
     input  wire        mem_rsp_valid_i,
     input  wire [31:0] mem_rsp_rdata_i,
@@ -999,6 +999,7 @@ module backend_top #(
         assign rob_pay_w[g5*RB_W +: RB_W] = {
             //   ★ 2B-4：顶端 [415:411] 放 LQ 索引（与 STQ 字段同理：加在最顶端不影响
             //     其下任何字段的绝对位置；RB_W 仍 416）
+            //   ★ 2B-5 L5：LQ 16 ⇒ 索引 [414:411]（4 bit），[415] 保留；其下字段不变。
             ld_alloc_idx[g5*LDW +: LDW],                   // LQ 索引
             st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],   // STQ 索引
             5'b0,                                          // fflags
