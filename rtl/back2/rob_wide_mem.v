@@ -80,15 +80,19 @@ module rob_wide_mem #(
             .READ_DATA_WIDTH_B  (DW),
             .BYTE_WRITE_WIDTH_A (DW),
             .READ_RESET_VALUE_B ("0"),
-            .WRITE_MODE_A       ("read_first"),
+            //   ★ XPM 修正（探针实测 [Synth 8-7136]）：SDP 的写模式参数叫 **`WRITE_MODE_B`**
+            //     （端口 A 写 / 端口 B 读；法定值 no_change/read_first/write_first），与行为模型同口径。
+            .WRITE_MODE_B       ("read_first"),
             .READ_LATENCY_B     (1),
             .RST_MODE_B         ("SYNC")
         ) u_sdp (
+            //   ★ XPM 修正（探针实测 [Synth 8-11365]）：SDP **没有** `rsta/regcea`（端口 A 无复位/无输出寄存器），
+            //     **也没有** `injectsbiterrb/injectdbiterrb`（注入只在 A 侧）。端口名单以 XPM 源码为准：
+            //       sleep clka ena wea addra dina injectsbiterra injectdbiterra
+            //       clkb rstb enb regceb addrb doutb sbiterrb dbiterrb
             .sleep          (1'b0),
             .clka           (clk),
-            .rsta           (~rst_n),
             .ena            (we[gb]),
-            .regcea         (1'b1),
             .wea            (we[gb]),
             .addra          (woff[gb*OW +: OW]),
             .dina           (wdata[gb*DW +: DW]),
@@ -101,9 +105,7 @@ module rob_wide_mem #(
             .addrb          (roff[gb*OW +: OW]),
             .doutb          (rdata[gb*DW +: DW]),
             .sbiterrb       (),
-            .dbiterrb       (),
-            .injectsbiterrb (1'b0),
-            .injectdbiterrb (1'b0)
+            .dbiterrb       ()
         );
     end
     endgenerate
@@ -119,7 +121,9 @@ module rob_wide_mem #(
     always @(posedge clk) begin
         for (bi = 0; bi < NW; bi = bi + 1) begin
             if (we[bi]) mem[bi*BW + woff[bi*OW +: OW]] <= wdata[bi*DW +: DW];
-            if (re[bi]) dout_r[bi] <= mem[bi*BW + roff[bi*OW +: OW]];
+            //   与 XPM `RST_MODE_B="SYNC"/READ_RESET_VALUE_B="0"` 逐拍等价：复位期间读输出清零
+            if (!rst_n)     dout_r[bi] <= {DW{1'b0}};
+            else if (re[bi]) dout_r[bi] <= mem[bi*BW + roff[bi*OW +: OW]];
         end
     end
 

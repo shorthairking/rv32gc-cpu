@@ -6155,3 +6155,56 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
    收窄后 ≈0.8 k FF）；`pl_q` 关联的窄字段（`nq` 已接管）在 BRAM 载荷中的冗余位可一并重编码。
 3. 性能观察：窗口失配会插气泡；本轮 219/lockstep 的**提交条数未变化**（lockstep 提交 821 条/5 程序），
    说明常规路径几乎不失配。
+
+---
+
+# B4.56 ★ 综合量测轮：XPM 探针修正 + 完整 60 MHz 综合（post-B2/B3）数据落档
+
+> 检查点：探针（`RV32_SYNTH_TAG=2bprobe`）与完整综合（`RV32_SYNTH_TAG=2b`，
+> `RV32_SYNTH_DIRECTIVE=RuntimeOptimized`）**均零错误跑通**；产物带 `2b` tag；
+> **pre-B2 基线已另存** `../.b2chk/baseline_preB2_{util,util_hier,timing}.rpt`（避免被同 tag 覆盖）。
+
+## B4.56.1 XPM 修正 diff（`rtl/back2/rob_wide_mem.v`，探针实测两轮）
+
+| 轮 | 探针报错 | 修正 |
+|---|---|---|
+| 1 | `[Synth 8-7136] parameter 'WRITE_MODE_A' ... does not exist` | SDP 的写模式参数名是 **`WRITE_MODE_B`**（端口 A 写 / 端口 B 读；法定值 `no_change/read_first/write_first`）⇒ 改 `.WRITE_MODE_B("read_first")` |
+| 1 | `[Synth 8-196] conditional expression could not be resolved to a constant`（`:61`） | 上条错误的连带（模块 elaborated 失败）⇒ 随参数修正消失 |
+| 2 | `[Synth 8-11365] named port connection 'rsta'/'regcea'/'injectsbiterrb'/'injectdbiterrb' does not exist` | 以 XPM 源码端口清单为准：**SDP 无 `rsta/regcea`**（A 侧无复位/无输出寄存器），**无 B 侧注入端口** ⇒ 端口表改为 `sleep clka ena wea addra dina injectsbiterra injectdbiterra clkb rstb enb regceb addrb doutb sbiterrb dbiterrb` |
+| — | 顺带 | 行为模型补 `if (!rst_n) dout_r<=0` ⇒ 与 XPM `RST_MODE_B="SYNC"/READ_RESET_VALUE_B="0"` **逐拍等价** |
+* 3 轮探针均为**秒级 elaboration 失败/通过** ⇒ 探针策略（先 `synth_design` 快速暴露 IP 口径）有效；单测 `tb_back2_rob_wide_mem` 修正后仍 **PASS**。
+
+## B4.56.2 面积对比（同配方 RuntimeOptimized / 16.667 ns / 未布局）
+
+| 资源 | pre-B2（基线） | **post-B2/B3（本次）** | Δ |
+|---|---|---|---|
+| **全核 Slice LUT** | 393 744（292.53%） | **366 483（272.28%）** | **−27 261（−6.9%）** |
+| **全核 Slice Registers** | 142 259（52.85%） | **129 899（48.25%）** | **−12 360（−8.7%）** |
+| **u_rob LUT** | 133 034 | **106 704** | **−26 330（−19.8%）** |
+| **u_rob FF** | 27 612 | **15 246** | **−12 366（−44.8%）** |
+| **Block RAM Tile** | 19 | **35** | **+16（u_rob 独占 +16）** |
+| F7 / F8 Muxes | 38 903 / 14 594 | 32 853 / 11 798 | −6 050 / −2 796 |
+| DSPs | 34 | 34 | 0 |
+| 其余模块（参考） | — | `u_ren_i` 50 248、`u_ren_f` 49 894、`u_lsu` 43 357、`u_prf_i` 23 696、`u_fpu` 23 811 | ±3~6 k（综合分配波动） |
+* **ROB 侧确实兑现**了"写侧塌缩 + 读侧 8:1"：LUT −19.8%、FF −44.8%、+16 RAMB36。
+* **为何 ROB 仍有 106.7 k**（下一轮杠杆）：迁移后剩余的 FF 表 `nq[128]×50` 与 `updq[128]×102`
+  各自带**多写源**（`nq`：4 派发 + 7 路 wb-done + upd_exc/upd_tr；`updq`：4 派发 + 4 字段回写）
+  ⇒ 它们的**每表项写 mux** 成为新的主项（估算 ≈ 128×50×5 + 128×102×5 量级）；另有窗口 8×416 FF
+  与 4 lane × 416 bit 的 8:1 窗口读。**收窄窗口字到 §B4.53.1 的 100 bit 位图**可同时砍掉窗口 FF
+  （3.3 k→0.8 k）与 **RAMB36 数**（416 bit 宽需要 4 个 RAMB36/bank ⇒ 16 个；≈100 bit 只需 2 个/bank ⇒ 8 个）。
+* BRAM 数实测 **+16**（先前估 2~4 偏低）：根因是**字宽粒度**（RAMB36 最宽 72 bit/实例 ⇒ 416 bit 需
+  4 实例/bank × 4 bank）。
+
+## B4.56.3 时序与关键路径（未布局，供 impl 轮参考）
+
+* **Setup**：失败端点 **167 410**（pre-B2：180 206）、WNS **−62.876 ns**（pre-B2：−59.146 ns）、
+  TNS −2 652 459 ns；**Hold 0 违规**、PW 0 违规。⇒ 失败端点减少、但最差路径略恶化。
+* **最差路径（与 pre-B2 同源，非 ROB）**：`u_plic/threshold_r_reg[1][1]/C` → `u_back/x_i2_ep_reg[1][0]/CE`；
+  **79.198 ns**（logic 22.404 = 28.3%，route 56.794 = 71.7%）、**逻辑级数 138**（LUT6×49、LUT5/4×19、CARRY4×19…）。
+  ⇒ 结论同 §B4.42.3：**PLIC/中断 → 后端 E1 使能**的组合锥过深，属 impl 轮的首要优化对象；
+  本轮 B2/B3 **没有**改善它（也没恶化它的结构）。
+* **组合环警告 13 条**（pre-B2：7 条）：新增 8 条穿过 `u_backi_165/alloc_valid0[*]`（4）与
+  `lalloc_valid0[*]`（4）——**分配/派发握手上出现新的组合环**，Vivado 以 `set_false_path` 自动打断。
+  **风险**：假路径会**掩盖该握手上的真实时序路径** ⇒ 下一轮应定位这 8 条环（怀疑点在
+  `alloc_fire → bw_we/bw_woff` 与 `alloc_ready/room_free ← cmt_n_w ← cmt_chain ← win_lane_ok` 的组合耦合），
+  必要时给 BRAM 写口插入一级寄存或把 `alloc_ready` 的依赖解除。
