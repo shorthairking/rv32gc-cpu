@@ -127,10 +127,24 @@ module rename #(
     //==========================================================================
     // 0. 状态
     //==========================================================================
+    //   ★ L8（面积分析 `fpga/scratch/area_analysis_2b_l1.md` §3/§5，用户授权降条目）：
+    //     free list **数组深度 256→128**。实际只需容纳 `FREE_N` 个物理号（整数域 64 /
+    //     浮点域 32），256 深是 4×/8× 超配。只降"读 mux 256:1→128:1 + 写 demux 减半"
+    //     的规模，**不改任何指令语义**。
+    //   ★ 为什么等价：环形窗口内**活项数 = ftail−fhead ≤ FREE_N ≤ 64 < 128**，
+    //     故不存在"数组下标相差 128"的两个活项 ⇒ 下标按 FL_DEPTH 取模是**单射**，
+    //     与 256 深逐拍等价（陈旧槽只会在被释放覆写前保持垃圾值，与深度无关）。
+    //   ★ `FL_PTR_W` **保持 8 不动**：它是"模 256 指针 ⇒ 距离无歧义"的语义
+    //     （距离 ≤ 64 < 128；若缩成 7 bit 模 128，"距离 64"会与"距离 0"撞车 ⇒ 空满误判）。
+    //     因此**只有 `flist_q` 的数组下标**收窄到 FL_AW 位；指针/快照/距离算术
+    //     （`fhead_q`/`ftail_q`/`ck_fhead`/`rb_fhead`/`free_cnt_w`）一律不动。
+    localparam integer FL_AW    = FL_PTR_W - 1;   // 数组下标宽度（深度 128 ⇒ 7 bit）
+    localparam integer FL_DEPTH = 1 << FL_AW;     // free list 数组深度（= 128，2 的幂）
+
     reg  [PDW-1:0]       rat_q   [0:ARCH_N-1];
     reg  [PDW-1:0]       arat_q  [0:ARCH_N-1];
     reg  [NREG-1:0]      ar_used_q;
-    reg  [PDW-1:0]       flist_q [0:255];
+    reg  [PDW-1:0]       flist_q [0:FL_DEPTH-1];
     reg  [FL_PTR_W-1:0]  fhead_q, ftail_q;
 
     localparam integer LOG_AW   = $clog2(LOG_N);   // log array address width (64 -> 6 bit; index wraps naturally)
@@ -201,10 +215,28 @@ module rename #(
                            {2'b0, lane_valid[2]} + {2'b0, lane_valid[3]};
 
     // ---- 1.1 free list 组合读（目的新物理号）----
+    //   ★ L8：数组深度 FL_DEPTH=128 ⇒ 下标取低 FL_AW(=7) 位（= 按深度取模，见 §0 注释）。
+    //     指针保值 8 bit 的模 256 语义，只有**取数组**时截断。
     wire [PDW-1:0] ev_pd_dst [0:W-1];
+    wire [FL_PTR_W-1:0] fl_rd_idx [0:W-1];       // fhead + ord_d[]（8 bit 指针语义）
+    wire [FL_PTR_W-1:0] fl_wr_idx [0:W-1];       // ftail + ord_r[]（8 bit 指针语义）
     generate
     for (g = 0; g < W; g = g + 1) begin : g_dst
-        assign ev_pd_dst[g] = flist_q[fhead_q + {{(FL_PTR_W-3){1'b0}}, ord_d[g]}];
+        assign fl_rd_idx[g] = fhead_q + {{(FL_PTR_W-3){1'b0}}, ord_d[g]};
+        assign ev_pd_dst[g] = flist_q[fl_rd_idx[g][FL_AW-1:0]];
+    end
+    for (g = 0; g < W; g = g + 1) begin : g_flw
+        assign fl_wr_idx[g] = ftail_q + {{(FL_PTR_W-3){1'b0}}, ord_r[g]};
+    end
+    endgenerate
+
+    //   ★ L8：自检打印用的 `fhead .. fhead+7` 连续读下标（与 §1.1 同一"按深度取模"口径）。
+    //     仅用于 §2.9 的 $display 证据，综合侧会被完全优化掉。
+    wire [FL_AW-1:0] fl_dbg_a [0:7];
+    generate
+    for (g = 0; g < 8; g = g + 1) begin : g_fldbg
+        wire [FL_PTR_W:0] fl_dbg_sum = fhead_q + g;   // 9 bit：8 bit 指针 + 0..7 不溢出
+        assign fl_dbg_a[g] = fl_dbg_sum[FL_AW-1:0];
     end
     endgenerate
 
@@ -431,9 +463,11 @@ module rename #(
                                      cj, ck, lane_dst_arn[cj*ARN_W +: ARN_W],
                                      lane_pd_dst[cj*PDW +: PDW],
                                      fhead_q, ftail_q,
-                                     flist_q[fhead_q], flist_q[fhead_q+1], flist_q[fhead_q+2],
-                                     flist_q[fhead_q+3], flist_q[fhead_q+4], flist_q[fhead_q+5],
-                                     flist_q[fhead_q+6], flist_q[fhead_q+7],
+                                     //   ★ L8：数组深度 128 ⇒ 打印下标同样按深度取模
+                                     //     （fl_dbg_a 见 §1.1；否则 8 bit 下标越界读出 x）
+                                     flist_q[fl_dbg_a[0]], flist_q[fl_dbg_a[1]], flist_q[fl_dbg_a[2]],
+                                     flist_q[fl_dbg_a[3]], flist_q[fl_dbg_a[4]], flist_q[fl_dbg_a[5]],
+                                     flist_q[fl_dbg_a[6]], flist_q[fl_dbg_a[7]],
                                      lane_pd_dst[0*PDW +: PDW], ord_d[0],
                                      lane_pd_dst[1*PDW +: PDW], ord_d[1],
                                      lane_pd_dst[2*PDW +: PDW], ord_d[2],
@@ -469,7 +503,9 @@ module rename #(
                 rat_q [j2] <= j2[PDW-1:0];
                 arat_q[j2] <= j2[PDW-1:0];
             end
-            for (j2 = 0; j2 < 256; j2 = j2 + 1) flist_q[j2] <= {PDW{1'b0}};
+            //   ★ L8：清零与预置循环上界必须 = 数组深度 FL_DEPTH（=128），不能再用 256
+            //     （否则 iverilog/综合对越界下标写出界；FREE_N ≤ 64 ⇒ 预置范围不受影响）。
+            for (j2 = 0; j2 < FL_DEPTH; j2 = j2 + 1) flist_q[j2] <= {PDW{1'b0}};
             for (j2 = 0; j2 < FREE_N; j2 = j2 + 1) flist_q[j2] <= (ARCH_N + j2);
             for (j2 = 0; j2 < LOG_N; j2 = j2 + 1) begin
                 lg_arn[j2] <= {ARN_W{1'b0}}; lg_old[j2] <= {PDW{1'b0}}; lg_val[j2] <= 1'b0;
@@ -499,7 +535,8 @@ module rename #(
             end
             ar_used_q <= ar_used_next;
             for (j2 = 0; j2 < W; j2 = j2 + 1) begin
-                if (rel_we[j2]) flist_q[ftail_q + {{(FL_PTR_W-3){1'b0}}, ord_r[j2]}]
+                //   ★ L8：写下标同样按数组深度取模（fl_wr_idx 见 §1.1）
+                if (rel_we[j2]) flist_q[fl_wr_idx[j2][FL_AW-1:0]]
                                     <= rel_preg[j2*PDW +: PDW];
             end
             ftail_q <= ftail_q + {{(FL_PTR_W-4){1'b0}}, rel_n_w};
@@ -520,7 +557,9 @@ module rename #(
             end else if (rb_act) begin
                 if (rb_cnt < NREG) begin
                     if (!ar_used_q[rb_cnt[PDW-1:0]]) begin
-                        flist_q[rb_head] <= rb_cnt[PDW-1:0];
+                        //   ★ L8：rb_head 是 8 bit 模 256 指针（终值 ≤ FREE_N ≤ 64），
+                        //     取数组时截到 FL_AW 位；`ftail_q <= rb_head` 仍用全 8 bit。
+                        flist_q[rb_head[FL_AW-1:0]] <= rb_cnt[PDW-1:0];
                         rb_head <= rb_head + 1'b1;
                     end
                     rb_cnt <= rb_cnt + 9'd1;
