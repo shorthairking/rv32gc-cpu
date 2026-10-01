@@ -29,6 +29,16 @@ module tb_back2_iq;
     localparam integer UOPW   = `BACK2_UOP_W;
     localparam integer SRC_N  = 5;
 
+    //   ★ L3（ROB 128→64，2026）：本 TB 的激励/期望**按 7 bit ROB 索引手工构造**
+    //     （rob 索引 120..126、`rob_cnt=128` 表示"窗口全开"），其覆盖点本身就是
+    //     "**128 项窗口**下的年龄序/回绕"（C6）。集成设计的真源已改为
+    //     `BACK2_ROB_IDX_W = 6`（ROB_N=64），若让本 TB 跟随默认参数，7 bit 激励会被
+    //     截断成 6 bit（120→56、128→0）⇒ 判据全废。故此处**显式把被测 iq 配回 7 bit**：
+    //     测的仍是同一个 `iq.v` 器件在"其原契约宽度"下的行为（iq.v 内部全部按
+    //     ROB_IDX_W 参数化，7 bit 配置即其最全覆盖），集成配置（6 bit）由
+    //     tb_back2_lockstep / scripts/regress.sh 端到端覆盖。**判据未放宽、激励未改**。
+    localparam integer ROB_IDX_W_TB = 7;
+
     reg clk, rst_n;
     initial begin clk = 1'b0; forever #(CLK_P/2) clk = ~clk; end
 
@@ -75,7 +85,7 @@ module tb_back2_iq;
     assign wki_tag = { 7'd6, 7'd5, 7'd4, 7'd3, 7'd2, 7'd1 };
     assign wkf_tag = { 6'd6, 6'd5, 6'd4, 6'd3, 6'd2, 6'd1 };
 
-    iq #(.DEPTH(`BACK2_IQ_ALU0_D)) u_iq0 (
+    iq #(.DEPTH(`BACK2_IQ_ALU0_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq0 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all[0]), .squash(squash[0]), .squash_idx(squash_idx[0]), .rob_cnt(rob_cnt[0]),
         .epoch(epoch[0]),
         .wr_valid({3'b0, wr_v[0]}),
@@ -92,7 +102,7 @@ module tb_back2_iq;
         .o_sel_v(sel_v[0]), .o_sel_uop(sel_uop[0*UOPW +: UOPW]),
         .o_sel_rob(sel_rob[0*7 +: 7])
     );
-    iq #(.DEPTH(`BACK2_IQ_ALU1_D)) u_iq1 (
+    iq #(.DEPTH(`BACK2_IQ_ALU1_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq1 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all[1]), .squash(squash[1]), .squash_idx(squash_idx[1]), .rob_cnt(rob_cnt[1]),
         .epoch(epoch[1]),
         .wr_valid({3'b0, wr_v[1]}),
@@ -109,7 +119,7 @@ module tb_back2_iq;
         .o_sel_v(sel_v[1]), .o_sel_uop(sel_uop[1*UOPW +: UOPW]),
         .o_sel_rob(sel_rob[1*7 +: 7])
     );
-    iq #(.DEPTH(`BACK2_IQ_BRU_D)) u_iq2 (
+    iq #(.DEPTH(`BACK2_IQ_BRU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq2 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all[2]), .squash(squash[2]), .squash_idx(squash_idx[2]), .rob_cnt(rob_cnt[2]),
         .epoch(epoch[2]),
         .wr_valid({3'b0, wr_v[2]}),
@@ -126,7 +136,7 @@ module tb_back2_iq;
         .o_sel_v(sel_v[2]), .o_sel_uop(sel_uop[2*UOPW +: UOPW]),
         .o_sel_rob(sel_rob[2*7 +: 7])
     );
-    iq #(.DEPTH(`BACK2_IQ_MDU_D)) u_iq3 (
+    iq #(.DEPTH(`BACK2_IQ_MDU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq3 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all[3]), .squash(squash[3]), .squash_idx(squash_idx[3]), .rob_cnt(rob_cnt[3]),
         .epoch(epoch[3]),
         .wr_valid({3'b0, wr_v[3]}),
@@ -143,7 +153,7 @@ module tb_back2_iq;
         .o_sel_v(sel_v[3]), .o_sel_uop(sel_uop[3*UOPW +: UOPW]),
         .o_sel_rob(sel_rob[3*7 +: 7])
     );
-    iq #(.DEPTH(`BACK2_IQ_LSU_D)) u_iq4 (
+    iq #(.DEPTH(`BACK2_IQ_LSU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq4 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all[4]), .squash(squash[4]), .squash_idx(squash_idx[4]), .rob_cnt(rob_cnt[4]),
         .epoch(epoch[4]),
         .wr_valid({3'b0, wr_v[4]}),
@@ -160,7 +170,7 @@ module tb_back2_iq;
         .o_sel_v(sel_v[4]), .o_sel_uop(sel_uop[4*UOPW +: UOPW]),
         .o_sel_rob(sel_rob[4*7 +: 7])
     );
-    iq #(.DEPTH(`BACK2_IQ_FPU_D)) u_iq5 (
+    iq #(.DEPTH(`BACK2_IQ_FPU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq5 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all[5]), .squash(squash[5]), .squash_idx(squash_idx[5]), .rob_cnt(rob_cnt[5]),
         .epoch(epoch[5]),
         .wr_valid({3'b0, wr_v[5]}),

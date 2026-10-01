@@ -133,7 +133,7 @@ module rename #(
     reg  [PDW-1:0]       flist_q [0:255];
     reg  [FL_PTR_W-1:0]  fhead_q, ftail_q;
 
-    localparam integer LOG_AW   = $clog2(LOG_N);   // log array address width (128 -> 7 bit; index wraps naturally)
+    localparam integer LOG_AW   = $clog2(LOG_N);   // log array address width (64 -> 6 bit; index wraps naturally)
     wire [LOG_AW-1:0]  lg_wr_a  = log_wr_q[LOG_AW-1:0];   // write address (B27 fix: slice, no mask)
     reg  [ARN_W-1:0]     lg_arn  [0:LOG_N-1];
     reg  [PDW-1:0]       lg_old  [0:LOG_N-1];
@@ -145,8 +145,10 @@ module rename #(
     reg                  ck_val   [0:CKPT_N-1];
 
     // 按 ROB 索引的回滚点快照（"该 uop 分配完成之后"的状态）
-    reg  [FL_PTR_W-1:0]  rb_fhead [0:127];
-    reg  [LOG_PTR_W-1:0] rb_log   [0:127];
+    //   ★ L3（ROB 128→64）：深度必须随 LOG_N（= RATLOG_N = ROB_N）收缩 —— 原硬编码
+    //     `[0:127]` 在 LOG_N=64 时会让索引 0..63 只覆盖一半表、且综合无法裁掉另外一半。
+    reg  [FL_PTR_W-1:0]  rb_fhead [0:LOG_N-1];
+    reg  [LOG_PTR_W-1:0] rb_log   [0:LOG_N-1];
 
     reg                  undo_act;
     reg  [LOG_PTR_W-1:0] undo_ptr;
@@ -476,7 +478,7 @@ module rename #(
                 ck_fhead[j2] <= {FL_PTR_W{1'b0}}; ck_log[j2] <= {LOG_PTR_W{1'b0}};
                 ck_val[j2]   <= 1'b0;
             end
-            for (j2 = 0; j2 < 128; j2 = j2 + 1) begin
+            for (j2 = 0; j2 < LOG_N; j2 = j2 + 1) begin
                 rb_fhead[j2] <= {FL_PTR_W{1'b0}}; rb_log[j2] <= {LOG_PTR_W{1'b0}};
             end
         end else begin

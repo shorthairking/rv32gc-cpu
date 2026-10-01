@@ -77,7 +77,7 @@ module iq #(
 
     // ---- 选择/发射（I1）----
     input  wire [ROB_IDX_W-1:0]  rob_head,         // 年龄基准（最老优先）
-    //   ★ ROB 有效项数（窗口大小 0..128）。队列项若落在窗口之外（已被提交越过、
+    //   ★ ROB 有效项数（窗口大小 0..ROB_N）。队列项若落在窗口之外（已被提交越过、
     //     或已被冲刷），必须**永久作废**：否则它会一直占着槽位、并被"最老优先"
     //     误判成最年轻项而永不发射（实测：ALU0 内滞留 rob=7/9/12/38/45 等早已
     //     提交过的项，槽位泄漏后新项无处可放 ⇒ 后端停顿）。
@@ -275,9 +275,9 @@ module iq #(
     // 5. 时序：唤醒置位 / 出队 / 入队
     //==========================================================================
     // ---- 冲刷作废掩码（组合；只读打包向量）----
-    //   年轻判据必须以 **ROB 头为年龄原点**：age = (idx - head) mod 128，
+    //   年轻判据必须以 **ROB 头为年龄原点**：age = (idx - head) mod ROB_N，
     //   "更年轻" ⇔ age(项) > age(squash_idx)。不能写成 (idx - squash_idx) != 0 ——
-    //   模 128 下 idx 更小会得到 127（看起来"非零"），会把**更老**的项一起误杀
+    //   模 N 下 idx 更小会得到一个很大的年龄（看起来"非零"），会把**更老**的项一起误杀
     //   （实测：squash_idx=21 时把 idx=20 的项也杀掉，队列 3→1 而非 3→2）。
     wire [DEPTH-1:0] squash_kill;
     wire [DEPTH-1:0] out_window;      // 落在 ROB 窗口之外（已提交越过 / 已冲刷）
@@ -286,8 +286,8 @@ module iq #(
     for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_kill
         wire [ROB_IDX_W-1:0] age_e = rob_q[ge*ROB_IDX_W +: ROB_IDX_W] - rob_head;
         assign squash_kill[ge] = squash & valid_q[ge] & (age_e > age_sq);
-        //   8 bit 比较：rob_cnt=128 时 7 bit 表示为 0 ⇒ 必须零扩展到 8 bit，否则
-        //   "满窗口"会被误判成"空窗口"而把全部项清掉。
+        //   比较必须零扩展到 rob_cnt 的宽度（ROB_IDX_W+1）：rob_cnt=ROB_N 时在
+        //   ROB_IDX_W 位里表示为 0 ⇒ 窄位比较会把"满窗口"误判成"空窗口"而全清。
         assign out_window[ge]  = valid_q[ge] & ({1'b0, age_e} >= rob_cnt);
     end
     endgenerate

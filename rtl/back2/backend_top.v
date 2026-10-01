@@ -218,7 +218,12 @@ module backend_top #(
     localparam       PW_I  = `BACK2_PREG_I_W;
     localparam       PW_F  = `BACK2_PREG_F_W;
     localparam       SRC_N = 5;
-    localparam       ROBW  = 7;              // ROB 索引位宽（= `BACK2_ROB_IDX_W）
+    localparam       ROBW  = `BACK2_ROB_IDX_W;   // ROB 索引位宽（= 真源 BACK2_ROB_IDX_W = log2(ROB_N)）
+    //   ★ L3（ROB 128→64）：ROB 索引一律取 **ROBW 位模 ROB_N 算术**（与 rob.v/iq.v 的
+    //     "age = (idx - head) mod N" 口径一致）。**不得**再用 7 bit / `& 7'h7F` 的模 128
+    //     写法：索引值只到 63，模 128 会把"回绕后的在窗项"算成 65..127 ⇒ 误判为窗外。
+    //     年龄判序也**不得**再用"N/2 半分窗"近似（N=64 时半窗只有 32 ⇒ 更老项会被误判），
+    //     改为"两侧各自相对 ROB 头的精确年龄比较"（见 §5 的 load/FP→CSR 可见性门）。
     localparam       LDW   = `BACK2_LQ_IDX_W;   // LQ 索引位宽
     localparam WBP_ALU0 = 0, WBP_ALU1 = 1, WBP_BRU = 2, WBP_MDU = 3,
                WBP_LSU  = 4, WBP_FPU  = 5, WBP_STD = 6;
@@ -386,10 +391,11 @@ module backend_top #(
     reg         mdu_if_di, fpu_if_di, fpu_if_df;
     reg  [PW_I-1:0] mdu_if_pdi, fpu_if_pdi;
     reg  [PW_F-1:0] fpu_if_pdf;
-    reg  [`BACK2_STQ_IDX_W-1:0] stq_of_rob [0:127];
+    //   ★ L3：深度 = ROB_N（原硬编码 128；索引现在是模 ROB_N 的 ROBW 位值）
+    reg  [`BACK2_STQ_IDX_W-1:0] stq_of_rob [0:ROB_N-1];
     //   ★ 2B-4 第二步：LQ 槽在 **D3 派发期**分配（load 项、程序序）⇒ 需要"ROB 项 → LQ 槽"
     //     登记表供 E1 取用（与 store 的 `stq_of_rob` 同构）。
-    reg  [`BACK2_LQ_IDX_W-1:0]  lq_of_rob  [0:127];
+    reg  [`BACK2_LQ_IDX_W-1:0]  lq_of_rob  [0:ROB_N-1];
     wire [`BACK2_LQ_IDX_W-1:0]  lq_of_rob_r;
     wire [11:0] csr_raddr_w;
     assign csr_raddr_o = csr_raddr_w;
@@ -438,7 +444,7 @@ module backend_top #(
     wire [5:0]  iq_iss_dead;
     reg  [6*WI-1:0]          iq_wv;
     reg  [6*WI*UOPW-1:0]     iq_wuop;
-    reg  [6*WI*7-1:0]        iq_wrob;
+    reg  [6*WI*ROBW-1:0]     iq_wrob;      // ★ L3：字段宽 = ROBW（与 iq.wr_rob 端口逐位对齐）
     reg  [6*WI*SRC_N-1:0]    iq_wrdy;
     wire [4:0]  iq_cnt [0:5];
 
@@ -466,10 +472,10 @@ module backend_top #(
 
     // 写回总线（0..5 六部件；6 = store 完成仅置 done）
     wire [6:0]      wb_v;
-    wire [7*7-1:0]  wb_rob;
+    wire [7*ROBW-1:0] wb_rob;   // ★ L3：字段宽 = ROBW
     wire [COMMIT_W*`BACK2_NQ_W-1:0] cmt_narrow;  // ★ ROB 窄控制字（第 1 步已导出；本步接线并作为提交判定唯一依据）
     wire [`BACK2_CMT_CSR_W-1:0] csr_pay_w;     // ★ ② 单 lane 动态 CSR 读口数据
-    wire [6:0]      csr_dyn_idx_w;            // ★ ② 其索引（提交组内 CSR lane 的绝对 ROB 索引）
+    wire [ROBW-1:0] csr_dyn_idx_w;            // ★ ② 其索引（提交组内 CSR lane 的绝对 ROB 索引；L3：模 ROB_N）
     wire [7*EW-1:0] wb_ep;
     wire [5:0]      wbi_v;              // 整数写回有效（部件 0..5）
     wire [6*PW_I-1:0] wbi_tag;
@@ -506,13 +512,22 @@ module backend_top #(
     wire [DISP_W*`BACK2_STQ_IDX_W-1:0] lsu_dr_idx;
     //   ★ 2B-3 第 6 段第二步：STQ 分配随带的 ROB 索引（年龄在分配期写入）
     wire [DISP_W*ROBW-1:0] st_alloc_rob;
+    //   ★ L3：D3 派发块内各 lane 的 ROB 索引（lane 0 最老；块"自 lane0 连续"⇒ idx = idx0+lane），
+    //     统一 **ROBW 位（模 ROB_N）**。7 bit 的 `rob_alloc_idx0` 在此截断为模 64：
+    //     直接写 `rob_alloc_idx0 + 7'dk` 会得到 [0,66] 的非模值（head=63、k=3 时 66 而非 2）
+    //     ⇒ 跨 64 回绕后所有年龄/窗口比较都会错。
+    wire [ROBW-1:0] rb_ix_w [0:DISP_W-1];
+    assign rb_ix_w[0] = rob_alloc_idx0;
+    assign rb_ix_w[1] = rob_alloc_idx0 + 7'd1;
+    assign rb_ix_w[2] = rob_alloc_idx0 + 7'd2;
+    assign rb_ix_w[3] = rob_alloc_idx0 + 7'd3;
     //   本拍提交条数（LQ 提交点释放的窗口宽度；已按 cmt_ok 门控）
     wire [2:0]  cmt_n_w;
 
     // 前端接口
     reg  [31:0] cnt_sq_q, cnt_cmt4_q, cnt_iss_q;
     reg  [3:0]  ck_busy_q;
-    reg  [6:0]  ck_rob_q [0:CKPT_N-1];
+    reg  [ROBW-1:0] ck_rob_q [0:CKPT_N-1];   // ★ L3：模 ROB_N
     reg  [CKPT_N-1:0] ck_pend_q;
 
     //==========================================================================
@@ -797,8 +812,7 @@ module backend_top #(
         .cmt_we(cmt_i_we), .cmt_arn(cmt_i_arn), .cmt_pd(cmt_i_pd),
         .rel_we(rel_i_we), .rel_preg(rel_i_pd),
         .rob_snap_valid(~rn_i_busy),
-        .rob_snap_idx({rob_alloc_idx0 + 7'd3, rob_alloc_idx0 + 7'd2,
-                       rob_alloc_idx0 + 7'd1, rob_alloc_idx0}),
+        .rob_snap_idx({rb_ix_w[3], rb_ix_w[2], rb_ix_w[1], rb_ix_w[0]}),
         .snap_valid(snap_v_w), .snap_id(snap_id_w), .snap_lane(snap_lane_w),
         .restore_valid(restore_ck_v_w), .restore_id(restore_ck_id_w),
         .restore_rob_valid(restore_rob_v_w), .restore_rob_idx(restore_rob_idx_w),
@@ -816,8 +830,7 @@ module backend_top #(
         .cmt_we(cmt_f_we), .cmt_arn(cmt_f_arn), .cmt_pd(cmt_f_pd),
         .rel_we(rel_f_we), .rel_preg(rel_f_pd),
         .rob_snap_valid(~rn_f_busy),
-        .rob_snap_idx({rob_alloc_idx0 + 7'd3, rob_alloc_idx0 + 7'd2,
-                       rob_alloc_idx0 + 7'd1, rob_alloc_idx0}),
+        .rob_snap_idx({rb_ix_w[3], rb_ix_w[2], rb_ix_w[1], rb_ix_w[0]}),
         .snap_valid(snap_v_w), .snap_id(snap_id_w), .snap_lane(snap_lane_w),
         .restore_valid(restore_ck_v_w), .restore_id(restore_ck_id_w),
         .restore_rob_valid(restore_rob_v_w), .restore_rob_idx(restore_rob_idx_w),
@@ -855,8 +868,7 @@ module backend_top #(
     assign ld_alloc_v[3] = d1_v_q[3] & u_is_ld(d1_uop_q[3]);
     //   ★ STQ 分配同时把各 lane 的 ROB 索引送进 LSQ：ROB 项与 lane 一一对应
     //     （同一块内 lane 0 最老：ROB 索引 = rob_alloc_idx0 + lane，与 §IQ 写口同式）。
-    assign st_alloc_rob = {rob_alloc_idx0 + 7'd3, rob_alloc_idx0 + 7'd2,
-                           rob_alloc_idx0 + 7'd1, rob_alloc_idx0};
+    assign st_alloc_rob = {rb_ix_w[3], rb_ix_w[2], rb_ix_w[1], rb_ix_w[0]};
     wire [3:0]  lsu_dr_ok_w;
     //   ★★ 4c(2/3)：**CSR 串行化**（本核 CSR 只在 ROB 头发射、提交点写 ⇒ 同一时刻只应有一条
     //     "未提交 CSR"在飞）。原实现的待提交跟踪 `csr_pend_q` 只记**一条**（派发时
@@ -867,7 +879,7 @@ module backend_top #(
     //     "至多一条未提交 CSR"成立，`csr_pend_q` 的年龄窗（load/FP 门）才可靠。
     //     （死锁性：在飞的 CSR 一定比 D1 里的块**更老**，其发射不受本门影响 ⇒ 它提交后门即开。）
     reg        csr_pend_q;      // 有"最老未提交 CSR 指令"
-    reg  [6:0] csr_pend_rob_q;  // 它的 ROB 索引（年龄窗原点）
+    reg  [ROBW-1:0] csr_pend_rob_q;  // 它的 ROB 索引（年龄窗原点；L3：模 ROB_N）
     wire       blk_has_csr_w = (d1_v_q[0] & u_is_csr(d1_uop_q[0])) |
                                (d1_v_q[1] & u_is_csr(d1_uop_q[1])) |
                                (d1_v_q[2] & u_is_csr(d1_uop_q[2])) |
@@ -964,7 +976,7 @@ module backend_top #(
         for (qi = 0; qi < 6; qi = qi + 1) begin
             iq_wv  [qi*WI +: WI]           = {WI{1'b0}};
             iq_wuop[qi*WI*UOPW +: WI*UOPW] = {(WI*UOPW){1'b0}};
-            iq_wrob[qi*WI*7 +: WI*7]       = {(WI*7){1'b0}};
+            iq_wrob[qi*WI*ROBW +: WI*ROBW] = {(WI*ROBW){1'b0}};
             iq_wrdy[qi*WI*SRC_N +: WI*SRC_N] = {(WI*SRC_N){1'b0}};
         end
         for (gi2 = 0; gi2 < DISP_W; gi2 = gi2 + 1) begin
@@ -972,8 +984,8 @@ module backend_top #(
                 iq_wv  [lane_q[gi2*3 +: 3]*WI + q_ord[gi2]] = 1'b1;
                 iq_wuop[lane_q[gi2*3 +: 3]*WI*UOPW + q_ord[gi2]*UOPW +: UOPW] =
                         lane_uop_fin[gi2];
-                iq_wrob[lane_q[gi2*3 +: 3]*WI*7 + q_ord[gi2]*7 +: 7] =
-                        rob_alloc_idx0 + gi2[6:0];
+                iq_wrob[lane_q[gi2*3 +: 3]*WI*ROBW + q_ord[gi2]*ROBW +: ROBW] =
+                        rb_ix_w[gi2];
                 iq_wrdy[lane_q[gi2*3 +: 3]*WI*SRC_N + q_ord[gi2]*SRC_N +: SRC_N] =
                         lane_rdy[gi2*5 +: 5];
             end
@@ -1054,8 +1066,17 @@ module backend_top #(
     //     B27 口径：`(a-b)&0x7F` ∈ (0, 64) 即"a 在 b 之后、且未绕环"）。
     //     跟踪寄存器/组合信号在此声明（driver 见 §12 后的 CSR 提交区）。
 
-    wire [6:0] csr_age_w      = (i4_sel_rob - csr_pend_rob_q) & 7'h7F;
-    wire       csr_ld_block_w = csr_pend_q & (csr_age_w != 7'h0) & (csr_age_w < 7'h40);
+    //   ★ L3（ROB 128→64）：判据改为**精确年龄序**（原半分窗写法在 N=64 下会误挡更老项）。
+    //     原写法 `(候选 − CSR) & 0x7F ∈ (0, N/2)` 只在两者距离 < N/2 时正确；N=64 后
+    //     N/2=32，距离 ≥33 的**更老**候选会被误判为"更年轻"而挡下 —— 这与本段注释声明的
+    //     "更老项不受影响（无死锁）"矛盾：更老项若卡在 ROB 头，年轻 CSR 永不成为头 ⇒ 永久停顿。
+    //     精确性依据：候选与在飞 CSR **都必在 ROB 窗内**（iq.v 的 out_window 保证在飞项
+    //     age < rob_cnt；CSR 未提交/未冲刷则 csr_pend_q 恒有效）⇒ 二者相对 ROB 头的模 N 年龄
+    //     就是真实偏移（唯一），`age(候选) > age(CSR)` 即精确的"候选更年轻"，且更老项永不被挡。
+    wire [ROBW-1:0] csr_pend_age_w = csr_pend_rob_q - rob_head_w[ROBW-1:0];
+    wire [ROBW-1:0] csr_age_w      = i4_sel_rob[ROBW-1:0] - rob_head_w[ROBW-1:0];
+    wire       csr_cand_win_w = ({1'b0, csr_age_w} < rob_cnt_w);   // 候选确在窗内才判序
+    wire       csr_ld_block_w = csr_pend_q & csr_cand_win_w & (csr_age_w > csr_pend_age_w);
     wire lsu_ld_block = u_is_ld(i4_sel_uop) & (~lsu_iss_ok_w | csr_ld_block_w);
     //   ★★ 4c(2/3)：**CSR→FP 可见性互锁**（与上面的 load 门同构、同一窗算术）——
     //     FP 指令读的是**组合回灌**的 `csr_frm_w`（fcsr.frm，供 DYN 舍入解析）+ 提交点累积
@@ -1063,11 +1084,12 @@ module backend_top #(
     //     **更年轻**的 FP 指令在它提交前发射/执行，就会用**旧 frm**（实测 p16：
     //     `fsrmi frm,1(RTZ)` → `fcvt.w.s 3.5`(经 frm=RTZ)=3 ✓ → `fsrm frm,0(RNE)` →
     //     紧随的 `fcvt.w.s` **仍按 RTZ 执行** ⇒ 得 3 而非 4 ⇒ 自检跳 fail、黄金在 #40 分歧）。
-    //     判据与 load 门逐字同构：候选 FP 项比"最老未提交 CSR"更年轻（`!= 0` 排除 CSR 自身、
-    //     `< 0x40` 为模 128 年龄窗内的"更年轻"）；更老的项不受影响 ⇒ CSR 仍能提交、
-    //     窗清空后 FP 恢复发射（**无死锁**：CSR 在 ROB 里更老且其发射不受 FP 影响）。
-    wire [6:0] csr_fp_age_w   = (i5_sel_rob - csr_pend_rob_q) & 7'h7F;
-    wire       csr_fp_block_w = csr_pend_q & (csr_fp_age_w != 7'h0) & (csr_fp_age_w < 7'h40);
+    //     判据与 load 门同构（**精确年龄序**，见 §5 该门的 L3 说明）；更老的项不受影响 ⇒
+    //     CSR 仍能提交、窗清空后 FP 恢复发射（**无死锁**：CSR 在 ROB 里更老且其发射不受 FP 影响）。
+    //   ★ L3：与 load 门同构（精确年龄序，阈值/半分窗近似问题见上），仅换到 i5 的候选。
+    wire [ROBW-1:0] csr_fp_age_w   = i5_sel_rob[ROBW-1:0] - rob_head_w[ROBW-1:0];
+    wire       csr_fp_win_w = ({1'b0, csr_fp_age_w} < rob_cnt_w);
+    wire       csr_fp_block_w = csr_pend_q & csr_fp_win_w & (csr_fp_age_w > csr_pend_age_w);
     //   ★★ 4c(2/3)：**DYN 舍入的 FP 项只在 ROB 头发射** —— `rm=111(DYN)` 时 FPU 的舍入模式
     //     取自 `csr_frm_w`（fcsr.frm 的**提交点**回灌），而上面的年龄窗门只能挡住"年龄窗内
     //     登记过的那条 CSR"；一个派发块可含**多条** CSR（p16 实测 `{fsrmi,frrm,frcsr}` 同块）
@@ -1088,7 +1110,7 @@ module backend_top #(
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[0*WI +: WI]), .wr_uop(iq_wuop[0*WI*UOPW +: WI*UOPW]),
-        .wr_rob(iq_wrob[0*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[0*WI*SRC_N +: WI*SRC_N]),
+        .wr_rob(iq_wrob[0*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[0*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[0]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(~al0_csr_blk),
@@ -1101,7 +1123,7 @@ module backend_top #(
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[1*WI +: WI]), .wr_uop(iq_wuop[1*WI*UOPW +: WI*UOPW]),
-        .wr_rob(iq_wrob[1*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[1*WI*SRC_N +: WI*SRC_N]),
+        .wr_rob(iq_wrob[1*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[1*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[1]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(1'b1),
@@ -1114,7 +1136,7 @@ module backend_top #(
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[2*WI +: WI]), .wr_uop(iq_wuop[2*WI*UOPW +: WI*UOPW]),
-        .wr_rob(iq_wrob[2*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[2*WI*SRC_N +: WI*SRC_N]),
+        .wr_rob(iq_wrob[2*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[2*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[2]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(1'b1),
@@ -1127,7 +1149,7 @@ module backend_top #(
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[3*WI +: WI]), .wr_uop(iq_wuop[3*WI*UOPW +: WI*UOPW]),
-        .wr_rob(iq_wrob[3*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[3*WI*SRC_N +: WI*SRC_N]),
+        .wr_rob(iq_wrob[3*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[3*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[3]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(mdu_free_w),
@@ -1160,7 +1182,7 @@ module backend_top #(
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[4*WI +: WI]), .wr_uop(iq_wuop[4*WI*UOPW +: WI*UOPW]),
-        .wr_rob(iq_wrob[4*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[4*WI*SRC_N +: WI*SRC_N]),
+        .wr_rob(iq_wrob[4*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[4*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[4]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(~lsu_ld_block),
@@ -1173,7 +1195,7 @@ module backend_top #(
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[5*WI +: WI]), .wr_uop(iq_wuop[5*WI*UOPW +: WI*UOPW]),
-        .wr_rob(iq_wrob[5*WI*7 +: WI*7]), .wr_rdy(iq_wrdy[5*WI*SRC_N +: WI*SRC_N]),
+        .wr_rob(iq_wrob[5*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[5*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[5]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(fpu_iss_ok_w),
@@ -1197,14 +1219,16 @@ module backend_top #(
     //     其 `bru_mis` 会在重定向后一拍**再发一次重定向**（把前端拉到错路径取指）。
     //     年龄判据照抄 `iq.v` 的 `squash_kill`：以 **ROB 头为原点**取模年龄，
     //     "更年轻" ⇔ `age(项) > age(squash_idx)`；比较**零扩展到 8 bit**
-    //     （`rob_cnt=128` 时 7 bit 表示为 0 ⇒ 7 bit 比较会把"满窗口"误判成"空窗口"，
-    //      见 `iq.v:279-287` 的实测注释）。更老的项（含正在提交的前缀）不受影响 ✓
+    //     （`rob_cnt=ROB_N` 时在 ROB_IDX_W 位里表示为 0 ⇒ 窄位比较会把"满窗口"误判成
+    //      "空窗口"，见 `iq.v:279-287` 的实测注释）。更老的项（含正在提交的前缀）不受影响 ✓
+    //   ★ L3：年龄统一为 **ROBW 位模 ROB_N**（与 iq.v §5 的 `age = idx - head` 逐位同口径）；
+    //     两侧年龄都只有 0..ROB_N-1 ⇒ 零扩展到 8 bit 后与 rob_cnt(≤ROB_N) 比较仍然正确。
     function i2_sq_kill_f;
-        input [6:0] iss_rob;
+        input [ROBW-1:0] iss_rob;
         begin
             i2_sq_kill_f = squash_v_w &
-                           ({1'b0, (iss_rob - rob_head_w)} >
-                            {1'b0, (squash_idx_w - rob_head_w)});
+                           ({1'b0, (iss_rob - rob_head_w[ROBW-1:0])} >
+                            {1'b0, (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])});
         end
     endfunction
     always @(posedge clk or negedge rst_n) begin
@@ -1301,11 +1325,11 @@ module backend_top #(
     //     判据与 ROB/LSU 同口径（无掩码窗口算术，B27 纪律）：
     //       age(在飞项) > age(squash 点) ⇒ 该项更年轻 ⇒ 本次冲刷该杀它。
     wire        mdu_kill = flush_all_w |
-                           (squash_v_w & (((mdu_if_rob - rob_head_w) & 7'h7F) >
-                                          ((squash_idx_w - rob_head_w) & 7'h7F)));
+                           (squash_v_w & ((mdu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
+                                          (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])));
     wire        fpu_kill = flush_all_w |
-                           (squash_v_w & (((fpu_if_rob - rob_head_w) & 7'h7F) >
-                                          ((squash_idx_w - rob_head_w) & 7'h7F)));
+                           (squash_v_w & ((fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
+                                          (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])));
     wire [4:0] mdu_brop = x_i2_uop[3][`BACK2_U_BROP_MSB:`BACK2_U_BROP_LSB];
     mdu u_mdu (.aclk(clk), .aresetn(rst_n), .start(mdu_go), .flush(mdu_kill),
                .mdu_op(mdu_brop[2:0]),
@@ -1435,13 +1459,13 @@ module backend_top #(
     assign wb_v[WBP_LSU]  = lsu_wb_v;
     assign wb_v[WBP_FPU]  = fpu_wb_v;
     assign wb_v[WBP_STD]  = lsu_st_done_v;
-    assign wb_rob[WBP_ALU0*7 +: 7] = x_i2_rob[0];
-    assign wb_rob[WBP_ALU1*7 +: 7] = x_i2_rob[1];
-    assign wb_rob[WBP_BRU*7 +: 7]  = x_i2_rob[2];
-    assign wb_rob[WBP_MDU*7 +: 7]  = mdu_if_rob;
-    assign wb_rob[WBP_LSU*7 +: 7]  = lsu_wb_rob;
-    assign wb_rob[WBP_FPU*7 +: 7]  = fpu_if_rob;
-    assign wb_rob[WBP_STD*7 +: 7]  = lsu_st_done_rob;
+    assign wb_rob[WBP_ALU0*ROBW +: ROBW] = x_i2_rob[0];
+    assign wb_rob[WBP_ALU1*ROBW +: ROBW] = x_i2_rob[1];
+    assign wb_rob[WBP_BRU*ROBW +: ROBW]  = x_i2_rob[2];
+    assign wb_rob[WBP_MDU*ROBW +: ROBW]  = mdu_if_rob;
+    assign wb_rob[WBP_LSU*ROBW +: ROBW]  = lsu_wb_rob;
+    assign wb_rob[WBP_FPU*ROBW +: ROBW]  = fpu_if_rob;
+    assign wb_rob[WBP_STD*ROBW +: ROBW]  = lsu_st_done_rob;
     assign wb_ep[WBP_ALU0*EW +: EW] = x_i2_ep[0];
     assign wb_ep[WBP_ALU1*EW +: EW] = x_i2_ep[1];
     assign wb_ep[WBP_BRU*EW +: EW]  = x_i2_ep[2];
@@ -1453,21 +1477,21 @@ module backend_top #(
     assign wbi_v = { (fpu_wb_v & fpu_wb_i), (lsu_wb_v & lsu_wb_di), mdu_wb_v,
                      (x_i2_v[2] & bru_wb_i), (x_i2_v[1] & a1_wb_i), (x_i2_v[0] & a0_wb_i) };
     function in_rob_win;
-        input [6:0] idx;
+        input [ROBW-1:0] idx;
         begin
-            in_rob_win = ({1'b0, (idx - rob_head_w)} < rob_cnt_w);
+            in_rob_win = ({1'b0, (idx - rob_head_w[ROBW-1:0])} < rob_cnt_w);
         end
     endfunction
     //   ★ 这里**不用 function 调用**（展开为纯表达式）：iverilog 12.0 在把 function
     //     调用放进连续赋值/位拼接时实测会给出错误结果（本文件另一处 generate 内
     //     调用 function 也有同类记录，见 iq.v §1 注）。展开写法与函数语义逐位相同。
     wire [5:0] wbi_keep = {
-        ({1'b0, (wb_rob[5*7 +: 7] - rob_head_w)} < rob_cnt_w),
-        ({1'b0, (wb_rob[4*7 +: 7] - rob_head_w)} < rob_cnt_w),
-        ({1'b0, (wb_rob[3*7 +: 7] - rob_head_w)} < rob_cnt_w),
-        ({1'b0, (wb_rob[2*7 +: 7] - rob_head_w)} < rob_cnt_w),
-        ({1'b0, (wb_rob[1*7 +: 7] - rob_head_w)} < rob_cnt_w),
-        ({1'b0, (wb_rob[0*7 +: 7] - rob_head_w)} < rob_cnt_w) };
+        ({1'b0, (wb_rob[5*ROBW +: ROBW] - rob_head_w[ROBW-1:0])} < rob_cnt_w),
+        ({1'b0, (wb_rob[4*ROBW +: ROBW] - rob_head_w[ROBW-1:0])} < rob_cnt_w),
+        ({1'b0, (wb_rob[3*ROBW +: ROBW] - rob_head_w[ROBW-1:0])} < rob_cnt_w),
+        ({1'b0, (wb_rob[2*ROBW +: ROBW] - rob_head_w[ROBW-1:0])} < rob_cnt_w),
+        ({1'b0, (wb_rob[1*ROBW +: ROBW] - rob_head_w[ROBW-1:0])} < rob_cnt_w),
+        ({1'b0, (wb_rob[0*ROBW +: ROBW] - rob_head_w[ROBW-1:0])} < rob_cnt_w) };
     //   ★ 写回 tag = **目的**物理号（PDIDST/PDFDST），供 ① PRF 写口 ② busy 位清零
     //     ③ 唤醒广播 三处共用。旧版误写成源 1（ps1i）⇒ 结果写进源寄存器、目的
     //     busy 位永不清零 ⇒ 消费者永不唤醒（实测：lui 之后的 jalr 永不发射）。
@@ -1576,7 +1600,7 @@ module backend_top #(
     reg        csr_cmt_we;  reg [11:0] csr_cmt_addr; reg [31:0] csr_cmt_data;
     reg [2:0]  csr_cmt_op;   // ★ B29：提交级 CSR 操作码
     reg        ff_cmt_any;  reg [4:0]  ff_cmt_val;
-    reg [6:0]  csr_cmt_idx;                  // ★ 4c(2/3)：本拍提交的 CSR 的 ROB 索引
+    reg [ROBW-1:0] csr_cmt_idx;              // ★ 4c(2/3)：本拍提交的 CSR 的 ROB 索引（L3：模 ROB_N）
     reg [31:0] csr_cmt_insn;                 // 该 CSR 指令的原始编码（判 zimm 形式）
     reg [PW_I-1:0] csr_cmt_ps1i;             // 该 CSR 指令自己的 rs1 物理号（B29 残留清理）
     //   ★★ 2B-5 第 3 步②：CSR lane 在提交组内的位置（供**单 lane 动态读口**索引）
@@ -1589,7 +1613,7 @@ module backend_top #(
         csr_cmt_ps1i = {PW_I{1'b0}};
         ff_cmt_any   = 1'b0;
         ff_cmt_val   = 5'h0;
-        csr_cmt_idx  = 7'h0;
+        csr_cmt_idx  = {ROBW{1'b0}};
         csr_cmt_lane = 2'd0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
             if (commit_valid_o[cw]) begin
@@ -1603,7 +1627,7 @@ module backend_top #(
                     csr_cmt_op   = csr_pay_w[2:0];
                     csr_cmt_insn = csr_pay_w[78:47];
                     csr_cmt_ps1i = csr_pay_w[15 +: PW_I];   // 同一字段（csrw）的低 PW_I 位（与 4b-1 口径一致）
-                    csr_cmt_idx  = rob_head_w + cw[6:0];                // ★ 4c(2/3)：它的 ROB 索引
+                    csr_cmt_idx  = rob_head_w[ROBW-1:0] + cw[1:0];      // ★ L3：模 ROB_N（cw ≤ 3）
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
                     ff_cmt_any = 1'b1;
@@ -1613,7 +1637,7 @@ module backend_top #(
         end
     end
     //   ★ ②：单 lane 动态读口索引 = 提交组内 CSR lane 的**绝对 ROB 索引**
-    assign csr_dyn_idx_w = rob_head_w + {{5{1'b0}}, csr_cmt_lane};
+    assign csr_dyn_idx_w = rob_head_w[ROBW-1:0] + csr_cmt_lane;   // ★ L3：模 ROB_N
 
     // fflags 累积写入（FPU 结果提交时），与 CSR 写并路：地址 0x001 用"读改写"
     //   ★★ CSR 可见性互锁的**跟踪**（见 §9 发射门处的声明/说明）
@@ -1623,13 +1647,13 @@ module backend_top #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             csr_pend_q     <= 1'b0;
-            csr_pend_rob_q <= 7'h0;
+            csr_pend_rob_q <= {ROBW{1'b0}};
         end else begin
             if (flush_all_w) begin
                 csr_pend_q <= 1'b0;
             end else if (squash_v_w && csr_pend_q &&
-                         (((csr_pend_rob_q - rob_head_w) & 7'h7F) >
-                          ((squash_idx_w - rob_head_w) & 7'h7F))) begin
+                         ((csr_pend_rob_q[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
+                          (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0]))) begin
                 csr_pend_q <= 1'b0;                     // 该 CSR 在冲刷点之后 ⇒ 已不存在
             end else if (csr_cmt_we) begin
                 //   ★★ 4c(2/3)：**只有"被跟踪的那条 CSR"提交才清** —— 一个派发块可含**多条**
@@ -1655,13 +1679,13 @@ module backend_top #(
                 //     才清" ⇒ 在其提交前，所有更年轻的 FP 项都被挡在发射口外 ✓（保守但正确：
                 //     块内更老的 CSR 也一定更早提交）。
                 if (d1_v_q[0] & u_is_csr(d1_uop_q[0])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0;
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[0];
                 end else if (d1_v_q[1] & u_is_csr(d1_uop_q[1])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd1;
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[1];
                 end else if (d1_v_q[2] & u_is_csr(d1_uop_q[2])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd2;
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[2];
                 end else if (d1_v_q[3] & u_is_csr(d1_uop_q[3])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rob_alloc_idx0 + 7'd3;
+                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[3];
                 end
             end
         end
@@ -1805,7 +1829,7 @@ module backend_top #(
     assign iprf_ra[13*PW_I +: PW_I] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
     assign iprf_ra[14*PW_I +: PW_I] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
     //   ★ PRF 写口判据 = "写回所属 ROB 项仍在 ROB 窗口内"（不能用 epoch，理由见 prf.v）
-    //     `(idx - head) mod 128 < cnt`；用 8 bit 比较以正确处理 cnt=128。
+    //     `(idx - head) mod ROB_N < cnt`；比较零扩展到 cnt 的宽度以正确处理 cnt=ROB_N。
     assign iprf_we    = wbi_v & wbi_keep;
     assign iprf_wa    = wbi_tag;
     assign iprf_wd    = wbi_data;
@@ -1827,8 +1851,8 @@ module backend_top #(
     assign fprf_ra[5*PW_F +: PW_F] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_ra[6*PW_F +: PW_F] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_ra[7*PW_F +: PW_F] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
-    assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob - rob_head_w)} < rob_cnt_w)),
-                          (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob - rob_head_w)} < rob_cnt_w)) };
+    assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)),
+                          (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)) };
     assign fprf_wa    = { u_pdf(x_i2_uop[5]), lsu_wb_pdf };
     //   ★★ 4c(3/3)：**FLD 不做 NaN-box** —— 8 B 装载写满 FLEN（ISA：只有 FLW 才 box）；
     //     ≤4 B 装载保持 NaN-box ⇒ 既有 flw/整数装载零回归。
@@ -1840,8 +1864,8 @@ module backend_top #(
     prf #(.NW(2), .NRD(8), .NREG(`BACK2_PRF_F_N), .PDW(PW_F), .DW(64)) u_prf_f (
         .clk(clk), .rst_n(rst_n),
         .we(fprf_we), .waddr(fprf_wa), .wdata(fprf_wd), .wepoch(fprf_we_ep), .epoch(epoch_w),
-        .wkeep({(fpu_wb_v & fpu_wb_f) ? ({1'b0,(fpu_if_rob - rob_head_w)} < rob_cnt_w) : 1'b0,
-                (lsu_wb_v & lsu_wb_f) ? ({1'b0,(lsu_wb_rob - rob_head_w)} < rob_cnt_w) : 1'b0}),
+        .wkeep({(fpu_wb_v & fpu_wb_f) ? ({1'b0,(fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w) : 1'b0,
+                (lsu_wb_v & lsu_wb_f) ? ({1'b0,(lsu_wb_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w) : 1'b0}),
         .re(fprf_re), .raddr(fprf_ra), .rdata(fprf_rd)
     );
 
@@ -2134,9 +2158,9 @@ module backend_top #(
             mdu_if_pdi <= {PW_I{1'b0}};
             fpu_if_rob <= 7'd0; fpu_if_ep <= {EW{1'b0}}; fpu_if_di <= 1'b0;
             fpu_if_df <= 1'b0; fpu_if_pdi <= {PW_I{1'b0}}; fpu_if_pdf <= {PW_F{1'b0}};
-            for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) ck_rob_q[si2] <= 7'd0;
-            for (si2 = 0; si2 < 128; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
-            for (si2 = 0; si2 < 128; si2 = si2 + 1) lq_of_rob[si2]  <= {`BACK2_LQ_IDX_W{1'b0}};
+            for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) ck_rob_q[si2] <= {ROBW{1'b0}};
+            for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
+            for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) lq_of_rob[si2]  <= {`BACK2_LQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= 107'h0;
         end else begin
             busy_i_q <= busy_i_nx;
@@ -2172,22 +2196,22 @@ module backend_top #(
             if (disp_fire_w) begin
                 for (si2 = 0; si2 < DISP_W; si2 = si2 + 1) begin
                     if (st_alloc_v[si2])
-                        stq_of_rob[rob_alloc_idx0 + si2[6:0]] <= st_alloc_idx[si2*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W];
+                        stq_of_rob[rb_ix_w[si2]] <= st_alloc_idx[si2*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W];
                     if (ld_alloc_v[si2])
-                        lq_of_rob[rob_alloc_idx0 + si2[6:0]]  <= ld_alloc_idx[si2*LDW +: LDW];
+                        lq_of_rob[rb_ix_w[si2]]  <= ld_alloc_idx[si2*LDW +: LDW];
                 end
             end
 
             // ---- 检查点表（登记 / 释放）----
             if (disp_fire_w && snap_v_r) begin
                 ck_busy_q[snap_id_r] <= 1'b1;
-                ck_rob_q[snap_id_r]  <= rob_alloc_idx0 + snap_lane_r;
+                ck_rob_q[snap_id_r]  <= rb_ix_w[snap_lane_r];
             end
             if (squash_v_w) begin
                 for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) begin
                     if (ck_busy_q[si2] &&
-                        (((ck_rob_q[si2] - rob_head_w) & 7'h7F) >=
-                         ((squash_idx_w - rob_head_w) & 7'h7F))) begin
+                        ((ck_rob_q[si2] - rob_head_w[ROBW-1:0]) >=
+                         (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0]))) begin
                         ck_pend_q[si2] <= 1'b1;
                         ck_busy_q[si2] <= 1'b0;
                     end
