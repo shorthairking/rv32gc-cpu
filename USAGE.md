@@ -16,19 +16,20 @@
 
 ## 2. 关键事实：子 Agent 模型路由（本机已就绪，无需安装任何东西）
 
-用户要求"母 Agent 调用子 Agent 时使用 DeepSeek 官方 API 的 ds v4.1 模型"（2026-09-21 深夜最终口径：官方 API；早前 opencode-go-chat 网关路由已弃用）。在本 dsh 环境中该模型的准确路由是：
+用户要求"母 Agent 调用子 Agent 时使用 opencode-go 路由的 V4.1 Flash，xhigh 档"（2026-09-24 夜最新口径）。在本 dsh 环境中该模型的准确路由是：
 
-- `provider: "deepseek-official"` —— dsh 的 DeepSeek 官方 API 提供商
-- `model: "deepseek-flash"` —— 即 "ds v4.1"（官方目录 id `deepseek-flash` = DeepSeek-V41-Flash，支持 off/low/high/max 四档推理）
+- `provider: "opencode-go"` —— OpenCode Go 网关（**精确 provider 名以新会话 `list_subagent_models` 实查为准**；本会话工具可见的是 `opencode-go-chat`，用户新加的路由本会话看不到）
+- `model: "deepseek-v4.1-flash"` —— DeepSeek V4.1 Flash
+- `reasoning_effort: "xhigh"` —— 思考强度 xhigh 档（该模型支持 off/minimal/low/medium/high/xhigh/max）
 
 本机 `~/.dsh/settings.yaml` 已开启子 Agent 模型选择（`subagent-model-selection: enabled: true`），且 `allowedModels` 中**已包含该路由**。因此：
 
-- **不需要在 WSL 里安装 opencode 本体**；模型由 DeepSeek 官方 API 提供。
-- 母 Agent 每次调用 `subagent`/`subagent_fork` 时，在参数里**显式携带 `provider`/`model`/`reasoning_effort`** 即可（`AGENT.md` §0.2 已写死：`provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "max"`）。
+- **不需要在 WSL 里安装 opencode 本体**；模型由 opencode-go 网关提供。
+- 母 Agent 每次调用 `subagent`/`subagent_fork` 时，在参数里**显式携带 `provider`/`model`/`reasoning_effort`** 即可（`AGENT.md` §0.2 已写死：`provider: "opencode-go"`、`model: "deepseek-v4.1-flash"`、`reasoning_effort: "xhigh"`）。
 
 验证方法（新会话里让母 Agent 执行）：
 
-- 调用 `list_subagent_models`（无参数 → 列出可用 provider；`provider=deepseek-official` → 列出该 provider 的模型）。
+- 调用 `list_subagent_models`（无参数 → 列出可用 provider；`provider=opencode-go` → 列出该 provider 的模型）。
 - 若 `subagent`/`subagent_fork` 工具参数里**没有** `provider`/`model` 字段、且 `list_subagent_models` 也未注册 → 说明宿主未启用 tool-subagent 的模型选择能力，**报告用户**处理（这是环境缺失，按红线不能自行绕过或退化成用母 Agent 模型跑子 Agent）。
 
 ## 3. 创建新母 Agent（dsh 会话）
@@ -53,15 +54,15 @@ subagent(
 【验收判据】bash scripts/run_unit_decoder.sh → 输出 DECODER_UNIT_TESTS: PASS；iverilog 编译零告警
 【禁止事项】禁止使用原语；禁止自写 AXI 相关逻辑；禁止修改 rtl/pkg/*.vh 之外的定义
 【参考】AGENT.md §4 红线；docs/design/spec/02-uop-and-decode.md（如已存在）",
-  provider: "deepseek-official",
-  model: "deepseek-flash",
-  reasoning_effort: "max",
+  provider: "opencode-go",
+  model: "deepseek-v4.1-flash",
+  reasoning_effort: "xhigh",
   run_in_background: true
 )
 ```
 
 - 新任务用 `subagent`；需要延续母 Agent 会话上下文的任务用 `subagent_fork`。
-- `reasoning_effort` 固定 `"max"`（用户指令 2026-09-14）；官方适配器支持 off/low/high/max 四档；若核实发现不支持 max，报告用户，不得擅自降档。
+- `reasoning_effort` 固定 `"xhigh"`（用户指令 2026-09-24）；适配器支持 off/minimal/low/medium/high/xhigh/max；若核实发现不支持 xhigh，报告用户，不得擅自降档。
 - 三个子 Agent 的职责/写权限边界见 `AGENT.md` §5：testing 与 info 默认只读；coding 只动指派范围。
 
 ## 5. 常见问题
