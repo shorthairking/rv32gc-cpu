@@ -41,6 +41,13 @@
 - **后续串行路线（方案1）**：C2 IQ 深度 68→50（在跑）→ **D1** rb_fhead/rb_log 回滚快照按 4-lane 压缩（rename.v，−3~4k）→ **D2** nq 组不变字段上移（rob.v+params+backend_top，−1.2~1.8k）→ **C3** 唤醒矩阵去 _q 半份+共享位图 → **C1** IQ 304→45bit（−15~25k，最大单条，风险高）→ C6/C9/C7/C4/C8（LSQ 转发/uop 字段裁剪/trq 32→16/RB 载荷裁剪/年龄收敛）。每段改 → 四套判据绿 → 重综合实测 → 母 Agent 复跑验收 → 提交。
 - **判据口径（沿用）**：深 = tb_core_top_2b 219/219 + tb_back2_iq 151/151 + tb_back2_lockstep 57/57(821 提交, top=`tb_back2_lockstep_top`) + regress 33/33；RTL 全量列表 = `scripts/env.sh` 的 `rv32_rtl_sources`（58 文件）。综合统一经 `./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667`，2B 用 `RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_DIRECTIVE=RuntimeOptimized`。
 
+### 1.5.3 📋 交接存档点 #13（2026-10-01：用户暂停 + 要求总结与可行性方案）
+
+- **状态**：7 个杠杆已落地并全部提交（HEAD `299216e`，工作树干净）：L1 `ee99f84` −74k、L3 ROB64 `5b2e35e` −36k、L5 LQ16 `b8a2675` −2.6k、L8 flist_q `0acdb01` −14.3k、C2 IQ68→50 `1df7252` −8.4k、ROB 表优化（done_bitmap 实测净回归已回退；仅 ifdef 化 `299216e` 面积中性）。**366,483→230,998 LUT（−37.0%，171.62%），FF 129,899→76,281**。全部四套判据绿 + 母 Agent 复跑验收。
+- **关键学习**：①大 mux 降深给超线性收益（flist_q 256:1→−81% 自身 LUT），小 mux 降深只给 FF（LQ 32:1→−1%）；②控制层已是组语义（blk_mask/cmt_chain），仅存储层逐指令；③综合已裁未读字段（win_q 822 LUT 非外部估 17K、uop_q 44% FF）；④ROB nq+updq 18.3k 是写口结构死重量（upd 三写口同拍异索引不可合并、done_bitmap 拆出反贵 +1.2k、updq→BRAM 不可取）；⑤RB 载荷 416b 仅 ~126b 被消费、nq 与 uop 重叠 31b。
+- **剩余杠杆（估）**：C1 IQ 304→45bit −15~25k（最大单条、风险高、+1 级流水）、C3 唤醒去 _q −3~6k、D1 rb_fhead/rb_log 快照压缩 −3~4k（已 interrupt）、C6 LSQ 转发 −1.5~3k、C9 uop 字段 −1~3k、C7 trq 32→16 −1.5~2k、C4 RB 载荷裁剪 −0.4~0.9k+BRAM、C8 年龄收敛 −0.5~1.5k、updq 读口裁剪 −1.1~2.1k、D2 nq 字段上移 −1.2~1.8k。合计估 **−28~51k ⇒ 落地 ~134-151%，到不了 80% 也到不了 100%**。
+- **★根本矛盾（待用户裁决）**：4 发射 OoO 的结构宽度（4-wide 派发 / 16 PRF 读口 / 304bit uop / 6 执行部件 / 6 唤醒口）在 xc7a200t（134,600 LUT）装不下；消冗余+降宽降口只能压到 ~134-151%。要 ≤80%（107,680）需架构降档（4→2 发射等）。恢复口径见 §1.5.2 判据 + 用户后续指令。
+
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
