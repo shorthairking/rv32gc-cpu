@@ -28,6 +28,14 @@
 - **后续路线**：分析→并行优化（窗口收窄/nq+updq 写 mux/rename 瘦身检查点 16→8/LSU 转发降宽/组合环修复）→ 综合复测 → impl 布线 → 60MHz → 100MHz → 上板。面积压不到容量需用户决策（换器件/降规格都碰硬指标）。
 - **备份/日志**：../.b2chk/（*.s41-*.s77、baseline_preB2_*.rpt、postB2_*.rpt、synth_2bprobe*.log、绿证 log）、fpga/out/synth_2b_16.667ns_*.rpt + post_synth_2b*.dcp。恢复方式：新会话按 AGENT.md §7/§9 开工清单（读 AGENT.md → git status → NEXT_SESSION.md → list_subagent_models）→ 按本点①②执行。
 
+### 1.5.2 📋 交接存档点 #12（2026-10-01：L1 收官 + 用户授权降条目 + ROB 64 在跑）
+
+- **★用户裁决（2026-10-01）**：按分析报告"选项 2"执行——**放宽 §1 条目数量硬指标**（用户："后端的条目数量指标对于四发射来说太多了"）。授权：ROB 128→64、LQ 32→16、PRF 96→64，配合 IQ 载荷瘦身与 ROB 四写口合并。**§1 中"ROB 128 项 / LSQ / 物理寄存器重命名"原硬指标已解除，可改**；但 4 发射/特权级/Cache/主频等其余指标不变。
+- **L1 ✅（commit `ee99f84`，母 Agent 已复跑四套判据全绿）**：`rename.v:57` `LOG_PTR_W` 由 `` `BACK2_RATLOG_N ``(128) 改为 `` `BACK2_RATLOG_PTR_W ``(8)（1 行参数错绑；rb_log/ck_log 位宽 128→8）。重综合实测（`RV32_SYNTH_TAG=2b_l1`，RuntimeOptimized/16.667ns）：**LUT 366,483→292,397（−74,086，−20.22%）、FF 129,899→95,150（−34,749，−26.75%）**；时序 WNS −62.876→−59.844 ns、失败端点 167,410→98,066。**新面积基线 = 292,397 LUT（217.23%）/ 95,150 FF（35.35%）**。
+- **进行中：ROB 128→64（L3，子 Agent `6d8156e5`）**：改 `back2_params.vh`（ROB_N/RATLOG_N 128→64、ROB_IDX_W 7→6）+ 同步 `rename.v:148-149`（rb_fhead/rb_log 硬编码 `[0:127]`→`[0:63]`）、`backend_top.v:221`（ROBW=7→6）；功能判据必须全绿、性能基线（IPC/C5 档）按需重标定（禁止放松功能判据）、`RV32_SYNTH_TAG=2b_rob64` 重综合。
+- **后续串行路线**：ROB 64 → LQ 32→16 + PRF 96→64（L5+L4）→ IQ 载荷瘦身 + ROB 四写口合并（L9+L2）→ 微优化批量（L6/L7/L8/L10/L11/L12）。每段改 → 四套判据绿 → 重综合实测 → 母 Agent 复跑验收 → 提交。
+- **判据口径（沿用）**：深 = tb_core_top_2b 219/219 + tb_back2_iq 151/151 + tb_back2_lockstep 57/57(821 提交, top=`tb_back2_lockstep_top`) + regress 33/33；RTL 全量列表 = `scripts/env.sh` 的 `rv32_rtl_sources`（58 文件）。综合统一经 `./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667`，2B 用 `RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_DIRECTIVE=RuntimeOptimized`。
+
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
