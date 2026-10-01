@@ -60,14 +60,24 @@
 // ---- epoch（§8.2：2 bit，冲刷递增；RIQ/SQ 出队时比较）----
 `define BACK2_EPOCH_W        2
 
-// ---- 分布式发射队列深度（§4.2：ALU0/1=16、BRU=8、MDU=8、LSU=12、FPU=8）----
-`define BACK2_IQ_ALU0_D      16
-`define BACK2_IQ_ALU1_D      16
-`define BACK2_IQ_BRU_D       8
-`define BACK2_IQ_MDU_D       8
-`define BACK2_IQ_LSU_D       12
-`define BACK2_IQ_FPU_D       8
-`define BACK2_IQ_MAX_D       16         // 通用 iq.v 的实例化上界（参数）
+// ---- 分布式发射队列深度（§4.2 原口径：ALU0/1=16、BRU=8、MDU=8、LSU=12、FPU=8）----
+//   ★★ C2 面积杠杆（IQ 深度与 ROB 对齐，纯容量缩减）：原总容量
+//     16+16+8+8+12+8 = **68 > ROB_N=64**，而每个 IQ 项在提交/发射上都是**某个 ROB 项
+//     的从属**（IQ 项 ⊆ ROB 项，1:1 由 rob 索引标识）⇒ 超出 64 的那 4 个槽在满窗口时
+//     **结构性不可能被填满**（派发受 ROB 容量阻塞），是死容量。
+//     新口径 **12+12+6+6+8+6 = 50**（= ROB_N 64 的 ~78%，按各部件实测占用重定：
+//     ALU 12、BRU/MDU/FPU 6、LSU 8），`BACK2_IQ_MAX_D` 16→12 同步收窄实例化上界。
+//     **不改任何指令语义**：iq.v / backend_top.v 的存储、写口分配、最老优先选择、
+//     冲刷作废、唤醒矩阵全部按 `DEPTH`/`BACK2_IQ_*_D` 参数化（无字面深度）。
+//     ⚠ 深度上限 12 ≤ 16 ⇒ `free_cnt`/`cnt_o` 的 5 bit 宽度口径不变；
+//       写口数 `BACK2_IQ_WR_PORTS` 保持 4 不动（派发宽度 4 未变）。
+`define BACK2_IQ_ALU0_D      12
+`define BACK2_IQ_ALU1_D      12
+`define BACK2_IQ_BRU_D       6
+`define BACK2_IQ_MDU_D       6
+`define BACK2_IQ_LSU_D       8
+`define BACK2_IQ_FPU_D       6
+`define BACK2_IQ_MAX_D       12         // 通用 iq.v 的实例化上界（参数）
 `define BACK2_IQ_WR_PORTS    4          // 每队列写口 ≤4/拍（02 §4.2）
 
 // ---- 唤醒/写回总线端口数（6 个执行部件各 1 个写回口）----
