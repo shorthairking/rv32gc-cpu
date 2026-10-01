@@ -54,7 +54,7 @@ module rename #(
     parameter integer ARN_W      = `BACK2_ARN_W,
     parameter integer FL_PTR_W   = `BACK2_FL_PTR_W,
     parameter integer LOG_N      = `BACK2_RATLOG_N,
-    parameter integer LOG_PTR_W  = `BACK2_RATLOG_N,
+    parameter integer LOG_PTR_W  = `BACK2_RATLOG_PTR_W,
     parameter integer CKPT_N     = `BACK2_CKPT_N,
     parameter integer CKPT_ID_W  = `BACK2_CKPT_ID_W,
     parameter integer ROB_IDX_W  = `BACK2_ROB_IDX_W,
