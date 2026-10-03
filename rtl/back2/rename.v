@@ -303,14 +303,32 @@ module rename #(
     assign free_cnt_o = free_cnt_w[7:0];
 
     // ---- 1.5 提交时架构引用位图更新（逐槽顺序：先清旧、后置新）----
+    //   ★★ 泄漏修复（正确性）：同一提交组内**两条 lane 写同一 ARN** 时，第二条 lane 要
+    //     清掉的不是 `arat_q[arn]`（组前旧映射），而是"该 ARN 在本组已处理部分（更早
+    //     lane）的当前映射"——即组内更早且同 ARN 的 lane 的 `cmt_pd`，其中**更年轻者
+    //     优先**（v 升序扫描、命中即覆盖 ⇒ 留下最大 v < u）。
+    //     旧实现一律按 `arat_q[arn]` 清位 ⇒ 中间那个 preg 在 `ar_used_q` 里残留假 used
+    //     位，而它其实已随本次提交释放回空闲表；`flush_all` 重建（§3.1 `rb_act`）按
+    //     `ar_used_q` 过滤 ⇒ 该 preg 不再被压回 ⇒ **每次"陷阱/xRET 冲刷 + 同组同 ARN
+    //     双写"永久丢 1 个物理号**（单测 S8：重建后 free=63、golden=64，缺 preg=32）。
     reg [NREG-1:0] ar_used_next;
+    reg [PDW-1:0]  clr_pd;
     integer        u;
+    integer        v;
     always @(*) begin
         ar_used_next = ar_used_q;
         for (u = 0; u < W; u = u + 1) begin
             if (cmt_we[u]) begin
+                //   本 lane 要清掉的映射：默认取组前架构值 `arat_q[arn]`；
+                //   若组内更早的 lane 写过同一 ARN，则取其中最年轻者的 `cmt_pd`。
+                clr_pd = arat_q[cmt_arn[u*ARN_W +: ARN_W]];
+                for (v = 0; v < W; v = v + 1) begin
+                    if ((v < u) && cmt_we[v] &&
+                        (cmt_arn[v*ARN_W +: ARN_W] == cmt_arn[u*ARN_W +: ARN_W]))
+                        clr_pd = cmt_pd[v*PDW +: PDW];
+                end
                 ar_used_next = (ar_used_next &
-                                ~({{(NREG-1){1'b0}}, 1'b1} << arat_q[cmt_arn[u*ARN_W +: ARN_W]]))
+                                ~({{(NREG-1){1'b0}}, 1'b1} << clr_pd))
                                | ({{(NREG-1){1'b0}}, 1'b1} << cmt_pd[u*PDW +: PDW]);
             end
         end
@@ -383,8 +401,21 @@ module rename #(
     end
     endgenerate
 
-    wire [LOG_PTR_W-1:0] undo_tgt_w  = restore_valid ? ck_log[restore_id] : rb_log[restore_rob_idx];
-    wire [FL_PTR_W-1:0]  undo_fhead_w= restore_valid ? ck_fhead[restore_id] : rb_fhead[restore_rob_idx];
+    //   ★★ 回滚取点修复（正确性）：两条入口**统一**改用"误判分支自身 ROB 索引"的快照。
+    //     `restore_rob_idx` 恒等于 ROB 的冲刷点 `squash_idx`（`backend_top.v`：
+    //     `squash_idx_w = restore_rob_idx_w = x_i2_rob[2]`），而 `rb_fhead[K]/rb_log[K]`
+    //     登记的是"派发 K 分配完成之后"的状态（§1.6 / §3.4），与 ROB"保留 ≤K"的冲刷
+    //     语义逐位对齐。
+    //     旧实现让 `restore_valid`（检查点入口）用 `ck_fhead[restore_id]`——该快照取在
+    //     "派发块内第一条 CKPT_VALID lane（掩码是前缀 ⇒ 恒为 lane 0）分配完成之后"，
+    //     而 ROB 的冲刷点是**误判分支自身索引**：分支不在块首（或块首与分支之间存在写
+    //     目的寄存器的 lane）时，快照早于分支 ⇒ free list 回卷过头 ⇒ 仍在飞/已提交的
+    //     pdi 被放回空闲表 ⇒ 同一 pdi 发给两条在飞指令（EXP-A pdi=90 撞车）。
+    //     改用 rb_* 后两入口同源：回卷量 = ROB 实际保留集对应的分配量。
+    //     注：`ck_fhead/ck_log/ck_val` 因此成为死逻辑，本任务按裁决**不清理**
+    //     （清理会涉及 `backend_top.v` 端口，留待 EXP-C 之后）。
+    wire [LOG_PTR_W-1:0] undo_tgt_w  = rb_log[restore_rob_idx];
+    wire [FL_PTR_W-1:0]  undo_fhead_w= rb_fhead[restore_rob_idx];
 
     //==========================================================================
     // 2. 回滚窗口（每拍 4 条逆序；窗口内最早写入者胜）
@@ -477,6 +508,25 @@ module rename #(
             end
         end
     end
+
+    //==========================================================================
+    // 2.10 不变式自检（CHK=1）：空闲项数不得超过物理空闲容量 `FREE_N`
+    //     ——`free_cnt_w = ftail_q − fhead_q`（模 256 指针差，9 bit）。合法状态下
+    //       空闲数 = NREG − 架构引用(ARCH_N) − 在飞已分配 ≤ FREE_N。若回滚把 `fhead`
+    //       退到"仍被引用/仍在飞"的旧位置（回卷过头，缺陷①②的形态），空闲数会虚高并
+    //       越过 `FREE_N` ⇒ 同一 preg 被再次发出。此前无任何检查，缺陷得以静默数周。
+    //     豁免：`flush_all` 拍与 `rb_act` 重建期是**已知过渡态**（`fhead` 暂置 0 而
+    //       `ftail` 未同步），不参与判据；其余拍恒应满足。
+    //     仅仿真分支编译（综合脚本定义 `RV32GC_USE_VIVADO_IP`）⇒ 综合面积零代价。
+    //==========================================================================
+`ifndef RV32GC_USE_VIVADO_IP
+    always @(posedge clk) begin
+        if (CHK && rst_n && !rb_act && !flush_all && (free_cnt_w > FREE_N))
+            $display("RENAME-CHK FREE-OVER: 空闲数 %0d > FREE_N %0d（回卷过头/重复归还）| fhead=%0d ftail=%0d restore_v=%0d restore_rob_v=%0d rob_idx=%0d",
+                     free_cnt_w, FREE_N, fhead_q, ftail_q,
+                     restore_valid, restore_rob_valid, restore_rob_idx);
+    end
+`endif // !RV32GC_USE_VIVADO_IP
 
     //==========================================================================
     // 3. 时序
