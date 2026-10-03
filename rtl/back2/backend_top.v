@@ -225,6 +225,9 @@ module backend_top #(
     //     年龄判序也**不得**再用"N/2 半分窗"近似（N=64 时半窗只有 32 ⇒ 更老项会被误判），
     //     改为"两侧各自相对 ROB 头的精确年龄比较"（见 §5 的 load/FP→CSR 可见性门）。
     localparam       LDW   = `BACK2_LQ_IDX_W;   // LQ 索引位宽
+    //   ★★ C1（IQ 载荷瘦身）：IQ 窄载荷宽度 与 发射宽载荷（回读）宽度
+    localparam       IQNW  = `BACK2_IQN_W;      // IQ 窄载荷（唤醒+门控）
+    localparam       IWW   = `BACK2_IW_W;       // 发射宽载荷 = uop[279:0]（见 back2_params §2.5）
     localparam WBP_ALU0 = 0, WBP_ALU1 = 1, WBP_BRU = 2, WBP_MDU = 3,
                WBP_LSU  = 4, WBP_FPU  = 5, WBP_STD = 6;
 
@@ -438,7 +441,23 @@ module backend_top #(
     wire [23:0] iq_free_cnt;
     wire [5:0]  iq_iss_v;
     wire [5:0]  iq_sel_v;
-    wire [UOPW-1:0] iq_iss_uop [0:5];
+    //   ★★ C1：IQ 的**窄载荷**选择观察口（发射门控真源）；`iq_iss_uop`/`sel_uop` 已废弃
+    //     （IQ 不再持宽字段 ⇒ backend_top 不再消费宽 uop 端口）。
+    wire [IQNW-1:0] iq_sel_nq [0:5];
+    //   ★★ C1：发射宽载荷存储（4 bank SDP，写口=派发、读口=发射仲裁）—— 见 §5.5
+    //   ⚠ 偏移位宽 = NW × OW = 4 × 4 = 16 bit（OW=4：每 bank 16 深 ⇒ 偏移 = rob 索引 [5:2]）
+    wire [3:0]       iwm_we;              // 每 bank 写使能（派发，4 lane 天然各占 1 bank）
+    wire [4*4-1:0]   iwm_woff;            // 每 bank 写偏移（= rob 索引 [5:2]）
+    wire [4*IWW-1:0] iwm_wdata;
+    wire [3:0]       iwm_re;              // 每 bank 读使能（发射，每 bank ≤1/拍）
+    wire [4*4-1:0]   iwm_roff;
+    wire [4*IWW-1:0] iwm_rdata;           // 同步读（1 拍）
+    reg  [2:0]       iwm_own_q [0:3];     // 上一拍各 bank 读回数据属于哪个队列（6=无）
+    wire [2:0]       iwm_own_nx [0:3];
+    wire [11:0]      iwm_rbank;           // 各队列读请求的 bank（= rob 索引低 2 位；6×2bit）
+    wire [5:0]       iwm_req;             // 发射读请求（未门控选择口 ∧ 基础就绪）
+    wire [5:0]       iwm_gnt;             // 读口仲裁结果（固定优先级；每 bank ≤1）
+    wire [5:0]       iq_base_rdy;         // 各队列**基础**发射许可（不含读口仲裁）
     wire [6:0]  iq_iss_rob [0:5];
     wire [EW-1:0] iq_iss_ep [0:5];
     wire [5:0]  iq_iss_dead;
@@ -486,7 +505,10 @@ module backend_top #(
     wire [6*PW_F-1:0] wkf_tag;
 
     // 各部件 I2 寄存器
-    reg  [UOPW-1:0] x_i2_uop [0:5];
+    //   ★★ C1：`x_i2_uop` 由**寄存器**改为**组合线**（源 = `u_iwmem` 的同步读输出 +
+    //     4:1 交叉开关）—— BRAM 输出寄存器恰好承担了原 `x_i2_uop` 的"发射拍→执行拍"
+    //     寄存作用 ⇒ **发射→执行仍是 1 拍**（无新增级数，见 §5.5/§6）。
+    wire [UOPW-1:0] x_i2_uop [0:5];
     reg  [6:0]      x_i2_rob [0:5];
     reg  [EW-1:0]   x_i2_ep  [0:5];
     reg             x_i2_v   [0:5];
@@ -1038,18 +1060,19 @@ module backend_top #(
     //==========================================================================
     // 5. 六个发射队列（分布式）
     //==========================================================================
-    wire [UOPW-1:0] i0_sel_uop; wire i0_sel_v; wire [6:0] i0_sel_rob;
-    wire [UOPW-1:0] i1_sel_uop; wire i1_sel_v; wire [6:0] i1_sel_rob;
-    wire [UOPW-1:0] i2_sel_uop; wire i2_sel_v; wire [6:0] i2_sel_rob;
-    wire [UOPW-1:0] i3_sel_uop; wire i3_sel_v; wire [6:0] i3_sel_rob;
-    wire [UOPW-1:0] i4_sel_uop; wire i4_sel_v; wire [6:0] i4_sel_rob;
-    wire [UOPW-1:0] i5_sel_uop; wire i5_sel_v; wire [6:0] i5_sel_rob;
+    //   ★★ C1：不再有 `i*_sel_uop`（IQ 不持宽字段）；门控改读窄载荷 `iq_sel_nq[q]`
+    wire i0_sel_v; wire [6:0] i0_sel_rob;
+    wire i1_sel_v; wire [6:0] i1_sel_rob;
+    wire i2_sel_v; wire [6:0] i2_sel_rob;
+    wire i3_sel_v; wire [6:0] i3_sel_rob;
+    wire i4_sel_v; wire [6:0] i4_sel_rob;
+    wire i5_sel_v; wire [6:0] i5_sel_rob;
     wire [5:0] wk_i_v_w;
     wire [6*PW_I-1:0] wk_i_tag_w;
     wire [5:0] wk_f_v_w;
     wire [6*PW_F-1:0] wk_f_tag_w;
     // CSR 只在 ALU0、且必须已到 ROB 头（§8.3：读写都按提交序可见）
-    wire al0_csr_blk = i0_sel_v & u_is_csr(i0_sel_uop) & (i0_sel_rob != rob_head_w);
+    wire al0_csr_blk = i0_sel_v & iq_sel_nq[0][`BACK2_IQN_IS_CSR] & (i0_sel_rob != rob_head_w);
 
     wire [2:0] q0_ready = ~al0_csr_blk;
     wire [2:0] q1_ready = 3'd1;
@@ -1079,7 +1102,7 @@ module backend_top #(
     wire [ROBW-1:0] csr_age_w      = i4_sel_rob[ROBW-1:0] - rob_head_w[ROBW-1:0];
     wire       csr_cand_win_w = ({1'b0, csr_age_w} < rob_cnt_w);   // 候选确在窗内才判序
     wire       csr_ld_block_w = csr_pend_q & csr_cand_win_w & (csr_age_w > csr_pend_age_w);
-    wire lsu_ld_block = u_is_ld(i4_sel_uop) & (~lsu_iss_ok_w | csr_ld_block_w);
+    wire lsu_ld_block = iq_sel_nq[4][`BACK2_IQN_IS_LOAD] & (~lsu_iss_ok_w | csr_ld_block_w);
     //   ★★ 4c(2/3)：**CSR→FP 可见性互锁**（与上面的 load 门同构、同一窗算术）——
     //     FP 指令读的是**组合回灌**的 `csr_frm_w`（fcsr.frm，供 DYN 舍入解析）+ 提交点累积
     //     fflags 的 RMW 基值 `csr_ff_w`；而 CSR 写只在**提交点**生效 ⇒ 若一条比该 CSR
@@ -1099,13 +1122,18 @@ module backend_top #(
     //     用**旧 frm** 执行。最稳且与 2A 顺序语义一致的判据：DYN 项**等到它成为 ROB 头**
     //     才发射 ⇒ 届时所有更老指令（含任何 CSR 写）都已提交 ⇒ 读到的 frm 必为已提交值 ✓
     //     （无死锁：更老指令不依赖 FP 队列；静态 rm 的 FP 项不受此门限制）
-    wire       fpu_dyn_w   = (i5_sel_uop[`BACK2_U_RM_MSB:`BACK2_U_RM_LSB] == 3'b111);
+    wire       fpu_dyn_w   = iq_sel_nq[5][`BACK2_IQN_RM_DYN];   // ★ C1：RM==7 由 IQ 窄载荷直接给出
     wire       fpu_head_w  = (i5_sel_rob == rob_head_w);
     wire       fpu_iss_ok_w = fpu_free_w & ~csr_fp_block_w & (~fpu_dyn_w | fpu_head_w);
     wire [2:0] q4_ready = ~lsu_ld_block;
     //   注：`q5_ready` 是**派发侧容量**（只反映队列余量），**不得**并入发射门 ——
     //   它会经写口仲裁影响派发，实测并入后 p16 第 12 条出现多余整数写回。
     wire [2:0] q5_ready = fpu_free_w ? 3'd1 : 3'd0;
+
+    //   ★★ C1：各队列的**基础**发射许可（= C1 之前 `iss_ready` 的全部判据，逐位不变）。
+    //     最终 `iss_ready` = 基础许可 ∧ **读口获准**（`iwm_gnt`）⇒ 拿不到读口的队列本拍
+    //     不出队、下一拍重试（宽载荷要到手才能进 E1）。顺序：{q5,q4,q3,q2,q1,q0}
+    assign iq_base_rdy = { fpu_iss_ok_w, ~lsu_ld_block, mdu_free_w, 1'b1, 1'b1, ~al0_csr_blk };
 
     iq #(.DEPTH(`BACK2_IQ_ALU0_D), .DBG(DBG_IQ)) u_iq0 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
@@ -1115,10 +1143,10 @@ module backend_top #(
         .wr_rob(iq_wrob[0*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[0*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[0]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(~al0_csr_blk),
-        .iss_valid(iq_iss_v[0]), .iss_uop(iq_iss_uop[0]), .iss_rob(iq_iss_rob[0]),
+        .rob_head(rob_head_w), .iss_ready(iq_base_rdy[0] & iwm_gnt[0]),
+        .iss_valid(iq_iss_v[0]), .iss_rob(iq_iss_rob[0]),   // ★ C1：不接宽 uop
         .iss_epoch(iq_iss_ep[0]), .iss_dead(iq_iss_dead[0]),
-        .o_sel_v(i0_sel_v), .o_sel_uop(i0_sel_uop), .o_sel_rob(i0_sel_rob), .cnt_o()
+        .o_sel_v(i0_sel_v), .o_sel_rob(i0_sel_rob), .o_sel_nq(iq_sel_nq[0]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_ALU1_D), .DBG(DBG_IQ)) u_iq1 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
@@ -1128,10 +1156,10 @@ module backend_top #(
         .wr_rob(iq_wrob[1*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[1*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[1]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(1'b1),
-        .iss_valid(iq_iss_v[1]), .iss_uop(iq_iss_uop[1]), .iss_rob(iq_iss_rob[1]),
+        .rob_head(rob_head_w), .iss_ready(iq_base_rdy[1] & iwm_gnt[1]),
+        .iss_valid(iq_iss_v[1]), .iss_rob(iq_iss_rob[1]),   // ★ C1：不接宽 uop
         .iss_epoch(iq_iss_ep[1]), .iss_dead(iq_iss_dead[1]),
-        .o_sel_v(i1_sel_v), .o_sel_uop(i1_sel_uop), .o_sel_rob(i1_sel_rob), .cnt_o()
+        .o_sel_v(i1_sel_v), .o_sel_rob(i1_sel_rob), .o_sel_nq(iq_sel_nq[1]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_BRU_D), .DBG(DBG_IQ)) u_iq2 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
@@ -1141,10 +1169,10 @@ module backend_top #(
         .wr_rob(iq_wrob[2*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[2*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[2]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(1'b1),
-        .iss_valid(iq_iss_v[2]), .iss_uop(iq_iss_uop[2]), .iss_rob(iq_iss_rob[2]),
+        .rob_head(rob_head_w), .iss_ready(iq_base_rdy[2] & iwm_gnt[2]),
+        .iss_valid(iq_iss_v[2]), .iss_rob(iq_iss_rob[2]),   // ★ C1：不接宽 uop
         .iss_epoch(iq_iss_ep[2]), .iss_dead(iq_iss_dead[2]),
-        .o_sel_v(i2_sel_v), .o_sel_uop(i2_sel_uop), .o_sel_rob(i2_sel_rob), .cnt_o()
+        .o_sel_v(i2_sel_v), .o_sel_rob(i2_sel_rob), .o_sel_nq(iq_sel_nq[2]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_MDU_D), .DBG(DBG_IQ)) u_iq3 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
@@ -1154,10 +1182,10 @@ module backend_top #(
         .wr_rob(iq_wrob[3*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[3*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[3]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(mdu_free_w),
-        .iss_valid(iq_iss_v[3]), .iss_uop(iq_iss_uop[3]), .iss_rob(iq_iss_rob[3]),
+        .rob_head(rob_head_w), .iss_ready(iq_base_rdy[3] & iwm_gnt[3]),
+        .iss_valid(iq_iss_v[3]), .iss_rob(iq_iss_rob[3]),   // ★ C1：不接宽 uop
         .iss_epoch(iq_iss_ep[3]), .iss_dead(iq_iss_dead[3]),
-        .o_sel_v(i3_sel_v), .o_sel_uop(i3_sel_uop), .o_sel_rob(i3_sel_rob), .cnt_o()
+        .o_sel_v(i3_sel_v), .o_sel_rob(i3_sel_rob), .o_sel_nq(iq_sel_nq[3]), .cnt_o()
     );
     //   ★★ 2B-3 第 6 段第二步（**真乱序的边界**）：`INORD_LOAD` **保持 1**，但它的角色
     //     从"唯一兜底"变为"**LQ 槽位序的防死锁门**"，与精确的 STQ 闸门**并联**：
@@ -1187,10 +1215,10 @@ module backend_top #(
         .wr_rob(iq_wrob[4*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[4*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[4]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(~lsu_ld_block),
-        .iss_valid(iq_iss_v[4]), .iss_uop(iq_iss_uop[4]), .iss_rob(iq_iss_rob[4]),
+        .rob_head(rob_head_w), .iss_ready(iq_base_rdy[4] & iwm_gnt[4]),
+        .iss_valid(iq_iss_v[4]), .iss_rob(iq_iss_rob[4]),   // ★ C1：不接宽 uop
         .iss_epoch(iq_iss_ep[4]), .iss_dead(iq_iss_dead[4]),
-        .o_sel_v(i4_sel_v), .o_sel_uop(i4_sel_uop), .o_sel_rob(i4_sel_rob), .cnt_o()
+        .o_sel_v(i4_sel_v), .o_sel_rob(i4_sel_rob), .o_sel_nq(iq_sel_nq[4]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_FPU_D), .DBG(DBG_IQ)) u_iq5 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
@@ -1200,15 +1228,112 @@ module backend_top #(
         .wr_rob(iq_wrob[5*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[5*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[5]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
-        .rob_head(rob_head_w), .iss_ready(fpu_iss_ok_w),
-        .iss_valid(iq_iss_v[5]), .iss_uop(iq_iss_uop[5]), .iss_rob(iq_iss_rob[5]),
+        .rob_head(rob_head_w), .iss_ready(iq_base_rdy[5] & iwm_gnt[5]),
+        .iss_valid(iq_iss_v[5]), .iss_rob(iq_iss_rob[5]),   // ★ C1：不接宽 uop
         .iss_epoch(iq_iss_ep[5]), .iss_dead(iq_iss_dead[5]),
-        .o_sel_v(i5_sel_v), .o_sel_uop(i5_sel_uop), .o_sel_rob(i5_sel_rob), .cnt_o()
+        .o_sel_v(i5_sel_v), .o_sel_rob(i5_sel_rob), .o_sel_nq(iq_sel_nq[5]), .cnt_o()
     );
 
     // 选择观察口汇总（诊断/外部门控用；旧版只在 §1 声明了 iq_sel_v 却从未驱动
     //   ⇒ 悬空网 z，任何引用都会把 x 传下去。此处补上唯一赋值点。）
     assign iq_sel_v = {i5_sel_v, i4_sel_v, i3_sel_v, i2_sel_v, i1_sel_v, i0_sel_v};
+
+    //==========================================================================
+    // 5.5 ★★ C1：发射宽载荷（IQ 已不存宽字段）—— 4 bank SDP 存储 + 读口仲裁 + 4:1 交叉开关
+    //==========================================================================
+    // 【为什么另起一份 4 bank SDP，而不是复用 `rob.v` 里 `rob_wide_mem` 的读口】
+    //   · ROB 那份读口被**提交头部窗口预取**占满（rob.v §1.5 的 `re(4'hF)`：每拍 4 读，
+    //     把 head..head+3 的 416 bit 载荷预取进 8 槽 FF 窗口）；
+    //   · 发射读的需求是"任意 rob 索引、每拍最多 4 个不同 bank"。若与预取共用同一份读口，
+    //     发射最多 **1 读/拍**（且会让提交窗口饿死 ⇒ 提交宽度掉到 ≤1）—— 那是"用 IPC 换面积"，
+    //     与本任务"不改变 4-wide 派发/提交"的口径冲突；实测口径见交付报告 §C1 读路径量化。
+    //   · 故为发射路径**单独实例化一份同构 4 bank SDP**（`u_iwmem`，复用 `rob_wide_mem`
+    //     模块本体 ⇒ 零新增模块文件）：写口与 ROB 载荷同源、同拍、同索引分解
+    //     （bank = idx[1:0]，偏移 = idx[5:2]）⇒ 每拍 4 lane 写天然各占 1 bank、无需仲裁；
+    //     读口 4 个 bank 各 1 个，仲裁后每 bank ≤1 读 ⇒ 每拍最多 4 个队列同时拿到宽载荷。
+    // 【为什么"不增加发射级数"】同步读 1 拍：第 T 拍 IQ 选出 rob 索引 ⇒ 发起读；第 T+1 拍
+    //   BRAM 的输出寄存器给出的宽载荷**直接**作为 E1 的 `x_i2_uop`（与改前的 `x_i2_uop`
+    //   触发器完全同拍）⇒ **发射→执行仍是 1 拍**（IPC 不因本改动结构性下降）。
+    //   硬成本 = +16 个 RAMB36（DW=280 ⇒ 4/bank；见报告"读路径代价"）。
+    // 【写口】D3 派发 4 lane 的 rob 索引连续 ⇒ bank=gw 对应的 lane = (gw - idx0[1:0]) mod 4
+    //   （与 rob.v §1.5 的 `wsel` 逐位同式），写数据 = `lane_uop_fin[lane][IWW-1:0]`
+    //   （= 与 ROB 载荷、原 IQ 存储**同一条** uop 的低 280 位）。
+    genvar gw_iwm;
+    generate
+    for (gw_iwm = 0; gw_iwm < 4; gw_iwm = gw_iwm + 1) begin : g_iwmw
+        wire [1:0] lw = gw_iwm[1:0] - rob_alloc_idx0[1:0];
+        assign iwm_we[gw_iwm] = disp_fire_w & d1_v_q[lw];
+        assign iwm_woff[gw_iwm*4 +: 4] = rb_ix_w[lw][5:2];
+        assign iwm_wdata[gw_iwm*IWW +: IWW] = lane_uop_fin[lw][IWW-1:0];
+    end
+    endgenerate
+    rob_wide_mem #(.NW(4), .BW(16), .DW(IWW), .AW(ROBW), .OW(4), .CHK(0)) u_iwmem (
+        .clk(clk), .rst_n(rst_n),
+        .we(iwm_we), .woff(iwm_woff), .wdata(iwm_wdata),
+        .re(iwm_re), .roff(iwm_roff), .rdata(iwm_rdata));
+
+    // ---- 读口仲裁（组合、固定优先级 ALU0 > ALU1 > BRU > MDU > LSU > FPU）----
+    //   请求源用**未门控**的选择观察口（`i*_sel_v`/`i*_sel_rob`）⇒ 与 `iss_ready` 无组合环
+    //   （`iss_ready` ⊃ `iwm_gnt`，而 `iwm_gnt` 只依赖观察口与**基础**许可 `iq_base_rdy`）。
+    //   每 bank 至多 1 个获准者 ⇒ 与 4 bank 的读口数一一对应；被抢的队列只是"本拍不出队"，
+    //   下一拍重试。无饥饿：更高优先级队列的在飞项数有限（程序有限），且每拍最多 4 个 bank
+    //   同时获准 ⇒ ROB 头项不会永久拿不到读口（有界等待）。
+    assign iwm_req   = { i5_sel_v, i4_sel_v, i3_sel_v, i2_sel_v, i1_sel_v, i0_sel_v } & iq_base_rdy;
+    assign iwm_rbank = { i5_sel_rob[1:0], i4_sel_rob[1:0], i3_sel_rob[1:0],
+                         i2_sel_rob[1:0], i1_sel_rob[1:0], i0_sel_rob[1:0] };
+    function [5:0] iwm_arb;
+        input [5:0]  rq;
+        input [11:0] bk;
+        integer      a, c;
+        reg [5:0]    g;
+        begin
+            g = 6'd0;
+            for (a = 0; a < 6; a = a + 1)
+                if (rq[a]) begin
+                    g[a] = 1'b1;
+                    for (c = 0; c < a; c = c + 1)
+                        if (rq[c] && (bk[c*2 +: 2] == bk[a*2 +: 2])) g[a] = 1'b0;
+                end
+            iwm_arb = g;
+        end
+    endfunction
+    assign iwm_gnt = iwm_arb(iwm_req, iwm_rbank);
+
+    //   bank 级读命令与数据归属：每个 bank 的获准队列（唯一）+ 它的 rob 索引 [5:2]
+    genvar gb_iwm;
+    generate
+    for (gb_iwm = 0; gb_iwm < 4; gb_iwm = gb_iwm + 1) begin : g_iwmr
+        wire [5:0] hit = iwm_gnt & { (iwm_rbank[11:10] == gb_iwm[1:0]),
+                                     (iwm_rbank[9:8]  == gb_iwm[1:0]),
+                                     (iwm_rbank[7:6]  == gb_iwm[1:0]),
+                                     (iwm_rbank[5:4]  == gb_iwm[1:0]),
+                                     (iwm_rbank[3:2]  == gb_iwm[1:0]),
+                                     (iwm_rbank[1:0]  == gb_iwm[1:0]) };
+        assign iwm_re[gb_iwm] = |hit;
+        assign iwm_roff[gb_iwm*4 +: 4] =
+               (hit[0] ? i0_sel_rob[5:2] : 4'h0) |
+               (hit[1] ? i1_sel_rob[5:2] : 4'h0) |
+               (hit[2] ? i2_sel_rob[5:2] : 4'h0) |
+               (hit[3] ? i3_sel_rob[5:2] : 4'h0) |
+               (hit[4] ? i4_sel_rob[5:2] : 4'h0) |
+               (hit[5] ? i5_sel_rob[5:2] : 4'h0);
+        assign iwm_own_nx[gb_iwm] = hit[0] ? 3'd0 : hit[1] ? 3'd1 : hit[2] ? 3'd2 :
+                                    hit[3] ? 3'd3 : hit[4] ? 3'd4 : hit[5] ? 3'd5 : 3'd6;
+    end
+    endgenerate
+
+    // ---- E1 拍：把"上一拍读回的 4 bank 数据"按归属路由到 6 个队列（4:1 mux ×6）----
+    //   注：`x_i2_v[xi]`（= 上一拍发射有效，见 §6）与读回数据严格同拍 ⇒ 未发射队列的 mux
+    //   输出即使来自别的 bank 也没有消费者（下游全部由 `x_i2_v` 门控）。
+    genvar gx_iwm;
+    generate
+    for (gx_iwm = 0; gx_iwm < 6; gx_iwm = gx_iwm + 1) begin : g_xbar
+        wire [1:0] os = (iwm_own_q[0] == gx_iwm[2:0]) ? 2'd0 :
+                        (iwm_own_q[1] == gx_iwm[2:0]) ? 2'd1 :
+                        (iwm_own_q[2] == gx_iwm[2:0]) ? 2'd2 : 2'd3;
+        assign x_i2_uop[gx_iwm] = { {(UOPW-IWW){1'b0}}, iwm_rdata[os*IWW +: IWW] };
+    end
+    endgenerate
 
     //==========================================================================
     // 6. I2 寄存器 + E1 执行
@@ -1252,7 +1377,8 @@ module backend_top #(
                 x_i2_v[xi] <= iq_iss_v[xi] & ~iq_iss_dead[xi] & ~flush_all_w &
                               ~i2_sq_kill_f(iq_iss_rob[xi]);
                 if (iq_iss_v[xi] & ~flush_all_w & ~i2_sq_kill_f(iq_iss_rob[xi])) begin
-                    x_i2_uop[xi] <= iq_iss_uop[xi];
+                    //   ★★ C1：`x_i2_uop[xi]` 不再在此寄存 —— 宽载荷由 §5.5 的 `u_iwmem`
+                    //     同步读输出（同拍）+ 4:1 交叉开关组合给出，与这里的 `x_i2_v` 同拍。
                     x_i2_rob[xi] <= iq_iss_rob[xi];
                     x_i2_ep[xi]  <= iq_iss_ep[xi];
                 end
@@ -1260,7 +1386,7 @@ module backend_top #(
         end
     end
 
-    wire [31:0] a0_opa = u_au(iq_iss_uop[0] ? x_i2_uop[0] : x_i2_uop[0]) ? u_pc(x_i2_uop[0]) : iprf_rd[0*32 +: 32];
+    wire [31:0] a0_opa = u_au(x_i2_uop[0]) ? u_pc(x_i2_uop[0]) : iprf_rd[0*32 +: 32];
     wire [31:0] a0_opb = u_rt(x_i2_uop[0]) ? iprf_rd[1*32 +: 32] : u_imm(x_i2_uop[0]);
     wire [31:0] a0_res;
     alu u_alu0 (.a(a0_opa), .b(a0_opb),
@@ -1497,7 +1623,7 @@ module backend_top #(
     //   ★ 写回 tag = **目的**物理号（PDIDST/PDFDST），供 ① PRF 写口 ② busy 位清零
     //     ③ 唤醒广播 三处共用。旧版误写成源 1（ps1i）⇒ 结果写进源寄存器、目的
     //     busy 位永不清零 ⇒ 消费者永不唤醒（实测：lui 之后的 jalr 永不发射）。
-    assign wbi_tag = { u_pdi(x_i2_uop[5]), lsu_wb_pdi, mdu_if_pdi,
+    assign wbi_tag = { fpu_if_pdi, lsu_wb_pdi, mdu_if_pdi,
                        u_pdi(x_i2_uop[2]), u_pdi(x_i2_uop[1]), u_pdi(x_i2_uop[0]) };
     assign wbi_data = { fpu_wb_idata, lsu_wb_data, mdu_wb_data, bru_wb_data, a1_wb_data, a0_wb_data };
 
@@ -1506,7 +1632,7 @@ module backend_top #(
     assign wk_i_v_w = wki_v;
     assign wk_i_tag_w = wki_tag;
     assign wk_f_v_w   = {{(6-2){1'b0}}, (fpu_wb_v & fpu_wb_f), (lsu_wb_v & lsu_wb_f)};
-    assign wk_f_tag_w = {{(6*PW_F - 2*PW_F){1'b0}}, u_pdf(x_i2_uop[5]), lsu_wb_pdf};
+    assign wk_f_tag_w = {{(6*PW_F - 2*PW_F){1'b0}}, fpu_if_pdf, lsu_wb_pdf};
 
     //==========================================================================
     // 8. 忙碌位图（发射就绪判定：物理寄存器的生产者尚未写回）
@@ -1527,7 +1653,7 @@ module backend_top #(
                 busy_i_nx[wbi_tag[bi*PW_I +: PW_I]] = 1'b0;
         end
         if (lsu_wb_v & lsu_wb_df & (lsu_wb_ep == epoch_w)) busy_f_nx[lsu_wb_pdf] = 1'b0;
-        if (fpu_wb_v & fpu_wb_f & (fpu_if_ep  == epoch_w)) busy_f_nx[u_pdf(x_i2_uop[5])] = 1'b0;
+        if (fpu_wb_v & fpu_wb_f & (fpu_if_ep  == epoch_w)) busy_f_nx[fpu_if_pdf] = 1'b0;
     end
 
     //==========================================================================
@@ -1852,7 +1978,7 @@ module backend_top #(
     assign fprf_ra[7*PW_F +: PW_F] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)),
                           (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)) };
-    assign fprf_wa    = { u_pdf(x_i2_uop[5]), lsu_wb_pdf };
+    assign fprf_wa    = { fpu_if_pdf, lsu_wb_pdf };
     //   ★★ 4c(3/3)：**FLD 不做 NaN-box** —— 8 B 装载写满 FLEN（ISA：只有 FLW 才 box）；
     //     ≤4 B 装载保持 NaN-box ⇒ 既有 flw/整数装载零回归。
     assign fprf_wd    = { fpu_wb_fdata,
@@ -2158,12 +2284,16 @@ module backend_top #(
             fpu_if_rob <= 7'd0; fpu_if_ep <= {EW{1'b0}}; fpu_if_di <= 1'b0;
             fpu_if_df <= 1'b0; fpu_if_pdi <= {PW_I{1'b0}}; fpu_if_pdf <= {PW_F{1'b0}};
             for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) ck_rob_q[si2] <= {ROBW{1'b0}};
+            //   ★★ C1：发射读回数据的 bank 归属（E1 拍做 4:1 路由用）复位为"无归属"
+            for (si2 = 0; si2 < 4; si2 = si2 + 1) iwm_own_q[si2] <= 3'd6;
             for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) lq_of_rob[si2]  <= {`BACK2_LQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= 107'h0;
         end else begin
             busy_i_q <= busy_i_nx;
             busy_f_q <= busy_f_nx;
+            //   ★★ C1：发射读回数据的 bank 归属打拍（与 §5.5 的 `u_iwmem` 同步读同沿）
+            for (si2 = 0; si2 < 4; si2 = si2 + 1) iwm_own_q[si2] <= iwm_own_nx[si2];
 
             // ---- MDU/FPU 在途登记（★ 只清"被本次冲刷杀掉的"在飞项，见 mdu_kill/fpu_kill）
             if (mdu_kill) begin
@@ -2173,8 +2303,6 @@ module backend_top #(
                     mdu_if_v   <= 1'b1;
                     mdu_if_rob <= iq_iss_rob[3];
                     mdu_if_ep  <= iq_iss_ep[3];
-                    mdu_if_di  <= u_di(iq_iss_uop[3]);
-                    mdu_if_pdi <= u_pdi(iq_iss_uop[3]);
                 end else if (mdu_done) mdu_if_v <= 1'b0;
             end
             if (fpu_kill) begin
@@ -2184,11 +2312,22 @@ module backend_top #(
                     fpu_if_v   <= 1'b1;
                     fpu_if_rob <= iq_iss_rob[5];
                     fpu_if_ep  <= iq_iss_ep[5];
-                    fpu_if_di  <= u_di(iq_iss_uop[5]);
-                    fpu_if_df  <= u_df(iq_iss_uop[5]);
-                    fpu_if_pdi <= u_pdi(iq_iss_uop[5]);
-                    fpu_if_pdf <= u_pdf(iq_iss_uop[5]);
                 end else if (fpu_done) fpu_if_v <= 1'b0;
+            end
+            //   ★★ C1：`di/pdi/df/pdf` 改在 **E1 拍**（= 宽载荷 `x_i2_uop` 到手的那一拍）登记 ——
+            //     比原"发射拍"晚 1 拍；这几个字段只在**写回拍**（`mdu_done`/`fpu_done`，至少再晚
+            //     1 拍）被消费（`wbi_tag`/`wbi_data`/`fprf_wa`/`busy_f_nx`），故语义等价。
+            //     注意 `rob/ep` 仍与"在途标志"同拍登记：`mdu_kill`/`fpu_kill` 的年龄判据
+            //     在登记后的**下一拍**就要用到它们，不能晚。
+            if (x_i2_v[3]) begin
+                mdu_if_di  <= u_di(x_i2_uop[3]);
+                mdu_if_pdi <= u_pdi(x_i2_uop[3]);
+            end
+            if (x_i2_v[5]) begin
+                fpu_if_di  <= u_di(x_i2_uop[5]);
+                fpu_if_df  <= u_df(x_i2_uop[5]);
+                fpu_if_pdi <= u_pdi(x_i2_uop[5]);
+                fpu_if_pdf <= u_pdf(x_i2_uop[5]);
             end
 
             // ---- STQ 归属表（store 的 ROB 项 → STQ 索引）----

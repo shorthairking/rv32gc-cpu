@@ -21,8 +21,17 @@
 // 【实现要点】
 //   · 有效位/就绪位/年龄/ROB 索引一律用**打包向量**（非存储器）⇒ 选择与唤醒全组合，
 //     满足"唤醒当拍即可选择"（§4.3 的 I1/I2 拆分）。
-//   · 载荷（uop，272 bit）存于阵列；出队时按动态索引取出（`assign iss_uop = uop_q[sel]`，
-//     与 2A 核 GPR 读口同一写法）。
+//   · ★★ C1（IQ 载荷瘦身）：阵列里存的是**窄载荷** `np_q[0:DEPTH-1]`（`BACK2_IQN_W`
+//     = 40 bit，布局见 `back2_params.vh` §2.5），不再是整条 304 bit uop。逐槽只留
+//       ① 唤醒用：5 个源物理号 + 5 个 `S*_USE`；
+//       ② 出队/发射门控用：`IS_LOAD` / `IS_CSR` / `RM==7` 三个门控位。
+//     宽字段（PC/IMM/PREDTGT/ALUOP/…）改由 `backend_top.v` 在**发射拍按 rob 索引**从
+//     一张 4 bank SDP BRAM 读回（`u_iwmem`）⇒ IQ 的存储/写 mux/读 mux 只按 40 bit 计。
+//   · 出队时按动态索引取出窄载荷（`np_q[sel]`，与 2A 核 GPR 读口同一写法），经
+//     `o_sel_nq` 给 backend_top 做门控。
+//   · 端口 `iss_uop`/`o_sel_uop`（UOPW 宽）**仅为接口兼容保留**（单测 TB 仍按 uop 宽
+//     连接）：C1 后 IQ 不再持有宽字段，两者输出的是"窄载荷零扩展"，backend_top
+//     **不再消费**（综合时被剪除）。语义真源是 `o_sel_nq`。
 //   · ★ 不在 function 内读存储器（iverilog 12.0 会返回错误结果，front4 README §7.1）。
 //
 // 风格  : 组合逻辑用 `assign` + 打包向量 function；两处 always 块分别为
@@ -37,6 +46,7 @@
 module iq #(
     parameter integer DEPTH      = `BACK2_IQ_ALU0_D,
     parameter integer UOPW       = `BACK2_UOP_W,
+    parameter integer IQW        = `BACK2_IQN_W,   // ★ C1：窄载荷宽度（存储真源）
     parameter integer PDW_I      = `BACK2_PREG_I_W,
     parameter integer PDW_F      = `BACK2_PREG_F_W,
     parameter integer ROB_IDX_W  = `BACK2_ROB_IDX_W,
@@ -92,13 +102,42 @@ module iq #(
     output wire [4:0]            cnt_o,
     // ---- 未被 iss_ready 门控的选择观察口（供 CSR "只在 ROB 头执行" 之类的外部门控）----
     output wire                  o_sel_v,
-    output wire [UOPW-1:0]       o_sel_uop,
-    output wire [ROB_IDX_W-1:0]  o_sel_rob
+    output wire [UOPW-1:0]       o_sel_uop,        // ★ C1：兼容保留（= 窄载荷零扩展，综合被剪）
+    output wire [ROB_IDX_W-1:0]  o_sel_rob,
+    //   ★★ C1：**窄载荷**选择观察口（真源）—— backend_top 由它取 is_csr/is_load/RM_DYN
+    //     三个门控位（宽字段不再存在于 IQ，不能从 o_sel_uop 取）。
+    output wire [IQW-1:0]        o_sel_nq
 );
     genvar ge;
-    assign o_sel_uop = uop_q[sel_idx];
+    //   ★★ C1：窄载荷打包（宽 uop ⇒ 40 bit）。UOPW 与 IQW 的布局真源分别是
+    //     `back2_params.vh` §2 与 §2.5；本函数是两者之间**唯一**的映射点。
+    function [IQW-1:0] pack_iqn;
+        input [UOPW-1:0] u;
+        begin
+            pack_iqn = {
+                (u[`BACK2_U_RM_MSB:`BACK2_U_RM_LSB] == 3'b111),          // [39]   RM_DYN
+                u[`BACK2_UB_IS_CSR],                                     // [38]   IS_CSR
+                u[`BACK2_UB_IS_LOAD],                                    // [37]   IS_LOAD
+                u[`BACK2_UB_S3_F_USE], u[`BACK2_UB_S2_F_USE],            // [36:35]
+                u[`BACK2_UB_S1_F_USE], u[`BACK2_UB_S2_I_USE],            // [34:33]
+                u[`BACK2_UB_S1_I_USE],                                   // [32]
+                u[`BACK2_U_PS3F_MSB:`BACK2_U_PS3F_LSB],                  // [31:26]
+                u[`BACK2_U_PS2F_MSB:`BACK2_U_PS2F_LSB],                  // [25:20]
+                u[`BACK2_U_PS1F_MSB:`BACK2_U_PS1F_LSB],                  // [19:14]
+                u[`BACK2_U_PS2I_MSB:`BACK2_U_PS2I_LSB],                  // [13:7]
+                u[`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB] };                // [6:0]
+        end
+    endfunction
+    //   窄载荷字段取用（与 `BACK2_IQN_*` 宏逐位对应；纯位选函数，**不读存储器**）
+    function [PDW_I-1:0] iqn_ps1i; input [IQW-1:0] n; begin iqn_ps1i = n[`BACK2_IQN_PS1I_L +: PDW_I]; end endfunction
+    function [PDW_I-1:0] iqn_ps2i; input [IQW-1:0] n; begin iqn_ps2i = n[`BACK2_IQN_PS2I_L +: PDW_I]; end endfunction
+    function [PDW_F-1:0] iqn_ps1f; input [IQW-1:0] n; begin iqn_ps1f = n[`BACK2_IQN_PS1F_L +: PDW_F]; end endfunction
+    function [PDW_F-1:0] iqn_ps2f; input [IQW-1:0] n; begin iqn_ps2f = n[`BACK2_IQN_PS2F_L +: PDW_F]; end endfunction
+    function [PDW_F-1:0] iqn_ps3f; input [IQW-1:0] n; begin iqn_ps3f = n[`BACK2_IQN_PS3F_L +: PDW_F]; end endfunction
+    assign o_sel_uop = {{(UOPW-IQW){1'b0}}, np_q[sel_idx]};   // C1：仅兼容（宽字段恒 0）
+    assign o_sel_nq  = np_q[sel_idx];
     assign o_sel_rob = rob_q[sel_idx*ROB_IDX_W +: ROB_IDX_W];
-    assign iss_uop   = uop_q[sel_idx];
+    assign iss_uop   = {{(UOPW-IQW){1'b0}}, np_q[sel_idx]};   // C1：同上；backend_top 不接
     assign iss_rob   = rob_q[sel_idx*ROB_IDX_W +: ROB_IDX_W];
     assign iss_epoch = ep_q[sel_idx*`BACK2_EPOCH_W +: `BACK2_EPOCH_W];
     //   ★ `iss_dead` 必须恒 0：错路径条目已在**冲刷拍按 squash_idx 一次性作废**
@@ -113,7 +152,9 @@ module iq #(
     //    约定：全部用**打包向量**；禁止"读存储器的 function"（iverilog 12 + 综合口径）。
     //==========================================================================
     reg  [DEPTH-1:0]                 valid_q;
-    reg  [UOPW-1:0]                  uop_q [0:DEPTH-1];   // 每条一个 uop 字（解包数组）
+    //   ★★ C1：载荷阵列改为**窄载荷**（`BACK2_IQN_W`）。写口仍收 UOPW 宽的 `wr_uop`
+    //     （backend_top 原样驱动 ⇒ 接口/单测不变），入队沿用 `pack_iqn()` 抽出窄载荷。
+    reg  [IQW-1:0]                   np_q [0:DEPTH-1];   // 每槽一个窄载荷字
     reg  [DEPTH*ROB_IDX_W-1:0]       rob_q;
     reg  [DEPTH*`BACK2_EPOCH_W-1:0]  ep_q;
     reg  [DEPTH*SRC_N-1:0]           rdy_q;
@@ -151,25 +192,26 @@ module iq #(
     integer                gi, gk;
 
     //  源序（与 SRC_N 注释一致）：0=s1i 1=s2i 2=s1f 3=s2f 4=s3f
+    //  ★★ C1：所有逐槽比较/门控一律读**窄载荷** `np_q[gi]`（宽字段已不在 IQ 内）
     always @(*) begin
         wk_hit_w = {(DEPTH*SRC_N){1'b0}};
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
             e_age[gi] = rob_q[gi*ROB_IDX_W +: ROB_IDX_W] - rob_head;   // 8 bit 零扩展
             for (gk = 0; gk < WK_N; gk = gk + 1) begin
-                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == uop_q[gi][`BACK2_U_PS1I_MSB -: PDW_I])) ||
-                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == uop_q[gi][`BACK2_U_PS1I_MSB -: PDW_I])))
+                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps1i(np_q[gi]))) ||
+                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps1i(np_q[gi]))))
                     wk_hit_w[gi*SRC_N + 0] = 1'b1;
-                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == uop_q[gi][`BACK2_U_PS2I_MSB -: PDW_I])) ||
-                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == uop_q[gi][`BACK2_U_PS2I_MSB -: PDW_I])))
+                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps2i(np_q[gi]))) ||
+                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps2i(np_q[gi]))))
                     wk_hit_w[gi*SRC_N + 1] = 1'b1;
-                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == uop_q[gi][`BACK2_U_PS1F_MSB -: PDW_F])) ||
-                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == uop_q[gi][`BACK2_U_PS1F_MSB -: PDW_F])))
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps1f(np_q[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps1f(np_q[gi]))))
                     wk_hit_w[gi*SRC_N + 2] = 1'b1;
-                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == uop_q[gi][`BACK2_U_PS2F_MSB -: PDW_F])) ||
-                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == uop_q[gi][`BACK2_U_PS2F_MSB -: PDW_F])))
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps2f(np_q[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps2f(np_q[gi]))))
                     wk_hit_w[gi*SRC_N + 3] = 1'b1;
-                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == uop_q[gi][`BACK2_U_PS3F_MSB -: PDW_F])) ||
-                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == uop_q[gi][`BACK2_U_PS3F_MSB -: PDW_F])))
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps3f(np_q[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps3f(np_q[gi]))))
                     wk_hit_w[gi*SRC_N + 4] = 1'b1;
             end
         end
@@ -179,13 +221,13 @@ module iq #(
                 if (valid_q[gk] && (e_age[gk] < e_age[gi]) && ~e_rdy[gk]) sel_blk[gi] = 1'b1;
         end
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
-            e_rdy[gi] = (~uop_q[gi][`BACK2_UB_S1_I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
-                        (~uop_q[gi][`BACK2_UB_S2_I_USE] | rdy_q[gi*SRC_N+1] | wk_hit_w[gi*SRC_N+1]) &
-                        (~uop_q[gi][`BACK2_UB_S1_F_USE] | rdy_q[gi*SRC_N+2] | wk_hit_w[gi*SRC_N+2]) &
-                        (~uop_q[gi][`BACK2_UB_S2_F_USE] | rdy_q[gi*SRC_N+3] | wk_hit_w[gi*SRC_N+3]) &
-                        (~uop_q[gi][`BACK2_UB_S3_F_USE] | rdy_q[gi*SRC_N+4] | wk_hit_w[gi*SRC_N+4]);
+            e_rdy[gi] = (~np_q[gi][`BACK2_IQN_S1I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
+                        (~np_q[gi][`BACK2_IQN_S2I_USE] | rdy_q[gi*SRC_N+1] | wk_hit_w[gi*SRC_N+1]) &
+                        (~np_q[gi][`BACK2_IQN_S1F_USE] | rdy_q[gi*SRC_N+2] | wk_hit_w[gi*SRC_N+2]) &
+                        (~np_q[gi][`BACK2_IQN_S2F_USE] | rdy_q[gi*SRC_N+3] | wk_hit_w[gi*SRC_N+3]) &
+                        (~np_q[gi][`BACK2_IQN_S3F_USE] | rdy_q[gi*SRC_N+4] | wk_hit_w[gi*SRC_N+4]);
             e_sel[gi] = valid_q[gi] & e_rdy[gi] &
-                        ~(INORD_LOAD[0] & uop_q[gi][`BACK2_UB_IS_LOAD] & sel_blk[gi]);
+                        ~(INORD_LOAD[0] & np_q[gi][`BACK2_IQN_IS_LOAD] & sel_blk[gi]);
         end
     end
     assign wk_hit = wk_hit_w;
@@ -253,14 +295,13 @@ module iq #(
         if (DBG && rst_n && (valid_q != {DEPTH{1'b0}})) begin
             for (dsi = 0; dsi < DEPTH; dsi = dsi + 1) begin
                 if (valid_q[dsi])
-                    $display("[iq-dbg %m] slot=%0d rob=%0d rdy=%b pdst=%0d ps1i=%0d ps2i=%0d use=%b%b",
+                    $display("[iq-dbg %m] slot=%0d rob=%0d rdy=%b ps1i=%0d ps2i=%0d use=%b%b",
                              dsi, rob_q[dsi*ROB_IDX_W +: ROB_IDX_W],
                              rdy_q[dsi*SRC_N +: SRC_N],
-                             uop_q[dsi][`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],
-                             uop_q[dsi][`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB],
-                             uop_q[dsi][`BACK2_U_PS2I_MSB:`BACK2_U_PS2I_LSB],
-                             uop_q[dsi][`BACK2_UB_S1_I_USE],
-                             uop_q[dsi][`BACK2_UB_S2_I_USE]);
+                             iqn_ps1i(np_q[dsi]),
+                             iqn_ps2i(np_q[dsi]),
+                             np_q[dsi][`BACK2_IQN_S1I_USE],
+                             np_q[dsi][`BACK2_IQN_S2I_USE]);
             end
             $display("[iq-dbg %m] wki_v_e=%b wki_tag_e=%b wk_hit=%b rob_head=%0d rob_cnt=%0d",
                      wki_v_e, wki_tag_e, wk_hit, rob_head, rob_cnt);
@@ -314,7 +355,7 @@ module iq #(
                     rdy_q[wi[q]*SRC_N +: SRC_N] <= wr_rdy[q*SRC_N +: SRC_N];
                     rob_q[wi[q]*ROB_IDX_W +: ROB_IDX_W] <= wr_rob[q*ROB_IDX_W +: ROB_IDX_W];
                     ep_q [wi[q]*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
-                    uop_q[wi[q]] <= wr_uop[q*UOPW +: UOPW];
+                    np_q [wi[q]] <= pack_iqn(wr_uop[q*UOPW +: UOPW]);   // ★ C1：只存窄载荷
                 end
             end
         end

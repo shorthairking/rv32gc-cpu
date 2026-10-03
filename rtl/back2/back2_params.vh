@@ -233,6 +233,50 @@
 `define BACK2_U_PSPD_MSB     132        // PDIDST 段最高位
 `define BACK2_U_PSPD_LSB     75         // PS3F 段最低位
 
+//==============================================================================
+// 2.5 ★★ C1（IQ 载荷瘦身）：IQ **窄载荷** 布局 + 发射期**宽载荷回读**宽度
+//------------------------------------------------------------------------------
+// 背景（C1 面积杠杆，fpga/scratch/redundancy_audit.md §4 C1）：
+//   原先每个 IQ 槽存**整条 304 bit uop**（`iq.v` 的 `uop_q[0:DEPTH-1]`）。但 IQ 内部
+//   逐槽真正消费的只有两组位：
+//     ① 唤醒：5 个源物理号（PS1I/PS2I/PS1F/PS2F/PS3F）+ 5 个 `S*_USE`；
+//     ② 发射门控：`IS_LOAD`（LSU 队列的 load 门）、`IS_CSR`（ALU0 的"CSR 只在 ROB 头
+//        发射"门）、`RM==7`（FPU 的 DYN 舍入门）。
+//   其余（PC/IMM/PREDTGT/ALUOP/… 执行期字段，以及 W1 才用的 CSROP/CSRADDR/CKPT）只在
+//   I2/E1 及以后才用 ⇒ 不必逐槽复制。C1 把 IQ 存储改为**窄载荷**（本节的 `BACK2_IQN_*`
+//   布局），宽字段在**发射拍按 rob 索引**从一张 4 bank SDP BRAM（`backend_top.v` 的
+//   `u_iwmem`，复用 `rob_wide_mem` 结构）读回，**不增加发射级数**：
+//     · 第 T 拍：IQ 选出 rob 索引 ⇒ 启动读（同步读 1 拍）；
+//     · 第 T+1 拍：BRAM 输出寄存器给出的宽载荷直接作为 I2/E1 的 uop（与改前
+//       `x_i2_uop` 寄存器同拍），故 **发射→执行仍是 1 拍**。
+//
+// ★ 唯一真源：本节是窄载荷布局的唯一真源。改动必须同步：
+//     · `iq.v` 的 `pack_iqn()`（打包）与唤醒/门控位选；
+//     · `backend_top.v` 的三个门控（is_csr / is_load / rm_dyn）。
+// ★ 窄载荷**不含**任何执行期字段：宽载荷由 `BACK2_IW_W` 定义（见下）。
+`define BACK2_IQN_PS1I_L    0          // [6:0]   源 1 整数物理号
+`define BACK2_IQN_PS2I_L    7          // [13:7]  源 2 整数物理号
+`define BACK2_IQN_PS1F_L    14         // [19:14] 源 1 浮点物理号
+`define BACK2_IQN_PS2F_L    20         // [25:20] 源 2 浮点物理号
+`define BACK2_IQN_PS3F_L    26         // [31:26] 源 3 浮点物理号（FMA）
+`define BACK2_IQN_S1I_USE   32         // [32]    源 1 取整数物理寄存器
+`define BACK2_IQN_S2I_USE   33         // [33]    源 2 取整数物理寄存器
+`define BACK2_IQN_S1F_USE   34         // [34]    源 1 取浮点物理寄存器
+`define BACK2_IQN_S2F_USE   35         // [35]    源 2 取浮点物理寄存器
+`define BACK2_IQN_S3F_USE   36         // [36]    源 3 取浮点物理寄存器
+`define BACK2_IQN_IS_LOAD   37         // [37]    uop 的 fl7（LSU 队列 load 门）
+`define BACK2_IQN_IS_CSR    38         // [38]    uop 的 fl10（ALU0 "CSR 只在 ROB 头"门）
+`define BACK2_IQN_RM_DYN    39         // [39]    uop 的 RM == 3'b111（FPU DYN 舍入门）
+`define BACK2_IQN_W         40         // 窄载荷总宽（bit）
+//
+// 发射宽载荷宽度：**等于 uop 的低 280 位**（`uop[279:0]`）。
+//   为什么可以截掉 [303:280]：那 24 bit 是 `{9'b0, rs3(5), rs2(5), rs1(5)}`（架构源号），
+//   全仓库**唯一读点**是 D2 重命名请求（`backend_top.v:794-801`，读的是 D1 滑板里的
+//   uop，不是发射载荷）⇒ 发射/执行/写回路径逐位不读它。截断后 `x_i2_uop[303:280]` 恒 0，
+//   其下所有字段的**绝对 bit 位置逐位不变**（与 L5 的 STQ/LQ 字段同理）。
+//   收益：BRAM 字宽 304→280（每 bank 4 个 RAMB36，而不是 5 个）。
+`define BACK2_IW_W          280
+
 // ---- ROB 项载荷 = uop 载荷 + ROB 专用字段（执行期回写）----
 `define BACK2_RB_CSRW_MSB    335
 `define BACK2_RB_CSRW_LSB    304        // [335:304] CSR 新值（csr_op 按 W/S/C 由 ALU 算好）
