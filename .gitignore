@@ -63,3 +63,6 @@ clockInfo.txt
 tight_setup_hold_pins.txt
 sw/**/out/
 sw/**/xsim.dir/
+
+# 参考回答（外部 agent 输出，仅本地参考，不追踪）
+answer.md
