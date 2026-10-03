@@ -136,8 +136,10 @@ module rename #(
     //     与 256 深逐拍等价（陈旧槽只会在被释放覆写前保持垃圾值，与深度无关）。
     //   ★ `FL_PTR_W` **保持 8 不动**：它是"模 256 指针 ⇒ 距离无歧义"的语义
     //     （距离 ≤ 64 < 128；若缩成 7 bit 模 128，"距离 64"会与"距离 0"撞车 ⇒ 空满误判）。
-    //     因此**只有 `flist_q` 的数组下标**收窄到 FL_AW 位；指针/快照/距离算术
-    //     （`fhead_q`/`ftail_q`/`ck_fhead`/`rb_fhead`/`free_cnt_w`）一律不动。
+    //     因此**只有 `flist_q` 的数组下标**收窄到 FL_AW 位；指针/距离算术
+    //     （`fhead_q`/`ftail_q`/`ck_fhead`/`free_cnt_w`）一律不动。
+    //     （D1 之后 `rb_fhead` 一族改为"按 4-lane 组压缩存储"，其**指针语义与位宽**
+    //      仍守本条：`rb_g_fhead` 是 8 bit 模 256 指针。）
     localparam integer FL_AW    = FL_PTR_W - 1;   // 数组下标宽度（深度 128 ⇒ 7 bit）
     localparam integer FL_DEPTH = 1 << FL_AW;     // free list 数组深度（= 128，2 的幂）
 
@@ -161,8 +163,25 @@ module rename #(
     // 按 ROB 索引的回滚点快照（"该 uop 分配完成之后"的状态）
     //   ★ L3（ROB 128→64）：深度必须随 LOG_N（= RATLOG_N = ROB_N）收缩 —— 原硬编码
     //     `[0:127]` 在 LOG_N=64 时会让索引 0..63 只覆盖一半表、且综合无法裁掉另外一半。
-    reg  [FL_PTR_W-1:0]  rb_fhead [0:LOG_N-1];
-    reg  [LOG_PTR_W-1:0] rb_log   [0:LOG_N-1];
+    //   ★★ D1（组级 ROB 评估 §D1）：64 深逐索引快照 → **16 深按 4-lane 对齐组压缩**。
+    //     依据：D3 派发块内 lane 的 ROB 索引连续（idx = base + lane，见 backend_top
+    //     `rb_ix_w`），且每 lane 只消耗 0/1 个 free list 项、恰好写 0/1 条日志 ⇒ 同组内
+    //     lane 的快照 = 组基快照 + 组内前缀计数。存 3 样东西：
+    //       rb_g_fhead[g] = 组 g 首条指令**分配前**的 fhead（= F_{4g-1}）；
+    //       rb_g_log  [g] = 组 g 首条指令**写日志前**的 log_wr（= L_{4g-1}，需 §3.2 回卷）；
+    //       rb_g_ndst [g] = 组内 4 个 ROB 索引的 "lane 需要目的寄存器" 位（dst 前缀计数）。
+    //     回滚到任意索引 i=4g+k：
+    //       fhead(i) = rb_g_fhead[g] + popcount(rb_g_ndst[g][0..k])（含 i 自身消耗）；
+    //       log(i)   = rb_g_log  [g] + (k+1)（组内索引全有效 ⇒ 恰好 k+1 条日志）。
+    //     `rb_g_init[g]`：组 g 已在**当前世代**被进入过。正常世代按对齐组基（idx[1:0]==0）
+    //     进入；`flush_all`（含 trap 退役 head+1 ⇒ 下一索引可非 4 对齐）后允许"组中途
+    //     进入"（层 0..j-1 未派发 ⇒ dst 计数为 0），故需该位区分"首次进入/继续"。
+    localparam integer GRP_N  = LOG_N >> 2;        // 组数 = 16（LOG_N=64，4 条/组）
+    localparam integer GRP_AW = LOG_AW - 2;        // 组索引宽度 = 4
+    reg  [FL_PTR_W-1:0]   rb_g_fhead [0:GRP_N-1];
+    reg  [LOG_PTR_W-1:0]  rb_g_log   [0:GRP_N-1];
+    reg  [3:0]            rb_g_ndst  [0:GRP_N-1];
+    reg  [GRP_N-1:0]      rb_g_init;
 
     reg                  undo_act;
     reg  [LOG_PTR_W-1:0] undo_ptr;
@@ -356,14 +375,65 @@ module rename #(
     end
     endgenerate
 
-    // ---- 1.6 派发期回滚点（"该 lane 分配完成之后"）----
-    wire [FL_PTR_W-1:0]   dn_fhead [0:W-1];
-    wire [LOG_PTR_W-1:0]  dn_log   [0:W-1];
+    // ---- 1.6 派发期回滚点：D1 组压缩后的组合推导（唯一真源）----
+    //   组号 = idx[LOG_AW-1:2]、组内位 = idx[1:0]。逐 lane 命中其所属组；组内**最早命中
+    //   lane**（= 对齐组基，或 flush 后世代中途首次进入的那条）负责写组基 {fhead, log}
+    //   并**清零 dst 掩码**，其余命中 lane 只置自己的 dst 位。同一块最多跨 2 个组。
+    wire [ROB_IDX_W-1:0]  lane_ridx [0:W-1];
+    wire [GRP_AW-1:0]     lane_grp  [0:W-1];
+    wire [1:0]            lane_bit  [0:W-1];
+    wire                  lane_go   [0:W-1];   // 本拍确实登记快照的有效 lane
     generate
-    for (g = 0; g < W; g = g + 1) begin : g_dn
-        assign dn_fhead[g] = fhead_q + {{(FL_PTR_W-3){1'b0}},
-                              (ord_d[g] + {2'b0, (lane_valid[g] & lane_need_dst[g])})};
-        assign dn_log[g]   = log_wr_q + {{(LOG_PTR_W-3){1'b0}}, lg_after[g]};
+    for (g = 0; g < W; g = g + 1) begin : g_d1l
+        assign lane_ridx[g] = rob_snap_idx[g*ROB_IDX_W +: ROB_IDX_W];
+        assign lane_grp [g] = lane_ridx[g][LOG_AW-1:2];
+        assign lane_bit [g] = lane_ridx[g][1:0];
+        assign lane_go  [g] = rob_snap_valid & lane_fire & lane_valid[g];
+    end
+    endgenerate
+
+    wire [GRP_N-1:0]           grp_has_w;     // 本拍有 lane 命中该组
+    wire [GRP_N-1:0]           grp_init_w;    // 该组本拍需（重新）写组基
+    wire [4*GRP_N-1:0]         grp_mask_w;    // 写回的新 dst 掩码（按组拼接）
+    wire [FL_PTR_W*GRP_N-1:0]  grp_bf_w;      // 新组基 fhead（按组拼接）
+    wire [LOG_PTR_W*GRP_N-1:0] grp_bl_w;      // 新组基 log（按组拼接）
+    generate
+    for (g = 0; g < GRP_N; g = g + 1) begin : g_d1g
+        wire [W-1:0] hit;
+        for (k = 0; k < W; k = k + 1) begin : g_d1h
+            assign hit[k] = lane_go[k] & (lane_grp[k] == g);
+        end
+        wire       has     = |hit;
+        wire [1:0] first   = hit[0] ? 2'd0 : hit[1] ? 2'd1 : hit[2] ? 2'd2 : 2'd3;
+        wire       is_base = (hit[0] & (lane_bit[0] == 2'd0)) |
+                             (hit[1] & (lane_bit[1] == 2'd0)) |
+                             (hit[2] & (lane_bit[2] == 2'd0)) |
+                             (hit[3] & (lane_bit[3] == 2'd0));
+        wire       do_init = has & (is_base | ~rb_g_init[g]);
+        wire [3:0] set_b;
+        assign set_b[0] = (hit[0] & (lane_bit[0] == 2'd0) & lane_need_dst[0]) |
+                          (hit[1] & (lane_bit[1] == 2'd0) & lane_need_dst[1]) |
+                          (hit[2] & (lane_bit[2] == 2'd0) & lane_need_dst[2]) |
+                          (hit[3] & (lane_bit[3] == 2'd0) & lane_need_dst[3]);
+        assign set_b[1] = (hit[0] & (lane_bit[0] == 2'd1) & lane_need_dst[0]) |
+                          (hit[1] & (lane_bit[1] == 2'd1) & lane_need_dst[1]) |
+                          (hit[2] & (lane_bit[2] == 2'd1) & lane_need_dst[2]) |
+                          (hit[3] & (lane_bit[3] == 2'd1) & lane_need_dst[3]);
+        assign set_b[2] = (hit[0] & (lane_bit[0] == 2'd2) & lane_need_dst[0]) |
+                          (hit[1] & (lane_bit[1] == 2'd2) & lane_need_dst[1]) |
+                          (hit[2] & (lane_bit[2] == 2'd2) & lane_need_dst[2]) |
+                          (hit[3] & (lane_bit[3] == 2'd2) & lane_need_dst[3]);
+        assign set_b[3] = (hit[0] & (lane_bit[0] == 2'd3) & lane_need_dst[0]) |
+                          (hit[1] & (lane_bit[1] == 2'd3) & lane_need_dst[1]) |
+                          (hit[2] & (lane_bit[2] == 2'd3) & lane_need_dst[2]) |
+                          (hit[3] & (lane_bit[3] == 2'd3) & lane_need_dst[3]);
+        assign grp_has_w [g]        = has;
+        assign grp_init_w[g]        = do_init;
+        assign grp_mask_w[4*g +: 4] = (do_init ? 4'b0 : rb_g_ndst[g]) | set_b;
+        assign grp_bf_w  [FL_PTR_W*g +: FL_PTR_W] =
+                   fhead_q + {{(FL_PTR_W-3){1'b0}}, ord_d[first]};
+        assign grp_bl_w  [LOG_PTR_W*g +: LOG_PTR_W] =
+                   log_wr_q + {{(LOG_PTR_W-3){1'b0}}, lg_rank[first]};
     end
     endgenerate
 
@@ -403,7 +473,8 @@ module rename #(
 
     //   ★★ 回滚取点修复（正确性）：两条入口**统一**改用"误判分支自身 ROB 索引"的快照。
     //     `restore_rob_idx` 恒等于 ROB 的冲刷点 `squash_idx`（`backend_top.v`：
-    //     `squash_idx_w = restore_rob_idx_w = x_i2_rob[2]`），而 `rb_fhead[K]/rb_log[K]`
+    //     `squash_idx_w = restore_rob_idx_w = x_i2_rob[2]`），而该索引的快照
+    //     （原 `rb_fhead[K]/rb_log[K]`；D1 后由 `rb_g_*` 现算，见下）
     //     登记的是"派发 K 分配完成之后"的状态（§1.6 / §3.4），与 ROB"保留 ≤K"的冲刷
     //     语义逐位对齐。
     //     旧实现让 `restore_valid`（检查点入口）用 `ck_fhead[restore_id]`——该快照取在
@@ -414,8 +485,21 @@ module rename #(
     //     改用 rb_* 后两入口同源：回卷量 = ROB 实际保留集对应的分配量。
     //     注：`ck_fhead/ck_log/ck_val` 因此成为死逻辑，本任务按裁决**不清理**
     //     （清理会涉及 `backend_top.v` 端口，留待 EXP-C 之后）。
-    wire [LOG_PTR_W-1:0] undo_tgt_w  = rb_log[restore_rob_idx];
-    wire [FL_PTR_W-1:0]  undo_fhead_w= rb_fhead[restore_rob_idx];
+    //   ★★ D1：压缩后按 restore_rob_idx 重建该 lane 的快照（组基 + 组内前缀计数）。
+    wire [GRP_AW-1:0] urst_grp  = restore_rob_idx[LOG_AW-1:2];
+    wire [1:0]        urst_lane = restore_rob_idx[1:0];
+    wire [3:0]        urst_mask = rb_g_ndst[urst_grp];
+    //   dst 前缀计数 = mask[0..k] 的 popcount（k = urst_lane）：mask[b] = 索引 4g+b 是否
+    //   消耗目的寄存器。fhead(i) = 组基 + Σ_{b<=k} mask[b]（含 i 自身，见 §1.6）。
+    wire [2:0]        urst_cnt  = {2'b0, urst_mask[0]}
+                                + {2'b0, (urst_mask[1] & (urst_lane != 2'd0))}
+                                + {2'b0, (urst_mask[2] &  urst_lane[1])}
+                                + {2'b0, (urst_mask[3] & (urst_lane == 2'd3))};
+    wire [LOG_PTR_W-1:0] undo_tgt_w  = rb_g_log[urst_grp] +
+                                       {{(LOG_PTR_W-3){1'b0}}, urst_lane} +
+                                       {{(LOG_PTR_W-1){1'b0}}, 1'b1};
+    wire [FL_PTR_W-1:0]  undo_fhead_w= rb_g_fhead[urst_grp] +
+                                       {{(FL_PTR_W-3){1'b0}}, urst_cnt};
 
     //==========================================================================
     // 2. 回滚窗口（每拍 4 条逆序；窗口内最早写入者胜）
@@ -564,9 +648,12 @@ module rename #(
                 ck_fhead[j2] <= {FL_PTR_W{1'b0}}; ck_log[j2] <= {LOG_PTR_W{1'b0}};
                 ck_val[j2]   <= 1'b0;
             end
-            for (j2 = 0; j2 < LOG_N; j2 = j2 + 1) begin
-                rb_fhead[j2] <= {FL_PTR_W{1'b0}}; rb_log[j2] <= {LOG_PTR_W{1'b0}};
+            for (j2 = 0; j2 < GRP_N; j2 = j2 + 1) begin
+                rb_g_fhead[j2] <= {FL_PTR_W{1'b0}};
+                rb_g_log  [j2] <= {LOG_PTR_W{1'b0}};
+                rb_g_ndst [j2] <= 4'b0;
             end
+            rb_g_init <= {GRP_N{1'b0}};
         end else begin
             //==================================================================
             // 3.0 提交侧（架构）更新：**每拍无条件执行**
@@ -599,6 +686,10 @@ module rename #(
                 //   ★ 2B-5 第 2 轮修正：用 `arat_next`（含本拍提交），而非旧 `arat_q`
                 for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) rat_q[j2] <= arat_next[j2];
                 for (j2 = 0; j2 < CKPT_N; j2 = j2 + 1) ck_val[j2] <= 1'b0;
+                //   ★★ D1：整机冲刷后 ROB 从任意 head（trap 退役时 head+1）重新开始，
+                //     下一索引可非 4 对齐 ⇒ 清组"已进入"标志，让新世代按"组中途进入"
+                //     重新写组基（层 0..j-1 未派发 ⇒ dst 计数天然为 0）。
+                rb_g_init <= {GRP_N{1'b0}};
                 log_wr_q <= {LOG_PTR_W{1'b0}};
                 fhead_q  <= {FL_PTR_W{1'b0}};
                 rb_act   <= 1'b1;
@@ -629,6 +720,13 @@ module rename #(
                 //      不同代"，两条路径都会偏，只是偏的方向相反（快照偏多⇒重复；重放偏少
                 //      ⇒泄漏）。故回退到快照路径（程序 0 全绿），真正修法见报告 §1 B27。
                 fhead_q   <= undo_fhead_w;
+                //   ★★ D1：日志写指针**回卷**到回滚点的日志位置。压缩后回滚读取按
+                //     "组基 + 组内偏移"重建，前提是"同一 ROB 索引的日志槽位 = 世代内
+                //     索引的仿射函数"。回卷后重新派发从 L_i 继续写 ⇒ 该前提在任意次
+                //     squash 下都成立（若不回卷，保留条目与重新分配条目的槽位会不连续，
+                //     这正是旧 D1 尝试的反例）。回放范围 undo_dist 用**回卷前**的日志
+                //     指针（非阻塞右值取旧值）⇒ 与逐索引快照实现逐位相同。
+                log_wr_q  <= undo_tgt_w;
                 undo_ptr  <= log_wr_q;
                 undo_dist <= {1'b0, (log_wr_q - undo_tgt_w)};
                 undo_act  <= (log_wr_q != undo_tgt_w);
@@ -661,11 +759,17 @@ module rename #(
                     if (lvf[j2] & lane_need_dst[j2])
                         rat_q[lane_dst_arn[j2*ARN_W +: ARN_W]] <= ev_pd_dst[j2];
                 end
+                //   ★★ D1：按 4-lane 对齐组写压缩快照（组基 {fhead,log} + dst 掩码）。
+                //     写口由"每 lane 一个 64 深地址写"降为"每拍 ≤2 个组写"。
                 if (rob_snap_valid & lane_fire) begin
-                    for (j2 = 0; j2 < W; j2 = j2 + 1) begin
-                        if (lane_valid[j2]) begin
-                            rb_fhead[rob_snap_idx[j2*ROB_IDX_W +: ROB_IDX_W]] <= dn_fhead[j2];
-                            rb_log  [rob_snap_idx[j2*ROB_IDX_W +: ROB_IDX_W]] <= dn_log[j2];
+                    for (j2 = 0; j2 < GRP_N; j2 = j2 + 1) begin
+                        if (grp_has_w[j2]) begin
+                            rb_g_ndst[j2] <= grp_mask_w[4*j2 +: 4];
+                            rb_g_init[j2] <= 1'b1;
+                            if (grp_init_w[j2]) begin
+                                rb_g_fhead[j2] <= grp_bf_w[FL_PTR_W*j2 +: FL_PTR_W];
+                                rb_g_log  [j2] <= grp_bl_w[LOG_PTR_W*j2 +: LOG_PTR_W];
+                            end
                         end
                     end
                 end
