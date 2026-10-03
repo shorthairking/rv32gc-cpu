@@ -59,6 +59,9 @@
   - 暂不动：ROB 深度 64（48 非 2 幂会牵 age/wrap）、wakeup（v0.3）、LSU、rename、FU。
 - **判据（沿用）**：四套判据绿（219/219+iq151+锁步57+regress33）+ IPC/C5（OC 会让 3 源 FMA +1 拍、罕见提交读 +1 拍，按需重标定）+ `RV32_SYNTH_TAG=2b_<exp>` 重综合（RuntimeOptimized/16.667ns）。
 
+- **EXP-A 负结果（已回退，工作树干净）**：PRF 读口 16/8→4/2 + `operand_collector.v` 功能五套判据全绿（219/219+iq151+锁步57+regress34+IPC2.0、cmt_prf_wait 仅 7 拍），但重综合（`2b_oc`）**全核 230,998→277,477（+46,479 LUT，206.15%）**：u_prf_i −11,922(−76.2%)/u_prf_f −4,323(−65.6%)（PRF 读 mux 确为有效杠杆 −16,245）被 **u_oc +19,500（数据路由回 6 槽的变量下标 mux 固有代价）+ 时序驱动反共享 u_ren_f +31,308 + IQ×6 +15,518（oc_rdy 长组合锥）**吞掉。**教训：FPGA 上 operand collector 的固定代价 > mux 省量，此路不通**。已回退（2 新文件存 `fpga/scratch/expA_*`）。另：端口仲裁必须"执行期优先"（提交优先暴露 rename 潜在重复分配 pdi 撞车，记为 blocker）。
+- **进行中：EXP-B（ROB updq→BR/FF/EXC typed 表）**：`updq`(102b 多写源)→ 三张单写源表（br_q 64×34 / ff_q 64×5 / ex_tval_q 64×32），删 `upd_csr` 死口，CSRW 改从 uop.PS1I 取，stale 用 {valid,epoch}；rob.v + backend_top.v + back2_params.vh，LOCAL 改动无新路由结构。
+
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
