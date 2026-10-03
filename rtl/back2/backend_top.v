@@ -502,9 +502,10 @@ module backend_top #(
     wire [6:0]  rob_head_w, squash_idx_w;
     wire [7:0]  rob_cnt_w;
     wire [EW-1:0] epoch_w;
-    wire [31:0] upd_csrw;
-    wire [6:0]  upd_csr_idx;
-    wire        upd_csr_v, upd_tr_v, upd_ff_v, upd_exc_v;
+    //   ★★ EXP-B：`upd_csr_*`（含 `upd_csrw`/`upd_csr_idx`/`upd_csr_v`）整条路径已删除
+    //      —— 它原本就硬接 `1'b0`（动态实测恒 0），CSR 提交期源改从载荷 `uop.PS1I` 取
+    //      （见下方 `csr_cmt_ps1i` ← rob 的 `csr_pay`，其 `csrw` 段现由 rob 从载荷 PS1I 给出）。
+    wire        upd_tr_v, upd_ff_v, upd_exc_v;
 
     // 提交
     wire [6:0]  cmt_i2;
@@ -1627,7 +1628,7 @@ module backend_top #(
                     csr_cmt_data = csr_pay_w[46:15];
                     csr_cmt_op   = csr_pay_w[2:0];
                     csr_cmt_insn = csr_pay_w[78:47];
-                    csr_cmt_ps1i = csr_pay_w[15 +: PW_I];   // 同一字段（csrw）的低 PW_I 位（与 4b-1 口径一致）
+                    csr_cmt_ps1i = csr_pay_w[15 +: PW_I];   // ★ EXP-B：该字段现由 rob 从**载荷 uop.PS1I** 拼出（原为 updq.CSRW 低 PW_I 位，逐位等价）
                     csr_cmt_idx  = rob_head_w[ROBW-1:0] + cw[1:0];      // ★ L3：模 ROB_N（cw ≤ 3）
                 end
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
@@ -1729,10 +1730,13 @@ module backend_top #(
                           (x_i2_v[2] & u_is_csr(x_i2_uop[2])) | (x_i2_v[3] & u_is_csr(x_i2_uop[3])) |
                           (x_i2_v[4] & u_is_csr(x_i2_uop[4])) | (x_i2_v[5] & u_is_csr(x_i2_uop[5]));
     wire [UOPW-1:0] csr_uop = x_i2_uop[csr_lane];
-    //   ★★ B29 修法（第 34 轮，按母代理更正）：提交点现算 CSR 写数据 —— 载荷的 CSRW 字段里
-    //   携带的是**该 CSR 指令的 rs1 物理号（PS1I）**（分配期写入、单写者、天然稳定），
-    //   提交拍直接 `PRF[ps1i]` 取值；不再从 `p_imm[19:15]` 反推（那是 CSR 地址 0x340，
-    //   [19:15]=6 ⇒ ARAT[6] 恰为值 1 的寄存器，正是第 33 轮仍为 1 的原因）。
+    //   ★★ B29 修法（第 34 轮，按母代理更正）：提交点现算 CSR 写数据 —— 源操作数取
+    //   **该 CSR 指令自己的 rs1 物理号（PS1I）**，提交拍直接 `PRF[ps1i]` 取值；不再从
+    //   `p_imm[19:15]` 反推（那是 CSR 地址 0x340，[19:15]=6 ⇒ ARAT[6] 恰为值 1 的寄存器，
+    //   正是第 33 轮仍为 1 的原因）。
+    //   ★★ EXP-B：PS1I 的**载体**由 `updq.CSRW`（102 bit 表里那 32 bit）改为**载荷 uop.PS1I**
+    //     —— rob 的 `csr_pay` 的 `csrw` 段现在直接由窗口读回的载荷 PS1I 拼出（见 rob.v §4），
+    //     故这里 `csr_cmt_ps1i` 的取值口径**逐位不变**（仍是 PW_I 位物理号）。
     wire [31:0] csr_cmt_src = iprf_rd[15*32 +: 32];
     //   ★ 4b-1：端口 15 的读地址取**该 CSR 指令自己**的 ps1i（4a 曾固定用 lane 0 的载荷
     //     ⇒ CSR 指令不在 lane 0 时会读到无关寄存器；与 B29 同类，一并清掉）
@@ -1741,6 +1745,8 @@ module backend_top #(
     assign csr_raddr_w = csr_cmt_we ? csr_cmt_addr : u_csra(csr_uop);
 
     //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
+    //   ★ EXP-B：`cb_src`/`upd_csrw`/`upd_csr_v`/`upd_csr_idx` 随死口删除（CSR 源只走
+    //     端口 15 的 PRF 读 + 提交级合成 `csr_cmt_new`），本块只保留仍在用的观测。
     always @(posedge clk) begin
         if (DBG_CSR && rst_n && (|iprf_we))
             $display("[prf-w t=%0t] we=%b wa=%0d,%0d,%0d,%0d,%0d,%0d wd0=0x%08x wd1=0x%08x",
@@ -1749,18 +1755,17 @@ module backend_top #(
                      iprf_wa[3*PW_I +: PW_I], iprf_wa[4*PW_I +: PW_I], iprf_wa[5*PW_I +: PW_I],
                      iprf_wd[0*32 +: 32], iprf_wd[1*32 +: 32]);
         if (DBG_CSR && rst_n && csr_v_w)
-            $display("[csr-r t=%0t] ra0=%0d rd0=0x%08x cb_src=0x%08x upd_csrw=0x%08x csrop=%0d",
-                     $time, iprf_ra[0*PW_I +: PW_I], iprf_rd[0*32 +: 32], cb_src_w, upd_csrw,
+            $display("[csr-r t=%0t] ra15=%0d rd15=0x%08x ps1i=%0d csrop=%0d",
+                     $time, iprf_ra[15*PW_I +: PW_I], csr_cmt_src, csr_cmt_ps1i,
                      u_csrop(csr_uop));
         if (DBG_CSR && rst_n && csr_v_w)
-            $display("[csr-uop t=%0t] lane=%0d ps1i=%0d s1i=%b imm=0x%08x csrop=%0d | rd0=0x%08x cb_src=0x%08x upd_csrw=0x%08x | v=%b idx=%0d rdata=0x%08x",
+            $display("[csr-uop t=%0t] lane=%0d ps1i=%0d s1i=%b imm=0x%08x csrop=%0d | rdata=0x%08x",
                      $time, csr_lane, u_ps1i(csr_uop), u_s1i(csr_uop), u_imm(csr_uop),
-                     u_csrop(csr_uop), iprf_rd[0*32 +: 32], cb_src_w, upd_csrw,
-                     upd_csr_v, upd_csr_idx, csr_rdata_w);
+                     u_csrop(csr_uop), csr_rdata_w);
         if (DBG_CSR && rst_n && x_i2_v[0] && u_is_csr(x_i2_uop[0]))
-            $display("[csr-i2 t=%0t] op=%0d addr=0x%03x s1i=%b imm=0x%08x rdata=0x%08x upd_csrw=0x%08x upd_v=%b",
+            $display("[csr-i2 t=%0t] op=%0d addr=0x%03x s1i=%b imm=0x%08x rdata=0x%08x",
                      $time, u_csrop(x_i2_uop[0]), u_csra(x_i2_uop[0]),
-                     u_s1i(x_i2_uop[0]), u_imm(x_i2_uop[0]), csr_rdata_w, upd_csrw, upd_csr_v);
+                     u_s1i(x_i2_uop[0]), u_imm(x_i2_uop[0]), csr_rdata_w);
         if (DBG_CSR && rst_n && csr_we_w)
             $display("[csr-cmt t=%0t] we=%b addr=0x%03x wdata=0x%08x (cmt_we=%b cmt_addr=0x%03x cmt_data=0x%08x) mscratch=0x%08x",
                      $time, csr_we_w, csr_waddr_w, csr_wdata_w,
@@ -1771,14 +1776,7 @@ module backend_top #(
 
     // ---- ROB ----
     assign upd_tr_v = x_i2_v[2] & u_is_br(x_i2_uop[2]);
-    assign upd_csr_v   = csr_v_w & (u_csrop(csr_uop) != 3'd0);
-    assign upd_csr_idx = x_i2_rob[csr_lane];                 // ★ B29：用 CSR 自己的 ROB 索引
-    assign upd_csrw    = (u_csrop(csr_uop) == 3'd1) ? cb_src_w :
-                         (u_csrop(csr_uop) == 3'd2) ? (csr_rdata_w | cb_src_w) :
-                                                      (csr_rdata_w & ~cb_src_w);
     assign upd_ff_v    = fpu_done & fpu_if_v;
-    //   CSR 源操作数：ALU0 的 rs1 读口（CSR 属 ALU0 类）；csrrwi/csrsi/csrrci 用 imm（zimm）
-    wire   cb_src_w = u_s1i(csr_uop) ? iprf_rd[0*32 +: 32] : u_imm(csr_uop);
 
 
     rob #(.WB_N(7), .DBG_CSR(DBG_CSR)) u_rob (   // B29 定案探针透传
@@ -1790,7 +1788,7 @@ module backend_top #(
         .cmt_narrow(cmt_narrow),
         .alloc_epoch(epoch_w),
         .wb_valid(wb_v), .wb_rob_idx(wb_rob), .wb_epoch(wb_ep),
-        .upd_csr_valid(1'b0), .upd_csr_idx(upd_csr_idx), .upd_csr_wdata(upd_csrw),   // ★ B29：值改由提交级现算
+        //   ★★ EXP-B：`upd_csr_*` 三口已删（rob 侧端口同步移除）——它本就硬接 1'b0
         .upd_tr_valid(upd_tr_v), .upd_tr_idx(x_i2_rob[2]),
         .upd_tr_taken(bru_act_tk), .upd_tr_target(bru_target),
         .upd_ff_valid(upd_ff_v), .upd_ff_idx(fpu_if_rob), .upd_ff_flags(fpu_ff),

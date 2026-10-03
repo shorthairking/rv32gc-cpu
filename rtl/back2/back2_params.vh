@@ -23,7 +23,7 @@
 //==============================================================================
 // ---- ROB（§2.1；★ L3 面积杠杆：深度 128→64，条目数由用户裁决降档）----
 //   ★ ROB 128→64（2026 面积分析 L3）：只降"在飞指令数上限"，**不改任何指令语义**。
-//     `BACK2_ROB_IDX_W` 必须 == log2(ROB_N)：rob.v 的存储表 `nq/updq/rep_q` 与
+//     `BACK2_ROB_IDX_W` 必须 == log2(ROB_N)：rob.v 的存储表 `nq` 与三张 typed 更新表与
 //     `rob_wide_mem` 的 bank 寻址都按 ROB_IDX_W 位宽取模 ⇒ 宽度写错会越界。
 //     ROB 深度须为 2 的幂（环形指针截断即取模，见 rob.v §1）。
 `define BACK2_ROB_N          64
@@ -265,8 +265,9 @@
 `define BACK2_RB_LQ_MSB      414
 `define BACK2_RB_LQ_LSB      411        // [414:411] load queue 项索引（≤16 项）
 // ---- 项内 epoch ----
-//   ★ 不占载荷位域：由 rob.v 的独立 2 bit 小数组 `rep_q[]` 承载（原因见 rob.v §0：
+//   ★ 不占载荷位域：由 rob.v 的窄控制字 `nq` 的 [2:1] 承载（原因见 rob.v §0：
 //     放进 416 bit 载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
+//     （原独立的 `rep_q[]` 数组已无任何读写 ⇒ EXP-B 一并删除。）
 //     ★ 2B-5 L5 后载荷 [415] 亦成为保留位（LQ 索引收窄为 [414:411]）。
 `define BACK2_RB_W           416
 //   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
@@ -299,17 +300,23 @@
 `define BACK2_NQ_SRET        47
 `define BACK2_NQ_MRET        48
 //   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
+//     ★★ EXP-B：其中 `csrw` 段（rob 侧）改由**载荷 uop.PS1I** 直接给出（原为 updq.CSRW 的
+//        低 7 位）；`tval` 段改由载荷 `BACK2_RB_TVAL`（= 原始指令位）给出 ⇒ 字段布局与宽度不变。
 `define BACK2_CMT_CSR_W      79
-//   ★★ 2B-5 B2/B3 前置（写口冲突纠正，报告 §B4.51.3）：可更新字段独立成 FF 表 `updq`
-//     · 它们在载荷里恰好是**连续区间 [405:304]**（CSRW/TVAL/TRTGT/TRTAKEN/FFLAGS = 102 bit）
-//       ⇒ 拼接只需 3 段：{pl[415:406], updq[101:0], pl[303:0]}
-`define BACK2_UPDQ_W         102
-`define BACK2_UPD_PAY_LSB    304        // 对应载荷位 [405:304]
-`define BACK2_UPD_CSRW_LSB   0          // updq[31:0]   = 载荷[335:304]
-`define BACK2_UPD_TVAL_LSB   32         // updq[63:32]  = 载荷[367:336]
-`define BACK2_UPD_TRTGT_LSB  64         // updq[95:64]  = 载荷[399:368]
-`define BACK2_UPD_TRTAKEN    96         // updq[96]     = 载荷[400]
-`define BACK2_UPD_FFLAGS_LSB 97         // updq[101:97] = 载荷[405:401]
+//   ★★ EXP-B（架构 v0.1 §16–§21）：可更新字段由**一张 102 bit 多写源表 `updq`** 拆成
+//     **三张"每表单写源" typed 表**，并删除恒 0 死口 `upd_csr`：
+//       · 载荷 [405:304] 的原 102 bit ⇒ br{TRTAKEN,TRTGT} / ff{FFLAGS} / ex{TVAL} 三表；
+//         `CSRW` 段（= {25'b0, PS1I}）**不再进更新表**（CSR 源改从载荷 uop.PS1I 取）；
+//       · 每表恰好一个写源（BRU / FPU / LSU）⇒ 无共享写口、无仲裁、无多写源写 mux；
+//       · 每表自带 {valid, epoch}：提交/陷阱时 `valid && epoch == 项内 epoch` 才采用
+//         （epoch 复用项内 2 bit 口径）⇒ flush/squash 无需清 64 项，旧项天然作废。
+//     动态依据：`upd_tr/ff/exc` 同拍并发 ≥2 仅 0.02%（3 拍）、`upd_csr_valid` 恒 0
+//     （docs/design/10-dynamic-behavior.md §1.3、docs/design/09-...-review.md §1.5）。
+`define BACK2_BR_TGT_W      32         // br 表数据：分支实际目标
+`define BACK2_BR_TAKEN_W    1          // br 表数据：分支实际方向
+`define BACK2_FF_W          5          // ff 表数据：FP flags[4:0]
+`define BACK2_EX_TVAL_W     32         // ex 表数据：异常 TVAL（cause 已在 nq.exc，不重复存）
+`define BACK2_TBL_EP_W      `BACK2_EPOCH_W   // 三表 {valid, epoch} 的 epoch 宽度（= 项内 epoch）
 
 // ---- 标志位在 uop 内的绝对 bit 位置（= FLAGS_LSB + fl 序号）----
 `define BACK2_UB_RD_I_WEN    (`BACK2_U_FLAGS_LSB + `BACK2_FL_RD_I_WEN)

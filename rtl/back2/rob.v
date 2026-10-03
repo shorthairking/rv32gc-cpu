@@ -19,6 +19,18 @@
 // 【载荷】每项 = BACK2_RB_W 位打包向量（`back2_params.vh` §2 为唯一布局真源）：
 //   uop(272) + CSR 新值 + 异常 tval + 分支实际方向/目标 + 浮点 flags + store 队列索引。
 //
+// ★★ EXP-B（架构 v0.1 §16–§21）：**可更新字段从"一张 102 bit 多写源表 `updq`"拆成
+//    三张"每表单写源"typed 表**：
+//      · `br_q`（分支结果：taken + tgt）  —— 唯一写源 **BRU**（`upd_tr`）
+//      · `ff_q`（FP flags[4:0]）           —— 唯一写源 **FPU**（`upd_ff`）
+//      · `ex_q`（异常 TVAL[31:0]）         —— 唯一写源 **LSU**（`upd_exc`）
+//      · 死口 `upd_csr` 整条删除（动态实测恒 0）；CSR 提交期源改从载荷 `uop.PS1I` 取。
+//    每表自带 {valid, epoch}（epoch 复用项内 2 bit 口径）：提交/陷阱时
+//    `valid && epoch == 项内 epoch` 才采用 ⇒ flush/squash 不必清 64 项（旧项天然作废）。
+//    对外接口（`cmt_payload`/`cmt_narrow`/`cmt_st_*`/`trap_*`/`csr_pay`）**逐位不变**。
+//    动态依据：`upd_tr/ff/exc` 同拍并发 ≥2 仅 0.02%（3 拍）、`upd_csr_valid` 恒 0
+//    （docs/design/10-dynamic-behavior.md §1.3）。
+//
 // 风格  : 组合逻辑全部 `assign`/函数（红线 3）；always 块只用于存储体与指针（时序元件）。
 //==============================================================================
 
@@ -56,11 +68,9 @@ module rob #(
     input  wire [WB_N*`BACK2_EPOCH_W-1:0]  wb_epoch,     // §8.2 epoch：过期写回不得置 done
 
     //==================================================================
-    // 执行期字段回写（每个至多 1 路/拍；本里程碑够用）
+    // 执行期字段回写（每张 typed 表**恰好一个写源**；本里程碑够用）
+    //   ★ EXP-B：原 `upd_csr_*` 三口已删（`backend_top.v` 早已硬接 1'b0；动态实测恒 0）
     //==================================================================
-    input  wire                    upd_csr_valid,
-    input  wire [ROB_IDX_W-1:0]    upd_csr_idx,
-    input  wire [31:0]             upd_csr_wdata,
     input  wire                    upd_tr_valid,
     input  wire [ROB_IDX_W-1:0]    upd_tr_idx,
     input  wire                    upd_tr_taken,
@@ -170,20 +180,52 @@ module rob #(
     localparam integer NQ_LQ_L   = `BACK2_NQ_LQ_L;
     localparam integer NQ_MK_L   = `BACK2_NQ_MK_L;
     reg  [NQ_W-1:0]      nq    [0:ROB_N-1];
-    //   ★★ 2B-5 B2/B3 前置：**可更新字段独立 FF 表** `updq`（载荷的 [405:304] = 102 bit）
-    //     · 动机：BRAM 分 bank 后每 bank 只有 **1 个写口**，4 条派发写已占满 ⇒ 字段回写只能落在 FF 表；
-    //     · 本步先把它们**从 `pl_q` 的写入里拿走**（`pl_q` 只剩派发写：对应位自动被 Vivado 裁掉），
-    //       读取时用 `merge_upd()` 拼回原坐标 ⇒ **对外接口与行为逐位不变**；
-    //     · 这也是下一步“`pl_q` 整体换 `rob_wide_mem` + 头部窗口”的前提（到那时 `pl_q` 只剩派发写、可直接换成 DRAM）。
-    reg  [`BACK2_UPDQ_W-1:0] updq [0:ROB_N-1];
+    //   ★★ EXP-B（架构 v0.1 §16–§19）：**三张 typed 单写源更新表**（替代原 102 bit `updq`）
+    //     · 动机：原 `updq` 每表项有 8 个写源（4 派发 lane + CSR/BRU/FPU/LSU 四口）⇒
+    //       每表项一个多写源写 mux（面积探针实测 ≈11 k LUT，docs/design/09 §2.3 第 3 行）；
+    //       动态实测 `upd_tr/ff/exc` 同拍并发 ≥2 仅 0.02% ⇒ **无需共享写口**，
+    //       三张表各留一个写源即可，写侧退化为"每表一次索引译码 + 数据直连"。
+    //     · 每表 {valid, epoch}：写口在**目标项自己的 epoch**（`nq[idx].epoch`）下置位；
+    //       提交/陷阱时 `valid && epoch == 项内 epoch` 才采用 ⇒ 索引被复用/跨冲刷的旧表项
+    //       epoch 不同，天然作废（不必在 flush/squash 清 64 项）。
+    //     · 数据数组不置复位（valid=0 时被 merge 的回落支路屏蔽，无 x 传播）；
+    //       valid/epoch 数组复位清零（仿真下不会出现 x 判定）。
+    reg                          br_v_q  [0:ROB_N-1];
+    reg  [`BACK2_TBL_EP_W-1:0]   br_ep_q [0:ROB_N-1];
+    reg  [`BACK2_BR_TGT_W-1:0]   br_tgt_q[0:ROB_N-1];
+    reg  [`BACK2_BR_TAKEN_W-1:0] br_taken_q[0:ROB_N-1];
+    reg                          ff_v_q  [0:ROB_N-1];
+    reg  [`BACK2_TBL_EP_W-1:0]   ff_ep_q [0:ROB_N-1];
+    reg  [`BACK2_FF_W-1:0]       ff_q    [0:ROB_N-1];
+    reg                          ex_v_q  [0:ROB_N-1];
+    reg  [`BACK2_TBL_EP_W-1:0]   ex_ep_q [0:ROB_N-1];
+    reg  [`BACK2_EX_TVAL_W-1:0]  ex_tval_q[0:ROB_N-1];
 
-    //   拼接：取 `pl_q` 的不可更新部分 + `updq` 的可更新部分（纯布线，无 mux）
+    //   拼接：载荷的不可更新部分 + 三张 typed 表的命中值（纯布线 + 单层选择，无多写源 mux）
+    //     命中判据由调用方给出（`*_use` = 表 valid && 表 epoch == 项内 epoch && 该字段真被读）；
+    //     未命中回落到"该字段在载荷里的原值"（br/ff 的原值恒 0 ⇒ 直接用常量，见下）
+    //   ★★ EXP-B 回落支路口径（与综合面积直接相关，勿随手改）：
+    //     · br/ff 两个回落支路用**常量 0**：载荷的 [405:401]/[400]/[399:368] 由
+    //       `backend_top.v` 的 ROB 载荷组装式**恒写 `5'b0 / 1'b0 / 32'h0`**（"执行期回写"
+    //       占位，且载荷只有派发一个写源）⇒ 与读 `pl[...]` **逐位等价**；本文件 §6 的
+    //       `ROB-ASSERT-PAY0` 自检在仿真里逐拍钉死该前提。
+    //       为何不读 `pl[...]`：那会让 BRAM 的**读数据位宽**多出 38 bit ⇒ 实测每 bank
+    //       从 5 个 RAMB36 撑到 6 个（全核 +4 RAMB36、u_wmem +1.5 k LUT 的**假成本**）。
+    //     · ex（TVAL）的回落支路**必须**读 `pl[367:336]`：非法指令/取指异常的 mtval
+    //       就存在那里（唯一真源，见 §3 `trap_tval`）。
     function [RB_W-1:0] merge_upd;
-        input [RB_W-1:0] pl; input [`BACK2_UPDQ_W-1:0] ud;
+        input [RB_W-1:0]              pl;
+        input                         br_use; input [`BACK2_BR_TAKEN_W-1:0] br_tk;
+        input [`BACK2_BR_TGT_W-1:0]   br_tgt;
+        input                         ff_use; input [`BACK2_FF_W-1:0]       ff_d;
+        input                         ex_use; input [`BACK2_EX_TVAL_W-1:0]  ex_tv;
         begin
-            merge_upd = { pl[RB_W-1:`BACK2_UPD_PAY_LSB+`BACK2_UPDQ_W],
-                          ud,
-                          pl[`BACK2_UPD_PAY_LSB-1:0] };
+            merge_upd = { pl[RB_W-1:`BACK2_RB_FFLAGS_MSB+1],
+                          ff_use ? ff_d : {`BACK2_FF_W{1'b0}},
+                          br_use ? br_tk : {`BACK2_BR_TAKEN_W{1'b0}},
+                          br_use ? br_tgt : {`BACK2_BR_TGT_W{1'b0}},
+                          ex_use ? ex_tv : pl[`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
+                          pl[`BACK2_RB_CSRW_MSB:0] };
         end
     endfunction
 
@@ -210,10 +252,9 @@ module rob #(
                         dn };                                          // [0]
         end
     endfunction
-    //   ★ 项内 epoch 单独放一个 2 bit 小数组（而不是塞进 416 bit 载荷）：
-    //     载荷内的字段要在"时钟块里按 7 个写回索引读" ⇒ iverilog 会展开成
-    //     7×(ROB_N×416) 的组合读森林，仿真吞吐直接掉一个数量级（实测 ~12× 变慢）。
-    reg  [`BACK2_EPOCH_W-1:0] rep_q [0:ROB_N-1];
+    //   ★ 项内 epoch 由 `nq` 的 [2:1] 承载（原独立的 `rep_q` 数组已无任何读写 ⇒ 删除；
+    //     原因仍是"不要把 epoch 塞进 416 bit 载荷"：载荷内的字段要在时钟块里按 7 个
+    //     写回索引读 ⇒ iverilog 会展开成 7×(ROB_N×416) 的组合读森林，仿真慢 ~12×）。
     reg  [ROB_IDX_W-1:0] head_q;
     reg  [ROB_IDX_W:0]   cnt_q;              // 0..ROB_N（8 bit）
     reg  [31:0]          cmt_cnt_q;
@@ -295,6 +336,10 @@ module rob #(
     assign slot_idx[3] = slot_idx3;
 
     genvar gi;
+    //   ★★ EXP-B：三张 typed 表在提交组 4 个 lane 上的"采用判据"（模块级数组：断言块也要看）
+    wire [COMMIT_W-1:0] slot_is_br;
+    wire [COMMIT_W-1:0] slot_is_fp;
+    wire [COMMIT_W-1:0] br_use, ff_use, ex_use;
     generate
     for (gi = 0; gi < COMMIT_W; gi = gi + 1) begin : g_cmt
         assign slot_in_range[gi] = (cnt_q > gi);
@@ -305,6 +350,21 @@ module rob #(
         //   ★ B3：窗口未命中 ⇒ 本 lane 不可提交（插一拍气泡；**绝不交付错误 PC/tval**）
         assign slot_ok[gi]       = slot_in_range[gi] & slot_done[gi] & ~slot_exc[gi] & slot_st_ok[gi]
                                  & win_lane_ok[gi];
+
+        //   ★★ EXP-B：typed 表采用判据 = 表 valid && 表 epoch == **本项项内 epoch** && 本项真消费该字段
+        //     · `is_branch` 取 `nq`（= 载荷 IS_BRANCH，同源）；`is_fp` 只存在载荷里 ⇒ 取窗口读回值；
+        //     · ex 的判据：`exc` **派发期为空、现在非空** ⇒ 该异常只可能由 LSU 的 `upd_exc`
+        //       回写而来（`nq.exc` 全文只有两个写源：派发 `pack_nq` 与 `upd_exc`）⇒ 此时才吃 ex 表；
+        //       派发期异常（非法/ecall/ebreak/取指异常）的 mtval 必须回落**载荷 TVAL**。
+        wire [`BACK2_EPOCH_W-1:0] ep_gi   = nq[slot_idx[gi]][NQ_EP_L +: `BACK2_EPOCH_W];
+        wire [3:0]                exc_gi  = nq[slot_idx[gi]][NQ_EXC_L +: 4];
+        wire [3:0]                pexc_gi = win_rd[gi][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB];
+        assign slot_is_br[gi] = nq[slot_idx[gi]][NQ_BR];
+        assign slot_is_fp[gi] = win_rd[gi][`BACK2_UB_IS_FP];
+        assign br_use[gi] = br_v_q[slot_idx[gi]] & (br_ep_q[slot_idx[gi]] == ep_gi) & slot_is_br[gi];
+        assign ff_use[gi] = ff_v_q[slot_idx[gi]] & (ff_ep_q[slot_idx[gi]] == ep_gi) & slot_is_fp[gi];
+        assign ex_use[gi] = ex_v_q[slot_idx[gi]] & (ex_ep_q[slot_idx[gi]] == ep_gi)
+                          & (|exc_gi) & (pexc_gi == 4'd0);
     end
     endgenerate
 
@@ -347,7 +407,11 @@ module rob #(
     //==========================================================================
     generate
     for (gi = 0; gi < COMMIT_W; gi = gi + 1) begin : g_cmtout
-        assign cmt_payload[gi*RB_W +: RB_W] = merge_upd(win_rd[gi], updq[slot_idx[gi]]);
+        assign cmt_payload[gi*RB_W +: RB_W] =
+            merge_upd(win_rd[gi],
+                      br_use[gi], br_taken_q[slot_idx[gi]], br_tgt_q[slot_idx[gi]],
+                      ff_use[gi], ff_q[slot_idx[gi]],
+                      ex_use[gi], ex_tval_q[slot_idx[gi]]);
         assign cmt_narrow[gi*NQ_W +: NQ_W]  = nq[slot_idx[gi]];
         assign cmt_st_drain[gi] = cmt_chain[gi] & slot_store[gi];
         assign cmt_st_ckpt[gi]  = cmt_chain[gi] & nq[slot_idx[gi]][NQ_CKV];
@@ -359,14 +423,21 @@ module rob #(
     assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0] & win_lane_ok[0];
     assign trap_pc    = win_q[slot_idx0[2:0]][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB];
     assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
-    assign trap_tval  = updq[slot_idx[0]][`BACK2_UPD_TVAL_LSB +: 32];
+    //   ★★ EXP-B：mtval 取 ex 表（LSU 数据侧异常）或**载荷 TVAL**（派发期异常：非法指令的
+    //     原始指令位 / 取指异常的故障 VA）——判据与提交侧 `ex_use` 同源（`ex_use[0]`）。
+    assign trap_tval  = ex_use[0] ? ex_tval_q[slot_idx[0]]
+                                  : win_q[slot_idx0[2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
 
     //==========================================================================
     // 4. 观测输出
     //==========================================================================
     //   ★ ② CSR 提交合成**单 lane 动态读口**：只读被选中的那一项（而非 4 lane 全读）
-    assign csr_pay = { updq[csr_lane_idx][`BACK2_UPD_TVAL_LSB +: 32],
-                       updq[csr_lane_idx][`BACK2_UPD_CSRW_LSB +: 32],
+    //   ★★ EXP-B：`tval` 段（= 原始指令位，判 zimm 形式用）改从**载荷 `BACK2_RB_TVAL`** 取；
+    //      `csrw` 段（其低 PW_I 位 = 该 CSR 指令自己的 PS1I）改从**载荷 uop.PS1I** 取 ——
+    //      两者在拆分前分别等于 `updq.TVAL` 与 `updq.CSRW`（后者从不被回写，恒为派发期
+    //      `{25'b0, PS1I}`）⇒ 对外 79 bit 布局与语义**逐位不变**，且不再需要 64 项 32 bit 表。
+    assign csr_pay = { win_q[csr_lane_idx[2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
+                       {25'b0, win_q[csr_lane_idx[2:0]][`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB]},
                        win_q[csr_lane_idx[2:0]][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB],
                        win_q[csr_lane_idx[2:0]][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB] };
 
@@ -396,7 +467,11 @@ module rob #(
             for (k = 0; k < 4; k = k + 1) e_of_r_q[k] <= {ROB_IDX_W{1'b0}};
             for (k = 0; k < ROB_N; k = k + 1) begin
                 nq[k]     <= {NQ_W{1'b0}};
-                updq[k]   <= {`BACK2_UPDQ_W{1'b0}};
+                //   ★★ EXP-B：三张 typed 表只复位 {valid, epoch}（数据数组在 valid=0 时被
+                //     merge 的回落支路屏蔽 ⇒ 无 x 传播；不置复位也让综合更容易落 LUTRAM）
+                br_v_q[k]  <= 1'b0;  br_ep_q[k]  <= {`BACK2_TBL_EP_W{1'b0}};
+                ff_v_q[k]  <= 1'b0;  ff_ep_q[k]  <= {`BACK2_TBL_EP_W{1'b0}};
+                ex_v_q[k]  <= 1'b0;  ex_ep_q[k]  <= {`BACK2_TBL_EP_W{1'b0}};
             end
         end else begin
             // ---- 5.1 派发写入（新项：done 清零；仅真正派发拍 = alloc_fire）----
@@ -409,8 +484,8 @@ module rob #(
                         nq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
                             pack_nq(alloc_payload[k*RB_W +: RB_W], alloc_epoch, 1'b0,
                                     alloc_pre[k*5 +: 5]);
-                        updq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
-                            alloc_payload[k*RB_W + `BACK2_UPD_PAY_LSB +: `BACK2_UPDQ_W];
+                        //   ★★ EXP-B：派发期**不再**把可更新字段复制进更新表 —— 三张 typed 表
+                        //     只由各自的执行部件写（BRU/FPU/LSU），派发写只落 `nq` 与 BRAM 载荷。
                     end
                 end
             end
@@ -430,22 +505,26 @@ module rob #(
                     nq[wb_rob_idx[k*ROB_IDX_W +: ROB_IDX_W]][NQ_DONE] <= 1'b1;
             end
 
-            // ---- 5.3 执行期字段回写 ----
-            if (upd_csr_valid) begin
-                updq[upd_csr_idx][`BACK2_UPD_CSRW_LSB +: 32] <= upd_csr_wdata;
-`ifndef RV32GC_USE_VIVADO_IP
-                if (DBG_CSR) $display("[rob-upd t=%0t] idx=%0d wdata=0x%08x", $time, upd_csr_idx, upd_csr_wdata);
-`endif
-            end
+            // ---- 5.3 ★★ EXP-B：三张 typed 表写入（**每表恰好一个写源** ⇒ 无共享写口/无仲裁）----
+            //   写口与该项的写回（5.2 置 done）**同沿**：此时该项尚未提交 ⇒ 索引不可能被复用
+            //   ⇒ `nq[idx].epoch` 就是该项自己的 epoch（写入口径 == 提交比对口径）。
             if (upd_tr_valid) begin
-                nq[upd_tr_idx][NQ_TRT] <= upd_tr_taken;
-                updq[upd_tr_idx][`BACK2_UPD_TRTAKEN] <= upd_tr_taken;
-                updq[upd_tr_idx][`BACK2_UPD_TRTGT_LSB +: 32] <= upd_tr_target;
+                nq[upd_tr_idx][NQ_TRT]   <= upd_tr_taken;   // 提交侧 `tcp_tk` 仍吃 nq（保持原状）
+                br_v_q[upd_tr_idx]       <= 1'b1;
+                br_ep_q[upd_tr_idx]      <= nq[upd_tr_idx][NQ_EP_L +: `BACK2_EPOCH_W];
+                br_tgt_q[upd_tr_idx]     <= upd_tr_target;
+                br_taken_q[upd_tr_idx]   <= upd_tr_taken;
             end
-            if (upd_ff_valid) updq[upd_ff_idx][`BACK2_UPD_FFLAGS_LSB +: 5] <= upd_ff_flags;
+            if (upd_ff_valid) begin
+                ff_v_q[upd_ff_idx]       <= 1'b1;
+                ff_ep_q[upd_ff_idx]      <= nq[upd_ff_idx][NQ_EP_L +: `BACK2_EPOCH_W];
+                ff_q[upd_ff_idx]         <= upd_ff_flags;
+            end
             if (upd_exc_valid) begin
                 nq[upd_exc_idx][NQ_EXC_L +: 4] <= upd_exc_code;
-                updq[upd_exc_idx][`BACK2_UPD_TVAL_LSB +: 32] <= upd_exc_tval;
+                ex_v_q[upd_exc_idx]      <= 1'b1;
+                ex_ep_q[upd_exc_idx]     <= nq[upd_exc_idx][NQ_EP_L +: `BACK2_EPOCH_W];
+                ex_tval_q[upd_exc_idx]   <= upd_exc_tval;
             end
 
             // ---- 5.35 ★ B3：头部窗口填充（上一拍发出的预取读在本拍到达）----
@@ -524,6 +603,108 @@ module rob #(
                         (nq[e_of_r_q[nk]][NQ_EXC_L-1:1]        !== nq_chk[NQ_EXC_L-1:1]))
                         $display("ROB-NQ-CHK MISMATCH: idx=%0d nq=0x%011x pay=0x%011x",
                                  e_of_r_q[nk], nq[e_of_r_q[nk]], nq_chk);
+                end
+            end
+        end
+    end
+`endif
+
+    //==========================================================================
+    // 6. ★★ EXP-B §29：typed 表 assertion（仿真专属；`ifndef RV32GC_USE_VIVADO_IP`）
+    //==========================================================================
+    //   ① 写口自检（单写源正确性）：上一拍的三个写口必须**逐位落到对应表**（valid/epoch/数据）。
+    //      —— 三张表各只有一个写源（`br_q`←upd_tr / `ff_q`←upd_ff / `ex_q`←upd_exc），
+    //      故同拍 br/ff/exc 写**不同表绝不冲突**（结构上各自独立写口，无需任何仲裁）；
+    //      本自检即该不变式的逐拍证据（含"同拍多表写同一索引"的边界拍）。
+    //   ② 采用不变式：提交的分支必有 br 表命中；提交的 FP 必有 ff 表命中；
+    //      头部陷阱且"派发期无异常、现异常"（⇒ 异常由 LSU 回写）必有 ex 表命中。
+    //      ⚠ `commit_exc → ex_v_q` 不能用 `cmt_valid` 作前件：`slot_ok` 已含 `~slot_exc`
+    //        ⇒ 带异常项**永不提交**，其断言锚点只能是 `trap_valid`（头部精确陷阱点）。
+    //   失败打印一律带 `ROB-ASSERT` 字样（判定脚本按该字样判失败，兜底文案不含 PASS）。
+`ifndef RV32GC_USE_VIVADO_IP
+    integer bk;
+    reg                    w_br_v, w_ff_v, w_ex_v;
+    reg [ROB_IDX_W-1:0]    w_br_i, w_ff_i, w_ex_i;
+    reg [`BACK2_BR_TAKEN_W-1:0] w_br_tk;
+    reg [`BACK2_BR_TGT_W-1:0]   w_br_tg;
+    reg [`BACK2_FF_W-1:0]       w_ff_d;
+    reg [`BACK2_EX_TVAL_W-1:0]  w_ex_tv;
+    reg [`BACK2_EPOCH_W-1:0]    w_br_ep, w_ff_ep, w_ex_ep;
+    //   ⚠ 本块的"写口影子"必须**随异步复位清零**：否则复位前采到的写口会在复位后的
+    //     第一个 posedge 与（已被复位清零的）表内容比对 ⇒ 程序边界的假失败（实测过）。
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            w_br_v <= 1'b0; w_ff_v <= 1'b0; w_ex_v <= 1'b0;
+        end else begin
+            // ---- ① 写口自检（核对上一拍的写）----
+            if (w_br_v) begin
+                if (br_v_q[w_br_i]   !== 1'b1)          $display("ROB-ASSERT-BR FAIL: valid  idx=%0d", w_br_i);
+                if (br_ep_q[w_br_i]  !== w_br_ep)       $display("ROB-ASSERT-BR FAIL: epoch  idx=%0d", w_br_i);
+                if (br_tgt_q[w_br_i] !== w_br_tg)       $display("ROB-ASSERT-BR FAIL: tgt    idx=%0d", w_br_i);
+                if (br_taken_q[w_br_i] !== w_br_tk)     $display("ROB-ASSERT-BR FAIL: taken  idx=%0d", w_br_i);
+            end
+            if (w_ff_v) begin
+                if (ff_v_q[w_ff_i]   !== 1'b1)          $display("ROB-ASSERT-FF FAIL: valid  idx=%0d", w_ff_i);
+                if (ff_ep_q[w_ff_i]  !== w_ff_ep)       $display("ROB-ASSERT-FF FAIL: epoch  idx=%0d", w_ff_i);
+                if (ff_q[w_ff_i]     !== w_ff_d)        $display("ROB-ASSERT-FF FAIL: flags  idx=%0d", w_ff_i);
+            end
+            if (w_ex_v) begin
+                if (ex_v_q[w_ex_i]   !== 1'b1)          $display("ROB-ASSERT-EX FAIL: valid  idx=%0d", w_ex_i);
+                if (ex_ep_q[w_ex_i]  !== w_ex_ep)       $display("ROB-ASSERT-EX FAIL: epoch  idx=%0d", w_ex_i);
+                if (ex_tval_q[w_ex_i] !== w_ex_tv)      $display("ROB-ASSERT-EX FAIL: tval   idx=%0d", w_ex_i);
+            end
+            // ---- ② 采用不变式（提交组 4 lane）----
+            for (bk = 0; bk < COMMIT_W; bk = bk + 1) begin
+                if (cmt_valid[bk] & slot_is_br[bk] & ~br_use[bk])
+                    $display("ROB-ASSERT-BR FAIL: commit branch without br table t=%0t lane=%0d idx=%0d",
+                             $time, bk, slot_idx[bk]);
+                if (cmt_valid[bk] & slot_is_fp[bk] & ~ff_use[bk])
+                    $display("ROB-ASSERT-FF FAIL: commit fp without ff table t=%0t lane=%0d idx=%0d",
+                             $time, bk, slot_idx[bk]);
+            end
+            if (trap_valid & (|nq[slot_idx[0]][NQ_EXC_L +: 4])
+                           & (win_rd[0][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB] == 4'd0)
+                           & ~ex_use[0])
+                $display("ROB-ASSERT-EX FAIL: trap with LSU exc but no ex table t=%0t idx=%0d",
+                         $time, slot_idx[0]);
+            // ---- 采样本拍三个写口（下一拍核对）----
+            w_br_v  <= upd_tr_valid;
+            w_br_i  <= upd_tr_idx;
+            w_br_ep <= nq[upd_tr_idx][NQ_EP_L +: `BACK2_EPOCH_W];
+            w_br_tg <= upd_tr_target;
+            w_br_tk <= upd_tr_taken;
+            w_ff_v  <= upd_ff_valid;
+            w_ff_i  <= upd_ff_idx;
+            w_ff_ep <= nq[upd_ff_idx][NQ_EP_L +: `BACK2_EPOCH_W];
+            w_ff_d  <= upd_ff_flags;
+            w_ex_v  <= upd_exc_valid;
+            w_ex_i  <= upd_exc_idx;
+            w_ex_ep <= nq[upd_exc_idx][NQ_EP_L +: `BACK2_EPOCH_W];
+            w_ex_tv <= upd_exc_tval;
+        end
+    end
+
+    //   ★★ EXP-B：载荷占位字段恒 0 自检 —— `merge_upd` 的 br/ff 回落支路用**常量 0**
+    //     的前提（载荷 [405:401]/[400]/[399:368] 只有派发一个写源、恒写 5'b0/1'b0/32'h0，
+    //     见 `backend_top.v` 的 ROB 载荷组装式）。口径与上面的 nq 自检一致：只在"该索引
+    //     非本拍/上拍刚分配"且"在 ROB 当前范围内"时比对（否则读到的是无效/旧值）。
+    integer zk;
+    always @(posedge clk) begin
+        if (rst_n) begin
+            for (zk = 0; zk < 4; zk = zk + 1) begin
+                if (!(alloc_idx_v_q[0] & (alloc_idx_q[0] == e_of_r_q[zk]) |
+                      alloc_idx_v_q[1] & (alloc_idx_q[1] == e_of_r_q[zk]) |
+                      alloc_idx_v_q[2] & (alloc_idx_q[2] == e_of_r_q[zk]) |
+                      alloc_idx_v_q[3] & (alloc_idx_q[3] == e_of_r_q[zk])) &&
+                    (((e_of_r_q[zk] - head_q) & 7'h7F) < cnt_q)) begin
+                    if ((pl_rdata[zk][`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB] !== 5'h0) ||
+                        (pl_rdata[zk][`BACK2_RB_TRTAKEN] !== 1'b0) ||
+                        (pl_rdata[zk][`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB] !== 32'h0))
+                        $display("ROB-ASSERT-PAY0 FAIL: 载荷占位字段非 0（merge 回落常量前提被破坏）idx=%0d fflags=%b trtaken=%b trtgt=0x%08x",
+                                 e_of_r_q[zk],
+                                 pl_rdata[zk][`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB],
+                                 pl_rdata[zk][`BACK2_RB_TRTAKEN],
+                                 pl_rdata[zk][`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB]);
                 end
             end
         end
