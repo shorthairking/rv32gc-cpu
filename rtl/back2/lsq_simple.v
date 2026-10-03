@@ -372,12 +372,23 @@ module lsq_simple #(
     endgenerate
     wire any_unk_w = |unk_v;
 
-    // 2.2 字节级转发（原 `always @(*)` + 双重 for 的连续赋值等价）
+    // 2.2 字节级转发（★ C6 重写：只消除重复计算，语义与旧实现逐位等价）
     //   ★★ `exe_size` 的编码是 **log2(字节数)**，不是字节数！唯一真源 `decoder.v`
     //      `mem_size_o`：LB/SB=3'd0、LH/SH=3'd1、LW/SW=3'd2、AMO=3'd2、flw=3'd2、
     //      fld=3'd3（其注释里的"1/2/4 B"是**字节数说明**，不是字段取值）。
-    //      本里程碑只做 ≤4 B 对齐访问 ⇒ 用条件链给出字节掩码；
-    //      3'd3（8 B，fld/fsd）超出本里程碑范围，按 4 B 处理（2B-3 第 6 段补 64 bit 访存）。
+    //   转发优先级**口径**（沿用）：扫描**更老且地址已确认**的 store（32 候选 × 8 字节道），
+    //      取该字节上**最年轻**的匹配者（age = 离 ROB 头的距离 ⇒ 越大越年轻）。
+    //   重写点（只消除重复，不改语义；对应审计 A-A4 的三条方向）：
+    //     ① **per-entry 年龄向量**：`(stq_rob - rob_head) & 7'h7F` 每 store 只算一次
+    //        （旧：每字节每 store 各算一份，源码 512 份）；
+    //     ② **高字加法器移出字节循环**：load 侧只保留 **w0-1 / w0 / w0+1 / w0+2** 四个
+    //        字数，与 store 低字 `stq_a[31:2]` 做 4 个等值比较（旧：每字节每 store 一次
+    //        32bit 高字加法 + 30bit 等值，源码 256+512 份）；
+    //     ③ **单趟比较-选择树**：比较 age 的同时选择数据（`fw_max2`），
+    //        不再"先求 best_age、再逐项等值比较、再按选择位选数据"——
+    //        旧实现有三段（248 max + 256 `fw_sel` 8bit 等值 + 256 8bit mux），
+    //        新实现只有 5 级 × 8 字节 = 248 个 `fw_max2`（8bit 比较 + 8bit 数据选 + hit 或）。
+    //   布局：8 字节 × 32 候选（gj ≥ STQ_N 恒 0）——扩到 32 槽时零改动。
     wire [3:0] lmask_w = (exe_size == 3'd0) ? (4'h1 << exe_addr[1:0]) :
                          (exe_size == 3'd1) ? (4'h3 << exe_addr[1:0]) :
                                               (4'hF << exe_addr[1:0]);
@@ -386,90 +397,139 @@ module lsq_simple #(
                           (exe_size == 3'd0) ? (8'h01 << exe_addr[2:0]) :
                           (exe_size == 3'd1) ? (8'h03 << exe_addr[2:0]) :
                                                (8'h0F << exe_addr[2:0]);
-    //   ★★ 转发优先级**口径修正**（2B-3 规格 §6.2 / 本文件头注："取字内**最年轻**的更老匹配者"）：
-    //      原循环用 `cur_age <= best_age`（初值 255）⇒ 实际取到 age **最小**者 = **最老** store
-    //      —— 与规格相反（同字节两条更老 store 时应取更年轻者）。本段改为"取 age 最大者"
-    //      （age = 离 ROB 头的距离 ⇒ 越大越年轻）。用例 C3（同字节 0x11/0x22 ⇒ 期望 0x22）
-    //      即验此点。
-    //   布局：4 字节 × 32 候选（gj ≥ STQ_N 恒 0）——扩到 32 槽时零改动。
-    //   （所有中间网先声明后使用；连续赋值之间的先后次序无关。）
-    wire [8*32-1:0]    fw_match;
-    wire [8*32*8-1:0]  fw_age_c;             // 匹配 ⇒ 该 store 的 age；否则 0
-    wire [8*32*8-1:0]  fw_dat_c;             // 匹配 ⇒ 该字节数据；否则 0
-    wire [8*32-1:0]    fw_sel;               // 匹配 且 age == 该字节最优 age
-    wire [8*8-1:0]     fw_best;
-    wire [8*4*8*8-1:0] fw_ag_ch, fw_wd_ch;
+
+    // ---- (a) per-store 预计算：年龄 + "更老且地址已确认"（每 store 一次）----
+    wire [8*STQ_N-1:0] fw_age_e;             // [gj] = 该 store 的 8bit 年龄
+    wire [STQ_N-1:0]   fw_live_e;            // 更老 且 地址已确认（v & av & age<age_rob）
+    // ---- (b) load 侧三个字数（w0-1 / w0 / w0+1）与 store 低字字数比较（每 store 3 个）----
+    //   旧实现的 `fw_lo_w`/`fw_hi_w` 在每个字节上重算 `(exe_addr+gb)[31:2]`：因
+    //   `gb ∈ [0,8)`、`exe_addr[1:0] ∈ [0,4)`，目标字数 = `w0 + gcar`，`gcar ∈ {0,1,2}`
+    //   （注意：**不是**"8 B 访问才跨字"——旧实现里 size≤2 且 `exe_addr[2:0]≠0` 时也会
+    //    因 `lmask_w8` 的移位选中 `gb = exe_addr[2:0]`，从而落到 w0+1 / w0+2）。
+    //   ⇒ 需要的目标字数只有 {w0-1, w0, w0+1, w0+2}：前三个供低字等值，w0-1..w0+1 供
+    //     8 B store 高字（= 低字地址 +4）。**逐字**等值一次，供 8 个字节共用。
+    wire [29:0]        fw_lwm1 = exe_addr[31:2] - 30'd1;
+    wire [29:0]        fw_lwp1 = exe_addr[31:2] + 30'd1;
+    wire [29:0]        fw_lwp2 = exe_addr[31:2] + 30'd2;
+    wire [STQ_N-1:0]   fw_eqm_e, fw_eq0_e, fw_eqp_e, fw_eqp2_e;
+    generate
+    for (gj = 0; gj < STQ_N; gj = gj + 1) begin : g_fw_pre
+        assign fw_age_e[gj*8 +: 8] = (stq_rob[gj] - rob_head) & 7'h7F;
+        assign fw_live_e[gj]       = stq_v[gj] & stq_av[gj] &
+                                     (fw_age_e[gj*8 +: 8] < age_rob);
+        assign fw_eqm_e[gj]        = (stq_a[gj][31:2] == fw_lwm1);
+        assign fw_eq0_e[gj]        = (stq_a[gj][31:2] == exe_addr[31:2]);
+        assign fw_eqp_e[gj]        = (stq_a[gj][31:2] == fw_lwp1);
+        assign fw_eqp2_e[gj]       = (stq_a[gj][31:2] == fw_lwp2);
+    end
+    endgenerate
+
+    // ---- (c) 组合两路候选：取 age 大者、数据随之选择、hit 相或（纯函数，只吃入参）----
+    //   平局（age 相等）时按旧实现的"或"语义合并两路数据（年龄唯一时退化为唯一胜者）。
+    function [16:0] fw_max2(input [7:0] a_age, input [7:0] a_dat, input a_hit,
+                            input [7:0] b_age, input [7:0] b_dat, input b_hit);
+        reg a_ge;
+        begin
+            a_ge = (a_age >= b_age);
+            fw_max2[16]   = a_hit | b_hit;
+            fw_max2[15:8] = a_ge ? a_age : b_age;
+            fw_max2[7:0]  = (a_hit &  a_ge         ? a_dat : 8'h0) |
+                            (b_hit & (b_age >= a_age) ? b_dat : 8'h0);
+        end
+    endfunction
+
+    // ---- (d) 每字节 32 候选叶子（gj ≥ STQ_N 恒 0）----
+    //   本字节地址 = `exe_addr + gb`，其字数 = w0 + gcar、字内道 = glane（gcar/glane 只由
+    //   `exe_addr[1:0]` 与常量 gb 决定，与旧实现逐位一致）。
+    //   低字候选：store 低字 = 本字节所在字 且 掩码覆盖该道；
+    //   高字候选：8 B store 的高字（低字地址 +4）= 本字节所在字。
+    wire [8*32*8-1:0]  fw_a0;                // 叶子年龄（每叶 8 bit）
+    wire [8*32*8-1:0]  fw_d0;                // 叶子数据（每叶 8 bit）
+    wire [8*32-1:0]    fw_h0;                // 叶子命中（1 bit/叶）
     wire [7:0]         fwd_hit_w;
     wire [63:0]        fwd_data_w;
     generate
     for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_b
-        //   ★★ 4c(3/3)：**每个字节用自己的地址**定位"哪个 4 B 字的哪一道" ——
-        //     8 B 访问的字节 4..7 落在下一个字（`addr+4`），旧实现在这里
-        //     `bl_w = exe_addr[1:0]+gb` 且 `bl_w < 4` ⇒ 后半被整体丢弃（8 B 前半也错位）。
-        wire [31:0] ba_w  = exe_addr + gb[31:0];      // 该字节的字节地址
-        wire [1:0]  bl_w  = ba_w[1:0];                // 字内字节道
-        wire        in_w  = lmask_w8[gb];             // 该字节在本次访问内
+        //   gsum = exe_addr[1:0] + gb（0..10）；gcar = 跨字数（0/1/2）；glane = 字内道。
+        wire [3:0]  gsum_w  = {2'b0, exe_addr[1:0]} + gb[3:0];
+        wire [1:0]  gcar_w  = gsum_w[3:2];
+        wire [1:0]  lane_w  = gsum_w[1:0];
+        wire        in_w    = lmask_w8[gb];                     // 该字节在本次访问内
         for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_j
             if (gj < STQ_N) begin : g_fw_on
-                //   ★★ 4c(3/3)：8 B store 的**高字**也参与转发（字地址 = `stq_a+4`，
-                //     掩码恒 4'hF）；≤4 B store 时 `stq_hi=0` ⇒ 低字路径与旧实现逐位等价。
-                wire       fw_lo_w = (stq_a[gj][31:2] == ba_w[31:2]);
-                wire       fw_hi_w = stq_hi[gj] &
-                                     (({2'b0, stq_a[gj][31:2]} + 32'd1) == {2'b0, ba_w[31:2]});
-                assign fw_match[gb*32 + gj] =
-                       in_w & stq_v[gj] & stq_av[gj] & (fw_lo_w | fw_hi_w) &
-                       (fw_lo_w ? stq_msk[gj][bl_w] : 1'b1) &
-                       (((stq_rob[gj] - rob_head) & 7'h7F) < age_rob);
-                assign fw_age_c[(gb*32+gj)*8 +: 8] =
-                       fw_match[gb*32 + gj] ? ((stq_rob[gj] - rob_head) & 7'h7F) : 8'h0;
-                assign fw_dat_c[(gb*32+gj)*8 +: 8] =
-                       fw_match[gb*32 + gj] ? (fw_hi_w ? stq_dh[gj][8*bl_w +: 8]
-                                                       : stq_d [gj][8*bl_w +: 8]) : 8'h0;
+                wire lo_eq_w = (gcar_w == 2'd0) ? fw_eq0_e [gj] :
+                               (gcar_w == 2'd1) ? fw_eqp_e [gj] : fw_eqp2_e[gj];
+                wire hi_eq_w = (gcar_w == 2'd0) ? fw_eqm_e [gj] :
+                               (gcar_w == 2'd1) ? fw_eq0_e [gj] : fw_eqp_e [gj];
+                wire lo_w = lo_eq_w & stq_msk[gj][lane_w];
+                wire hi_w = stq_hi[gj] & hi_eq_w;
+                wire mt_w = in_w & fw_live_e[gj] & (lo_w | hi_w);
+                assign fw_a0[(gb*32+gj)*8 +: 8] = mt_w ? fw_age_e[gj*8 +: 8] : 8'h0;
+                assign fw_d0[(gb*32+gj)*8 +: 8] = mt_w ? (lo_w ? stq_d [gj][8*lane_w +: 8]
+                                                               : stq_dh[gj][8*lane_w +: 8]) : 8'h0;
+                assign fw_h0[gb*32 + gj] = mt_w;
             end else begin : g_fw_off
-                assign fw_match[gb*32 + gj]       = 1'b0;
-                assign fw_age_c[(gb*32+gj)*8 +: 8] = 8'h0;
-                assign fw_dat_c[(gb*32+gj)*8 +: 8] = 8'h0;
+                assign fw_a0[(gb*32+gj)*8 +: 8] = 8'h0;
+                assign fw_d0[(gb*32+gj)*8 +: 8] = 8'h0;
+                assign fw_h0[gb*32 + gj] = 1'b0;
             end
         end
-        //   best_age[b] = max over j（8 组 × 组内 8 项串行链 + 组间两级归约）
-        wire [7:0] bs01_w, bs23_w, bs_w;
-        assign bs01_w = (fw_ag_ch[((gb*4+0)*8+7)*8 +: 8] >= fw_ag_ch[((gb*4+1)*8+7)*8 +: 8])
-                        ? fw_ag_ch[((gb*4+0)*8+7)*8 +: 8] : fw_ag_ch[((gb*4+1)*8+7)*8 +: 8];
-        assign bs23_w = (fw_ag_ch[((gb*4+2)*8+7)*8 +: 8] >= fw_ag_ch[((gb*4+3)*8+7)*8 +: 8])
-                        ? fw_ag_ch[((gb*4+2)*8+7)*8 +: 8] : fw_ag_ch[((gb*4+3)*8+7)*8 +: 8];
-        assign bs_w   = (bs01_w >= bs23_w) ? bs01_w : bs23_w;
-        assign fw_best[gb*8 +: 8] = bs_w;
-        //   命中位（与掩码无关：in_w 已并入 fw_match）
-        assign fwd_hit_w[gb] = |fw_match[gb*32 +: 32];
-        //   胜者数据（唯一胜者 ⇒ 或归约等价于选择）
-        assign fwd_data_w[gb*8 +: 8] =
-               fw_wd_ch[((gb*4+0)*8+7)*8 +: 8] | fw_wd_ch[((gb*4+1)*8+7)*8 +: 8] |
-               fw_wd_ch[((gb*4+2)*8+7)*8 +: 8] | fw_wd_ch[((gb*4+3)*8+7)*8 +: 8];
     end
     endgenerate
+
+    // ---- (e) 每字节 32→1 平衡比较-选择树（5 级：32→16→8→4→2→1）----
+    //   每级每结点 = 一次 `fw_max2`；`fwd_hit_w`/`fwd_data_w` 取第 5 级根结点。
+    wire [8*16*8-1:0] fw_a1, fw_d1;  wire [8*16-1:0] fw_h1;
+    wire [8*8*8-1:0]  fw_a2, fw_d2;  wire [8*8-1:0]  fw_h2;
+    wire [8*4*8-1:0]  fw_a3, fw_d3;  wire [8*4-1:0]  fw_h3;
+    wire [8*2*8-1:0]  fw_a4, fw_d4;  wire [8*2-1:0]  fw_h4;
     generate
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_sel
-        for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_selj
-            assign fw_sel[gb*32 + gj] = fw_match[gb*32 + gj] &
-                                        (fw_age_c[(gb*32+gj)*8 +: 8] == fw_best[gb*8 +: 8]);
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r1
+        for (gk = 0; gk < 16; gk = gk + 1) begin : g_r
+            wire [16:0] cc;
+            assign cc = fw_max2(fw_a0[(gb*32+2*gk  )*8 +: 8], fw_d0[(gb*32+2*gk  )*8 +: 8], fw_h0[gb*32+2*gk  ],
+                                fw_a0[(gb*32+2*gk+1)*8 +: 8], fw_d0[(gb*32+2*gk+1)*8 +: 8], fw_h0[gb*32+2*gk+1]);
+            assign fw_a1[(gb*16+gk)*8 +: 8] = cc[15:8];
+            assign fw_d1[(gb*16+gk)*8 +: 8] = cc[7:0];
+            assign fw_h1[gb*16+gk] = cc[16];
         end
     end
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_ch
-        for (gk = 0; gk < 4; gk = gk + 1) begin : g_fw_chg
-            assign fw_ag_ch[((gb*4+gk)*8 + 0)*8 +: 8] = fw_age_c[(gb*32 + gk*8 + 0)*8 +: 8];
-            assign fw_wd_ch[((gb*4+gk)*8 + 0)*8 +: 8] = fw_sel[gb*32 + gk*8 + 0]
-                                                        ? fw_dat_c[(gb*32 + gk*8 + 0)*8 +: 8] : 8'h0;
-            for (gj = 1; gj < 8; gj = gj + 1) begin : g_fw_chs
-                assign fw_ag_ch[((gb*4+gk)*8 + gj)*8 +: 8] =
-                       (fw_ag_ch[((gb*4+gk)*8 + gj-1)*8 +: 8] >=
-                        fw_age_c[(gb*32 + gk*8 + gj)*8 +: 8])
-                       ? fw_ag_ch[((gb*4+gk)*8 + gj-1)*8 +: 8]
-                       : fw_age_c[(gb*32 + gk*8 + gj)*8 +: 8];
-                assign fw_wd_ch[((gb*4+gk)*8 + gj)*8 +: 8] =
-                       fw_wd_ch[((gb*4+gk)*8 + gj-1)*8 +: 8] |
-                       (fw_sel[gb*32 + gk*8 + gj] ? fw_dat_c[(gb*32 + gk*8 + gj)*8 +: 8] : 8'h0);
-            end
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r2
+        for (gk = 0; gk < 8; gk = gk + 1) begin : g_r
+            wire [16:0] cc;
+            assign cc = fw_max2(fw_a1[(gb*16+2*gk  )*8 +: 8], fw_d1[(gb*16+2*gk  )*8 +: 8], fw_h1[gb*16+2*gk  ],
+                                fw_a1[(gb*16+2*gk+1)*8 +: 8], fw_d1[(gb*16+2*gk+1)*8 +: 8], fw_h1[gb*16+2*gk+1]);
+            assign fw_a2[(gb*8+gk)*8 +: 8] = cc[15:8];
+            assign fw_d2[(gb*8+gk)*8 +: 8] = cc[7:0];
+            assign fw_h2[gb*8+gk] = cc[16];
         end
+    end
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r3
+        for (gk = 0; gk < 4; gk = gk + 1) begin : g_r
+            wire [16:0] cc;
+            assign cc = fw_max2(fw_a2[(gb*8+2*gk  )*8 +: 8], fw_d2[(gb*8+2*gk  )*8 +: 8], fw_h2[gb*8+2*gk  ],
+                                fw_a2[(gb*8+2*gk+1)*8 +: 8], fw_d2[(gb*8+2*gk+1)*8 +: 8], fw_h2[gb*8+2*gk+1]);
+            assign fw_a3[(gb*4+gk)*8 +: 8] = cc[15:8];
+            assign fw_d3[(gb*4+gk)*8 +: 8] = cc[7:0];
+            assign fw_h3[gb*4+gk] = cc[16];
+        end
+    end
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r4
+        for (gk = 0; gk < 2; gk = gk + 1) begin : g_r
+            wire [16:0] cc;
+            assign cc = fw_max2(fw_a3[(gb*4+2*gk  )*8 +: 8], fw_d3[(gb*4+2*gk  )*8 +: 8], fw_h3[gb*4+2*gk  ],
+                                fw_a3[(gb*4+2*gk+1)*8 +: 8], fw_d3[(gb*4+2*gk+1)*8 +: 8], fw_h3[gb*4+2*gk+1]);
+            assign fw_a4[(gb*2+gk)*8 +: 8] = cc[15:8];
+            assign fw_d4[(gb*2+gk)*8 +: 8] = cc[7:0];
+            assign fw_h4[gb*2+gk] = cc[16];
+        end
+    end
+    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r5
+        wire [16:0] cc;
+        assign cc = fw_max2(fw_a4[(gb*2+0)*8 +: 8], fw_d4[(gb*2+0)*8 +: 8], fw_h4[gb*2+0],
+                            fw_a4[(gb*2+1)*8 +: 8], fw_d4[(gb*2+1)*8 +: 8], fw_h4[gb*2+1]);
+        assign fwd_hit_w [gb]        = cc[16];
+        assign fwd_data_w[gb*8 +: 8] = cc[7:0];
     end
     endgenerate
 
