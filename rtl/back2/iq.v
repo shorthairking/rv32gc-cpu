@@ -71,6 +71,10 @@ module iq #(
     //     写回 ⇒ 头卡死（实测：head pc=0x8000_0030、hdone=0、IQ 全空、永久停顿）。
     input  wire                  squash,
     input  wire [ROB_IDX_W-1:0]  squash_idx,
+    //   ★★ C8：ROB 侧**统一年龄输出** = `(squash_idx − rob_head) mod ROB_N`
+    //     （唯一真源见 `rob.v` §1.1）。本队列只**消费**它，不再自算
+    //     `squash_idx - rob_head`（原 6 个队列实例各算一份 ROB_IDX_W 位减法器）。
+    input  wire [ROB_IDX_W-1:0]  squash_age,
     input  wire [`BACK2_EPOCH_W-1:0] epoch,
 
     // ---- 入队（D3 派发）----
@@ -185,18 +189,38 @@ module iq #(
     //==========================================================================
     wire [DEPTH*SRC_N-1:0] wk_hit;
     reg  [DEPTH-1:0]       e_rdy, e_sel;
-    reg  [7:0]             e_age [0:DEPTH-1];
     reg  [DEPTH*SRC_N-1:0] wk_hit_w;
     reg  [DEPTH-1:0]       sel_blk;    // 存在更老的未就绪项（⇒ load 项暂缓可选）
-    reg  [7:0]             sel_idx, best_age;
+    //   ★★ C8：`best_age` 由 8 bit 收窄到 ROB_IDX_W+1 bit —— 哨兵值必须**严格大于**
+    //     任何合法年龄：合法年龄 ≤ ROB_N−1，而满窗口（rob_cnt=ROB_N）时最新项年龄
+    //     恰为 ROB_N−1 ⇒ 哨兵取 ROB_N（否则该哨兵会用 `<` 把满窗口里最年轻的那一项
+    //     永久排除在"最老优先"之外）。
+    reg  [ROB_IDX_W:0]     best_age;
+    reg  [7:0]             sel_idx;
     integer                gi, gk;
+
+    //   ★★ C8：**模块内唯一年龄计算点** —— `age_q[gi] = (rob_q[gi] − rob_head) mod ROB_N`。
+    //     原实现把同一表达式算了两份且宽度不同：`e_age`（8 bit，供最老优先选择，含
+    //     完整借位链）与 §5 的 `age_e`（ROB_IDX_W bit，供冲刷作废/窗口判定）⇒ 两份
+    //     减法器阵列互不共享。统一为一份 ROB_IDX_W 位年龄后：
+    //       ① 减法器阵列由 2 份降为 1 份（同一模块内真正 CSE）；
+    //       ② "最老优先"比较器由 8 bit 收窄到 ROB_IDX_W+1 bit。
+    //     语义等价性：合法在队项（未被 `squash_kill`/`out_window` 作废）必有
+    //     `rob_head ≤ age < rob_head + rob_cnt`（模 N）⇒ 其模 N 年龄 ∈ [0, ROB_N−1]；
+    //     8 bit 写法只在这些项上产生同样的低 ROB_IDX_W 位（高位为 0），故可达状态逐位一致。
+    wire [DEPTH*ROB_IDX_W-1:0] age_q;
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_age
+        assign age_q[ge*ROB_IDX_W +: ROB_IDX_W] =
+               rob_q[ge*ROB_IDX_W +: ROB_IDX_W] - rob_head;
+    end
+    endgenerate
 
     //  源序（与 SRC_N 注释一致）：0=s1i 1=s2i 2=s1f 3=s2f 4=s3f
     //  ★★ C1：所有逐槽比较/门控一律读**窄载荷** `np_q[gi]`（宽字段已不在 IQ 内）
     always @(*) begin
         wk_hit_w = {(DEPTH*SRC_N){1'b0}};
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
-            e_age[gi] = rob_q[gi*ROB_IDX_W +: ROB_IDX_W] - rob_head;   // 8 bit 零扩展
             for (gk = 0; gk < WK_N; gk = gk + 1) begin
                 if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps1i(np_q[gi]))) ||
                     (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps1i(np_q[gi]))))
@@ -218,7 +242,9 @@ module iq #(
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
             sel_blk[gi] = 1'b0;
             for (gk = 0; gk < DEPTH; gk = gk + 1)
-                if (valid_q[gk] && (e_age[gk] < e_age[gi]) && ~e_rdy[gk]) sel_blk[gi] = 1'b1;
+                if (valid_q[gk] &&
+                    (age_q[gk*ROB_IDX_W +: ROB_IDX_W] < age_q[gi*ROB_IDX_W +: ROB_IDX_W]) &&
+                    ~e_rdy[gk]) sel_blk[gi] = 1'b1;
         end
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
             e_rdy[gi] = (~np_q[gi][`BACK2_IQN_S1I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
@@ -233,12 +259,14 @@ module iq #(
     assign wk_hit = wk_hit_w;
 
     //  最老优先（年龄原点 = ROB 头；同拍唤醒即可选）
+    //  ★ C8：年龄取 §2 的唯一年龄向量 `age_q`；比较宽度 = ROB_IDX_W+1（零扩展后与
+    //     7 bit 哨兵 ROB_N 比较），与旧 8 bit 写法在可达状态上逐位一致。
     always @(*) begin
         sel_idx  = 8'h0;
-        best_age = 8'hFF;
+        best_age = {(ROB_IDX_W+1){1'b1}};
         for (gi = 0; gi < DEPTH; gi = gi + 1)
-            if (e_sel[gi] && (e_age[gi] < best_age)) begin
-                best_age = e_age[gi];
+            if (e_sel[gi] && ({1'b0, age_q[gi*ROB_IDX_W +: ROB_IDX_W]} < best_age)) begin
+                best_age = {1'b0, age_q[gi*ROB_IDX_W +: ROB_IDX_W]};
                 sel_idx  = gi[7:0];
             end
     end
@@ -323,14 +351,18 @@ module iq #(
     //   （实测：squash_idx=21 时把 idx=20 的项也杀掉，队列 3→1 而非 3→2）。
     wire [DEPTH-1:0] squash_kill;
     wire [DEPTH-1:0] out_window;      // 落在 ROB 窗口之外（已提交越过 / 已冲刷）
-    wire [ROB_IDX_W-1:0] age_sq = squash_idx - rob_head;
+    //   ★ C8：年龄基准改由 ROB 单点提供（`squash_age`）；本模块不再重算
+    //     `squash_idx - rob_head`。逐位等价（两侧同为 ROB_IDX_W 位模 ROB_N 减法）。
+    wire [ROB_IDX_W-1:0] age_sq = squash_age;
     generate
     for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_kill
-        wire [ROB_IDX_W-1:0] age_e = rob_q[ge*ROB_IDX_W +: ROB_IDX_W] - rob_head;
-        assign squash_kill[ge] = squash & valid_q[ge] & (age_e > age_sq);
+        //   ★ C8：本项年龄复用 §2 的唯一计算点 `age_q`（原此处再算一份同式减法）。
+        assign squash_kill[ge] = squash & valid_q[ge] &
+                                 (age_q[ge*ROB_IDX_W +: ROB_IDX_W] > age_sq);
         //   比较必须零扩展到 rob_cnt 的宽度（ROB_IDX_W+1）：rob_cnt=ROB_N 时在
         //   ROB_IDX_W 位里表示为 0 ⇒ 窄位比较会把"满窗口"误判成"空窗口"而全清。
-        assign out_window[ge]  = valid_q[ge] & ({1'b0, age_e} >= rob_cnt);
+        assign out_window[ge]  = valid_q[ge] &
+                                 ({1'b0, age_q[ge*ROB_IDX_W +: ROB_IDX_W]} >= rob_cnt);
     end
     endgenerate
 

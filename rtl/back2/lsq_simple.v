@@ -245,10 +245,22 @@ module lsq_simple #(
     //     defined as a genvar` + `8-8891 'gv' is already declared`（首次 2B 综合实测）。
     //     仅声明位置变化，**零行为差异**。
     genvar gv, gb, gk, gj;
+    //   ★★ C8：**STQ 每项年龄的唯一计算点** —— `stq_age[gv] = (stq_rob[gv] − rob_head) & 7'h7F`。
+    //     宽度/掩码与旧实现**逐位一致**（7 bit 模 128：越过 ROB 头的项落在 65..127，
+    //     恒大于任何窗口内年龄 <64 ⇒ **不能**收窄成 6 bit 模 64，B27 口径见下方 ld 释放注）。
+    //     旧实现把同一表达式在三处各算一遍：`stq_win_w`（提交窗，STQ_N 项）、`unk_v`
+    //     （更老未定址闸门，STQ_N 项）、`fw_age_e`（转发窗口，STQ_N 项）⇒ 本线是它们的
+    //     共同真源（审计 §A-A1 第 3 条 / §C8 的方向③）。
+    wire [8*STQ_N-1:0] stq_age;
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqage
+        assign stq_age[gv*8 +: 8] = (stq_rob[gv] - rob_head) & 7'h7F;
+    end
+    endgenerate
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqblk
         assign stq_win_w[gv] = stq_v[gv] & stq_av[gv] & ~stq_ret[gv] &
-                               (((stq_rob[gv] - rob_head) & 7'h7F) < W[7:0]);
+                               (stq_age[gv*8 +: 8] < W[7:0]);
         assign stq_blk_w[gv] = stq_win_w[gv] & ~stq_bad[gv] &
                                ~(~stx_en_w | (stq_pv[gv] & (stq_ctx[gv] == st_xlate_ctx)));
     end
@@ -367,7 +379,7 @@ module lsq_simple #(
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_unk
         assign unk_v[gv] = stq_v[gv] & ~stq_av[gv] &
-                           (((stq_rob[gv] - rob_head) & 7'h7F) < age_iss);
+                           (stq_age[gv*8 +: 8] < age_iss);   // ★ C8：复用 STQ 唯一年龄向量
     end
     endgenerate
     wire any_unk_w = |unk_v;
@@ -399,7 +411,7 @@ module lsq_simple #(
                                                (8'h0F << exe_addr[2:0]);
 
     // ---- (a) per-store 预计算：年龄 + "更老且地址已确认"（每 store 一次）----
-    wire [8*STQ_N-1:0] fw_age_e;             // [gj] = 该 store 的 8bit 年龄
+    //   ★ C8：年龄不再在本段另算一份 —— 直接用 §0 的 STQ 唯一年龄向量 `stq_age`。
     wire [STQ_N-1:0]   fw_live_e;            // 更老 且 地址已确认（v & av & age<age_rob）
     // ---- (b) load 侧三个字数（w0-1 / w0 / w0+1）与 store 低字字数比较（每 store 3 个）----
     //   旧实现的 `fw_lo_w`/`fw_hi_w` 在每个字节上重算 `(exe_addr+gb)[31:2]`：因
@@ -414,9 +426,8 @@ module lsq_simple #(
     wire [STQ_N-1:0]   fw_eqm_e, fw_eq0_e, fw_eqp_e, fw_eqp2_e;
     generate
     for (gj = 0; gj < STQ_N; gj = gj + 1) begin : g_fw_pre
-        assign fw_age_e[gj*8 +: 8] = (stq_rob[gj] - rob_head) & 7'h7F;
         assign fw_live_e[gj]       = stq_v[gj] & stq_av[gj] &
-                                     (fw_age_e[gj*8 +: 8] < age_rob);
+                                     (stq_age[gj*8 +: 8] < age_rob);
         assign fw_eqm_e[gj]        = (stq_a[gj][31:2] == fw_lwm1);
         assign fw_eq0_e[gj]        = (stq_a[gj][31:2] == exe_addr[31:2]);
         assign fw_eqp_e[gj]        = (stq_a[gj][31:2] == fw_lwp1);
@@ -464,7 +475,7 @@ module lsq_simple #(
                 wire lo_w = lo_eq_w & stq_msk[gj][lane_w];
                 wire hi_w = stq_hi[gj] & hi_eq_w;
                 wire mt_w = in_w & fw_live_e[gj] & (lo_w | hi_w);
-                assign fw_a0[(gb*32+gj)*8 +: 8] = mt_w ? fw_age_e[gj*8 +: 8] : 8'h0;
+                assign fw_a0[(gb*32+gj)*8 +: 8] = mt_w ? stq_age[gj*8 +: 8] : 8'h0;
                 assign fw_d0[(gb*32+gj)*8 +: 8] = mt_w ? (lo_w ? stq_d [gj][8*lane_w +: 8]
                                                                : stq_dh[gj][8*lane_w +: 8]) : 8'h0;
                 assign fw_h0[gb*32 + gj] = mt_w;

@@ -65,6 +65,16 @@ module tb_back2_iq;
     reg  [NI-1:0]        flush_all;
     reg  [NI-1:0]        squash;
     reg  [NI-1:0][6:0]   squash_idx;
+    //   ★ C8：被测 iq 新增 ROB「统一年龄」输入（= (squash_idx − rob_head) mod ROB_N）。
+    //     本 TB 直连 iq（不例化 rob），故按 rob.v §1.1 的口径在 TB 侧生成同一值
+    //     —— **逐位等于**旧实现里 iq 自算的 `squash_idx - rob_head`，激励/判据未变。
+    wire [NI-1:0][6:0]   squash_age_tb;
+    assign squash_age_tb[0] = squash_idx[0] - rob_head[0];
+    assign squash_age_tb[1] = squash_idx[1] - rob_head[1];
+    assign squash_age_tb[2] = squash_idx[2] - rob_head[2];
+    assign squash_age_tb[3] = squash_idx[3] - rob_head[3];
+    assign squash_age_tb[4] = squash_idx[4] - rob_head[4];
+    assign squash_age_tb[5] = squash_idx[5] - rob_head[5];
     reg  [NI-1:0][7:0]   rob_cnt;   // ROB 窗口大小（0..128）
     reg  [NI-1:0]        iss_ready;
     reg  [NI-1:0][5:0]   wki_v;               // 6 个整数唤醒道
@@ -86,7 +96,7 @@ module tb_back2_iq;
     assign wkf_tag = { 6'd6, 6'd5, 6'd4, 6'd3, 6'd2, 6'd1 };
 
     iq #(.DEPTH(`BACK2_IQ_ALU0_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq0 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[0]), .squash(squash[0]), .squash_idx(squash_idx[0]), .rob_cnt(rob_cnt[0]),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[0]), .squash(squash[0]), .squash_idx(squash_idx[0]), .squash_age(squash_age_tb[0]), .rob_cnt(rob_cnt[0]),
         .epoch(epoch[0]),
         .wr_valid({3'b0, wr_v[0]}),
         .wr_uop(wr_uop[0*4*UOPW +: 4*UOPW]),
@@ -103,7 +113,7 @@ module tb_back2_iq;
         .o_sel_rob(sel_rob[0*7 +: 7])
     );
     iq #(.DEPTH(`BACK2_IQ_ALU1_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq1 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[1]), .squash(squash[1]), .squash_idx(squash_idx[1]), .rob_cnt(rob_cnt[1]),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[1]), .squash(squash[1]), .squash_idx(squash_idx[1]), .squash_age(squash_age_tb[1]), .rob_cnt(rob_cnt[1]),
         .epoch(epoch[1]),
         .wr_valid({3'b0, wr_v[1]}),
         .wr_uop(wr_uop[1*4*UOPW +: 4*UOPW]),
@@ -120,7 +130,7 @@ module tb_back2_iq;
         .o_sel_rob(sel_rob[1*7 +: 7])
     );
     iq #(.DEPTH(`BACK2_IQ_BRU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq2 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[2]), .squash(squash[2]), .squash_idx(squash_idx[2]), .rob_cnt(rob_cnt[2]),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[2]), .squash(squash[2]), .squash_idx(squash_idx[2]), .squash_age(squash_age_tb[2]), .rob_cnt(rob_cnt[2]),
         .epoch(epoch[2]),
         .wr_valid({3'b0, wr_v[2]}),
         .wr_uop(wr_uop[2*4*UOPW +: 4*UOPW]),
@@ -137,7 +147,7 @@ module tb_back2_iq;
         .o_sel_rob(sel_rob[2*7 +: 7])
     );
     iq #(.DEPTH(`BACK2_IQ_MDU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq3 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[3]), .squash(squash[3]), .squash_idx(squash_idx[3]), .rob_cnt(rob_cnt[3]),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[3]), .squash(squash[3]), .squash_idx(squash_idx[3]), .squash_age(squash_age_tb[3]), .rob_cnt(rob_cnt[3]),
         .epoch(epoch[3]),
         .wr_valid({3'b0, wr_v[3]}),
         .wr_uop(wr_uop[3*4*UOPW +: 4*UOPW]),
@@ -154,7 +164,7 @@ module tb_back2_iq;
         .o_sel_rob(sel_rob[3*7 +: 7])
     );
     iq #(.DEPTH(`BACK2_IQ_LSU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq4 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[4]), .squash(squash[4]), .squash_idx(squash_idx[4]), .rob_cnt(rob_cnt[4]),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[4]), .squash(squash[4]), .squash_idx(squash_idx[4]), .squash_age(squash_age_tb[4]), .rob_cnt(rob_cnt[4]),
         .epoch(epoch[4]),
         .wr_valid({3'b0, wr_v[4]}),
         .wr_uop(wr_uop[4*4*UOPW +: 4*UOPW]),
@@ -171,7 +181,7 @@ module tb_back2_iq;
         .o_sel_rob(sel_rob[4*7 +: 7])
     );
     iq #(.DEPTH(`BACK2_IQ_FPU_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq5 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[5]), .squash(squash[5]), .squash_idx(squash_idx[5]), .rob_cnt(rob_cnt[5]),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all[5]), .squash(squash[5]), .squash_idx(squash_idx[5]), .squash_age(squash_age_tb[5]), .rob_cnt(rob_cnt[5]),
         .epoch(epoch[5]),
         .wr_valid({3'b0, wr_v[5]}),
         .wr_uop(wr_uop[5*4*UOPW +: 4*UOPW]),

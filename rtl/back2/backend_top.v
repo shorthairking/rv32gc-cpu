@@ -595,6 +595,11 @@ module backend_top #(
     wire [DISP_W*RB_W-1:0] rob_pay_w;
     wire        trap_v_rob, flush_all_w, squash_v_w;
     wire [6:0]  rob_head_w, squash_idx_w;
+    //   ★★ C8：ROB 的**统一年龄输出**（"距头距离"唯一真源，见 `rob.v` §1.1）——
+    //     = `(squash_idx_w − rob_head_w) mod ROB_N`。本文件的全部"更年轻"判据
+    //     （I2 发射杀、MDU/FPU 杀、CSR 跟踪表冲刷、检查点回滚登记）一律改用它，
+    //     不再各自重算 `squash_idx_w − rob_head_w`（原 4 处就地重算）。
+    wire [ROBW-1:0] squash_age_w;
     wire [7:0]  rob_cnt_w;
     wire [EW-1:0] epoch_w;
     //   ★★ EXP-B：`upd_csr_*`（含 `upd_csrw`/`upd_csr_idx`/`upd_csr_v`）整条路径已删除
@@ -1229,7 +1234,7 @@ module backend_top #(
     assign iq_base_rdy = { fpu_iss_ok_w, ~lsu_ld_block, mdu_free_w, 1'b1, 1'b1, ~al0_csr_blk };
 
     iq #(.DEPTH(`BACK2_IQ_ALU0_D), .DBG(DBG_IQ)) u_iq0 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[0*WI +: WI]), .wr_uop(iq_wuop[0*WI*UOPW +: WI*UOPW]),
@@ -1242,7 +1247,7 @@ module backend_top #(
         .o_sel_v(i0_sel_v), .o_sel_rob(i0_sel_rob), .o_sel_nq(iq_sel_nq[0]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_ALU1_D), .DBG(DBG_IQ)) u_iq1 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[1*WI +: WI]), .wr_uop(iq_wuop[1*WI*UOPW +: WI*UOPW]),
@@ -1255,7 +1260,7 @@ module backend_top #(
         .o_sel_v(i1_sel_v), .o_sel_rob(i1_sel_rob), .o_sel_nq(iq_sel_nq[1]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_BRU_D), .DBG(DBG_IQ)) u_iq2 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[2*WI +: WI]), .wr_uop(iq_wuop[2*WI*UOPW +: WI*UOPW]),
@@ -1268,7 +1273,7 @@ module backend_top #(
         .o_sel_v(i2_sel_v), .o_sel_rob(i2_sel_rob), .o_sel_nq(iq_sel_nq[2]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_MDU_D), .DBG(DBG_IQ)) u_iq3 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[3*WI +: WI]), .wr_uop(iq_wuop[3*WI*UOPW +: WI*UOPW]),
@@ -1301,7 +1306,7 @@ module backend_top #(
     //     故队列级门撤销（`INORD_LOAD=0`），"更老未定址 store"的保守语义由 §2.1 的
     //     精确 STQ 闸门（`iss_ok`）独立承担 —— 实测五个程序逐位不变（见报告 §B4.1）。
     iq #(.DEPTH(`BACK2_IQ_LSU_D), .DBG(DBG_IQ), .INORD_LOAD(0)) u_iq4 (   // 2B-4: LQ 派发期分配 ⇒ 可放开
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[4*WI +: WI]), .wr_uop(iq_wuop[4*WI*UOPW +: WI*UOPW]),
@@ -1314,7 +1319,7 @@ module backend_top #(
         .o_sel_v(i4_sel_v), .o_sel_rob(i4_sel_rob), .o_sel_nq(iq_sel_nq[4]), .cnt_o()
     );
     iq #(.DEPTH(`BACK2_IQ_FPU_D), .DBG(DBG_IQ)) u_iq5 (
-        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w),
+        .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
         .rob_cnt(rob_cnt_w),
         .epoch(epoch_w),
         .wr_valid(iq_wv_g[5*WI +: WI]), .wr_uop(iq_wuop[5*WI*UOPW +: WI*UOPW]),
@@ -1449,7 +1454,7 @@ module backend_top #(
         begin
             i2_sq_kill_f = squash_v_w &
                            ({1'b0, (iss_rob - rob_head_w[ROBW-1:0])} >
-                            {1'b0, (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])});
+                            {1'b0, squash_age_w});
         end
     endfunction
     always @(posedge clk or negedge rst_n) begin
@@ -1548,10 +1553,10 @@ module backend_top #(
     //       age(在飞项) > age(squash 点) ⇒ 该项更年轻 ⇒ 本次冲刷该杀它。
     wire        mdu_kill = flush_all_w |
                            (squash_v_w & ((mdu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
-                                          (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])));
+                                          squash_age_w));
     wire        fpu_kill = flush_all_w |
                            (squash_v_w & ((fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
-                                          (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])));
+                                          squash_age_w));
     wire [4:0] mdu_brop = w_brop(x_i2_uop[3]);
     mdu u_mdu (.aclk(clk), .aresetn(rst_n), .start(mdu_go), .flush(mdu_kill),
                .mdu_op(mdu_brop[2:0]),
@@ -1884,7 +1889,7 @@ module backend_top #(
                 csr_pend_q <= 1'b0;
             end else if (squash_v_w && csr_pend_q &&
                          ((csr_pend_rob_q[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
-                          (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0]))) begin
+                          squash_age_w)) begin
                 csr_pend_q <= 1'b0;                     // 该 CSR 在冲刷点之后 ⇒ 已不存在
             end else if (csr_cmt_we) begin
                 //   ★★ 4c(2/3)：**只有"被跟踪的那条 CSR"提交才清** —— 一个派发块可含**多条**
@@ -2035,6 +2040,7 @@ module backend_top #(
         .squash_valid(squash_v_w), .squash_idx(squash_idx_w), .flush_all(flush_all_w),
         .trap_retire(trap_v_rob & trp_flush_v_i),
         .head_o(rob_head_w), .cnt_o(rob_cnt_w), .empty_o(), .head_done_o(), .head_exc_o(),
+        .squash_age_o(squash_age_w),   // ★ C8：统一年龄（距头距离）输出
         .cmt_cnt_o(cnt_commit_o), .epoch_o(epoch_w)
     );
 
@@ -2472,7 +2478,7 @@ module backend_top #(
                 for (si2 = 0; si2 < CKPT_N; si2 = si2 + 1) begin
                     if (ck_busy_q[si2] &&
                         ((ck_rob_q[si2] - rob_head_w[ROBW-1:0]) >=
-                         (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0]))) begin
+                         squash_age_w)) begin
                         ck_pend_q[si2] <= 1'b1;
                         ck_busy_q[si2] <= 1'b0;
                     end

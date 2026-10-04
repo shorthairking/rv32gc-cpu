@@ -131,6 +131,13 @@ module rob #(
     //==================================================================
     output wire [ROB_IDX_W-1:0]    head_o,
     output wire [ROB_IDX_W:0]      cnt_o,
+    //   ★★ C8：**统一年龄输出**（"距 ROB 头距离"的全核唯一计算点）——
+    //     `squash_age_o = (squash_idx − head_q) mod ROB_N`
+    //     全核所有"更年轻 ⇔ age(项) > age(冲刷点)"判据一律改用它：`iq.v` ×6
+    //     （冲刷作废掩码）、`backend_top.v` 的 MDU/FPU/I2 杀链与 CSR 追踪表、
+    //     以及本模块 §5 的 `cnt_q` 重建。**语义与各站点的本地重算逐位一致**
+    //     （两侧都是 ROB_IDX_W 位的模 ROB_N 减法，见 §1.1）。
+    output wire [ROB_IDX_W-1:0]    squash_age_o,
     output wire                    empty_o,
     output wire                    head_done_o,
     output wire [3:0]              head_exc_o,
@@ -280,6 +287,22 @@ module rob #(
     endfunction
 
     wire [ROB_IDX_W-1:0] tail_w = idx_add(head_q, cnt_q);
+
+    //==========================================================================
+    // 1.1 ★★ C8：年龄（"距头距离"）的唯一计算点
+    //==========================================================================
+    //   口径（与 `iq.v` §2/§5、`backend_top.v` 的杀链**逐位一致**，勿改宽度）：
+    //     · ROB_N = 2^ROB_IDX_W ⇒ `ROB_IDX_W` 位无符号减法**天然取模**：
+    //       `squash_idx - head_q` 在 ROB_IDX_W 位上下文里就是 `(squash_idx − head_q) mod ROB_N`
+    //       （与 `idx_add()` 的"截断即取模"同一口径）；
+    //     · 消费侧一律**零扩展**到 `rob_cnt` 的位宽（ROB_IDX_W+1）再比较 ——
+    //       `rob_cnt = ROB_N` 时在 ROB_IDX_W 位里表示为 0，窄位比较会把"满窗口"
+    //       误判成"空窗口"（`iq.v` §5 有实测注释）。
+    //   ★ 本线是"更年轻 ⇔ age(项) > age(冲刷点)"这套模 N 语义在全核的**唯一实现**；
+    //     各消费模块不再各自重算 `squash_idx − rob_head`（原 9 份：rob 1 + iq 6 +
+    //     backend_top 1 + lsq 1）。
+    wire [ROB_IDX_W-1:0] age_sq_w = squash_idx - head_q;
+    assign squash_age_o = age_sq_w;
 
     //==========================================================================
     // 1.5 ★ B2/B3：BRAM 写/读轮转 + 头部窗口
@@ -577,7 +600,8 @@ module rob #(
             end else if (squash_valid) begin
                 epoch_q <= epoch_q + 1'b1;
                 // 保留 [head, squash_idx]（含分支自身）
-                cnt_q <= {1'b0, (squash_idx - head_q)} + {{ROB_IDX_W{1'b0}}, 1'b1};
+                //   ★ C8：改用 §1.1 的唯一年龄计算点（原为就地重算 `squash_idx - head_q`）
+                cnt_q <= {1'b0, age_sq_w} + {{ROB_IDX_W{1'b0}}, 1'b1};
             end else begin
                 head_q <= idx_add(head_q, cmt_n_w);
                 cnt_q  <= cnt_q - {5'b0, cmt_n_w}
