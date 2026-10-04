@@ -168,8 +168,11 @@ module rob #(
     //     · 本步将 rob.v **自用的关键读**（done/exc/is_store/ckpt/is_branch/trap_cause/epoch）
     //       全部改走 `nq`（行为逐位等价），并导出 `cmt_narrow` 供下一步改造 backend_top。
     //     字段布局（MSB→LSB）：
-    //       lq[3:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
+    //       pre{mret,sret,maint_kind[2:0]} trtaken pdf[5:0] pdi[6:0] arn[4:0]
     //       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
+    //     ★★ D2：原 `lq[3:0] stq[4:0] csrop[2:0]`（12 bit）在 `nq` 里**只写不读**（唯一"读"
+    //       是 §5 自检对 nq/nq_chk 的恒等区间比对）⇒ 已删，`NQ_W` 49→37；
+    //       布局真源 = back2_params.vh §2，本文件不得另存一份位号。
     localparam integer NQ_W      = `BACK2_NQ_W;
     localparam integer NQ_DONE   = `BACK2_NQ_DONE;
     localparam integer NQ_EP_L   = `BACK2_NQ_EP_L;
@@ -183,10 +186,7 @@ module rob #(
     localparam integer NQ_ARN_L  = `BACK2_NQ_ARN_L;
     localparam integer NQ_PDI_L  = `BACK2_NQ_PDI_L;
     localparam integer NQ_PDF_L  = `BACK2_NQ_PDF_L;
-    localparam integer NQ_CSROP_L= `BACK2_NQ_CSROP_L;
     localparam integer NQ_TRT    = `BACK2_NQ_TRT;
-    localparam integer NQ_STQ_L  = `BACK2_NQ_STQ_L;
-    localparam integer NQ_LQ_L   = `BACK2_NQ_LQ_L;
     localparam integer NQ_MK_L   = `BACK2_NQ_MK_L;
     reg  [NQ_W-1:0]      nq    [0:ROB_N-1];
     //   ★★ EXP-B（架构 v0.1 §16–§19）：**三张 typed 单写源更新表**（替代原 102 bit `updq`）
@@ -248,14 +248,13 @@ module rob #(
     //   ★★ C4：本函数从载荷取的每个字段都必须用 **`BACK2_RB_*`（载荷布局）** 宏 ——
     //     旧版直接借用 `BACK2_U_*`（uop 布局）只是因为旧载荷的低 304 位恰好就是 uop；
     //     载荷重排后两者不再重合（唯一仍然重合的是 [19:0] 的 EXC+FLAGS 块，见参数表）。
+    //   ★★ D2：删除 `lq[3:0]/stq[4:0]/csrop[2:0]` 三段（只写不读）；其余字段与
+    //     `BACK2_NQ_*` 位号一一对应（位号真源在 back2_params.vh）。
     function [NQ_W-1:0] pack_nq;
         input [RB_W-1:0] p; input [`BACK2_EPOCH_W-1:0] ep; input dn; input [4:0] pre;
         begin
-            pack_nq = { pre,                                           // [48:44] {mret,sret,maint_kind}
-                        p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB],          // [43:40]（2B-5 L5：LQ 16 ⇒ 4 bit）
-                        p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB],        // [39:35]
-                        p[`BACK2_RB_TRTAKEN],                          // [34]
-                        p[`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB],    // [33:31]
+            pack_nq = { pre,                                           // [36:32] {mret,sret,maint_kind}
+                        p[`BACK2_RB_TRTAKEN],                          // [31]
                         p[`BACK2_RB_PDFDST_MSB:`BACK2_RB_PDFDST_LSB],  // [30:25]
                         p[`BACK2_RB_PDIDST_MSB:`BACK2_RB_PDIDST_LSB],  // [24:18]
                         p[`BACK2_RB_ARND_MSB:`BACK2_RB_ARND_LSB],      // [17:13]

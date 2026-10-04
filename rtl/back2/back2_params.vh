@@ -477,15 +477,18 @@
 //     （原独立的 `rep_q[]` 数组已无任何读写 ⇒ EXP-B 一并删除。）
 `define BACK2_RB_W           229        // ★ C4：416→229（XPM 位宽 229 ⇒ 3 RAMB36/bank）
 //   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
-//     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）：
-//       lq[3:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]
-//       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
-//       ── ② 新增： maint_kind[2:0] is_sret is_mret
-//   ★ 2B-5 L5：`lq` 字段随 LQ 索引 5→4 bit 收窄 1 bit。`lq` 位于 `stq` **之上** ⇒ 其下
-//     所有字段（stq/trtaken/csrop/pdf/pdi/arn/…/done）绝对位位置**逐位不变**；只有
-//     `lq` 之上的 `pre`（maint_kind/sret/mret）与 NQ_W 各下移 1：MK 45→44、SRET 48→47、
-//     MRET 49→48、**NQ_W 50→49**。（`lq` 自身 LSB 恒 40，字段区间 [43:40]。）
-`define BACK2_NQ_W           49
+//     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）。
+//     MSB→LSB： pre{mret, sret, maint_kind[2:0]} | trtaken | pdf[5:0] | pdi[6:0] | arn[4:0] |
+//              is_csr | is_fp_wen | is_int_wen | ckpt_valid | is_branch | is_store |
+//              exc[3:0] | epoch[1:0] | done
+//   ★★ D2（nq 死字段裁剪，2B-5）：删除 `lq[3:0]` / `stq[4:0]` / `csrop[2:0]` 共 12 bit ——
+//     三者在 `nq` 里**只被 `pack_nq` 写、全仓库无任何功能读点**（原自检的区间比较只做
+//     "nq vs 重新 pack 的 nq" 恒等比对，不构成语义读点）。载荷侧三者各有归属、**未动**：
+//     `stq` 仍供提交侧 `p_stq()→lsu_dr_idx`、`csrop` 仍供 `csr_pay`（rob.v §4）、
+//     `lq` 在载荷侧亦无功能读点（登记为后续 C4 载荷裁剪候选，见 D2 报告）。
+//     裁剪后 `nq` 49→37 bit：`trtaken` 34→31，其上的 `pre` 整段下移 12（MK 44→32、
+//     SRET 47→35、MRET 48→36）；`pdf` 及其以下所有字段绝对位位置**逐位不变**。
+`define BACK2_NQ_W           37
 `define BACK2_NQ_DONE        0
 `define BACK2_NQ_EP_L        1
 `define BACK2_NQ_EXC_L       3
@@ -498,13 +501,10 @@
 `define BACK2_NQ_ARN_L       13
 `define BACK2_NQ_PDI_L       18
 `define BACK2_NQ_PDF_L       25
-`define BACK2_NQ_CSROP_L     31
-`define BACK2_NQ_TRT         34
-`define BACK2_NQ_STQ_L       35
-`define BACK2_NQ_LQ_L        40        // lq 字段 LSB（2B-5 L5：区间 [43:40]，4 bit）
-`define BACK2_NQ_MK_L        44        // [46:44] maint_kind[2:0]
-`define BACK2_NQ_SRET        47
-`define BACK2_NQ_MRET        48
+`define BACK2_NQ_TRT         31
+`define BACK2_NQ_MK_L        32        // [34:32] maint_kind[2:0]
+`define BACK2_NQ_SRET        35
+`define BACK2_NQ_MRET        36
 //   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
 //     ★★ EXP-B：其中 `csrw` 段（rob 侧）改由**载荷 uop.PS1I** 直接给出（原为 updq.CSRW 的
 //        低 7 位）；`tval` 段改由载荷 `BACK2_RB_TVAL`（= 原始指令位）给出 ⇒ 字段布局与宽度不变。
