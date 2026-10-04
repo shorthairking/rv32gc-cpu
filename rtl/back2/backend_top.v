@@ -2153,12 +2153,29 @@ module backend_top #(
     //==========================================================================
     // 12. 提交训练 / 检查点释放 / RAS（前端衔接）
     //==========================================================================
-    // ---- 12.1 训练 FIFO（深度 32；提交侧 ≤4/拍入队，前端 1 条/拍出队）----
-    localparam integer TRQ_D = 32;
+    // ---- 12.1 训练 FIFO（深度 16；提交侧 ≤4/拍入队，前端 1 条/拍出队）----
+    //   ★ 2B-5 C7（面积杠杆）：深度 32→16（107 bit × 16 项，减半）。训练是 **best-effort**：
+    //     `trq_full` 只 gate 入队（丢弃本拍训练条目），**不反压提交**——它不参与
+    //     `cmt_ok`/派发门控（消费方只有本段训练 FIFO 入队的两处 `if`）⇒ 深度减半只降低
+    //     "在飞训练条数上限"，不改训练语义/预测器接口/4 宽提交。
+    //   ★ 位宽口径（按原设计"指针 = 2×深度"成比例收窄 ⇒ 行为同型、不改训练语义）：
+    //       原：TRQ_D=32 ⇒ 指针 6 bit（mod 64）、cnt 7 bit（0..32）
+    //       本段：TRQ_D=16 ⇒ 指针 **5 bit**（mod 32）、cnt **5 bit**（0..16；满判据保持原式
+    //             `cnt > TRQ_D-4` ⇒ 13 项起判满，单拍最多 +4 ⇒ 12+4=16 恰在界内，不溢出）
+    //   ⚠ 已知边界（**沿用原设计同型行为，本段有意不改变**；另登记为后续任务）：指针宽度
+    //     > log2(深度) ⇒ 指针 ≥ 深度 时 `trq[...]` 下标越界；iverilog 语义 = **读回 x、
+    //     写被丢弃**（实测 `reg [106:0] trq[0:15]` 以 5'd16 索引 → x）。原 32 深设计（6 bit
+    //     指针）同样如此（≥32 越界）。**实测反证**：把它改成"指针 = 4 bit 的真循环缓冲"后，
+    //     `tb_core_top_2b` 程序 13（p17_fld_fsd）在第 16 条提交后 PC 跳 0 挂死（200k 拍不前进）
+    //     —— 越界 x 读恰好**掩盖**了下面两处既有记账缺陷，故本段严格保持 5 bit 指针口径。
+    //   ⚠ 另注（既有缺陷，本段未修、已登记）：① `trq_cnt` 在同一 always 块被写两次，同拍
+    //     "出队 + 入队"时后一次赋值覆盖前一次 ⇒ cnt 每拍多计 1（虚高）；② `trq_acc` 仅 2 bit
+    //     而 `COMMIT_W = 4` ⇒ 4 lane 全中时 acc 回绕为 0（4 条已写入却不记账）。
+    localparam integer TRQ_D = 16;
     reg [106:0] trq [0:TRQ_D-1];
-    reg [5:0]   trq_w, trq_r;
-    reg [6:0]   trq_cnt;
-    wire        trq_full = (trq_cnt > (TRQ_D-4));
+    reg [4:0]   trq_w, trq_r;
+    reg [4:0]   trq_cnt;
+    wire        trq_full = (trq_cnt > (TRQ_D-4));    // 保持原式 ⇒ 阈值 12（13 项起判满）
     reg  [3:0]  trq_ok;
     reg  [1:0]  trq_ord [0:3];
     reg  [1:0]  trq_acc;
@@ -2278,7 +2295,7 @@ module backend_top #(
             cnt_sq_q  <= 32'h0; cnt_cmt4_q <= 32'h0; cnt_iss_q <= 32'h0;
             ck_busy_q <= {CKPT_N{1'b0}};
             ck_pend_q <= {CKPT_N{1'b0}};
-            trq_w <= 6'd0; trq_r <= 6'd0; trq_cnt <= 7'd0;
+            trq_w <= 5'd0; trq_r <= 5'd0; trq_cnt <= 5'd0;    // ★ C7：TRQ_D=16 ⇒ 指针 5 bit / cnt 5 bit
             mdu_if_rob <= 7'd0; mdu_if_ep <= {EW{1'b0}}; mdu_if_di <= 1'b0;
             mdu_if_pdi <= {PW_I{1'b0}};
             fpu_if_rob <= 7'd0; fpu_if_ep <= {EW{1'b0}}; fpu_if_di <= 1'b0;
@@ -2368,13 +2385,13 @@ module backend_top #(
 
             // ---- 训练 FIFO ----
             if (train_valid_o) begin
-                trq_r   <= trq_r + 6'd1;
-                trq_cnt <= trq_cnt - 7'd1;
+                trq_r   <= trq_r + 5'd1;
+                trq_cnt <= trq_cnt - 5'd1;
             end
             if (disp_fire_w | cmt_ok) begin
                 for (si2 = 0; si2 < COMMIT_W; si2 = si2 + 1) begin
                     if (trq_ok[si2] && !trq_full) begin
-                        trq[trq_w + {4'b0, trq_ord[si2]}] <= {
+                        trq[trq_w + {3'b0, trq_ord[si2]}] <= {
                             tcp_cond[si2], tcp_tk[si2], tcp_ind[si2], tcp_call[si2],
                             tcp_ret[si2], tcp_tgt[si2],
                             tcp_ptk[si2], tcp_psg[si2], tcp_pgd[si2], tcp_pld[si2],
@@ -2383,8 +2400,8 @@ module backend_top #(
                     end
                 end
                 if (!trq_full) begin
-                    trq_w   <= trq_w + {4'b0, trq_acc};
-                    trq_cnt <= trq_cnt + {5'b0, trq_acc};
+                    trq_w   <= trq_w + {3'b0, trq_acc};
+                    trq_cnt <= trq_cnt + {3'b0, trq_acc};
                 end
             end
 
