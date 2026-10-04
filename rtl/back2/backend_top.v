@@ -227,7 +227,7 @@ module backend_top #(
     localparam       LDW   = `BACK2_LQ_IDX_W;   // LQ 索引位宽
     //   ★★ C1（IQ 载荷瘦身）：IQ 窄载荷宽度 与 发射宽载荷（回读）宽度
     localparam       IQNW  = `BACK2_IQN_W;      // IQ 窄载荷（唤醒+门控）
-    localparam       IWW   = `BACK2_IW_W;       // 发射宽载荷 = uop[279:0]（见 back2_params §2.5）
+    localparam       IWW   = `BACK2_IW_W;       // ★ C9：发射宽载荷 = 215 bit 紧凑布局（back2_params §2.5）
     localparam WBP_ALU0 = 0, WBP_ALU1 = 1, WBP_BRU = 2, WBP_MDU = 3,
                WBP_LSU  = 4, WBP_FPU  = 5, WBP_STD = 6;
 
@@ -271,30 +271,101 @@ module backend_top #(
     function [PW_F-1:0] u_ps2f; input [UOPW-1:0] u; begin u_ps2f = u[`BACK2_U_PS2F_MSB:`BACK2_U_PS2F_LSB]; end endfunction
     function [PW_F-1:0] u_ps3f; input [UOPW-1:0] u; begin u_ps3f = u[`BACK2_U_PS3F_MSB:`BACK2_U_PS3F_LSB]; end endfunction
     // ROB 载荷取字段（纯函数）
-    function [31:0] p_pc;    input [RB_W-1:0] p; begin p_pc  = p[`BACK2_U_PC_MSB:`BACK2_U_PC_LSB]; end endfunction
-    function [4:0]  p_arn;   input [RB_W-1:0] p; begin p_arn = p[`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB]; end endfunction
-    function [PW_I-1:0] p_pdi;  input [RB_W-1:0] p; begin p_pdi  = p[`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB]; end endfunction
-    function [PW_I-1:0] p_pdio; input [RB_W-1:0] p; begin p_pdio = p[`BACK2_U_PDIOLD_MSB:`BACK2_U_PDIOLD_LSB]; end endfunction
-    function [PW_F-1:0] p_pdf;  input [RB_W-1:0] p; begin p_pdf  = p[`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB]; end endfunction
-    function [PW_F-1:0] p_pdfo; input [RB_W-1:0] p; begin p_pdfo = p[`BACK2_U_PDFOLD_MSB:`BACK2_U_PDFOLD_LSB]; end endfunction
+    //   ★★ C4：**一律改用 `BACK2_RB_*`（载荷布局）宏** —— 旧版借用 `BACK2_U_*`（uop 布局）
+    //     只是因为旧载荷的低 304 位恰好等于 uop；载荷重排后两者不再重合。唯一仍重合的是
+    //     [19:0] 的 EXC+FLAGS 块（硬约束，见 back2_params §2）⇒ 该块仍用 `BACK2_UB_*`。
+    //   ⚠ 这些函数被 `sim/unit/tb_back2_lockstep.sv` 按层次名调用（p_pc/p_pdi/p_pdio/p_di/
+    //     p_cls/p_st/p_csr）⇒ **名字与签名不得改**，只改函数体里的位域宏。
+    function [31:0] p_pc;    input [RB_W-1:0] p; begin p_pc  = p[`BACK2_RB_PC_MSB:`BACK2_RB_PC_LSB]; end endfunction
+    function [4:0]  p_arn;   input [RB_W-1:0] p; begin p_arn = p[`BACK2_RB_ARND_MSB:`BACK2_RB_ARND_LSB]; end endfunction
+    function [PW_I-1:0] p_pdi;  input [RB_W-1:0] p; begin p_pdi  = p[`BACK2_RB_PDIDST_MSB:`BACK2_RB_PDIDST_LSB]; end endfunction
+    function [PW_I-1:0] p_pdio; input [RB_W-1:0] p; begin p_pdio = p[`BACK2_RB_PDIOLD_MSB:`BACK2_RB_PDIOLD_LSB]; end endfunction
+    function [PW_F-1:0] p_pdf;  input [RB_W-1:0] p; begin p_pdf  = p[`BACK2_RB_PDFDST_MSB:`BACK2_RB_PDFDST_LSB]; end endfunction
+    function [PW_F-1:0] p_pdfo; input [RB_W-1:0] p; begin p_pdfo = p[`BACK2_RB_PDFOLD_MSB:`BACK2_RB_PDFOLD_LSB]; end endfunction
     function p_di;  input [RB_W-1:0] p; begin p_di = p[`BACK2_UB_RD_I_WEN]; end endfunction
     function p_df;  input [RB_W-1:0] p; begin p_df = p[`BACK2_UB_RD_F_WEN]; end endfunction
     function p_st;  input [RB_W-1:0] p; begin p_st = p[`BACK2_UB_IS_STORE]; end endfunction
     function p_csr; input [RB_W-1:0] p; begin p_csr = p[`BACK2_UB_IS_CSR]; end endfunction
     function p_ckv; input [RB_W-1:0] p; begin p_ckv = p[`BACK2_UB_CKPT_VALID]; end endfunction
-    function [3:0] p_ckid; input [RB_W-1:0] p; begin p_ckid = p[`BACK2_U_CKPT_MSB:`BACK2_U_CKPT_LSB]; end endfunction
-    function [2:0] p_cls;  input [RB_W-1:0] p; begin p_cls  = p[`BACK2_U_CLS_MSB:`BACK2_U_CLS_LSB]; end endfunction
+    function [3:0] p_ckid; input [RB_W-1:0] p; begin p_ckid = p[`BACK2_RB_CKPT_MSB:`BACK2_RB_CKPT_LSB]; end endfunction
+    function [2:0] p_cls;  input [RB_W-1:0] p; begin p_cls  = p[`BACK2_RB_CLS_MSB:`BACK2_RB_CLS_LSB]; end endfunction
     function [`BACK2_STQ_IDX_W-1:0] p_stq; input [RB_W-1:0] p; begin p_stq = p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB]; end endfunction
     function [`BACK2_LQ_IDX_W-1:0]  p_lq;  input [RB_W-1:0] p; begin p_lq  = p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB];  end endfunction
-    function [31:0] p_csrw;input [RB_W-1:0] p; begin p_csrw = p[`BACK2_RB_CSRW_MSB:`BACK2_RB_CSRW_LSB]; end endfunction
-    function [11:0] p_csra;input [RB_W-1:0] p; begin p_csra = p[`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB]; end endfunction
-    function [2:0]  p_csrop;input [RB_W-1:0] p;begin p_csrop= p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB]; end endfunction
+    function [11:0] p_csra;input [RB_W-1:0] p; begin p_csra = p[`BACK2_RB_CSRADDR_MSB:`BACK2_RB_CSRADDR_LSB]; end endfunction
+    function [2:0]  p_csrop;input [RB_W-1:0] p;begin p_csrop= p[`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB]; end endfunction
     //   ★ 2B-4 第 4a 段：载荷里的**原始指令位**（`decoder.tval_o = insn_i`，norvc）
     //     —— xRET 识别与 CSR 立即数形式都靠它
-    function [31:0] p_tval;  input [RB_W-1:0] p;begin p_tval = p[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB]; end endfunction
+    function [31:0] p_tval;  input [RB_W-1:0] p;begin p_tval = p[`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB]; end endfunction
     function [4:0]  p_ff;  input [RB_W-1:0] p; begin p_ff  = p[`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB]; end endfunction
     function [31:0] p_trtgt;input [RB_W-1:0] p;begin p_trtgt=p[`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB]; end endfunction
     function p_trtk;       input [RB_W-1:0] p; begin p_trtk = p[`BACK2_RB_TRTAKEN]; end endfunction
+    //   ★★ C9：发射宽载荷取字段（纯函数；`x_i2_uop` = `u_iwmem` 同步读回的 **215 bit 紧凑
+    //     布局**，见 back2_params.vh §2.5）。这些 `w_*` 函数只用于 E1 及其后的发射路径；
+    //     D1/D2/D3 仍用 `u_*`（uop 304 bit 布局，`iq.v`/`rename.v` 的契约不变）。
+    function [31:0] w_pc;    input [IWW-1:0] w; begin w_pc  = w[`BACK2_IW_PC_MSB:`BACK2_IW_PC_LSB]; end endfunction
+    function [31:0] w_imm;   input [IWW-1:0] w; begin w_imm = w[`BACK2_IW_IMM_MSB:`BACK2_IW_IMM_LSB]; end endfunction
+    function [31:0] w_predtgt;input [IWW-1:0] w;begin w_predtgt = w[`BACK2_IW_PREDTGT_MSB:`BACK2_IW_PREDTGT_LSB]; end endfunction
+    function [2:0]  w_cls;   input [IWW-1:0] w; begin w_cls = w[`BACK2_IW_CLS_MSB:`BACK2_IW_CLS_LSB]; end endfunction
+    function [3:0]  w_opt;   input [IWW-1:0] w; begin w_opt = w[`BACK2_IW_OPTYPE_MSB:`BACK2_IW_OPTYPE_LSB]; end endfunction
+    function [2:0]  w_wbsel; input [IWW-1:0] w; begin w_wbsel = w[`BACK2_IW_WBSEL_MSB:`BACK2_IW_WBSEL_LSB]; end endfunction
+    function [11:0] w_csra;  input [IWW-1:0] w; begin w_csra = w[`BACK2_IW_CSRADDR_MSB:`BACK2_IW_CSRADDR_LSB]; end endfunction
+    function [6:0]  w_fpop;  input [IWW-1:0] w; begin w_fpop = w[`BACK2_IW_FPOP_MSB:`BACK2_IW_FPOP_LSB]; end endfunction
+    function [1:0]  w_fmt;   input [IWW-1:0] w; begin w_fmt  = w[`BACK2_IW_FMT_MSB:`BACK2_IW_FMT_LSB]; end endfunction
+    function [2:0]  w_rm;    input [IWW-1:0] w; begin w_rm   = w[`BACK2_IW_RM_MSB:`BACK2_IW_RM_LSB]; end endfunction
+    function [2:0]  w_msize; input [IWW-1:0] w; begin w_msize= w[`BACK2_IW_MSIZE_MSB:`BACK2_IW_MSIZE_LSB]; end endfunction
+    function [4:0]  w_brop;  input [IWW-1:0] w; begin w_brop = w[`BACK2_IW_BROP_MSB:`BACK2_IW_BROP_LSB]; end endfunction
+    function [3:0]  w_aluop; input [IWW-1:0] w; begin w_aluop= w[`BACK2_IW_ALUOP_MSB:`BACK2_IW_ALUOP_LSB]; end endfunction
+    function w_il32;         input [IWW-1:0] w; begin w_il32 = w[`BACK2_IW_IL32]; end endfunction
+    function w_rt;           input [IWW-1:0] w; begin w_rt   = w[`BACK2_IW_RTYPE]; end endfunction
+    function w_au;           input [IWW-1:0] w; begin w_au   = w[`BACK2_IW_AUIPC]; end endfunction
+    function w_pred_tk;      input [IWW-1:0] w; begin w_pred_tk = w[`BACK2_IW_PRED_TAKEN]; end endfunction
+    function w_munsign;      input [IWW-1:0] w; begin w_munsign = w[`BACK2_IW_MUNSIGN]; end endfunction
+    function w_is_csr;       input [IWW-1:0] w; begin w_is_csr = w[`BACK2_UB_IS_CSR]; end endfunction
+    function w_is_br;        input [IWW-1:0] w; begin w_is_br = w[`BACK2_UB_IS_BRANCH]; end endfunction
+    function w_is_st;        input [IWW-1:0] w; begin w_is_st = w[`BACK2_UB_IS_STORE]; end endfunction
+    function w_di;           input [IWW-1:0] w; begin w_di = w[`BACK2_UB_RD_I_WEN]; end endfunction
+    function w_df;           input [IWW-1:0] w; begin w_df = w[`BACK2_UB_RD_F_WEN]; end endfunction
+    function w_fpls;         input [IWW-1:0] w; begin w_fpls = w[`BACK2_UB_IS_FPLS]; end endfunction
+    function w_s1i;          input [IWW-1:0] w; begin w_s1i = w[`BACK2_UB_S1_I_USE]; end endfunction
+    function w_s1f;          input [IWW-1:0] w; begin w_s1f = w[`BACK2_UB_S1_F_USE]; end endfunction
+    function w_ckv;          input [IWW-1:0] w; begin w_ckv = w[`BACK2_UB_CKPT_VALID]; end endfunction
+    function [3:0]  w_ckid;  input [IWW-1:0] w; begin w_ckid = w[`BACK2_IW_CKPT_MSB:`BACK2_IW_CKPT_LSB]; end endfunction
+    function [PW_I-1:0] w_pdi;  input [IWW-1:0] w; begin w_pdi  = w[`BACK2_IW_PDI_MSB:`BACK2_IW_PDI_LSB]; end endfunction
+    function [PW_F-1:0] w_pdf;  input [IWW-1:0] w; begin w_pdf  = w[`BACK2_IW_PDF_MSB:`BACK2_IW_PDF_LSB]; end endfunction
+    function [PW_I-1:0] w_ps1i; input [IWW-1:0] w; begin w_ps1i = w[`BACK2_IW_PS1I_MSB:`BACK2_IW_PS1I_LSB]; end endfunction
+    function [PW_I-1:0] w_ps2i; input [IWW-1:0] w; begin w_ps2i = w[`BACK2_IW_PS2I_MSB:`BACK2_IW_PS2I_LSB]; end endfunction
+    function [PW_F-1:0] w_ps1f; input [IWW-1:0] w; begin w_ps1f = w[`BACK2_IW_PS1F_MSB:`BACK2_IW_PS1F_LSB]; end endfunction
+    function [PW_F-1:0] w_ps2f; input [IWW-1:0] w; begin w_ps2f = w[`BACK2_IW_PS2F_MSB:`BACK2_IW_PS2F_LSB]; end endfunction
+    function [PW_F-1:0] w_ps3f; input [IWW-1:0] w; begin w_ps3f = w[`BACK2_IW_PS3F_MSB:`BACK2_IW_PS3F_LSB]; end endfunction
+    //   打包：uop(304) → 发射宽载荷(215)（D3 派发写口用；与上面的 w_* 逐位互逆）
+    function [IWW-1:0] pack_iw; input [UOPW-1:0] u;
+        begin
+            pack_iw = { u[`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB],
+                        u[`BACK2_U_IMM_MSB:`BACK2_U_IMM_LSB],
+                        u[`BACK2_U_PC_MSB:`BACK2_U_PC_LSB],
+                        u[`BACK2_U_PS3F_MSB:`BACK2_U_PS3F_LSB],
+                        u[`BACK2_U_PS2F_MSB:`BACK2_U_PS2F_LSB],
+                        u[`BACK2_U_PS1F_MSB:`BACK2_U_PS1F_LSB],
+                        u[`BACK2_U_PS2I_MSB:`BACK2_U_PS2I_LSB],
+                        u[`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB],
+                        u[`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],
+                        u[`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],
+                        u[`BACK2_U_PRED_MSB],
+                        u[`BACK2_UAX_AUIPC], u[`BACK2_UAX_RTYPE], u[`BACK2_UAX_IL32],
+                        u[`BACK2_UAX_FMT_MSB:`BACK2_UAX_FMT_LSB],
+                        u[`BACK2_U_BROP_MSB:`BACK2_U_BROP_LSB],
+                        u[`BACK2_U_OPTYPE_MSB:`BACK2_U_OPTYPE_LSB],
+                        u[`BACK2_U_ALUOP_MSB:`BACK2_U_ALUOP_LSB],
+                        u[`BACK2_U_WBSEL_MSB:`BACK2_U_WBSEL_LSB],
+                        u[`BACK2_U_MUNSIGN], u[`BACK2_U_MSIZE_MSB:`BACK2_U_MSIZE_LSB],
+                        u[`BACK2_U_RM_MSB:`BACK2_U_RM_LSB], u[`BACK2_U_FPOP_MSB:`BACK2_U_FPOP_LSB],
+                        u[`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB],
+                        u[`BACK2_U_CLS_MSB:`BACK2_U_CLS_LSB],
+                        u[`BACK2_U_CKPT_MSB:`BACK2_U_CKPT_LSB],
+                        u[`BACK2_U_FLAGS_MSB:`BACK2_U_FLAGS_LSB],
+                        u[`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB] };
+        end
+    endfunction
 
     // 分支类别（front4 README §1 的 lane_cls 编码）
     function t_call; input [2:0] c; begin t_call = (c == 3'd5) | (c == 3'd6); end endfunction
@@ -508,7 +579,9 @@ module backend_top #(
     //   ★★ C1：`x_i2_uop` 由**寄存器**改为**组合线**（源 = `u_iwmem` 的同步读输出 +
     //     4:1 交叉开关）—— BRAM 输出寄存器恰好承担了原 `x_i2_uop` 的"发射拍→执行拍"
     //     寄存作用 ⇒ **发射→执行仍是 1 拍**（无新增级数，见 §5.5/§6）。
-    wire [UOPW-1:0] x_i2_uop [0:5];
+    //   ★★ C9：`x_i2_uop` 现在是 **IWW(215) 位紧凑发射载荷**（不再是 uop 的切片）⇒ 读取
+    //     一律走 `w_*` 访问函数（见 §0）；`u_*` 只用于 D1/D2/D3 的 uop(304)。
+    wire [IWW-1:0] x_i2_uop [0:5];
     reg  [6:0]      x_i2_rob [0:5];
     reg  [EW-1:0]   x_i2_ep  [0:5];
     reg             x_i2_v   [0:5];
@@ -1016,21 +1089,41 @@ module backend_top #(
     end
 
     // ---- ROB 载荷组装 ----
+    //   ★★ C4：按 `back2_params.vh` §2 的**新位域表**逐字段拼接（MSB→LSB，无空洞）。
+    //     与旧版的差别只有「删掉谁都不读的位」：uop 全量副本（IMM/ARND/源物理号/控制码/
+    //     uop.TVAL/架构源号）与 CSRW 段不再进载荷；其余字段（PC/PREDTGT/PRED/BTB/CLS/CKPT/
+    //     PDIOLD/PDFOLD/TVAL/PS1I/CSRADDR/CSROP/STQ/LQ）逐位保留、语义不变。
+    //   ⚠ 拼接顺序必须与参数表的 MSB→LSB 一致；改一处必须两处同步（唯一真源纪律）。
+    //   ⚠⚠ 每个 lane 的**源切片**用 `BACK2_U_*`（uop 布局，因为源是 `lane_uop_fin`），
+    //      而注释里的 `[a:b]` 是**目标位置**（`BACK2_RB_*`）—— 两者**不可混用**：
+    //      初版误用 RB_* 去切 uop（如 PDIOLD 切到 [55:49]）⇒ 提交释放的旧物理号全错
+    //      ⇒ 实测 tb_core_top_2b 出现大量 `RENAME-CHK DUP/自环`。
     genvar g5;
     generate
     for (g5 = 0; g5 < DISP_W; g5 = g5 + 1) begin : g_rb
         assign rob_pay_w[g5*RB_W +: RB_W] = {
-            //   ★ 2B-4：顶端 [415:411] 放 LQ 索引（与 STQ 字段同理：加在最顶端不影响
-            //     其下任何字段的绝对位置；RB_W 仍 416）
-            //   ★ 2B-5 L5：LQ 16 ⇒ 索引 [414:411]（4 bit），[415] 保留；其下字段不变。
-            ld_alloc_idx[g5*LDW +: LDW],                   // LQ 索引
-            st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],   // STQ 索引
-            5'b0,                                          // fflags
-            1'b0,                                          // tr_taken（执行期回写）
-            32'h0,                                         // tr 实际目标（执行期回写）
-            d1_uop_q[g5][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],   // 异常 tval
-            {25'b0, u_ps1i(lane_uop_fin[g5])},             // ★ B29：改为携带该 lane 的 PS1I（提交级 CSR 源解析用）
-            lane_uop_fin[g5]                               // uop
+            lane_uop_fin[g5][`BACK2_U_BTB_MSB:`BACK2_U_BTB_LSB],           // → [228:227] BTB
+            lane_uop_fin[g5][`BACK2_U_PRED_MSB:`BACK2_U_PRED_LSB],         // → [226:223] PRED
+            lane_uop_fin[g5][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB],             // → [222:191] PC
+            lane_uop_fin[g5][`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB],   // → [190:159] PREDTGT
+            5'b0,                                                          // [158:154] fflags（占位）
+            1'b0,                                                          // [153]     trtaken（占位）
+            32'h0,                                                         // [152:121] tr 目标（占位）
+            d1_uop_q[g5][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],             // [120:89]  异常 tval
+            ld_alloc_idx[g5*LDW +: LDW],                                   // [88:85]   LQ 索引
+            st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],         // [84:80]   STQ 索引
+            lane_uop_fin[g5][`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],   // → [79:74]   浮点新映射
+            lane_uop_fin[g5][`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB],       // → [73:69]   目的架构号
+            lane_uop_fin[g5][`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],   // → [68:62]   整数新映射
+            lane_uop_fin[g5][`BACK2_U_PDFOLD_MSB:`BACK2_U_PDFOLD_LSB],   // → [61:56]   浮点旧映射
+            lane_uop_fin[g5][`BACK2_U_PDIOLD_MSB:`BACK2_U_PDIOLD_LSB],   // → [55:49]   整数旧映射
+            lane_uop_fin[g5][`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB],       // → [48:42]   源 1 物理号
+            lane_uop_fin[g5][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB], // → [41:30]   CSR 地址
+            lane_uop_fin[g5][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB],     // → [29:27]   CSR 操作
+            lane_uop_fin[g5][`BACK2_U_CLS_MSB:`BACK2_U_CLS_LSB],         // → [26:24]   分支类别
+            lane_uop_fin[g5][`BACK2_U_CKPT_MSB:`BACK2_U_CKPT_LSB],       // → [23:20]   检查点 id
+            lane_uop_fin[g5][`BACK2_U_FLAGS_MSB:`BACK2_U_FLAGS_LSB],     // → [19:4]    FLAGS 整块
+            lane_uop_fin[g5][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB]          // → [3:0]     异常码
         };
     end
     endgenerate
@@ -1254,17 +1347,18 @@ module backend_top #(
     // 【为什么"不增加发射级数"】同步读 1 拍：第 T 拍 IQ 选出 rob 索引 ⇒ 发起读；第 T+1 拍
     //   BRAM 的输出寄存器给出的宽载荷**直接**作为 E1 的 `x_i2_uop`（与改前的 `x_i2_uop`
     //   触发器完全同拍）⇒ **发射→执行仍是 1 拍**（IPC 不因本改动结构性下降）。
-    //   硬成本 = +16 个 RAMB36（DW=280 ⇒ 4/bank；见报告"读路径代价"）。
+    //   ★★ C9 后硬成本 = **12 个 RAMB36**（DW=215 ≤ 216 ⇒ 3/bank；改前 DW=280 ⇒ 4/bank）。
     // 【写口】D3 派发 4 lane 的 rob 索引连续 ⇒ bank=gw 对应的 lane = (gw - idx0[1:0]) mod 4
-    //   （与 rob.v §1.5 的 `wsel` 逐位同式），写数据 = `lane_uop_fin[lane][IWW-1:0]`
-    //   （= 与 ROB 载荷、原 IQ 存储**同一条** uop 的低 280 位）。
+    //   （与 rob.v §1.5 的 `wsel` 逐位同式），写数据 = `pack_iw(lane_uop_fin[lane])`
+    //   （= 从**同一条** uop 抽取 E1 真正读的字段，见 back2_params §2.5）。
     genvar gw_iwm;
     generate
     for (gw_iwm = 0; gw_iwm < 4; gw_iwm = gw_iwm + 1) begin : g_iwmw
         wire [1:0] lw = gw_iwm[1:0] - rob_alloc_idx0[1:0];
         assign iwm_we[gw_iwm] = disp_fire_w & d1_v_q[lw];
         assign iwm_woff[gw_iwm*4 +: 4] = rb_ix_w[lw][5:2];
-        assign iwm_wdata[gw_iwm*IWW +: IWW] = lane_uop_fin[lw][IWW-1:0];
+        //   ★★ C9：写数据 = `pack_iw(uop)`（字段抽取，纯布线）；不再是 `uop[IWW-1:0]` 切片。
+        assign iwm_wdata[gw_iwm*IWW +: IWW] = pack_iw(lane_uop_fin[lw]);
     end
     endgenerate
     rob_wide_mem #(.NW(4), .BW(16), .DW(IWW), .AW(ROBW), .OW(4), .CHK(0)) u_iwmem (
@@ -1331,7 +1425,7 @@ module backend_top #(
         wire [1:0] os = (iwm_own_q[0] == gx_iwm[2:0]) ? 2'd0 :
                         (iwm_own_q[1] == gx_iwm[2:0]) ? 2'd1 :
                         (iwm_own_q[2] == gx_iwm[2:0]) ? 2'd2 : 2'd3;
-        assign x_i2_uop[gx_iwm] = { {(UOPW-IWW){1'b0}}, iwm_rdata[os*IWW +: IWW] };
+        assign x_i2_uop[gx_iwm] = iwm_rdata[os*IWW +: IWW];
     end
     endgenerate
 
@@ -1386,36 +1480,36 @@ module backend_top #(
         end
     end
 
-    wire [31:0] a0_opa = u_au(x_i2_uop[0]) ? u_pc(x_i2_uop[0]) : iprf_rd[0*32 +: 32];
-    wire [31:0] a0_opb = u_rt(x_i2_uop[0]) ? iprf_rd[1*32 +: 32] : u_imm(x_i2_uop[0]);
+    wire [31:0] a0_opa = w_au(x_i2_uop[0]) ? w_pc(x_i2_uop[0]) : iprf_rd[0*32 +: 32];
+    wire [31:0] a0_opb = w_rt(x_i2_uop[0]) ? iprf_rd[1*32 +: 32] : w_imm(x_i2_uop[0]);
     wire [31:0] a0_res;
     alu u_alu0 (.a(a0_opa), .b(a0_opb),
-                .alu_op(x_i2_uop[0][`BACK2_U_ALUOP_MSB:`BACK2_U_ALUOP_LSB]),
-                .pc(u_pc(x_i2_uop[0])), .result(a0_res));
+                .alu_op(w_aluop(x_i2_uop[0])),
+                .pc(w_pc(x_i2_uop[0])), .result(a0_res));
 
-    wire [31:0] a1_opa = u_au(x_i2_uop[1]) ? u_pc(x_i2_uop[1]) : iprf_rd[2*32 +: 32];
-    wire [31:0] a1_opb = u_rt(x_i2_uop[1]) ? iprf_rd[3*32 +: 32] : u_imm(x_i2_uop[1]);
+    wire [31:0] a1_opa = w_au(x_i2_uop[1]) ? w_pc(x_i2_uop[1]) : iprf_rd[2*32 +: 32];
+    wire [31:0] a1_opb = w_rt(x_i2_uop[1]) ? iprf_rd[3*32 +: 32] : w_imm(x_i2_uop[1]);
     wire [31:0] a1_res;
     alu u_alu1 (.a(a1_opa), .b(a1_opb),
-                .alu_op(x_i2_uop[1][`BACK2_U_ALUOP_MSB:`BACK2_U_ALUOP_LSB]),
-                .pc(u_pc(x_i2_uop[1])), .result(a1_res));
+                .alu_op(w_aluop(x_i2_uop[1])),
+                .pc(w_pc(x_i2_uop[1])), .result(a1_res));
 
     wire [31:0] bru_rs1 = iprf_rd[4*32 +: 32];
     wire [31:0] bru_rs2 = iprf_rd[5*32 +: 32];
     wire        bru_taken;
     wire [31:0] bru_target;
-    bru u_bru (.rs1(bru_rs1), .rs2(bru_rs2), .imm(u_imm(x_i2_uop[2])), .pc(u_pc(x_i2_uop[2])),
-               .br_op(x_i2_uop[2][`BACK2_U_BROP_MSB:`BACK2_U_BROP_LSB]),
+    bru u_bru (.rs1(bru_rs1), .rs2(bru_rs2), .imm(w_imm(x_i2_uop[2])), .pc(w_pc(x_i2_uop[2])),
+               .br_op(w_brop(x_i2_uop[2])),
                .taken(bru_taken), .target(bru_target));
-    wire        bru_isjal  = (u_opt(x_i2_uop[2]) == OPT_JAL);
-    wire        bru_isjalr = (u_opt(x_i2_uop[2]) == OPT_JALR);
+    wire        bru_isjal  = (w_opt(x_i2_uop[2]) == OPT_JAL);
+    wire        bru_isjalr = (w_opt(x_i2_uop[2]) == OPT_JALR);
     wire        bru_act_tk = bru_isjal | bru_isjalr | bru_taken;
-    wire [31:0] bru_ilen   = u_il32(x_i2_uop[2]) ? 32'd4 : 32'd2;
-    wire [31:0] bru_link   = u_pc(x_i2_uop[2]) + bru_ilen;
+    wire [31:0] bru_ilen   = w_il32(x_i2_uop[2]) ? 32'd4 : 32'd2;
+    wire [31:0] bru_link   = w_pc(x_i2_uop[2]) + bru_ilen;
     wire [31:0] bru_npc    = bru_act_tk ? bru_target : bru_link;
-    wire [31:0] bru_pred_t = {32{x_i2_uop[2][`BACK2_U_PRED_MSB]}} & u_predtgt(x_i2_uop[2]);
-    wire [31:0] bru_pred_n = x_i2_uop[2][`BACK2_U_PRED_MSB] ? u_predtgt(x_i2_uop[2]) : bru_link;
-    wire [2:0]  bru_cls    = u_cls(x_i2_uop[2]);
+    wire [31:0] bru_pred_t = {32{w_pred_tk(x_i2_uop[2])}} & w_predtgt(x_i2_uop[2]);
+    wire [31:0] bru_pred_n = w_pred_tk(x_i2_uop[2]) ? w_predtgt(x_i2_uop[2]) : bru_link;
+    wire [2:0]  bru_cls    = w_cls(x_i2_uop[2]);
     //   ★ 误判判定必须覆盖**全部控制转移**（cls != 0）：
     //     · 方向：任何控制转移都要与实际方向比（条件分支的条件分支走向是预测出来的，
     //       是最常见的误判源）；
@@ -1427,7 +1521,7 @@ module backend_top #(
     wire        bru_is_ctl = (bru_cls != 3'd0);
     wire        bru_cmp_t  = (bru_cls == 3'd3) | (bru_cls == 3'd4) | (bru_cls == 3'd6);
     wire        bru_mis    = bru_is_ctl &
-                             ((bru_act_tk != x_i2_uop[2][`BACK2_U_PRED_MSB]) |
+                             ((bru_act_tk != w_pred_tk(x_i2_uop[2])) |
                               (bru_act_tk & bru_cmp_t & (bru_target != bru_pred_n)));
 
     // MDU（至多 1 条在飞；busy/done 握手）
@@ -1435,7 +1529,7 @@ module backend_top #(
     //     不能取 **发射拍**（`iq_iss_v[3]`）——mdu.v/fpu.v 的端口契约是
     //     "`start`/`req_valid` 与操作数在**同一拍**被采样"（2A 侧即 `e_mdu_go`/`e_fp_go`
     //     与 `e_rs1_byp`/`e_fp_src*` 同拍）。而本后端的操作数走 **E1**（`iprf_ra[6..10]`
-    //     = `u_ps1i(x_i2_uop[3/5])`，见 §PRF 读口），发射拍的操作数尚不在 `x_i2_*` 里
+    //     = `w_ps1i(x_i2_uop[3/5])`，见 §PRF 读口），发射拍的操作数尚不在 `x_i2_*` 里
     //     ⇒ 旧接法把"发射拍"当启动、却把"上一拍的 x_i2 内容"当操作数：
     //     该 FP/MDU 指令**永远不启动** ⇒ `done` 不来 ⇒ `fpu_if_v/mdu_if_v` 恒 1
     //     ⇒ 队列永久停摆（锁步实测：p4_fpu 第 20 条 `fadd.s` 处挂死，探针
@@ -1458,7 +1552,7 @@ module backend_top #(
     wire        fpu_kill = flush_all_w |
                            (squash_v_w & ((fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
                                           (squash_idx_w[ROBW-1:0] - rob_head_w[ROBW-1:0])));
-    wire [4:0] mdu_brop = x_i2_uop[3][`BACK2_U_BROP_MSB:`BACK2_U_BROP_LSB];
+    wire [4:0] mdu_brop = w_brop(x_i2_uop[3]);
     mdu u_mdu (.aclk(clk), .aresetn(rst_n), .start(mdu_go), .flush(mdu_kill),
                .mdu_op(mdu_brop[2:0]),
                .a(iprf_rd[6*32 +: 32]), .b(iprf_rd[7*32 +: 32]),
@@ -1468,13 +1562,13 @@ module backend_top #(
     wire        fpu_busy, fpu_done, fpu_ffwe;
     wire [63:0] fpu_result;
     wire [4:0]  fpu_ff;
-    wire [63:0] fpu_a = u_s1f(x_i2_uop[5]) ? fprf_rd[0*64 +: 64]
+    wire [63:0] fpu_a = w_s1f(x_i2_uop[5]) ? fprf_rd[0*64 +: 64]
                                             : {32'hFFFF_FFFF, iprf_rd[10*32 +: 32]};
     fpu u_fpu (
         .clk(clk), .rst_n(rst_n), .flush(fpu_kill),
         //   ★★ 2B-4 同上：`req_valid` 取 **E1 有效**（与 `.a/.b/.c` 同拍）
-        .req_valid(x_i2_v[5]), .fp_op(u_fpop(x_i2_uop[5])),
-        .fmt(u_fmt(x_i2_uop[5])), .rm(x_i2_uop[5][`BACK2_U_RM_MSB:`BACK2_U_RM_LSB]),
+        .req_valid(x_i2_v[5]), .fp_op(w_fpop(x_i2_uop[5])),
+        .fmt(w_fmt(x_i2_uop[5])), .rm(w_rm(x_i2_uop[5])),
         .frm(csr_frm_w), .a(fpu_a), .b(fprf_rd[1*64 +: 64]), .c(fprf_rd[2*64 +: 64]),
         .busy(fpu_busy), .done(fpu_done), .result(fpu_result),
         .fflags_we(fpu_ffwe), .fflags(fpu_ff)
@@ -1498,12 +1592,12 @@ module backend_top #(
     wire [6:0]  lsu_exc_rob;
     wire [3:0]  lsu_exc_cause;
     wire [31:0] lsu_exc_tval;
-    wire [31:0] lsu_addr = iprf_rd[8*32 +: 32] + u_imm(x_i2_uop[4]);
+    wire [31:0] lsu_addr = iprf_rd[8*32 +: 32] + w_imm(x_i2_uop[4]);
     wire [63:0] lsu_fpsrc = fprf_rd[3*64 +: 64];
-    wire [31:0] lsu_wdata = (u_fpls(x_i2_uop[4]) & u_is_st(x_i2_uop[4])) ?
+    wire [31:0] lsu_wdata = (w_fpls(x_i2_uop[4]) & w_is_st(x_i2_uop[4])) ?
                             lsu_fpsrc[31:0] : iprf_rd[9*32 +: 32];
     //   ★★ 4c(3/3)：FP store 的**高 4 B**（fsd 的 64 bit 数据上半）；非 FP store 恒 0
-    wire [31:0] lsu_wdata_hi = (u_fpls(x_i2_uop[4]) & u_is_st(x_i2_uop[4])) ?
+    wire [31:0] lsu_wdata_hi = (w_fpls(x_i2_uop[4]) & w_is_st(x_i2_uop[4])) ?
                                lsu_fpsrc[63:32] : 32'h0;
     lsq_simple #(.DBG(DBG_LSU)) u_lsu (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w),
@@ -1514,15 +1608,15 @@ module backend_top #(
         .lalloc_rob(st_alloc_rob),
         .lalloc_ok(ld_alloc_ok), .lalloc_idx(ld_alloc_idx),
         .alloc_ok(st_alloc_ok), .alloc_idx(st_alloc_idx),
-        .exe_valid(x_i2_v[4]), .exe_is_store(u_is_st(x_i2_uop[4])),
-        .exe_is_fp(u_fpls(x_i2_uop[4])),
+        .exe_valid(x_i2_v[4]), .exe_is_store(w_is_st(x_i2_uop[4])),
+        .exe_is_fp(w_fpls(x_i2_uop[4])),
         .exe_rob(x_i2_rob[4]), .exe_epoch(x_i2_ep[4]),
         .exe_addr(lsu_addr), .exe_wdata(lsu_wdata), .exe_wdata_hi(lsu_wdata_hi),
-        .exe_size(x_i2_uop[4][`BACK2_U_MSIZE_MSB:`BACK2_U_MSIZE_LSB]),
-        .exe_unsign(x_i2_uop[4][`BACK2_U_MUNSIGN]),
-        .exe_dst_i(u_di(x_i2_uop[4])), .exe_dst_f(u_df(x_i2_uop[4])),
+        .exe_size(w_msize(x_i2_uop[4])),
+        .exe_unsign(w_munsign(x_i2_uop[4])),
+        .exe_dst_i(w_di(x_i2_uop[4])), .exe_dst_f(w_df(x_i2_uop[4])),
         //   ★ 目的物理号取 **PDIDST**（u_pdi），不是源 1（u_ps1i）；写口/唤醒 tag 同源。
-        .exe_pdest_i(u_pdi(x_i2_uop[4])), .exe_pdest_f(u_pdf(x_i2_uop[4])),
+        .exe_pdest_i(w_pdi(x_i2_uop[4])), .exe_pdest_f(w_pdf(x_i2_uop[4])),
         .exe_stq_idx(stq_of_rob_r), .exe_lq_idx(lq_of_rob_r),
         //   ★ 发射闸门按**候选**（i4_sel）的 ROB 索引判年龄；iss_ok 即接 IQ 的 iss_ready。
         .iss_rob(i4_sel_rob),
@@ -1564,13 +1658,22 @@ module backend_top #(
     assign stq_of_rob_r = stq_of_rob[x_i2_rob[4]];
     //   ★ 2B-4：E1 的 load 取"派发期分到的 LQ 槽"（组合读 `lq_of_rob`，与 stq_of_rob 同法）
     assign lq_of_rob_r  = lq_of_rob[x_i2_rob[4]];
-    wire [31:0] a0_wb_data = (csr_v_w & (csr_uop[`BACK2_UAX_Q_MSB:`BACK2_UAX_Q_LSB] == `BACK2_Q_ALU0))
-                             ? csr_rdata_w : a0_res;   // ★ B29：按 CSR 实际槽/队列
-    wire        a0_wb_i    = u_di(x_i2_uop[0]);
+    //   ★ B29：CSR 指令的写回值 = CSR 读回值（而非 ALU 结果）。
+    //   ★★ C9：判据由「`csr_uop[Q] == Q_ALU0`」改为「**CSR 落在 ALU0 的发射槽（lane 0）**」。
+    //     等价性论证（不是放松，是等价且更严）：
+    //       · CSR 指令的队列归属由译码器 `oq` 固定为 `Q_ALU0`（§4.1「CSR 只在 ALU0 执行」）
+    //         ⇒ 旧式读的是 **CSR uop 自己的 Q 字段**，而它**恒等于 Q_ALU0** ⇒ 旧式实际退化为
+    //         `csr_v_w ? csr_rdata_w : a0_res`；
+    //       · `x_i2_uop[0]` 就是 ALU0 队列本拍发射的那条 ⇒ `csr_lane == 0` 精确表达
+    //         「本拍 ALU0 槽里是那条 CSR」；若 CSR 出现在别的槽（构造上不可能：只有 ALU0
+    //         队列会取到 Q=ALU0 的 uop），新式给出 `a0_res`（不把 CSR 数据错塞进 lane 0）。
+    //       · 发射宽载荷（IW）因此不必再存 3 bit 的 Q 字段（其唯一消费点就是本判据）。
+    wire [31:0] a0_wb_data = (csr_v_w & (csr_lane == 3'd0)) ? csr_rdata_w : a0_res;
+    wire        a0_wb_i    = w_di(x_i2_uop[0]);
     wire [31:0] a1_wb_data = a1_res;
-    wire        a1_wb_i    = u_di(x_i2_uop[1]);
-    wire [31:0] bru_wb_data = (u_wbsel(x_i2_uop[2]) == WB_PC4) ? bru_link : bru_target;
-    wire        bru_wb_i    = u_di(x_i2_uop[2]);
+    wire        a1_wb_i    = w_di(x_i2_uop[1]);
+    wire [31:0] bru_wb_data = (w_wbsel(x_i2_uop[2]) == WB_PC4) ? bru_link : bru_target;
+    wire        bru_wb_i    = w_di(x_i2_uop[2]);
     wire        mdu_wb_v    = mdu_done & mdu_if_v;
     wire [31:0] mdu_wb_data = mdu_result;
     wire        fpu_wb_v    = fpu_done & fpu_if_v;
@@ -1624,7 +1727,7 @@ module backend_top #(
     //     ③ 唤醒广播 三处共用。旧版误写成源 1（ps1i）⇒ 结果写进源寄存器、目的
     //     busy 位永不清零 ⇒ 消费者永不唤醒（实测：lui 之后的 jalr 永不发射）。
     assign wbi_tag = { fpu_if_pdi, lsu_wb_pdi, mdu_if_pdi,
-                       u_pdi(x_i2_uop[2]), u_pdi(x_i2_uop[1]), u_pdi(x_i2_uop[0]) };
+                       w_pdi(x_i2_uop[2]), w_pdi(x_i2_uop[1]), w_pdi(x_i2_uop[0]) };
     assign wbi_data = { fpu_wb_idata, lsu_wb_data, mdu_wb_data, bru_wb_data, a1_wb_data, a0_wb_data };
 
     assign wki_v   = NO_WAKE ? {wbi_v[5], wbi_v[4], wbi_v[3], wbi_v[2], 1'b0, wbi_v[0]} : wbi_v;
@@ -1846,16 +1949,16 @@ module backend_top #(
     //   ★★ B29 修复：CSR 指令可能落在 I2 的**任意槽**（此前四处硬编码槽 0 ⇒ 取到别的指令的
     //     `x_i2_rob[0]`/读口数据 ⇒ `csrrw` 写入了错误值，实测 mscratch 被写成 1 而非 3）。
     //     CSR 属 ALU0 类（D1 的 oq 分配：CSR 的 opt ⇒ Q_ALU0）⇒ 源操作数取 ALU0 的 rs1 读口。
-    wire [2:0] csr_lane = (x_i2_v[0] & u_is_csr(x_i2_uop[0])) ? 3'd0 :
-                          (x_i2_v[1] & u_is_csr(x_i2_uop[1])) ? 3'd1 :
-                          (x_i2_v[2] & u_is_csr(x_i2_uop[2])) ? 3'd2 :
-                          (x_i2_v[3] & u_is_csr(x_i2_uop[3])) ? 3'd3 :
-                          (x_i2_v[4] & u_is_csr(x_i2_uop[4])) ? 3'd4 :
-                          (x_i2_v[5] & u_is_csr(x_i2_uop[5])) ? 3'd5 : 3'd0;
-    wire       csr_v_w  = (x_i2_v[0] & u_is_csr(x_i2_uop[0])) | (x_i2_v[1] & u_is_csr(x_i2_uop[1])) |
-                          (x_i2_v[2] & u_is_csr(x_i2_uop[2])) | (x_i2_v[3] & u_is_csr(x_i2_uop[3])) |
-                          (x_i2_v[4] & u_is_csr(x_i2_uop[4])) | (x_i2_v[5] & u_is_csr(x_i2_uop[5]));
-    wire [UOPW-1:0] csr_uop = x_i2_uop[csr_lane];
+    wire [2:0] csr_lane = (x_i2_v[0] & w_is_csr(x_i2_uop[0])) ? 3'd0 :
+                          (x_i2_v[1] & w_is_csr(x_i2_uop[1])) ? 3'd1 :
+                          (x_i2_v[2] & w_is_csr(x_i2_uop[2])) ? 3'd2 :
+                          (x_i2_v[3] & w_is_csr(x_i2_uop[3])) ? 3'd3 :
+                          (x_i2_v[4] & w_is_csr(x_i2_uop[4])) ? 3'd4 :
+                          (x_i2_v[5] & w_is_csr(x_i2_uop[5])) ? 3'd5 : 3'd0;
+    wire       csr_v_w  = (x_i2_v[0] & w_is_csr(x_i2_uop[0])) | (x_i2_v[1] & w_is_csr(x_i2_uop[1])) |
+                          (x_i2_v[2] & w_is_csr(x_i2_uop[2])) | (x_i2_v[3] & w_is_csr(x_i2_uop[3])) |
+                          (x_i2_v[4] & w_is_csr(x_i2_uop[4])) | (x_i2_v[5] & w_is_csr(x_i2_uop[5]));
+    wire [IWW-1:0] csr_uop = x_i2_uop[csr_lane];   // ★ C9：发射载荷宽 = IWW
     //   ★★ B29 修法（第 34 轮，按母代理更正）：提交点现算 CSR 写数据 —— 源操作数取
     //   **该 CSR 指令自己的 rs1 物理号（PS1I）**，提交拍直接 `PRF[ps1i]` 取值；不再从
     //   `p_imm[19:15]` 反推（那是 CSR 地址 0x340，[19:15]=6 ⇒ ARAT[6] 恰为值 1 的寄存器，
@@ -1868,7 +1971,7 @@ module backend_top #(
     //     ⇒ CSR 指令不在 lane 0 时会读到无关寄存器；与 B29 同类，一并清掉）
     assign iprf_ra[15*PW_I +: PW_I] = csr_cmt_ps1i;
     wire [31:0] csr_cmt_src_sel = csr_cmt_we ? csr_cmt_src : csr_cmt_src;   // 占位保持可读性
-    assign csr_raddr_w = csr_cmt_we ? csr_cmt_addr : u_csra(csr_uop);
+    assign csr_raddr_w = csr_cmt_we ? csr_cmt_addr : w_csra(csr_uop);
 
     //   B29 诊断：I2 CSR 现场 + CSR 提交现场（默认关）
     //   ★ EXP-B：`cb_src`/`upd_csrw`/`upd_csr_v`/`upd_csr_idx` 随死口删除（CSR 源只走
@@ -1881,17 +1984,18 @@ module backend_top #(
                      iprf_wa[3*PW_I +: PW_I], iprf_wa[4*PW_I +: PW_I], iprf_wa[5*PW_I +: PW_I],
                      iprf_wd[0*32 +: 32], iprf_wd[1*32 +: 32]);
         if (DBG_CSR && rst_n && csr_v_w)
-            $display("[csr-r t=%0t] ra15=%0d rd15=0x%08x ps1i=%0d csrop=%0d",
-                     $time, iprf_ra[15*PW_I +: PW_I], csr_cmt_src, csr_cmt_ps1i,
-                     u_csrop(csr_uop));
+            //   ★ C9：CSROP 已不存于发射载荷（提交级操作码走 ROB 载荷 `csr_pay`）
+            //     ⇒ 本行只打发射侧的 PS1I。
+            $display("[csr-r t=%0t] ra15=%0d rd15=0x%08x ps1i=%0d",
+                     $time, iprf_ra[15*PW_I +: PW_I], csr_cmt_src, csr_cmt_ps1i);
         if (DBG_CSR && rst_n && csr_v_w)
-            $display("[csr-uop t=%0t] lane=%0d ps1i=%0d s1i=%b imm=0x%08x csrop=%0d | rdata=0x%08x",
-                     $time, csr_lane, u_ps1i(csr_uop), u_s1i(csr_uop), u_imm(csr_uop),
-                     u_csrop(csr_uop), csr_rdata_w);
-        if (DBG_CSR && rst_n && x_i2_v[0] && u_is_csr(x_i2_uop[0]))
-            $display("[csr-i2 t=%0t] op=%0d addr=0x%03x s1i=%b imm=0x%08x rdata=0x%08x",
-                     $time, u_csrop(x_i2_uop[0]), u_csra(x_i2_uop[0]),
-                     u_s1i(x_i2_uop[0]), u_imm(x_i2_uop[0]), csr_rdata_w);
+            $display("[csr-uop t=%0t] lane=%0d ps1i=%0d s1i=%b imm=0x%08x | rdata=0x%08x",
+                     $time, csr_lane, w_ps1i(csr_uop), w_s1i(csr_uop), w_imm(csr_uop),
+                     csr_rdata_w);
+        if (DBG_CSR && rst_n && x_i2_v[0] && w_is_csr(x_i2_uop[0]))
+            $display("[csr-i2 t=%0t] addr=0x%03x s1i=%b imm=0x%08x rdata=0x%08x",
+                     $time, w_csra(x_i2_uop[0]),
+                     w_s1i(x_i2_uop[0]), w_imm(x_i2_uop[0]), csr_rdata_w);
         if (DBG_CSR && rst_n && csr_we_w)
             $display("[csr-cmt t=%0t] we=%b addr=0x%03x wdata=0x%08x (cmt_we=%b cmt_addr=0x%03x cmt_data=0x%08x) mscratch=0x%08x",
                      $time, csr_we_w, csr_waddr_w, csr_wdata_w,
@@ -1901,7 +2005,7 @@ module backend_top #(
     //   ★ 4b-1a：`b2_csr` 已搬到 `core_top_2b`（CSR 文件不再内嵌于后端）
 
     // ---- ROB ----
-    assign upd_tr_v = x_i2_v[2] & u_is_br(x_i2_uop[2]);
+    assign upd_tr_v = x_i2_v[2] & w_is_br(x_i2_uop[2]);
     assign upd_ff_v    = fpu_done & fpu_if_v;
 
 
@@ -1938,17 +2042,17 @@ module backend_top #(
     // 10. PRF（整数 15 读 6 写 / 浮点 8 读 2 写）
     //==========================================================================
     assign iprf_re = 16'hFFFF;
-    assign iprf_ra[0*PW_I +: PW_I]  = u_ps1i(x_i2_uop[0]);
-    assign iprf_ra[1*PW_I +: PW_I]  = u_ps2i(x_i2_uop[0]);
-    assign iprf_ra[2*PW_I +: PW_I]  = u_ps1i(x_i2_uop[1]);
-    assign iprf_ra[3*PW_I +: PW_I]  = u_ps2i(x_i2_uop[1]);
-    assign iprf_ra[4*PW_I +: PW_I]  = u_ps1i(x_i2_uop[2]);
-    assign iprf_ra[5*PW_I +: PW_I]  = u_ps2i(x_i2_uop[2]);
-    assign iprf_ra[6*PW_I +: PW_I]  = u_ps1i(x_i2_uop[3]);
-    assign iprf_ra[7*PW_I +: PW_I]  = u_ps2i(x_i2_uop[3]);
-    assign iprf_ra[8*PW_I +: PW_I]  = u_ps1i(x_i2_uop[4]);
-    assign iprf_ra[9*PW_I +: PW_I]  = u_ps2i(x_i2_uop[4]);
-    assign iprf_ra[10*PW_I +: PW_I] = u_ps1i(x_i2_uop[5]);
+    assign iprf_ra[0*PW_I +: PW_I]  = w_ps1i(x_i2_uop[0]);
+    assign iprf_ra[1*PW_I +: PW_I]  = w_ps2i(x_i2_uop[0]);
+    assign iprf_ra[2*PW_I +: PW_I]  = w_ps1i(x_i2_uop[1]);
+    assign iprf_ra[3*PW_I +: PW_I]  = w_ps2i(x_i2_uop[1]);
+    assign iprf_ra[4*PW_I +: PW_I]  = w_ps1i(x_i2_uop[2]);
+    assign iprf_ra[5*PW_I +: PW_I]  = w_ps2i(x_i2_uop[2]);
+    assign iprf_ra[6*PW_I +: PW_I]  = w_ps1i(x_i2_uop[3]);
+    assign iprf_ra[7*PW_I +: PW_I]  = w_ps2i(x_i2_uop[3]);
+    assign iprf_ra[8*PW_I +: PW_I]  = w_ps1i(x_i2_uop[4]);
+    assign iprf_ra[9*PW_I +: PW_I]  = w_ps2i(x_i2_uop[4]);
+    assign iprf_ra[10*PW_I +: PW_I] = w_ps1i(x_i2_uop[5]);
     assign iprf_ra[11*PW_I +: PW_I] = cmt_narrow[0*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
     assign iprf_ra[12*PW_I +: PW_I] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
     assign iprf_ra[13*PW_I +: PW_I] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
@@ -1968,10 +2072,10 @@ module backend_top #(
     );
 
     assign fprf_re = 8'hFF;
-    assign fprf_ra[0*PW_F +: PW_F] = u_ps1f(x_i2_uop[5]);
-    assign fprf_ra[1*PW_F +: PW_F] = u_ps2f(x_i2_uop[5]);
-    assign fprf_ra[2*PW_F +: PW_F] = u_ps3f(x_i2_uop[5]);
-    assign fprf_ra[3*PW_F +: PW_F] = u_ps2f(x_i2_uop[4]);
+    assign fprf_ra[0*PW_F +: PW_F] = w_ps1f(x_i2_uop[5]);
+    assign fprf_ra[1*PW_F +: PW_F] = w_ps2f(x_i2_uop[5]);
+    assign fprf_ra[2*PW_F +: PW_F] = w_ps3f(x_i2_uop[5]);
+    assign fprf_ra[3*PW_F +: PW_F] = w_ps2f(x_i2_uop[4]);
     assign fprf_ra[4*PW_F +: PW_F] = cmt_narrow[0*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_ra[5*PW_F +: PW_F] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_ra[6*PW_F +: PW_F] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
@@ -1999,9 +2103,9 @@ module backend_top #(
     //==========================================================================
     assign squash_v_w    = x_i2_v[2] & bru_mis;
     assign squash_idx_w  = x_i2_rob[2];
-    assign restore_ck_v_w  = squash_v_w & u_ckv(x_i2_uop[2]);
-    assign restore_ck_id_w = u_ckid(x_i2_uop[2]);
-    assign restore_rob_v_w = squash_v_w & ~u_ckv(x_i2_uop[2]);
+    assign restore_ck_v_w  = squash_v_w & w_ckv(x_i2_uop[2]);
+    assign restore_ck_id_w = w_ckid(x_i2_uop[2]);
+    assign restore_rob_v_w = squash_v_w & ~w_ckv(x_i2_uop[2]);
     assign restore_rob_idx_w = x_i2_rob[2];
     //   ★★ 2B-4 第 4a 段：**陷阱不再等于停机**。旧实现 `flush_all_w = trap_v_rob | trap_halt_q`
     //     且 `trap_halt_q` 一经陷阱永久置位 ⇒ 无法进入 mtvec 处理程序（§B4.4.1 B1）。
@@ -2020,8 +2124,8 @@ module backend_top #(
     assign redirect_valid_o    = trp_redirect_v_i | squash_v_w;
     assign redirect_pc_o       = trp_redirect_v_i ? trp_redirect_pc_i :
                                  (squash_v_w ? bru_npc : 32'h0);
-    assign redirect_use_ckpt_o = ~trp_redirect_v_i & squash_v_w & u_ckv(x_i2_uop[2]);
-    assign redirect_ckpt_o     = u_ckid(x_i2_uop[2]);
+    assign redirect_use_ckpt_o = ~trp_redirect_v_i & squash_v_w & w_ckv(x_i2_uop[2]);
+    assign redirect_ckpt_o     = w_ckid(x_i2_uop[2]);
     assign trap_valid_o        = trap_v_rob;
     assign trap_valid_o_pc     = trap_pc_o;
 
@@ -2032,9 +2136,10 @@ module backend_top #(
     //     xret_kind_o）、以及"外部冲刷 + 重定向"骨架（trp_flush_v_i/trp_redirect_*_i）。
 
     //   ★ 提交点 xRET 识别：载荷 TVAL 字段 = **原始指令位**（decoder `tval_o = insn_i`，norvc）
-    //     ⇒ 直接按编码判定 mret(0x3020_0073) / sret(0x1020_0073)，**不需要新增载荷位**
-    //     （RB_W=416 已用满，见 back2_params.vh）。
-    wire [31:0] cmt0_tval = cmt_pay[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB];
+    //     ⇒ 直接按编码判定 mret(0x3020_0073) / sret(0x1020_0073)，**不需要新增载荷位**。
+    //   ★★ C4：原 lane-0 单点探针线 `cmt0_tval = cmt_pay[U_TVAL]` 已删 —— ① 它**全仓库 0 读**
+    //     （4b-2a 之后改为逐 lane 扫描）；② 新载荷里 uop 的 TVAL 段已不存在（真值在
+    //     `BACK2_RB_TVAL`，逐 lane 扫描用的就是 `p_pc/p_cls` + `nq` 预译码标志）。
     //   ★★ 4b-2a 缺陷修正（实测抓出）：xRET 与维护操作**可以在提交组的任意 lane**
     //     （4a/4b 原实现只看 lane 0 的 `cmt0_tval` ⇒ 只要它们不在 lane 0 就识别不到：
     //      实测 p11 的 `fence.i` 与 lane 0 的另一条指令同拍提交 ⇒ `maint_cmt` 恒 0）。
@@ -2205,13 +2310,14 @@ module backend_top #(
         assign tcp_call[tc] = t_call(p_cls(pp));
         assign tcp_ret[tc]  = t_ret(p_cls(pp));
         assign tcp_tgt[tc]  = p_trtgt(pp);
-        assign tcp_ptk[tc]  = pp[`BACK2_U_PRED_MSB];
-        assign tcp_psg[tc]  = pp[`BACK2_U_PRED_MSB-1];
-        assign tcp_pgd[tc]  = pp[`BACK2_U_PRED_MSB-2];
-        assign tcp_pld[tc]  = pp[`BACK2_U_PRED_MSB-3];
-        assign tcp_bh[tc]   = pp[`BACK2_U_BTB_MSB];
-        assign tcp_bw[tc]   = pp[`BACK2_U_BTB_LSB];
-        assign tcp_ptg[tc]  = pp[`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB];
+        //   ★★ C4：预测元数据改用**载荷布局**宏（`BACK2_RB_*`）；字段仍在载荷里，语义不变。
+        assign tcp_ptk[tc]  = pp[`BACK2_RB_PRED_MSB];
+        assign tcp_psg[tc]  = pp[`BACK2_RB_PRED_MSB-1];
+        assign tcp_pgd[tc]  = pp[`BACK2_RB_PRED_MSB-2];
+        assign tcp_pld[tc]  = pp[`BACK2_RB_PRED_MSB-3];
+        assign tcp_bh[tc]   = pp[`BACK2_RB_BTB_MSB];
+        assign tcp_bw[tc]   = pp[`BACK2_RB_BTB_LSB];
+        assign tcp_ptg[tc]  = pp[`BACK2_RB_PREDTGT_MSB:`BACK2_RB_PREDTGT_LSB];
         assign tcp_pc[tc]   = p_pc(pp);
     end
     endgenerate
@@ -2337,14 +2443,14 @@ module backend_top #(
             //     注意 `rob/ep` 仍与"在途标志"同拍登记：`mdu_kill`/`fpu_kill` 的年龄判据
             //     在登记后的**下一拍**就要用到它们，不能晚。
             if (x_i2_v[3]) begin
-                mdu_if_di  <= u_di(x_i2_uop[3]);
-                mdu_if_pdi <= u_pdi(x_i2_uop[3]);
+                mdu_if_di  <= w_di(x_i2_uop[3]);
+                mdu_if_pdi <= w_pdi(x_i2_uop[3]);
             end
             if (x_i2_v[5]) begin
-                fpu_if_di  <= u_di(x_i2_uop[5]);
-                fpu_if_df  <= u_df(x_i2_uop[5]);
-                fpu_if_pdi <= u_pdi(x_i2_uop[5]);
-                fpu_if_pdf <= u_pdf(x_i2_uop[5]);
+                fpu_if_di  <= w_di(x_i2_uop[5]);
+                fpu_if_df  <= w_df(x_i2_uop[5]);
+                fpu_if_pdi <= w_pdi(x_i2_uop[5]);
+                fpu_if_pdf <= w_pdf(x_i2_uop[5]);
             end
 
             // ---- STQ 归属表（store 的 ROB 项 → STQ 索引）----

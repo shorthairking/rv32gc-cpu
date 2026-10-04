@@ -269,51 +269,213 @@
 `define BACK2_IQN_RM_DYN    39         // [39]    uop 的 RM == 3'b111（FPU DYN 舍入门）
 `define BACK2_IQN_W         40         // 窄载荷总宽（bit）
 //
-// 发射宽载荷宽度：**等于 uop 的低 280 位**（`uop[279:0]`）。
-//   为什么可以截掉 [303:280]：那 24 bit 是 `{9'b0, rs3(5), rs2(5), rs1(5)}`（架构源号），
-//   全仓库**唯一读点**是 D2 重命名请求（`backend_top.v:794-801`，读的是 D1 滑板里的
-//   uop，不是发射载荷）⇒ 发射/执行/写回路径逐位不读它。截断后 `x_i2_uop[303:280]` 恒 0，
-//   其下所有字段的**绝对 bit 位置逐位不变**（与 L5 的 STQ/LQ 字段同理）。
-//   收益：BRAM 字宽 304→280（每 bank 4 个 RAMB36，而不是 5 个）。
-`define BACK2_IW_W          280
+// 发射宽载荷布局（★★ C9：`uop[279:0]` 切片 → **215 bit 紧凑布局**）。
+//------------------------------------------------------------------------------
+// 背景（C9 面积杠杆）：C1 把发射宽载荷定为「uop 的低 280 位」切片（截掉架构源号
+//   [303:280]），但该切片里仍有大量**发射/执行路径 0 读**的位（它们只在 D1/D2/D3 或
+//   提交/训练路径用，且 D3 之前早已消费完）：
+//     · **TVAL(32)**：uop[233:202]。E1 全仓库 0 读（异常 tval 走 ROB 载荷 / nq）；
+//     · **ARND(5) / PDIOLD(7) / PDFOLD(6)**：只被 D2 重命名/提交释放读，E1 0 读；
+//     · **IMM 之外的全套 E1-无关控制**：OPTYPE/ALUOP 之外……
+//     · **BTB(2)**：E1 0 读（训练读的是 ROB 载荷的同名字段）；
+//     · **Q(3)**：D3 派发队列归属，D3 当拍已消费；
+//     · **PRED[2:0]**：E1 只读 `pred_taken`（1 bit）；
+//     · **MEMOP(4)**：无任何访问函数（全仓库 0 读）；
+//     · **EXC(4)**：E1 0 读（异常走 nq / ROB 载荷）；
+//     · **CSROP(3)**：E1 0 读（提交级 CSR 操作码走 ROB 载荷 `csr_pay`）；
+//     · **CSRW/FLAGS 里的 S*_USE/IS_LOAD/IS_ILLEGAL/IS_UNSUP**：仅唤醒/派发/提交用。
+//   本段把发射宽载荷重排为「E1 执行 + E1 PRF 读口 + E1 冲刷/检查点恢复」真正读的位并集。
+//------------------------------------------------------------------------------
+// ★ 为什么 [19:0] 整块照抄 uop（不是偷懒，是硬约束）：
+//   `sim/unit/dyn_probe_back2_body.inc`（动态行为探针，docs/design/10-dynamic-behavior.md
+//   的真源）按**绝对位**层次引用 `x_i2_uop[*][BACK2_UB_S1_I_USE]`(=6)、`[S2_I_USE]`(=7)、
+//   `[S1_F_USE]`(=8)、`[S2_F_USE]`(=9)、`[S3_F_USE]`(=10)、`[IS_CSR]`(=14)。该文件**不在
+//   本任务的允许改动范围**（只许动 back2_params/rob/backend_top）⇒ [19:4] 的 FLAGS 块必须
+//   逐位保留（因而 [3:0] 也需占位 4 bit，否则整块下移）。代价 = 6 bit 死位（EXC 4 + 块内
+//   2 个 0 读标志），有意保留；要再省必须**同步**改该探针文件（后续任务）。
+//------------------------------------------------------------------------------
+// 新布局（LSB→MSB，**无空洞**）：
+//   [3:0]     EXC            占位（E1 0 读；只为 FLAGS 块对齐，见上硬约束）
+//   [19:4]    FLAGS          整块照抄 uop [19:4]（`BACK2_UB_*` 位序不变）
+//   [23:20]   CKPT           检查点 id（冲刷恢复 `u_ckid`）
+//   [26:24]   CLS            分支类别（BRU 误判判定 `u_cls`）
+//   [38:27]   CSRADDR        CSR 地址（E1 CSR 读口 `csr_raddr_w`）
+//   [44:39]   FPOP           浮点归一化操作码（`fpu.fp_op`）
+//   [47:45]   RM             浮点舍入模式（`fpu.rm`）
+//   [50:48]   MSIZE          访存宽度（`lsq.exe_size`）
+//   [51]      MUNSIGN        load 零扩展（`lsq.exe_unsign`）
+//   [54:52]   WBSEL          写回来源（BRU `WB_PC4` 判定）
+//   [58:55]   ALUOP          ALU 微操作（`alu.alu_op`）
+//   [62:59]   OPTYPE         执行部件类型（JAL/JALR 判定）
+//   [67:63]   BROP           控制转移选择（`bru.br_op` / MDU 低 3 位）
+//   [69:68]   FMT            浮点 fmt（`fpu.fmt`）
+//   [70]      IL32           指令 32 bit（链接值）
+//   [71]      RTYPE          R 型（ALU b 取 rs2）
+//   [72]      AUIPC          auipc（ALU a 取 pc）
+//   [73]      PRED_TAKEN     预测方向（BRU 误判比对）
+//   [80:74]   PDI            整数新映射（LSU 写口 / 在途登记）
+//   [86:81]   PDF            浮点新映射（同上）
+//   [93:87]   PS1I           源 1 整数物理号（E1 PRF 读口）
+//   [100:94]  PS2I           源 2 整数物理号
+//   [106:101] PS1F           源 1 浮点物理号
+//   [112:107] PS2F           源 2 浮点物理号
+//   [118:113] PS3F           源 3 浮点物理号（FMA）
+//   [150:119] PC             指令 PC（ALU/BRU 链接值/维护重定向）
+//   [182:151] IMM            立即数（ALU/BRU/LSU 地址）
+//   [214:183] PREDTGT        预测目标（BRU 误判比对）
+`define BACK2_IW_EXC_MSB     3
+`define BACK2_IW_EXC_LSB     0          // 占位（见上硬约束）
+`define BACK2_IW_FLAGS_MSB   19         // ★ 与 uop FLAGS 段同值
+`define BACK2_IW_FLAGS_LSB   4
+`define BACK2_IW_CKPT_MSB    23
+`define BACK2_IW_CKPT_LSB    20
+`define BACK2_IW_CLS_MSB     26
+`define BACK2_IW_CLS_LSB     24
+`define BACK2_IW_CSRADDR_MSB 38
+`define BACK2_IW_CSRADDR_LSB 27
+`define BACK2_IW_FPOP_MSB    44
+`define BACK2_IW_FPOP_LSB    39
+`define BACK2_IW_RM_MSB      47
+`define BACK2_IW_RM_LSB      45
+`define BACK2_IW_MSIZE_MSB   50
+`define BACK2_IW_MSIZE_LSB   48
+`define BACK2_IW_MUNSIGN     51
+`define BACK2_IW_WBSEL_MSB   54
+`define BACK2_IW_WBSEL_LSB   52
+`define BACK2_IW_ALUOP_MSB   58
+`define BACK2_IW_ALUOP_LSB   55
+`define BACK2_IW_OPTYPE_MSB  62
+`define BACK2_IW_OPTYPE_LSB  59
+`define BACK2_IW_BROP_MSB    67
+`define BACK2_IW_BROP_LSB    63
+`define BACK2_IW_FMT_MSB     69
+`define BACK2_IW_FMT_LSB     68
+`define BACK2_IW_IL32        70
+`define BACK2_IW_RTYPE       71
+`define BACK2_IW_AUIPC       72
+`define BACK2_IW_PRED_TAKEN  73
+`define BACK2_IW_PDI_MSB     80
+`define BACK2_IW_PDI_LSB     74
+`define BACK2_IW_PDF_MSB     86
+`define BACK2_IW_PDF_LSB     81
+`define BACK2_IW_PS1I_MSB    93
+`define BACK2_IW_PS1I_LSB    87
+`define BACK2_IW_PS2I_MSB    100
+`define BACK2_IW_PS2I_LSB    94
+`define BACK2_IW_PS1F_MSB    106
+`define BACK2_IW_PS1F_LSB    101
+`define BACK2_IW_PS2F_MSB    112
+`define BACK2_IW_PS2F_LSB    107
+`define BACK2_IW_PS3F_MSB    118
+`define BACK2_IW_PS3F_LSB    113
+`define BACK2_IW_PC_MSB      150
+`define BACK2_IW_PC_LSB      119
+`define BACK2_IW_IMM_MSB     182
+`define BACK2_IW_IMM_LSB     151
+`define BACK2_IW_PREDTGT_MSB 214
+`define BACK2_IW_PREDTGT_LSB 183
+`define BACK2_IW_W           215        // ★ C9：280→215（XPM 位宽 ≤216 ⇒ 3 RAMB36/bank）
 
-// ---- ROB 项载荷 = uop 载荷 + ROB 专用字段（执行期回写）----
-`define BACK2_RB_CSRW_MSB    335
-`define BACK2_RB_CSRW_LSB    304        // [335:304] CSR 新值（csr_op 按 W/S/C 由 ALU 算好）
-`define BACK2_RB_TVAL_MSB    367
-`define BACK2_RB_TVAL_LSB    336        // [367:336] 异常附加值（mtval/stval）
-`define BACK2_RB_TRTGT_MSB   399
-`define BACK2_RB_TRTGT_LSB   368        // [399:368] 分支实际目标（训练用）
-`define BACK2_RB_TRTAKEN     400        // [400]     分支实际方向（训练用）
-`define BACK2_RB_FFLAGS_MSB  405
-`define BACK2_RB_FFLAGS_LSB  401        // [405:401] 浮点 flags 累积（FPU done 时）
-//   ★ 2B-3 第 6 段第一步：STQ 索引 4→5 bit。**位域位置必须逐位核对**——
-//     本载荷在 backend_top 的组装式 `{stq_idx, 5'b0, 1'b0, 32'h0, tval, {25'b0,ps1i}, uop}`
-//     是**右对齐（LSB 对齐）**拼接、高位由赋值零扩展 ⇒ **加宽最顶端的 STQ 字段只会向上
-//     生长，其下所有字段（fflags/trtgt/CSRW/uop…）的绝对 bit 位置逐位不变**。
-//     故 STQ_MSB 409→410、**STQ_LSB 恒为 406**、`BACK2_RB_W` 恒为 416
-//     （顶端保留位由 [415:410] 6 bit 缩为 [415:411] 5 bit）。
-//     ⚠ 不可写成 LSB 406→405：那会让 5 bit 字段跨进 [405]（= fflags 最高位），
-//       `p_stq` 取值将含 fflags 位而丢掉 STQ 高位。
-`define BACK2_RB_STQ_MSB     410
-`define BACK2_RB_STQ_LSB     406        // [410:406] store queue 项索引（≤32 项）
-//   ★ 2B-4 第二步：**LQ 索引**放入顶端空闲位 [415:411]（5 bit，正好用尽 ⇒ RB_W 仍 416）。
-//     与 STQ 字段同理：拼接式右对齐+高位零扩展 ⇒ 加在**最顶端**不影响其下任何字段位置。
-//     LQ 在 **D3 派发期**分配（程序序）、提交点释放 ⇒ load 的槽位不再依赖发射/执行顺序，
-//     队列级 `INORD_LOAD` 门不再承担"槽位序防死锁"职责（可安全置 0）。
-//   ★ 2B-5 L5：LQ 32→16（索引 5→4）⇒ 顶端字段收窄 1 bit：**MSB 415→414、LSB 恒 411**，
-//     拼接式仍右对齐+高位零扩展 ⇒ 其下所有字段（STQ/TRTGT/FFLAGS/CSRW/TVAL/uop…）绝对
-//     位位置逐位不变；`[415]` 变为保留位，`BACK2_RB_W` 仍 416。
-//     ⚠ 不可写成 LSB 411→410：那会让字段跨进 [410]（= STQ 最高位），`p_lq` 取值将含 STQ
-//       位而丢掉 LQ 高位。
-`define BACK2_RB_LQ_MSB      414
-`define BACK2_RB_LQ_LSB      411        // [414:411] load queue 项索引（≤16 项）
+// ---- ROB 项载荷（★★ C4：416 bit → 229 bit，「存了但谁都不读」的位全部删除）----
+//------------------------------------------------------------------------------
+// 背景（C4 面积杠杆；只读审计 fpga/scratch/redundancy_audit.md §B-B2 + 本段逐字段复检）：
+//   旧布局 = `{LQ(4), STQ(5), FFLAGS(5), TRTAKEN(1), TRTGT(32), TVAL(32), {25'b0,PS1I}(32),
+//             uop(304)}` = 416 bit。其中：
+//     · uop 的 **[303:280]**（架构源号 SRC1/2/3）唯一读点是 D2 重命名（读 D1 滑板，不读载荷）；
+//     · uop 的 **TVAL(233:202)** 与 RB 的 TVAL **同一真值**（rob 只读 RB_TVAL）；
+//     · uop 的 **IMM/ARND/PS2I/PS1F/PS2F/PS3F/OPTYPE/ALUOP/MEMOP/MSIZE/MUNSIGN/WBSEL/
+//       FPOP/RM/BROP/AUX(RTYPE/AUIPC/FMT/IL32/Q)** = 纯发射/执行期字段，提交路径 0 读
+//       （C1 之后它们在 `u_iwmem` 里另有一份，见下 §2.5；本载荷存的是**重复副本**）；
+//     · `CSRW [335:304]` = `{25'b0, PS1I}`，自 EXP-B 起 `csr_pay` 直接取载荷 uop.PS1I
+//       ⇒ 这 32 bit（其中 25 bit 恒 0）**结构上永不读**；
+//     · uop 的 FLAGS 里只有 `IS_FP` 被读（断言用；其余 RD_*/S*_USE/IS_ILLEGAL/IS_UNSUP
+//       只在 nq 重建时读，或根本 0 读）。
+//   本段把载荷重排为「rob.v 自己 + 提交路径 + `pack_nq` 重建 nq 真正读的位」的并集。
+//------------------------------------------------------------------------------
+// ★ 为什么 [3:0] 与 [19:4] 保持**逐位不变**（不是偷懒，是硬约束）：
+//   `sim/unit/tb_back2_lockstep.sv` 与 `sim/unit/dyn_probe_back2_body.inc` 都按**绝对位**
+//   层次引用 ROB 载荷：`cmt_pay[BACK2_UB_IS_FP]`(=15)、`cmt_pay[BACK2_UB_IS_LOAD]`(=11)、
+//   `cmt_pay[BACK2_U_EXC_MSB:LSB]`(=[3:0])、`pp[BACK2_UB_IS_BRANCH]`(=13)。这两个文件**不在
+//   本任务的允许改动范围**（只许动 back2_params/rob/backend_top）⇒ 载荷的 [19:0] 必须
+//   原样保留（EXC 4 bit + FLAGS 16 bit 整块），`BACK2_UB_*` 宏因而在载荷上继续成立。
+//   ⚠ 代价 = 7 bit 死位（S2I/S2F/S3F_USE、IS_ILLEGAL、IS_UNSUP 等），有意保留；
+//     若要再省，必须**同步**改上面两个 sim 文件（后续任务）。
+//------------------------------------------------------------------------------
+// 新布局（LSB→MSB，**无空洞**；每行 = [MSB:LSB] 字段（源））：
+//   [3:0]     EXC            异常码（uop fl 之外；rob `slot_exc`/`pexc`/`pack_nq`）
+//   [19:4]    FLAGS          整块照抄 uop [19:4]（`BACK2_UB_*` 位序不变；见上硬约束）
+//   [23:20]   CKPT           检查点 id（提交释放 `p_ckid` + nq）
+//   [26:24]   CLS            分支类别（提交训练 `p_cls`）
+//   [29:27]   CSROP          CSR 操作（`csr_pay` + nq）
+//   [41:30]   CSRADDR        CSR 地址（`csr_pay`）
+//   [48:42]   PS1I           源 1 整数物理号（`csr_pay` 的 csrw 段）
+//   [55:49]   PDIOLD         整数旧映射（提交释放 `p_pdio`）
+//   [61:56]   PDFOLD         浮点旧映射（提交释放 `p_pdfo`）
+//   [68:62]   PDIDST         整数新映射（**只为 `pack_nq` 重建 nq**）
+//   [73:69]   ARND           目的架构号（**只为 `pack_nq`**）
+//   [79:74]   PDFDST         浮点新映射（**只为 `pack_nq`**）
+//   [84:80]   STQ            store queue 项索引（`p_stq` 排空 + nq）
+//   [88:85]   LQ             load queue 项索引（nq；见 §2.5 L5 口径）
+//   [120:89]  TVAL           异常附加值 / 原始指令位（`trap_tval` 回落 + `csr_pay`）
+//   [152:121] TRTGT          分支实际目标（**占位 0**，输出位置由 `merge_upd` 用 br 表填）
+//   [153]     TRTAKEN        分支实际方向（**占位 0**，同上）
+//   [158:154] FFLAGS         浮点 flags（**占位 0**，输出位置由 `merge_upd` 用 ff 表填）
+//   [190:159] PREDTGT        预测目标（提交训练 `tcp_ptg`）
+//   [222:191] PC             指令 PC（提交 PC 流 / 维护重定向 / 训练）
+//   [226:223] PRED           {pred_taken,selg,gdir,ldir}（提交训练）
+//   [228:227] BTB            {btb_hit,btb_way}（提交训练）
+// ★ 为什么 TRTGT/TRTAKEN/FFLAGS 三个「占位」字段仍留在位域里：`merge_upd` 的**输出**就是
+//   本向量（位置必须存在，否则 backend_top 的 `p_ff`/`p_trtgt` 无处可读）；把它们挪出载荷
+//   需改 rob↔backend_top 的接口，并会使 `ROB-ASSERT-PAY0`（载荷占位恒 0 的前提）失去对象
+//   ⇒ 本段选择保留（38 bit，见报告 §3 收益-风险权衡）。
+`define BACK2_RB_EXC_MSB     3
+`define BACK2_RB_EXC_LSB     0
+`define BACK2_RB_FLAGS_MSB   19         // ★ 与 uop 的 FLAGS 段（BACK2_U_FLAGS_MSB）同值
+`define BACK2_RB_FLAGS_LSB   4          //   逐位不变的理由见上「硬约束」
+`define BACK2_RB_CKPT_MSB    23
+`define BACK2_RB_CKPT_LSB    20
+`define BACK2_RB_CLS_MSB     26
+`define BACK2_RB_CLS_LSB     24
+`define BACK2_RB_CSROP_MSB   29
+`define BACK2_RB_CSROP_LSB   27
+`define BACK2_RB_CSRADDR_MSB 41
+`define BACK2_RB_CSRADDR_LSB 30
+`define BACK2_RB_PS1I_MSB    48
+`define BACK2_RB_PS1I_LSB    42
+`define BACK2_RB_PDIOLD_MSB  55
+`define BACK2_RB_PDIOLD_LSB  49
+`define BACK2_RB_PDFOLD_MSB  61
+`define BACK2_RB_PDFOLD_LSB  56
+`define BACK2_RB_PDIDST_MSB  68
+`define BACK2_RB_PDIDST_LSB  62
+`define BACK2_RB_ARND_MSB    73
+`define BACK2_RB_ARND_LSB    69
+`define BACK2_RB_PDFDST_MSB  79
+`define BACK2_RB_PDFDST_LSB  74
+`define BACK2_RB_STQ_MSB     84
+`define BACK2_RB_STQ_LSB     80         // store queue 项索引（≤16 项）
+`define BACK2_RB_LQ_MSB      88
+`define BACK2_RB_LQ_LSB      85         // load queue 项索引（≤16 项）
+`define BACK2_RB_TVAL_MSB    120
+`define BACK2_RB_TVAL_LSB    89         // 异常附加值 / 原始指令位
+`define BACK2_RB_TRTGT_MSB   152
+`define BACK2_RB_TRTGT_LSB   121        // 分支实际目标（占位 0；merge_upd 用 br 表填）
+`define BACK2_RB_TRTAKEN     153        // 分支实际方向（占位 0）
+`define BACK2_RB_FFLAGS_MSB  158
+`define BACK2_RB_FFLAGS_LSB  154        // 浮点 flags（占位 0；merge_upd 用 ff 表填）
+`define BACK2_RB_PREDTGT_MSB 190
+`define BACK2_RB_PREDTGT_LSB 159
+`define BACK2_RB_PC_MSB      222
+`define BACK2_RB_PC_LSB      191
+`define BACK2_RB_PRED_MSB    226
+`define BACK2_RB_PRED_LSB    223
+`define BACK2_RB_BTB_MSB     228
+`define BACK2_RB_BTB_LSB     227
 // ---- 项内 epoch ----
 //   ★ 不占载荷位域：由 rob.v 的窄控制字 `nq` 的 [2:1] 承载（原因见 rob.v §0：
-//     放进 416 bit 载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
+//     放进宽载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
 //     （原独立的 `rep_q[]` 数组已无任何读写 ⇒ EXP-B 一并删除。）
-//     ★ 2B-5 L5 后载荷 [415] 亦成为保留位（LQ 索引收窄为 [414:411]）。
-`define BACK2_RB_W           416
+`define BACK2_RB_W           229        // ★ C4：416→229（XPM 位宽 229 ⇒ 3 RAMB36/bank）
 //   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
 //     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）：
 //       lq[3:0] stq[4:0] trtaken csrop[2:0] pdf[5:0] pdi[6:0] arn[4:0]

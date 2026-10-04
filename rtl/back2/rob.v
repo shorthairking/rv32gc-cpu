@@ -17,7 +17,9 @@
 //     写存储，保证异常回滚不会双重写，03 §6.2/§9）。
 //
 // 【载荷】每项 = BACK2_RB_W 位打包向量（`back2_params.vh` §2 为唯一布局真源）：
-//   uop(272) + CSR 新值 + 异常 tval + 分支实际方向/目标 + 浮点 flags + store 队列索引。
+//   ★★ C4（416→229 bit）：只保留「rob.v 自己 + 提交路径 + `pack_nq` 重建 nq」真正读的位；
+//     旧的 uop(304) 全量副本（其中 IMM/ARND/源物理号/控制码/TVAL 重复副本…）与 CSRW(32)
+//     全部删除。字段表与逐字段证据见 `back2_params.vh` §2 的 C4 段注释。
 //
 // ★★ EXP-B（架构 v0.1 §16–§21）：**可更新字段从"一张 102 bit 多写源表 `updq`"拆成
 //    三张"每表单写源"typed 表**：
@@ -140,7 +142,7 @@ module rob #(
     // 0. 存储体与指针
     //==========================================================================
     //   ★★ B2：`pl_q` 已删（宽载荷改由 `rob_wide_mem` 承担：写侧每表项 mux 塔缩为每 bank 1 个 4:1 选择）
-    reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（先存全字；B4 可按 100 bit 形态收窄）
+    reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（C4 后 RB_W=229，按被消费的位存）
     reg  [ROB_IDX_W-1:0] win_idx [0:7];       // 每槽 7 bit 全索引标签
     reg                  win_val [0:7];       // 每槽有效（复位/冲刷清零）
     reg  [ROB_IDX_W-1:0] e_of_r_q[0:3];       // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
@@ -220,16 +222,25 @@ module rob #(
         input                         ff_use; input [`BACK2_FF_W-1:0]       ff_d;
         input                         ex_use; input [`BACK2_EX_TVAL_W-1:0]  ex_tv;
         begin
+            //   ★★ C4：字段序随新布局（见 back2_params.vh §2 的位域表）。结构**未变**：
+            //     · FFLAGS / TRTAKEN / TRTGT 三段仍是「表命中值 or 常量 0」的占位；
+            //     · TVAL 段仍是「ex 表命中值 or 载荷原值」；
+            //     · TVAL 以下（LQ/STQ/PDFDST/…/EXC）整段直通载荷。
+            //   ⚠ CSRW 段（旧 [335:304]）已从载荷删除（EXP-B 起 `csr_pay` 直接取载荷
+            //     uop.PS1I）⇒ 本式的最后一段下移到 `RB_TVAL_LSB-1`。
             merge_upd = { pl[RB_W-1:`BACK2_RB_FFLAGS_MSB+1],
                           ff_use ? ff_d : {`BACK2_FF_W{1'b0}},
                           br_use ? br_tk : {`BACK2_BR_TAKEN_W{1'b0}},
                           br_use ? br_tgt : {`BACK2_BR_TGT_W{1'b0}},
                           ex_use ? ex_tv : pl[`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
-                          pl[`BACK2_RB_CSRW_MSB:0] };
+                          pl[`BACK2_RB_TVAL_LSB-1:0] };
         end
     endfunction
 
     //   打包：从宽载荷 + epoch + done 生成窄字（分配与一致性自检共用）
+    //   ★★ C4：本函数从载荷取的每个字段都必须用 **`BACK2_RB_*`（载荷布局）** 宏 ——
+    //     旧版直接借用 `BACK2_U_*`（uop 布局）只是因为旧载荷的低 304 位恰好就是 uop；
+    //     载荷重排后两者不再重合（唯一仍然重合的是 [19:0] 的 EXC+FLAGS 块，见参数表）。
     function [NQ_W-1:0] pack_nq;
         input [RB_W-1:0] p; input [`BACK2_EPOCH_W-1:0] ep; input dn; input [4:0] pre;
         begin
@@ -237,17 +248,17 @@ module rob #(
                         p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB],          // [43:40]（2B-5 L5：LQ 16 ⇒ 4 bit）
                         p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB],        // [39:35]
                         p[`BACK2_RB_TRTAKEN],                          // [34]
-                        p[`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB],      // [33:31]
-                        p[`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],    // [30:25]
-                        p[`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],    // [24:18]
-                        p[`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB],        // [17:13]
+                        p[`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB],    // [33:31]
+                        p[`BACK2_RB_PDFDST_MSB:`BACK2_RB_PDFDST_LSB],  // [30:25]
+                        p[`BACK2_RB_PDIDST_MSB:`BACK2_RB_PDIDST_LSB],  // [24:18]
+                        p[`BACK2_RB_ARND_MSB:`BACK2_RB_ARND_LSB],      // [17:13]
                         p[`BACK2_UB_IS_CSR],                           // [12]
                         p[`BACK2_UB_RD_F_WEN],                         // [11]
                         p[`BACK2_UB_RD_I_WEN],                         // [10]
                         p[`BACK2_UB_CKPT_VALID],                       // [9]
                         p[`BACK2_UB_IS_BRANCH],                        // [8]
                         p[`BACK2_UB_IS_STORE],                         // [7]
-                        p[`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB],          // [6:3]
+                        p[`BACK2_RB_EXC_MSB:`BACK2_RB_EXC_LSB],        // [6:3]
                         ep,                                            // [2:1]
                         dn };                                          // [0]
         end
@@ -358,7 +369,9 @@ module rob #(
         //       派发期异常（非法/ecall/ebreak/取指异常）的 mtval 必须回落**载荷 TVAL**。
         wire [`BACK2_EPOCH_W-1:0] ep_gi   = nq[slot_idx[gi]][NQ_EP_L +: `BACK2_EPOCH_W];
         wire [3:0]                exc_gi  = nq[slot_idx[gi]][NQ_EXC_L +: 4];
-        wire [3:0]                pexc_gi = win_rd[gi][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB];
+        //   ★★ C4：载荷的 EXC/FLAGS 两段按硬约束**保持 uop 原绝对位**（见 back2_params §2
+        //     的位域表），故这里 `BACK2_U_EXC_*` / `BACK2_UB_IS_FP` 在载荷上仍逐位成立。
+        wire [3:0]                pexc_gi = win_rd[gi][`BACK2_RB_EXC_MSB:`BACK2_RB_EXC_LSB];
         assign slot_is_br[gi] = nq[slot_idx[gi]][NQ_BR];
         assign slot_is_fp[gi] = win_rd[gi][`BACK2_UB_IS_FP];
         assign br_use[gi] = br_v_q[slot_idx[gi]] & (br_ep_q[slot_idx[gi]] == ep_gi) & slot_is_br[gi];
@@ -421,7 +434,7 @@ module rob #(
 
     // 异常：仅当该槽已完成且为头部（slot 0）
     assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0] & win_lane_ok[0];
-    assign trap_pc    = win_q[slot_idx0[2:0]][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB];
+    assign trap_pc    = win_q[slot_idx0[2:0]][`BACK2_RB_PC_MSB:`BACK2_RB_PC_LSB];
     assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
     //   ★★ EXP-B：mtval 取 ex 表（LSU 数据侧异常）或**载荷 TVAL**（派发期异常：非法指令的
     //     原始指令位 / 取指异常的故障 VA）——判据与提交侧 `ex_use` 同源（`ex_use[0]`）。
@@ -437,9 +450,9 @@ module rob #(
     //      两者在拆分前分别等于 `updq.TVAL` 与 `updq.CSRW`（后者从不被回写，恒为派发期
     //      `{25'b0, PS1I}`）⇒ 对外 79 bit 布局与语义**逐位不变**，且不再需要 64 项 32 bit 表。
     assign csr_pay = { win_q[csr_lane_idx[2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
-                       {25'b0, win_q[csr_lane_idx[2:0]][`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB]},
-                       win_q[csr_lane_idx[2:0]][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB],
-                       win_q[csr_lane_idx[2:0]][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB] };
+                       {25'b0, win_q[csr_lane_idx[2:0]][`BACK2_RB_PS1I_MSB:`BACK2_RB_PS1I_LSB]},
+                       win_q[csr_lane_idx[2:0]][`BACK2_RB_CSRADDR_MSB:`BACK2_RB_CSRADDR_LSB],
+                       win_q[csr_lane_idx[2:0]][`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB] };
 
     assign head_o      = head_q;
     assign cnt_o       = cnt_q;
@@ -479,7 +492,9 @@ module rob #(
                 for (k = 0; k < COMMIT_W; k = k + 1) begin
                     if (alloc_lane_valid[k] & (k < alloc_n)) begin
 `ifndef RV32GC_USE_VIVADO_IP
-                        if (DBG_CSR) $display("[rob-alloc t=%0t] k=%0d idx=%0d pay_csrw=0x%08x", $time, k, idx_add(tail_w, k[ROB_IDX_W:0]), alloc_payload[k*RB_W + `BACK2_RB_CSRW_MSB -: 32]);
+                        //   ★ C4：CSRW 段已从载荷删除 ⇒ 探针改打「CSR 源」= 载荷 PS1I
+                        //     （提交级 `csr_pay` 的 csrw 段正是由它拼出，语义等价）。
+                        if (DBG_CSR) $display("[rob-alloc t=%0t] k=%0d idx=%0d pay_ps1i=0x%02x", $time, k, idx_add(tail_w, k[ROB_IDX_W:0]), alloc_payload[k*RB_W + `BACK2_RB_PS1I_LSB +: `BACK2_PREG_I_W]);
 `endif
                         nq[idx_add(tail_w, k[ROB_IDX_W:0])] <=
                             pack_nq(alloc_payload[k*RB_W +: RB_W], alloc_epoch, 1'b0,
@@ -663,7 +678,7 @@ module rob #(
                              $time, bk, slot_idx[bk]);
             end
             if (trap_valid & (|nq[slot_idx[0]][NQ_EXC_L +: 4])
-                           & (win_rd[0][`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB] == 4'd0)
+                           & (win_rd[0][`BACK2_RB_EXC_MSB:`BACK2_RB_EXC_LSB] == 4'd0)
                            & ~ex_use[0])
                 $display("ROB-ASSERT-EX FAIL: trap with LSU exc but no ex table t=%0t idx=%0d",
                          $time, slot_idx[0]);
