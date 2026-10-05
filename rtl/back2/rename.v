@@ -1,10 +1,10 @@
 //==============================================================================
-// rtl/back2/rename.v —— 物理寄存器重命名（RAT + free list + 变更日志 + 检查点）
+// rtl/back2/rename.v —— 物理寄存器重命名（RAT + free list + **RAT 快照回滚** + 检查点）
 //==============================================================================
 // 项目  : rv32gc-cpu（阶段二 2B-2）
 // 规格  : docs/design/03-out-of-order.md §3.1（结构）、§3.2（整数 96 / 浮点 64，分离
 //         free list；架构基线 32 复位预置给 RAT）、§3.3（重命名规则 R1–R6）、
-//         §3.4（16 检查点 + **RAT 变更日志**恢复；free list 头快照）、§9（检查点取舍）。
+//         §3.4（16 检查点 + RAT 状态恢复；free list 头快照）、§9（检查点取舍）。
 //         docs/design/02-pipeline.md §3.6（D2：RAT 读改写 + 空闲分配 + 同块内前递）、
 //         §4.1 S3（自由表不足 ⇒ 冻结）、§5 硬规则 3（推测态回滚不依赖回滚路径回收寄存器）。
 //
@@ -21,21 +21,33 @@
 //   ① `restore_valid/restore_id`：按前端的检查点 id 恢复（03 §3.4 的设计口径）；
 //   ② `restore_rob_valid/restore_rob_idx`：按**分支的 ROB 索引**恢复（本实现的补充：
 //      前端只在"块尾预测跳转"分配检查点，块中其它条件分支误判时没有检查点——此时若
-//      退回全冲刷要重建 free list，代价过大；故维护一张按 ROB 索引的
-//      {日志写指针, free list 头} 快照表，任何 ROB 索引都可作为回滚点）。
-//   两条入口共用同一套回滚 FSM。
+//      退回全冲刷要重建 free list，代价过大；故维护一张按 ROB 索引的回滚点状态表，
+//      任何 ROB 索引都可作为回滚点）。
+//   两条入口**同源**：都以 `restore_rob_idx`（= ROB 冲刷点 `squash_idx`）为唯一回滚键。
 //
-// 回滚口径：
+// 回滚口径（★ EXP-R1：log-based rollback → **checkpointed RAT snapshot**）：
 //   · free list **只回退 head**：比回滚点更年轻的指令不可能在其存活期间提交，故"已释放
 //     区间"与"待回收的头部区间"不可能重叠（不会双重登记/静默错值）；若连 tail 一起
 //     回退，则会丢掉提交真实发生的释放 ⇒ 物理寄存器泄漏。
-//   · 变更日志按绝对位置**逆序、每拍 4 条窗口**回放：窗口内"最早写入者胜"，与逐条
-//     逆序回放等价（净效果 = 每个 arn 恢复为该窗口最早那条的 old 值）。
+//   · RAT 用**历史状态**直接恢复，不再重放"旧映射变更日志"（原 `lg_arn/lg_old/lg_val`
+//     64 深 × 13 bit 四写口/四读口阵列 + 逆序每拍 4 条回放）：
+//       ① 每个 4-lane 对齐组一份**完整 RAT 快照**（组基 = "该组首条命中 lane 之前"，
+//          与 `rb_g_fhead` 取点一致），存 `rb_rat_e/rb_rat_o`（奇偶分表 ⇒ 每表每拍 1 写口）；
+//       ② 组内 4 条 lane 的 (arn, 新 pd) 增量，按 ROB 索引 mod 4 分 4 bank 存（块内 lane
+//          的 ROB 索引连续 ⇒ 每 bank 每拍 1 写口）；回滚到组内索引 k 时把 lane 0..k
+//          **正向**应用到组基快照上。
+//       ③ 回滚拍一次**宽恢复**（§3.2）：`rat_q <= rat_restore`（= 组基 + 组内前缀增量），
+//          不再有"逆序回放窗口"，`busy` 只由全冲刷重建 `rb_act` 驱动。
+//       ★ 实测结论（EXP-R1 交付报告）：本改写**LUT 基本持平**（OOC 综合整数域 +105、
+//         浮点域 −376），因为被删掉的日志阵列本身只值 ~2.9k/域（旧口径 "lg_*≈11k"
+//         已过时），而快照的宽读 mux + 组基捕获 mux 与之量级相当；FF 则 +6.4k。
+//         结构正确性/拍级等价已全绿（tb_fl S4/S8、锁步五个程序逐拍一致、regress 33/33）。
 //
 // 【全冲刷（提交点异常）】架构 RAT 复制 + free list 重建 FSM（逐拍扫描 NREG 项，凡未被
 //   架构 RAT 引用者依次压回）；架构引用位图 `ar_used_q` 在提交点增量维护。
 //
 // 风格  : 组合逻辑 `assign`/条件表达式；always 块只用于存储体与指针（时序元件）。
+//         EXP-R1 新增的 4-bank 增量/奇偶快照表全部用 `assign` + generate 表达。
 //         ★ 不使用"读存储器"的 function（iverilog 12.0 实测返回错误结果，
 //           见 rtl/front4/README.md §7.1）。
 //==============================================================================
@@ -150,10 +162,11 @@ module rename #(
     reg  [FL_PTR_W-1:0]  fhead_q, ftail_q;
 
     localparam integer LOG_AW   = $clog2(LOG_N);   // log array address width (64 -> 6 bit; index wraps naturally)
-    wire [LOG_AW-1:0]  lg_wr_a  = log_wr_q[LOG_AW-1:0];   // write address (B27 fix: slice, no mask)
-    reg  [ARN_W-1:0]     lg_arn  [0:LOG_N-1];
-    reg  [PDW-1:0]       lg_old  [0:LOG_N-1];
-    reg                  lg_val  [0:LOG_N-1];
+    //   ★★ EXP-R1（本任务）：原"旧映射变更日志" `lg_arn/lg_old/lg_val`（64 深 × 13 bit、
+    //      四写口 + 四读口、回滚时按绝对位置逆序每拍 4 条回放）已被**组基 RAT 快照 +
+    //      组内 lane 增量 + 一次宽恢复**取代；状态见下面 §0.1。
+    //   `log_wr_q` 保留为"已派发有效 lane 计数"（仅 `log_wr_o` 观测端口与既有死逻辑用；
+    //      综合出顶层后即被裁剪），口径与旧实现逐位相同。
     reg  [LOG_PTR_W-1:0] log_wr_q;
 
     reg  [FL_PTR_W-1:0]  ck_fhead [0:CKPT_N-1];
@@ -183,9 +196,35 @@ module rename #(
     reg  [3:0]            rb_g_ndst  [0:GRP_N-1];
     reg  [GRP_N-1:0]      rb_g_init;
 
-    reg                  undo_act;
-    reg  [LOG_PTR_W-1:0] undo_ptr;
-    reg  [8:0]           undo_dist;
+    //==========================================================================
+    // 0.1 EXP-R1：RAT 快照回滚状态（取代 log-based rollback）
+    //==========================================================================
+    //   回滚真正需要的是"某个历史时点的**整份 map state**"，不是"把日志一条条倒放"。
+    //   这里把它直接存下来，回滚时**一次宽恢复**（§3.2）：
+    //     (1) `rb_rat_e/rb_rat_o[g>>1]`：组 g 的**完整 RAT 快照**，语义 = "该组首条命中
+    //         lane 之前"的 RAT（与 `rb_g_fhead[g]` 的取点完全一致）。
+    //         ★ 按**组号奇偶**分两张平面表（奇偶是组号的静态属性）：同拍最多 2 个组需要
+    //           写基（4 条 lane 的 ROB 索引连续 ⇒ 最多跨 2 个相邻组），相邻组奇偶必不同
+    //           ⇒ 每张平面表每拍 ≤1 写口（写数据二选一只需 1 bit 选择）。
+    //         ★ 读侧同样按 `urst_grp[0]` 二选一（两个 8:1 mux + 1 个 2:1 选），
+    //           比"16:1 双平面 + 2:1 选"省约一半读 mux LUT（实测 1,247 LUT）。
+    //     (2) `rb_arn_b*/rb_pd_b*`：组内 4 条 lane 的 (目的架构号, 新物理号) 增量，
+    //         按 **ROB 索引 mod 4 分 4 个 bank**（块内 lane 的 ROB 索引连续 ⇒ 4 条 lane
+    //         必落在 4 个不同 bank）⇒ 每 bank 每拍 1 写口，数据直连。
+    //         回滚到组内索引 k：把 lane 0..k 的增量**正向**应用到组基快照上即可。
+    //   ★ 资源取向：用 FF 换 LUT（当前 LUT 146.51%、FF 25.6%）。
+    localparam integer SNAP_W = ARCH_N * PDW;      // 组基快照位宽（整数 224 / 浮点 192）
+    reg  [SNAP_W-1:0]    rb_rat_e [0:(GRP_N/2)-1]; // 偶数组组基 RAT 快照（写口 A）
+    reg  [SNAP_W-1:0]    rb_rat_o [0:(GRP_N/2)-1]; // 奇数组组基 RAT 快照（写口 B）
+    reg  [ARN_W-1:0]     rb_arn_b0 [0:GRP_N-1];    // bank 0（ROB 索引 mod 4 == 0）
+    reg  [ARN_W-1:0]     rb_arn_b1 [0:GRP_N-1];
+    reg  [ARN_W-1:0]     rb_arn_b2 [0:GRP_N-1];
+    reg  [ARN_W-1:0]     rb_arn_b3 [0:GRP_N-1];
+    reg  [PDW-1:0]       rb_pd_b0  [0:GRP_N-1];
+    reg  [PDW-1:0]       rb_pd_b1  [0:GRP_N-1];
+    reg  [PDW-1:0]       rb_pd_b2  [0:GRP_N-1];
+    reg  [PDW-1:0]       rb_pd_b3  [0:GRP_N-1];
+
     reg  [15:0]          cnt_rst_q;
 
     reg                  rb_act;
@@ -397,6 +436,8 @@ module rename #(
     wire [4*GRP_N-1:0]         grp_mask_w;    // 写回的新 dst 掩码（按组拼接）
     wire [FL_PTR_W*GRP_N-1:0]  grp_bf_w;      // 新组基 fhead（按组拼接）
     wire [LOG_PTR_W*GRP_N-1:0] grp_bl_w;      // 新组基 log（按组拼接）
+    wire [2*GRP_N-1:0]         grp_first_w;   // 组内**首条命中 lane** 的块内位置（EXP-R1）
+
     generate
     for (g = 0; g < GRP_N; g = g + 1) begin : g_d1g
         wire [W-1:0] hit;
@@ -429,6 +470,7 @@ module rename #(
                           (hit[3] & (lane_bit[3] == 2'd3) & lane_need_dst[3]);
         assign grp_has_w [g]        = has;
         assign grp_init_w[g]        = do_init;
+        assign grp_first_w[2*g +: 2] = first;
         assign grp_mask_w[4*g +: 4] = (do_init ? 4'b0 : rb_g_ndst[g]) | set_b;
         assign grp_bf_w  [FL_PTR_W*g +: FL_PTR_W] =
                    fhead_q + {{(FL_PTR_W-3){1'b0}}, ord_d[first]};
@@ -436,6 +478,125 @@ module rename #(
                    log_wr_q + {{(LOG_PTR_W-3){1'b0}}, lg_rank[first]};
     end
     endgenerate
+
+    // ---- 1.6c EXP-R1：RAT 快照写侧（组基宽快照候选 + 每 bank 增量写口）----
+    //   `blk_pre[j]` = 本块**前 j 条 lane 已应用后**的整份 RAT（j = 0..3；j=0 即当前
+    //   `rat_q`）。组基快照 = "该组首条命中 lane 之前" ⇒ 就是 `blk_pre[grp_first_w[g]]`。
+    //   j 是生成期常量 ⇒ `(j>=2)/(j>=3)` 常量折叠，低 j 的候选更便宜。
+    //   lane j 是否改写 arn=g（仅"有效 + 需目的寄存器"的 lane 有写权限）
+    wire [ARCH_N-1:0] lhit0, lhit1, lhit2;
+    generate
+    for (g = 0; g < ARCH_N; g = g + 1) begin : g_lhit
+        assign lhit0[g] = lane_valid[0] & lane_need_dst[0] &
+                          (lane_dst_arn[0*ARN_W +: ARN_W] == g[ARN_W-1:0]);
+        assign lhit1[g] = lane_valid[1] & lane_need_dst[1] &
+                          (lane_dst_arn[1*ARN_W +: ARN_W] == g[ARN_W-1:0]);
+        assign lhit2[g] = lane_valid[2] & lane_need_dst[2] &
+                          (lane_dst_arn[2*ARN_W +: ARN_W] == g[ARN_W-1:0]);
+    end
+    endgenerate
+    //   ★ 折叠式：把 "j >= lane 序号" 的门控直接并进每个 arn 的优先级表达式，
+    //     不再先算 4 份整向量再 4:1 选（后者在 224 bit 宽度上极贵，实测 +3.6k LUT）。
+    wire ck_w0_ge1 = (ck_w0_first != 2'd0);
+    wire ck_w0_ge2 = ck_w0_first[1];
+    wire ck_w0_ge3 = (ck_w0_first == 2'd3);
+    wire ck_w1_ge1 = (ck_w1_first != 2'd0);
+    wire ck_w1_ge2 = ck_w1_first[1];
+    wire ck_w1_ge3 = (ck_w1_first == 2'd3);
+    wire [SNAP_W-1:0] ck_w0_dat;
+    wire [SNAP_W-1:0] ck_w1_dat;
+    generate
+    for (k = 0; k < ARCH_N; k = k + 1) begin : g_cap
+        assign ck_w0_dat[k*PDW +: PDW] =
+            ((ck_w0_ge3 & lhit2[k]) ? ev_pd_dst[2] :
+             (ck_w0_ge2 & lhit1[k]) ? ev_pd_dst[1] :
+             (ck_w0_ge1 & lhit0[k]) ? ev_pd_dst[0] : rat_q[k]);
+        assign ck_w1_dat[k*PDW +: PDW] =
+            ((ck_w1_ge3 & lhit2[k]) ? ev_pd_dst[2] :
+             (ck_w1_ge2 & lhit1[k]) ? ev_pd_dst[1] :
+             (ck_w1_ge1 & lhit0[k]) ? ev_pd_dst[0] : rat_q[k]);
+    end
+    endgenerate
+
+    //   本拍需要写组基的组（`grp_init_w`）最多 2 个；用"最低/次低置位"各取一个
+    //   （两个写口），再按各自组号的奇偶落到 `rb_rat_e` / `rb_rat_o`（见 §3.4 写侧）。
+    wire [GRP_N-1:0]  ck_init_lsb = grp_init_w & (~grp_init_w + 1'b1);
+    wire [GRP_N-1:0]  ck_init_rem = grp_init_w & (grp_init_w - 1'b1);
+    wire [GRP_N-1:0]  ck_init_2nd = ck_init_rem & (~ck_init_rem + 1'b1);
+    wire              ck_w0_en    = |ck_init_lsb;
+    wire              ck_w1_en    = |ck_init_2nd;
+    wire [GRP_AW-1:0] ck_w0_g = ck_init_lsb[0]  ? 4'd0  : ck_init_lsb[1]  ? 4'd1  :
+                                ck_init_lsb[2]  ? 4'd2  : ck_init_lsb[3]  ? 4'd3  :
+                                ck_init_lsb[4]  ? 4'd4  : ck_init_lsb[5]  ? 4'd5  :
+                                ck_init_lsb[6]  ? 4'd6  : ck_init_lsb[7]  ? 4'd7  :
+                                ck_init_lsb[8]  ? 4'd8  : ck_init_lsb[9]  ? 4'd9  :
+                                ck_init_lsb[10] ? 4'd10 : ck_init_lsb[11] ? 4'd11 :
+                                ck_init_lsb[12] ? 4'd12 : ck_init_lsb[13] ? 4'd13 :
+                                ck_init_lsb[14] ? 4'd14 : 4'd15;
+    wire [GRP_AW-1:0] ck_w1_g = ck_init_2nd[0]  ? 4'd0  : ck_init_2nd[1]  ? 4'd1  :
+                                ck_init_2nd[2]  ? 4'd2  : ck_init_2nd[3]  ? 4'd3  :
+                                ck_init_2nd[4]  ? 4'd4  : ck_init_2nd[5]  ? 4'd5  :
+                                ck_init_2nd[6]  ? 4'd6  : ck_init_2nd[7]  ? 4'd7  :
+                                ck_init_2nd[8]  ? 4'd8  : ck_init_2nd[9]  ? 4'd9  :
+                                ck_init_2nd[10] ? 4'd10 : ck_init_2nd[11] ? 4'd11 :
+                                ck_init_2nd[12] ? 4'd12 : ck_init_2nd[13] ? 4'd13 :
+                                ck_init_2nd[14] ? 4'd14 : 4'd15;
+    wire [1:0]        ck_w0_first = grp_first_w[2*ck_w0_g +: 2];
+    wire [1:0]        ck_w1_first = grp_first_w[2*ck_w1_g +: 2];
+
+    //   增量写口：bank = ROB 索引 [1:0]，bank 内地址 = 组号（ROB 索引 [LOG_AW-1:2]）。
+    //   块内 lane 的 ROB 索引连续 ⇒ 4 条 lane 落在 4 个不同 bank ⇒ 每 bank 每拍 ≤1 写口。
+    wire [W-1:0]      bw_sel [0:3];
+    wire              bw_en  [0:3];
+    wire [GRP_AW-1:0] bw_a   [0:3];
+    wire [ARN_W-1:0]  bw_arn [0:3];
+    wire [PDW-1:0]    bw_pd  [0:3];
+    generate
+    for (g = 0; g < W; g = g + 1) begin : g_bws
+        for (k = 0; k < 4; k = k + 1) begin : g_bwsk
+            assign bw_sel[k][g] = lane_go[g] & (lane_bit[g] == k[1:0]);
+        end
+    end
+    endgenerate
+    generate
+    for (g = 0; g < 4; g = g + 1) begin : g_bwm
+        assign bw_en [g] = |bw_sel[g];
+        assign bw_a  [g] = bw_sel[g][0] ? lane_grp[0] :
+                           bw_sel[g][1] ? lane_grp[1] :
+                           bw_sel[g][2] ? lane_grp[2] : lane_grp[3];
+        assign bw_arn[g] = bw_sel[g][0] ? lane_dst_arn[0*ARN_W +: ARN_W] :
+                           bw_sel[g][1] ? lane_dst_arn[1*ARN_W +: ARN_W] :
+                           bw_sel[g][2] ? lane_dst_arn[2*ARN_W +: ARN_W] :
+                                          lane_dst_arn[3*ARN_W +: ARN_W];
+        assign bw_pd [g] = bw_sel[g][0] ? ev_pd_dst[0] :
+                           bw_sel[g][1] ? ev_pd_dst[1] :
+                           bw_sel[g][2] ? ev_pd_dst[2] : ev_pd_dst[3];
+    end
+    endgenerate
+
+    //   ★ EXP-R1 结构前提自检（仅仿真分支编译 ⇒ 综合零代价）：
+    //     ① 同拍需要写组基的组 ≤ 2 个，且二者**奇偶必然不同**（4 条 lane 的 ROB 索引连续
+    //        ⇒ 最多跨 2 个相邻组）。若违反，奇偶分表会静默丢掉一个组的快照 ⇒ 回滚基错。
+    //     ② 4 条 lane 必须落在 4 个**不同 bank**（同样由"ROB 索引连续"保证），否则同一
+    //        拍对同一 bank 的双写会丢一条增量。
+    //     两条都是"未捕获即失败"：回归里一响就说明对外契约被破坏，而不是让我们静默错误。
+`ifndef RV32GC_USE_VIVADO_IP
+    always @(posedge clk) begin
+        if (CHK && rst_n) begin
+            if (ck_w0_en && ck_w1_en && (ck_w0_g[0] == ck_w1_g[0]))
+                $display("RENAME-CHK CKPT-PAR: 同拍组基写口同奇偶 g0=%0d g1=%0d（相邻组前提被破坏）",
+                         ck_w0_g, ck_w1_g);
+            if (ck_w1_en && (ck_w0_g == ck_w1_g))
+                $display("RENAME-CHK CKPT-DUP: 同拍组基写口同组 g=%0d", ck_w0_g);
+            if ((bw_sel[0][0] + bw_sel[0][1] + bw_sel[0][2] + bw_sel[0][3]) > 1 ||
+                (bw_sel[1][0] + bw_sel[1][1] + bw_sel[1][2] + bw_sel[1][3]) > 1 ||
+                (bw_sel[2][0] + bw_sel[2][1] + bw_sel[2][2] + bw_sel[2][3]) > 1 ||
+                (bw_sel[3][0] + bw_sel[3][1] + bw_sel[3][2] + bw_sel[3][3]) > 1)
+                $display("RENAME-CHK INC-BANK: 同拍两条 lane 命中同一 bank（ROB 索引连续前提被破坏）");
+        end
+    end
+`endif // !RV32GC_USE_VIVADO_IP
+
 
     // ---- 1.7 检查点快照指针（含 ckpt lane 在内）----
     wire [2:0] snap_ord = (snap_lane == 2'd0) ? 3'd0 :
@@ -501,34 +662,39 @@ module rename #(
     wire [FL_PTR_W-1:0]  undo_fhead_w= rb_g_fhead[urst_grp] +
                                        {{(FL_PTR_W-3){1'b0}}, urst_cnt};
 
-    //==========================================================================
-    // 2. 回滚窗口（每拍 4 条逆序；窗口内最早写入者胜）
-    //==========================================================================
-    wire [2:0] u_k = (undo_dist >= 9'd4) ? 3'd4 :
-                     (undo_dist >= 9'd3) ? 3'd3 :
-                     (undo_dist >= 9'd2) ? 3'd2 :
-                     (undo_dist >= 9'd1) ? 3'd1 : 3'd0;
-    wire [LOG_AW-1:0] u_p3 = undo_ptr[LOG_AW-1:0] - 3'd4;
-    wire [LOG_AW-1:0] u_p2 = undo_ptr[LOG_AW-1:0] - 3'd3;
-    wire [LOG_AW-1:0] u_p1 = undo_ptr[LOG_AW-1:0] - 3'd2;
-    wire [LOG_AW-1:0] u_p0 = undo_ptr[LOG_AW-1:0] - 3'd1;
+    // ---- 1.6d EXP-R1：回滚点整份 RAT（组基快照 + 组内 lane 0..k 正向增量）----
+    //   组基：按组号奇偶取 `rb_rat_e` / `rb_rat_o`（每张平面表每拍只有 1 个写口，
+    //   避免"16 深 × 224 bit × 2 写口"每 FF 一个数据 mux 的 LUT 爆炸）。
+    wire [SNAP_W-1:0] urst_base = urst_grp[0] ? rb_rat_o[urst_grp[GRP_AW-1:1]]
+                                              : rb_rat_e[urst_grp[GRP_AW-1:1]];
+    wire [ARN_W-1:0]  urst_arn [0:3];
+    wire [PDW-1:0]    urst_pd  [0:3];
+    assign urst_arn[0] = rb_arn_b0[urst_grp];
+    assign urst_arn[1] = rb_arn_b1[urst_grp];
+    assign urst_arn[2] = rb_arn_b2[urst_grp];
+    assign urst_arn[3] = rb_arn_b3[urst_grp];
+    assign urst_pd [0] = rb_pd_b0 [urst_grp];
+    assign urst_pd [1] = rb_pd_b1 [urst_grp];
+    assign urst_pd [2] = rb_pd_b2 [urst_grp];
+    assign urst_pd [3] = rb_pd_b3 [urst_grp];
+    //   组内 lane b 生效 = mask[b]（该 lane 需目的寄存器，且已派发）且 b <= urst_lane；
+    //   同一 arn 被多条 lane 写过时**索引更大（更年轻）者胜** ⇒ 优先级 3 > 2 > 1 > 0。
+    wire urst_app1 = urst_mask[1] & (urst_lane != 2'd0);
+    wire urst_app2 = urst_mask[2] & urst_lane[1];
+    wire urst_app3 = urst_mask[3] & (urst_lane == 2'd3);
+    wire [SNAP_W-1:0] rat_restore;
+    generate
+    for (g = 0; g < ARCH_N; g = g + 1) begin : g_rrst
+        assign rat_restore[g*PDW +: PDW] =
+            (urst_app3 & (urst_arn[3] == g[ARN_W-1:0])) ? urst_pd[3] :
+            (urst_app2 & (urst_arn[2] == g[ARN_W-1:0])) ? urst_pd[2] :
+            (urst_app1 & (urst_arn[1] == g[ARN_W-1:0])) ? urst_pd[1] :
+            (urst_mask[0] & (urst_arn[0] == g[ARN_W-1:0])) ? urst_pd[0] :
+            urst_base[g*PDW +: PDW];
+    end
+    endgenerate
 
-    wire u_v3 = (u_k == 3'd4) & lg_val[u_p3];
-    wire u_v2 = (u_k >= 3'd3) & lg_val[u_p2];
-    wire u_v1 = (u_k >= 3'd2) & lg_val[u_p1];
-    wire u_v0 = (u_k >= 3'd1) & lg_val[u_p0];
-    //   ★★ free list 归还量 = 本窗口**真正被重放的、消耗目的寄存器的**条数
-    //      （`u_v*` 已由 `lg_val` 门控 ⇒ 恰好是"分配过 preg 的条目"）。归还与 RAT 重放
-    //      **同源**：RAT 回滚了几条，free list 就归还几个 preg ⇒ 结构上不可能失步。
-    wire [2:0] u_ret = {2'b0, u_v3} + {2'b0, u_v2} + {2'b0, u_v1} + {2'b0, u_v0};
-    wire u_a2 = u_v2 & ~(u_v3 & (lg_arn[u_p3] == lg_arn[u_p2]));
-    wire u_a1 = u_v1 & ~((u_v3 & (lg_arn[u_p3] == lg_arn[u_p1])) |
-                         (u_a2 & (lg_arn[u_p2] == lg_arn[u_p1])));
-    wire u_a0 = u_v0 & ~((u_v3 & (lg_arn[u_p3] == lg_arn[u_p0])) |
-                         (u_a2 & (lg_arn[u_p2] == lg_arn[u_p0])) |
-                         (u_a1 & (lg_arn[u_p1] == lg_arn[u_p0])));
-
-    assign busy          = undo_act | rb_act;
+    assign busy          = rb_act;   // EXP-R1：宽恢复 1 拍完成 ⇒ 不再有 undo_act 停顿
     assign log_wr_o      = log_wr_q;
     assign cnt_restore_o = cnt_rst_q;
 
@@ -616,6 +782,7 @@ module rename #(
     // 3. 时序
     //==========================================================================
     integer j2;
+    integer j3;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             fhead_q   <= {FL_PTR_W{1'b0}};
@@ -629,7 +796,6 @@ module rename #(
             //       flist[fhead..+7]=0 0 0 0 0 0 0 0`）。
             ftail_q   <= FREE_N[FL_PTR_W-1:0];
             log_wr_q  <= {LOG_PTR_W{1'b0}};
-            undo_act  <= 1'b0; undo_ptr <= {LOG_PTR_W{1'b0}}; undo_dist <= 9'd0;
             rb_act    <= 1'b0; rb_cnt <= 9'd0; rb_head <= {FL_PTR_W{1'b0}};
             cnt_rst_q <= 16'h0;
             ar_used_q <= {{(NREG-ARCH_N){1'b0}}, {ARCH_N{1'b1}}};
@@ -641,8 +807,19 @@ module rename #(
             //     （否则 iverilog/综合对越界下标写出界；FREE_N ≤ 64 ⇒ 预置范围不受影响）。
             for (j2 = 0; j2 < FL_DEPTH; j2 = j2 + 1) flist_q[j2] <= {PDW{1'b0}};
             for (j2 = 0; j2 < FREE_N; j2 = j2 + 1) flist_q[j2] <= (ARCH_N + j2);
-            for (j2 = 0; j2 < LOG_N; j2 = j2 + 1) begin
-                lg_arn[j2] <= {ARN_W{1'b0}}; lg_old[j2] <= {PDW{1'b0}}; lg_val[j2] <= 1'b0;
+            //   ★★ EXP-R1：组基 RAT 快照复位为单位映射（安全垫：正常世代下"未进入过的组"
+            //     不会被回滚命中，此处置恒等映射保证即使误命中也不出 X）。
+            for (j2 = 0; j2 < (GRP_N/2); j2 = j2 + 1) begin
+                for (j3 = 0; j3 < ARCH_N; j3 = j3 + 1) begin
+                    rb_rat_e[j2][j3*PDW +: PDW] <= j3[PDW-1:0];
+                    rb_rat_o[j2][j3*PDW +: PDW] <= j3[PDW-1:0];
+                end
+            end
+            for (j2 = 0; j2 < GRP_N; j2 = j2 + 1) begin
+                rb_arn_b0[j2] <= {ARN_W{1'b0}}; rb_arn_b1[j2] <= {ARN_W{1'b0}};
+                rb_arn_b2[j2] <= {ARN_W{1'b0}}; rb_arn_b3[j2] <= {ARN_W{1'b0}};
+                rb_pd_b0 [j2] <= {PDW{1'b0}};   rb_pd_b1 [j2] <= {PDW{1'b0}};
+                rb_pd_b2 [j2] <= {PDW{1'b0}};   rb_pd_b3 [j2] <= {PDW{1'b0}};
             end
             for (j2 = 0; j2 < CKPT_N; j2 = j2 + 1) begin
                 ck_fhead[j2] <= {FL_PTR_W{1'b0}}; ck_log[j2] <= {LOG_PTR_W{1'b0}};
@@ -682,7 +859,6 @@ module rename #(
             // 3.1 全冲刷（最高优先级）
             //------------------------------------------------------------------
             if (flush_all) begin
-                undo_act <= 1'b0;
                 //   ★ 2B-5 第 2 轮修正：用 `arat_next`（含本拍提交），而非旧 `arat_q`
                 for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) rat_q[j2] <= arat_next[j2];
                 for (j2 = 0; j2 < CKPT_N; j2 = j2 + 1) ck_val[j2] <= 1'b0;
@@ -719,42 +895,21 @@ module rename #(
                 //      直至 free list 耗尽。根因是"日志重放范围（undo_tgt）与分配范围本就
                 //      不同代"，两条路径都会偏，只是偏的方向相反（快照偏多⇒重复；重放偏少
                 //      ⇒泄漏）。故回退到快照路径（程序 0 全绿），真正修法见报告 §1 B27。
+                //   ★★ EXP-R1：**一次宽恢复**——把整份 RAT 换成回滚点的快照
+                //     （组基 RAT + 组内 lane 0..k 正向增量，见 §1.6d）。
+                //     不再有"逆序回放窗口"，故 `busy` 只由 `rb_act`（全冲刷重建）驱动。
+                for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1)
+                    rat_q[j2] <= rat_restore[j2*PDW +: PDW];
                 fhead_q   <= undo_fhead_w;
-                //   ★★ D1：日志写指针**回卷**到回滚点的日志位置。压缩后回滚读取按
-                //     "组基 + 组内偏移"重建，前提是"同一 ROB 索引的日志槽位 = 世代内
-                //     索引的仿射函数"。回卷后重新派发从 L_i 继续写 ⇒ 该前提在任意次
-                //     squash 下都成立（若不回卷，保留条目与重新分配条目的槽位会不连续，
-                //     这正是旧 D1 尝试的反例）。回放范围 undo_dist 用**回卷前**的日志
-                //     指针（非阻塞右值取旧值）⇒ 与逐索引快照实现逐位相同。
+                //   `log_wr_q` 仍按原口径回卷到回滚点（= 已派发有效 lane 计数），
+                //   仅供 `log_wr_o` 观测端口与既有死逻辑；不影响任何功能路径。
                 log_wr_q  <= undo_tgt_w;
-                undo_ptr  <= log_wr_q;
-                undo_dist <= {1'b0, (log_wr_q - undo_tgt_w)};
-                undo_act  <= (log_wr_q != undo_tgt_w);
                 if (restore_valid) ck_val[restore_id] <= 1'b0;
                 cnt_rst_q <= cnt_rst_q + 16'd1;
-            end else if (undo_act) begin
-                //------------------------------------------------------------------
-                // 3.3 逆序回放窗口
-                //------------------------------------------------------------------
-                if (u_v3) rat_q[lg_arn[u_p3]] <= lg_old[u_p3];
-                if (u_a2) rat_q[lg_arn[u_p2]] <= lg_old[u_p2];
-                if (u_a1) rat_q[lg_arn[u_p1]] <= lg_old[u_p1];
-                if (u_a0) rat_q[lg_arn[u_p0]] <= lg_old[u_p0];
-                undo_ptr  <= undo_ptr - {{(LOG_PTR_W-3){1'b0}}, u_k};
-                if (undo_dist <= 9'd4) undo_act <= 1'b0;
-                else                   undo_dist <= undo_dist - {6'b0, u_k};
             end else begin
                 //------------------------------------------------------------------
                 // 3.4 常规：变更日志 + RAT + 提交 + 快照登记
                 //------------------------------------------------------------------
-                for (j2 = 0; j2 < W; j2 = j2 + 1) begin
-                    if (lvf[j2]) begin
-                        //   slot = log_wr_q + lg_rank[j2] (valid-lane rank; see 1.6b)
-                        lg_arn[lg_wr_a + lg_rank[j2]] <= lane_dst_arn[j2*ARN_W +: ARN_W];
-                        lg_old[lg_wr_a + lg_rank[j2]] <= ev_pd_old[j2];
-                        lg_val[lg_wr_a + lg_rank[j2]] <= lane_need_dst[j2];
-                    end
-                end
                 for (j2 = 0; j2 < W; j2 = j2 + 1) begin
                     if (lvf[j2] & lane_need_dst[j2])
                         rat_q[lane_dst_arn[j2*ARN_W +: ARN_W]] <= ev_pd_dst[j2];
@@ -777,6 +932,36 @@ module rename #(
                     ck_fhead[snap_id] <= snap_fhead_w;
                     ck_log  [snap_id] <= snap_log_w;
                     ck_val  [snap_id] <= 1'b1;
+                end
+                //   ★★ EXP-R1：写"重命名增量"（4 bank，每 bank 每拍 ≤1 写口，数据直连）
+                //     + 组基全 RAT 快照（按奇偶落到两张平面表，每表每拍 1 写口）。
+                if (rob_snap_valid & lane_fire) begin
+                    if (bw_en[0]) begin
+                        rb_arn_b0[bw_a[0]] <= bw_arn[0];
+                        rb_pd_b0 [bw_a[0]] <= bw_pd [0];
+                    end
+                    if (bw_en[1]) begin
+                        rb_arn_b1[bw_a[1]] <= bw_arn[1];
+                        rb_pd_b1 [bw_a[1]] <= bw_pd [1];
+                    end
+                    if (bw_en[2]) begin
+                        rb_arn_b2[bw_a[2]] <= bw_arn[2];
+                        rb_pd_b2 [bw_a[2]] <= bw_pd [2];
+                    end
+                    if (bw_en[3]) begin
+                        rb_arn_b3[bw_a[3]] <= bw_arn[3];
+                        rb_pd_b3 [bw_a[3]] <= bw_pd [3];
+                    end
+                    //   奇偶分组：两个 init 组必然一奇一偶 ⇒ 每张平面表每拍 ≤1 写口。
+                    //   写数据按"哪个写口落在本平面"二选一（共用 1 bit 选择 ⇒ 每 bit 1 LUT）。
+                    if ((ck_w0_en & ~ck_w0_g[0]) | (ck_w1_en & ~ck_w1_g[0])) begin
+                        rb_rat_e[~ck_w0_g[0] ? ck_w0_g[GRP_AW-1:1] : ck_w1_g[GRP_AW-1:1]]
+                            <= ~ck_w0_g[0] ? ck_w0_dat : ck_w1_dat;
+                    end
+                    if ((ck_w0_en & ck_w0_g[0]) | (ck_w1_en & ck_w1_g[0])) begin
+                        rb_rat_o[ck_w0_g[0] ? ck_w0_g[GRP_AW-1:1] : ck_w1_g[GRP_AW-1:1]]
+                            <= ck_w0_g[0] ? ck_w0_dat : ck_w1_dat;
+                    end
                 end
                 log_wr_q <= log_wr_q + {{(LOG_PTR_W-3){1'b0}}, valid_n_f};   // 每条有效 lane 一条日志
                 fhead_q  <= fhead_q + {{(FL_PTR_W-3){1'b0}}, alloc_n_f};     // 仅需目的寄存器的 lane 消耗 free list
