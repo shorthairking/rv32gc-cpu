@@ -83,22 +83,25 @@
 // ---- 唤醒/写回总线端口数（6 个执行部件各 1 个写回口）----
 `define BACK2_WB_N           6
 
-// ---- LSQ（2B-3：SQ 32 + LQ 32；本文件是容量/位宽唯一真源）----
+// ---- LSQ（2B-3：SQ 32 + LQ 8；本文件是容量/位宽唯一真源）----
 //   ★ 2B-3 第 6 段第一步：SQ 16→32（索引宽度 4→5），LQ 4→32（在途表 → 32 项 LQ）。
 //     `BACK2_STQ_IDX_W` 只被 lsq_simple.v 与 backend_top.v 的 6 处位宽引用使用；
 //     LQ 深度改变只牵动 lsq_simple.v 内部与内存标签宽度（见 `BACK2_MEM_TAG_W`）。
 //   ★ 2B-5 L5（面积杠杆）：**LQ 32→16**（索引 5→4）——纯容量缩减，只降低"在飞 load
 //     数上限"，不改任何指令语义（槽位仍在 D3 派发期分配、提交点释放；转发/请求/响应
 //     逐拍逻辑全部按 `OUT_N`/`LQ_IW` 参数化，无字面宽度）。SQ 保持 32 不动。
+//   ★★ EXP-R3（LQ 16→8，索引 4→3）——同上口径的第二次纯容量缩减。依据：EXP-R 容量数据
+//     （docs/design/11-dynamic-behavior-r.md §1.3）实测 **LQ 高水位仅 6**（16 深有余量；
+//     而 SQ 高水位 20 ⇒ SQ 不可砍，LQ 是更安全的一侧）。逐拍逻辑全部参数化 ⇒ 无字面宽度。
 `define BACK2_STQ_N          32
 `define BACK2_STQ_IDX_W      5
-`define BACK2_LQ_N           16
-`define BACK2_LQ_IDX_W       4
+`define BACK2_LQ_N           8
+`define BACK2_LQ_IDX_W       3
 //   标签宽度 = log2(LQ_N) + 1：槽标签用 0..LQ_N-1（最高位恒 0），**store 提交排空的
 //   标签取全 1** ⇒ 恰好多留 1 bit 才不会与末号槽撞车（LQ_N=4 时 3 bit 的旧口径只是
-//   因为 2 bit 槽号 + 1 bit 分隔位；LQ_N=16 ⇒ 4 bit 槽号 + 1 bit 分隔位 = 5 bit；
-//   LQ_N=32 时曾同步为 6 bit）。
-`define BACK2_MEM_TAG_W      5
+//   因为 2 bit 槽号 + 1 bit 分隔位；LQ_N=8 ⇒ 3 bit 槽号 + 1 bit 分隔位 = 4 bit；
+//   LQ_N=16 时为 5 bit、LQ_N=32 时曾为 6 bit）。
+`define BACK2_MEM_TAG_W      4
 `define BACK2_MEM_OUT_N      `BACK2_LQ_N     // 在途访存槽（MSHR 口径）= LQ 深度
 //   提交排空队列（CDQ）深度：rob.v 允许**同拍最多 4 条 store 提交**，而排空口每拍只发一笔
 //   ⇒ LSQ 必须能暂存"提交组内的其余 store"，否则它们会被提交却永不落地（2B-3 登记的
@@ -415,7 +418,8 @@
 //   [73:69]   ARND           目的架构号（**只为 `pack_nq`**）
 //   [79:74]   PDFDST         浮点新映射（**只为 `pack_nq`**）
 //   [84:80]   STQ            store queue 项索引（`p_stq` 排空 + nq）
-//   [88:85]   LQ             load queue 项索引（nq；见 §2.5 L5 口径）
+//   [88]      保留           （EXP-R3：LQ 16→8 后本字段收窄 1 bit ⇒ 此位恒 0）
+//   [87:85]   LQ             load queue 项索引（3 bit；见 §2.5 L5 口径）
 //   [120:89]  TVAL           异常附加值 / 原始指令位（`trap_tval` 回落 + `csr_pay`）
 //   [152:121] TRTGT          分支实际目标（**占位 0**，输出位置由 `merge_upd` 用 br 表填）
 //   [153]     TRTAKEN        分支实际方向（**占位 0**，同上）
@@ -454,8 +458,13 @@
 `define BACK2_RB_PDFDST_LSB  74
 `define BACK2_RB_STQ_MSB     84
 `define BACK2_RB_STQ_LSB     80         // store queue 项索引（≤16 项）
-`define BACK2_RB_LQ_MSB      88
-`define BACK2_RB_LQ_LSB      85         // load queue 项索引（≤16 项）
+//   ★★ EXP-R3（LQ 16→8）：本字段收窄 1 bit —— **MSB 88→87、LSB 恒 85**，`[88]` 变为保留位
+//     （恒 0）。`BACK2_RB_W` 仍 229：本字段之上的 TVAL/TRTGT/…/BTB 绝对位位置**逐位不变**
+//     （与 2B-5 L5 的"顶端收窄留保留位"同一做法）。打包侧 `backend_top.v` 在 `[88]` 补 1 bit 0。
+//     ⚠ 本字段当前**无功能读点**（`backend_top.v` 的 `p_lq` 已无调用者；见 D2 报告 §nq 死字段），
+//       保留它只为不改动 RB 布局的其余部分；彻底删除属后续 C4 载荷裁剪候选，不在本任务范围。
+`define BACK2_RB_LQ_MSB      87         // ★ EXP-R3：88→87（LQ 16→8；[88] 保留）
+`define BACK2_RB_LQ_LSB      85         // load queue 项索引（≤8 项，3 bit）
 `define BACK2_RB_TVAL_MSB    120
 `define BACK2_RB_TVAL_LSB    89         // 异常附加值 / 原始指令位
 `define BACK2_RB_TRTGT_MSB   152
@@ -476,6 +485,9 @@
 //     放进宽载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
 //     （原独立的 `rep_q[]` 数组已无任何读写 ⇒ EXP-B 一并删除。）
 `define BACK2_RB_W           229        // ★ C4：416→229（XPM 位宽 229 ⇒ 3 RAMB36/bank）
+//   ★★ EXP-R3（LQ 16→8）：LQ 字段收窄 1 bit 但 `[88]` 转为保留位 ⇒ **RB_W 仍 229**
+//     （与 2B-5 L5 收窄顶端字段时 RB_W 恒 416 同理：宁可留 1 bit 保留位，也不动其余字段的
+//      绝对位位置）。
 //   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
 //     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）。
 //     MSB→LSB： pre{mret, sret, maint_kind[2:0]} | trtaken | pdf[5:0] | pdi[6:0] | arn[4:0] |

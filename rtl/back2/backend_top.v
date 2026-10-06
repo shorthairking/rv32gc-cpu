@@ -108,7 +108,7 @@ module backend_top #(
     output wire [31:0] mem_req_addr_o,
     output wire [31:0] mem_req_wdata_o,
     output wire [3:0]  mem_req_wstrb_o,
-    output wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag_o,   // ★ 2B-3 扩 3→6 bit；2B-5 L5 LQ 16 ⇒ 5 bit
+    output wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag_o,   // ★ 2B-3 扩 3→6 bit；2B-5 L5 LQ 16 ⇒ 5 bit；EXP-R3 LQ 8 ⇒ 4 bit
     input  wire        mem_req_ready_i,
     input  wire        mem_rsp_valid_i,
     input  wire [31:0] mem_rsp_rdata_i,
@@ -290,6 +290,8 @@ module backend_top #(
     function [3:0] p_ckid; input [RB_W-1:0] p; begin p_ckid = p[`BACK2_RB_CKPT_MSB:`BACK2_RB_CKPT_LSB]; end endfunction
     function [2:0] p_cls;  input [RB_W-1:0] p; begin p_cls  = p[`BACK2_RB_CLS_MSB:`BACK2_RB_CLS_LSB]; end endfunction
     function [`BACK2_STQ_IDX_W-1:0] p_stq; input [RB_W-1:0] p; begin p_stq = p[`BACK2_RB_STQ_MSB:`BACK2_RB_STQ_LSB]; end endfunction
+    //   ★ EXP-R3：本函数当前**无调用者**（LQ 索引在提交侧无功能读点，见 back2_params.vh
+    //     RB_LQ 注）；保留定义仅为"位域真源"完整。LQ 16→8 后返回 3 bit（p[87:85]）。
     function [`BACK2_LQ_IDX_W-1:0]  p_lq;  input [RB_W-1:0] p; begin p_lq  = p[`BACK2_RB_LQ_MSB:`BACK2_RB_LQ_LSB];  end endfunction
     function [11:0] p_csra;input [RB_W-1:0] p; begin p_csra = p[`BACK2_RB_CSRADDR_MSB:`BACK2_RB_CSRADDR_LSB]; end endfunction
     function [2:0]  p_csrop;input [RB_W-1:0] p;begin p_csrop= p[`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB]; end endfunction
@@ -1118,7 +1120,8 @@ module backend_top #(
             1'b0,                                                          // [153]     trtaken（占位）
             32'h0,                                                         // [152:121] tr 目标（占位）
             d1_uop_q[g5][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],             // [120:89]  异常 tval
-            ld_alloc_idx[g5*LDW +: LDW],                                   // [88:85]   LQ 索引
+            1'b0,                                                          // [88]      保留（EXP-R3 LQ 16→8）
+            ld_alloc_idx[g5*LDW +: LDW],                                   // [87:85]   LQ 索引（3 bit）
             st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],         // [84:80]   STQ 索引
             lane_uop_fin[g5][`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],   // → [79:74]   浮点新映射
             lane_uop_fin[g5][`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB],       // → [73:69]   目的架构号
