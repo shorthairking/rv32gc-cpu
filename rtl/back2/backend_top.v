@@ -2297,35 +2297,77 @@ module backend_top #(
     //     `cnt − deq_n + enq_n`，见 §13 时序块。原写法在"出队 + 派发/提交"同拍恒把那次 −1
     //     抹掉（`trq_acc==0` 时 `+0` 覆盖）⇒ cnt 长期虚高不归零 ⇒ `train_valid_o` 恒 1 ⇒
     //     `trq_r` 空转跑飞（EXP-R 实测出队 39251 vs 入队 4359）。
-    //   ⚠ 遗留（**本任务有意不改、已登记 EXP-R3b**）：`trq_acc` 仅 2 bit 而 `COMMIT_W = 4`
-    //     ⇒ 4 lane 全中时 acc 回绕为 0（4 条已写入却不计入 cnt/w，指针与 cnt 仍自洽，
-    //     只是这 4 条训练被下一拍覆盖）；若需修需改 3 bit 并同步 cnt/指针核算。
-    localparam integer TRQ_D = 16;
-    reg [106:0] trq [0:TRQ_D-1];
-    reg [4:0]   trq_w, trq_r;
-    reg [4:0]   trq_cnt;
-    wire        trq_full = (trq_cnt > (TRQ_D-4));    // 保持原式 ⇒ 阈值 12（13 项起判满）
-    reg  [3:0]  trq_ok;
-    reg  [1:0]  trq_ord [0:3];
-    reg  [1:0]  trq_acc;
-    //   EXP-R3a：出队/入队条数（同拍各一，计入同一表达式；`enq` 在满拍整拍丢弃）
-    wire        trq_deq_n = train_valid_o;
-    wire        trq_enq_en = (disp_fire_w | cmt_ok) & ~trq_full;
-    wire [4:0]  trq_enq_n = trq_enq_en ? {3'b0, trq_acc} : 5'd0;
-    integer     ti;
-    always @(*) begin
-        trq_acc = 2'd0;
-        for (ti = 0; ti < COMMIT_W; ti = ti + 1) begin
-            trq_ok[ti] = cmt_st_branch[ti] & cmt_ok & ~cmt_hold_w[ti];
-            trq_ord[ti] = trq_acc;
-            if (trq_ok[ti]) trq_acc = trq_acc + 2'd1;
-        end
-    end
+    //   ⚠ 遗留（EXP-R3a 登记的 `trq_acc` 2 bit 回绕）——**本段（EXP-R3b）已随结构重构消除**：
+    //     新结构没有 `trq_acc`，入队条数不再由累加器计数（4 lane 全中时 acc 回绕为 0 的老坑
+    //     自然消失），见下。
+    //
+    //==========================================================================
+    //   ★★ EXP-R3b（P0 面积杠杆）：结构重构为「4 槽提交暂存 + 1W/1R 16 深 FIFO」
+    //==========================================================================
+    //   动机：旧结构 = 「4 个**任意**写口 × 107 bit × 16 项」——每个 FIFO 项都要一套
+    //   4:1 数据 mux ＋ 四路写地址译码，是"多写口 mux"大户（历史定位 ~9.8k LUT）。
+    //
+    //        commit 4-wide（lane 0..3 = 程序序）
+    //             ↓   槽 i ← lane i（**单源写 ⇒ 数据口零 mux**）
+    //        4 槽 staging（stg[0:3] / stg_v[0:3]）
+    //             ↓   每拍排空 1 条（取**最低有效槽**）
+    //        1W/1R FIFO（深 16；写口 = 单一 107 bit 数据总线 ＋ 4→16 写使能译码）
+    //             ↓   1 条/拍
+    //        BPU training
+    //
+    //   面积机理：FIFO 每项不再需要数据 mux（写数据是**总线** `trq_wdata`，各槽只多一条
+    //   "写指针相等"的写使能 ⇒ 落成带 CE 的触发器，几乎零 LUT）；4:1 数据选择只剩
+    //   staging→FIFO 的**一处**。
+    //   ★ 次序正确性（不靠"恰好顺序对"）：staging 槽号 = lane 号 = 程序序；排空取最低有效槽。
+    //     新 lane i 仅当"排在**本拍排空后**仍挂起的最高槽之后"才允许写入（`stg_mask_hi`）——
+    //     排空自低向高 ⇒ 槽 i 一旦写入就必然晚于所有挂起项进 FIFO ⇒ **不重排**。被拒的新
+    //     lane 就地处丢弃（best-effort，与旧 `trq_full` 丢弃同契约，不反压提交）。
+    //   ★ 容量：staging 4 ＋ FIFO 16 ⇒ 在飞 ≤20（旧口径 `cnt>12` 起丢弃）；丢弃率不升反降。
+    //   ★ `disp_fire_w` 从入队条件中删除：旧式 `(disp_fire_w | cmt_ok) & ~trq_full` 中写数据/
+    //     写使能全部来自提交 lane（`trq_ok` 已含 `cmt_ok`）⇒ `disp_fire_w` 分支在旧码里即
+    //     **空转**（acc=0、无 lane 写、指针 +0）；本段按真源只保留提交驱动。
+    localparam integer TRQ_D  = 16;          // 单写口 FIFO 深度（沿用 C7 口径）
+    localparam integer TRQ_SD = 4;           // staging 槽数（= COMMIT_W=4，4 宽提交是结构前提）
+    localparam integer TRQW   = 107;         // 训练条目位宽（与旧 FIFO 逐位同布局）
+
+    // ---- 1W/1R FIFO（mod-16 环形，**单写口**）----
+    reg  [TRQW-1:0] trq [0:TRQ_D-1];
+    reg  [3:0]      trq_w, trq_r;            // ★ 4 bit（真 mod 16；旧 5 bit 指针已废）
+    reg  [4:0]      trq_cnt;                 // 0..16
+    wire            trq_pop  = train_valid_o;                          // FIFO 出队 = training 出队
+    wire            trq_room = ((trq_cnt - {4'b0, trq_pop}) < 5'd16);  // 本拍可写 1 条
+
+    // ---- 4 槽 staging（槽 i ← lane i：单源写 ⇒ 数据口零 mux）----
+    reg  [TRQW-1:0]  stg [0:TRQ_SD-1];
+    reg  [TRQ_SD-1:0] stg_v;                 // 各槽有效位
+    //   提交侧训练申请（唯一真源）：本拍哪些 lane 是"可上报的控制转移"
+    wire [3:0]      trq_ok = cmt_st_branch & {4{cmt_ok}} & ~cmt_hold_w;
+
+    //   排空槽 = 最低有效槽；`trq_room` 保证不覆盖 FIFO 中未出队项
+    wire [1:0]      stg_drain_slot = stg_v[0] ? 2'd0 : stg_v[1] ? 2'd1 :
+                                     stg_v[2] ? 2'd2 : 2'd3;
+    wire            stg_drain_v    = (|stg_v) & trq_room;
+    wire [3:0]      stg_v_after    = stg_v & ~(stg_drain_v ? (4'd1 << stg_drain_slot) : 4'd0);
+    wire            stg_any_after  = |stg_v_after;
+    wire [1:0]      stg_hi_after   = stg_v_after[3] ? 2'd3 : stg_v_after[2] ? 2'd2 :
+                                     stg_v_after[1] ? 2'd1 : 2'd0;
+    //   "排在所有挂起项之后"的 lane 掩码（lane 号 = 槽号）：hi_after 的下一槽起全 1。
+    //   `hi_after+1 == 4` 时 `4'd1<<4` 截断为 0 ⇒ `0-1=4'hF` ⇒ 取反全 0（lane 3 也拒）✓
+    wire [3:0]      stg_mask_hi    = stg_any_after ? ~((4'd1 << (stg_hi_after + 2'd1)) - 4'd1)
+                                                   : 4'hF;
+    wire [3:0]      stg_acc        = trq_ok & stg_mask_hi;
+
+    //   staging → FIFO 的**唯一** 4:1 数据选择（旧结构是每个 FIFO 项一套）
+    wire [TRQW-1:0] trq_wdata      = stg[stg_drain_slot];
+
     wire [3:0]  tcp_cond, tcp_tk, tcp_ind, tcp_call, tcp_ret;
     wire [31:0] tcp_tgt [0:3];
     wire [3:0]  tcp_ptk, tcp_psg, tcp_pgd, tcp_pld, tcp_bh, tcp_bw;
     wire [31:0] tcp_ptg [0:3];
     wire [31:0] tcp_pc  [0:3];
+    //   ★ EXP-R3b：每 lane 打成**一条 107 bit 训练条目**（与旧 FIFO 项逐位同布局），
+    //     staging 槽 i 直接吞 `tcp_data[i]`（单源写）。
+    wire [TRQW-1:0] tcp_data [0:3];
     genvar tc;
     generate
     for (tc = 0; tc < COMMIT_W; tc = tc + 1) begin : g_trf
@@ -2347,25 +2389,44 @@ module backend_top #(
         assign tcp_bw[tc]   = pp[`BACK2_RB_BTB_LSB];
         assign tcp_ptg[tc]  = pp[`BACK2_RB_PREDTGT_MSB:`BACK2_RB_PREDTGT_LSB];
         assign tcp_pc[tc]   = p_pc(pp);
+        //   ★ EXP-R3b：位拼接顺序 = 旧 FIFO 写口顺序（MSB→LSB），逐位等价
+        assign tcp_data[tc] = {
+            tcp_cond[tc], tcp_tk[tc], tcp_ind[tc], tcp_call[tc], tcp_ret[tc], tcp_tgt[tc],
+            tcp_ptk[tc], tcp_psg[tc], tcp_pgd[tc], tcp_pld[tc], tcp_bh[tc], tcp_bw[tc],
+            tcp_ptg[tc], tcp_pc[tc]
+        };
+    end
+    endgenerate
+
+    //   ★ EXP-R3b：staging 槽 i 的单源写（`stg_acc[i]` 为写使能 ⇒ 带 CE 触发器，数据口零 mux）。
+    //     复位把数据槽清零（与旧 `trq[]` 全清零同口径，避免 iverilog 下未初始化 x 进入
+    //     `trq_wdata` 组合路径）。
+    genvar sg;
+    generate
+    for (sg = 0; sg < TRQ_SD; sg = sg + 1) begin : g_stg
+        always @(posedge clk or negedge rst_n) begin
+            if (!rst_n) stg[sg] <= {TRQW{1'b0}};
+            else if (stg_acc[sg]) stg[sg] <= tcp_data[sg];
+        end
     end
     endgenerate
 
     assign train_valid_o = (trq_cnt != 0) & train_ready_i;
-    //   ★ EXP-R3a（D1b）：读索引取 `trq_r[3:0]`（真 mod 16），不再用 5 bit 指针直接索引
-    assign train_pc_o    = trq[trq_r[3:0]][31:0];
-    assign train_pred_target_o = trq[trq_r[3:0]][63:32];
-    assign train_btb_way_o     = trq[trq_r[3:0]][64];
-    assign train_btb_hit_o     = trq[trq_r[3:0]][65];
-    assign train_pred_ldir_o   = trq[trq_r[3:0]][66];
-    assign train_pred_gdir_o   = trq[trq_r[3:0]][67];
-    assign train_pred_sel_global_o = trq[trq_r[3:0]][68];
-    assign train_pred_taken_o  = trq[trq_r[3:0]][69];
-    assign train_target_o      = trq[trq_r[3:0]][101:70];
-    assign train_is_return_o   = trq[trq_r[3:0]][102];
-    assign train_is_call_o     = trq[trq_r[3:0]][103];
-    assign train_is_indirect_o = trq[trq_r[3:0]][104];
-    assign train_taken_o       = trq[trq_r[3:0]][105];
-    assign train_is_cond_o     = trq[trq_r[3:0]][106];
+    //   ★ EXP-R3b：读索引 = 4 bit 读指针（真 mod 16）
+    assign train_pc_o    = trq[trq_r][31:0];
+    assign train_pred_target_o = trq[trq_r][63:32];
+    assign train_btb_way_o     = trq[trq_r][64];
+    assign train_btb_hit_o     = trq[trq_r][65];
+    assign train_pred_ldir_o   = trq[trq_r][66];
+    assign train_pred_gdir_o   = trq[trq_r][67];
+    assign train_pred_sel_global_o = trq[trq_r][68];
+    assign train_pred_taken_o  = trq[trq_r][69];
+    assign train_target_o      = trq[trq_r][101:70];
+    assign train_is_return_o   = trq[trq_r][102];
+    assign train_is_call_o     = trq[trq_r][103];
+    assign train_is_indirect_o = trq[trq_r][104];
+    assign train_taken_o       = trq[trq_r][105];
+    assign train_is_cond_o     = trq[trq_r][106];
     assign train_pred_valid_o  = 1'b0;
 
     // ---- 12.2 检查点释放（待释放位图 + 1 条/拍排出）----
@@ -2430,7 +2491,8 @@ module backend_top #(
             cnt_sq_q  <= 32'h0; cnt_cmt4_q <= 32'h0; cnt_iss_q <= 32'h0;
             ck_busy_q <= {CKPT_N{1'b0}};
             ck_pend_q <= {CKPT_N{1'b0}};
-            trq_w <= 5'd0; trq_r <= 5'd0; trq_cnt <= 5'd0;    // ★ C7：TRQ_D=16 ⇒ 指针 5 bit / cnt 5 bit
+            trq_w <= 4'd0; trq_r <= 4'd0; trq_cnt <= 5'd0;   // ★ EXP-R3b：4 bit 环形指针（mod 16）
+            stg_v <= 4'd0;                                   // ★ EXP-R3b：staging 槽全空（数据槽在 g_stg 内复位）
             mdu_if_rob <= 7'd0; mdu_if_ep <= {EW{1'b0}}; mdu_if_di <= 1'b0;
             mdu_if_pdi <= {PW_I{1'b0}};
             fpu_if_rob <= 7'd0; fpu_if_ep <= {EW{1'b0}}; fpu_if_di <= 1'b0;
@@ -2440,7 +2502,7 @@ module backend_top #(
             for (si2 = 0; si2 < 4; si2 = si2 + 1) iwm_own_q[si2] <= 3'd6;
             for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) lq_of_rob[si2]  <= {`BACK2_LQ_IDX_W{1'b0}};
-            for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= 107'h0;
+            for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= {TRQW{1'b0}};
         end else begin
             busy_i_q <= busy_i_nx;
             busy_f_q <= busy_f_nx;
@@ -2518,25 +2580,16 @@ module backend_top #(
             if (ckpt_free_valid_o) ck_pend_q[ck_free_id_r] <= 1'b0;
             if (flush_all_w) ck_busy_q <= {CKPT_N{1'b0}};
 
-            // ---- 训练 FIFO ----
-            //   ★★ EXP-R3a（D1）：**单一赋值** `cnt − deq + enq`（同拍出队+入队都计入，
-            //     用旧值 ⇒ 不丢计数）。原为两次独立赋值，后写 `+trq_acc` 覆盖先写 `−1`。
-            trq_cnt <= trq_cnt - trq_deq_n + trq_enq_n;
-            if (train_valid_o) trq_r <= trq_r + 5'd1;
-            if (trq_enq_en) begin
-                for (si2 = 0; si2 < COMMIT_W; si2 = si2 + 1) begin
-                    if (trq_ok[si2]) begin
-                        //   ★ EXP-R3a（D1b）：写索引取低 4 bit + 组内序号（真 mod 16）
-                        trq[trq_w[3:0] + {2'b0, trq_ord[si2]}] <= {
-                            tcp_cond[si2], tcp_tk[si2], tcp_ind[si2], tcp_call[si2],
-                            tcp_ret[si2], tcp_tgt[si2],
-                            tcp_ptk[si2], tcp_psg[si2], tcp_pgd[si2], tcp_pld[si2],
-                            tcp_bh[si2], tcp_bw[si2], tcp_ptg[si2], tcp_pc[si2]
-                        };
-                    end
-                end
-                trq_w   <= trq_w + {3'b0, trq_acc};
+            // ---- 训练 FIFO（EXP-R3b：单写口 + 4 槽 staging）----
+            //   ① FIFO：出队 / 单写口入队 / 计数（**单一赋值**，同拍出队+入队都计入）
+            trq_cnt <= trq_cnt - {4'b0, trq_pop} + {4'b0, stg_drain_v};
+            if (trq_pop) trq_r <= trq_r + 4'd1;
+            if (stg_drain_v) begin
+                trq[trq_w] <= trq_wdata;            // 写数据 = staging 头（**FIFO 项无数据 mux**）
+                trq_w      <= trq_w + 4'd1;
             end
+            //   ② staging 有效位：被接收的置 1；其余按"排空后仍挂起"保持（两者互斥）
+            stg_v <= stg_acc | stg_v_after;
 
             // ---- 统计 ----
             if (squash_v_w) cnt_sq_q <= cnt_sq_q + 32'd1;
