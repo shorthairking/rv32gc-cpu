@@ -2,13 +2,13 @@
 // rtl/back2/rename.v —— 物理寄存器重命名（RAT + free list + **RAT 快照回滚** + 检查点）
 //==============================================================================
 // 项目  : rv32gc-cpu（阶段二 2B-2）
-// 规格  : docs/design/03-out-of-order.md §3.1（结构）、§3.2（整数 96 / 浮点 64，分离
+// 规格  : docs/design/03-out-of-order.md §3.1（结构）、§3.2（整数 64 / 浮点 64，分离
 //         free list；架构基线 32 复位预置给 RAT）、§3.3（重命名规则 R1–R6）、
 //         §3.4（16 检查点 + RAT 状态恢复；free list 头快照）、§9（检查点取舍）。
 //         docs/design/02-pipeline.md §3.6（D2：RAT 读改写 + 空闲分配 + 同块内前递）、
 //         §4.1 S3（自由表不足 ⇒ 冻结）、§5 硬规则 3（推测态回滚不依赖回滚路径回收寄存器）。
 //
-// 【一个实例 = 一个重命名域】整数域（PDW=7/NREG=96/FREE_N=64/NSRC=2）与浮点域
+// 【一个实例 = 一个重命名域】整数域（★ EXP-R2：PDW=6/NREG=64/FREE_N=32/NSRC=2）与浮点域
 //   （PDW=6/NREG=64/FREE_N=32/NSRC=3，第 3 源给 FMA 的 rs3）各例化一份 —— 参数化复用，
 //   避免两套实现分叉。
 //
@@ -213,7 +213,7 @@ module rename #(
     //         必落在 4 个不同 bank）⇒ 每 bank 每拍 1 写口，数据直连。
     //         回滚到组内索引 k：把 lane 0..k 的增量**正向**应用到组基快照上即可。
     //   ★ 资源取向：用 FF 换 LUT（当前 LUT 146.51%、FF 25.6%）。
-    localparam integer SNAP_W = ARCH_N * PDW;      // 组基快照位宽（整数 224 / 浮点 192）
+    localparam integer SNAP_W = ARCH_N * PDW;      // 组基快照位宽（★ EXP-R2 后整数 192 / 浮点 192）
     reg  [SNAP_W-1:0]    rb_rat_e [0:(GRP_N/2)-1]; // 偶数组组基 RAT 快照（写口 A）
     reg  [SNAP_W-1:0]    rb_rat_o [0:(GRP_N/2)-1]; // 奇数组组基 RAT 快照（写口 B）
     reg  [ARN_W-1:0]     rb_arn_b0 [0:GRP_N-1];    // bank 0（ROB 索引 mod 4 == 0）

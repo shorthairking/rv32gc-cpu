@@ -227,7 +227,7 @@ module backend_top #(
     localparam       LDW   = `BACK2_LQ_IDX_W;   // LQ 索引位宽
     //   ★★ C1（IQ 载荷瘦身）：IQ 窄载荷宽度 与 发射宽载荷（回读）宽度
     localparam       IQNW  = `BACK2_IQN_W;      // IQ 窄载荷（唤醒+门控）
-    localparam       IWW   = `BACK2_IW_W;       // ★ C9：发射宽载荷 = 215 bit 紧凑布局（back2_params §2.5）
+    localparam       IWW   = `BACK2_IW_W;       // ★ EXP-R2：发射宽载荷 = 212 bit 紧凑布局（back2_params §2.5）
     localparam WBP_ALU0 = 0, WBP_ALU1 = 1, WBP_BRU = 2, WBP_MDU = 3,
                WBP_LSU  = 4, WBP_FPU  = 5, WBP_STD = 6;
 
@@ -301,9 +301,9 @@ module backend_top #(
     function [4:0]  p_ff;  input [RB_W-1:0] p; begin p_ff  = p[`BACK2_RB_FFLAGS_MSB:`BACK2_RB_FFLAGS_LSB]; end endfunction
     function [31:0] p_trtgt;input [RB_W-1:0] p;begin p_trtgt=p[`BACK2_RB_TRTGT_MSB:`BACK2_RB_TRTGT_LSB]; end endfunction
     function p_trtk;       input [RB_W-1:0] p; begin p_trtk = p[`BACK2_RB_TRTAKEN]; end endfunction
-    //   ★★ C9：发射宽载荷取字段（纯函数；`x_i2_uop` = `u_iwmem` 同步读回的 **215 bit 紧凑
-    //     布局**，见 back2_params.vh §2.5）。这些 `w_*` 函数只用于 E1 及其后的发射路径；
-    //     D1/D2/D3 仍用 `u_*`（uop 304 bit 布局，`iq.v`/`rename.v` 的契约不变）。
+    //   ★★ C9：发射宽载荷取字段（纯函数；`x_i2_uop` = `u_iwmem` 同步读回的紧凑布局，
+    //     ★ EXP-R2 后为 **212 bit**，见 back2_params.vh §2.5）。这些 `w_*` 函数只用于 E1
+    //     及其后的发射路径；D1/D2/D3 仍用 `u_*`（uop 300 bit 布局，契约不变）。
     function [31:0] w_pc;    input [IWW-1:0] w; begin w_pc  = w[`BACK2_IW_PC_MSB:`BACK2_IW_PC_LSB]; end endfunction
     function [31:0] w_imm;   input [IWW-1:0] w; begin w_imm = w[`BACK2_IW_IMM_MSB:`BACK2_IW_IMM_LSB]; end endfunction
     function [31:0] w_predtgt;input [IWW-1:0] w;begin w_predtgt = w[`BACK2_IW_PREDTGT_MSB:`BACK2_IW_PREDTGT_LSB]; end endfunction
@@ -339,7 +339,7 @@ module backend_top #(
     function [PW_F-1:0] w_ps1f; input [IWW-1:0] w; begin w_ps1f = w[`BACK2_IW_PS1F_MSB:`BACK2_IW_PS1F_LSB]; end endfunction
     function [PW_F-1:0] w_ps2f; input [IWW-1:0] w; begin w_ps2f = w[`BACK2_IW_PS2F_MSB:`BACK2_IW_PS2F_LSB]; end endfunction
     function [PW_F-1:0] w_ps3f; input [IWW-1:0] w; begin w_ps3f = w[`BACK2_IW_PS3F_MSB:`BACK2_IW_PS3F_LSB]; end endfunction
-    //   打包：uop(304) → 发射宽载荷(215)（D3 派发写口用；与上面的 w_* 逐位互逆）
+    //   打包：uop(300) → 发射宽载荷(212)（D3 派发写口用；与上面的 w_* 逐位互逆）
     function [IWW-1:0] pack_iw; input [UOPW-1:0] u;
         begin
             pack_iw = { u[`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB],
@@ -581,8 +581,8 @@ module backend_top #(
     //   ★★ C1：`x_i2_uop` 由**寄存器**改为**组合线**（源 = `u_iwmem` 的同步读输出 +
     //     4:1 交叉开关）—— BRAM 输出寄存器恰好承担了原 `x_i2_uop` 的"发射拍→执行拍"
     //     寄存作用 ⇒ **发射→执行仍是 1 拍**（无新增级数，见 §5.5/§6）。
-    //   ★★ C9：`x_i2_uop` 现在是 **IWW(215) 位紧凑发射载荷**（不再是 uop 的切片）⇒ 读取
-    //     一律走 `w_*` 访问函数（见 §0）；`u_*` 只用于 D1/D2/D3 的 uop(304)。
+    //   ★★ C9：`x_i2_uop` 现在是 **IWW(212) 位紧凑发射载荷**（不再是 uop 的切片）⇒ 读取
+    //     一律走 `w_*` 访问函数（见 §0）；`u_*` 只用于 D1/D2/D3 的 uop(300)。
     wire [IWW-1:0] x_i2_uop [0:5];
     reg  [6:0]      x_i2_rob [0:5];
     reg  [EW-1:0]   x_i2_ep  [0:5];
@@ -778,7 +778,7 @@ module backend_top #(
         //   的 0/1 冲突会在 iverilog/Vivado 下解析成 **x**（实测：PC/ARND 等所有含 1
         //   的字段全变 x ⇒ ROB 提交流全 x ⇒ 后端假提交、前端不推进）。本块内
         //   [UOPW-1:0] 的**每一个 bit 恰好被下面一条赋值覆盖一次**（含 AUX/SRC 段；
-        //   PSPD 段 [132:75] 由重命名结果在 lane_uop_fin 处显式拼接填入）。
+        //   PSPD 段 [PDIDST_MSB:PS3F_LSB] 由重命名结果在 lane_uop_fin 处显式拼接填入）。
         assign d1_lat_uop[g][`BACK2_U_BTB_MSB:`BACK2_U_BTB_LSB] =
                {lane_btb_hit_i[g], lane_btb_way_i[g]};
         assign d1_lat_uop[g][`BACK2_U_PRED_MSB:`BACK2_U_PRED_LSB] =
@@ -1031,9 +1031,9 @@ module backend_top #(
 
         //   ★ 用**显式拼接**替换 PSPD 段，不用 `u & ~(mask << LSB)`：
         //     `58'h… << 75` 的自决定位宽是 58 ⇒ 移位结果恒 0（掩码失效），且 x|值 = x。
-        //     段序（MSB→LSB）必须与 back2_params.vh §2 的 PSPD 段一致：
-        //     PDIDST(132:126) PDIOLD(125:119) PDFDST(118:113) PDFOLD(112:107)
-        //     PS1I(106:100) PS2I(99:93) PS1F(92:87) PS2F(86:81) PS3F(80:75)
+        //     段序（MSB→LSB）必须与 back2_params.vh §2 的 PSPD 段一致（★ EXP-R2 后的位号）：
+        //     PDIDST(128:123) PDIOLD(122:117) PDFDST(116:111) PDFOLD(110:105)
+        //     PS1I(104:99) PS2I(98:93) PS1F(92:87) PS2F(86:81) PS3F(80:75)
         assign lane_uop_fin[g4] = {u[UOPW-1:`BACK2_U_PSPD_MSB+1],
                                    pdi, pdio, pdf, pdfo, p1i, p2i, p1f, p2f, p3f,
                                    u[`BACK2_U_PSPD_LSB-1:0]};
@@ -1100,6 +1100,7 @@ module backend_top #(
 
     // ---- ROB 载荷组装 ----
     //   ★★ C4：按 `back2_params.vh` §2 的**新位域表**逐字段拼接（MSB→LSB，无空洞）。
+    //      ★ EXP-R2：整数字段收窄后 RB_W 229→225，位置注释已同步。
     //     与旧版的差别只有「删掉谁都不读的位」：uop 全量副本（IMM/ARND/源物理号/控制码/
     //     uop.TVAL/架构源号）与 CSRW 段不再进载荷；其余字段（PC/PREDTGT/PRED/BTB/CLS/CKPT/
     //     PDIOLD/PDFOLD/TVAL/PS1I/CSRADDR/CSROP/STQ/LQ）逐位保留、语义不变。
@@ -1108,27 +1109,29 @@ module backend_top #(
     //      而注释里的 `[a:b]` 是**目标位置**（`BACK2_RB_*`）—— 两者**不可混用**：
     //      初版误用 RB_* 去切 uop（如 PDIOLD 切到 [55:49]）⇒ 提交释放的旧物理号全错
     //      ⇒ 实测 tb_core_top_2b 出现大量 `RENAME-CHK DUP/自环`。
+    //   ★★ EXP-R2：三个整数字段（PS1I/PDIOLD/PDIDST）随 `BACK2_PREG_I_W` 收窄 1 bit ⇒
+    //      其上整段下移 3，EXP-R3 的 `[88]` 保留位被**回收给 LQ**（本拼接不再补那 1 bit 0）。
+    //      拼接总宽 = `BACK2_RB_W`（225）；源切片全用 `BACK2_U_*`，目标位置全用 `BACK2_RB_*`。
     genvar g5;
     generate
     for (g5 = 0; g5 < DISP_W; g5 = g5 + 1) begin : g_rb
         assign rob_pay_w[g5*RB_W +: RB_W] = {
-            lane_uop_fin[g5][`BACK2_U_BTB_MSB:`BACK2_U_BTB_LSB],           // → [228:227] BTB
-            lane_uop_fin[g5][`BACK2_U_PRED_MSB:`BACK2_U_PRED_LSB],         // → [226:223] PRED
-            lane_uop_fin[g5][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB],             // → [222:191] PC
-            lane_uop_fin[g5][`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB],   // → [190:159] PREDTGT
-            5'b0,                                                          // [158:154] fflags（占位）
-            1'b0,                                                          // [153]     trtaken（占位）
-            32'h0,                                                         // [152:121] tr 目标（占位）
-            d1_uop_q[g5][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],             // [120:89]  异常 tval
-            1'b0,                                                          // [88]      保留（EXP-R3 LQ 16→8）
-            ld_alloc_idx[g5*LDW +: LDW],                                   // [87:85]   LQ 索引（3 bit）
-            st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],         // [84:80]   STQ 索引
-            lane_uop_fin[g5][`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],   // → [79:74]   浮点新映射
-            lane_uop_fin[g5][`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB],       // → [73:69]   目的架构号
-            lane_uop_fin[g5][`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],   // → [68:62]   整数新映射
-            lane_uop_fin[g5][`BACK2_U_PDFOLD_MSB:`BACK2_U_PDFOLD_LSB],   // → [61:56]   浮点旧映射
-            lane_uop_fin[g5][`BACK2_U_PDIOLD_MSB:`BACK2_U_PDIOLD_LSB],   // → [55:49]   整数旧映射
-            lane_uop_fin[g5][`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB],       // → [48:42]   源 1 物理号
+            lane_uop_fin[g5][`BACK2_U_BTB_MSB:`BACK2_U_BTB_LSB],           // → [224:223] BTB
+            lane_uop_fin[g5][`BACK2_U_PRED_MSB:`BACK2_U_PRED_LSB],         // → [222:219] PRED
+            lane_uop_fin[g5][`BACK2_U_PC_MSB:`BACK2_U_PC_LSB],             // → [218:187] PC
+            lane_uop_fin[g5][`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB],   // → [186:155] PREDTGT
+            5'b0,                                                          // [154:150] fflags（占位）
+            1'b0,                                                          // [149]     trtaken（占位）
+            32'h0,                                                         // [148:117] tr 目标（占位）
+            d1_uop_q[g5][`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB],             // [116:85]  异常 tval
+            ld_alloc_idx[g5*LDW +: LDW],                                   // [84:82]   LQ 索引（3 bit）
+            st_alloc_idx[g5*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],         // [81:77]   STQ 索引
+            lane_uop_fin[g5][`BACK2_U_PDFDST_MSB:`BACK2_U_PDFDST_LSB],   // → [76:71]   浮点新映射
+            lane_uop_fin[g5][`BACK2_U_ARND_MSB:`BACK2_U_ARND_LSB],       // → [70:66]   目的架构号
+            lane_uop_fin[g5][`BACK2_U_PDIDST_MSB:`BACK2_U_PDIDST_LSB],   // → [65:60]   整数新映射
+            lane_uop_fin[g5][`BACK2_U_PDFOLD_MSB:`BACK2_U_PDFOLD_LSB],   // → [59:54]   浮点旧映射
+            lane_uop_fin[g5][`BACK2_U_PDIOLD_MSB:`BACK2_U_PDIOLD_LSB],   // → [53:48]   整数旧映射
+            lane_uop_fin[g5][`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB],       // → [47:42]   源 1 物理号
             lane_uop_fin[g5][`BACK2_U_CSRADDR_MSB:`BACK2_U_CSRADDR_LSB], // → [41:30]   CSR 地址
             lane_uop_fin[g5][`BACK2_U_CSROP_MSB:`BACK2_U_CSROP_LSB],     // → [29:27]   CSR 操作
             lane_uop_fin[g5][`BACK2_U_CLS_MSB:`BACK2_U_CLS_LSB],         // → [26:24]   分支类别
@@ -1359,6 +1362,7 @@ module backend_top #(
     //   BRAM 的输出寄存器给出的宽载荷**直接**作为 E1 的 `x_i2_uop`（与改前的 `x_i2_uop`
     //   触发器完全同拍）⇒ **发射→执行仍是 1 拍**（IPC 不因本改动结构性下降）。
     //   ★★ C9 后硬成本 = **12 个 RAMB36**（DW=215 ≤ 216 ⇒ 3/bank；改前 DW=280 ⇒ 4/bank）。
+    //     ★ EXP-R2：DW 215→212，仍 ≤ 216 ⇒ 仍是 3/bank（RAMB 数不变，只省读出位宽）。
     // 【写口】D3 派发 4 lane 的 rob 索引连续 ⇒ bank=gw 对应的 lane = (gw - idx0[1:0]) mod 4
     //   （与 rob.v §1.5 的 `wsel` 逐位同式），写数据 = `pack_iw(lane_uop_fin[lane])`
     //   （= 从**同一条** uop 抽取 E1 真正读的字段，见 back2_params §2.5）。

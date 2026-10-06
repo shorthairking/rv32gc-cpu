@@ -88,11 +88,14 @@ module tb_back2_iq;
     wire [NI*UOPW-1:0]   sel_uop;
     wire [NI*7-1:0]      sel_rob;
 
-    // 整数唤醒标签：道 k 广播 tag = {1, ps[5:0]}（6 bit → 7 bit 物理号低位）
-    wire [6*7-1:0] wki_tag;
-    wire [6*6-1:0] wkf_tag;
+    // 整数唤醒标签：道 k 广播 tag = k+1，按 **`BACK2_PREG_I_W`** 步长打包（DUT 端口宽
+    // = `WK_N*PDW_I`）。★ EXP-R2：整数物理号 7→6 bit ⇒ 本激励必须随宏收窄，否则
+    // 单元 TB 仍按 7 bit 步长打包、而 DUT 按 6 bit 步长取道 ⇒ 道 1..5 唤醒错位（假失败）。
+    wire [6*`BACK2_PREG_I_W-1:0] wki_tag;
+    wire [6*`BACK2_PREG_F_W-1:0] wkf_tag;
     // 道 j 的标签 = j+1（打包向量低位 = 道 0）
-    assign wki_tag = { 7'd6, 7'd5, 7'd4, 7'd3, 7'd2, 7'd1 };
+    assign wki_tag = { `BACK2_PREG_I_W'd6, `BACK2_PREG_I_W'd5, `BACK2_PREG_I_W'd4,
+                       `BACK2_PREG_I_W'd3, `BACK2_PREG_I_W'd2, `BACK2_PREG_I_W'd1 };
     assign wkf_tag = { 6'd6, 6'd5, 6'd4, 6'd3, 6'd2, 6'd1 };
 
     iq #(.DEPTH(`BACK2_IQ_ALU0_D), .ROB_IDX_W(ROB_IDX_W_TB)) u_iq0 (

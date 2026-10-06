@@ -29,14 +29,22 @@
 `define BACK2_ROB_N          64
 `define BACK2_ROB_IDX_W      6          // log2(64)
 
-// ---- 物理寄存器（§3.2：整数 96 / 浮点 64，分离 free list）----
-`define BACK2_PRF_I_N        96         // 整数物理寄存器数
-`define BACK2_PREG_I_W       7          // 整数物理号宽（0–95）
-`define BACK2_PRF_F_N        64         // 浮点物理寄存器数
+// ---- 物理寄存器（§3.2：整数 64 / 浮点 64，分离 free list）----
+//   ★★ EXP-R2（整数物理寄存器 NREG 96→64 级联减宽，只动**整数侧**）：浮点侧
+//     64/6bit/FREE 32 **一律不动**。整数域三件必须**同时**改、且满足恒等式
+//        FREE_I_N == PRF_I_N − ARCH_N   （64 − 32 = 32）
+//      否则 rename 的空闲表深度与物理号空间不一致 ⇒ 重复分配同一个物理号
+//      （已修过的"pdi 撞车"同型缺陷；rename.v §2.10 的 `FREE-OVER` 自检即守这条）。
+//   · 物理号宽 `PREG_I_W` 由 `$clog2(PRF_I_N)` 定：96 ⇒ 7，64 ⇒ 6。**每一位都真降**：
+//     PRF 读 mux（16 口 × 96:1 → 16 口 × 64:1，本核 LUT 大头）、RAT/ARAT/空闲表、
+//     IQ 唤醒比较器（6 写回 × 5 源 × 50 槽 × 两代）、ROB 窄字 pdi、写回 tag、busy 位图。
+`define BACK2_PRF_I_N        64         // 整数物理寄存器数（EXP-R2：96→64）
+`define BACK2_PREG_I_W       6          // 整数物理号宽（0–63）
+`define BACK2_PRF_F_N        64         // 浮点物理寄存器数（EXP-R2 不动）
 `define BACK2_PREG_F_W       6          // 浮点物理号宽（0–63）
 `define BACK2_ARCH_N         32         // 架构寄存器数（x0/x1..x31、f0..f31）
 `define BACK2_ARN_W          5
-`define BACK2_FREE_I_N       64         // 整数 free list 容量（不含架构基线 32）
+`define BACK2_FREE_I_N       32         // 整数 free list 容量（不含架构基线 32；= 64−32）
 `define BACK2_FREE_F_N       32         // 浮点 free list 容量（不含架构基线 32）
 
 // ---- 发射宽度 / 提交宽度（§1：4 发射；提交 ≤4 条/拍）----
@@ -184,57 +192,62 @@
 `define BACK2_U_ALUOP_LSB    67         // [70:67] ALU 微操作（alu.v 端口口径）
 `define BACK2_U_OPTYPE_MSB   74
 `define BACK2_U_OPTYPE_LSB   71         // [74:71] 执行部件类型（decoder §0：OPT_*）
+//   ★★ EXP-R2（整数 NREG 96→64 级联）：整数字段 PS2I/PS1I/PDIOLD/PDIDST 由
+//     `BACK2_PREG_I_W`（7→6）**参数化计算 MSB**（= LSB + 宽 − 1）⇒ 位宽只有一个真源。
+//     四个整数字段各收窄 1 bit ⇒ PS1F 之上的**全部字段绝对位下移 4**（UOP_W 304→300）。
+//     ⚠ [19:0] 的 EXC+FLAGS 块**绝对位不变**（`BACK2_UB_*` 由 FLAGS_LSB=4 推出，探针
+//       `sim/unit/dyn_probe_back2_body.inc` 按绝对位引用它们）——整数字段全在其上方 ✓。
 `define BACK2_U_PS3F_MSB     80
 `define BACK2_U_PS3F_LSB     75         // [80:75] 源 3 浮点物理号（FMA）
 `define BACK2_U_PS2F_MSB     86
 `define BACK2_U_PS2F_LSB     81         // [86:81] 源 2 浮点物理号
 `define BACK2_U_PS1F_MSB     92
 `define BACK2_U_PS1F_LSB     87         // [92:87] 源 1 浮点物理号
-`define BACK2_U_PS2I_MSB     99
-`define BACK2_U_PS2I_LSB     93         // [99:93] 源 2 整数物理号
-`define BACK2_U_PS1I_MSB     106
-`define BACK2_U_PS1I_LSB     100        // [106:100] 源 1 整数物理号
-`define BACK2_U_PDFOLD_MSB   112
-`define BACK2_U_PDFOLD_LSB   107        // [112:107] 浮点旧映射（提交时释放）
-`define BACK2_U_PDFDST_MSB   118
-`define BACK2_U_PDFDST_LSB   113        // [118:113] 浮点新映射
-`define BACK2_U_PDIOLD_MSB   125
-`define BACK2_U_PDIOLD_LSB   119        // [125:119] 整数旧映射（提交时释放）
-`define BACK2_U_PDIDST_MSB   132
-`define BACK2_U_PDIDST_LSB   126        // [132:126] 整数新映射
-`define BACK2_U_ARND_MSB     137
-`define BACK2_U_ARND_LSB     133        // [137:133] 目的架构寄存器号
-`define BACK2_U_IMM_MSB      169
-`define BACK2_U_IMM_LSB      138        // [169:138] 立即数（decoder imm_o）
-`define BACK2_U_PREDTGT_MSB  201
-`define BACK2_U_PREDTGT_LSB  170        // [201:170] 预测目标（训练必须携带）
-`define BACK2_U_TVAL_MSB     233
-`define BACK2_U_TVAL_LSB     202        // [233:202] 原始指令位（非法指令 mtval）
-`define BACK2_U_PC_MSB       265
-`define BACK2_U_PC_LSB       234        // [265:234] 指令虚拟地址
-`define BACK2_U_PRED_MSB     269
-`define BACK2_U_PRED_LSB     266        // [269:266] {pred_taken, pred_selg, pred_gdir, pred_ldir}
-`define BACK2_U_BTB_MSB      271
-`define BACK2_U_BTB_LSB      270        // [271:270] {btb_hit, btb_way}
+`define BACK2_U_PS2I_LSB     93         // [98:93]  源 2 整数物理号（EXP-R2：7→6 bit）
+`define BACK2_U_PS2I_MSB     (`BACK2_U_PS2I_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_U_PS1I_LSB     99         // [104:99] 源 1 整数物理号（EXP-R2：7→6 bit）
+`define BACK2_U_PS1I_MSB     (`BACK2_U_PS1I_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_U_PDFOLD_MSB   110
+`define BACK2_U_PDFOLD_LSB   105        // [110:105] 浮点旧映射（提交时释放）
+`define BACK2_U_PDFDST_MSB   116
+`define BACK2_U_PDFDST_LSB   111        // [116:111] 浮点新映射
+`define BACK2_U_PDIOLD_LSB   117        // [122:117] 整数旧映射（提交时释放；EXP-R2：7→6 bit）
+`define BACK2_U_PDIOLD_MSB   (`BACK2_U_PDIOLD_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_U_PDIDST_LSB   123        // [128:123] 整数新映射（EXP-R2：7→6 bit）
+`define BACK2_U_PDIDST_MSB   (`BACK2_U_PDIDST_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_U_ARND_MSB     133
+`define BACK2_U_ARND_LSB     129        // [133:129] 目的架构寄存器号
+`define BACK2_U_IMM_MSB      165
+`define BACK2_U_IMM_LSB      134        // [165:134] 立即数（decoder imm_o）
+`define BACK2_U_PREDTGT_MSB  197
+`define BACK2_U_PREDTGT_LSB  166        // [197:166] 预测目标（训练必须携带）
+`define BACK2_U_TVAL_MSB     229
+`define BACK2_U_TVAL_LSB     198        // [229:198] 原始指令位（非法指令 mtval）
+`define BACK2_U_PC_MSB       261
+`define BACK2_U_PC_LSB       230        // [261:230] 指令虚拟地址
+`define BACK2_U_PRED_MSB     265
+`define BACK2_U_PRED_LSB     262        // [265:262] {pred_taken, pred_selg, pred_gdir, pred_ldir}
+`define BACK2_U_BTB_MSB      267
+`define BACK2_U_BTB_LSB      266        // [267:266] {btb_hit, btb_way}
 // ---- AUX（执行级需要的少量原始位；D1 译码期填好）----
-`define BACK2_U_AUX_MSB      279
-`define BACK2_U_AUX_LSB      272        // [279:272]
-`define BACK2_UAX_RTYPE      272        //  [272]   R 型（OP）⇒ ALU 的 b 取 rs2
-`define BACK2_UAX_AUIPC      273        //  [273]   auipc ⇒ ALU 的 a 取 pc
-`define BACK2_UAX_FMT_MSB    275
-`define BACK2_UAX_FMT_LSB    274        // [275:274] 浮点 fmt = insn[26:25]
-`define BACK2_UAX_IL32       276        //  [276]   指令为 32 bit（链接值/顺序 PC 用）
-`define BACK2_UAX_Q_MSB      279
-`define BACK2_UAX_Q_LSB      277        // [279:277] 目标发射队列（0..5）
-`define BACK2_U_SRC_MSB      303
-`define BACK2_U_SRC_LSB      280        // [303:280] {9'b0, rs3(5), rs2(5), rs1(5)}（架构号）
-`define BACK2_U_SRC1_LSB     280        // rs1 域 [284:280]
-`define BACK2_U_SRC2_LSB     285        // rs2 域 [289:285]
-`define BACK2_U_SRC3_LSB     290        // rs3 域 [294:290]
-`define BACK2_UOP_W          304
+`define BACK2_U_AUX_MSB      275
+`define BACK2_U_AUX_LSB      268        // [275:268]
+`define BACK2_UAX_RTYPE      268        //  [268]   R 型（OP）⇒ ALU 的 b 取 rs2
+`define BACK2_UAX_AUIPC      269        //  [269]   auipc ⇒ ALU 的 a 取 pc
+`define BACK2_UAX_FMT_MSB    271
+`define BACK2_UAX_FMT_LSB    270        // [271:270] 浮点 fmt = insn[26:25]
+`define BACK2_UAX_IL32       272        //  [272]   指令为 32 bit（链接值/顺序 PC 用）
+`define BACK2_UAX_Q_MSB      275
+`define BACK2_UAX_Q_LSB      273        // [275:273] 目标发射队列（0..5）
+`define BACK2_U_SRC_MSB      299
+`define BACK2_U_SRC_LSB      276        // [299:276] {9'b0, rs3(5), rs2(5), rs1(5)}（架构号）
+`define BACK2_U_SRC1_LSB     276        // rs1 域 [280:276]
+`define BACK2_U_SRC2_LSB     281        // rs2 域 [285:281]
+`define BACK2_U_SRC3_LSB     286        // rs3 域 [290:286]
+`define BACK2_UOP_W          300
 // ---- uop 内 ps/pd 字段的整段掩码（派发期填重命名结果用）----
-`define BACK2_U_PSPD_MSB     132        // PDIDST 段最高位
-`define BACK2_U_PSPD_LSB     75         // PS3F 段最低位
+`define BACK2_U_PSPD_MSB     `BACK2_U_PDIDST_MSB   // PDIDST 段最高位
+`define BACK2_U_PSPD_LSB     `BACK2_U_PS3F_LSB     // PS3F 段最低位
 
 //==============================================================================
 // 2.5 ★★ C1（IQ 载荷瘦身）：IQ **窄载荷** 布局 + 发射期**宽载荷回读**宽度
@@ -257,22 +270,26 @@
 //     · `iq.v` 的 `pack_iqn()`（打包）与唤醒/门控位选；
 //     · `backend_top.v` 的三个门控（is_csr / is_load / rm_dyn）。
 // ★ 窄载荷**不含**任何执行期字段：宽载荷由 `BACK2_IW_W` 定义（见下）。
-`define BACK2_IQN_PS1I_L    0          // [6:0]   源 1 整数物理号
-`define BACK2_IQN_PS2I_L    7          // [13:7]  源 2 整数物理号
-`define BACK2_IQN_PS1F_L    14         // [19:14] 源 1 浮点物理号
-`define BACK2_IQN_PS2F_L    20         // [25:20] 源 2 浮点物理号
-`define BACK2_IQN_PS3F_L    26         // [31:26] 源 3 浮点物理号（FMA）
-`define BACK2_IQN_S1I_USE   32         // [32]    源 1 取整数物理寄存器
-`define BACK2_IQN_S2I_USE   33         // [33]    源 2 取整数物理寄存器
-`define BACK2_IQN_S1F_USE   34         // [34]    源 1 取浮点物理寄存器
-`define BACK2_IQN_S2F_USE   35         // [35]    源 2 取浮点物理寄存器
-`define BACK2_IQN_S3F_USE   36         // [36]    源 3 取浮点物理寄存器
-`define BACK2_IQN_IS_LOAD   37         // [37]    uop 的 fl7（LSU 队列 load 门）
-`define BACK2_IQN_IS_CSR    38         // [38]    uop 的 fl10（ALU0 "CSR 只在 ROB 头"门）
-`define BACK2_IQN_RM_DYN    39         // [39]    uop 的 RM == 3'b111（FPU DYN 舍入门）
-`define BACK2_IQN_W         40         // 窄载荷总宽（bit）
+//   ★★ EXP-R2：两个整数源 tag 由 `BACK2_PREG_I_W` 定宽（7→6）⇒ 其上的段整体下移 2
+//     （窄载荷 40→38 bit）。逐槽存 5 源 tag + 5 USE + 3 门控，合计 50 槽 ⇒ 直接减 100 FF，
+//     并让唤醒比较器（6 写回 × 5 源 × 50 槽 × 两代）的比较位宽真降 1 bit。
+`define BACK2_IQN_PS1I_L    0          // [5:0]   源 1 整数物理号
+`define BACK2_IQN_PS2I_L    (`BACK2_IQN_PS1I_L + `BACK2_PREG_I_W)   // [11:6]  源 2 整数物理号
+`define BACK2_IQN_PS1F_L    (`BACK2_IQN_PS2I_L + `BACK2_PREG_I_W)   // [17:12] 源 1 浮点物理号
+`define BACK2_IQN_PS2F_L    (`BACK2_IQN_PS1F_L + `BACK2_PREG_F_W)   // [23:18] 源 2 浮点物理号
+`define BACK2_IQN_PS3F_L    (`BACK2_IQN_PS2F_L + `BACK2_PREG_F_W)   // [29:24] 源 3 浮点物理号（FMA）
+`define BACK2_IQN_S1I_USE   (`BACK2_IQN_PS3F_L + `BACK2_PREG_F_W)   // [30]    源 1 取整数物理寄存器
+`define BACK2_IQN_S2I_USE   (`BACK2_IQN_S1I_USE + 1)                // [31]    源 2 取整数物理寄存器
+`define BACK2_IQN_S1F_USE   (`BACK2_IQN_S2I_USE + 1)                // [32]    源 1 取浮点物理寄存器
+`define BACK2_IQN_S2F_USE   (`BACK2_IQN_S1F_USE + 1)                // [33]    源 2 取浮点物理寄存器
+`define BACK2_IQN_S3F_USE   (`BACK2_IQN_S2F_USE + 1)                // [34]    源 3 取浮点物理寄存器
+`define BACK2_IQN_IS_LOAD   (`BACK2_IQN_S3F_USE + 1)                // [35]    uop 的 fl7（LSU 队列 load 门）
+`define BACK2_IQN_IS_CSR    (`BACK2_IQN_IS_LOAD + 1)                // [36]    uop 的 fl10（ALU0 "CSR 只在 ROB 头"门）
+`define BACK2_IQN_RM_DYN    (`BACK2_IQN_IS_CSR + 1)                 // [37]    uop 的 RM == 3'b111（FPU DYN 舍入门）
+`define BACK2_IQN_W         (`BACK2_IQN_RM_DYN + 1)                 // 窄载荷总宽（EXP-R2：40→38 bit）
 //
-// 发射宽载荷布局（★★ C9：`uop[279:0]` 切片 → **215 bit 紧凑布局**）。
+// 发射宽载荷布局（★★ C9：`uop[279:0]` 切片 → **215 bit 紧凑布局**；
+//   ★ EXP-R2 后整数源/pdi 字段收窄 ⇒ **212 bit**，位号见下面的新布局表）。
 //------------------------------------------------------------------------------
 // 背景（C9 面积杠杆）：C1 把发射宽载荷定为「uop 的低 280 位」切片（截掉架构源号
 //   [303:280]），但该切片里仍有大量**发射/执行路径 0 读**的位（它们只在 D1/D2/D3 或
@@ -302,7 +319,7 @@
 //   [19:4]    FLAGS          整块照抄 uop [19:4]（`BACK2_UB_*` 位序不变）
 //   [23:20]   CKPT           检查点 id（冲刷恢复 `u_ckid`）
 //   [26:24]   CLS            分支类别（BRU 误判判定 `u_cls`）
-//   [38:27]   CSRADDR        CSR 地址（E1 CSR 读口 `csr_raddr_w`）
+//   [38:27]   CSRADDR        CSR 地址（E1 CSR 读口 `csr_raddr_w`）   ← 本段及以下绝对位不变
 //   [44:39]   FPOP           浮点归一化操作码（`fpu.fp_op`）
 //   [47:45]   RM             浮点舍入模式（`fpu.rm`）
 //   [50:48]   MSIZE          访存宽度（`lsq.exe_size`）
@@ -316,16 +333,16 @@
 //   [71]      RTYPE          R 型（ALU b 取 rs2）
 //   [72]      AUIPC          auipc（ALU a 取 pc）
 //   [73]      PRED_TAKEN     预测方向（BRU 误判比对）
-//   [80:74]   PDI            整数新映射（LSU 写口 / 在途登记）
-//   [86:81]   PDF            浮点新映射（同上）
-//   [93:87]   PS1I           源 1 整数物理号（E1 PRF 读口）
-//   [100:94]  PS2I           源 2 整数物理号
-//   [106:101] PS1F           源 1 浮点物理号
-//   [112:107] PS2F           源 2 浮点物理号
-//   [118:113] PS3F           源 3 浮点物理号（FMA）
-//   [150:119] PC             指令 PC（ALU/BRU 链接值/维护重定向）
-//   [182:151] IMM            立即数（ALU/BRU/LSU 地址）
-//   [214:183] PREDTGT        预测目标（BRU 误判比对）
+//   [79:74]   PDI            整数新映射（LSU 写口 / 在途登记；★ EXP-R2 6 bit）
+//   [85:80]   PDF            浮点新映射（同上）
+//   [91:86]   PS1I           源 1 整数物理号（E1 PRF 读口；6 bit）
+//   [97:92]   PS2I           源 2 整数物理号（6 bit）
+//   [103:98]  PS1F           源 1 浮点物理号
+//   [109:104] PS2F           源 2 浮点物理号
+//   [115:110] PS3F           源 3 浮点物理号（FMA）
+//   [147:116] PC             指令 PC（ALU/BRU 链接值/维护重定向）
+//   [179:148] IMM            立即数（ALU/BRU/LSU 地址）
+//   [211:180] PREDTGT        预测目标（BRU 误判比对）
 `define BACK2_IW_EXC_MSB     3
 `define BACK2_IW_EXC_LSB     0          // 占位（见上硬约束）
 `define BACK2_IW_FLAGS_MSB   19         // ★ 与 uop FLAGS 段同值
@@ -357,27 +374,29 @@
 `define BACK2_IW_RTYPE       71
 `define BACK2_IW_AUIPC       72
 `define BACK2_IW_PRED_TAKEN  73
-`define BACK2_IW_PDI_MSB     80
-`define BACK2_IW_PDI_LSB     74
-`define BACK2_IW_PDF_MSB     86
-`define BACK2_IW_PDF_LSB     81
-`define BACK2_IW_PS1I_MSB    93
-`define BACK2_IW_PS1I_LSB    87
-`define BACK2_IW_PS2I_MSB    100
-`define BACK2_IW_PS2I_LSB    94
-`define BACK2_IW_PS1F_MSB    106
-`define BACK2_IW_PS1F_LSB    101
-`define BACK2_IW_PS2F_MSB    112
-`define BACK2_IW_PS2F_LSB    107
-`define BACK2_IW_PS3F_MSB    118
-`define BACK2_IW_PS3F_LSB    113
-`define BACK2_IW_PC_MSB      150
-`define BACK2_IW_PC_LSB      119
-`define BACK2_IW_IMM_MSB     182
-`define BACK2_IW_IMM_LSB     151
-`define BACK2_IW_PREDTGT_MSB 214
-`define BACK2_IW_PREDTGT_LSB 183
-`define BACK2_IW_W           215        // ★ C9：280→215（XPM 位宽 ≤216 ⇒ 3 RAMB36/bank）
+//   ★★ EXP-R2：PDI/PS1I/PS2I（整数物理号）由 `BACK2_PREG_I_W` 定宽（7→6）⇒ 其上整段
+//     下移 3（IW 215→212 bit）。PDI 段与 uop/窄载荷/ROB 载荷的整数字段**同位宽同口径**。
+`define BACK2_IW_PDI_LSB     74         // [79:74]  整数新映射（LSU 写口 / 在途登记）
+`define BACK2_IW_PDI_MSB     (`BACK2_IW_PDI_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_IW_PDF_MSB     85
+`define BACK2_IW_PDF_LSB     80         // [85:80]  浮点新映射（同上）
+`define BACK2_IW_PS1I_LSB    86         // [91:86]  源 1 整数物理号（E1 PRF 读口）
+`define BACK2_IW_PS1I_MSB    (`BACK2_IW_PS1I_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_IW_PS2I_LSB    92         // [97:92]  源 2 整数物理号
+`define BACK2_IW_PS2I_MSB    (`BACK2_IW_PS2I_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_IW_PS1F_MSB    103
+`define BACK2_IW_PS1F_LSB    98         // [103:98] 源 1 浮点物理号
+`define BACK2_IW_PS2F_MSB    109
+`define BACK2_IW_PS2F_LSB    104        // [109:104] 源 2 浮点物理号
+`define BACK2_IW_PS3F_MSB    115
+`define BACK2_IW_PS3F_LSB    110        // [115:110] 源 3 浮点物理号（FMA）
+`define BACK2_IW_PC_MSB      147
+`define BACK2_IW_PC_LSB      116        // [147:116] PC（ALU/BRU 链接值/维护重定向）
+`define BACK2_IW_IMM_MSB     179
+`define BACK2_IW_IMM_LSB     148        // [179:148] IMM（ALU/BRU/LSU 地址）
+`define BACK2_IW_PREDTGT_MSB 211
+`define BACK2_IW_PREDTGT_LSB 180        // [211:180] PREDTGT（BRU 误判比对）
+`define BACK2_IW_W           212        // ★ EXP-R2：215→212（三个整数字段各收窄 1 bit）
 
 // ---- ROB 项载荷（★★ C4：416 bit → 229 bit，「存了但谁都不读」的位全部删除）----
 //------------------------------------------------------------------------------
@@ -405,29 +424,32 @@
 //     若要再省，必须**同步**改上面两个 sim 文件（后续任务）。
 //------------------------------------------------------------------------------
 // 新布局（LSB→MSB，**无空洞**；每行 = [MSB:LSB] 字段（源））：
+//   ★★ EXP-R2（整数 NREG 96→64 级联）：PS1I/PDIOLD/PDIDST 三个整数字段由
+//     `BACK2_PREG_I_W` 定宽（7→6）⇒ 其上整段下移 3、并把 EXP-R3 留下的 `[88]` 保留位
+//     **回收给 LQ**（LQ 本就在紧邻下方）⇒ RB 229→225 bit，载荷**无空洞**。
+//     ⚠ [19:0] 的 EXC+FLAGS 块**绝对位不变**（sim 探针按 `BACK2_UB_*` 绝对位引用）✓。
 //   [3:0]     EXC            异常码（uop fl 之外；rob `slot_exc`/`pexc`/`pack_nq`）
 //   [19:4]    FLAGS          整块照抄 uop [19:4]（`BACK2_UB_*` 位序不变；见上硬约束）
 //   [23:20]   CKPT           检查点 id（提交释放 `p_ckid` + nq）
 //   [26:24]   CLS            分支类别（提交训练 `p_cls`）
 //   [29:27]   CSROP          CSR 操作（`csr_pay` + nq）
 //   [41:30]   CSRADDR        CSR 地址（`csr_pay`）
-//   [48:42]   PS1I           源 1 整数物理号（`csr_pay` 的 csrw 段）
-//   [55:49]   PDIOLD         整数旧映射（提交释放 `p_pdio`）
-//   [61:56]   PDFOLD         浮点旧映射（提交释放 `p_pdfo`）
-//   [68:62]   PDIDST         整数新映射（**只为 `pack_nq` 重建 nq**）
-//   [73:69]   ARND           目的架构号（**只为 `pack_nq`**）
-//   [79:74]   PDFDST         浮点新映射（**只为 `pack_nq`**）
-//   [84:80]   STQ            store queue 项索引（`p_stq` 排空 + nq）
-//   [88]      保留           （EXP-R3：LQ 16→8 后本字段收窄 1 bit ⇒ 此位恒 0）
-//   [87:85]   LQ             load queue 项索引（3 bit；见 §2.5 L5 口径）
-//   [120:89]  TVAL           异常附加值 / 原始指令位（`trap_tval` 回落 + `csr_pay`）
-//   [152:121] TRTGT          分支实际目标（**占位 0**，输出位置由 `merge_upd` 用 br 表填）
-//   [153]     TRTAKEN        分支实际方向（**占位 0**，同上）
-//   [158:154] FFLAGS         浮点 flags（**占位 0**，输出位置由 `merge_upd` 用 ff 表填）
-//   [190:159] PREDTGT        预测目标（提交训练 `tcp_ptg`）
-//   [222:191] PC             指令 PC（提交 PC 流 / 维护重定向 / 训练）
-//   [226:223] PRED           {pred_taken,selg,gdir,ldir}（提交训练）
-//   [228:227] BTB            {btb_hit,btb_way}（提交训练）
+//   [47:42]   PS1I           源 1 整数物理号（6 bit；`csr_pay` 的 csrw 段低 6 位）
+//   [53:48]   PDIOLD         整数旧映射（6 bit；提交释放 `p_pdio`）
+//   [59:54]   PDFOLD         浮点旧映射（提交释放 `p_pdfo`）
+//   [65:60]   PDIDST         整数新映射（6 bit；**只为 `pack_nq` 重建 nq**）
+//   [70:66]   ARND           目的架构号（**只为 `pack_nq`**）
+//   [76:71]   PDFDST         浮点新映射（**只为 `pack_nq`**）
+//   [81:77]   STQ            store queue 项索引（`p_stq` 排空 + nq）
+//   [84:82]   LQ             load queue 项索引（3 bit；EXP-R2 回收原 [88] 保留位）
+//   [116:85]  TVAL           异常附加值 / 原始指令位（`trap_tval` 回落 + `csr_pay`）
+//   [148:117] TRTGT          分支实际目标（**占位 0**，输出位置由 `merge_upd` 用 br 表填）
+//   [149]     TRTAKEN        分支实际方向（**占位 0**，同上）
+//   [154:150] FFLAGS         浮点 flags（**占位 0**，输出位置由 `merge_upd` 用 ff 表填）
+//   [186:155] PREDTGT        预测目标（提交训练 `tcp_ptg`）
+//   [218:187] PC             指令 PC（提交 PC 流 / 维护重定向 / 训练）
+//   [222:219] PRED           {pred_taken,selg,gdir,ldir}（提交训练）
+//   [224:223] BTB            {btb_hit,btb_way}（提交训练）
 // ★ 为什么 TRTGT/TRTAKEN/FFLAGS 三个「占位」字段仍留在位域里：`merge_upd` 的**输出**就是
 //   本向量（位置必须存在，否则 backend_top 的 `p_ff`/`p_trtgt` 无处可读）；把它们挪出载荷
 //   需改 rob↔backend_top 的接口，并会使 `ROB-ASSERT-PAY0`（载荷占位恒 0 的前提）失去对象
@@ -444,53 +466,49 @@
 `define BACK2_RB_CSROP_LSB   27
 `define BACK2_RB_CSRADDR_MSB 41
 `define BACK2_RB_CSRADDR_LSB 30
-`define BACK2_RB_PS1I_MSB    48
-`define BACK2_RB_PS1I_LSB    42
-`define BACK2_RB_PDIOLD_MSB  55
-`define BACK2_RB_PDIOLD_LSB  49
-`define BACK2_RB_PDFOLD_MSB  61
-`define BACK2_RB_PDFOLD_LSB  56
-`define BACK2_RB_PDIDST_MSB  68
-`define BACK2_RB_PDIDST_LSB  62
-`define BACK2_RB_ARND_MSB    73
-`define BACK2_RB_ARND_LSB    69
-`define BACK2_RB_PDFDST_MSB  79
-`define BACK2_RB_PDFDST_LSB  74
-`define BACK2_RB_STQ_MSB     84
-`define BACK2_RB_STQ_LSB     80         // store queue 项索引（≤16 项）
-//   ★★ EXP-R3（LQ 16→8）：本字段收窄 1 bit —— **MSB 88→87、LSB 恒 85**，`[88]` 变为保留位
-//     （恒 0）。`BACK2_RB_W` 仍 229：本字段之上的 TVAL/TRTGT/…/BTB 绝对位位置**逐位不变**
-//     （与 2B-5 L5 的"顶端收窄留保留位"同一做法）。打包侧 `backend_top.v` 在 `[88]` 补 1 bit 0。
-//     ⚠ 本字段当前**无功能读点**（`backend_top.v` 的 `p_lq` 已无调用者；见 D2 报告 §nq 死字段），
-//       保留它只为不改动 RB 布局的其余部分；彻底删除属后续 C4 载荷裁剪候选，不在本任务范围。
-`define BACK2_RB_LQ_MSB      87         // ★ EXP-R3：88→87（LQ 16→8；[88] 保留）
-`define BACK2_RB_LQ_LSB      85         // load queue 项索引（≤8 项，3 bit）
-`define BACK2_RB_TVAL_MSB    120
-`define BACK2_RB_TVAL_LSB    89         // 异常附加值 / 原始指令位
-`define BACK2_RB_TRTGT_MSB   152
-`define BACK2_RB_TRTGT_LSB   121        // 分支实际目标（占位 0；merge_upd 用 br 表填）
-`define BACK2_RB_TRTAKEN     153        // 分支实际方向（占位 0）
-`define BACK2_RB_FFLAGS_MSB  158
-`define BACK2_RB_FFLAGS_LSB  154        // 浮点 flags（占位 0；merge_upd 用 ff 表填）
-`define BACK2_RB_PREDTGT_MSB 190
-`define BACK2_RB_PREDTGT_LSB 159
-`define BACK2_RB_PC_MSB      222
-`define BACK2_RB_PC_LSB      191
-`define BACK2_RB_PRED_MSB    226
-`define BACK2_RB_PRED_LSB    223
-`define BACK2_RB_BTB_MSB     228
-`define BACK2_RB_BTB_LSB     227
+`define BACK2_RB_PS1I_LSB    42         // [47:42]  源 1 整数物理号（EXP-R2：7→6 bit）
+`define BACK2_RB_PS1I_MSB    (`BACK2_RB_PS1I_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_RB_PDIOLD_LSB  48         // [53:48]  整数旧映射（EXP-R2：7→6 bit）
+`define BACK2_RB_PDIOLD_MSB  (`BACK2_RB_PDIOLD_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_RB_PDFOLD_MSB  59
+`define BACK2_RB_PDFOLD_LSB  54         // [59:54]  浮点旧映射
+`define BACK2_RB_PDIDST_LSB  60         // [65:60]  整数新映射（EXP-R2：7→6 bit）
+`define BACK2_RB_PDIDST_MSB  (`BACK2_RB_PDIDST_LSB + `BACK2_PREG_I_W - 1)
+`define BACK2_RB_ARND_MSB    70
+`define BACK2_RB_ARND_LSB    66         // [70:66]  目的架构号
+`define BACK2_RB_PDFDST_MSB  76
+`define BACK2_RB_PDFDST_LSB  71         // [76:71]  浮点新映射
+`define BACK2_RB_STQ_MSB     81
+`define BACK2_RB_STQ_LSB     77         // [81:77]  store queue 项索引（≤32 项）
+//   ★★ EXP-R2：EXP-R3 留下的 `[88]` 保留位被**回收**（整数字段收窄 3 bit ⇒ 其上整体下移 3，
+//     LQ 顺势压到 STQ 之上），载荷不再有空洞。
+`define BACK2_RB_LQ_MSB      84         // [84:82]  load queue 项索引（≤8 项，3 bit）
+`define BACK2_RB_LQ_LSB      82
+`define BACK2_RB_TVAL_MSB    116
+`define BACK2_RB_TVAL_LSB    85         // [116:85]  异常附加值 / 原始指令位
+`define BACK2_RB_TRTGT_MSB   148
+`define BACK2_RB_TRTGT_LSB   117        // [148:117] 分支实际目标（占位 0；merge_upd 用 br 表填）
+`define BACK2_RB_TRTAKEN     149        // [149]     分支实际方向（占位 0）
+`define BACK2_RB_FFLAGS_MSB  154
+`define BACK2_RB_FFLAGS_LSB  150        // [154:150] 浮点 flags（占位 0；merge_upd 用 ff 表填）
+`define BACK2_RB_PREDTGT_MSB 186
+`define BACK2_RB_PREDTGT_LSB 155        // [186:155] 预测目标
+`define BACK2_RB_PC_MSB      218
+`define BACK2_RB_PC_LSB      187        // [218:187] 指令 PC
+`define BACK2_RB_PRED_MSB    222
+`define BACK2_RB_PRED_LSB    219
+`define BACK2_RB_BTB_MSB     224
+`define BACK2_RB_BTB_LSB     223
 // ---- 项内 epoch ----
 //   ★ 不占载荷位域：由 rob.v 的窄控制字 `nq` 的 [2:1] 承载（原因见 rob.v §0：
 //     放进宽载荷会让"时钟块内 7 端口读"展开成组合读森林，仿真慢 ~12×）。
 //     （原独立的 `rep_q[]` 数组已无任何读写 ⇒ EXP-B 一并删除。）
-`define BACK2_RB_W           229        // ★ C4：416→229（XPM 位宽 229 ⇒ 3 RAMB36/bank）
-//   ★★ EXP-R3（LQ 16→8）：LQ 字段收窄 1 bit 但 `[88]` 转为保留位 ⇒ **RB_W 仍 229**
-//     （与 2B-5 L5 收窄顶端字段时 RB_W 恒 416 同理：宁可留 1 bit 保留位，也不动其余字段的
-//      绝对位位置）。
+`define BACK2_RB_W           225        // ★ EXP-R2：229→225（三个整数字段各收窄 1 bit）
+//   ★★ EXP-R3（LQ 16→8）曾把 LQ 之上留 1 bit 保留位（RB_W 恒 229）；EXP-R2 因整数字段
+//     收窄而必须重排其上整段，故把该保留位**回收给 LQ**（LQ 与 STQ 之间不再有空洞）。
 //   ★★ 2B-5 第 3 步②（读 lane 数改造）：ROB **窄控制字** `nq` 的宽度与关键位
 //     字段布局与 rob.v 的 `pack_nq` 逐位对应（两模块共用，不得各自硬编码）。
-//     MSB→LSB： pre{mret, sret, maint_kind[2:0]} | trtaken | pdf[5:0] | pdi[6:0] | arn[4:0] |
+//     MSB→LSB： pre{mret, sret, maint_kind[2:0]} | trtaken | pdf[5:0] | pdi[W-1:0] | arn[4:0] |
 //              is_csr | is_fp_wen | is_int_wen | ckpt_valid | is_branch | is_store |
 //              exc[3:0] | epoch[1:0] | done
 //   ★★ D2（nq 死字段裁剪，2B-5）：删除 `lq[3:0]` / `stq[4:0]` / `csrop[2:0]` 共 12 bit ——
@@ -498,9 +516,9 @@
 //     "nq vs 重新 pack 的 nq" 恒等比对，不构成语义读点）。载荷侧三者各有归属、**未动**：
 //     `stq` 仍供提交侧 `p_stq()→lsu_dr_idx`、`csrop` 仍供 `csr_pay`（rob.v §4）、
 //     `lq` 在载荷侧亦无功能读点（登记为后续 C4 载荷裁剪候选，见 D2 报告）。
-//     裁剪后 `nq` 49→37 bit：`trtaken` 34→31，其上的 `pre` 整段下移 12（MK 44→32、
-//     SRET 47→35、MRET 48→36）；`pdf` 及其以下所有字段绝对位位置**逐位不变**。
-`define BACK2_NQ_W           37
+//   ★★ EXP-R2（整数 NREG 96→64 级联）：`pdi` 由 `BACK2_PREG_I_W` 定宽（7→6）⇒ `pdi` 及其
+//     以上整段下移 1（NQ 37→36 bit）；`pdf` 及其以下字段绝对位位置**逐位不变**。
+`define BACK2_NQ_W           36
 `define BACK2_NQ_DONE        0
 `define BACK2_NQ_EP_L        1
 `define BACK2_NQ_EXC_L       3
@@ -511,15 +529,17 @@
 `define BACK2_NQ_DF          11
 `define BACK2_NQ_CSR         12
 `define BACK2_NQ_ARN_L       13
-`define BACK2_NQ_PDI_L       18
-`define BACK2_NQ_PDF_L       25
-`define BACK2_NQ_TRT         31
-`define BACK2_NQ_MK_L        32        // [34:32] maint_kind[2:0]
-`define BACK2_NQ_SRET        35
-`define BACK2_NQ_MRET        36
+`define BACK2_NQ_PDI_L       18        // [23:18] 整数新映射（6 bit；宽由 PREG_I_W 定）
+`define BACK2_NQ_PDF_L       (`BACK2_NQ_PDI_L + `BACK2_PREG_I_W)   // [29:24] 浮点新映射
+`define BACK2_NQ_TRT         (`BACK2_NQ_PDF_L + `BACK2_PREG_F_W)   // [30]    分支实际方向
+`define BACK2_NQ_MK_L        (`BACK2_NQ_TRT + 1)   // [33:31] maint_kind[2:0]
+`define BACK2_NQ_SRET        (`BACK2_NQ_MK_L + 3)   // [34]
+`define BACK2_NQ_MRET        (`BACK2_NQ_SRET + 1)   // [35]
 //   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
 //     ★★ EXP-B：其中 `csrw` 段（rob 侧）改由**载荷 uop.PS1I** 直接给出（原为 updq.CSRW 的
 //        低 7 位）；`tval` 段改由载荷 `BACK2_RB_TVAL`（= 原始指令位）给出 ⇒ 字段布局与宽度不变。
+//     ★★ EXP-R2：`csrw` 仍是**零扩展的 32 bit 字段**（`{(32−PREG_I_W){1'b0}, PS1I}`）⇒
+//        79 bit 对外布局与各段位置（tval[78:47]/csrw[46:15]/csra[14:3]/csrop[2:0]）**不变**。
 `define BACK2_CMT_CSR_W      79
 //   ★★ EXP-B（架构 v0.1 §16–§21）：可更新字段由**一张 102 bit 多写源表 `updq`** 拆成
 //     **三张"每表单写源" typed 表**，并删除恒 0 死口 `upd_csr`：

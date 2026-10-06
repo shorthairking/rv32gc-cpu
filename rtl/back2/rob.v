@@ -17,7 +17,8 @@
 //     写存储，保证异常回滚不会双重写，03 §6.2/§9）。
 //
 // 【载荷】每项 = BACK2_RB_W 位打包向量（`back2_params.vh` §2 为唯一布局真源）：
-//   ★★ C4（416→229 bit）：只保留「rob.v 自己 + 提交路径 + `pack_nq` 重建 nq」真正读的位；
+//   ★★ C4（416→229 bit；★ EXP-R2 再 229→225）：只保留「rob.v 自己 + 提交路径 + `pack_nq`
+//   重建 nq」真正读的位；
 //     旧的 uop(304) 全量副本（其中 IMM/ARND/源物理号/控制码/TVAL 重复副本…）与 CSRW(32)
 //     全部删除。字段表与逐字段证据见 `back2_params.vh` §2 的 C4 段注释。
 //
@@ -149,7 +150,7 @@ module rob #(
     // 0. 存储体与指针
     //==========================================================================
     //   ★★ B2：`pl_q` 已删（宽载荷改由 `rob_wide_mem` 承担：写侧每表项 mux 塔缩为每 bank 1 个 4:1 选择）
-    reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（C4 后 RB_W=229，按被消费的位存）
+    reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（C4 后 RB_W=229；★ EXP-R2 后 225）
     reg  [ROB_IDX_W-1:0] win_idx [0:7];       // 每槽 7 bit 全索引标签
     reg                  win_val [0:7];       // 每槽有效（复位/冲刷清零）
     reg  [ROB_IDX_W-1:0] e_of_r_q[0:3];       // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
@@ -168,11 +169,12 @@ module rob #(
     //     · 本步将 rob.v **自用的关键读**（done/exc/is_store/ckpt/is_branch/trap_cause/epoch）
     //       全部改走 `nq`（行为逐位等价），并导出 `cmt_narrow` 供下一步改造 backend_top。
     //     字段布局（MSB→LSB）：
-    //       pre{mret,sret,maint_kind[2:0]} trtaken pdf[5:0] pdi[6:0] arn[4:0]
+    //       pre{mret,sret,maint_kind[2:0]} trtaken pdf[5:0] pdi[5:0] arn[4:0]
     //       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
     //     ★★ D2：原 `lq[3:0] stq[4:0] csrop[2:0]`（12 bit）在 `nq` 里**只写不读**（唯一"读"
     //       是 §5 自检对 nq/nq_chk 的恒等区间比对）⇒ 已删，`NQ_W` 49→37；
     //       布局真源 = back2_params.vh §2，本文件不得另存一份位号。
+    //     ★★ EXP-R2：`pdi` 由 `PREG_I_W` 定宽（7→6）⇒ `NQ_W` 37→36，其上整段下移 1。
     localparam integer NQ_W      = `BACK2_NQ_W;
     localparam integer NQ_DONE   = `BACK2_NQ_DONE;
     localparam integer NQ_EP_L   = `BACK2_NQ_EP_L;
@@ -471,8 +473,12 @@ module rob #(
     //      `csrw` 段（其低 PW_I 位 = 该 CSR 指令自己的 PS1I）改从**载荷 uop.PS1I** 取 ——
     //      两者在拆分前分别等于 `updq.TVAL` 与 `updq.CSRW`（后者从不被回写，恒为派发期
     //      `{25'b0, PS1I}`）⇒ 对外 79 bit 布局与语义**逐位不变**，且不再需要 64 项 32 bit 表。
+    //   ★★ EXP-R2：`csrw` 段仍是**零扩展的 32 bit 字段** —— 填充宽度由 `BACK2_PREG_I_W`
+    //      算出（不再写死 25'b0）。若仍写 25'b0，整条 79 bit 拼接会缩短 1 bit ⇒
+    //      tval/csra/csrop 全体错位（backend_top 按 [78:47]/[46:15]/[14:3]/[2:0] 取段）。
     assign csr_pay = { win_q[csr_lane_idx[2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
-                       {25'b0, win_q[csr_lane_idx[2:0]][`BACK2_RB_PS1I_MSB:`BACK2_RB_PS1I_LSB]},
+                       {{(32-`BACK2_PREG_I_W){1'b0}},
+                        win_q[csr_lane_idx[2:0]][`BACK2_RB_PS1I_MSB:`BACK2_RB_PS1I_LSB]},
                        win_q[csr_lane_idx[2:0]][`BACK2_RB_CSRADDR_MSB:`BACK2_RB_CSRADDR_LSB],
                        win_q[csr_lane_idx[2:0]][`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB] };
 
