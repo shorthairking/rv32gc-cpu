@@ -627,7 +627,10 @@ module backend_top #(
 
     // 前端接口
     reg  [31:0] cnt_sq_q, cnt_cmt4_q, cnt_iss_q;
-    reg  [3:0]  ck_busy_q;
+    //   ★ EXP-R3a（D2 修复）：原 `reg [3:0]` 却按 `ck_busy_q[snap_id_r]`（id 0..15）与
+    //     `for (si2<CKPT_N=16)` 访问 ⇒ id≥4 的登记被丢弃、读取返回 x（实测 62 拍 snapid≥4）。
+    //     改为与 `ck_pend_q` 同宽（CKPT_N 位）。
+    reg  [CKPT_N-1:0] ck_busy_q;
     reg  [ROBW-1:0] ck_rob_q [0:CKPT_N-1];   // ★ L3：模 ROB_N
     reg  [CKPT_N-1:0] ck_pend_q;
 
@@ -1756,12 +1759,25 @@ module backend_top #(
                 if (rn_ndst_f[bi]) busy_f_nx[pd_f_dst[bi*PW_F +: PW_F]] = 1'b1;
             end
         end
+        //   ★★ EXP-R3a 第 4 处（busy 表 epoch 过滤缺陷，2026-10-06 母 Agent 批准落地）：
+        //     原判据 `wb_ep[bi] == epoch_w` 用**全局当前 epoch** 过滤在飞写回 ⇒ 跨冲刷
+        //     存活的生产者（已被发射、1~2 拍后写回）带的是**发射时** epoch，其写回被误
+        //     过滤 ⇒ `busy` 位永不清零 ⇒ 消费者入队时就绪位恒 0、而 IQ 唤醒是一拍脉冲早
+        //     已过去 ⇒ 该 ROB 项永不 done ⇒ ROB 头卡死、前端检查点池饱和（实测 p13
+        //     `bne x19,x5` 卡在 BRU 队：ps1i=40 恒 rdy=0，`busy_i_q[40]` 永为 1）。
+        //     **与 rob.v §5.2 同口径**：rob 侧早已把 done 过滤改为比"项内记录的分配时
+        //     epoch"，并留下同型教训注释；此处改用 **`wbi_keep`**（写回项仍在 ROB 窗口内
+        //     ⇒ 属于存活项）等价表达同一语义，且天然排除索引被复用/已冲刷的旧写回。
+        //     ⚠ 不能简单删掉过滤：窗口判据同时承担"旧写回不得误清新分配项"的原目标。
         for (bi = 0; bi < 6; bi = bi + 1) begin
-            if (wbi_v[bi] && (wb_ep[bi*EW +: EW] == epoch_w))
+            if (wbi_v[bi] && wbi_keep[bi])
                 busy_i_nx[wbi_tag[bi*PW_I +: PW_I]] = 1'b0;
         end
-        if (lsu_wb_v & lsu_wb_df & (lsu_wb_ep == epoch_w)) busy_f_nx[lsu_wb_pdf] = 1'b0;
-        if (fpu_wb_v & fpu_wb_f & (fpu_if_ep  == epoch_w)) busy_f_nx[fpu_if_pdf] = 1'b0;
+        //   ★★ 同上，浮点 busy 表两处同型潜伏缺陷一并按"在窗"口径修（`wbi_keep[WBP_LSU]`
+        //     = bit4 ↔ `lsu_wb_rob`、`wbi_keep[WBP_FPU]` = bit5 ↔ `fpu_if_rob`；与 2105-2106
+        //     行浮点 PRF 写口既有的 `wkeep` 表达式**同一语义**，非另起口径）。
+        if (lsu_wb_v & lsu_wb_df & wbi_keep[WBP_LSU]) busy_f_nx[lsu_wb_pdf] = 1'b0;
+        if (fpu_wb_v & fpu_wb_f  & wbi_keep[WBP_FPU]) busy_f_nx[fpu_if_pdf] = 1'b0;
     end
 
     //==========================================================================
@@ -2273,15 +2289,17 @@ module backend_top #(
     //       原：TRQ_D=32 ⇒ 指针 6 bit（mod 64）、cnt 7 bit（0..32）
     //       本段：TRQ_D=16 ⇒ 指针 **5 bit**（mod 32）、cnt **5 bit**（0..16；满判据保持原式
     //             `cnt > TRQ_D-4` ⇒ 13 项起判满，单拍最多 +4 ⇒ 12+4=16 恰在界内，不溢出）
-    //   ⚠ 已知边界（**沿用原设计同型行为，本段有意不改变**；另登记为后续任务）：指针宽度
-    //     > log2(深度) ⇒ 指针 ≥ 深度 时 `trq[...]` 下标越界；iverilog 语义 = **读回 x、
-    //     写被丢弃**（实测 `reg [106:0] trq[0:15]` 以 5'd16 索引 → x）。原 32 深设计（6 bit
-    //     指针）同样如此（≥32 越界）。**实测反证**：把它改成"指针 = 4 bit 的真循环缓冲"后，
-    //     `tb_core_top_2b` 程序 13（p17_fld_fsd）在第 16 条提交后 PC 跳 0 挂死（200k 拍不前进）
-    //     —— 越界 x 读恰好**掩盖**了下面两处既有记账缺陷，故本段严格保持 5 bit 指针口径。
-    //   ⚠ 另注（既有缺陷，本段未修、已登记）：① `trq_cnt` 在同一 always 块被写两次，同拍
-    //     "出队 + 入队"时后一次赋值覆盖前一次 ⇒ cnt 每拍多计 1（虚高）；② `trq_acc` 仅 2 bit
-    //     而 `COMMIT_W = 4` ⇒ 4 lane 全中时 acc 回绕为 0（4 条已写入却不记账）。
+    //   ★★ EXP-R3a（D1b 修复）：原设计指针宽度 > log2(深度) ⇒ 指针 ≥ 深度 时 `trq[...]`
+    //     下标越界（iverilog 语义 = 读回 x、写被丢弃）。**索引改为低 4 bit**（`trq_w[3:0]` /
+    //     `trq_r[3:0]`，即真·mod 16 环形缓冲）——5 bit 指针寄存器保留（只作"已写条数"的
+    //     无歧义计数，便于 `cnt == (trq_w−trq_r) mod 32` 自检），深度 16 是 C7 已定口径。
+    //   ★★ EXP-R3a（D1 修复）：`trq_cnt` 由**同块两次赋值**（后写覆盖前写）改为**单一赋值**
+    //     `cnt − deq_n + enq_n`，见 §13 时序块。原写法在"出队 + 派发/提交"同拍恒把那次 −1
+    //     抹掉（`trq_acc==0` 时 `+0` 覆盖）⇒ cnt 长期虚高不归零 ⇒ `train_valid_o` 恒 1 ⇒
+    //     `trq_r` 空转跑飞（EXP-R 实测出队 39251 vs 入队 4359）。
+    //   ⚠ 遗留（**本任务有意不改、已登记 EXP-R3b**）：`trq_acc` 仅 2 bit 而 `COMMIT_W = 4`
+    //     ⇒ 4 lane 全中时 acc 回绕为 0（4 条已写入却不计入 cnt/w，指针与 cnt 仍自洽，
+    //     只是这 4 条训练被下一拍覆盖）；若需修需改 3 bit 并同步 cnt/指针核算。
     localparam integer TRQ_D = 16;
     reg [106:0] trq [0:TRQ_D-1];
     reg [4:0]   trq_w, trq_r;
@@ -2290,6 +2308,10 @@ module backend_top #(
     reg  [3:0]  trq_ok;
     reg  [1:0]  trq_ord [0:3];
     reg  [1:0]  trq_acc;
+    //   EXP-R3a：出队/入队条数（同拍各一，计入同一表达式；`enq` 在满拍整拍丢弃）
+    wire        trq_deq_n = train_valid_o;
+    wire        trq_enq_en = (disp_fire_w | cmt_ok) & ~trq_full;
+    wire [4:0]  trq_enq_n = trq_enq_en ? {3'b0, trq_acc} : 5'd0;
     integer     ti;
     always @(*) begin
         trq_acc = 2'd0;
@@ -2329,20 +2351,21 @@ module backend_top #(
     endgenerate
 
     assign train_valid_o = (trq_cnt != 0) & train_ready_i;
-    assign train_pc_o    = trq[trq_r][31:0];
-    assign train_pred_target_o = trq[trq_r][63:32];
-    assign train_btb_way_o     = trq[trq_r][64];
-    assign train_btb_hit_o     = trq[trq_r][65];
-    assign train_pred_ldir_o   = trq[trq_r][66];
-    assign train_pred_gdir_o   = trq[trq_r][67];
-    assign train_pred_sel_global_o = trq[trq_r][68];
-    assign train_pred_taken_o  = trq[trq_r][69];
-    assign train_target_o      = trq[trq_r][101:70];
-    assign train_is_return_o   = trq[trq_r][102];
-    assign train_is_call_o     = trq[trq_r][103];
-    assign train_is_indirect_o = trq[trq_r][104];
-    assign train_taken_o       = trq[trq_r][105];
-    assign train_is_cond_o     = trq[trq_r][106];
+    //   ★ EXP-R3a（D1b）：读索引取 `trq_r[3:0]`（真 mod 16），不再用 5 bit 指针直接索引
+    assign train_pc_o    = trq[trq_r[3:0]][31:0];
+    assign train_pred_target_o = trq[trq_r[3:0]][63:32];
+    assign train_btb_way_o     = trq[trq_r[3:0]][64];
+    assign train_btb_hit_o     = trq[trq_r[3:0]][65];
+    assign train_pred_ldir_o   = trq[trq_r[3:0]][66];
+    assign train_pred_gdir_o   = trq[trq_r[3:0]][67];
+    assign train_pred_sel_global_o = trq[trq_r[3:0]][68];
+    assign train_pred_taken_o  = trq[trq_r[3:0]][69];
+    assign train_target_o      = trq[trq_r[3:0]][101:70];
+    assign train_is_return_o   = trq[trq_r[3:0]][102];
+    assign train_is_call_o     = trq[trq_r[3:0]][103];
+    assign train_is_indirect_o = trq[trq_r[3:0]][104];
+    assign train_taken_o       = trq[trq_r[3:0]][105];
+    assign train_is_cond_o     = trq[trq_r[3:0]][106];
     assign train_pred_valid_o  = 1'b0;
 
     // ---- 12.2 检查点释放（待释放位图 + 1 条/拍排出）----
@@ -2496,14 +2519,15 @@ module backend_top #(
             if (flush_all_w) ck_busy_q <= {CKPT_N{1'b0}};
 
             // ---- 训练 FIFO ----
-            if (train_valid_o) begin
-                trq_r   <= trq_r + 5'd1;
-                trq_cnt <= trq_cnt - 5'd1;
-            end
-            if (disp_fire_w | cmt_ok) begin
+            //   ★★ EXP-R3a（D1）：**单一赋值** `cnt − deq + enq`（同拍出队+入队都计入，
+            //     用旧值 ⇒ 不丢计数）。原为两次独立赋值，后写 `+trq_acc` 覆盖先写 `−1`。
+            trq_cnt <= trq_cnt - trq_deq_n + trq_enq_n;
+            if (train_valid_o) trq_r <= trq_r + 5'd1;
+            if (trq_enq_en) begin
                 for (si2 = 0; si2 < COMMIT_W; si2 = si2 + 1) begin
-                    if (trq_ok[si2] && !trq_full) begin
-                        trq[trq_w + {3'b0, trq_ord[si2]}] <= {
+                    if (trq_ok[si2]) begin
+                        //   ★ EXP-R3a（D1b）：写索引取低 4 bit + 组内序号（真 mod 16）
+                        trq[trq_w[3:0] + {2'b0, trq_ord[si2]}] <= {
                             tcp_cond[si2], tcp_tk[si2], tcp_ind[si2], tcp_call[si2],
                             tcp_ret[si2], tcp_tgt[si2],
                             tcp_ptk[si2], tcp_psg[si2], tcp_pgd[si2], tcp_pld[si2],
@@ -2511,10 +2535,7 @@ module backend_top #(
                         };
                     end
                 end
-                if (!trq_full) begin
-                    trq_w   <= trq_w + {3'b0, trq_acc};
-                    trq_cnt <= trq_cnt + {3'b0, trq_acc};
-                end
+                trq_w   <= trq_w + {3'b0, trq_acc};
             end
 
             // ---- 统计 ----
