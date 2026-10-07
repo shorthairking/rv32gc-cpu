@@ -83,6 +83,8 @@
 1. 新项目载体 = **就地沿用 `rv32gc-cpu/` dev 分支**（不再另建 rv32gc-cpu-v2/；旧实现文件已从磁盘移除，历史在 master）。
 2. 用户已发"开始阶段一"指令：info 复核 → coding 重写 docs/design+porting+kb → 收尾提交 → 停下审阅。
 3. 子 Agent 路由（2026-10-01 更新）：`provider` 取 `opencode-go` 或 `opencode-go-chat`（**两者放行**）、`model=deepseek-v4.1-flash`、`reasoning_effort=high`（OpenCode Go 网关；旧 xhigh 与 deepseek-official 口径作废）。
+4. **★任务要求口径更新（2026-10-04 用户拍板，覆盖此前"4 发射是禁区"）**：**4 发射 + 目标平台（chiplab, xc7a200t）是底线、不允许改**。具体：**前端一次取 4 条指令（hard）；后端至少支持一次提交 2 条指令，即底线 IPC 在 2 附近（hard）**。其余（FU 数量、资源占用率、时钟频率等）**可改，但需经用户审阅后再改**。⇒ 后端可从"4-wide 提交 + 6 FU"降为"4-fetch / 2-commit / 更少 FU"，这是关闭 133.69%→80% 结构缺口的关键路径；但 FU 数量/频率改动必须先报用户审阅。
+5. **总结性 report 固定内容（2026-10-04，下次提"总结性 report"即照此、勿再声明）**：①项目当前大概状况（架构/技术/资源占用率，快速获取整体框架）；②目前主要问题与成因（详细 + **原始数据印证，禁止编造/夸大或减小**）；③可能的解决方案与优化路径（简写方向）；④其他补充信息。**一律写在同一个 md（`fpga/area-optimization-report.md`）上修改，禁止新建 md。**
 
 ## 3. 平台硬事实快照（info 复核 + 母 Agent 复跑，引用分级见 docs/kb/platform-facts.md）
 
