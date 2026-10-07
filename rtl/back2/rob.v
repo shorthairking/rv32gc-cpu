@@ -34,6 +34,19 @@
 //    动态依据：`upd_tr/ff/exc` 同拍并发 ≥2 仅 0.02%（3 拍）、`upd_csr_valid` 恒 0
 //    （docs/design/10-dynamic-behavior.md §1.3）。
 //
+// ★★ EXP-N3（本轮 A 优先级，answer.md §五）：**头部退休窗口 8 槽 → `WIN_N = 2` 项（lane 对齐）**：
+//     · 事实依据：提交宽度已是 `COMMIT_W = 2` ⇒ 每拍只消费 2 项（`slot_ok[gi]` 只看 `head+gi`），
+//       原 8 槽窗口（槽号 = `idx[2:0]`）里其余 6 项**从不被任何 lane 读**；
+//     · 新口径：**槽号 = 组内 lane 号**（槽 0 = 预测的下一拍 head、槽 1 = head+1）
+//       ⇒ 提交读 `win_rd[gi] = win_q[gi]` **零 mux**（原 2 lane × 8:1 × RB_W 读 mux 整体消失）；
+//     · 预取读侧仍 = 4 bank（PF_W=4，**不是**浪费）：BRAM 写侧 4 口按 `bank = idx[1:0]` bank 化
+//       ⇒ 读口必须也是 4 个 bank；且"读命令 T 拍发出、数据 T+1 拍到、填窗在 T+1→T+2 沿"
+//       意味着填窗目标（T+2 的 head = 本拍 `hpred`）与读命令基址（T 拍 `hpred`）相差
+//       `cmt_n ∈ {0,1,2}` ⇒ 只能一次读回 4 个连续项再把其中 2 项选进窗口（2 个 4:1 选择）。
+//     · 语义等价保障：全索引标签 + valid 命中判定保留（失配 ⇒ 插气泡，绝不交付错数据）、
+//       `read_first` 同址危险丢弃保留、`flush_all` 清窗保留、`squash_valid` 拍**不覆盖**
+//       （该拍 head 不前进 ⇒ 旧窗口内容仍是下一拍的正确组）。
+//
 // 风格  : 组合逻辑全部 `assign`/函数（红线 3）；always 块只用于存储体与指针（时序元件）。
 //==============================================================================
 
@@ -157,16 +170,25 @@ module rob #(
     // 0. 存储体与指针
     //==========================================================================
     //   ★★ B2：`pl_q` 已删（宽载荷改由 `rob_wide_mem` 承担：写侧每表项 mux 塔缩为每 bank 1 个 4:1 选择）
-    //   ★★ EXP-N1：**预取宽度口径**（= 每拍从 BRAM 预取的项数；不由 COMMIT_W 决定）：
-    //     PF_W = 4 必须覆盖 BRAM 同步读延迟（1 拍）× 每拍提交前进量（≤ COMMIT_W = 2）
-    //     = 2，取 4 是为"连续满宽提交（2/拍）时窗口仍领先 2 拍"留余量。
-    //     **不能**跟着 COMMIT_W 缩到 2：预取地址 T 拍算出、数据 T+2 拍可用，每拍只预取 2 项
-    //     会让连续 2/拍提交组落到窗口之外 ⇒ 每拍插气泡（性能判据不允许）。
+    //   ★★ B2/B3：**预取宽度口径** `PF_W` = BRAM bank 数 = 预取读口数（本设计恒 4）：
+    //     · **由写侧决定**：派发重命名宽度 `ALLOC_W = 4`、4 条 lane 索引连续 ⇒ 宽载荷按
+    //       `bank = idx[1:0]` 分成 4 个 bank（每 bank 每拍至多 1 写，无仲裁；见 `rob_wide_mem`）
+    //       ⇒ 读口也只能是这 4 个 bank（XPM SDP 每实例 1W1R）。
+    //     · **不是**"窗口宽度"：EXP-N3 后窗口只剩 2 项（见下），但一次读回仍是 4 个连续项
+    //       （`rsel[k] = k - hpred[1:0]` 把 bank 对齐到索引），因为"读命令 T 拍发出、数据 T+1 拍到、
+    //       填窗在 T+1→T+2 沿"⇒ 填窗目标（T+2 的 head = 本拍 `hpred`）与本次读命令的基址
+    //       （T 拍 `hpred`）相差 `cmt_n ∈ {0,1,2}` ⇒ 必须 4 选 2（见 §1.5 的 `fhit/fdat` 与 §5.35）。
+    //     · 若把 PF_W 直接缩到 2：写侧 4 lane 无处可写（bank 化前提被破坏），且 4 选 2 退化成
+    //       动态 bank 选择的地址+数据双 mux，**更贵**。故 PF_W 恒 4，收窄的是窗口存储（WIN_N）。
     localparam integer PF_W = 4;
-    //   ★★ EXP-N1：头部窗口/预取/BRAM 读侧保持 4 宽（见上）；收窄的是**提交侧消费**（2 lane）。
-    reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（C4 后 RB_W=229；★ EXP-R2 后 225）
-    reg  [ROB_IDX_W-1:0] win_idx [0:7];       // 每槽 7 bit 全索引标签
-    reg                  win_val [0:7];       // 每槽有效（复位/冲刷清零）
+    //   ★★ EXP-N3：**退休窗口 = WIN_N = COMMIT_W 项（槽号 = 组内 lane 号）**。
+    //     · 原 8 槽窗口按 `idx[2:0]` 寻址，提交侧每拍只读 head/head+1 ⇒ 6 槽是纯冗余 FF + mux；
+    //     · 新窗口槽 0 恒为"下一拍 head"、槽 1 恒为"head+1" ⇒ 提交读是**寄存器直连**（零 mux）。
+    //     · 预取读侧仍是 PF_W = 4 bank（bank 化写口的固有宽度，见 §1.5/§5.35 的口径说明）。
+    localparam integer WIN_N = COMMIT_W;
+    reg  [RB_W-1:0]      win_q   [0:WIN_N-1]; // ★ EXP-N3：头部窗口（C4 后 RB_W=229；★ EXP-R2 后 225）
+    reg  [ROB_IDX_W-1:0] win_idx [0:WIN_N-1]; // 每槽全索引标签（命中校验 ⇒ 绝不交付 stale 载荷）
+    reg                  win_val [0:WIN_N-1]; // 每槽有效（复位/冲刷清零；read_first 危险拍丢弃）
     reg  [ROB_IDX_W-1:0] e_of_r_q[0:PF_W-1];  // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
     //   ★★ 危险修正（p11 实测）：BRAM 为 `read_first` ⇒ "同拍被写的项，当拍读到旧值"。
     //     若预取地址正好是本拍刚分配的项（ROB 近空：清洗后 head≈tail），窗口会被填入**旧载荷**
@@ -334,16 +356,18 @@ module rob #(
     end
     endgenerate
 
-    //   窗口读（**提交组每 lane 一个 8:1 mux**）+ 命中判定
-    //   ★★ EXP-N1：只有 COMMIT_W（=2）个 lane 需要读窗口 ⇒ 这里从 4 lane 缩到 2 lane
-    //     （原 4 lane 的 win_rd/win_lane_ok 与它们的 8:1 mux 全部消失）。
+    //   窗口读（**零 mux**：槽号 = lane 号）+ 命中判定
+    //   ★★ EXP-N3：窗口槽号 = 组内 lane 号 ⇒ `win_rd[gi] = win_q[gi]` **直连**，
+    //     原 2 lane × 8:1 × RB_W 的窗口读 mux 与按 `idx[2:0]` 的动态索引整体消失。
+    //     命中判定保留（全索引标签 + valid）：填窗只在"预测正确"时进行，标签失配
+    //     ⇒ 该 lane 本拍不提交（插气泡；**绝不交付错误 PC/tval**）。
     wire [RB_W-1:0] win_rd [0:COMMIT_W-1];
     wire [COMMIT_W-1:0] win_lane_ok;
     generate
     for (gw = 0; gw < COMMIT_W; gw = gw + 1) begin : g_winrd
         wire [ROB_IDX_W-1:0] ei = idx_add(head_q, gw[ROB_IDX_W-1:0]);
-        assign win_rd[gw]      = win_q[ei[2:0]];
-        assign win_lane_ok[gw] = win_val[ei[2:0]] & (win_idx[ei[2:0]] == ei);
+        assign win_rd[gw]      = win_q[gw];
+        assign win_lane_ok[gw] = win_val[gw] & (win_idx[gw] == ei);
     end
     endgenerate
 
@@ -385,6 +409,23 @@ module rob #(
         end
     end
     endgenerate
+
+    //   ★★ EXP-N3：**填窗选择**（纯 `assign`）—— 本拍读回的 4 个 bank 里，哪两个是"下一拍退休组"。
+    //     · 读口 k 恒携带 **bank k** 的项（`rsel[k] = k - hpred[1:0]` 把 4 个连续项铺到 4 个 bank）
+    //       ⇒ "索引 X 在哪个口" 只看 `X[1:0]`；`e_of_r_q[k]` 是权威标签（与 `pl_rdata[k]` 同源同拍）。
+    //     · `fhit*` = 口内数据的全索引 == 目标索引（读命令基址与当前 head 脱节时失配 ⇒ 不填）；
+    //       `fdang*` = `read_first` 同址危险（该地址恰在发出读命令的那一拍被分配写入 ⇒ 读回旧载荷）。
+    //     · 目标索引 = `hpred_w`（= 本拍 `head + cmt_n`）= **下一拍 head**（正常推进分支逐位相等）
+    //       ⇒ 槽 0 ← `hpred`、槽 1 ← `hpred+1`，与"槽号 = lane 号"的提交读口径严格对齐。
+    wire [ROB_IDX_W-1:0] fidx1_w  = hpred_w + {{(ROB_IDX_W-1){1'b0}}, 1'b1};
+    wire [1:0]           fsel0_w  = hpred_w[1:0];
+    wire [1:0]           fsel1_w  = hpred_w[1:0] + 2'd1;
+    wire                 fhit0_w  = (e_of_r_q[fsel0_w] == hpred_w);
+    wire                 fhit1_w  = (e_of_r_q[fsel1_w] == fidx1_w);
+    wire                 fdang0_w = |dang_hit[fsel0_w];
+    wire                 fdang1_w = |dang_hit[fsel1_w];
+    wire [RB_W-1:0]      fdat0_w  = pl_rdata[fsel0_w];
+    wire [RB_W-1:0]      fdat1_w  = pl_rdata[fsel1_w];
 
     // 提交链（先算，用于同拍释放余量）
     //   ★★ EXP-N1：以下**全部**是提交侧 ⇒ 宽度 = COMMIT_W（= 2），4 份复制变 2 份。
@@ -492,13 +533,15 @@ module rob #(
     endgenerate
 
     // 异常：仅当该槽已完成且为头部（slot 0）
+    //   ★★ EXP-N3：槽 0 恒为 head 项（填窗目标 = 下一拍 head，`win_lane_ok[0]` 已校验标签）
+    //     ⇒ 不再按 `slot_idx[0][2:0]` 动态索引窗口（原 8:1 mux 消失）。
     assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0] & win_lane_ok[0];
-    assign trap_pc    = win_q[slot_idx[0][2:0]][`BACK2_RB_PC_MSB:`BACK2_RB_PC_LSB];
+    assign trap_pc    = win_q[0][`BACK2_RB_PC_MSB:`BACK2_RB_PC_LSB];
     assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
     //   ★★ EXP-B：mtval 取 ex 表（LSU 数据侧异常）或**载荷 TVAL**（派发期异常：非法指令的
     //     原始指令位 / 取指异常的故障 VA）——判据与提交侧 `ex_use` 同源（`ex_use[0]`）。
     assign trap_tval  = ex_use[0] ? ex_tval_q[slot_idx[0]]
-                                  : win_q[slot_idx[0][2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
+                                  : win_q[0][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
 
     //==========================================================================
     // 4. 观测输出
@@ -511,11 +554,21 @@ module rob #(
     //   ★★ EXP-R2：`csrw` 段仍是**零扩展的 32 bit 字段** —— 填充宽度由 `BACK2_PREG_I_W`
     //      算出（不再写死 25'b0）。若仍写 25'b0，整条 79 bit 拼接会缩短 1 bit ⇒
     //      tval/csra/csrop 全体错位（backend_top 按 [78:47]/[46:15]/[14:3]/[2:0] 取段）。
-    assign csr_pay = { win_q[csr_lane_idx[2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
-                       {{(32-`BACK2_PREG_I_W){1'b0}},
-                        win_q[csr_lane_idx[2:0]][`BACK2_RB_PS1I_MSB:`BACK2_RB_PS1I_LSB]},
-                       win_q[csr_lane_idx[2:0]][`BACK2_RB_CSRADDR_MSB:`BACK2_RB_CSRADDR_LSB],
-                       win_q[csr_lane_idx[2:0]][`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB] };
+    //   ★★ EXP-N3：槽号 = lane 号 ⇒ 动态索引退化为**组内 2:1 位置选择**
+    //      （`backend_top` 的 `csr_dyn_idx_w = head + csr_cmt_lane`，`csr_cmt_lane ∈ {0,1}`）。
+    //      字段抽取做成函数（红线 3：组合逻辑用函数，不写 always），79 bit 拼接只做一次。
+    function [`BACK2_CMT_CSR_W-1:0] pack_csr_pay;
+        input [RB_W-1:0] p;
+        begin
+            pack_csr_pay = { p[`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB],
+                             {{(32-`BACK2_PREG_I_W){1'b0}},
+                              p[`BACK2_RB_PS1I_MSB:`BACK2_RB_PS1I_LSB]},
+                             p[`BACK2_RB_CSRADDR_MSB:`BACK2_RB_CSRADDR_LSB],
+                             p[`BACK2_RB_CSROP_MSB:`BACK2_RB_CSROP_LSB] };
+        end
+    endfunction
+    wire csr_win_lane1_w = (csr_lane_idx != head_q);   // 索引 ∈ {head, head+1} ⇒ 非 head 即为 lane 1
+    assign csr_pay = csr_win_lane1_w ? pack_csr_pay(win_q[1]) : pack_csr_pay(win_q[0]);
 
     assign head_o      = head_q;
     assign cnt_o       = cnt_q;
@@ -535,7 +588,7 @@ module rob #(
             cnt_q     <= {(ROB_IDX_W+1){1'b0}};
             cmt_cnt_q <= 32'h0;
             epoch_q   <= {`BACK2_EPOCH_W{1'b0}};
-            for (k = 0; k < 8; k = k + 1) begin
+            for (k = 0; k < WIN_N; k = k + 1) begin
                 win_q[k]   <= {RB_W{1'b0}};
                 win_idx[k] <= {ROB_IDX_W{1'b0}};
                 win_val[k] <= 1'b0;
@@ -606,19 +659,23 @@ module rob #(
                 ex_tval_q[upd_exc_idx]   <= upd_exc_tval;
             end
 
-            // ---- 5.35 ★ B3：头部窗口填充（上一拍发出的预取读在本拍到达）----
-            //   读口 i 对应项 `e_of_r_q[i]`（上一拍的 head_pred 算出）⇒ 写入槽 `[2:0]`、打全索引标签、置有效。
-            //   ★★ EXP-N1：本循环是**预取侧** ⇒ 上界 = PF_W（=4，不随 COMMIT_W 变化）。
-            for (k = 0; k < PF_W; k = k + 1) begin
-                //   危险判定：该项是否在“读命令发出的那一拍”刚好被分配写入
-                if (|dang_hit[k]) begin
-                    if (win_val[e_of_r_q[k][2:0]] & (win_idx[e_of_r_q[k][2:0]] == e_of_r_q[k]))
-                        win_val[e_of_r_q[k][2:0]] <= 1'b0;      // 旧内容不可用 ⇒ 置无效
-                end else begin
-                    win_q  [e_of_r_q[k][2:0]] <= pl_rdata[k];
-                    win_idx[e_of_r_q[k][2:0]] <= e_of_r_q[k];
-                    win_val[e_of_r_q[k][2:0]] <= 1'b1;
-                end
+            // ---- 5.35 ★ B3/EXP-N3：头部窗口填充（上一拍发出的预取读在本拍到达）----
+            //   ★★ EXP-N3：窗口只剩 `WIN_N = 2` 槽且**槽号 = lane 号** ⇒ 本步做的是
+            //     "把 4 个 bank 读回值里对应当前预测组 `{hpred_w, hpred_w+1}` 的两项选进槽 0/1"。
+            //     · 目标 `hpred_w`（= 本拍 `head + cmt_n`）**逐位等于下一拍的 head**
+            //       （正常推进分支 `head_q <= head_q + cmt_n_w`）⇒ 填进去的正是下一拍要提交的组；
+            //     · **只在 `~flush_all & ~squash_valid` 拍填**：这两拍 head 都不按 `cmt_n_w`
+            //       前进（flush 另行把窗口清零；squash 保 head 不动 ⇒ 旧窗口内容仍是下一拍的
+            //       正确组），照常填反而会用"错的预测索引"覆盖掉正确项（2 槽没有冗余空间）。
+            //     · `fhit`（读命令基址与当前 head 脱节）与 `fdang`（`read_first` 同址）失配
+            //       ⇒ 该槽置无效，下一拍凭新读回值重填（插一拍气泡；**绝不交付错 PC/tval**）。
+            if (!flush_all && !squash_valid) begin
+                win_q  [0] <= fdat0_w;
+                win_idx[0] <= hpred_w;
+                win_val[0] <= fhit0_w & ~fdang0_w;
+                win_q  [1] <= fdat1_w;
+                win_idx[1] <= fidx1_w;
+                win_val[1] <= fhit1_w & ~fdang1_w;
             end
             //   预取地址打拍（下一拍用它给读回的数据定标签）
             for (k = 0; k < PF_W; k = k + 1) e_of_r_q[k] <= idx_add(hpred_w, {{5{1'b0}}, rsel[k]});
@@ -631,7 +688,7 @@ module rob #(
 
             // ---- 5.4 指针推进（提交 / 冲刷 / 分配）----
             if (flush_all) begin
-                for (k = 0; k < 8; k = k + 1) win_val[k] <= 1'b0;   // ★ 冲刷后窗口不可信
+                for (k = 0; k < WIN_N; k = k + 1) win_val[k] <= 1'b0;   // ★ 冲刷后窗口不可信
                 cnt_q   <= {(ROB_IDX_W+1){1'b0}};
                 //   ★ 陷阱退役：头部异常项**弹出**（其余全清）；否则只清 cnt（原口径）
                 head_q  <= trap_retire ? idx_add(head_q, {{ROB_IDX_W-1{1'b0}}, 1'b1})
