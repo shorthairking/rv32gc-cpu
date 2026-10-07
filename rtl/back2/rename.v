@@ -147,20 +147,42 @@ module rename #(
     // 0. 状态
     //==========================================================================
     //   ★ L8（面积分析 `fpga/scratch/area_analysis_2b_l1.md` §3/§5，用户授权降条目）：
-    //     free list **数组深度 256→128**。实际只需容纳 `FREE_N` 个物理号（整数域 64 /
-    //     浮点域 32），256 深是 4×/8× 超配。只降"读 mux 256:1→128:1 + 写 demux 减半"
-    //     的规模，**不改任何指令语义**。
-    //   ★ 为什么等价：环形窗口内**活项数 = ftail−fhead ≤ FREE_N ≤ 64 < 128**，
-    //     故不存在"数组下标相差 128"的两个活项 ⇒ 下标按 FL_DEPTH 取模是**单射**，
-    //     与 256 深逐拍等价（陈旧槽只会在被释放覆写前保持垃圾值，与深度无关）。
+    //     free list **数组深度 256→128**（再降 64 见下 ★★ L9）。只降"读 mux
+    //     宽度 + 写 demux 规模"的规模，**不改任何指令语义**。
+    //   ★ 为什么等价（L8 版）：环形窗口内**活项数 = ftail−fhead ≤ FREE_N**，
+    //     故不存在"数组下标相差 FL_DEPTH"的两个活项 ⇒ 下标按 FL_DEPTH 取模是**单射**，
+    //     与更深的数组逐拍等价（陈旧槽只会在被释放覆写前保持垃圾值，与深度无关）。
     //   ★ `FL_PTR_W` **保持 8 不动**：它是"模 256 指针 ⇒ 距离无歧义"的语义
-    //     （距离 ≤ 64 < 128；若缩成 7 bit 模 128，"距离 64"会与"距离 0"撞车 ⇒ 空满误判）。
+    //     （距离 ≤ FREE_N ≤ 32 ≪ 128；若把指针本身缩成更窄的模，会改变
+    //      `ck_fhead`/`rb_g_fhead`/`snap_fhead`/`undo_fhead` 一族的绝对指针口径 ⇒ 无谓风险）。
     //     因此**只有 `flist_q` 的数组下标**收窄到 FL_AW 位；指针/距离算术
     //     （`fhead_q`/`ftail_q`/`ck_fhead`/`free_cnt_w`）一律不动。
     //     （D1 之后 `rb_fhead` 一族改为"按 4-lane 组压缩存储"，其**指针语义与位宽**
     //      仍守本条：`rb_g_fhead` 是 8 bit 模 256 指针。）
-    localparam integer FL_AW    = FL_PTR_W - 1;   // 数组下标宽度（深度 128 ⇒ 7 bit）
-    localparam integer FL_DEPTH = 1 << FL_AW;     // free list 数组深度（= 128，2 的幂）
+    //
+    //   ★★ L9（本任务，面积归因 `fpga/scratch/area_attrib_nreg.md`）：free list
+    //     **数组深度 128→64**。EXP-R2 把整数域 NREG 96→64、`FREE_I_N` 恒等于
+    //     `PRF_I_N − ARCH_N = 64 − 32 = 32`（浮点域同为 32，见 back2_params.vh §1），
+    //     而指针仍是"模 256 的 8 bit"⇒ 128 深是 2× 超配的残留。
+    //   ★ 为什么 64 是**最小安全**幂次（不是 32，也不是拍脑袋的 2×32）：
+    //     记本拍数组被触碰的指针集合 = 读域 {fhead + ord_d[g] : ord_d ≤ W−1 = 3}
+    //     ∪ 写域 {ftail + ord_r[j] : ord_r ≤ CMW−1 = 1}，即**连续区间
+    //       [fhead, ftail + rel_n − 1]**，跨度 = (ftail − fhead) + rel_n ≤ FREE_N + CMW = 34。
+    //     取模下标是单射 ⟺ 深度 > 最大跨度（33）⇒ 深度 ≥ 34 ⇒ 2 的幂取 **64**。
+    //     ⚠ 深度 32 **不安全**：`free_cnt = 32` 且同拍 `rel_n = 1` 时，写下标
+    //       `ftail = fhead + 32 ≡ fhead (mod 32)` 会**覆写仍活着的读槽** `fhead`
+    //       （alloc_n=0 时它下拍还要被读）⇒ 同一物理号被发两次（pdi 撞车同型）。
+    //   ★ 等价的**双重保证**：
+    //     ① 结构性：`FREE_N == PRF_I_N − ARCH_N`（back2_params.vh §1 恒等式）⇒ 空闲表
+    //        活项数 ≤ FREE_N = 32（基线 32 个架构物理号 0..31 **永不进表**）；
+    //     ② 运行时：§2.10 的 `FREE-OVER` 自检（`free_cnt_w > FREE_N` 即报）逐拍守 ①。
+    //     二者成立时跨度 ≤ 34 < 64 ⇒ 不存在"下标相差 64"的两个同拍活项 ⇒ 与 128 深
+    //     **逐拍等价**（陈旧槽只会在被释放覆写前保持垃圾值，与深度无关）。
+    //   ★ 覆盖范围核对：`rb_act` 重建（§3.1）写 `rb_head` ∈ [0, FREE_N] ⊆ [0,32]
+    //     （32 需 6 bit ⇒ FL_AW=6 恰好容纳）、复位预置 `flist_q[0..FREE_N-1]`、
+    //     自检打印 `fhead..fhead+7` —— 全部落在 6 bit 下标内，无需其它改动。
+    localparam integer FL_AW    = FL_PTR_W - 2;   // 数组下标宽度（深度 64 ⇒ 6 bit）
+    localparam integer FL_DEPTH = 1 << FL_AW;     // free list 数组深度（= 64，2 的幂）
 
     reg  [PDW-1:0]       rat_q   [0:ARCH_N-1];
     reg  [PDW-1:0]       arat_q  [0:ARCH_N-1];
@@ -295,7 +317,7 @@ module rename #(
                            {2'b0, lane_valid[2]} + {2'b0, lane_valid[3]};
 
     // ---- 1.1 free list 组合读（目的新物理号）----
-    //   ★ L8：数组深度 FL_DEPTH=128 ⇒ 下标取低 FL_AW(=7) 位（= 按深度取模，见 §0 注释）。
+    //   ★ L9：数组深度 FL_DEPTH=64 ⇒ 下标取低 FL_AW(=6) 位（= 按深度取模，见 §0 ★★ L9）。
     //     指针保值 8 bit 的模 256 语义，只有**取数组**时截断。
     wire [PDW-1:0] ev_pd_dst [0:W-1];
     wire [FL_PTR_W-1:0] fl_rd_idx [0:W-1];       // fhead + ord_d[]（8 bit 指针语义）
@@ -777,7 +799,7 @@ module rename #(
                                      cj, ck, lane_dst_arn[cj*ARN_W +: ARN_W],
                                      lane_pd_dst[cj*PDW +: PDW],
                                      fhead_q, ftail_q,
-                                     //   ★ L8：数组深度 128 ⇒ 打印下标同样按深度取模
+                                     //   ★ L9：数组深度 64 ⇒ 打印下标同样按深度取模
                                      //     （fl_dbg_a 见 §1.1；否则 8 bit 下标越界读出 x）
                                      flist_q[fl_dbg_a[0]], flist_q[fl_dbg_a[1]], flist_q[fl_dbg_a[2]],
                                      flist_q[fl_dbg_a[3]], flist_q[fl_dbg_a[4]], flist_q[fl_dbg_a[5]],
@@ -836,8 +858,8 @@ module rename #(
                 rat_q [j2] <= j2[PDW-1:0];
                 arat_q[j2] <= j2[PDW-1:0];
             end
-            //   ★ L8：清零与预置循环上界必须 = 数组深度 FL_DEPTH（=128），不能再用 256
-            //     （否则 iverilog/综合对越界下标写出界；FREE_N ≤ 64 ⇒ 预置范围不受影响）。
+            //   ★ L9：清零与预置循环上界必须 = 数组深度 FL_DEPTH（=64），不能写更大常量
+            //     （否则 iverilog/综合对越界下标写出界；FREE_N = 32 ≤ FL_DEPTH ⇒ 预置范围不受影响）。
             for (j2 = 0; j2 < FL_DEPTH; j2 = j2 + 1) flist_q[j2] <= {PDW{1'b0}};
             for (j2 = 0; j2 < FREE_N; j2 = j2 + 1) flist_q[j2] <= (ARCH_N + j2);
             //   ★★ EXP-R1：组基 RAT 快照复位为单位映射（安全垫：正常世代下"未进入过的组"
@@ -909,7 +931,7 @@ module rename #(
             end else if (rb_act) begin
                 if (rb_cnt < NREG) begin
                     if (!ar_used_q[rb_cnt[PDW-1:0]]) begin
-                        //   ★ L8：rb_head 是 8 bit 模 256 指针（终值 ≤ FREE_N ≤ 64），
+                        //   ★ L9：rb_head 是 8 bit 模 256 指针（终值 ≤ FREE_N = 32 ⇒ 6 bit 足够），
                         //     取数组时截到 FL_AW 位；`ftail_q <= rb_head` 仍用全 8 bit。
                         flist_q[rb_head[FL_AW-1:0]] <= rb_cnt[PDW-1:0];
                         rb_head <= rb_head + 1'b1;
