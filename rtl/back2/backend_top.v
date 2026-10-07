@@ -462,6 +462,9 @@ module backend_top #(
     wire [`BACK2_STQ_IDX_W-1:0] stq_of_rob_r;
     reg         trap_halt_q;
     reg         mdu_if_v, fpu_if_v;
+    //   ★★ EXP-N4：MDU/FPU 的**写口挂起**位 + 被推迟那笔的**数据锁存**（见 §7 共享写口仲裁）
+    reg         mdu_wb_pend_q, fpu_wb_pend_q;
+    reg  [31:0] mdu_wb_hold_q, fpu_wb_ihold_q;
     reg  [6:0]  mdu_if_rob, fpu_if_rob;
     reg  [EW-1:0] mdu_if_ep, fpu_if_ep;
     reg         mdu_if_di, fpu_if_di, fpu_if_df;
@@ -557,6 +560,13 @@ module backend_top #(
     wire [6*PW_I-1:0]  iprf_wa;
     wire [6*32-1:0]    iprf_wd;
     wire [6*EW-1:0]    iprf_we_ep;
+    //   ★★ EXP-N4：整数 PRF **物理写口 4 路**（逻辑仍是 6 个写回源 ⇒ 4:1 写 mux + 1 路仲裁共享口）。
+    //     口径见 §7 写回总线的"端口分配"：port0/1/2 = ALU0/ALU1/BRU 直连，port3 = LSU>MDU>FPU 共享口。
+    wire [3:0]        iprf_p4_we;
+    wire [3:0]        iprf_p4_wkp;
+    wire [4*PW_I-1:0] iprf_p4_wa;
+    wire [4*32-1:0]   iprf_p4_wd;
+    wire [4*EW-1:0]   iprf_p4_ep;
     wire [7:0]      fprf_re;
     wire [8*PW_F-1:0]  fprf_ra;
     wire [8*64-1:0]    fprf_rd;
@@ -1693,12 +1703,45 @@ module backend_top #(
     wire        a1_wb_i    = w_di(x_i2_uop[1]);
     wire [31:0] bru_wb_data = (w_wbsel(x_i2_uop[2]) == WB_PC4) ? bru_link : bru_target;
     wire        bru_wb_i    = w_di(x_i2_uop[2]);
-    wire        mdu_wb_v    = mdu_done & mdu_if_v;
-    wire [31:0] mdu_wb_data = mdu_result;
-    wire        fpu_wb_v    = fpu_done & fpu_if_v;
+    //--------------------------------------------------------------------------
+    // ★★ EXP-N4：整数 PRF 写口 6 → 4 —— 共享写口 3 的仲裁（LSU > MDU > FPU）
+    //--------------------------------------------------------------------------
+    //   【为什么只有这 3 个源共享一个口】port0/1/2 已直连 ALU0/ALU1/BRU（同拍 E1 的组合
+    //     写回，零仲裁）；剩下 3 个"晚完成"源（MDU / LSU / FPU→整数）共用 port3。
+    //   【不丢数据的三条依据】
+    //     ① LSU：写回是 `lsq_simple.v` 的组合完成脉冲（`wb_valid`），而该模块**禁改**、
+    //        不可回压 ⇒ port3 **无条件优先授予 LSU**，绝不把它挤掉。
+    //     ② MDU/FPU：结构上"至多 1 条在飞"（`mdu_if_v`/`fpu_if_v` 门控各自 IQ 的发射）⇒
+    //        被 LSU 挤掉时**停 1 拍**即可：不清 `*_if_v`（源自动保持单在飞、不会再产生新
+    //        写回），用 `*_wb_pend_q` 捕获单拍 done，并把 done 那一拍的数据**锁存**。
+    //        ⇒ 挂起项 ≤ 2（MDU + FPU 各一），共享口**永不溢出**（不依赖任何 skid 容量假设，
+    //        这是本设计区别于"k 级 skid"的关键：有界性来自源端单在飞不变量）。
+    //     ③ 数据锁存是**必须**的：`fpu_result` 是流水级寄存器的**组合**输出（done 后即失去
+    //        有效性，见 fpu.v §8），推迟一拍必须用 `fpu_wb_ihold_q`；`mdu_result` 虽是
+    //        `res_q`（done 后保持），也一并锁存以统一口径。只在**首次**被挤掉那拍锁存
+    //        （判据用"本次完成"脉冲 `mdu_new`/`fpu_i_new`，避免后续挂起拍把已锁存值覆盖成
+    //        源端已失效的数据）。
+    //   【下游一致性】被推迟时，ROB done（`wb_v`）、唤醒（`wbi_v` → `wki_v`）、busy 清零
+    //     必须与写口**同拍**移动，否则消费者会读到尚未落地的值 ⇒ 本段把 `mdu_wb_v`/
+    //     `fpu_wb_v` 直接**重定义为"有效完成"信号**，下游全部沿用原名，天然一致。
+    //   【实测依据】fpga/scratch/n4_report.md：20 基准 / 48,400 拍，写口 high-water = 3，
+    //     ≥2 路并发组合只有 {ALU0,ALU1}/{ALU0,BRU}/{ALU0,LSU}/{ALU1,LSU}/{ALU0,ALU1,LSU}
+    //     ⇒ 本结构在已量化 workload 上**不发生任何停拍**（预期 IPC 零影响）。
+    wire        wb_lsu_int  = lsu_wb_v & lsu_wb_di;               // LSU → 整数目的（port3 最高优先）
+    wire        mdu_new     = mdu_done & mdu_if_v;                // MDU 本次完成（单拍脉冲）
+    wire        fpu_i_new   = fpu_done & fpu_if_v & fpu_if_di;    // FPU 本次完成且目的为整数寄存器
+    wire        mdu_req     = (mdu_new | mdu_wb_pend_q) & mdu_if_v;  // "有整数写回待落"
+    wire        fpu_i_req   = (fpu_i_new | fpu_wb_pend_q) & fpu_if_v;
+    wire        p3_lsu      = wb_lsu_int;
+    wire        p3_mdu      = ~p3_lsu &  mdu_req;
+    wire        p3_fpu      = ~p3_lsu & ~p3_mdu & fpu_i_req;
+    wire        mdu_wb_v    = p3_mdu;                    // ★ 有效完成（可能比 `mdu_done` 晚 1 拍）
+    wire [31:0] mdu_wb_data = mdu_wb_pend_q ? mdu_wb_hold_q : mdu_result;
+    //   FPU：目的为整数寄存器 ⇒ 受 port3 仲裁（可推迟）；否则（浮点目的 / 无目的）当拍完成。
+    wire        fpu_wb_v    = fpu_if_di ? p3_fpu : (fpu_done & fpu_if_v);
     wire        fpu_wb_i    = fpu_if_di;
     wire        fpu_wb_f    = fpu_if_df;
-    wire [31:0] fpu_wb_idata= fpu_result[31:0];
+    wire [31:0] fpu_wb_idata= fpu_wb_pend_q ? fpu_wb_ihold_q : fpu_result[31:0];
     wire [63:0] fpu_wb_fdata= fpu_result;
     wire        lsu_wb_f    = lsu_wb_df;
 
@@ -2134,10 +2177,39 @@ module backend_top #(
     assign iprf_wd    = wbi_data;
     assign iprf_we_ep = { fpu_if_ep, lsu_wb_ep, mdu_if_ep, x_i2_ep[2], x_i2_ep[1], x_i2_ep[0] };
 
-    prf #(.NW(6), .NRD(16), .NREG(`BACK2_PRF_I_N), .PDW(PW_I), .DW(32)) u_prf_i (
+    //--------------------------------------------------------------------------
+    // ★★ EXP-N4：6 个逻辑写回源 → **4 个物理写口**的映射（唯一真源，见 §7 写口仲裁）
+    //--------------------------------------------------------------------------
+    //   port0/1/2 = ALU0/ALU1/BRU（直连，零仲裁、零延迟）
+    //   port3     = 共享口：LSU-int（bit4）> MDU（bit3）> FPU-int（bit5）
+    //     三者至多一个被授予（`p3_lsu`/`p3_mdu`/`p3_fpu` 互斥，见 §7），故 port3 的
+    //     (addr,data,epoch) 用一次 3:1 选择即可；`iprf_we[5:3]` 里被挤掉的那一位当拍为 0
+    //     （其源把 `*_if_v` 保持住，下一拍以 pend 再请求）⇒ 不会同拍双写。
+    //   注：`iprf_we`（逻辑 6 位）= `wbi_v & wbi_keep` 已含"ROB 在窗"过滤 ⇒ 物理口的
+    //     `wkeep` 恒 1（prf.v 内部仍是 `we & wkeep`，语义不变）；保留 `iprf_we`/`iprf_wa`/
+    //     `iprf_wd` 为 6 位**逻辑**信号是刻意的：DBG_CSR 打印与只读探针（dyn_probe_n4_*）
+    //     都按"每个写回源"口径观测，端口收窄不应改变该可观测量。
+    wire [2:0] iprf_p3_src = p3_lsu ? 3'd4 : (p3_mdu ? 3'd3 : 3'd5);
+    assign iprf_p4_we  = { (|iprf_we[5:3]), iprf_we[2], iprf_we[1], iprf_we[0] };
+    assign iprf_p4_wkp = 4'b1111;
+    assign iprf_p4_wa[0*PW_I +: PW_I] = iprf_wa[0*PW_I +: PW_I];
+    assign iprf_p4_wa[1*PW_I +: PW_I] = iprf_wa[1*PW_I +: PW_I];
+    assign iprf_p4_wa[2*PW_I +: PW_I] = iprf_wa[2*PW_I +: PW_I];
+    assign iprf_p4_wa[3*PW_I +: PW_I] = iprf_wa[iprf_p3_src*PW_I +: PW_I];
+    assign iprf_p4_wd[0*32 +: 32] = iprf_wd[0*32 +: 32];
+    assign iprf_p4_wd[1*32 +: 32] = iprf_wd[1*32 +: 32];
+    assign iprf_p4_wd[2*32 +: 32] = iprf_wd[2*32 +: 32];
+    assign iprf_p4_wd[3*32 +: 32] = iprf_wd[iprf_p3_src*32 +: 32];
+    assign iprf_p4_ep[0*EW +: EW] = iprf_we_ep[0*EW +: EW];
+    assign iprf_p4_ep[1*EW +: EW] = iprf_we_ep[1*EW +: EW];
+    assign iprf_p4_ep[2*EW +: EW] = iprf_we_ep[2*EW +: EW];
+    assign iprf_p4_ep[3*EW +: EW] = iprf_we_ep[iprf_p3_src*EW +: EW];
+
+    prf #(.NW(4), .NRD(16), .NREG(`BACK2_PRF_I_N), .PDW(PW_I), .DW(32)) u_prf_i (
         .clk(clk), .rst_n(rst_n),
-        .we(iprf_we), .waddr(iprf_wa), .wdata(iprf_wd), .wepoch(iprf_we_ep), .epoch(epoch_w),
-        .wkeep(wbi_keep),
+        .we(iprf_p4_we), .waddr(iprf_p4_wa), .wdata(iprf_p4_wd), .wepoch(iprf_p4_ep),
+        .epoch(epoch_w),
+        .wkeep(iprf_p4_wkp),
         .re(iprf_re), .raddr(iprf_ra), .rdata(iprf_rd)
     );
 
@@ -2559,6 +2631,9 @@ module backend_top #(
             busy_i_q  <= {`BACK2_PRF_I_N{1'b0}};
             busy_f_q  <= {`BACK2_PRF_F_N{1'b0}};
             mdu_if_v  <= 1'b0; fpu_if_v <= 1'b0;
+            //   ★★ EXP-N4：写口挂起位 + 锁存数据复位
+            mdu_wb_pend_q <= 1'b0; fpu_wb_pend_q <= 1'b0;
+            mdu_wb_hold_q <= 32'h0; fpu_wb_ihold_q <= 32'h0;
             cnt_sq_q  <= 32'h0; cnt_cmt4_q <= 32'h0; cnt_iss_q <= 32'h0;
             ck_busy_q <= {CKPT_N{1'b0}};
             ck_pend_q <= {CKPT_N{1'b0}};
@@ -2581,24 +2656,42 @@ module backend_top #(
             for (si2 = 0; si2 < 4; si2 = si2 + 1) iwm_own_q[si2] <= iwm_own_nx[si2];
 
             // ---- MDU/FPU 在途登记（★ 只清"被本次冲刷杀掉的"在飞项，见 mdu_kill/fpu_kill）
+            //   ★★ EXP-N4：`*_if_v` 的清零判据由"`*_done` 拍"改为"**写口被授予**拍"
+            //     （`mdu_wb_v`/`fpu_wb_v`）。被 LSU 挤掉时 `*_if_v` 保持 1（⇒ 源自动单在飞、
+            //     IQ 对应队列停发），`*_wb_pend_q` 置 1，下一拍以挂起身份再请求；冲刷
+            //     （`*_kill`）同时清 `*_if_v` 与挂起位（那笔写回本就不该落地）。
+            //     数据锁存只在**首次**被挤掉那拍发生（`*_new & ~*_wb_v`），避免后续挂起拍把
+            //     已锁存的正确数据覆盖成源端已经失效的输出（`fpu_result` done 后即失效）。
             if (mdu_kill) begin
-                mdu_if_v <= 1'b0;
+                mdu_if_v      <= 1'b0;
+                mdu_wb_pend_q <= 1'b0;
+            end else if (iq_iss_v[3] & ~iq_iss_dead[3]) begin
+                mdu_if_v      <= 1'b1;
+                mdu_wb_pend_q <= 1'b0;
+                mdu_if_rob    <= iq_iss_rob[3];
+                mdu_if_ep     <= iq_iss_ep[3];
+            end else if (mdu_wb_v) begin
+                mdu_if_v      <= 1'b0;
+                mdu_wb_pend_q <= 1'b0;
             end else begin
-                if (iq_iss_v[3] & ~iq_iss_dead[3]) begin
-                    mdu_if_v   <= 1'b1;
-                    mdu_if_rob <= iq_iss_rob[3];
-                    mdu_if_ep  <= iq_iss_ep[3];
-                end else if (mdu_done) mdu_if_v <= 1'b0;
+                mdu_wb_pend_q <= mdu_req;              // 被挤掉 ⇒ 挂起 1 拍（无请求则为 0）
             end
+            if (mdu_new & ~mdu_wb_v) mdu_wb_hold_q <= mdu_result;   // ★ 仅首次挂起时锁存
             if (fpu_kill) begin
-                fpu_if_v <= 1'b0;
+                fpu_if_v      <= 1'b0;
+                fpu_wb_pend_q <= 1'b0;
+            end else if (iq_iss_v[5] & ~iq_iss_dead[5]) begin
+                fpu_if_v      <= 1'b1;
+                fpu_wb_pend_q <= 1'b0;
+                fpu_if_rob    <= iq_iss_rob[5];
+                fpu_if_ep     <= iq_iss_ep[5];
+            end else if (fpu_wb_v) begin
+                fpu_if_v      <= 1'b0;
+                fpu_wb_pend_q <= 1'b0;
             end else begin
-                if (iq_iss_v[5] & ~iq_iss_dead[5]) begin
-                    fpu_if_v   <= 1'b1;
-                    fpu_if_rob <= iq_iss_rob[5];
-                    fpu_if_ep  <= iq_iss_ep[5];
-                end else if (fpu_done) fpu_if_v <= 1'b0;
+                fpu_wb_pend_q <= fpu_i_req;            // 被挤掉 ⇒ 挂起 1 拍（无请求则为 0）
             end
+            if (fpu_i_new & ~fpu_wb_v) fpu_wb_ihold_q <= fpu_result[31:0];  // ★ 仅首次挂起时锁存
             //   ★★ C1：`di/pdi/df/pdf` 改在 **E1 拍**（= 宽载荷 `x_i2_uop` 到手的那一拍）登记 ——
             //     比原"发射拍"晚 1 拍；这几个字段只在**写回拍**（`mdu_done`/`fpu_done`，至少再晚
             //     1 拍）被消费（`wbi_tag`/`wbi_data`/`fprf_wa`/`busy_f_nx`），故语义等价。
