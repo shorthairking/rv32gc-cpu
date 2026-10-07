@@ -407,10 +407,25 @@ module lsq_simple #(
                          (exe_size == 3'd1) ? (4'h3 << exe_addr[1:0]) :
                                               (4'hF << exe_addr[1:0]);
     //   ★★ 4c(3/3)：**8 字节道**掩码（8 B 访问用；非对齐的 8 B 已在 E1 判异常 ⇒ 此处恒 0xF..）
+    //   ★★ EXP-N1 修复（commit 4→2 暴露的**既有**字节转发缺陷；非本次提交宽度改动引入）：
+    //     口径统一为「**窗口位置 = 本访问的字节序号 i**」——
+    //       · 字节 i 的地址 = exe_addr + i，其字数 = w0 + ((a+i)>>2)、字内道 = (a+i)&3，
+    //         其中 a = exe_addr[1:0]、w0 = exe_addr[31:2]（见下面 `gsum_w = gb` 的推导）；
+    //       · 写回取数走 `ext_load(fwdp_data[31:0], fwdp_off=exe_addr[1:0], size, unsign)`
+    //         ⇒ 转发布局必须是「低字 = 含首字节的字 w0（字节 i 落在道 a+i）」，因此
+    //         **掩码必须按 exe_addr[1:0] 移位**（原来按 exe_addr[2:0] 移位 ⇒ 对
+    //         A[2:0]≠0 的访问把窗口整体平移了半个 8 B 窗）。
+    //     旧式 `lmask_w8 << exe_addr[2:0]` 与 `gsum_w = exe_addr[1:0] + gb` 是**两套互斥语义**
+    //     的混用（前者=8 B 窗偏移、后者=字节序号），只在 A[2:0]==0 时自洽 ⇒ 任何非 8 B 对齐的
+    //     load 要么漏命中（回落访存、结果碰巧正确），要么命中**错字**（转发到 w0+1/w0+2）。
+    //     触发条件：错字上恰有更老的 live store 且其掩码覆盖所需道。4 宽提交时 store 排空更早、
+    //     该 store 往往已不在 STQ ⇒ 缺陷被时序掩盖；commit 2 宽拉长 store 存活期后稳定复现
+    //     （p4_fpu 第 54 条 `flw f26,20(x6)`：被错映射到 w0+1 命中 `fsw f8,24` ⇒ 写回 0，
+    //      黄金 0x40400000）。
     wire [7:0] lmask_w8 = (exe_size == 3'd3) ? 8'hFF :
-                          (exe_size == 3'd0) ? (8'h01 << exe_addr[2:0]) :
-                          (exe_size == 3'd1) ? (8'h03 << exe_addr[2:0]) :
-                                               (8'h0F << exe_addr[2:0]);
+                          (exe_size == 3'd0) ? (8'h01 << exe_addr[1:0]) :
+                          (exe_size == 3'd1) ? (8'h03 << exe_addr[1:0]) :
+                                               (8'h0F << exe_addr[1:0]);
 
     // ---- (a) per-store 预计算：年龄 + "更老且地址已确认"（每 store 一次）----
     //   ★ C8：年龄不再在本段另算一份 —— 直接用 §0 的 STQ 唯一年龄向量 `stq_age`。
@@ -463,8 +478,13 @@ module lsq_simple #(
     wire [63:0]        fwd_data_w;
     generate
     for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_b
-        //   gsum = exe_addr[1:0] + gb（0..10）；gcar = 跨字数（0/1/2）；glane = 字内道。
-        wire [3:0]  gsum_w  = {2'b0, exe_addr[1:0]} + gb[3:0];
+        //   ★★ EXP-N1 修复（同上）：`gb` 就是**本访问的字节序号 i**（`in_w = lmask_w8[gb]`，
+        //     掩码已按 `exe_addr[1:0]` 移位 ⇒ 被置位的 gb 恰为 i = 0..size-1）。
+        //     ⇒ 该字节的字内偏移 = (a+i) = gb（a = exe_addr[1:0]）：
+        //         gsum = gb（0..7）；gcar = 跨字数（0/1）；glane = 字内道。
+        //     旧式 `gsum = exe_addr[1:0] + gb` 只在 a==0 时等于 gb ⇒ 对 a≠0（如 lh@+2）
+        //     会取错字/错道（详见上面 `lmask_w8` 处的根因说明）。
+        wire [3:0]  gsum_w  = gb[3:0];
         wire [1:0]  gcar_w  = gsum_w[3:2];
         wire [1:0]  lane_w  = gsum_w[1:0];
         wire        in_w    = lmask_w8[gb];                     // 该字节在本次访问内

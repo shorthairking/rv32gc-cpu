@@ -44,6 +44,11 @@
 module rob #(
     parameter integer ROB_N      = `BACK2_ROB_N,
     parameter integer ROB_IDX_W  = `BACK2_ROB_IDX_W,
+    //   ★★ EXP-N1：**分配宽度与提交宽度彻底分离**（原来两者共用 `COMMIT_W`）。
+    //     · ALLOC_W  = 派发/分配宽度（4，保持不动）——决定 `alloc_*` 口与 BRAM 写口数；
+    //     · COMMIT_W = 提交/退休宽度（2）——决定退休选择/前缀链/架构更新/输出口宽度。
+    //     两者分离后"4 发射 + 2 提交"在结构上才成立（只改一个共用宏无法表达）。
+    parameter integer ALLOC_W    = `BACK2_ALLOC_W,
     parameter integer COMMIT_W   = `BACK2_COMMIT_W,
     parameter integer RB_W       = `BACK2_RB_W,
     parameter integer WB_N       = `BACK2_WB_N,
@@ -53,14 +58,15 @@ module rob #(
     input  wire                    rst_n,
 
     //==================================================================
-    // 派发（D3）：连续 COMMIT_W 项（lane 0 最老）
+    // 派发（D3）：连续 ALLOC_W 项（lane 0 最老）
+    //   ★★ EXP-N1：本组口的宽度是 **ALLOC_W**（= 4，派发宽度未变），不是 COMMIT_W。
     //==================================================================
     input  wire                    alloc_valid,
-    input  wire [2:0]              alloc_n,          // 1..COMMIT_W
+    input  wire [2:0]              alloc_n,          // 1..ALLOC_W
     output wire                    alloc_ready,      // 余量 ≥ alloc_n
     output wire [ROB_IDX_W-1:0]    alloc_idx0,       // 本块首项索引
-    input  wire [COMMIT_W-1:0]     alloc_lane_valid,
-    input  wire [COMMIT_W*RB_W-1:0] alloc_payload,
+    input  wire [ALLOC_W-1:0]      alloc_lane_valid,
+    input  wire [ALLOC_W*RB_W-1:0] alloc_payload,
     input  wire [`BACK2_EPOCH_W-1:0] alloc_epoch,     // 本块分配时的流世代（存入项内）
 
     //==================================================================
@@ -98,7 +104,8 @@ module rob #(
     output wire [COMMIT_W*NQ_W-1:0] cmt_narrow,
     //   ★★ 2B-5 第 3 步②：派发期**预译码标志**（每 lane 5 bit：{mret, sret, maint_kind[2:0]}）
     //     ⇒ 提交侧不再需读 4 lane 的 32 bit 指令字去译码 xRET/维护操作。
-    input  wire [COMMIT_W*5-1:0] alloc_pre,
+    //   ★★ EXP-N1：本口是**派发侧**数据 ⇒ 宽度 = ALLOC_W*5（不是 COMMIT_W*5）。
+    input  wire [ALLOC_W*5-1:0] alloc_pre,
     //   ★ ② CSR 提交合成的**单 lane 动态读口**（索引 = 提交组内 CSR lane 的绝对 ROB 索引）
     input  wire [ROB_IDX_W-1:0]  csr_lane_idx,
     output wire [`BACK2_CMT_CSR_W-1:0] csr_pay,
@@ -150,19 +157,26 @@ module rob #(
     // 0. 存储体与指针
     //==========================================================================
     //   ★★ B2：`pl_q` 已删（宽载荷改由 `rob_wide_mem` 承担：写侧每表项 mux 塔缩为每 bank 1 个 4:1 选择）
+    //   ★★ EXP-N1：**预取宽度口径**（= 每拍从 BRAM 预取的项数；不由 COMMIT_W 决定）：
+    //     PF_W = 4 必须覆盖 BRAM 同步读延迟（1 拍）× 每拍提交前进量（≤ COMMIT_W = 2）
+    //     = 2，取 4 是为"连续满宽提交（2/拍）时窗口仍领先 2 拍"留余量。
+    //     **不能**跟着 COMMIT_W 缩到 2：预取地址 T 拍算出、数据 T+2 拍可用，每拍只预取 2 项
+    //     会让连续 2/拍提交组落到窗口之外 ⇒ 每拍插气泡（性能判据不允许）。
+    localparam integer PF_W = 4;
+    //   ★★ EXP-N1：头部窗口/预取/BRAM 读侧保持 4 宽（见上）；收窄的是**提交侧消费**（2 lane）。
     reg  [RB_W-1:0]      win_q   [0:7];       // ★ B3：头部窗口（C4 后 RB_W=229；★ EXP-R2 后 225）
     reg  [ROB_IDX_W-1:0] win_idx [0:7];       // 每槽 7 bit 全索引标签
     reg                  win_val [0:7];       // 每槽有效（复位/冲刷清零）
-    reg  [ROB_IDX_W-1:0] e_of_r_q[0:3];       // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
+    reg  [ROB_IDX_W-1:0] e_of_r_q[0:PF_W-1];  // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
     //   ★★ 危险修正（p11 实测）：BRAM 为 `read_first` ⇒ "同拍被写的项，当拍读到旧值"。
     //     若预取地址正好是本拍刚分配的项（ROB 近空：清洗后 head≈tail），窗口会被填入**旧载荷**
     //     但标签恰好命中 ⇒ 会交付错误 PC。修法：记下**上一拍的分配索引**，填充时若命中则
     //     **丢弃本次填充并把该槽置为无效**（下一拍重读即可）；冲刷时也全部置无效。
-    reg  [ROB_IDX_W-1:0] alloc_idx_q[0:3];
-    reg  [3:0]           alloc_idx_v_q;
-    wire [RB_W-1:0]      pl_rdata[0:3];       // 4 bank 同步读回数据
-    wire [1:0]           wsel    [0:3];       // 写轮转：bank i 对应的 lane 序号 = (i - tail[1:0]) & 3
-    wire [1:0]           rsel    [0:3];       // 读轮转：读口 i 对应的项序号 = (i - head_pred[1:0]) & 3
+    reg  [ROB_IDX_W-1:0] alloc_idx_q[0:PF_W-1];
+    reg  [PF_W-1:0]      alloc_idx_v_q;
+    wire [RB_W-1:0]      pl_rdata[0:PF_W-1];  // PF_W bank 同步读回数据
+    wire [1:0]           wsel    [0:PF_W-1];  // 写轮转：bank i 对应的 lane 序号 = (i - tail[1:0]) & 3
+    wire [1:0]           rsel    [0:PF_W-1];  // 读轮转：读口 i 对应的项序号 = (i - head_pred[1:0]) & 3
     //   ★★ 2B-5 第 3 步①：**窄控制表** `nq`（FF 阵列，组合读）
     //     · 收编原 `done_q` + `rep_q`（epoch）+ 提交/前缀链/排空/陷阱判定所需的控制位与索引；
     //     · **宽字段（PC/TVAL/CSRW/TRTGT/FFLAGS 等）仍在 `pl_q`**，本步不动；
@@ -308,22 +322,25 @@ module rob #(
     //==========================================================================
     // 1.5 ★ B2/B3：BRAM 写/读轮转 + 头部窗口
     //==========================================================================
-    //   派发 4 条 lane 索引连续（tail..tail+3），提交/预取 4 项索引也连续（head..head+3）
+    //   派发 ALLOC_W 条 lane 索引连续（tail..tail+ALLOC_W-1），提交 ≤COMMIT_W 项索引也连续。
     //   ⇒ 两边都是 "{0,1,2,3} 的旋转"，bank=i 的写/读只需选择对应那一项。
-    wire [ROB_IDX_W-1:0] hpred_w = idx_add(head_q, {4'b0, cmt_n_w});
+    //   ★★ EXP-N1：`PF_W` 已在 §0 声明（预取宽度，见那里的口径说明）。
+    wire [ROB_IDX_W-1:0] hpred_w = idx_add(head_q, {{(ROB_IDX_W-3){1'b0}}, cmt_n_w});
     genvar gw;
     generate
-    for (gw = 0; gw < 4; gw = gw + 1) begin : g_rot
+    for (gw = 0; gw < PF_W; gw = gw + 1) begin : g_rot
         assign wsel[gw] = gw[1:0] - tail_w[1:0];
         assign rsel[gw] = gw[1:0] - hpred_w[1:0];
     end
     endgenerate
 
-    //   窗口读（提交组每 lane 一个 8:1 mux）+ 命中判定
-    wire [RB_W-1:0] win_rd [0:3];
-    wire [3:0]      win_lane_ok;
+    //   窗口读（**提交组每 lane 一个 8:1 mux**）+ 命中判定
+    //   ★★ EXP-N1：只有 COMMIT_W（=2）个 lane 需要读窗口 ⇒ 这里从 4 lane 缩到 2 lane
+    //     （原 4 lane 的 win_rd/win_lane_ok 与它们的 8:1 mux 全部消失）。
+    wire [RB_W-1:0] win_rd [0:COMMIT_W-1];
+    wire [COMMIT_W-1:0] win_lane_ok;
     generate
-    for (gw = 0; gw < 4; gw = gw + 1) begin : g_winrd
+    for (gw = 0; gw < COMMIT_W; gw = gw + 1) begin : g_winrd
         wire [ROB_IDX_W-1:0] ei = idx_add(head_q, gw[ROB_IDX_W-1:0]);
         assign win_rd[gw]      = win_q[ei[2:0]];
         assign win_lane_ok[gw] = win_val[ei[2:0]] & (win_idx[ei[2:0]] == ei);
@@ -331,14 +348,17 @@ module rob #(
     endgenerate
 
     //   BRAM 实例（B1 交付的模块：4 bank × SDP，同步读）
-    wire [3:0]        bw_we;
-    wire [4*5-1:0]    bw_woff, bw_roff;
-    wire [4*RB_W-1:0] bw_wdata, bw_rdata;
+    //   ★★ EXP-N1：**写侧 4 口**（= ALLOC_W，派发宽度未变）、**读侧 PF_W=4 口**（预取口径，
+    //     见上）。两者都不随 COMMIT_W 变化 ⇒ 本段结构不变；提交侧只是少消费 2 个 lane。
+    wire [PF_W-1:0]        bw_we;
+    wire [PF_W*5-1:0]      bw_woff, bw_roff;
+    wire [PF_W*RB_W-1:0]   bw_wdata, bw_rdata;
     generate
-    for (gw = 0; gw < 4; gw = gw + 1) begin : g_bw
+    for (gw = 0; gw < PF_W; gw = gw + 1) begin : g_bw
         //   （函数返回值不能直接做位选（iverilog）⇒ 先存临时线）
         wire [ROB_IDX_W-1:0] wt = idx_add(tail_w,  {{5{1'b0}}, wsel[gw]});
         wire [ROB_IDX_W-1:0] rt = idx_add(hpred_w, {{5{1'b0}}, rsel[gw]});
+        //   `wsel[gw]` 是 2 bit（bank = idx[1:0]）⇒ 恒 < 4 = ALLOC_W，索引天然合法
         assign bw_we[gw]   = alloc_fire & alloc_lane_valid[wsel[gw]] & (wsel[gw] < alloc_n);
         assign bw_woff[gw*5 +: 5] = wt[ROB_IDX_W-1:2];
         assign bw_wdata[gw*RB_W +: RB_W] = alloc_payload[wsel[gw]*RB_W +: RB_W];
@@ -347,12 +367,27 @@ module rob #(
     end
     endgenerate
 
-    rob_wide_mem #(.NW(4), .BW(32), .DW(RB_W), .AW(ROB_IDX_W), .OW(5), .CHK(0)) u_wmem (
+    rob_wide_mem #(.NW(PF_W), .BW(32), .DW(RB_W), .AW(ROB_IDX_W), .OW(5), .CHK(0)) u_wmem (
         .clk(clk), .rst_n(rst_n),
         .we(bw_we), .woff(bw_woff), .wdata(bw_wdata),
-        .re(4'hF),  .roff(bw_roff), .rdata(bw_rdata));
+        .re({PF_W{1'b1}}),  .roff(bw_roff), .rdata(bw_rdata));
+
+    //   ★ B3「read_first 同址危险」判据（纯 `assign` 展开，供 §5.35 的窗口填充使用）：
+    //     `dang_hit[k]` = 预取口 k 的目标索引 `e_of_r_q[k]` 是否命中**上一拍刚分配的槽**
+    //     （命中 ⇒ 本次读回的是旧载荷，必须丢弃并把该窗口槽置无效，下一拍重读）。
+    //   ★★ EXP-N1：预取口数 = PF_W，分配槽数 = ALLOC_W（两者均不随 COMMIT_W 变化）。
+    wire [ALLOC_W-1:0] dang_hit [0:PF_W-1];
+    genvar gz, gk;
+    generate
+    for (gz = 0; gz < PF_W; gz = gz + 1) begin : g_dang
+        for (gk = 0; gk < ALLOC_W; gk = gk + 1) begin : g_dangk
+            assign dang_hit[gz][gk] = alloc_idx_v_q[gk] & (alloc_idx_q[gk] == e_of_r_q[gz]);
+        end
+    end
+    endgenerate
 
     // 提交链（先算，用于同拍释放余量）
+    //   ★★ EXP-N1：以下**全部**是提交侧 ⇒ 宽度 = COMMIT_W（= 2），4 份复制变 2 份。
     wire [COMMIT_W-1:0] slot_in_range;
     wire [COMMIT_W-1:0] slot_done;
     wire [COMMIT_W-1:0] slot_exc;
@@ -360,15 +395,15 @@ module rob #(
     wire [COMMIT_W-1:0] slot_st_ok;
     wire [COMMIT_W-1:0] slot_ok;
 
-    wire [ROB_IDX_W-1:0] slot_idx0 = head_q;
-    wire [ROB_IDX_W-1:0] slot_idx1 = idx_add(head_q, 1);
-    wire [ROB_IDX_W-1:0] slot_idx2 = idx_add(head_q, 2);
-    wire [ROB_IDX_W-1:0] slot_idx3 = idx_add(head_q, 3);
+    //   ★★ EXP-N1：退休选择从 `head0/head1/head2/head3` 收窄为 `head0/head1`
+    //     （`slot_idx[gi] = (head + gi) mod ROB_N`，gi < COMMIT_W）。
     wire [ROB_IDX_W-1:0] slot_idx [0:COMMIT_W-1];
-    assign slot_idx[0] = slot_idx0;
-    assign slot_idx[1] = slot_idx1;
-    assign slot_idx[2] = slot_idx2;
-    assign slot_idx[3] = slot_idx3;
+    genvar gsi;
+    generate
+    for (gsi = 0; gsi < COMMIT_W; gsi = gsi + 1) begin : g_slot
+        assign slot_idx[gsi] = idx_add(head_q, gsi[ROB_IDX_W:0]);
+    end
+    endgenerate
 
     genvar gi;
     //   ★★ EXP-B：三张 typed 表在提交组 4 个 lane 上的"采用判据"（模块级数组：断言块也要看）
@@ -458,12 +493,12 @@ module rob #(
 
     // 异常：仅当该槽已完成且为头部（slot 0）
     assign trap_valid = slot_in_range[0] & slot_done[0] & slot_exc[0] & win_lane_ok[0];
-    assign trap_pc    = win_q[slot_idx0[2:0]][`BACK2_RB_PC_MSB:`BACK2_RB_PC_LSB];
+    assign trap_pc    = win_q[slot_idx[0][2:0]][`BACK2_RB_PC_MSB:`BACK2_RB_PC_LSB];
     assign trap_cause = nq[slot_idx[0]][NQ_EXC_L +: 4];
     //   ★★ EXP-B：mtval 取 ex 表（LSU 数据侧异常）或**载荷 TVAL**（派发期异常：非法指令的
     //     原始指令位 / 取指异常的故障 VA）——判据与提交侧 `ex_use` 同源（`ex_use[0]`）。
     assign trap_tval  = ex_use[0] ? ex_tval_q[slot_idx[0]]
-                                  : win_q[slot_idx0[2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
+                                  : win_q[slot_idx[0][2:0]][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
 
     //==========================================================================
     // 4. 观测输出
@@ -505,7 +540,7 @@ module rob #(
                 win_idx[k] <= {ROB_IDX_W{1'b0}};
                 win_val[k] <= 1'b0;
             end
-            for (k = 0; k < 4; k = k + 1) e_of_r_q[k] <= {ROB_IDX_W{1'b0}};
+            for (k = 0; k < PF_W; k = k + 1) e_of_r_q[k] <= {ROB_IDX_W{1'b0}};
             for (k = 0; k < ROB_N; k = k + 1) begin
                 nq[k]     <= {NQ_W{1'b0}};
                 //   ★★ EXP-B：三张 typed 表只复位 {valid, epoch}（数据数组在 valid=0 时被
@@ -516,8 +551,9 @@ module rob #(
             end
         end else begin
             // ---- 5.1 派发写入（新项：done 清零；仅真正派发拍 = alloc_fire）----
+            //   ★★ EXP-N1：本循环是**分配侧** ⇒ 上界 = ALLOC_W（=4，派发宽度未变）。
             if (alloc_fire) begin
-                for (k = 0; k < COMMIT_W; k = k + 1) begin
+                for (k = 0; k < ALLOC_W; k = k + 1) begin
                     if (alloc_lane_valid[k] & (k < alloc_n)) begin
 `ifndef RV32GC_USE_VIVADO_IP
                         //   ★ C4：CSRW 段已从载荷删除 ⇒ 探针改打「CSR 源」= 载荷 PS1I
@@ -572,12 +608,10 @@ module rob #(
 
             // ---- 5.35 ★ B3：头部窗口填充（上一拍发出的预取读在本拍到达）----
             //   读口 i 对应项 `e_of_r_q[i]`（上一拍的 head_pred 算出）⇒ 写入槽 `[2:0]`、打全索引标签、置有效。
-            for (k = 0; k < 4; k = k + 1) begin
+            //   ★★ EXP-N1：本循环是**预取侧** ⇒ 上界 = PF_W（=4，不随 COMMIT_W 变化）。
+            for (k = 0; k < PF_W; k = k + 1) begin
                 //   危险判定：该项是否在“读命令发出的那一拍”刚好被分配写入
-                if (alloc_idx_v_q[0] & (alloc_idx_q[0] == e_of_r_q[k]) |
-                    alloc_idx_v_q[1] & (alloc_idx_q[1] == e_of_r_q[k]) |
-                    alloc_idx_v_q[2] & (alloc_idx_q[2] == e_of_r_q[k]) |
-                    alloc_idx_v_q[3] & (alloc_idx_q[3] == e_of_r_q[k])) begin
+                if (|dang_hit[k]) begin
                     if (win_val[e_of_r_q[k][2:0]] & (win_idx[e_of_r_q[k][2:0]] == e_of_r_q[k]))
                         win_val[e_of_r_q[k][2:0]] <= 1'b0;      // 旧内容不可用 ⇒ 置无效
                 end else begin
@@ -587,9 +621,10 @@ module rob #(
                 end
             end
             //   预取地址打拍（下一拍用它给读回的数据定标签）
-            for (k = 0; k < 4; k = k + 1) e_of_r_q[k] <= idx_add(hpred_w, {{5{1'b0}}, rsel[k]});
+            for (k = 0; k < PF_W; k = k + 1) e_of_r_q[k] <= idx_add(hpred_w, {{5{1'b0}}, rsel[k]});
             //   记下本拍分配的索引（下一拍用于上面的危险判定）
-            for (k = 0; k < 4; k = k + 1) begin
+            //   ★★ EXP-N1：分配槽数 = ALLOC_W（派发宽度，未变）。
+            for (k = 0; k < ALLOC_W; k = k + 1) begin
                 alloc_idx_q[k]   <= idx_add(tail_w, k[ROB_IDX_W-1:0]);
                 alloc_idx_v_q[k] <= alloc_fire & alloc_lane_valid[k] & (k < alloc_n);
             end

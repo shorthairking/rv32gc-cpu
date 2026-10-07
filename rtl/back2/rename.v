@@ -58,6 +58,12 @@
 
 module rename #(
     parameter integer W          = `BACK2_DISP_W,
+    //   ★★ EXP-N1（commit 4→2「彻底缩」）：**派发宽度 W 与提交宽度 CMW 分离**。
+    //     · W   = 派发/重命名宽度（4，**不动**）：lane_valid/分配/RAT 快照/回滚点全部按它；
+    //     · CMW = 提交/退休宽度（2）：`cmt_*`/`rel_*`（架构 RAT 更新 + free-list 回收口）
+    //       与"提交组内 WAW 优先级链"按它展开。
+    //     这是 free-list 回收口 4→2 的**接口级**收窄：回收写口/指针更新/仲裁从 4 份变 2 份。
+    parameter integer CMW        = `BACK2_COMMIT_W,
     parameter integer NSRC       = 2,
     parameter integer PDW        = `BACK2_PREG_I_W,
     parameter integer NREG       = `BACK2_PRF_I_N,
@@ -103,12 +109,13 @@ module rename #(
 
     //==================================================================
     // 提交（W1）：架构 RAT 更新 + 旧映射释放（R6）
+    //   ★★ EXP-N1：宽度 = **CMW**（提交宽度 = 2），不再跟派发宽度 W（=4）绑定。
     //==================================================================
-    input  wire [W-1:0]          cmt_we,
-    input  wire [W*ARN_W-1:0]    cmt_arn,
-    input  wire [W*PDW-1:0]      cmt_pd,
-    input  wire [W-1:0]          rel_we,
-    input  wire [W*PDW-1:0]      rel_preg,
+    input  wire [CMW-1:0]        cmt_we,
+    input  wire [CMW*ARN_W-1:0]  cmt_arn,
+    input  wire [CMW*PDW-1:0]    cmt_pd,
+    input  wire [CMW-1:0]        rel_we,
+    input  wire [CMW*PDW-1:0]    rel_preg,
 
     //==================================================================
     // 派发期登记"按 ROB 索引的回滚点"
@@ -235,7 +242,9 @@ module rename #(
     // 1. 同拍 lane 组合推导
     //==========================================================================
     wire [2:0] ord_d [0:W-1];
-    wire [2:0] ord_r [0:W-1];
+    //   ★★ EXP-N1：`ord_r` 是**提交侧**（free-list 回收写口）的压缩序号 ⇒ 按 CMW 展开
+    //     （回收写口 4→2 的直接体现：写口数、写地址偏移与 ftail 增量都只算 2 个）。
+    wire [2:0] ord_r [0:CMW-1];
     assign ord_d[0] = 3'd0;
     assign ord_r[0] = 3'd0;
 
@@ -243,6 +252,8 @@ module rename #(
     generate
     for (g = 1; g < W; g = g + 1) begin : g_ord
         assign ord_d[g] = ord_d[g-1] + {2'b0, (lane_valid[g-1] & lane_need_dst[g-1])};
+    end
+    for (g = 1; g < CMW; g = g + 1) begin : g_ordr
         assign ord_r[g] = ord_r[g-1] + {2'b0, rel_we[g-1]};
     end
     endgenerate
@@ -267,8 +278,19 @@ module rename #(
     //     ⇒ 该 uop 永远等不到写回、队列永久停顿。
     wire [2:0] valid_n_f = {2'b0, lvf[0]} + {2'b0, lvf[1]} +
                            {2'b0, lvf[2]} + {2'b0, lvf[3]};
-    wire [3:0] rel_n_w   = {3'b0, rel_we[0]} + {3'b0, rel_we[1]} +
-                           {3'b0, rel_we[2]} + {3'b0, rel_we[3]};
+    //   ★★ EXP-N1：回收条数 = 提交宽度 CMW（原来写死 rel_we[0..3] 四路相加）。
+    //     用 generate 累加避免硬编码：rel_n_w = Σ rel_we[0..CMW-1]。
+    wire [3:0] rel_n_w;
+    generate
+    if (CMW == 1) begin : g_rn1
+        assign rel_n_w = {3'b0, rel_we[0]};
+    end else if (CMW == 2) begin : g_rn2
+        assign rel_n_w = {3'b0, rel_we[0]} + {3'b0, rel_we[1]};
+    end else begin : g_rnN
+        assign rel_n_w = {3'b0, rel_we[0]} + {3'b0, rel_we[1]} +
+                         {3'b0, rel_we[2]} + {3'b0, rel_we[3]};
+    end
+    endgenerate
     wire [2:0] valid_n_w = {2'b0, lane_valid[0]} + {2'b0, lane_valid[1]} +
                            {2'b0, lane_valid[2]} + {2'b0, lane_valid[3]};
 
@@ -277,13 +299,13 @@ module rename #(
     //     指针保值 8 bit 的模 256 语义，只有**取数组**时截断。
     wire [PDW-1:0] ev_pd_dst [0:W-1];
     wire [FL_PTR_W-1:0] fl_rd_idx [0:W-1];       // fhead + ord_d[]（8 bit 指针语义）
-    wire [FL_PTR_W-1:0] fl_wr_idx [0:W-1];       // ftail + ord_r[]（8 bit 指针语义）
+    wire [FL_PTR_W-1:0] fl_wr_idx [0:CMW-1];     // ftail + ord_r[]（8 bit 指针语义；★ EXP-N1：提交侧 = CMW）
     generate
     for (g = 0; g < W; g = g + 1) begin : g_dst
         assign fl_rd_idx[g] = fhead_q + {{(FL_PTR_W-3){1'b0}}, ord_d[g]};
         assign ev_pd_dst[g] = flist_q[fl_rd_idx[g][FL_AW-1:0]];
     end
-    for (g = 0; g < W; g = g + 1) begin : g_flw
+    for (g = 0; g < CMW; g = g + 1) begin : g_flw
         assign fl_wr_idx[g] = ftail_q + {{(FL_PTR_W-3){1'b0}}, ord_r[g]};
     end
     endgenerate
@@ -373,14 +395,16 @@ module rename #(
     reg [PDW-1:0]  clr_pd;
     integer        u;
     integer        v;
+    //   ★★ EXP-N1：本块是**提交侧**（架构引用位图更新）⇒ 两层循环上界都用 CMW
+    //     （原来用 W=4 ⇒ 4 份复制的"清旧 + 置新"比较/mux 网络；现为 2 份）。
     always @(*) begin
         ar_used_next = ar_used_q;
-        for (u = 0; u < W; u = u + 1) begin
+        for (u = 0; u < CMW; u = u + 1) begin
             if (cmt_we[u]) begin
                 //   本 lane 要清掉的映射：默认取组前架构值 `arat_q[arn]`；
                 //   若组内更早的 lane 写过同一 ARN，则取其中最年轻者的 `cmt_pd`。
                 clr_pd = arat_q[cmt_arn[u*ARN_W +: ARN_W]];
-                for (v = 0; v < W; v = v + 1) begin
+                for (v = 0; v < CMW; v = v + 1) begin
                     if ((v < u) && cmt_we[v] &&
                         (cmt_arn[v*ARN_W +: ARN_W] == cmt_arn[u*ARN_W +: ARN_W]))
                         clr_pd = cmt_pd[v*PDW +: PDW];
@@ -620,15 +644,20 @@ module rename #(
     //       分支误判帧 `cmt_ok=0` ⇒ 走 undo 路径，与本修正无交集）。
     wire [PDW-1:0] arat_next [0:ARCH_N-1];
     genvar ga;
+    //   ★★ EXP-N1：提交组内 WAW 优先级链从 **4:1** 收窄到 **CMW:1（=2:1）**。
+    //     口径不变：从**高 lane（年轻）往低 lane** 优先 ⇒ 同一 ARN 多次写时取最年轻者。
+    //     用 generate 逐级构建链，避免硬编码 lane 下标（CMW 改回 4 也无需再动）。
     generate
     for (ga = 0; ga < ARCH_N; ga = ga + 1) begin : g_aratn
-        //   提交组内从高 lane（年轻）往低 lane 优先 ⇒ 同一 ARN 多次写时取**最年轻者**
-        assign arat_next[ga] =
-            (cmt_we[3] & (cmt_arn[3*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[3*PDW +: PDW] :
-            (cmt_we[2] & (cmt_arn[2*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[2*PDW +: PDW] :
-            (cmt_we[1] & (cmt_arn[1*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[1*PDW +: PDW] :
-            (cmt_we[0] & (cmt_arn[0*ARN_W +: ARN_W] == ga[ARN_W-1:0])) ? cmt_pd[0*PDW +: PDW] :
-            arat_q[ga];
+        wire [PDW-1:0] chain [0:CMW];       // chain[CMW] = 组前架构值；chain[0] = 最年轻命中
+        assign chain[CMW] = arat_q[ga];
+        for (k = 0; k < CMW; k = k + 1) begin : g_aratc
+            assign chain[k] =
+                (cmt_we[CMW-1-k] &
+                 (cmt_arn[(CMW-1-k)*ARN_W +: ARN_W] == ga[ARN_W-1:0]))
+                    ? cmt_pd[(CMW-1-k)*PDW +: PDW] : chain[k+1];
+        end
+        assign arat_next[ga] = chain[0];
     end
     endgenerate
 
@@ -708,11 +737,15 @@ module rename #(
     integer tj;
     always @(posedge clk) begin
         if (TRACE && rst_n) begin
+            //   ★★ EXP-N1：分配打印按 W（派发宽度）、释放打印按 CMW（提交宽度）分开循环
+            //     ——两者不再相等，混在一个循环里会对 `rel_we` 越界取值。
             for (tj = 0; tj < W; tj = tj + 1) begin
                 if (lvf[tj] & lane_need_dst[tj])
                     $display("[preg-alloc t=%0t] fhead=%0d preg=%0d arn=%0d rob_snap=%0d",
                              $time, fhead_q, lane_pd_dst[tj*PDW +: PDW],
                              lane_dst_arn[tj*ARN_W +: ARN_W], tj);
+            end
+            for (tj = 0; tj < CMW; tj = tj + 1) begin
                 if (rel_we[tj])
                     $display("[preg-rel   t=%0t] ftail=%0d preg=%0d (slot %0d)",
                              $time, ftail_q, rel_preg[tj*PDW +: PDW], tj);
@@ -844,11 +877,13 @@ module rename #(
             //   注：`flush_all`（陷阱）拍 `cmt_ok=0` ⇒ cmt_we/rel_we 全 0，无副作用；
             //       `rb_act` 拍 rel_we=0（陷阱后无在飞指令）⇒ 不与该分支的 ftail 赋值冲突。
             //==================================================================
-            for (j2 = 0; j2 < W; j2 = j2 + 1) begin
+            //   ★★ EXP-N1：两处循环都是**提交侧** ⇒ 上界 CMW（架构 RAT 写口 4→2、
+            //     free-list 回收写口 4→2 —— 后者正是"回收仲裁/写 demux"收窄的落点）。
+            for (j2 = 0; j2 < CMW; j2 = j2 + 1) begin
                 if (cmt_we[j2]) arat_q[cmt_arn[j2*ARN_W +: ARN_W]] <= cmt_pd[j2*PDW +: PDW];
             end
             ar_used_q <= ar_used_next;
-            for (j2 = 0; j2 < W; j2 = j2 + 1) begin
+            for (j2 = 0; j2 < CMW; j2 = j2 + 1) begin
                 //   ★ L8：写下标同样按数组深度取模（fl_wr_idx 见 §1.1）
                 if (rel_we[j2]) flist_q[fl_wr_idx[j2][FL_AW-1:0]]
                                     <= rel_preg[j2*PDW +: PDW];

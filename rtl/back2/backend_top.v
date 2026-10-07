@@ -501,10 +501,13 @@ module backend_top #(
     wire [DISP_W*3*PW_F-1:0] pd_f_s;
     wire free_i_ok, free_f_ok, rn_i_busy, rn_f_busy;
     wire [7:0] free_i_cnt, free_f_cnt;
-    wire [DISP_W-1:0]   cmt_i_we, cmt_f_we, rel_i_we, rel_f_we;
-    wire [DISP_W*5-1:0] cmt_i_arn, cmt_f_arn;
-    wire [DISP_W*PW_I-1:0] cmt_i_pd, rel_i_pd;
-    wire [DISP_W*PW_F-1:0] cmt_f_pd, rel_f_pd;
+    //   ★★ EXP-N1：提交侧（架构 RAT 更新 + free-list 回收）宽度 = **COMMIT_W**（=2）。
+    //     原来这四条是 `DISP_W`（=4）——因为当时 DISP_W == COMMIT_W；两者分离后必须
+    //     按 COMMIT_W 声明，否则会向 rename 传 4 宽口（接口不符 + 4 份回收仲裁残留）。
+    wire [COMMIT_W-1:0]   cmt_i_we, cmt_f_we, rel_i_we, rel_f_we;
+    wire [COMMIT_W*5-1:0] cmt_i_arn, cmt_f_arn;
+    wire [COMMIT_W*PW_I-1:0] cmt_i_pd, rel_i_pd;
+    wire [COMMIT_W*PW_F-1:0] cmt_f_pd, rel_f_pd;
 
     // 队列归属
     wire [11:0] lane_q;
@@ -591,7 +594,7 @@ module backend_top #(
     // ROB
     wire        rob_alloc_ready;
     wire [6:0]  rob_alloc_idx0;
-    wire [3:0]  cmt_raw, cmt_st_drain, cmt_st_ckpt, cmt_st_branch;
+    wire [COMMIT_W-1:0] cmt_raw, cmt_st_drain, cmt_st_ckpt, cmt_st_branch;
     wire [COMMIT_W*RB_W-1:0] cmt_pay;
     wire        cmt_ok;
     wire [DISP_W*RB_W-1:0] rob_pay_w;
@@ -907,7 +910,7 @@ module backend_top #(
     end
     endgenerate
 
-    rename #(.W(DISP_W), .NSRC(2), .PDW(PW_I), .NREG(`BACK2_PRF_I_N), .FREE_N(`BACK2_FREE_I_N))
+    rename #(.W(DISP_W), .CMW(COMMIT_W), .NSRC(2), .PDW(PW_I), .NREG(`BACK2_PRF_I_N), .FREE_N(`BACK2_FREE_I_N))
     u_ren_i (
         .clk(clk), .rst_n(rst_n),
         .lane_valid(rn_v), .lane_fire(disp_fire_w),
@@ -925,7 +928,7 @@ module backend_top #(
         .flush_all(flush_all_w), .busy(rn_i_busy), .log_wr_o(), .cnt_restore_o()
     );
 
-    rename #(.W(DISP_W), .NSRC(3), .PDW(PW_F), .NREG(`BACK2_PRF_F_N), .FREE_N(`BACK2_FREE_F_N))
+    rename #(.W(DISP_W), .CMW(COMMIT_W), .NSRC(3), .PDW(PW_F), .NREG(`BACK2_PRF_F_N), .FREE_N(`BACK2_FREE_F_N))
     u_ren_f (
         .clk(clk), .rst_n(rst_n),
         .lane_valid(rn_v), .lane_fire(disp_fire_w),
@@ -1009,7 +1012,8 @@ module backend_top #(
                                  maint_kind_f(t5) };
     end
     endgenerate
-    wire [COMMIT_W*5-1:0] alloc_pre_w = { lane_pre[3], lane_pre[2], lane_pre[1], lane_pre[0] };
+    //   ★★ EXP-N1：本口是**派发侧**（ROB 分配预译码标志）⇒ 宽度 = DISP_W（= ALLOC_W，未变）。
+    wire [DISP_W*5-1:0] alloc_pre_w = { lane_pre[3], lane_pre[2], lane_pre[1], lane_pre[0] };
     assign blk_ready_o = (d1_v_q == {DISP_W{1'b0}}) | disp_fire_w;
 
     // ---- 最终 uop（填重命名结果）----
@@ -1804,8 +1808,16 @@ module backend_top #(
     assign cmt_ok = ~squash_v_w & (~flush_all_w | ((xret_cmt_o | maint_cmt_o) & trp_flush_v_i));
     //   ★ LQ 提交点释放的窗口宽度：`cmt_raw` 是 rob.v 的**前缀连续**提交链（第 i 槽可提交 ⇒
     //     前面全可提交）⇒ 条数 = popcount；冲刷/陷阱拍强制 0（不得释放未提交项）。
-    assign cmt_n_w = cmt_ok ? ({2'b0, cmt_raw[0]} + {2'b0, cmt_raw[1]} +
-                               {2'b0, cmt_raw[2]} + {2'b0, cmt_raw[3]}) : 3'd0;
+    //   ★★ EXP-N1：popcount 只在 COMMIT_W（=2）个 lane 上做（原来是 4 路相加）。
+    //     （与 rob.v §1 的 `cmt_n_w` 同一写法：小规模计数器，仅 2 项 ⇒ 不构成"一堆 reg 赋值"。）
+    reg [2:0] cmt_n_c;
+    integer   cnp;
+    always @(*) begin
+        cmt_n_c = 3'd0;
+        for (cnp = 0; cnp < COMMIT_W; cnp = cnp + 1)
+            if (cmt_raw[cnp]) cmt_n_c = cmt_n_c + 3'd1;
+    end
+    assign cmt_n_w = cmt_ok ? cmt_n_c : 3'd0;
     assign cmt_i2 = x_i2_rob[2];
 
     genvar cc;
@@ -1852,6 +1864,25 @@ module backend_top #(
         //     覆盖面：维护 / 陷阱 / xRET 触发的整机冲刷拍全部包含在内。
         assign lsu_dr_valid[cc] = cmt_st_drain[cc] & ~cmt_hold_w[cc];
         assign lsu_dr_idx[cc*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = p_stq(p);
+    end
+    endgenerate
+
+    //   ★★ EXP-N1：**提交 4→2 的对外契约处理**。
+    //     `commit_*_o` 与 LSQ 的 `dr_valid/dr_idx` 是**固定 4 lane 的既有接口**
+    //     （锁步 TB / `core_top_2b` / `lsq_simple` 都按 4 lane 取用，本任务不改它们）⇒
+    //     COMMIT_W 之外的 lane 必须**显式恒 0**（"该 lane 本拍无提交"），
+    //     而不是悬空/复用。这样：① 对外 PC 流语义不变（只是每拍最多 2 条）；
+    //     ② 4 宽提交的**真实结构**（退休选择/架构更新/回收）已不存在于 RTL 中。
+    genvar co;
+    generate
+    for (co = COMMIT_W; co < DISP_W; co = co + 1) begin : g_cmtoff
+        assign commit_valid_o[co]            = 1'b0;
+        assign commit_pc_o[co*32 +: 32]      = 32'h0;
+        assign commit_arch_rd_o[co*5 +: 5]   = 5'h0;
+        assign commit_arch_we_o[co]          = 1'b0;
+        assign commit_arch_rd_wdata_o[co*32 +: 32] = 32'h0;
+        assign lsu_dr_valid[co]              = 1'b0;
+        assign lsu_dr_idx[co*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = {`BACK2_STQ_IDX_W{1'b0}};
     end
     endgenerate
 
@@ -2082,10 +2113,20 @@ module backend_top #(
     assign iprf_ra[8*PW_I +: PW_I]  = w_ps1i(x_i2_uop[4]);
     assign iprf_ra[9*PW_I +: PW_I]  = w_ps2i(x_i2_uop[4]);
     assign iprf_ra[10*PW_I +: PW_I] = w_ps1i(x_i2_uop[5]);
-    assign iprf_ra[11*PW_I +: PW_I] = cmt_narrow[0*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
-    assign iprf_ra[12*PW_I +: PW_I] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
-    assign iprf_ra[13*PW_I +: PW_I] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
-    assign iprf_ra[14*PW_I +: PW_I] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
+    //   ★★ EXP-N1：提交 PRF 读口按 **COMMIT_W** 展开（提交 4→2 ⇒ 只用 11/12 与 4/5 两口）。
+    //     端口 13/14（整数）与 6/7（浮点）在本任务**不接提交数据**（地址恒 0、输出不被读）
+    //     ⇒ 综合可把这两路的读 mux 整段裁掉（`prf.v` 不在本任务改动范围，故不改其端口表）。
+    genvar gcr;
+    generate
+    for (gcr = 0; gcr < COMMIT_W; gcr = gcr + 1) begin : g_cmtrd
+        assign iprf_ra[(11+gcr)*PW_I +: PW_I] = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
+        assign fprf_ra[(4+gcr)*PW_F +: PW_F]  = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
+    end
+    for (gcr = COMMIT_W; gcr < DISP_W; gcr = gcr + 1) begin : g_cmtrdoff
+        assign iprf_ra[(11+gcr)*PW_I +: PW_I] = {PW_I{1'b0}};
+        assign fprf_ra[(4+gcr)*PW_F +: PW_F]  = {PW_F{1'b0}};
+    end
+    endgenerate
     //   ★ PRF 写口判据 = "写回所属 ROB 项仍在 ROB 窗口内"（不能用 epoch，理由见 prf.v）
     //     `(idx - head) mod ROB_N < cnt`；比较零扩展到 cnt 的宽度以正确处理 cnt=ROB_N。
     assign iprf_we    = wbi_v & wbi_keep;
@@ -2101,14 +2142,11 @@ module backend_top #(
     );
 
     assign fprf_re = 8'hFF;
+    //   ★★ EXP-N1：浮点提交读口同样只接 COMMIT_W 个（见上面整数侧说明）。
     assign fprf_ra[0*PW_F +: PW_F] = w_ps1f(x_i2_uop[5]);
     assign fprf_ra[1*PW_F +: PW_F] = w_ps2f(x_i2_uop[5]);
     assign fprf_ra[2*PW_F +: PW_F] = w_ps3f(x_i2_uop[5]);
     assign fprf_ra[3*PW_F +: PW_F] = w_ps2f(x_i2_uop[4]);
-    assign fprf_ra[4*PW_F +: PW_F] = cmt_narrow[0*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
-    assign fprf_ra[5*PW_F +: PW_F] = cmt_narrow[1*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
-    assign fprf_ra[6*PW_F +: PW_F] = cmt_narrow[2*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
-    assign fprf_ra[7*PW_F +: PW_F] = cmt_narrow[3*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)),
                           (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)) };
     assign fprf_wa    = { fpu_if_pdf, lsu_wb_pdf };
@@ -2224,7 +2262,8 @@ module backend_top #(
                     ? 3'd5 : 3'd0;                         // cbo.flush（imm12=2）
         end
     endfunction
-    reg  [3:0]  xret_lane_oh, maint_lane_oh;
+    //   ★★ EXP-N1：本扫描是**提交侧** ⇒ 位向量宽度 = COMMIT_W（=2）。
+    reg  [COMMIT_W-1:0] xret_lane_oh, maint_lane_oh;
     reg  [1:0]  xret_lane_idx, maint_lane_idx;
     reg  [1:0]  xret_kind_sel;
     reg  [2:0]  maint_kind_sel;
@@ -2236,20 +2275,20 @@ module backend_top #(
     //     只用 `cmt_raw & ~squash_v_w`（前缀提交链 + 无分支误判冲刷）即可：
     //     陷阱拍 `cmt_raw` 在异常槽及其后全 0 ⇒ 不会误识别更年轻的 xRET/维护操作。
     always @(*) begin
-        xret_lane_oh = 4'h0;   xret_kind_sel  = 2'd0; xret_lane_idx  = 2'd0;
-        maint_lane_oh = 4'h0;  maint_kind_sel = 3'd0; maint_pc_sel = 32'h0;
+        xret_lane_oh = {COMMIT_W{1'b0}};  xret_kind_sel  = 2'd0; xret_lane_idx  = 2'd0;
+        maint_lane_oh = {COMMIT_W{1'b0}}; maint_kind_sel = 3'd0; maint_pc_sel = 32'h0;
         maint_lane_idx = 2'd0;
         for (mw2 = COMMIT_W-1; mw2 >= 0; mw2 = mw2 - 1) begin
             if (cmt_raw[mw2] & ~squash_v_w) begin
                 //   ★ ②：预解码标志改吃 `nq`（每 lane 5 bit）—— 不再读 4 lane 的 32 bit 指令字去译码。
                 if (cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MRET] |
                     cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_SRET]) begin
-                    xret_lane_oh  = 4'h1 << mw2[1:0];
+                    xret_lane_oh  = (4'h1 << mw2[1:0]);   // 4 bit 上下文 ⇒ 赋值时截断到 COMMIT_W
                     xret_lane_idx = mw2[1:0];
                     xret_kind_sel = cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MRET] ? 2'd1 : 2'd0;
                 end
                 if (cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MK_L +: 3] != 3'd0) begin
-                    maint_lane_oh  = 4'h1 << mw2[1:0];
+                    maint_lane_oh  = (4'h1 << mw2[1:0]);  // 同上
                     maint_lane_idx = mw2[1:0];
                     maint_kind_sel = cmt_narrow[mw2*`BACK2_NQ_W + `BACK2_NQ_MK_L +: 3];
                     maint_pc_sel   = p_pc(cmt_pay[mw2*RB_W +: RB_W]);
@@ -2278,11 +2317,15 @@ module backend_top #(
     //     正是 K1 的"丢一个 4 宽块"症状）。lane 0/1/2 的移位 1/2/3 正确 ⇒ 只有"维护指令
     //     恰好落在第 4 个 lane"时才触发 ⇒ 与实测失败点（满 4 宽组）完全吻合。
     //     修法：把移位量扩到 3 bit（最大 4）⇒ lane 3 时移位 4 ⇒ 掩码 0（不 hold 任何 lane）。
+    //   ★★ EXP-N1：掩码宽度 = COMMIT_W（=2）。移位量仍用 3 bit 上下文（最大 COMMIT_W=2 < 8
+    //     ⇒ 不会回绕），`{COMMIT_W{1'b1}} << COMMIT_W` 截断为 0 = "没有更年轻的 lane" ✓。
     wire [2:0] maint_hold_sh = {1'b0, maint_lane_idx} + 3'd1;
     wire [2:0] xret_hold_sh  = {1'b0, xret_lane_idx}  + 3'd1;
-    wire [3:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << maint_hold_sh) :
-                            (|xret_lane_oh)  ? (4'hF << xret_hold_sh)  : 4'h0;
-    wire [3:0] cmt_raw_m  = cmt_raw & ~cmt_hold_w;
+    //     （4 bit 上下文移位 ⇒ 赋值时截断到 COMMIT_W；COMMIT_W=2 时"移位 2"= 全 0 ✓）
+    wire [COMMIT_W-1:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << maint_hold_sh) :
+                                     (|xret_lane_oh)  ? (4'hF << xret_hold_sh)  :
+                                                        {COMMIT_W{1'b0}};
+    wire [COMMIT_W-1:0] cmt_raw_m  = cmt_raw & ~cmt_hold_w;
 
     //==========================================================================
     // 12. 提交训练 / 检查点释放 / RAS（前端衔接）
@@ -2334,8 +2377,11 @@ module backend_top #(
     //     写使能全部来自提交 lane（`trq_ok` 已含 `cmt_ok`）⇒ `disp_fire_w` 分支在旧码里即
     //     **空转**（acc=0、无 lane 写、指针 +0）；本段按真源只保留提交驱动。
     localparam integer TRQ_D  = 16;          // 单写口 FIFO 深度（沿用 C7 口径）
-    localparam integer TRQ_SD = 4;           // staging 槽数（= COMMIT_W=4，4 宽提交是结构前提）
+    //   ★★ EXP-N1：staging 槽数 = **COMMIT_W**（提交宽度）。原来写死 4（= 当时 COMMIT_W），
+    //     提交 4→2 后每拍最多 2 条可上报控制转移 ⇒ 2 槽足够（best-effort 契约不变）。
+    localparam integer TRQ_SD = COMMIT_W;    // staging 槽数（= 提交宽度）
     localparam integer TRQW   = 107;         // 训练条目位宽（与旧 FIFO 逐位同布局）
+    localparam integer SDW    = (TRQ_SD > 1) ? $clog2(TRQ_SD) : 1;   // 槽号宽度
 
     // ---- 1W/1R FIFO（mod-16 环形，**单写口**）----
     reg  [TRQW-1:0] trq [0:TRQ_D-1];
@@ -2344,37 +2390,55 @@ module backend_top #(
     wire            trq_pop  = train_valid_o;                          // FIFO 出队 = training 出队
     wire            trq_room = ((trq_cnt - {4'b0, trq_pop}) < 5'd16);  // 本拍可写 1 条
 
-    // ---- 4 槽 staging（槽 i ← lane i：单源写 ⇒ 数据口零 mux）----
+    // ---- TRQ_SD 槽 staging（槽 i ← lane i：单源写 ⇒ 数据口零 mux）----
     reg  [TRQW-1:0]  stg [0:TRQ_SD-1];
     reg  [TRQ_SD-1:0] stg_v;                 // 各槽有效位
     //   提交侧训练申请（唯一真源）：本拍哪些 lane 是"可上报的控制转移"
-    wire [3:0]      trq_ok = cmt_st_branch & {4{cmt_ok}} & ~cmt_hold_w;
+    wire [COMMIT_W-1:0] trq_ok = cmt_st_branch & {COMMIT_W{cmt_ok}} & ~cmt_hold_w;
 
     //   排空槽 = 最低有效槽；`trq_room` 保证不覆盖 FIFO 中未出队项
-    wire [1:0]      stg_drain_slot = stg_v[0] ? 2'd0 : stg_v[1] ? 2'd1 :
-                                     stg_v[2] ? 2'd2 : 2'd3;
-    wire            stg_drain_v    = (|stg_v) & trq_room;
-    wire [3:0]      stg_v_after    = stg_v & ~(stg_drain_v ? (4'd1 << stg_drain_slot) : 4'd0);
-    wire            stg_any_after  = |stg_v_after;
-    wire [1:0]      stg_hi_after   = stg_v_after[3] ? 2'd3 : stg_v_after[2] ? 2'd2 :
-                                     stg_v_after[1] ? 2'd1 : 2'd0;
+    //   （优先级编码：由高到低扫描、命中即覆盖 ⇒ 留下**最低**置位槽；规模 = COMMIT_W ≤ 2）
+    reg  [SDW-1:0]   stg_drain_slot;
+    reg  [SDW-1:0]   stg_hi_after;
+    integer          sps;
+    always @(*) begin
+        stg_drain_slot = {SDW{1'b0}};
+        for (sps = TRQ_SD-1; sps >= 0; sps = sps - 1)
+            if (stg_v[sps]) stg_drain_slot = sps[SDW-1:0];
+    end
+    wire             stg_drain_v   = (|stg_v) & trq_room;
+    wire [TRQ_SD-1:0] stg_v_after  = stg_v &
+                                     ~(stg_drain_v ? ({{(TRQ_SD-1){1'b0}}, 1'b1} << stg_drain_slot)
+                                                   : {TRQ_SD{1'b0}});
+    wire             stg_any_after = |stg_v_after;
+    always @(*) begin
+        stg_hi_after = {SDW{1'b0}};
+        for (sps = TRQ_SD-1; sps >= 0; sps = sps - 1)
+            if (stg_v_after[sps]) stg_hi_after = sps[SDW-1:0];
+    end
     //   "排在所有挂起项之后"的 lane 掩码（lane 号 = 槽号）：hi_after 的下一槽起全 1。
-    //   `hi_after+1 == 4` 时 `4'd1<<4` 截断为 0 ⇒ `0-1=4'hF` ⇒ 取反全 0（lane 3 也拒）✓
-    wire [3:0]      stg_mask_hi    = stg_any_after ? ~((4'd1 << (stg_hi_after + 2'd1)) - 4'd1)
-                                                   : 4'hF;
-    wire [3:0]      stg_acc        = trq_ok & stg_mask_hi;
+    reg  [TRQ_SD-1:0] stg_mask_hi;
+    integer           sms;
+    always @(*) begin
+        stg_mask_hi = {TRQ_SD{1'b1}};
+        if (stg_any_after)
+            for (sms = 0; sms < TRQ_SD; sms = sms + 1)
+                if (sms <= stg_hi_after) stg_mask_hi[sms] = 1'b0;
+    end
+    wire [TRQ_SD-1:0] stg_acc      = trq_ok & stg_mask_hi;
 
-    //   staging → FIFO 的**唯一** 4:1 数据选择（旧结构是每个 FIFO 项一套）
+    //   staging → FIFO 的**唯一** TRQ_SD:1 数据选择（旧结构是每个 FIFO 项一套）
     wire [TRQW-1:0] trq_wdata      = stg[stg_drain_slot];
 
-    wire [3:0]  tcp_cond, tcp_tk, tcp_ind, tcp_call, tcp_ret;
-    wire [31:0] tcp_tgt [0:3];
-    wire [3:0]  tcp_ptk, tcp_psg, tcp_pgd, tcp_pld, tcp_bh, tcp_bw;
-    wire [31:0] tcp_ptg [0:3];
-    wire [31:0] tcp_pc  [0:3];
+    //   ★★ EXP-N1：以下 per-lane 训练条目数组按 **COMMIT_W**（=2）展开。
+    wire [COMMIT_W-1:0]  tcp_cond, tcp_tk, tcp_ind, tcp_call, tcp_ret;
+    wire [31:0] tcp_tgt [0:COMMIT_W-1];
+    wire [COMMIT_W-1:0]  tcp_ptk, tcp_psg, tcp_pgd, tcp_pld, tcp_bh, tcp_bw;
+    wire [31:0] tcp_ptg [0:COMMIT_W-1];
+    wire [31:0] tcp_pc  [0:COMMIT_W-1];
     //   ★ EXP-R3b：每 lane 打成**一条 107 bit 训练条目**（与旧 FIFO 项逐位同布局），
     //     staging 槽 i 直接吞 `tcp_data[i]`（单源写）。
-    wire [TRQW-1:0] tcp_data [0:3];
+    wire [TRQW-1:0] tcp_data [0:COMMIT_W-1];
     genvar tc;
     generate
     for (tc = 0; tc < COMMIT_W; tc = tc + 1) begin : g_trf
@@ -2499,7 +2563,7 @@ module backend_top #(
             ck_busy_q <= {CKPT_N{1'b0}};
             ck_pend_q <= {CKPT_N{1'b0}};
             trq_w <= 4'd0; trq_r <= 4'd0; trq_cnt <= 5'd0;   // ★ EXP-R3b：4 bit 环形指针（mod 16）
-            stg_v <= 4'd0;                                   // ★ EXP-R3b：staging 槽全空（数据槽在 g_stg 内复位）
+            stg_v <= {TRQ_SD{1'b0}};                         // ★ EXP-R3b/N1：staging 槽全空（数据槽在 g_stg 内复位）
             mdu_if_rob <= 7'd0; mdu_if_ep <= {EW{1'b0}}; mdu_if_di <= 1'b0;
             mdu_if_pdi <= {PW_I{1'b0}};
             fpu_if_rob <= 7'd0; fpu_if_ep <= {EW{1'b0}}; fpu_if_di <= 1'b0;

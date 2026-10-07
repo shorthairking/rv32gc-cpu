@@ -47,9 +47,19 @@
 `define BACK2_FREE_I_N       32         // 整数 free list 容量（不含架构基线 32；= 64−32）
 `define BACK2_FREE_F_N       32         // 浮点 free list 容量（不含架构基线 32）
 
-// ---- 发射宽度 / 提交宽度（§1：4 发射；提交 ≤4 条/拍）----
+// ---- 发射宽度 / 分配宽度 / 提交宽度（§1：4 发射；提交 ≤COMMIT_W 条/拍）----
+//   ★★ EXP-N1（commit 4→2「彻底缩」，answer.md §二/§十三 S 级）：
+//     **4-issue ≠ 4-commit** —— 前端 4 fetch / rename 4-wide / issue 4-wide / 6 FU /
+//     ROB64 / IQ50 / NREG64 全部保留；**只有 commit/退休降到 2-wide**。
+//     因此这里把「ROB 分配（派发）宽度」与「ROB 提交（退休）宽度」拆成两个独立真源：
+//       · `BACK2_ALLOC_W`  = 派发/分配宽度（= `BACK2_DISP_W` = 4，**不动**）；
+//       · `BACK2_COMMIT_W` = 提交/退休宽度（4 → **2**）。
+//     ⚠ 这两个宽度**不得**再共用同一个宏：rob.v 的 `alloc_*` 口按 ALLOC_W、
+//       `cmt_*`/退休选择/前缀链/架构更新按 COMMIT_W 展开（原来共用一个宏 ⇒
+//       只改这一处会把 4 宽分配也一起砍掉，结构上不可实现）。
 `define BACK2_DISP_W         4
-`define BACK2_COMMIT_W       4          // ★ 反证实验改这一处（1 ⇒ 变相顺序提交）
+`define BACK2_ALLOC_W        4          // ROB 分配（派发）宽度：4 条/拍，保持不动
+`define BACK2_COMMIT_W       2          // ★ EXP-N1：提交/退休宽度 4 → 2（硬约束：≥2 条/拍）
 
 // ---- 分支检查点（§3.4：16 个）----
 `define BACK2_CKPT_N         16
