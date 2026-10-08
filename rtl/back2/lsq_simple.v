@@ -454,15 +454,34 @@ module lsq_simple #(
 
     // ---- (c) 组合两路候选：取 age 大者、数据随之选择、hit 相或（纯函数，只吃入参）----
     //   平局（age 相等）时按旧实现的"或"语义合并两路数据（年龄唯一时退化为唯一胜者）。
+    //   ★★ EXP-N10（2026-10-01）：**转发树内 age 位宽 8 → 6**（N7 报告 §6 建议 3a 的 sound 收窄）。
+    //     正确性论证（**纯结构性，与 ROB 窗口是否回绕无关**）：
+    //       · `m = (rob − rob_head) & 7'h7F`（rob/rob_head ∈ [0,63]）⇒ m 只可能落在
+    //         S = [0, 63−H] ∪ [128−H, 127]（H = rob_head；H=0 时右段为空）；
+    //       · 命中叶子必过 `fw_live_e`（**本段不动，8 bit 原样保留**）⇒ 其 m < age_rob；
+    //       · `m mod 64` 在 S 上**严格单调且单射**：[0,63−H] → [0,63−H]、
+    //         [128−H,127] → [64−H,63]，两像段相邻不交（64−H > 63−H）⇒ 树内
+    //         "取 age 大者（= 最年轻的更老 store）" 的 argmax 与平局语义逐位不变
+    //         ⇒ 叶子按 `8'h3F` 截断 + 比较器只比 [5:0]，与 8 bit 版**逐拍逐位等价**。
+    //     ★ 口径纠正（N7 报告 §6 建议 3a 的**前提有误**）：**"age_rob < 64"并不成立** ——
+    //       ROB 回绕时 `age_rob` 与"命中叶子"的 age 可达 127（核内实测 MAX_AGE_ROB=127、
+    //       live leaf age 最大 126，见探针）。等价性靠的是上面 S 的两段结构，**不是**
+    //       "窗口内年龄 <64"；标尺 TB 的 3000 例只喂了 age<64 的输入，**不足以**单独支撑结论。
+    //       真正的判据 = 核内 A/B 探针（8-bit 参考锥 ∥ 6-bit 变体锥，喂同一份产品 STQ/load
+    //       输入）：core_top_2b/lockstep/ipc 上 REF_VS_VAR=0、DUT_VS_REF=0。
+    //     ★ **禁止收窄 `fw_live_e` 有效门**（`:250-252` 口径）：`& 7'h7F` 正是"窗口内"与
+    //       "越过 ROB 头"两者的区分依据（收成 6 bit/模 64 会漏转发）；本函数不参与该门。
+    localparam integer FW_AGE_W    = 6;             // 树内 age 位宽（原 8）
+    localparam [7:0]   FW_AGE_MASK = 8'h3F;         // {2'b00, 6'h3F}：树内 age 的合法上界掩码
     function [16:0] fw_max2(input [7:0] a_age, input [7:0] a_dat, input a_hit,
                             input [7:0] b_age, input [7:0] b_dat, input b_hit);
         reg a_ge;
         begin
-            a_ge = (a_age >= b_age);
+            a_ge = (a_age[FW_AGE_W-1:0] >= b_age[FW_AGE_W-1:0]);
             fw_max2[16]   = a_hit | b_hit;
-            fw_max2[15:8] = a_ge ? a_age : b_age;
-            fw_max2[7:0]  = (a_hit &  a_ge         ? a_dat : 8'h0) |
-                            (b_hit & (b_age >= a_age) ? b_dat : 8'h0);
+            fw_max2[15:8] = (a_ge ? a_age : b_age) & FW_AGE_MASK;
+            fw_max2[7:0]  = (a_hit &  a_ge ? a_dat : 8'h0) |
+                            (b_hit & (b_age[FW_AGE_W-1:0] >= a_age[FW_AGE_W-1:0]) ? b_dat : 8'h0);
         end
     endfunction
 
@@ -471,7 +490,10 @@ module lsq_simple #(
     //   `exe_addr[1:0]` 与常量 gb 决定，与旧实现逐位一致）。
     //   低字候选：store 低字 = 本字节所在字 且 掩码覆盖该道；
     //   高字候选：8 B store 的高字（低字地址 +4）= 本字节所在字。
-    wire [8*32*8-1:0]  fw_a0;                // 叶子年龄（每叶 8 bit）
+    //   ★★ EXP-N10：叶子携带的年龄按 `FW_AGE_MASK`（6 bit）截断 —— 命中叶子（`mt_w`）必然
+    //      通过 `fw_live_e`（`stq_age < age_rob`，而 `age_rob<64`）⇒ 截断是**无损的**
+    //      （上 2 bit 本来就是常量 0，截断只是把它在结构上钉成常量，供综合剪掉该数据通路）。
+    wire [8*32*8-1:0]  fw_a0;                // 叶子年龄（每叶 8 bit，仅低 6 bit 承载信息）
     wire [8*32*8-1:0]  fw_d0;                // 叶子数据（每叶 8 bit）
     wire [8*32-1:0]    fw_h0;                // 叶子命中（1 bit/叶）
     wire [7:0]         fwd_hit_w;
@@ -497,7 +519,7 @@ module lsq_simple #(
                 wire lo_w = lo_eq_w & stq_msk[gj][lane_w];
                 wire hi_w = stq_hi[gj] & hi_eq_w;
                 wire mt_w = in_w & fw_live_e[gj] & (lo_w | hi_w);
-                assign fw_a0[(gb*32+gj)*8 +: 8] = mt_w ? stq_age[gj*8 +: 8] : 8'h0;
+                assign fw_a0[(gb*32+gj)*8 +: 8] = mt_w ? (stq_age[gj*8 +: 8] & FW_AGE_MASK) : 8'h0;
                 assign fw_d0[(gb*32+gj)*8 +: 8] = mt_w ? (lo_w ? stq_d [gj][8*lane_w +: 8]
                                                                : stq_dh[gj][8*lane_w +: 8]) : 8'h0;
                 assign fw_h0[gb*32 + gj] = mt_w;
