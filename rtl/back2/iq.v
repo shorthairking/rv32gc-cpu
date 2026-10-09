@@ -29,6 +29,26 @@
 //     一张 4 bank SDP BRAM 读回（`u_iwmem`）⇒ IQ 的存储/写 mux/读 mux 只按 40 bit 计。
 //   · 出队时按动态索引取出窄载荷（`np_q[sel]`，与 2A 核 GPR 读口同一写法），经
 //     `o_sel_nq` 给 backend_top 做门控。
+//   · ★★ N10（IQ 窄载荷写口 4W → 2×(2W) bank）：`np_q` 按**槽号奇偶**拆成 2 个 bank
+//     （bank0 = 偶槽、bank1 = 奇槽），**每 bank 2 个写口**（合计 4 个物理写口不变）。
+//     4-wide 派发的一个派发块最多给本队列 4 条，由本模块的**局部、固定路径**均衡拆分
+//     （§3）摊到 2 个 bank：`b0 = clamp(ceil(a/2), a−cap1, cap0)`、`b1 = a−b0`
+//     ⇒ **每 bank 每拍 ≤2 条**，2 写口**结构性永不欠配**。
+//     ★ 因此这里**不需要**入队暂存寄存器（staging）：staging 只能吸收"写口超额"，而
+//     超额在本拆分下不存在；它**无法**吸收"某 bank 槽位用尽"（那需要"槽→暂存项"的
+//     旁路比较 + 逐槽 (STAGE+1):1 载荷 mux，代价远大于它省下的 2:1 写 mux）。
+//     bank 槽位用尽的处理 = **背压**：`wr_cap = min(2,free_b0)+min(2,free_b1)` 是
+//     "本拍可接纳条数上界"的**唯一真源**（新输出口），派发侧必须用 `q_wr_n ≤ wr_cap`
+//     判余量；`a ≤ wr_cap ⇔ 全部写口可写`（§3 有穷举论证），**绝不出现"接下了写不下"
+//     的静默丢项**。暂存深度口径（n7：ALU0 需 6 深）来自"**单个** 2 写口 sink"的漏桶
+//     需求，与本 2×(2W) 结构不对应（见报告 §0）。
+//   · 读侧：槽号在逐槽比较/门控里是**编译期常量** ⇒ `np_rd[gi]` 是两 bank 的**纯拼接**
+//     （无 mux，与原 `np_q[gi]` 逐位等价）；只有出队动态索引 `o_sel_nq` 需要一次
+//     `sel_idx[0]` bank 选择 + bank 内 6:1 mux。
+//   · ★ 接口契约（N10 新增，必须保持）：`wr_valid` 必须**从写口 0 起连续**
+//     （即 `wr_valid == (1<<a)-1`）。两个驱动方都满足：`backend_top.v` 的 `q_ord`
+//     按 lane 顺序自 0 递增；`tb_back2_iq` 只驱动写口 0。非连续掩码不在契约内。
+//   · ★ `DEPTH` 必须为**偶数**（6 个队列 12/12/6/6/8/6 全为偶数；奇数深度需同时改分 bank 索引）。
 //   · 端口 `iss_uop`/`o_sel_uop`（UOPW 宽）**仅为接口兼容保留**（单测 TB 仍按 uop 宽
 //     连接）：C1 后 IQ 不再持有宽字段，两者输出的是"窄载荷零扩展"，backend_top
 //     **不再消费**（综合时被剪除）。语义真源是 `o_sel_nq`。
@@ -83,6 +103,10 @@ module iq #(
     input  wire [WRP*ROB_IDX_W-1:0] wr_rob,
     input  wire [WRP*SRC_N-1:0]  wr_rdy,           // 入队时就绪掩码（未用源恒 1）
     output wire [4:0]            free_cnt,         // 剩余空位（派发侧判 S4；深度 ≤16 ⇒ 5 bit）
+    //   ★★ N10：**bank 余量可接纳上界**（0..4）—— "本拍最多能收几条"的**唯一真源**。
+    //     派发侧必须用 `q_wr_n ≤ wr_cap` 判余量；若仍用总空位 `free_cnt`，会在
+    //     "总空位够、某 bank 放不下"时让 iq 内部 `wr_ok=0` ⇒ **静默丢项**。
+    output wire [4:0]            wr_cap,
 
     // ---- 唤醒广播（写回拍：物理号 + 数据）----
     input  wire [WK_N-1:0]       wki_v,
@@ -138,10 +162,13 @@ module iq #(
     function [PDW_F-1:0] iqn_ps1f; input [IQW-1:0] n; begin iqn_ps1f = n[`BACK2_IQN_PS1F_L +: PDW_F]; end endfunction
     function [PDW_F-1:0] iqn_ps2f; input [IQW-1:0] n; begin iqn_ps2f = n[`BACK2_IQN_PS2F_L +: PDW_F]; end endfunction
     function [PDW_F-1:0] iqn_ps3f; input [IQW-1:0] n; begin iqn_ps3f = n[`BACK2_IQN_PS3F_L +: PDW_F]; end endfunction
-    assign o_sel_uop = {{(UOPW-IQW){1'b0}}, np_q[sel_idx]};   // C1：仅兼容（宽字段恒 0）
-    assign o_sel_nq  = np_q[sel_idx];
+    //   ★★ N10：出队**动态索引**读 = bank 选择（`sel_idx[0]`）+ bank 内 6:1 mux
+    //     （`sel_idx>>1`）。逐槽静态读走上面的 `np_rd[]` 纯拼接，不含 mux。
+    wire [IQW-1:0] np_sel = sel_idx[0] ? np_b1[sel_idx >> 1] : np_b0[sel_idx >> 1];
+    assign o_sel_uop = {{(UOPW-IQW){1'b0}}, np_sel};   // C1：仅兼容（宽字段恒 0）
+    assign o_sel_nq  = np_sel;
     assign o_sel_rob = rob_q[sel_idx*ROB_IDX_W +: ROB_IDX_W];
-    assign iss_uop   = {{(UOPW-IQW){1'b0}}, np_q[sel_idx]};   // C1：同上；backend_top 不接
+    assign iss_uop   = {{(UOPW-IQW){1'b0}}, np_sel};   // C1：同上；backend_top 不接
     assign iss_rob   = rob_q[sel_idx*ROB_IDX_W +: ROB_IDX_W];
     assign iss_epoch = ep_q[sel_idx*`BACK2_EPOCH_W +: `BACK2_EPOCH_W];
     //   ★ `iss_dead` 必须恒 0：错路径条目已在**冲刷拍按 squash_idx 一次性作废**
@@ -158,7 +185,18 @@ module iq #(
     reg  [DEPTH-1:0]                 valid_q;
     //   ★★ C1：载荷阵列改为**窄载荷**（`BACK2_IQN_W`）。写口仍收 UOPW 宽的 `wr_uop`
     //     （backend_top 原样驱动 ⇒ 接口/单测不变），入队沿用 `pack_iqn()` 抽出窄载荷。
-    reg  [IQW-1:0]                   np_q [0:DEPTH-1];   // 每槽一个窄载荷字
+    //   ★★ N10：窄载荷阵列按**槽号奇偶**拆 2 bank、每 bank **2 写口**（见文件头）。
+    //     `np_rd[]` 是**静态读视图**（槽号为编译期常量 ⇒ 纯拼接，无 mux）。
+    localparam integer HB = DEPTH / 2;                    // 每 bank 槽数（DEPTH 为偶数）
+    reg  [IQW-1:0]                   np_b0 [0:HB-1];      // 偶槽（slot 2*j）—— 2 写口
+    reg  [IQW-1:0]                   np_b1 [0:HB-1];      // 奇槽（slot 2*j+1）—— 2 写口
+    wire [IQW-1:0]                   np_rd [0:DEPTH-1];   // 静态读视图
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_nprd
+        if ((ge % 2) == 0) assign np_rd[ge] = np_b0[ge/2];
+        else               assign np_rd[ge] = np_b1[ge/2];
+    end
+    endgenerate
     reg  [DEPTH*ROB_IDX_W-1:0]       rob_q;
     reg  [DEPTH*`BACK2_EPOCH_W-1:0]  ep_q;
     reg  [DEPTH*SRC_N-1:0]           rdy_q;
@@ -217,25 +255,25 @@ module iq #(
     endgenerate
 
     //  源序（与 SRC_N 注释一致）：0=s1i 1=s2i 2=s1f 3=s2f 4=s3f
-    //  ★★ C1：所有逐槽比较/门控一律读**窄载荷** `np_q[gi]`（宽字段已不在 IQ 内）
+    //  ★★ C1：所有逐槽比较/门控一律读**窄载荷** `np_rd[gi]`（宽字段已不在 IQ 内）
     always @(*) begin
         wk_hit_w = {(DEPTH*SRC_N){1'b0}};
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
             for (gk = 0; gk < WK_N; gk = gk + 1) begin
-                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps1i(np_q[gi]))) ||
-                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps1i(np_q[gi]))))
+                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps1i(np_rd[gi]))) ||
+                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps1i(np_rd[gi]))))
                     wk_hit_w[gi*SRC_N + 0] = 1'b1;
-                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps2i(np_q[gi]))) ||
-                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps2i(np_q[gi]))))
+                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps2i(np_rd[gi]))) ||
+                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps2i(np_rd[gi]))))
                     wk_hit_w[gi*SRC_N + 1] = 1'b1;
-                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps1f(np_q[gi]))) ||
-                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps1f(np_q[gi]))))
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps1f(np_rd[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps1f(np_rd[gi]))))
                     wk_hit_w[gi*SRC_N + 2] = 1'b1;
-                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps2f(np_q[gi]))) ||
-                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps2f(np_q[gi]))))
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps2f(np_rd[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps2f(np_rd[gi]))))
                     wk_hit_w[gi*SRC_N + 3] = 1'b1;
-                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps3f(np_q[gi]))) ||
-                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps3f(np_q[gi]))))
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps3f(np_rd[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps3f(np_rd[gi]))))
                     wk_hit_w[gi*SRC_N + 4] = 1'b1;
             end
         end
@@ -247,13 +285,13 @@ module iq #(
                     ~e_rdy[gk]) sel_blk[gi] = 1'b1;
         end
         for (gi = 0; gi < DEPTH; gi = gi + 1) begin
-            e_rdy[gi] = (~np_q[gi][`BACK2_IQN_S1I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
-                        (~np_q[gi][`BACK2_IQN_S2I_USE] | rdy_q[gi*SRC_N+1] | wk_hit_w[gi*SRC_N+1]) &
-                        (~np_q[gi][`BACK2_IQN_S1F_USE] | rdy_q[gi*SRC_N+2] | wk_hit_w[gi*SRC_N+2]) &
-                        (~np_q[gi][`BACK2_IQN_S2F_USE] | rdy_q[gi*SRC_N+3] | wk_hit_w[gi*SRC_N+3]) &
-                        (~np_q[gi][`BACK2_IQN_S3F_USE] | rdy_q[gi*SRC_N+4] | wk_hit_w[gi*SRC_N+4]);
+            e_rdy[gi] = (~np_rd[gi][`BACK2_IQN_S1I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
+                        (~np_rd[gi][`BACK2_IQN_S2I_USE] | rdy_q[gi*SRC_N+1] | wk_hit_w[gi*SRC_N+1]) &
+                        (~np_rd[gi][`BACK2_IQN_S1F_USE] | rdy_q[gi*SRC_N+2] | wk_hit_w[gi*SRC_N+2]) &
+                        (~np_rd[gi][`BACK2_IQN_S2F_USE] | rdy_q[gi*SRC_N+3] | wk_hit_w[gi*SRC_N+3]) &
+                        (~np_rd[gi][`BACK2_IQN_S3F_USE] | rdy_q[gi*SRC_N+4] | wk_hit_w[gi*SRC_N+4]);
             e_sel[gi] = valid_q[gi] & e_rdy[gi] &
-                        ~(INORD_LOAD[0] & np_q[gi][`BACK2_IQN_IS_LOAD] & sel_blk[gi]);
+                        ~(INORD_LOAD[0] & np_rd[gi][`BACK2_IQN_IS_LOAD] & sel_blk[gi]);
         end
     end
     assign wk_hit = wk_hit_w;
@@ -285,7 +323,18 @@ module iq #(
     wire [WK_N*PDW_I-1:0] wki_tag_e = wki_tag;
 
     //==========================================================================
-    // 3. 空位分配（入队：WRP 路贪心扫描空闲槽）
+    // 3. 空位分配（★ N10：**按 bank 均衡拆分** + 每 bank 贪心扫 2 个最低空位）
+    //    · `free_cnt` 口径**不变**（总空位；供 DBG / 兼容）。
+    //    · `wr_cap`（新）= "本拍可接纳条数上界"，是派发侧**唯一**判据。
+    //    · 拆分（纯组合、只依赖 `valid_q` 与 `wr_valid`，**不构成组合环**）：
+    //         a  = |wr_valid|（契约：自写口 0 起连续）
+    //         b0 = clamp(ceil(a/2), a − min(2,free_b0) , min(2,free_b0))
+    //         b1 = a − b0
+    //      ⇒ 每 bank 每拍**至多 2 条**（2 写口永不欠配）；某 bank 满时 b0 自动向
+    //        有余侧夹取。**可达性等价**：`a ≤ wr_cap = min(2,free_b0)+min(2,free_b1)`
+    //        ⇔ 存在可行 (b0,b1)（b0_lo ≤ b0_hi 即该不等式；穷举 0≤a≤4、
+    //        0≤free_b0,free_b1≤HB 已逐点验证，见 fpga/scratch/n10_iq_bank_tb.sv）
+    //        ⇒ **绝不出现"接下了写不下"的静默丢项**；只可能在两 bank 都放不下时停顿。
     //==========================================================================
     // 空闲槽计数（打包向量 function，无存储器读）
     function [4:0] popc(input [DEPTH-1:0] v);
@@ -297,25 +346,75 @@ module iq #(
     endfunction
 
     wire [DEPTH-1:0] free_v = ~valid_q;
-    wire [4:0]       wr_need = {3'b0, wr_valid[0]} + {3'b0, wr_valid[1]} +
-                               {3'b0, wr_valid[2]} + {3'b0, wr_valid[3]};
-    wire [4:0]       free_n  = popc(free_v);
+    wire [4:0]       free_n = popc(free_v);
     assign free_cnt = free_n;
-    wire   wr_ok = (free_n >= wr_need);
 
-    // 贪心分配空位索引（组合；只读打包向量）
-    reg [7:0] wi [0:WRP-1];
-    integer   fj, wk;
-    always @(*) begin
-        for (fj = 0; fj < WRP; fj = fj + 1) wi[fj] = 8'h0;
-        wk = 0;
-        for (fj = 0; fj < DEPTH; fj = fj + 1) begin
-            if (free_v[fj] && (wk < WRP)) begin
-                wi[wk] = fj[7:0];
-                wk = wk + 1;
-            end
-        end
+    // ---- bank 占用/余量（偶槽 = bank0，奇槽 = bank1）----
+    wire [DEPTH-1:0] ev_valid, od_valid;
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_bv
+        assign ev_valid[ge] = ((ge % 2) == 0) ? valid_q[ge] : 1'b0;
+        assign od_valid[ge] = ((ge % 2) == 1) ? valid_q[ge] : 1'b0;
     end
+    endgenerate
+    wire [4:0] free_b0 = HB - popc(ev_valid);      // bank0（偶槽）余量
+    wire [4:0] free_b1 = HB - popc(od_valid);      // bank1（奇槽）余量
+    wire [4:0] cap0 = (free_b0 > 5'd2) ? 5'd2 : free_b0;   // min(2, free_b0)
+    wire [4:0] cap1 = (free_b1 > 5'd2) ? 5'd2 : free_b1;   // min(2, free_b1)
+    assign wr_cap = cap0 + cap1;                            // 0..4
+
+    // ---- 本拍到达条数与 bank 拆分 ----
+    wire [2:0] a_n    = {2'b0, wr_valid[0]} + {2'b0, wr_valid[1]} +
+                        {2'b0, wr_valid[2]} + {2'b0, wr_valid[3]};
+    wire [2:0] a_half = (a_n + 3'd1) >> 1;                                  // ceil(a/2)
+    wire [2:0] b0_lo  = (a_n > cap1[2:0]) ? (a_n - cap1[2:0]) : 3'd0;
+    wire [2:0] b0_hi  = (cap0 >= 5'd2) ? 3'd2 : cap0[2:0];
+    wire [2:0] b0     = (a_half < b0_lo) ? b0_lo : ((a_half > b0_hi) ? b0_hi : a_half);
+    wire [2:0] b1     = a_n - b0;
+    wire       wr_ok  = (a_n <= wr_cap[2:0]);
+
+    // ---- 每 bank 内贪心扫 2 个最低空位（bank-local 索引 0..HB-1）----
+    reg [2:0] wi0 [0:1];
+    reg [2:0] wi1 [0:1];
+    integer   bj, c0, c1;
+    always @(*) begin
+        wi0[0] = 3'd0; wi0[1] = 3'd0; wi1[0] = 3'd0; wi1[1] = 3'd0;
+        c0 = 0;
+        for (bj = 0; bj < HB; bj = bj + 1)
+            if (!valid_q[2*bj] && (c0 < 2)) begin wi0[c0] = bj[2:0]; c0 = c0 + 1; end
+        c1 = 0;
+        for (bj = 0; bj < HB; bj = bj + 1)
+            if (!valid_q[2*bj+1] && (c1 < 2)) begin wi1[c1] = bj[2:0]; c1 = c1 + 1; end
+    end
+
+    // ---- 4 个物理写口 → 全局槽号 + 使能 ----
+    //   bank0 p0 ← 到达 0；bank0 p1 ← 到达 1；bank1 p0 ← 到达 b0；bank1 p1 ← 到达 b0+1
+    //   （bank0 侧数据源是**固定**写口 0/1 ⇒ 无 mux；bank1 侧按 b0 做 3:1 选择）
+    wire [3:0] g0a = {wi0[0], 1'b0};
+    wire [3:0] g0b = {wi0[1], 1'b0};
+    wire [3:0] g1a = {wi1[0], 1'b1};
+    wire [3:0] g1b = {wi1[1], 1'b1};
+    wire we0 = wr_ok & ~squash & (b0 >= 3'd1);
+    wire we1 = wr_ok & ~squash & (b0 >= 3'd2);
+    wire we2 = wr_ok & ~squash & (b1 >= 3'd1);
+    wire we3 = wr_ok & ~squash & (b1 >= 3'd2);
+    //   窄载荷：先按**静态写口**抽 4 份（38 bit），再对 bank1 做 3:1 选择。
+    //   ★ 不能对 `wr_uop` 做变量 part-select：那会变成 300 bit × 3:1 的 mux。
+    wire [IQW-1:0] pn0 = pack_iqn(wr_uop[0*UOPW +: UOPW]);
+    wire [IQW-1:0] pn1 = pack_iqn(wr_uop[1*UOPW +: UOPW]);
+    wire [IQW-1:0] pn2 = pack_iqn(wr_uop[2*UOPW +: UOPW]);
+    wire [IQW-1:0] pn3 = pack_iqn(wr_uop[3*UOPW +: UOPW]);
+    wire [IQW-1:0] pn_b1p0 = (b0 == 3'd0) ? pn0 : ((b0 == 3'd1) ? pn1 : pn2);
+    wire [IQW-1:0] pn_b1p1 = (b0 == 3'd0) ? pn1 : ((b0 == 3'd1) ? pn2 : pn3);
+    //   同两路的 rob/rdy（窄 mux：6/5 bit）
+    wire [ROB_IDX_W-1:0] rb_l [0:3];
+    wire [SRC_N-1:0]     rd_l [0:3];
+    generate
+    for (ge = 0; ge < WRP; ge = ge + 1) begin : g_wl
+        assign rb_l[ge] = wr_rob[ge*ROB_IDX_W +: ROB_IDX_W];
+        assign rd_l[ge] = wr_rdy[ge*SRC_N +: SRC_N];
+    end
+    endgenerate
 
     // ---- 诊断打印（DBG=1 时；默认 0 ⇒ 不产生任何仿真开销/输出）----
     integer dsi;
@@ -326,10 +425,10 @@ module iq #(
                     $display("[iq-dbg %m] slot=%0d rob=%0d rdy=%b ps1i=%0d ps2i=%0d use=%b%b",
                              dsi, rob_q[dsi*ROB_IDX_W +: ROB_IDX_W],
                              rdy_q[dsi*SRC_N +: SRC_N],
-                             iqn_ps1i(np_q[dsi]),
-                             iqn_ps2i(np_q[dsi]),
-                             np_q[dsi][`BACK2_IQN_S1I_USE],
-                             np_q[dsi][`BACK2_IQN_S2I_USE]);
+                             iqn_ps1i(np_rd[dsi]),
+                             iqn_ps2i(np_rd[dsi]),
+                             np_rd[dsi][`BACK2_IQN_S1I_USE],
+                             np_rd[dsi][`BACK2_IQN_S2I_USE]);
             end
             $display("[iq-dbg %m] wki_v_e=%b wki_tag_e=%b wk_hit=%b rob_head=%0d rob_cnt=%0d",
                      wki_v_e, wki_tag_e, wk_hit, rob_head, rob_cnt);
@@ -366,7 +465,6 @@ module iq #(
     end
     endgenerate
 
-    integer q;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             valid_q <= {DEPTH{1'b0}};
@@ -380,15 +478,37 @@ module iq #(
             valid_q <= (valid_q & ~sel_onehot) & ~squash_kill & ~out_window;
             // ---- 5.2 唤醒置位（单调置 1；出队项无损）----
             rdy_q <= (rdy_q | wk_hit);
-            // ---- 5.3 入队（覆盖对应槽；冲刷拍**不接受**新项：该块必属错路径）----
-            for (q = 0; q < WRP; q = q + 1) begin
-                if (wr_valid[q] && wr_ok && ~squash) begin
-                    valid_q[wi[q]] <= 1'b1;
-                    rdy_q[wi[q]*SRC_N +: SRC_N] <= wr_rdy[q*SRC_N +: SRC_N];
-                    rob_q[wi[q]*ROB_IDX_W +: ROB_IDX_W] <= wr_rob[q*ROB_IDX_W +: ROB_IDX_W];
-                    ep_q [wi[q]*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
-                    np_q [wi[q]] <= pack_iqn(wr_uop[q*UOPW +: UOPW]);   // ★ C1：只存窄载荷
-                end
+            // ---- 5.3 入队（★ N10：4 个物理写口 → 2 bank×2 写口；冲刷拍**不接受**新项）----
+            //   ★ 四条写语句的槽号互不相同（同 bank 两口的空位由贪心扫描保证不同；
+            //     跨 bank 由 ox 奇偶保证）⇒ 4 张打包阵列（valid/rdy/rob/ep）在本段里
+            //     仍是"4 写口"，与改前同构；只有 `np_b0/np_b1` 落到"每 bank 2 写口"。
+            if (we0) begin                                         // bank0 p0 ← 到达 0
+                valid_q[g0a] <= 1'b1;
+                rdy_q [g0a*SRC_N +: SRC_N] <= rd_l[0];
+                rob_q [g0a*ROB_IDX_W +: ROB_IDX_W] <= rb_l[0];
+                ep_q  [g0a*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b0 [wi0[0]] <= pn0;
+            end
+            if (we1) begin                                         // bank0 p1 ← 到达 1
+                valid_q[g0b] <= 1'b1;
+                rdy_q [g0b*SRC_N +: SRC_N] <= rd_l[1];
+                rob_q [g0b*ROB_IDX_W +: ROB_IDX_W] <= rb_l[1];
+                ep_q  [g0b*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b0 [wi0[1]] <= pn1;
+            end
+            if (we2) begin                                         // bank1 p0 ← 到达 b0
+                valid_q[g1a] <= 1'b1;
+                rdy_q [g1a*SRC_N +: SRC_N] <= rd_l[b0];
+                rob_q [g1a*ROB_IDX_W +: ROB_IDX_W] <= rb_l[b0];
+                ep_q  [g1a*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b1 [wi1[0]] <= pn_b1p0;
+            end
+            if (we3) begin                                         // bank1 p1 ← 到达 b0+1
+                valid_q[g1b] <= 1'b1;
+                rdy_q [g1b*SRC_N +: SRC_N] <= rd_l[b0 + 3'd1];
+                rob_q [g1b*ROB_IDX_W +: ROB_IDX_W] <= rb_l[b0 + 3'd1];
+                ep_q  [g1b*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b1 [wi1[1]] <= pn_b1p1;
             end
         end
     end

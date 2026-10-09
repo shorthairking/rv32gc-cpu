@@ -545,6 +545,8 @@ module backend_top #(
     reg  [6*WI*ROBW-1:0]     iq_wrob;      // ★ L3：字段宽 = ROBW（与 iq.wr_rob 端口逐位对齐）
     reg  [6*WI*SRC_N-1:0]    iq_wrdy;
     wire [4:0]  iq_cnt [0:5];
+    //   ★★ N10：各队列的 **bank 余量可接纳上界**（iq.v `wr_cap`，0..4）—— 派发余量门的真源。
+    wire [4:0]  iq_wr_cap [0:5];
 
     // 忙碌位图
     reg  [`BACK2_PRF_I_N-1:0] busy_i_q;
@@ -961,12 +963,12 @@ module backend_top #(
     //     `q_wr_n[q]` 是本块要写入该队列的条数 ⇒ "装得下" = q_wr_n ≤ 空位，
     //     此时 `iq_free_ok` 必须为 **1**。旧版三目写反（有空位反而判 0）⇒ 派发
     //     恒被 S4 挡住、后端永不派发（实测：D1 持块、ROB 恒空、一条不提交）。
-    assign iq_free_ok[0] = (q_wr_n[0] <= iq_cnt[0]);
-    assign iq_free_ok[1] = (q_wr_n[1] <= iq_cnt[1]);
-    assign iq_free_ok[2] = (q_wr_n[2] <= iq_cnt[2]);
-    assign iq_free_ok[3] = (q_wr_n[3] <= iq_cnt[3]);
-    assign iq_free_ok[4] = (q_wr_n[4] <= iq_cnt[4]);
-    assign iq_free_ok[5] = (q_wr_n[5] <= iq_cnt[5]);
+    assign iq_free_ok[0] = (q_wr_n[0] <= iq_wr_cap[0]);   // N10：bank 上界，非总空位
+    assign iq_free_ok[1] = (q_wr_n[1] <= iq_wr_cap[1]);   // N10：bank 上界，非总空位
+    assign iq_free_ok[2] = (q_wr_n[2] <= iq_wr_cap[2]);   // N10：bank 上界，非总空位
+    assign iq_free_ok[3] = (q_wr_n[3] <= iq_wr_cap[3]);   // N10：bank 上界，非总空位
+    assign iq_free_ok[4] = (q_wr_n[4] <= iq_wr_cap[4]);   // N10：bank 上界，非总空位
+    assign iq_free_ok[5] = (q_wr_n[5] <= iq_wr_cap[5]);   // N10：bank 上界，非总空位
     wire iq_room_ok = &iq_free_ok;
 
     // STQ 分配许可（store 项）
@@ -1263,6 +1265,7 @@ module backend_top #(
         .wr_valid(iq_wv_g[0*WI +: WI]), .wr_uop(iq_wuop[0*WI*UOPW +: WI*UOPW]),
         .wr_rob(iq_wrob[0*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[0*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[0]),
+        .wr_cap(iq_wr_cap[0]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(iq_base_rdy[0] & iwm_gnt[0]),
         .iss_valid(iq_iss_v[0]), .iss_rob(iq_iss_rob[0]),   // ★ C1：不接宽 uop
@@ -1276,6 +1279,7 @@ module backend_top #(
         .wr_valid(iq_wv_g[1*WI +: WI]), .wr_uop(iq_wuop[1*WI*UOPW +: WI*UOPW]),
         .wr_rob(iq_wrob[1*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[1*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[1]),
+        .wr_cap(iq_wr_cap[1]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(iq_base_rdy[1] & iwm_gnt[1]),
         .iss_valid(iq_iss_v[1]), .iss_rob(iq_iss_rob[1]),   // ★ C1：不接宽 uop
@@ -1289,6 +1293,7 @@ module backend_top #(
         .wr_valid(iq_wv_g[2*WI +: WI]), .wr_uop(iq_wuop[2*WI*UOPW +: WI*UOPW]),
         .wr_rob(iq_wrob[2*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[2*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[2]),
+        .wr_cap(iq_wr_cap[2]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(iq_base_rdy[2] & iwm_gnt[2]),
         .iss_valid(iq_iss_v[2]), .iss_rob(iq_iss_rob[2]),   // ★ C1：不接宽 uop
@@ -1302,6 +1307,7 @@ module backend_top #(
         .wr_valid(iq_wv_g[3*WI +: WI]), .wr_uop(iq_wuop[3*WI*UOPW +: WI*UOPW]),
         .wr_rob(iq_wrob[3*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[3*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[3]),
+        .wr_cap(iq_wr_cap[3]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(iq_base_rdy[3] & iwm_gnt[3]),
         .iss_valid(iq_iss_v[3]), .iss_rob(iq_iss_rob[3]),   // ★ C1：不接宽 uop
@@ -1335,6 +1341,7 @@ module backend_top #(
         .wr_valid(iq_wv_g[4*WI +: WI]), .wr_uop(iq_wuop[4*WI*UOPW +: WI*UOPW]),
         .wr_rob(iq_wrob[4*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[4*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[4]),
+        .wr_cap(iq_wr_cap[4]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(iq_base_rdy[4] & iwm_gnt[4]),
         .iss_valid(iq_iss_v[4]), .iss_rob(iq_iss_rob[4]),   // ★ C1：不接宽 uop
@@ -1348,6 +1355,7 @@ module backend_top #(
         .wr_valid(iq_wv_g[5*WI +: WI]), .wr_uop(iq_wuop[5*WI*UOPW +: WI*UOPW]),
         .wr_rob(iq_wrob[5*WI*ROBW +: WI*ROBW]), .wr_rdy(iq_wrdy[5*WI*SRC_N +: WI*SRC_N]),
         .free_cnt(iq_cnt[5]),
+        .wr_cap(iq_wr_cap[5]),
         .wki_v(wk_i_v_w), .wki_tag(wk_i_tag_w), .wkf_v(wk_f_v_w), .wkf_tag(wk_f_tag_w),
         .rob_head(rob_head_w), .iss_ready(iq_base_rdy[5] & iwm_gnt[5]),
         .iss_valid(iq_iss_v[5]), .iss_rob(iq_iss_rob[5]),   // ★ C1：不接宽 uop
