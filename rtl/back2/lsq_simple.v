@@ -638,6 +638,34 @@ module lsq_simple #(
     reg                  ld_beat [0:OUT_N-1];
     reg  [31:0]          ld_lo   [0:OUT_N-1];
     reg                  ld_mis  [0:OUT_N-1];
+    //   ★★ N12B-cross（2026-10-01，本任务）：**≤4 B 非对齐且跨 4 B 对齐字边界**的两拍态。
+    //     根因（N12-fix 报告 §5.1 遗留 B）：L1D 只回**一个** `VA&~3` 对齐字
+    //     （`l1d.v:409 cs_rdata = hit_data_sel`，响应不做字节旋转），而 ≤4 B 的非对齐
+    //     load 旧实现只发**一笔**访存 ⇒ 落在**下一个 4 B 字**里的字节没有任何通路
+    //     （实测铁证：`lw@+1 obs=0x00dab55a vs isa=0xffdab55a`、`lh@+3 obs=0x5a vs isa=0x9f5a`）。
+    //     修法 = **复用 8 B 的两拍机制**：本项需要两拍时，首拍发 `VA`（回对齐字 A）、
+    //     次拍发 `VA+4`（回对齐字 A+4，见 `mem_req_addr` 的 `+4`），逐字节合并后拼成
+    //     「道 0..3 = 字 A、道 4..7 = 字 A+4」的 **64 bit 窗口**，再与转发路径同口径
+    //     **右移 a2 字节**取数（见 §写回段 `xw_win/xw_wsh`）。
+    //     判据（自然对齐要求另由 ISA 允许 ⇒ **≤4 B 非对齐不报异常，必须正确取数**）：
+    //       · sz=2（LW/FLW）：`a2 + 4 > 4` ⟺ a2 ≠ 0；
+    //       · sz=1（LH/LHU）：`a2 + 2 > 4` ⟺ a2 = 3；
+    //       · sz=0（LB/LBU）：永不跨（`a2+1 ≤ 4`）；
+    //       · sz=3（FLD）：走 `ld_hi`（非对齐在 E1 判 cause 4，不访存）。
+    //     全转发场景（`fwd_all_w`）**不进 LQ** ⇒ 本位对它无影响（仍 0 笔访存）。
+    reg                  ld_xw   [0:OUT_N-1];
+    //   两拍总判据（8 B 与跨界 ≤4 B 共用同一套请求/响应/组装流程）。
+    wire [OUT_N-1:0]     ld_2b;
+    generate
+    for (gv = 0; gv < OUT_N; gv = gv + 1) begin : g_ld2b
+        assign ld_2b[gv] = ld_hi[gv] | ld_xw[gv];
+    end
+    endgenerate
+    //   E1 判据（纯组合，只吃 `exe_size`/`exe_addr`）：本笔 load 是否**跨 4 B 对齐字边界**
+    //     且宽度 ≤4 B（8 B 走 `ld_hi`）。恒等推导：所需字节数 `1<<sz` ∈ {1,2,4}，
+    //     跨字 ⟺ `exe_addr[1:0] + (1<<sz) > 4`。
+    wire xw_w = (exe_size == 3'd2) ? (exe_addr[1:0] != 2'd0) :
+                (exe_size == 3'd1) ? (exe_addr[1:0] == 2'd3) : 1'b0;
 
     //--------------------------------------------------------------------------
     // 3.1b LQ 分配器（D3 派发期；与 §1.2 的 STQ 分配器**同构**：空闲前缀和 + 候选或归约）
@@ -931,7 +959,7 @@ module lsq_simple #(
 
     //   ★★ 4c(3/3)：写回源三选一 —— 全转发 / 访存响应 / **8 B 非对齐合成（带错）**；
     //     8 B 访问的**首拍响应不写回**（数据还没齐，等第二拍组装）
-    wire        rsp_wb_w     = rsp_ok & (~ld_hi[rsp_sel] | ld_beat[rsp_sel]);
+    wire        rsp_wb_w     = rsp_ok & (~ld_2b[rsp_sel] | ld_beat[rsp_sel]);
     //   非对齐 8 B：**不发访存请求**，直接合成一次“带错写回”（done+exc 同拍，与 rsp_err 同法）。
     //   判据只吃 `pend` 选择结果 ⇒ 与既有优先级链同源、无新挂起态。
     assign      mis_v        = pend_any & ld_mis[pend_sel] & ~dr_any;
@@ -984,11 +1012,23 @@ module lsq_simple #(
     //     `ld_mis`⇒cause 4，不参与转发）⇒ 高半与低半始终同源、不会各自错位。
     wire [63:0] fwdp_wsh = fwdp_data >> {fwdp_off, 3'b000};
     wire [31:0] wbw_sh   = wb_merge  >> {ld_addr[rsp_sel][1:0], 3'b000};
+    //   ★★ N12B-cross：跨 4 B 字边界的 ≤4 B load —— 两拍已把「低字 = VA 所在对齐字 A
+    //     （字节道 0..3）、高字 = 对齐字 A+4（道 4..7）」逐字节合并完成（首拍锁存在
+    //     `ld_lo`，次拍在 `wb_merge`）⇒ 先拼成 64 bit 窗口，再与转发路径**同口径**
+    //     右移 `a2` 字节、按 `size` 取数。这样跨字的那部分字节就有了通路
+    //     （旧实现单拍 ⇒ 高字恒缺 ⇒ 写回值高字节为 0）。
+    wire [63:0] xw_win   = {wb_merge, ld_lo[rsp_sel]};
+    wire [63:0] xw_wsh   = xw_win   >> {ld_addr[rsp_sel][1:0], 3'b000};
     assign wb_data    = fwdp_v ? ext_load(fwdp_wsh[31:0], fwdp_size, fwdp_uns)
                                : (ld_hi[rsp_sel] ? ld_lo[rsp_sel]
-                                                 : ext_load(wbw_sh,
-                                                            ld_size[rsp_sel], ld_uns[rsp_sel]));
-    assign wb_data_hi = fwdp_v ? fwdp_wsh[63:32] : wb_merge;
+                                                 : (ld_xw[rsp_sel] ? ext_load(xw_wsh[31:0],
+                                                                              ld_size[rsp_sel],
+                                                                              ld_uns[rsp_sel])
+                                                                   : ext_load(wbw_sh,
+                                                                              ld_size[rsp_sel],
+                                                                              ld_uns[rsp_sel])));
+    assign wb_data_hi = fwdp_v ? fwdp_wsh[63:32]
+                               : (ld_xw[rsp_sel] ? xw_wsh[63:32] : wb_merge);
     assign wb_f64     = fwdp_v ? (fwdp_size == 3'd3) : ld_hi[rsp_sel];
 
     assign st_done_valid = exe_valid & exe_is_store;
@@ -1032,6 +1072,8 @@ module lsq_simple #(
                 ld_pi[si] <= {PDW_I{1'b0}}; ld_pf[si] <= {PDW_F{1'b0}};
                 ld_addr[si] <= 32'h0; ld_size[si] <= 3'h0; ld_uns[si] <= 1'b0;
                 ld_hm[si] <= 4'h0; ld_hd[si] <= 32'h0; ld_tag[si] <= {TAG_W{1'b0}};
+                ld_hi[si] <= 1'b0; ld_beat[si] <= 1'b0; ld_mis[si] <= 1'b0;
+                ld_xw[si] <= 1'b0; ld_lo[si] <= 32'h0;
             end
         end else if (flush_all) begin
             //   ★★ (b) 收口（本段实测根因，报告 §B4.25）：**已提交 store 的 CDQ 入队
@@ -1095,6 +1137,7 @@ module lsq_simple #(
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
                 ld_hi[si] <= 1'b0; ld_beat[si] <= 1'b0; ld_mis[si] <= 1'b0; ld_lo[si] <= 32'h0;
+                ld_xw[si] <= 1'b0;
             end
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
@@ -1147,6 +1190,7 @@ module lsq_simple #(
                         ld_hi  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_beat[lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_mis [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
+                        ld_xw  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_lo  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 32'h0;
                         ld_rob[lalloc_idx[si*LQ_IW +: LQ_IW]] <=
                                 lalloc_rob[si*ROB_IDX_W +: ROB_IDX_W];
@@ -1219,6 +1263,9 @@ module lsq_simple #(
                     ld_hi  [exe_lq_idx] <= (exe_size == 3'd3);
                     ld_beat[exe_lq_idx] <= 1'b0;
                     ld_mis [exe_lq_idx] <= (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
+                    //   ★★ N12B-cross：≤4 B 非对齐**跨 4 B 对齐字** ⇒ 与 8 B 同一套两拍
+                    //     （判据见 `ld_xw` 声明处；sz=3 由 `ld_hi` 走，两者互斥）。
+                    ld_xw  [exe_lq_idx] <= xw_w;
                     ld_lo  [exe_lq_idx] <= 32'h0;
                     ld_hm  [exe_lq_idx] <= fwd_hit_w;
                     ld_hd  [exe_lq_idx] <= fwd_data_w;
@@ -1238,8 +1285,11 @@ module lsq_simple #(
             if (ld_fire) ld_req[pend_sel] <= 1'b1;
             //   ★★ 4c(3/3)：8 B 访问**两拍** —— 首拍响应只锁存低 4 B 并**重新挂起**
             //     （`ld_req<=0` ⇒ 回到 pend 队列，下次发 `VA+4`）；第二拍响应才 `ld_dn`。
+            //   ★★ N12B-cross：同一套两拍流程现在也服务「跨 4 B 字的 ≤4 B 非对齐 load」
+            //     （判据 `ld_2b = ld_hi | ld_xw`）—— 首拍锁存的 `wb_merge` 即该 load 的
+            //     **对齐字 A** 逐字节合并结果，次拍 `wb_merge` 即**对齐字 A+4**，组装见 §写回段。
             if (rsp_ok) begin
-                if (ld_hi[rsp_sel] & ~ld_beat[rsp_sel]) begin
+                if (ld_2b[rsp_sel] & ~ld_beat[rsp_sel]) begin
                     ld_req [rsp_sel] <= 1'b0;
                     ld_beat[rsp_sel] <= 1'b1;
                     ld_lo  [rsp_sel] <= wb_merge;
@@ -1265,6 +1315,7 @@ module lsq_simple #(
                     ld_hi [si] <= 1'b0;
                     ld_beat[si] <= 1'b0;
                     ld_mis[si] <= 1'b0;
+                    ld_xw [si] <= 1'b0;
                     ld_lo [si] <= 32'h0;
                 end
             end

@@ -20,11 +20,16 @@
 //   · 覆盖设计：LB/LBU（a2=0..3）、LH/LHU（a2=0..3）、LW（a2=0..3）、FLW（a2=0..3）、
 //     FLD（a2=0，两半组装）、以及**非对齐 + 部分转发合并**（LH@+1 只被 1 条 SB 覆盖，
 //     另一字节来自访存响应）——后者同时验证 memory 路径的同一右移口径。
+//   · ★★ N12B-cross（2026-10-01）新增覆盖：**≤4 B 非对齐且跨 4 B 对齐字边界**、
+//     且跨字字节**需访存提供**的形态（LW@+1/+2/+3、LH/LHU@+3、FLW@+1；覆盖掩码
+//     含"只覆盖首字节""只覆盖跨字字节""中间空洞""完全无 store"）——L1D 只回一个
+//     `VA&~3` 对齐字，修法是复用 8 B 的**两拍**（首拍 VA、次拍 VA+4）拼 64 bit 窗口
+//     后与转发同口径右移 a2 取数。判据 C 对这种形态断言 **恰好 2 笔**访存请求。
 //
 // 判据（全部 fail-closed；任一不满足 ⇒ $fatal，**绝不**打印 PASS 锚点）：
 //   A 写回在有限拍内到达、且不得报数据侧异常
 //   B 转发布局口径：`lmask_w8` == ((1<<size)-1)<<a2、全转发场景 `fwd_all_w` == 1
-//   C 全转发场景：载入访存请求数 == 0；部分转发场景：>= 1
+//   C 全转发场景：载入访存请求数 == 0；非跨字部分转发：>= 1；**跨 4 B 字**：== 2
 //   D `wb_data` == 参考值（逐位）；8 B：`wb_data_hi`/`wb_f64` 同判
 //   E 目的寄存器方向正确（整数 load ⇒ wb_dst_i、FP load ⇒ wb_dst_f）
 //   F 每个场景结束 STQ/LQ/CDQ 全空（槽回收正确）
@@ -473,6 +478,77 @@ module n12b_unalign_fwd_top;
         end
     endtask
 
+    //   非对齐 + **跨 4 B 对齐字边界**的 ≤4 B load（N12B-cross 修复点）：
+    //   `covmask` 的 bit i = load 字节 i 被一条更老 SB 覆盖，其余字节**必须由访存提供**。
+    //   跨字 ⇒ 对齐字 A（道 0..3）与对齐字 A+4（道 4..7）各需一笔 ⇒ **两拍访存**
+    //   （`exp_req` = 2）。参考模型 = 逐字节「被覆盖 ⇒ SB 数据；否则 ⇒ 内存像字节」。
+    task automatic run_cross(input integer id, input [2:0] sz, input [1:0] off,
+                             input uns, input fp, input [7:0] covmask,
+                             input integer exp_req, input string nm);
+        integer i, nsize, nst;
+        reg [LQ_IW-1:0] lslot;
+        reg ok, got_wb, got_exc;
+        reg [7:0]  bb [0:7];
+        reg [31:0] a_i, elo;
+        reg [15:0] hh;
+        begin
+            m_base = 32'h8000_2000 + (id << 5);
+            nsize  = 1 << sz;
+            for (i = 0; i < 8; i = i + 1) cb[i] = 8'h90 | i[7:0];   // SB 数据（高位恒 1）
+            // ---- 独立参考：逐字节 ----
+            for (i = 0; i < nsize; i = i + 1) begin
+                a_i  = m_base + {30'b0, off} + i[31:0];
+                bb[i] = covmask[i] ? cb[i] : memimg[a_i[11:0]];
+            end
+            elo = 32'h0; hh = 16'h0;
+            case (sz)
+                3'd0: elo = uns ? {24'h0, bb[0]} : {{24{bb[0][7]}}, bb[0]};
+                3'd1: begin hh  = {bb[1], bb[0]};
+                            elo = uns ? {16'h0, hh} : {{16{hh[15]}}, hh}; end
+                default: elo = {bb[3], bb[2], bb[1], bb[0]};
+            endcase
+            // ---- 更老 store：每个被覆盖字节一条 SB ----
+            nst = 0;
+            for (i = 0; i < nsize; i = i + 1) begin
+                if (covmask[i]) begin
+                    rob_wr = rob_wr + 1'b1;
+                    w_srob[nst] = rob_wr;
+                    alloc_st(w_srob[nst], w_sslot[nst], ok);
+                    if (!ok) ckfail({nm, "：store 分配失败"});
+                    st_e1(w_sslot[nst], w_srob[nst], m_base + {30'b0, off} + i[31:0],
+                          {24'h0, cb[i]}, 3'd0);
+                    nst = nst + 1;
+                end
+            end
+            // ---- load ----
+            rob_wr = rob_wr + 1'b1;
+            rob_load = rob_wr;
+            n_ldreq = 0;
+            ld_alloc(rob_load, lslot, ok);
+            if (!ok) ckfail({nm, "：LQ 分配失败"});
+            ld_e1(lslot, rob_load, m_base + {30'b0, off}, sz, uns, fp);
+            chk(obs_lmask === (((8'h01 << nsize) - 8'h01) << off),
+                {nm, "：lmask_w8 与 size/a2 口径不符"});
+            chk(obs_fwa === 1'b0, {nm, "：部分命中不得判全转发"});
+            wait_ld(rob_load, got_wb, got_exc);
+            chk(got_wb, {nm, "：load 未在限期内写回"});
+            chk(!got_exc, {nm, "：≤4 B 非对齐不得有数据侧异常（cause 4 只属 8 B）"});
+            chk(n_ldreq == exp_req,
+                {nm, "：跨 4 B 字边界应发两拍访存（对齐字 A 与 A+4）"});
+            chk(obs_lo === elo, {nm, "：wb_data 与逐字节参考不一致"});
+            if (fp) chk(obs_dstf === 1'b1, {nm, "：FP load 应写 FP 目的口"});
+            else    chk(obs_dsti === 1'b1, {nm, "：整数 load 应写整数目的口"});
+            // ---- 程序序提交 ----
+            for (i = 0; i < nst; i = i + 1) begin
+                cmt_store(w_sslot[i], w_srob[i], ok);
+                if (!ok) ckfail({nm, "：store 排空未被 CDQ 收下"});
+            end
+            cmt_load(rob_load);
+            wait_idle(ok);
+            if (!ok) ckfail({nm, "：场景结束 STQ/LQ/CDQ 未回空"});
+        end
+    endtask
+
     //==========================================================================
     // 6. 主流程
     //==========================================================================
@@ -514,6 +590,39 @@ module n12b_unalign_fwd_top;
         // ---- 非对齐 + 部分转发合并（LH@+1，1 条 SB；另一字节来自访存）----
         run_part(23, 1);
         run_part(24, 2);
+        // ---- ★★ 非对齐 **跨 4 B 对齐字边界** + 需访存（N12B-cross 修复点）----
+        //   covmask = 被更老 SB 覆盖的 load 字节集合；其余字节必须由访存提供。
+        //   · LW@+1/+2/+3、LH@+3、FLW@+1：部分覆盖 / 完全不覆盖（两拍取齐）
+        run_cross(25, 3'd2, 2'd1, 1'b0, 1'b0, 8'b0000_0001, 2,
+                  "case#25(LW@+1, 只覆盖字节0)");
+        run_cross(26, 3'd2, 2'd1, 1'b0, 1'b0, 8'b0000_0000, 2,
+                  "case#26(LW@+1, 无 store 全访存)");
+        run_cross(27, 3'd2, 2'd2, 1'b0, 1'b0, 8'b0000_0001, 2,
+                  "case#27(LW@+2, 只覆盖字节0)");
+        run_cross(28, 3'd2, 2'd2, 1'b0, 1'b0, 8'b0000_0000, 2,
+                  "case#28(LW@+2, 无 store 全访存)");
+        run_cross(29, 3'd2, 2'd3, 1'b0, 1'b0, 8'b0000_0001, 2,
+                  "case#29(LW@+3, 只覆盖字节0)");
+        run_cross(30, 3'd2, 2'd3, 1'b0, 1'b0, 8'b0000_0000, 2,
+                  "case#30(LW@+3, 无 store 全访存)");
+        run_cross(31, 3'd1, 2'd3, 1'b0, 1'b0, 8'b0000_0001, 2,
+                  "case#31(LH@+3, 有符号, 只覆盖字节0)");
+        run_cross(32, 3'd1, 2'd3, 1'b0, 1'b0, 8'b0000_0000, 2,
+                  "case#32(LH@+3, 有符号, 无 store)");
+        run_cross(33, 3'd1, 2'd3, 1'b1, 1'b0, 8'b0000_0000, 2,
+                  "case#33(LHU@+3, 无符号, 无 store)");
+        run_cross(34, 3'd2, 2'd1, 1'b0, 1'b1, 8'b0000_0000, 2,
+                  "case#34(FLW@+1, 无 store, FP 目的)");
+        //   **跨字那一笔的转发**：只覆盖字节 3（地址 base+4，属对齐字 A+4）
+        run_cross(35, 3'd2, 2'd1, 1'b0, 1'b0, 8'b0000_1000, 2,
+                  "case#35(LW@+1, 只覆盖跨字字节3)");
+        run_cross(36, 3'd2, 2'd2, 1'b0, 1'b0, 8'b0000_0011, 2,
+                  "case#36(LW@+2, 覆盖字节0-1)");
+        run_cross(37, 3'd1, 2'd3, 1'b0, 1'b0, 8'b0000_0010, 2,
+                  "case#37(LH@+3, 只覆盖跨字字节1)");
+        //   低字内**中间空洞**：字 A 的字节 2 来自访存、字节 3 属字 A+4 也来自访存
+        run_cross(38, 3'd2, 2'd1, 1'b0, 1'b0, 8'b0000_0101, 2,
+                  "case#38(LW@+1, 覆盖字节0/2, 中间空洞)");
 
         // ---- 汇总（fail-closed：0 失败才打印 PASS 锚点）----
         $display("== 检查项合计 %0d 项，失败 %0d 项", n_chk, n_fail);
