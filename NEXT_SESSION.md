@@ -76,6 +76,23 @@
 - **★新基线 = 179,949 LUT（133.69%）/ 71,884 FF。累计 366,483→179,949 = −50.9%。** 到 ≤80%（107,680）仍差 −72,269（−40.2%），结构性缺口依旧（4 发射是禁区）。
 - **后续候选（未派）**：type-specific IQ payload（1~4k）、delayed scoreboard wakeup（4~8k）、ROB 64→48（1~5k）、文档口径同步（NREG 96→64 等）。FP div/sqrt / SQ 32→16 / 检查点压缩已被容量数据否决。
 
+### 1.5.5 📋 交接存档点 #16（2026-10-07 用户令上下文压缩；当前进度全量落盘）
+
+- **★当前基线 = 147,472 LUT（109.56%）/ 68,142 FF / 40 RAMB36 / 10 RAMB18 / 23 DSP。累计 366,483→147,472 = −59.8%。HEAD `01594fa`，工作树干净。目标 ≤80%（107,680），仍差 −39,792（−27.0%）。**
+- **面积演进全史（commit 级，366,483→147,472）**：L1 −74,086 → ROB64 −36,052 → LQ16 −2,597 → flist_q −14,330 → C2 −8,420 → EXP-B(ROB typed 表) −6,807 → C1(IQ 载荷 304→40) −14,340 → C6(LSQ 转发) −8,879 → D1(rb 快照) −1,434 → C7(trq) −546 → C4+C9(RB/IW) −488 → C8(年龄) −425 → D2(nq) −874 → EXP-R1(RAT 快照) −3,536 → EXP-R3b(TRQ 单写) −2,479 → LQ16→8 −1,002 → NREG 96→64 −10,239 → N1(commit 4→2) −16,022 → flist_q 128→64 −2,093 → N4(PRF 写口 6→4) −3,171(脆弱) → N3(ROB 退休窗 8→2) −2,677 → LSQ age 8→6 −1,875 → N8(FPU add/mul 并入 FMA) −5,679 → N10(np_q 2W bank) −960。
+- **★关键教训（反复实证）**：①只有**删完整单元**（N8 FPU −5.7k）或**级联减宽**（NREG −10.2k、commit 4→2 −16k）给持久收益；②**写 mux 收窄 / 局部 <3k 的改动 net≈0 或脆弱**（N4 u_prf_i 自身 +2、N9-② CDQ 净 −349、N10 np_q 43% 被吞）；③"共享/时分复用"反涨（EXP-A collector +46k、EXP-C IQ 6→3 +2.3k、N7 SQ banking 只省 0.4%）；④全局重映射噪声 ~1.4k，局部 <200 LUT 会被吞成负值。
+- **★N11 面积归因（只读，`fpga/scratch/area_attrib_n11.md`，HEAD 当前）**：全核 147,472；**独立 LUT 23,627(14.9%) / 共享≥2 cone 134,540(84.9%) / 未归因 377(0.24%) ⇒ 84.9% LUT 在多结构 cone 交集，结构 LUT 数不可当可相减收益**（这是"局部省了全核没降"的根因）。当前真实量级：fwdp_data 已改名 **ld_hd=8,671**（非旧 14.2k）、FMA=6,149（fma_s 2,022+fma_d 4,127）、CVT=3,508、FP-DIV=3,956、np_q=7,684、PRF 读侧 13,720 LUT+8,448 MUXF。匿名>5k cone 1 个=6,524 LUT 100% u_ren_f。**下一个 10k+ 可动排序**：①存储包装 ~20.6k（u_iwmem 12,075+12RAMB36 纯组合 glue + XPM/bank 8,532，唯一 ≥10k 且不耦合 IPC/频率）②匿名云 16.1k ③PRF 读侧 13.7k ④ld_hd 8.7k ⑤d1_uop_q 8,249+nq 6,931 ⑥FSM 4,099 ⑦BPU lht_mem+lru_q 未映射 LUTRAM ⑧DEBUG 1,365(tie-off)。
+- **★当前计划（answer.md 最新版 §七，N11 已完，用户令：执行完 N12→N15，中途不询问）**：
+  - **N12**（LSQ 保守转发，answer.md §二，最值得先做）：先动态统计（older-store 候选数分布/单条完整覆盖比例/多 store 拼接比例/未定址 load 数），再 A/B 测"单条 store 完整覆盖才转发、其余等排空"——比 banking 更有结构差异；门槛=锁步+回归+memory stress 全绿 + 非对齐/跨 word/部分 mask 全过 + 全核净 LUT 下降 + C5 不跌。
+  - **N13**（FPU S/D 共享 + FMA/CVT round-pack 共享，answer.md §三）：A 仅共享控制/后处理（低风险）→ B 共享对齐/规格化（中）→ C 全合并 53bit（高）；每方案独立综合，FMA_d 仅 4.1k 单靠它补不满缺口，无收益就停。N13B=FMA 与 CVT 共享 round/pack（先定位公共逻辑）。
+  - **N14**（np_q 存储重构，answer.md §四）：先确定访问语义（每拍写几项/是否需任意异步读/哪些字段参与 wakeup vs 选中后），再试"选择元数据(FF/LUT) + 宽 payload(BRAM/reg)"分离；成功标准=全核净 LUT 降，不是 RAMB 增加。
+  - **N15**（PRF 读侧 + SQ 32→24，条件性）：仅当 N11 归因/动态数据支持才做；PRF 读侧必须固定 lane 路径不重做 EXP-A global collector；SQ 32→24 先加 sq_cnt 直方图/满阻塞统计。
+  - **Gate 门槛**：B1 147,472→<135,000（需一个大结构净收益）；B2→<120,000；B3→≤107,680。
+- **★用户口径（2026-10-04 拍板，最高优先级）**：4 发射 + chiplab/xc7a200t 是底线；前端 4 取指（hard）；后端至少 2 提交/拍（IPC≈2，hard）；**FU 数量/资源占用/时钟频率可改但需用户审阅**。
+- **判据口径（每次改动必过，母 Agent 复跑）**：tb_core_top_2b 219/219 + tb_back2_iq 151/151 + tb_back2_lockstep 57 项/提交 821/RENAME-CHK 0/FAIL 0 + regress 33/33；IPC=2.0 + C5 五档（0.3927/0.2472/0.1435/0.0847/0.0593，下限 0.30/0.19/0.1094/0.0625/0.0469）；综合 `RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_TAG=2b_<x> RV32_SYNTH_DIRECTIVE=RuntimeOptimized ./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667`（60MHz，每 tag 标注）。
+- **正确性收获（本阶段，比面积更重要）**：rename 回滚取点 pdi 撞车（51a06cf）、PRF busy 表 epoch 死锁（20da16e）、TRQ 三记账缺陷、LSQ 非对齐转发错字（dc36336）、FMUL 零符号（bf7b3e7）。div/sqrt 参数 RV32GC_FDIV/FSQRT_CYCLES=32 是死参数（实际 114 拍位串行），非面积杠杆，文档口径待澄清。
+- **遗留**：文档口径滞后（NREG 96→64/nq 49→37/RB 416→229/commit 4→2/FPU 6→2 算术单元）；动态探针 dyn_probe_r 需适配 EXP-R1 后 rename 接口；NREG=64 余量仅 6 号；时序 WNS≈−50ns 深度不收敛。
+
 ## 1.6 状态（M4 已收口；M5 上板待用户硬件参与）
 
 ## 2. 本会话关键裁决（2026-09-14，用户拍板）
