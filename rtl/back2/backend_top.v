@@ -536,6 +536,7 @@ module backend_top #(
     wire [11:0]      iwm_rbank;           // 各队列读请求的 bank（= rob 索引低 2 位；6×2bit）
     wire [5:0]       iwm_req;             // 发射读请求（未门控选择口 ∧ 基础就绪）
     wire [5:0]       iwm_gnt;             // 读口仲裁结果（固定优先级；每 bank ≤1）
+    wire [5:0]       iwm_gnt_raw;         // ★ EXP-N15：仲裁原始结果（未施加合并让位）
     wire [5:0]       iq_base_rdy;         // 各队列**基础**发射许可（不含读口仲裁）
     wire [6:0]  iq_iss_rob [0:5];
     wire [EW-1:0] iq_iss_ep [0:5];
@@ -555,9 +556,22 @@ module backend_top #(
     reg  [`BACK2_PRF_F_N-1:0] busy_f_nx;
 
     // PRF 端口
-    wire [15:0]     iprf_re;
-    wire [16*PW_I-1:0] iprf_ra;      // ★ B29：+1 路提交级 CSR 源读口
-    wire [16*32-1:0]   iprf_rd;
+    //   ★★ EXP-N15：**读口收窄 16→11（整数）/ 8→5（浮点）**，只做"固定 lane ↔ 固定口"的
+    //     **两两合并**（不引入能把任意 PRF 数据送任意执行槽的全局 crossbar；EXP-A 的
+    //     operand collector 已否，+46,479 LUT）：
+    //       · 整数口 2/3 = ALU1(L1) ∪ MDU(L3)   —— MDU 让位（`iwm_gnt[3] &= ~iwm_gnt[1]`）
+    //       · 整数口 7   = LSU 存数据(L4) ∪ FPU 整数源(L5) —— FPU 让位（`iwm_gnt[5] &= ~iwm_gnt[4]`）
+    //       · 原死口 13/14（整数，地址恒 0）与 6/7（浮点）一并从端口表去掉
+    //         （EXP-N1 已证综合会把这类死口的读 mux 整段裁掉；N15 直接在 RTL 收窄）。
+    //     让位规则保证共享同一口的两 lane **永不同拍发射** ⇒ 口地址 2:1 mux 的选中位
+    //     （`x_i2_v[3]` / `x_i2_v[5]`）与读回数据归属确定，无需任何额外数据 crossbar。
+    //     动态依据（19 程序 46k 拍：两组候选 lane 同拍发射 0 次）与代价量化见
+    //     `fpga/scratch/n15_prf_report.md`。
+    localparam integer NRD_I = 11;   // 整数读口数（原 16；现役口 0..10）
+    localparam integer NRD_F = 5;    // 浮点读口数（原 8；现役口 0..4）
+    wire [NRD_I-1:0]   iprf_re;
+    wire [NRD_I*PW_I-1:0] iprf_ra;   // ★ B29：+1 路提交级 CSR 源读口（N15 后 = 口 NRD_I-1）
+    wire [NRD_I*32-1:0]   iprf_rd;
     wire [5:0]      iprf_we;
     wire [6*PW_I-1:0]  iprf_wa;
     wire [6*32-1:0]    iprf_wd;
@@ -569,9 +583,9 @@ module backend_top #(
     wire [4*PW_I-1:0] iprf_p4_wa;
     wire [4*32-1:0]   iprf_p4_wd;
     wire [4*EW-1:0]   iprf_p4_ep;
-    wire [7:0]      fprf_re;
-    wire [8*PW_F-1:0]  fprf_ra;
-    wire [8*64-1:0]    fprf_rd;
+    wire [NRD_F-1:0]  fprf_re;
+    wire [NRD_F*PW_F-1:0]  fprf_ra;
+    wire [NRD_F*64-1:0]    fprf_rd;
     wire [1:0]      fprf_we;
     wire [2*PW_F-1:0]  fprf_wa;
     wire [2*64-1:0]    fprf_wd;
@@ -1428,7 +1442,18 @@ module backend_top #(
             iwm_arb = g;
         end
     endfunction
-    assign iwm_gnt = iwm_arb(iwm_req, iwm_rbank);
+    assign iwm_gnt_raw = iwm_arb(iwm_req, iwm_rbank);
+    //   ★★ EXP-N15：**读口合并的让位规则（唯一新增判据）**。`iwm_gnt_raw` 仍只是
+    //     "未门控选择口 ∧ 基础就绪"的纯函数 ⇒ 本让位**不构成组合环**（`iss_ready` ⊃ `iwm_gnt`，
+    //     而 `iwm_gnt` 不反过来影响 `iwm_req`）。让位的 lane 当拍不出队、下一拍重试；
+    //     优先级沿用在飞项数与发射率决定的既有次序（ALU1 > MDU、LSU > FPU）。
+    //       · MDU(L3) 让 ALU1(L1)：口 2/3 共享；
+    //       · FPU(L5) 让 LSU(L4)：口 7（LSU 存数据 ∪ FPU 整数源）与浮点口 2（FPU c ∪ LSU fpsrc）共享。
+    //     效果 = "共享同口的两个 lane 永不同拍发射"（口地址 2:1 mux 因此无需数据 crossbar）。
+    assign iwm_gnt[3]   = iwm_gnt_raw[3] & ~iwm_gnt_raw[1];
+    assign iwm_gnt[5]   = iwm_gnt_raw[5] & ~iwm_gnt_raw[4];
+    assign iwm_gnt[4]   = iwm_gnt_raw[4];
+    assign iwm_gnt[2:0] = iwm_gnt_raw[2:0];
 
     //   bank 级读命令与数据归属：每个 bank 的获准队列（唯一）+ 它的 rob 索引 [5:2]
     genvar gb_iwm;
@@ -1565,7 +1590,7 @@ module backend_top #(
     //   ★★ 2B-4 修复（锁步 p5_mdu 暴露）：`start` 必须取 **E1 有效**（`x_i2_v[3]`），
     //     不能取 **发射拍**（`iq_iss_v[3]`）——mdu.v/fpu.v 的端口契约是
     //     "`start`/`req_valid` 与操作数在**同一拍**被采样"（2A 侧即 `e_mdu_go`/`e_fp_go`
-    //     与 `e_rs1_byp`/`e_fp_src*` 同拍）。而本后端的操作数走 **E1**（`iprf_ra[6..10]`
+    //     与 `e_rs1_byp`/`e_fp_src*` 同拍）。而本后端的操作数走 **E1**（`iprf_ra[0..7]`
     //     = `w_ps1i(x_i2_uop[3/5])`，见 §PRF 读口），发射拍的操作数尚不在 `x_i2_*` 里
     //     ⇒ 旧接法把"发射拍"当启动、却把"上一拍的 x_i2 内容"当操作数：
     //     该 FP/MDU 指令**永远不启动** ⇒ `done` 不来 ⇒ `fpu_if_v/mdu_if_v` 恒 1
@@ -1592,7 +1617,7 @@ module backend_top #(
     wire [4:0] mdu_brop = w_brop(x_i2_uop[3]);
     mdu u_mdu (.aclk(clk), .aresetn(rst_n), .start(mdu_go), .flush(mdu_kill),
                .mdu_op(mdu_brop[2:0]),
-               .a(iprf_rd[6*32 +: 32]), .b(iprf_rd[7*32 +: 32]),
+               .a(iprf_rd[2*32 +: 32]), .b(iprf_rd[3*32 +: 32]),
                .busy(mdu_busy), .done(mdu_done), .result(mdu_result));
 
     // FPU（至多 1 条在飞）
@@ -1600,7 +1625,7 @@ module backend_top #(
     wire [63:0] fpu_result;
     wire [4:0]  fpu_ff;
     wire [63:0] fpu_a = w_s1f(x_i2_uop[5]) ? fprf_rd[0*64 +: 64]
-                                            : {32'hFFFF_FFFF, iprf_rd[10*32 +: 32]};
+                                            : {32'hFFFF_FFFF, iprf_rd[7*32 +: 32]};
     fpu u_fpu (
         .clk(clk), .rst_n(rst_n), .flush(fpu_kill),
         //   ★★ 2B-4 同上：`req_valid` 取 **E1 有效**（与 `.a/.b/.c` 同拍）
@@ -1629,10 +1654,10 @@ module backend_top #(
     wire [6:0]  lsu_exc_rob;
     wire [3:0]  lsu_exc_cause;
     wire [31:0] lsu_exc_tval;
-    wire [31:0] lsu_addr = iprf_rd[8*32 +: 32] + w_imm(x_i2_uop[4]);
-    wire [63:0] lsu_fpsrc = fprf_rd[3*64 +: 64];
+    wire [31:0] lsu_addr = iprf_rd[6*32 +: 32] + w_imm(x_i2_uop[4]);   // ★ EXP-N15：LSU 地址口 8→6
+    wire [63:0] lsu_fpsrc = fprf_rd[2*64 +: 64];
     wire [31:0] lsu_wdata = (w_fpls(x_i2_uop[4]) & w_is_st(x_i2_uop[4])) ?
-                            lsu_fpsrc[31:0] : iprf_rd[9*32 +: 32];
+                            lsu_fpsrc[31:0] : iprf_rd[7*32 +: 32];
     //   ★★ 4c(3/3)：FP store 的**高 4 B**（fsd 的 64 bit 数据上半）；非 FP store 恒 0
     wire [31:0] lsu_wdata_hi = (w_fpls(x_i2_uop[4]) & w_is_st(x_i2_uop[4])) ?
                                lsu_fpsrc[63:32] : 32'h0;
@@ -1883,9 +1908,9 @@ module backend_top #(
         assign commit_pc_o[cc*32 +: 32] = p_pc(p);
         assign commit_arch_rd_o[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
         assign commit_arch_we_o[cc] = pn[`BACK2_NQ_DI] | pn[`BACK2_NQ_DF];
-        wire [63:0] cval_f = fprf_rd[(4+cc)*64 +: 64];
+        wire [63:0] cval_f = fprf_rd[(NRD_F-2+cc)*64 +: 64];
         assign commit_arch_rd_wdata_o[cc*32 +: 32] =
-            pn[`BACK2_NQ_DI] ? iprf_rd[(11+cc)*32 +: 32] :
+            pn[`BACK2_NQ_DI] ? iprf_rd[(NRD_I-3+cc)*32 +: 32] :
             pn[`BACK2_NQ_DF] ? cval_f[31:0] : 32'h0;
         assign cmt_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DI];
         assign cmt_i_arn[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
@@ -2076,10 +2101,10 @@ module backend_top #(
     //   ★★ EXP-B：PS1I 的**载体**由 `updq.CSRW`（102 bit 表里那 32 bit）改为**载荷 uop.PS1I**
     //     —— rob 的 `csr_pay` 的 `csrw` 段现在直接由窗口读回的载荷 PS1I 拼出（见 rob.v §4），
     //     故这里 `csr_cmt_ps1i` 的取值口径**逐位不变**（仍是 PW_I 位物理号）。
-    wire [31:0] csr_cmt_src = iprf_rd[15*32 +: 32];
+    wire [31:0] csr_cmt_src = iprf_rd[(NRD_I-1)*32 +: 32];
     //   ★ 4b-1：端口 15 的读地址取**该 CSR 指令自己**的 ps1i（4a 曾固定用 lane 0 的载荷
     //     ⇒ CSR 指令不在 lane 0 时会读到无关寄存器；与 B29 同类，一并清掉）
-    assign iprf_ra[15*PW_I +: PW_I] = csr_cmt_ps1i;
+    assign iprf_ra[(NRD_I-1)*PW_I +: PW_I] = csr_cmt_ps1i;
     wire [31:0] csr_cmt_src_sel = csr_cmt_we ? csr_cmt_src : csr_cmt_src;   // 占位保持可读性
     assign csr_raddr_w = csr_cmt_we ? csr_cmt_addr : w_csra(csr_uop);
 
@@ -2097,7 +2122,7 @@ module backend_top #(
             //   ★ C9：CSROP 已不存于发射载荷（提交级操作码走 ROB 载荷 `csr_pay`）
             //     ⇒ 本行只打发射侧的 PS1I。
             $display("[csr-r t=%0t] ra15=%0d rd15=0x%08x ps1i=%0d",
-                     $time, iprf_ra[15*PW_I +: PW_I], csr_cmt_src, csr_cmt_ps1i);
+                     $time, iprf_ra[(NRD_I-1)*PW_I +: PW_I], csr_cmt_src, csr_cmt_ps1i);
         if (DBG_CSR && rst_n && csr_v_w)
             $display("[csr-uop t=%0t] lane=%0d ps1i=%0d s1i=%b imm=0x%08x | rdata=0x%08x",
                      $time, csr_lane, w_ps1i(csr_uop), w_s1i(csr_uop), w_imm(csr_uop),
@@ -2150,32 +2175,26 @@ module backend_top #(
     );
 
     //==========================================================================
-    // 10. PRF（整数 15 读 6 写 / 浮点 8 读 2 写）
+    // 10. PRF（整数 NRD_I=11 读 4 写 / 浮点 NRD_F=5 读 2 写）—— EXP-N15 收窄
     //==========================================================================
-    assign iprf_re = 16'hFFFF;
-    assign iprf_ra[0*PW_I +: PW_I]  = w_ps1i(x_i2_uop[0]);
-    assign iprf_ra[1*PW_I +: PW_I]  = w_ps2i(x_i2_uop[0]);
-    assign iprf_ra[2*PW_I +: PW_I]  = w_ps1i(x_i2_uop[1]);
-    assign iprf_ra[3*PW_I +: PW_I]  = w_ps2i(x_i2_uop[1]);
-    assign iprf_ra[4*PW_I +: PW_I]  = w_ps1i(x_i2_uop[2]);
-    assign iprf_ra[5*PW_I +: PW_I]  = w_ps2i(x_i2_uop[2]);
-    assign iprf_ra[6*PW_I +: PW_I]  = w_ps1i(x_i2_uop[3]);
-    assign iprf_ra[7*PW_I +: PW_I]  = w_ps2i(x_i2_uop[3]);
-    assign iprf_ra[8*PW_I +: PW_I]  = w_ps1i(x_i2_uop[4]);
-    assign iprf_ra[9*PW_I +: PW_I]  = w_ps2i(x_i2_uop[4]);
-    assign iprf_ra[10*PW_I +: PW_I] = w_ps1i(x_i2_uop[5]);
-    //   ★★ EXP-N1：提交 PRF 读口按 **COMMIT_W** 展开（提交 4→2 ⇒ 只用 11/12 与 4/5 两口）。
-    //     端口 13/14（整数）与 6/7（浮点）在本任务**不接提交数据**（地址恒 0、输出不被读）
-    //     ⇒ 综合可把这两路的读 mux 整段裁掉（`prf.v` 不在本任务改动范围，故不改其端口表）。
+    assign iprf_re = {NRD_I{1'b1}};
+    assign iprf_ra[0*PW_I +: PW_I]  = w_ps1i(x_i2_uop[0]);          // ALU0 s1
+    assign iprf_ra[1*PW_I +: PW_I]  = w_ps2i(x_i2_uop[0]);          // ALU0 s2
+    //   ★ EXP-N15：口 2/3 = ALU1 ∪ MDU（MDU 让位，见 §5.5 `iwm_gnt[3]`）
+    assign iprf_ra[2*PW_I +: PW_I]  = x_i2_v[3] ? w_ps1i(x_i2_uop[3]) : w_ps1i(x_i2_uop[1]);
+    assign iprf_ra[3*PW_I +: PW_I]  = x_i2_v[3] ? w_ps2i(x_i2_uop[3]) : w_ps2i(x_i2_uop[1]);
+    assign iprf_ra[4*PW_I +: PW_I]  = w_ps1i(x_i2_uop[2]);          // BRU s1
+    assign iprf_ra[5*PW_I +: PW_I]  = w_ps2i(x_i2_uop[2]);          // BRU s2
+    assign iprf_ra[6*PW_I +: PW_I]  = w_ps1i(x_i2_uop[4]);          // LSU 地址
+    //   ★ EXP-N15：口 7 = LSU 存数据 ∪ FPU 整数源（FPU 让位，见 §5.5 `iwm_gnt[5]`）
+    assign iprf_ra[7*PW_I +: PW_I]  = x_i2_v[5] ? w_ps1i(x_i2_uop[5]) : w_ps2i(x_i2_uop[4]);
+    //   ★ EXP-N15：提交级读口按 **COMMIT_W** 展开（提交 4→2 ⇒ 口 8/9 与 3/4）；
+    //     原"口 13/14、6/7 恒 0 死口"已从端口表删除（综合本已裁掉其读 mux）。
     genvar gcr;
     generate
     for (gcr = 0; gcr < COMMIT_W; gcr = gcr + 1) begin : g_cmtrd
-        assign iprf_ra[(11+gcr)*PW_I +: PW_I] = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
-        assign fprf_ra[(4+gcr)*PW_F +: PW_F]  = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
-    end
-    for (gcr = COMMIT_W; gcr < DISP_W; gcr = gcr + 1) begin : g_cmtrdoff
-        assign iprf_ra[(11+gcr)*PW_I +: PW_I] = {PW_I{1'b0}};
-        assign fprf_ra[(4+gcr)*PW_F +: PW_F]  = {PW_F{1'b0}};
+        assign iprf_ra[(NRD_I-3+gcr)*PW_I +: PW_I] = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
+        assign fprf_ra[(NRD_F-2+gcr)*PW_F +: PW_F] = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
     end
     endgenerate
     //   ★ PRF 写口判据 = "写回所属 ROB 项仍在 ROB 窗口内"（不能用 epoch，理由见 prf.v）
@@ -2213,7 +2232,7 @@ module backend_top #(
     assign iprf_p4_ep[2*EW +: EW] = iprf_we_ep[2*EW +: EW];
     assign iprf_p4_ep[3*EW +: EW] = iprf_we_ep[iprf_p3_src*EW +: EW];
 
-    prf #(.NW(4), .NRD(16), .NREG(`BACK2_PRF_I_N), .PDW(PW_I), .DW(32)) u_prf_i (
+    prf #(.NW(4), .NRD(NRD_I), .NREG(`BACK2_PRF_I_N), .PDW(PW_I), .DW(32)) u_prf_i (
         .clk(clk), .rst_n(rst_n),
         .we(iprf_p4_we), .waddr(iprf_p4_wa), .wdata(iprf_p4_wd), .wepoch(iprf_p4_ep),
         .epoch(epoch_w),
@@ -2221,12 +2240,12 @@ module backend_top #(
         .re(iprf_re), .raddr(iprf_ra), .rdata(iprf_rd)
     );
 
-    assign fprf_re = 8'hFF;
-    //   ★★ EXP-N1：浮点提交读口同样只接 COMMIT_W 个（见上面整数侧说明）。
-    assign fprf_ra[0*PW_F +: PW_F] = w_ps1f(x_i2_uop[5]);
-    assign fprf_ra[1*PW_F +: PW_F] = w_ps2f(x_i2_uop[5]);
-    assign fprf_ra[2*PW_F +: PW_F] = w_ps3f(x_i2_uop[5]);
-    assign fprf_ra[3*PW_F +: PW_F] = w_ps2f(x_i2_uop[4]);
+    assign fprf_re = {NRD_F{1'b1}};
+    //   ★★ EXP-N1/N15：浮点提交读口同样只接 COMMIT_W 个（见上面整数侧说明）。
+    assign fprf_ra[0*PW_F +: PW_F] = w_ps1f(x_i2_uop[5]);          // FPU a
+    assign fprf_ra[1*PW_F +: PW_F] = w_ps2f(x_i2_uop[5]);          // FPU b
+    //   ★ EXP-N15：浮点口 2 = FPU c（FMA 加数）∪ LSU 浮点存数据（FPU 让位，见 §5.5）
+    assign fprf_ra[2*PW_F +: PW_F] = x_i2_v[4] ? w_ps2f(x_i2_uop[4]) : w_ps3f(x_i2_uop[5]);
     assign fprf_we    = { (fpu_wb_v & fpu_wb_f & ({1'b0,(fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)),
                           (lsu_wb_v & lsu_wb_f & ({1'b0,(lsu_wb_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w)) };
     assign fprf_wa    = { fpu_if_pdf, lsu_wb_pdf };
@@ -2237,7 +2256,7 @@ module backend_top #(
                                                   : {32'hFFFF_FFFF, lsu_wb_data} };
     assign fprf_we_ep = { fpu_if_ep, lsu_wb_ep };
 
-    prf #(.NW(2), .NRD(8), .NREG(`BACK2_PRF_F_N), .PDW(PW_F), .DW(64)) u_prf_f (
+    prf #(.NW(2), .NRD(NRD_F), .NREG(`BACK2_PRF_F_N), .PDW(PW_F), .DW(64)) u_prf_f (
         .clk(clk), .rst_n(rst_n),
         .we(fprf_we), .waddr(fprf_wa), .wdata(fprf_wd), .wepoch(fprf_we_ep), .epoch(epoch_w),
         .wkeep({(fpu_wb_v & fpu_wb_f) ? ({1'b0,(fpu_if_rob[ROBW-1:0] - rob_head_w[ROBW-1:0])} < rob_cnt_w) : 1'b0,
