@@ -411,7 +411,8 @@ module lsq_simple #(
     //     口径统一为「**窗口位置 = 本访问的字节序号 i**」——
     //       · 字节 i 的地址 = exe_addr + i，其字数 = w0 + ((a+i)>>2)、字内道 = (a+i)&3，
     //         其中 a = exe_addr[1:0]、w0 = exe_addr[31:2]（见下面 `gsum_w = gb` 的推导）；
-    //       · 写回取数走 `ext_load(fwdp_data[31:0], fwdp_off=exe_addr[1:0], size, unsign)`
+    //       · 写回取数走 `ext_load(窗口 >> 8*a, size, unsign)`（`a = exe_addr[1:0]`，
+    //         N12-fix 后移位在调用点做，见 §写回段的 `fwdp_wsh`/`wbw_sh`）
     //         ⇒ 转发布局必须是「低字 = 含首字节的字 w0（字节 i 落在道 a+i）」，因此
     //         **掩码必须按 exe_addr[1:0] 移位**（原来按 exe_addr[2:0] 移位 ⇒ 对
     //         A[2:0]≠0 的访问把窗口整体平移了半个 8 B 窗）。
@@ -889,12 +890,23 @@ module lsq_simple #(
                              hm_beat[2] ? hd_beat[23:16] : wb_word[23:16],
                              hm_beat[1] ? hd_beat[15:8]  : wb_word[15:8],
                              hm_beat[0] ? hd_beat[7:0]   : wb_word[7:0] };
-    function [31:0] ext_load(input [31:0] w, input [1:0] off, input [2:0] sz, input uns);
+    //   ★★ N12-fix（2026-10-01，EXP-N12-STRESS §8.1 定位的非对齐全转发缺陷）：
+    //     本函数的入参口径 = **「本次访问的字节 0 已对齐到 bit0」的 32 bit 窗口**
+    //     （调用点在下方 `fwdp_wsh` / `wbw_sh` 两处**各自先右移 a2 字节**）。
+    //     · 转发路径：8 B 转发窗口的道号 = 对齐字内字节序号（byte i 落在道 a2+i，
+    //       见 §2.2/§2.3 的 `gb` 推导）；4 B 访问在 a2≠0 时跨越窗口低 32 bit ⇒
+    //       必须从**完整 64 bit** `fwdp_data` 取数（旧实现只传 `fwdp_data[31:0]`）。
+    //     · memory 路径：L1D 返回 `VA&~3` 的**对齐字**（响应不做字节旋转，
+    //       `l1d.v:409 cs_rdata = hit_data_sel`）⇒ 同样先右移 a2 再取。
+    //     · 对齐场景（a2=0）两条路径都退化为旧语义（逐位不变）；修复点只在 a2≠0：
+    //       旧实现 `sz≥2` 原样返回 w（少右移 a2 字节）、`sz=1` 只用 `off[1]` 二选半字
+    //       （a2∈{1,3} 取错半字）—— 与"窗口位置 = 字节序号"的转发布局自相矛盾。
+    function [31:0] ext_load(input [31:0] w, input [2:0] sz, input uns);
         reg [7:0]  b0;
         reg [15:0] h0;
         begin
-            b0 = w[8*off +: 8];
-            h0 = (off[1] == 1'b0) ? w[15:0] : w[31:16];
+            b0 = w[7:0];
+            h0 = w[15:0];
             //   ★ 同 §2.2：`sz` 是 log2(字节数) ⇒ 0=字节、1=半字、≥2=字（8 B 属 2B-3）
             case (sz)
                 3'd0: ext_load = uns ? {24'h0, b0} : {{24{b0[7]}}, b0};
@@ -964,11 +976,19 @@ module lsq_simple #(
     assign wb_pdest_f = fwdp_v ? fwdp_pf   : (mis_v ? {PDW_F{1'b0}} : ld_pf[rsp_sel]);
     //   ★★ 4c(3/3)：8 B 装载 = `{高 4 B 合并值, 首拍锁存的低 4 B}`；ISA 口径 **FLD 不做
     //     NaN-box**（后端据此写满 FLEN）。≤4 B 保持原 `ext_load` 语义 ⇒ 零回归。
-    assign wb_data    = fwdp_v ? ext_load(fwdp_data[31:0], fwdp_off, fwdp_size, fwdp_uns)
+    //   ★★ N12-fix：两条取数路径都先把窗口**右移 a2 字节**（本次访问的字节 0 落到 bit0）：
+    //     · 转发：`fwdp_data` 是 **64 bit** 转发窗口 ⇒ 4 B 访问 a2≠0 时跨低 32 bit 的字节
+    //       也能取到（旧实现只喂 `fwdp_data[31:0]` ⇒ 跨道字节丢失，写回值整体错位）；
+    //     · memory：`wb_merge` 是「`VA&~3` 对齐字」逐字节合并结果 ⇒ 同口径右移。
+    //     8 B（fld）两半从**同一个**右移后窗口取（该路径 a2 恒 0：8 B 非对齐在 E1 即
+    //     `ld_mis`⇒cause 4，不参与转发）⇒ 高半与低半始终同源、不会各自错位。
+    wire [63:0] fwdp_wsh = fwdp_data >> {fwdp_off, 3'b000};
+    wire [31:0] wbw_sh   = wb_merge  >> {ld_addr[rsp_sel][1:0], 3'b000};
+    assign wb_data    = fwdp_v ? ext_load(fwdp_wsh[31:0], fwdp_size, fwdp_uns)
                                : (ld_hi[rsp_sel] ? ld_lo[rsp_sel]
-                                                 : ext_load(wb_merge, ld_addr[rsp_sel][1:0],
+                                                 : ext_load(wbw_sh,
                                                             ld_size[rsp_sel], ld_uns[rsp_sel]));
-    assign wb_data_hi = fwdp_v ? fwdp_data[63:32] : wb_merge;
+    assign wb_data_hi = fwdp_v ? fwdp_wsh[63:32] : wb_merge;
     assign wb_f64     = fwdp_v ? (fwdp_size == 3'd3) : ld_hi[rsp_sel];
 
     assign st_done_valid = exe_valid & exe_is_store;
