@@ -17,7 +17,8 @@
 //   │  0 FADD   1 FSUB   2 FMUL   3 FDIV   4 FSQRT                          │
 //   │ 26 FMADD 27 FMSUB 28 FNMSUB 29 FNMADD  ← 本文件定义的扩展编码（见 ★） │
 //   │ ★ N8（2026-10-08）：**0/1/2 不再有独立 datapath**，与 26–29 共用同一个 │
-//   │   FMA 单元（fpu_fma_s / fpu_fma_d）：见 §5 的恒等式与零符号处理。      │
+//   │   FMA 单元。★ N27B：该 FMA 单元本身也 S/D 合一（fpu_fma_shared）⇒        │
+//   │   S/D 只剩**一条**主算术通路：见 §5 的恒等式与零符号处理。             │
 //   ├─ 比较 / 符号注入 / 分类（例化 fpu_cmp.v）──────────────────────────────┤
 //   │  5 FSGNJ   6 FSGNJN  7 FSGNJX  8 FMIN   9 FMAX                        │
 //   │ 10 FEQ    11 FLT    12 FLE    13 FCLASS                              │
@@ -88,10 +89,10 @@
 //        检查 ⇒ 本文件给它们**原始**操作数（避免双重替换；fmv.x.w / fcvt.d.s
 //        的 D 侧必须见原始 64 位，见 fpu_cvt.v 头注 ④⑥）。
 //   ② **S 结果**写回 fregfile 的 64 位视图时高 32 位必须全 1（NaN-boxing）：
-//      本文件对 32 位宽的子单元输出（N8 起算术类只剩 fpu_fma_s 一路，
-//      fpu_div_sqrt 的 S 路径）统一补高 32 位 1；fpu_cmp/fpu_cvt 的 result
-//      已按其头注完成"整数目标高 32 位 0 / 浮点目标 S 补 1 / D 完整 64 位"，
-//      本文件原样透传、**不**再补。
+//      本文件对 32 位宽的子单元输出（fpu_div_sqrt 的 S 路径）补高 32 位 1；
+//      ★ N27B 起算术类的 S 打包改由 `fpu_fma_shared` **在核内**完成（它与 D 的
+//      完整 64 位同口输出），本文件原样透传；fpu_cmp/fpu_cvt 的 result 已按其
+//      头注完成"整数目标高 32 位 0 / 浮点目标 S 补 1 / D 完整 64 位"，本文件不再补。
 //   ③ 算术结果若为 NaN ⇒ canonical NaN（S: 0x7FC0_0000 / D: 0x7FF8_0000_0000_0000），
 //      由各子单元保证；含 sNaN ⇒ 同时置 NV。
 //   ④ rm 解析（**唯一一处**，与 fpu_cvt.v 的解析式逐位一致）：
@@ -207,8 +208,10 @@ module fpu #(
 
     // ---- T4：非 div/sqrt 类的统一潜伏期（拍）----
     //   ★ 必须与各子单元内部的 `localparam integer LAT` 一致：
-    //        fpu_fma_s/d（= N8 起 add/sub/mul/fma 共用）、fpu_cvt、fpu_cmp = 8
-    //        （fpu_add_s/d、fpu_mul_s/d 仍为 8，但 N8 起不再被本文件例化）
+    //        fpu_fma_shared（★ N27B：S/D 合一 = add/sub/mul/fma 共用）、
+    //        fpu_cvt、fpu_cmp = 8
+    //        （fpu_fma_s/fpu_fma_d、fpu_add_s/d、fpu_mul_s/d 仍为 8 级，但自
+    //          N8 / N27B 起不再被本文件例化 —— 它们保留为逐位金标）
     //   口径：req_valid 在 E0 拍被采样 ⇒ result/fflags 在 E0+8 拍组合有效、
     //         done 在 E0+8 拍为 1（见头注 §2）。
     localparam integer FPU_SC_LAT = 8;
@@ -331,6 +334,30 @@ module fpu #(
     //     冻结树」与「改动后树」上各跑一遍，逐拍比对 busy/done/result/fflags
     //     全等（见交付报告的 n8 证据链）。
     //--------------------------------------------------------------------------
+    //------------------------------------------------------------------------------
+    // ★★★ N27B（2026-10-14）—— **S/D 共用同一条 53-bit 主算术核**（EXP-N27A 报
+    //   告 fpga/scratch/n27a_report.md 的实测落地）：
+    //   · 用 `fpu_fma_shared`（rtl/exec/fpu_fma_shared.v，N27A 探针的逐字搬运件）
+    //     **取代**下面原先并列的 `fpu_fma_s` / `fpu_fma_d` 两个实例；
+    //   · 精度模式由 `is_s = en_fma & ~is_d` 随 8 级流水携带（级 1 起与数据同深）；
+    //     操作数路由由原先的"两套 S/D mux"合并为**单套** `is_d` 选择的 `b3`/`c3`；
+    //   · `fpu_fma_s` / `fpu_fma_d` 的模块体**保留在 rtl/exec/fpu_add.v 内但不再被
+    //     例化**（沿用 N8 对 fpu_add_s/d、fpu_mul_s/d 的惯例：金标 + 差分对照；
+    //     无实例 ⇒ 综合自动剔除其全部 LUT/DSP）；
+    //   · 出口打包：共享核内部已按 `is_s` 完成"S 结果高 32 位全 1（NaN-box）/ D 结果
+    //     完整 64 位"的打包 ⇒ §8 的 `out_is_d ? … : {BOX_HI, …}` 模式 mux 与
+    //     §7.5 仅供该 mux 使用的 `sc_fmt` 元数据链（2 bit × 8 级）一并删除；
+    //   · **时序/握手不变**：共享核仍与本文件被替换的两条通路同为 LAT=8 ⇒
+    //     `FPU_SC_LAT = 8`、busy/done/fflags_we 逐拍不变 ⇒ **IPC 影响 = 0**；
+    //   · 语义前提不变：FADD/FSUB/FMUL 仍并入这条 FMA 通路（见上面 N8 头注的
+    //     三个恒等式），本改动只合并"算 S 还是算 D 的哪条硬件"，不改任何算式。
+    //   ★ 位级等价证据（不是论证而是实测，三条互不替代）：
+    //     ① 模块级 80,000 向量（共享核 ↔ 原生 fpu_fma_s/fpu_fma_d）0 失配
+    //        —— `bash fpga/scratch/n27b_equiv_run.sh`（4 种子 × 20,000）；
+    //     ② 双模舍入器 12,000 向量（↔ 原生 S/D fpu_round_pipe）0 失配
+    //        —— `bash fpga/scratch/n27b_round_run.sh`；
+    //     ③ 本文件**顶层**同树逐拍差分（改动前冻结树 vs 改动后工作树，逐字节比较
+    //        busy/done/result/fflags）—— `bash fpga/scratch/n27b_diff_run.sh`。
     // ★ 仿真吞吐优化（2026-09-17，**语义逐位不变**，只为让 arch-test F 组在
     //   run.sh 的超时内跑完）：**未选中子单元的操作数输入钳到 0**。
     //   若照常把 fregfile 的操作数接到所有子单元，iverilog 每拍都要重算全部单元
@@ -350,12 +377,14 @@ module fpu #(
     //==========================================================================
     wire       sc_gate  = disp_any;                      // 本拍有一条指令被本模块接收
     wire       arith_go = op_addsub | op_mul | op_fma;   // 走 FMA 单元的三类算术
-    wire       en_fma_s = arith_go & ~is_d & sc_gate;
-    wire       en_fma_d = arith_go &  is_d & sc_gate;
+    //   ★ N27B：S/D 共用**同一个实例** ⇒ 原来的 en_fma_s / en_fma_d 合并为一个
+    //     `en_fma`。钳零语义与 T4 补充说明逐字相同（只有真正被接收的那一拍输入
+    //     才非零），它是仿真吞吐优化，**不改变任何位级语义**。
+    wire       en_fma   = arith_go & sc_gate;
     wire       en_cmp   =  op_cmp & sc_gate;
     wire       en_cvt   =  op_cvt & sc_gate;
 
-    // ---- FMA 单元的三操作数路由（S/D 各一份常量；S 的 +1.0 已 NaN-box）----
+    // ---- FMA 单元的三操作数路由（★ N27B：S/D 合并为**单套** mux，按 is_d 选模式）----
     localparam [63:0] ONE_S  = {BOX_HI, 32'h3F80_0000};   // +1.0（S）
     localparam [63:0] ONE_D  = 64'h3FF0_0000_0000_0000;   // +1.0（D）
 
@@ -364,44 +393,45 @@ module fpu #(
     // 时按 canonical NaN 处理，其结果本就是 NaN，符号无关）
     wire       mul_zs = is_d ? (a[63] ^ b[63]) : (a_ar[31] ^ b_ar[31]);
 
-    wire [63:0] b3_s = op_addsub ? ONE_S : b_ar;          // 乘数：add/sub 用 1.0
-    wire [63:0] c3_s = op_fma ? c_ar :
-                       op_mul ? {32'b0, mul_zs, 31'b0} :  // FMUL：c = ±0（符号=积符号）
-                                b_ar;                      // FADD/FSUB：加数 = rs2
-    wire [63:0] b3_d = op_addsub ? ONE_D : b;
-    wire [63:0] c3_d = op_fma ? c_ar :
-                       op_mul ? {mul_zs, 63'b0} :
-                                b;
+    // 乘数 b3：add/sub 用 +1.0（S 版已 NaN-box），其余用 rs2（S 走 box_chk 后的
+    // a_ar 族）。与 N8 前的 b3_s/b3_d 逐位同义，只是把两份 mux 合成一份。
+    wire [63:0] b3 = op_addsub ? (is_d ? ONE_D : ONE_S) : (is_d ? b    : b_ar);
+    // 加数 c3：FMA 用 rs3；FMUL 用 ±0（符号 = 积符号，见 N8 头注 ③）；
+    //          FADD/FSUB 用 rs2。S/D 只在"±0 落在哪一位"上不同。
+    wire [63:0] c3 = op_fma ? c_ar :
+                     op_mul ? (is_d ? {mul_zs, 63'b0}           // FMUL(D)：c = ±0
+                                    : {32'b0, mul_zs, 31'b0})  // FMUL(S)：c = ±0
+                            : (is_d ? b : b_ar);
 
     wire       ar_neg_np = op_fma & op_fma_np;            // add/mul 恒不取反积
     wire       ar_neg_na = op_fma ? op_fma_na : is_sub;   // FSUB ⇒ 取反加数
 
-    wire [63:0] a_fma_s = en_fma_s ? a_ar : 64'd0;
-    wire [63:0] b_fma_s = en_fma_s ? b3_s : 64'd0;
-    wire [63:0] c_fma_s = en_fma_s ? c3_s : 64'd0;
-    wire [63:0] a_fma_d = en_fma_d ? a    : 64'd0;
-    wire [63:0] b_fma_d = en_fma_d ? b3_d : 64'd0;
-    wire [63:0] c_fma_d = en_fma_d ? c3_d : 64'd0;
+    wire [63:0] a_fma = en_fma ? (is_d ? a : a_ar) : 64'd0;
+    wire [63:0] b_fma = en_fma ? b3 : 64'd0;
+    wire [63:0] c_fma = en_fma ? c3 : 64'd0;
+    // 模式位与操作数**同拍门控**：无派发 ⇒ is_s=0（D 模式）+ 全 0 操作数，
+    // 此时结果不被消费（消费由 §7.5 的有效位链决定，链的起点就是 disp_sc）。
+    wire        is_s_fma = en_fma & ~is_d;
     wire [63:0] a_cmp   = en_cmp   ? a    : 64'd0;
     wire [63:0] b_cmp   = en_cmp   ? b    : 64'd0;
     wire [63:0] a_cvt   = en_cvt   ? a    : 64'd0;
 
-    wire [31:0] fma_s_r;  wire [63:0] fma_d_r;  wire [4:0] fma_s_f, fma_d_f;
+    wire [63:0] fma_r;   wire [4:0] fma_f;
 
-    // FMA：fpu_fma_s/d 内是"精确积 + 精确对阶 + **一次**舍入"⇒ 单次舍入
-    // （08 §5.3 ③；结构上不可能两次舍入，见 fpu_add.v 头注 §2.3）
-    // 它同时承载 FADD/FSUB（乘数=1.0）与 FMUL（加数=±0），见本节 N8 头注。
-    fpu_fma_s u_fma_s (
+    // ★★ N27B：**S/D 共用这一条 53-bit 主算术核**（fpu_fma_shared，见
+    //   rtl/exec/fpu_fma_shared.v 头注）取代原先并列的 fpu_fma_s / fpu_fma_d 两个
+    //   实例。它同样是"精确积 + 精确对阶 + **一次**舍入"（08 §5.3 ③；结构上不可能
+    //   两次舍入，见 fpu_add.v 头注 §2.3），同时承载 FADD/FSUB（乘数=1.0）与
+    //   FMUL（加数=±0）。S 操作数按 sig53 = {sig24, 29'b0} 精确注入 D 域，精度模式由
+    //   is_s 随流水携带；出入口打包（S 结果 NaN-box）在核内按 is_s 完成。
+    //   `fpu_fma_s` / `fpu_fma_d` 的模块体保留在 rtl/exec/fpu_add.v 内但不再被例化
+    //   （N8 惯例：金标 + 差分对照；无实例 ⇒ 综合自动剔除其全部 LUT/DSP）。
+    fpu_fma_shared u_fma (
         .clk (clk),
-        .a (a_fma_s), .b (b_fma_s), .c (c_fma_s),
+        .is_s (is_s_fma),
+        .a (a_fma), .b (b_fma), .c (c_fma),
         .neg_prod (ar_neg_np), .neg_add (ar_neg_na),
-        .rm (rm_eff), .result (fma_s_r), .fflags (fma_s_f)
-    );
-    fpu_fma_d u_fma_d (
-        .clk (clk),
-        .a (a_fma_d), .b (b_fma_d), .c (c_fma_d),
-        .neg_prod (ar_neg_np), .neg_add (ar_neg_na),
-        .rm (rm_eff), .result (fma_d_r), .fflags (fma_d_f)
+        .rm (rm_eff), .result (fma_r), .fflags (fma_f)
     );
 
     //==========================================================================
@@ -439,30 +469,30 @@ module fpu #(
     //==========================================================================
     reg  [FPU_SC_LAT-1:0]   sc_v;
     reg  [FPU_SC_LAT*7-1:0] sc_op;
-    reg  [FPU_SC_LAT*2-1:0] sc_fmt;
+    //   ★★ N27B：原先还有一条 `sc_fmt`（2 bit × FPU_SC_LAT）用于出口选
+    //      `out_is_d ? D 结果 : S 结果补 NaN-box`。共享核 `fpu_fma_shared` 已按
+    //      随流水携带的 `is_s` 在**核内**完成 S/D 两种打包 ⇒ 该元数据链与其出口
+    //      mux 一并删除（功能等价，省 2×FPU_SC_LAT 个 FF）。div/sqrt 的格式仍由
+    //      它自己的 `ds_fmt_d` 锁存决定（见 §4.5），与这里无关。
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             sc_v   <= {FPU_SC_LAT{1'b0}};
             sc_op  <= {(FPU_SC_LAT*7){1'b0}};
-            sc_fmt <= {(FPU_SC_LAT*2){1'b0}};
         end else if (flush) begin
             sc_v   <= {FPU_SC_LAT{1'b0}};
         end else begin
             sc_v   <= {sc_v[FPU_SC_LAT-2:0],        disp_sc};
             sc_op  <= {sc_op[(FPU_SC_LAT-1)*7-1:0], fp_op};
-            sc_fmt <= {sc_fmt[(FPU_SC_LAT-1)*2-1:0], fmt};
         end
     end
 
     wire        sc_done  = sc_v[FPU_SC_LAT-1];
     wire [6:0]  sc_op_o  = sc_op [FPU_SC_LAT*7-1 : (FPU_SC_LAT-1)*7];
-    wire [1:0]  sc_fmt_o = sc_fmt[FPU_SC_LAT*2-1 : (FPU_SC_LAT-1)*2];
 
-    // ---- 输出级的类别（必须用**流水后**的 fp_op/fmt 选结果）----
-    //   ★ N8：add/sub/mul/fma 四类的**结果同源**（同一个 FMA 单元）⇒ 输出级不再
-    //     需要 op 细分，只需 fmt（S 结果补 NaN-box）。cmp/cvt 仍各有一路。
-    wire out_is_d     = (sc_fmt_o == 2'b01);
+    // ---- 输出级的类别（必须用**流水后**的 fp_op 选结果）----
+    //   ★ N8：add/sub/mul/fma 四类的**结果同源**（同一个 FMA 单元）⇒ 输出级不需要
+    //     op 细分。★ N27B 起连 fmt 也不需要（共享核内部按 is_s 打包）。cmp/cvt 各一路。
     wire out_op_cmp   = (sc_op_o >= FP_FSGNJ) & (sc_op_o <= FP_FCLASS);
     wire out_op_cvt   = (sc_op_o >= FP_FMV_X) & (sc_op_o <= FP_FCVT_D_S);
     wire out_op_known = (sc_op_o <= FP_FNMADD);
@@ -470,9 +500,11 @@ module fpu #(
     //==========================================================================
     // 8. 结果 / fflags / 握手输出
     //==========================================================================
-    // ---- 算术结果打包：S 输出补高 32 位 1（NaN-boxing），D 输出完整 64 位 ----
-    wire [63:0] arith_r = out_is_d ? fma_d_r : {BOX_HI, fma_s_r};
-    wire [4:0]  arith_f = out_is_d ? fma_d_f : fma_s_f;
+    // ---- 算术结果：★ N27B 起 `fpu_fma_shared` 已按 `is_s` 在**核内**完成打包
+    //      （S 结果高 32 位全 1 的 NaN-boxing；D 结果完整 64 位）⇒ 此处原样透传，
+    //      不再需要出口的 `out_is_d ? … : {BOX_HI, …}` 模式 mux。----
+    wire [63:0] arith_r = fma_r;
+    wire [4:0]  arith_f = fma_f;
 
     wire [63:0] sc_r = out_op_cmp ? cmp_r :
                        out_op_cvt ? cvt_r :
