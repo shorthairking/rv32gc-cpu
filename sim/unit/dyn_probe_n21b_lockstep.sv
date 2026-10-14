@@ -1,0 +1,38 @@
+//==============================================================================
+// sim/unit/dyn_probe_n21b_lockstep.sv —— EXP-N21B 探针：tb_back2_lockstep 的 5 个程序
+//------------------------------------------------------------------------------
+// 用法（仓库根 = rv32gc-cpu/）：
+//   source scripts/env.sh
+//   iverilog "${RV32_IV_FLAGS[@]}" -g2012 -o /tmp/n21b_ls.vvp -s dyn_probe_n21b_lockstep \
+//            "${RTL[@]}" sim/unit/tb_back2_lockstep.sv sim/unit/dyn_probe_n21b_core.sv \
+//            sim/unit/dyn_probe_n21b_lockstep.sv
+//   vvp /tmp/n21b_ls.vvp
+// 产物：fpga/scratch/n21b/n21b_lockstep.csv（bench 列 = 程序号 0..4）
+// 纪律：只读层次引用；不改产品 RTL；不打印含 PASS 文案；不进 regress.sh。
+//==============================================================================
+`timescale 1ns / 1ps
+
+`include "rtl/pkg/rv32_defs.vh"
+`include "rtl/pkg/core_params.vh"
+`include "rtl/front4/front4_params.vh"
+`include "rtl/back2/back2_params.vh"
+
+module dyn_probe_n21b_lockstep;
+
+    tb_back2_lockstep_top u_tb ();
+
+`define N21B_BK    u_tb.u_back
+`define N21B_FNAME "fpga/scratch/n21b/n21b_lockstep.csv"
+`define N21B_BENCH u_tb.pi
+`define N21B_CLK   u_tb.clk
+`define N21B_RST   u_tb.rst_n
+`define N21B_EN    1'b1
+`include "sim/unit/dyn_probe_n21b_body.inc"
+`undef N21B_EN
+`undef N21B_RST
+`undef N21B_CLK
+`undef N21B_BENCH
+`undef N21B_FNAME
+`undef N21B_BK
+
+endmodule
