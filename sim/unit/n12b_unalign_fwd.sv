@@ -28,8 +28,13 @@
 //
 // 判据（全部 fail-closed；任一不满足 ⇒ $fatal，**绝不**打印 PASS 锚点）：
 //   A 写回在有限拍内到达、且不得报数据侧异常
-//   B 转发布局口径：`lmask_w8` == ((1<<size)-1)<<a2、全转发场景 `fwd_all_w` == 1
-//   C 全转发场景：载入访存请求数 == 0；非跨字部分转发：>= 1；**跨 4 B 字**：== 2
+//   B 转发布局口径：`lmask_w8` == ((1<<size)-1)<<a2；逐字节命中掩码 `fwd_hit_w` == 参考
+//     覆盖掩码 `exp_cov`；`fwd_all_w` == (命中掩码 ⊇ lmask_w8)（该线网在 N29B 下仅为
+//     探针兼容保留，不再参与功能）
+//   C ★★ N29B（纯等待变体）：**不再有"全转发 ⇒ 0 笔访存"** —— 有依赖的 load 一律等
+//     older store 落地后访存。故"载入访存请求数"判据改为：非跨字 == 1 笔、跨 4 B 字
+//     （含 8 B FLD 两拍）== 2 笔（与 N12B-cross 的既有一致；只是不再有 0 笔的情形）。
+//     ★ 数据判据（D）不变：写回值仍等于「store 字节 + 内存像字节」的逐字节参考。
 //   D `wb_data` == 参考值（逐位）；8 B：`wb_data_hi`/`wb_f64` 同判
 //   E 目的寄存器方向正确（整数 load ⇒ wb_dst_i、FP load ⇒ wb_dst_f）
 //   F 每个场景结束 STQ/LQ/CDQ 全空（槽回收正确）
@@ -163,8 +168,11 @@ module n12b_unalign_fwd_top;
 
     //==========================================================================
     // 2. 字节级内存像 + 读响应模型（**非旋转**：返回含请求地址的对齐 4 B 字，
-    //    与 rtl/cache/l1d.v 的 `cs_rdata = 对齐字` 同口径；store 落地不改 memimg，
-    //    本用例的目的只判「转发 + 合并」的取数口径）
+    //    与 rtl/cache/l1d.v 的 `cs_rdata = 对齐字` 同口径）
+    //   ★★ N29B（纯等待变体）：**store 落地（CDQ 排空口的写）按 `mem_req_wstrb` 写进
+    //     `memimg`** —— 这是"该 store 已对 L1D 真实可见"的夹具侧建模。被覆盖的字节由
+    //     store 落地提供、其余字节仍是初值 ⇒ 写回值仍与 N12B 之前的参考**逐位相等**
+    //     （数据来源从"转发"改成"落地后的存储映像"）。
     //==========================================================================
     integer k_mem;
     reg [7:0] memimg [0:MEMSZ-1];
@@ -175,6 +183,7 @@ module n12b_unalign_fwd_top;
             mem_word = {memimg[wa+3], memimg[wa+2], memimg[wa+1], memimg[wa]};
         end
     endfunction
+    integer mw_i;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             mem_rsp_valid <= 1'b0;
@@ -184,6 +193,13 @@ module n12b_unalign_fwd_top;
             mem_rsp_valid <= mem_req_valid & mem_req_ready & ~mem_req_wen;
             mem_rsp_tag   <= mem_req_tag;
             mem_rsp_rdata <= mem_word(mem_req_addr);
+            if (mem_req_valid & mem_req_ready & mem_req_wen) begin
+                mw_i = {mem_req_addr[11:2], 2'b00};
+                if (mem_req_wstrb[0]) memimg[mw_i+0] <= mem_req_wdata[7:0];
+                if (mem_req_wstrb[1]) memimg[mw_i+1] <= mem_req_wdata[15:8];
+                if (mem_req_wstrb[2]) memimg[mw_i+2] <= mem_req_wdata[23:16];
+                if (mem_req_wstrb[3]) memimg[mw_i+3] <= mem_req_wdata[31:24];
+            end
         end
     end
 
@@ -260,6 +276,7 @@ module n12b_unalign_fwd_top;
 
     //   load E1：同一拍组合态采样转发观测量（`lmask_w8`/`fwd_all_w`）
     reg [7:0] obs_lmask;
+    reg [7:0] obs_fwh;
     reg       obs_fwa;
     task ld_e1(input [LQ_IW-1:0] slot, input [ROBW-1:0] rob, input [31:0] a,
                input [2:0] sz, input uns, input fp);
@@ -273,6 +290,7 @@ module n12b_unalign_fwd_top;
             iss_rob = rob;
             #1;
             obs_lmask = u_lsq.lmask_w8;
+            obs_fwh   = u_lsq.fwd_hit_w;
             obs_fwa   = u_lsq.fwd_all_w;
             @(posedge clk);
             @(negedge clk); exe_valid = 1'b0; exe_is_store = 1'b0; exe_is_fp = 1'b0;
@@ -352,6 +370,7 @@ module n12b_unalign_fwd_top;
     //   单场景公共部分：逐字节 SB 覆盖 → load E1 → 判据（A..F）→ 提交收尾
     //   `exp_lo`/`exp_hi` 由调用方按参考模型给出（独立于 RTL）
     task automatic do_load(input [2:0] sz, input [1:0] off, input uns, input fp,
+                           input [7:0] exp_cov,
                            input [31:0] exp_lo, input [31:0] exp_hi, input exp_f64,
                            input integer exp_req, input string nm);
         integer i, nst, nsize;
@@ -376,11 +395,18 @@ module n12b_unalign_fwd_top;
             if (!ok) ckfail({nm, "：LQ 分配失败"});
             ld_e1(lslot, rob_load, m_base + off, sz, uns, fp);
             chk(obs_lmask === (((8'h01 << nsize) - 8'h01) << off), {nm, "：lmask_w8 与 size/a2 口径不符"});
-            chk(obs_fwa === (exp_req == 0), {nm, "：fwd_all_w 与「全转发」口径不符"});
+            chk(obs_fwh === exp_cov, {nm, "：逐字节命中掩码 fwd_hit_w 与参考覆盖不符"});
+            chk(obs_fwa === ((exp_cov & obs_lmask) == obs_lmask), {nm, "：fwd_all_w 与命中口径不符"});
+            //   ★★ N29B：**先让更老 store 按程序序提交排空**（= 对 L1D 可见），load 才能
+            //     通过等待闸门发出访存。旧顺序（先 wait_ld 再提交）在纯等待变体下必然超时。
+            for (i = 0; i < nst; i = i + 1) begin
+                cmt_store(w_sslot[i], w_srob[i], ok);
+                if (!ok) ckfail({nm, "：store 排空未被 CDQ 收下"});
+            end
             wait_ld(rob_load, got_wb, got_exc);
             chk(got_wb, {nm, "：load 未在限期内写回"});
             chk(!got_exc, {nm, "：本场景不应有数据侧异常"});
-            chk(n_ldreq == exp_req, {nm, "：访存请求数与口径不符（全转发应 0）"});
+            chk(n_ldreq == exp_req, {nm, "：访存请求数与口径不符（有依赖 ⇒ 必访存）"});
             chk(obs_lo === exp_lo, {nm, "：wb_data 与逐字节参考不一致"});
             if (sz == 3'd3) begin
                 chk(obs_hi === exp_hi, {nm, "：wb_data_hi 与参考不一致"});
@@ -388,11 +414,7 @@ module n12b_unalign_fwd_top;
             end
             if (fp) chk(obs_dstf === 1'b1, {nm, "：FP load 应写 FP 目的口"});
             else    chk(obs_dsti === 1'b1, {nm, "：整数 load 应写整数目的口"});
-            // ---- 程序序提交：store 排空 → load 提交点释放 → 全空 ----
-            for (i = 0; i < nst; i = i + 1) begin
-                cmt_store(w_sslot[i], w_srob[i], ok);
-                if (!ok) ckfail({nm, "：store 排空未被 CDQ 收下"});
-            end
+            // ---- 收尾：load 提交点释放 → 全空 ----
             cmt_load(rob_load);
             wait_idle(ok);
             if (!ok) ckfail({nm, "：场景结束 STQ/LQ/CDQ 未回空（槽泄漏/排空悬挂）"});
@@ -424,8 +446,13 @@ module n12b_unalign_fwd_top;
                           ehi = {cb[7], cb[6], cb[5], cb[4]};
                       end
             endcase
-            do_load(sz, off, uns, fp, elo, ehi, (sz == 3'd3), 0,
-                    $sformatf("case#%0d(sz=%0d,a2=%0d,uns=%0d,fp=%0d,全转发)",
+            //   ★★ N29B：全字节覆盖不再意味着"0 笔访存" —— 有依赖一律等待后访存。
+            //     访存笔数 = 1（字内）/ 2（跨 4 B 对齐字：8 B FLD、LW@a2≠0、LH@a2=3）。
+            do_load(sz, off, uns, fp, ((8'h01 << nsize) - 8'h01) << off,
+                    elo, ehi, (sz == 3'd3),
+                    ((sz == 3'd3) || ((sz == 3'd2) && (off != 2'd0)) ||
+                     ((sz == 3'd1) && (off == 2'd3))) ? 2 : 1,
+                    $sformatf("case#%0d(sz=%0d,a2=%0d,uns=%0d,fp=%0d,全字节覆盖)",
                               id, sz, off, uns, fp));
         end
     endtask
@@ -463,14 +490,15 @@ module n12b_unalign_fwd_top;
                 //   本场景是 **有符号** LH（uns=0）⇒ 必须按 bit15 符号扩展
                 hh  = (lane == 1) ? {mw[23:16], cb[1]} : {cb[2], mw[15:8]};
                 elo = {{16{hh[15]}}, hh};
+                //   ★★ N29B：先提交该更老 store（落地进 memimg），load 才能访存
+                cmt_store(w_sslot[0], w_srob[0], ok);
+                if (!ok) ckfail($sformatf("case#%0d：store 排空未被 CDQ 收下", id));
                 wait_ld(rob_load, got_wb, got_exc);
                 chk(got_wb, $sformatf("case#%0d：load 未写回", id));
                 chk(!got_exc, $sformatf("case#%0d：不应有异常", id));
                 chk(n_ldreq >= 1, $sformatf("case#%0d(部分转发)：应发访存", id));
                 chk(obs_lo === elo, $sformatf("case#%0d(LH@+1 部分转发, lane=%0d)：wb_data 与参考不一致", id, lane));
                 chk(obs_dsti === 1'b1, $sformatf("case#%0d：整数 load 应写整数目的口", id));
-                cmt_store(w_sslot[0], w_srob[0], ok);
-                if (!ok) ckfail($sformatf("case#%0d：store 排空未被 CDQ 收下", id));
                 cmt_load(rob_load);
                 wait_idle(ok);
                 if (!ok) ckfail($sformatf("case#%0d：场景结束 STQ/LQ/CDQ 未回空", id));
@@ -489,6 +517,7 @@ module n12b_unalign_fwd_top;
         reg [LQ_IW-1:0] lslot;
         reg ok, got_wb, got_exc;
         reg [7:0]  bb [0:7];
+        reg [7:0]  efwh;
         reg [31:0] a_i, elo;
         reg [15:0] hh;
         begin
@@ -496,9 +525,13 @@ module n12b_unalign_fwd_top;
             nsize  = 1 << sz;
             for (i = 0; i < 8; i = i + 1) cb[i] = 8'h90 | i[7:0];   // SB 数据（高位恒 1）
             // ---- 独立参考：逐字节 ----
+            //   `fwd_hit_w` 的位号 = **窗口字节号**（本次访问的字节 i 落在 gb = off + i），
+            //   而 `covmask` 的位号 = **访问内字节序号** i ⇒ 期望掩码必须按 off 移位。
+            efwh = 8'h00;
             for (i = 0; i < nsize; i = i + 1) begin
                 a_i  = m_base + {30'b0, off} + i[31:0];
                 bb[i] = covmask[i] ? cb[i] : memimg[a_i[11:0]];
+                if (covmask[i]) efwh[off + i] = 1'b1;   // 整数加法（i 可达 7 ⇒ gb 可达 7）
             end
             elo = 32'h0; hh = 16'h0;
             case (sz)
@@ -529,7 +562,14 @@ module n12b_unalign_fwd_top;
             ld_e1(lslot, rob_load, m_base + {30'b0, off}, sz, uns, fp);
             chk(obs_lmask === (((8'h01 << nsize) - 8'h01) << off),
                 {nm, "：lmask_w8 与 size/a2 口径不符"});
+            chk(obs_fwh === efwh,
+                {nm, "：逐字节命中掩码 fwd_hit_w 与参考覆盖不符"});
             chk(obs_fwa === 1'b0, {nm, "：部分命中不得判全转发"});
+            //   ★★ N29B：先按程序序提交更老 store（落地进 memimg），load 才能访存
+            for (i = 0; i < nst; i = i + 1) begin
+                cmt_store(w_sslot[i], w_srob[i], ok);
+                if (!ok) ckfail({nm, "：store 排空未被 CDQ 收下"});
+            end
             wait_ld(rob_load, got_wb, got_exc);
             chk(got_wb, {nm, "：load 未在限期内写回"});
             chk(!got_exc, {nm, "：≤4 B 非对齐不得有数据侧异常（cause 4 只属 8 B）"});
@@ -538,11 +578,7 @@ module n12b_unalign_fwd_top;
             chk(obs_lo === elo, {nm, "：wb_data 与逐字节参考不一致"});
             if (fp) chk(obs_dstf === 1'b1, {nm, "：FP load 应写 FP 目的口"});
             else    chk(obs_dsti === 1'b1, {nm, "：整数 load 应写整数目的口"});
-            // ---- 程序序提交 ----
-            for (i = 0; i < nst; i = i + 1) begin
-                cmt_store(w_sslot[i], w_srob[i], ok);
-                if (!ok) ckfail({nm, "：store 排空未被 CDQ 收下"});
-            end
+            // ---- 收尾：load 提交点释放 ----
             cmt_load(rob_load);
             wait_idle(ok);
             if (!ok) ckfail({nm, "：场景结束 STQ/LQ/CDQ 未回空"});

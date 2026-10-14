@@ -1,15 +1,28 @@
 //==============================================================================
-// sim/unit/tb_back2_lsq_fwd.sv —— 2B-3 验收判据④：**访存转发覆盖用例**（LSQ 直驱）
+// sim/unit/tb_back2_lsq_fwd.sv —— EXP-N29B：**纯等待变体**下的 LSQ 直驱覆盖用例
 //------------------------------------------------------------------------------
-// 方法学：不经前端/重命名，直接以握手信号驱动 `lsq_simple`（2B-3 将替换为真乱序 lsq.v，
-//   接口保持一致 ⇒ 本用例可原样复用于新模块），逐场景构造"更老 store + 更年轻 load"：
-//     C1 字节 store → 字 load：**部分转发**（掩码 0b0001）+ 访存合并 ⇒ 字节 0 来自 store
-//     C2 两个字节 store（A+0/A+1）→ 字 load：**部分重叠合并**（0b0011）
+// 方法学：不经前端/重命名，直接以握手信号驱动 `lsq_simple`，逐场景构造"更老 store +
+//   更年轻 load"。★ N29B 起 `lsq_simple` **完全移除 store→load 转发**（无逐字节合并、
+//   无"全转发直通"快路）：load 一律**等到它依赖的更老 store 对 L1D 真实可见**
+//   （= 该 store 完成提交 + CDQ 排空 + L1D 写完成）之后才访存。
+//
+//   ⇒ 本夹具的**场景内存模型**必须与之一致（N12B §3 登记的"语义互斥"收口）：
+//     · store 提交排空（`dr_valid`/`dr_idx` → `mem_req_valid & mem_req_wen`）**把数据按
+//       `mem_req_wstrb` 写进夹具的存储映像** `mem[]`；
+//     · **store 提交必须先于 load 完成**：夹具在 load 发访存之前显式驱动该更老 store 的
+//       提交（`drain_store`），随后 load 读回的就是"store 字节 + 内存字节"的合并结果。
+//
+//   场景（与 N12B 之前**逐位同构**，只把"数据从转发来"改成"数据从落地后的存储映像来"）：
+//     C1 字节 store → 字 load：1 字节覆盖 + 其余来自内存初值
+//     C2 两个字节 store（A+0/A+1）→ 字 load：两字节拼接 + 其余来自内存
 //     C3 同一字节的**两个 store**（更老 0x11 / 更年轻 0x22）→ 字节 load ⇒ 取**更年轻**者 0x22
-//     C4 字 store → 同址字 load：**全转发** ⇒ 不产生访存请求（mem_req_valid 保持 0）
-//     C5 地址不相交的 store → 字 load：**零转发** ⇒ 发访存且结果 = 存储器原值
-//     C6 半字 store → 半字 load：掩码 0b0011 且结果取 store 数据
-//   判据：每条场景都必须得到期望的 `wb_data` / `mem_req_valid`；任何超时即 FAIL（fail-closed）。
+//     C4 字 store → 同址字 load：**必须访存**（N29B 无直通快路）且结果 = 落地值
+//     C5 地址不相交的 store → 字 load：**无依赖 ⇒ 不等待**，结果 = 存储器初值
+//     C6 半字 store → 半字 load：结果取落地后的半字
+//   判据：每条场景都必须得到期望的 `wb_data` / `mem_req_valid`（load 请求笔数）；
+//         任何超时即 FAIL（fail-closed）。
+//
+//   ★ 数据判据（写回值）与 N12B 之前的**参考逐位相等**：期望值 = "store 字节 ⊕ 内存初值"。
 // 运行：iverilog -g2012 -Wall -I rtl/pkg -I . -o /tmp/lsqf.vvp \
 //         $(find rtl -name '*.v' | sort) sim/unit/tb_back2_lsq_fwd.sv && vvp /tmp/lsqf.vvp
 //==============================================================================
@@ -116,7 +129,8 @@ module tb_back2_lsq_fwd_top;
     endtask
 
     // ---- 单条 store 入队并 E1 ----
-    task st_issue(input [ROBW-1:0] rob, input [31:0] a, input [31:0] d, input [2:0] sz);
+    task st_issue(input [ROBW-1:0] rob, input [31:0] a, input [31:0] d, input [2:0] sz,
+                  output [STQ_IW-1:0] slot_o);
         reg [STQ_IW-1:0] slot;
         begin
             @(negedge clk);
@@ -126,6 +140,7 @@ module tb_back2_lsq_fwd_top;
             //   ★ 槽号必须在**分配拍**采样：`alloc_idx[0]` 是空闲表的组合读，
             //     在 `alloc_valid=1` 的那一拍它指向"下一拍将被分配的槽"。
             slot = alloc_idx[0*STQ_IW +: STQ_IW];
+            slot_o = slot;
             @(posedge clk);                       // 分配发生
             @(negedge clk);
             alloc_valid = 4'h0;
@@ -156,40 +171,70 @@ module tb_back2_lsq_fwd_top;
         end
     endtask
 
-    // ---- 内存响应模型（与 tb_back2_lockstep.sv 的存储器模型同口径）----
-    //   ★ 修（§B3.4 定案）：LSU 的请求是**单拍握手脉冲**——`ld_fire` 当拍即把 `ld_req` 置 1
-    //     ⇒ 下一拍 `mem_req_valid` 已回落。原 `wait_wb` 在 **negedge** 采样请求 ⇒ 必然漏掉
-    //     该脉冲 ⇒ 响应永不产生 ⇒ 判据全灭（与 RTL 无关）。本模型在 **posedge** 采样握手拍，
-    //     次拍给出带同 tag 的**单拍**响应（每次受理恰好一次响应，不重复、不漏）。
-    reg [31:0] rsp_data_m = 32'h0;
-    reg        saw_req_m  = 1'b0;
+    // ---- ★★ N29B 存储映像 + 响应模型 ----
+    //   · **store 落地**：`mem_req_valid & mem_req_wen`（= CDQ 排空口发出的写）按
+    //     `mem_req_wstrb` 写进 `mem[]` —— 这就是"对 L1D 真实可见"的夹具侧建模。
+    //   · **load 响应**：`mem_req_valid & ~mem_req_wen` 受理后**次拍**给出带同 tag 的单拍
+    //     响应，数据 = 该对齐字（L1D 口径：响应不做字节旋转，与 `l1d.v cs_rdata` 一致）。
+    //   · 请求是**单拍握手脉冲**（`ld_fire` 当拍把 `ld_req` 置 1 ⇒ 下一拍 `mem_req_valid`
+    //     已回落）⇒ 必须在 **posedge** 采样握手拍。
+    localparam integer MEMW = 16384;                 // 64 KiB / 4（覆盖本夹具全部地址）
+    reg [31:0] mem [0:MEMW-1];
+    wire [13:0] midx = mem_req_addr[15:2];
+    //   ★ N29B：写回 / load 请求**粘滞捕获** —— load 可能在夹具驱动 store 提交的那几拍里
+    //     就完成写回（store 排空 1 笔/拍），若只在 `wait_wb` 里轮询会漏掉那一拍。
+    reg        wb_seen_m = 1'b0;
+    reg [31:0] wb_data_m = 32'h0;
+    reg        req_seen_m = 1'b0;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wb_seen_m <= 1'b0; wb_data_m <= 32'h0; req_seen_m <= 1'b0;
+        end else begin
+            if (wb_valid) begin wb_seen_m <= 1'b1; wb_data_m <= wb_data; end
+            if (mem_req_valid & mem_req_ready & ~mem_req_wen) req_seen_m <= 1'b1;
+        end
+    end
+    integer    mi;
+    task set_mem(input [31:0] a, input [31:0] d);
+        begin mem[a[15:2]] = d; end
+    endtask
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             mem_rsp_valid <= 1'b0;
             mem_rsp_tag   <= {TAG_W{1'b0}};
             mem_rsp_rdata <= 32'h0;
+            for (mi = 0; mi < MEMW; mi = mi + 1) mem[mi] = 32'h0;
         end else begin
             mem_rsp_valid <= mem_req_valid & mem_req_ready & ~mem_req_wen;
             mem_rsp_tag   <= mem_req_tag;
-            mem_rsp_rdata <= rsp_data_m;
-            if (mem_req_valid & mem_req_ready & ~mem_req_wen) saw_req_m <= 1'b1;
+            mem_rsp_rdata <= mem[midx];
+            if (mem_req_valid & mem_req_ready &  mem_req_wen) begin
+                if (mem_req_wstrb[0]) mem[midx][7:0]   <= mem_req_wdata[7:0];
+                if (mem_req_wstrb[1]) mem[midx][15:8]  <= mem_req_wdata[15:8];
+                if (mem_req_wstrb[2]) mem[midx][23:16] <= mem_req_wdata[23:16];
+                if (mem_req_wstrb[3]) mem[midx][31:24] <= mem_req_wdata[31:24];
+            end
         end
     end
 
-    // ---- 等待写回（最多 16 拍）；请求由上面的响应模型自动应答 ----
-    task wait_wb(input [31:0] rdata, output [31:0] got, output integer saw_req);
-        integer t;
+    // ---- 等待写回（最多 40 拍）；load 请求由上面的响应模型自动应答 ----
+    //   ★ N29B：不再有"先给响应数据"的入参 —— 数据来自 `mem[]`（store 落地已写进去）。
+    task wait_wb(output [31:0] got, output integer saw_req);
+        integer t; reg done;
         begin
-            got = 32'h0; rsp_data_m = rdata; saw_req = 0; saw_req_m = 1'b0;
-            for (t = 0; t < 16; t = t + 1) begin
+            got = 32'h0; saw_req = 0; done = 1'b0;
+            for (t = 0; (t < 60) && !done; t = t + 1) begin
                 @(posedge clk);
-                if (wb_valid) begin
-                    got = wb_data;
-                    saw_req = saw_req_m | mem_req_valid;
-                    t = 16;
-                end
+                if (wb_seen_m) begin got = wb_data_m; done = 1'b1; end
             end
+            saw_req = req_seen_m ? 1 : 0;
             @(negedge clk);
+            if (!done) begin
+                n_chk = n_chk + 1; n_fail = n_fail + 1;
+                $display("FAIL[lsq-fwd]: 等待 load 写回超时（60 拍）");
+            end
+            //   清粘滞位供下一场景（每场景恰一次写回 / 恰一笔 load 请求）
+            wb_seen_m = 1'b0; req_seen_m = 1'b0; wb_data_m = 32'h0;
         end
     endtask
 
@@ -202,12 +247,17 @@ module tb_back2_lsq_fwd_top;
         end
     endfunction
 
-    // ---- 驱动 store 提交排空（dr_valid/dr_idx），使其离开 STQ ----
+    // ---- 驱动 store 提交排空（dr_valid/dr_idx）：入 CDQ → 排空口写进 `mem[]` ----
+    //   ★ N29B：`dr_room_ok` 要求 CDQ 余量 ≥ 2W=8（CDQ_N=8）⇒ 必须等上一笔真正排空
+    //     （`dr_fire`）之后才能提交下一笔；多等几拍是安全的（排空 1 笔/拍）。
     task drain_store(input [STQ_IW-1:0] slot);
+        integer w;
         begin
             @(negedge clk); dr_valid = 4'h1; dr_idx = {3'b0, slot};
             @(posedge clk);
             @(negedge clk); dr_valid = 4'h0;
+            for (w = 0; w < 4; w = w + 1) @(posedge clk);
+            @(negedge clk);
         end
     endtask
 
@@ -238,47 +288,62 @@ module tb_back2_lsq_fwd_top;
         rst_n = 1'b0; repeat (4) @(posedge clk); rst_n = 1'b1; repeat (2) @(posedge clk);
         rob_head = 7'd0;
 
-        // ---------- C1：字节 store(A) → 字 load(A)：部分转发 + 合并 ----------
-        st_issue(7'd1, 32'h8000_1000, 32'h0000_00AA, 3'd0);   // sb 0xAA
-        ld_issue(7'd2, 32'h8000_1000, 3'd2, 1'b0);                // lw
-        wait_wb(32'h1122_3344, v, rq);
-        chk(rq == 1, "C1 部分转发仍须访存");
-        chk(v == 32'h1122_33AA, "C1 字节 0 来自 store（0xAA），其余来自存储器");
+        // ---------- C1：字节 store(A) → 字 load(A)：走等待 + 访存（字节 0 来自落地值）----------
+        //   参考（逐位等价）：期望 = 内存初值 0x1122_3344 的字节 0 被 store 的 0xAA 覆盖。
+        set_mem(32'h8000_1000, 32'h1122_3344);
+        st_issue(7'd1, 32'h8000_1000, 32'h0000_00AA, 3'd0, s0);   // sb 0xAA
+        ld_issue(7'd2, 32'h8000_1000, 3'd2, 1'b0);                // lw（依赖更老 store ⇒ 等）
+        drain_store(s0);                                          // store 提交 → 落地进 mem[]
+        wait_wb(v, rq);
+        chk(rq == 1, "C1 有依赖 ⇒ 等待后仍须访存（请求 1 笔）");
+        chk(v == 32'h1122_33AA, "C1 字节 0 = store 落地值，其余 = 存储映像初值");
 
-        // ---------- C2：两个字节 store(A+0/A+1) → 字 load：部分重叠合并 ----------
-        st_issue(7'd3, 32'h8000_2000, 32'h0000_0055, 3'd0);   // sb 0x55 @+0
-        st_issue(7'd4, 32'h8000_2001, 32'h0000_0066, 3'd0);   // sb 0x66 @+1
+        // ---------- C2：两个字节 store(A+0/A+1) → 字 load：两字节拼接 ----------
+        set_mem(32'h8000_2000, 32'hAABB_CCDD);
+        st_issue(7'd3, 32'h8000_2000, 32'h0000_0055, 3'd0, s0);   // sb 0x55 @+0
+        st_issue(7'd4, 32'h8000_2001, 32'h0000_0066, 3'd0, s1);   // sb 0x66 @+1
         ld_issue(7'd5, 32'h8000_2000, 3'd2, 1'b0);                // lw
-        wait_wb(32'hAABB_CCDD, v, rq);
-        chk(rq == 1, "C2 两个字节 store 仍须访存（部分命中）");
-        chk(v == 32'hAABB_6655, "C2 字节 0/1 合并自两条 store");
+        drain_store(s0);                                          // 按程序序提交（更老在前）
+        drain_store(s1);
+        wait_wb(v, rq);
+        chk(rq == 1, "C2 两字节拼接 ⇒ 须访存（请求 1 笔）");
+        chk(v == 32'hAABB_6655, "C2 字节 0/1 = 两条 store 落地值，其余 = 初值");
 
         // ---------- C3：同字节两条 store（更老 0x11 / 更年轻 0x22）→ lbu ⇒ 更年轻者 ----------
-        st_issue(7'd6, 32'h8000_3000, 32'h0000_0011, 3'd0);
-        st_issue(7'd7, 32'h8000_3000, 32'h0000_0022, 3'd0);
+        set_mem(32'h8000_3000, 32'hDEAD_BEEF);
+        st_issue(7'd6, 32'h8000_3000, 32'h0000_0011, 3'd0, s0);
+        st_issue(7'd7, 32'h8000_3000, 32'h0000_0022, 3'd0, s1);
         ld_issue(7'd8, 32'h8000_3000, 3'd0, 1'b1);                // lbu
-        wait_wb(32'hDEAD_BEEF, v, rq);
-        chk(v == 32'h0000_0022, "C3 同字节取更年轻 store 的数据");
+        drain_store(s0);                                          // 程序序 ⇒ 年轻者后落地
+        drain_store(s1);
+        wait_wb(v, rq);
+        chk(v == 32'h0000_0022, "C3 同字节 ⇒ 更年轻 store 后落地，读回 0x22");
 
-        // ---------- C4：字 store → 同址字 load：全转发，不访存 ----------
-        st_issue(7'd9, 32'h8000_4000, 32'hCAFE_F00D, 3'd2);   // sw
-        ld_issue(7'd10, 32'h8000_4000, 3'd2, 1'b0);               // lw
-        wait_wb(32'h0000_0000, v, rq);
-        chk(rq == 0, "C4 全转发不得产生访存请求");
-        chk(v == 32'hCAFE_F00D, "C4 数据来自 store");
+        // ---------- C4：字 store → 同址字 load：**纯等待变体下必须访存** ----------
+        set_mem(32'h8000_4000, 32'h0BAD_0000);
+        st_issue(7'd9, 32'h8000_4000, 32'hCAFE_F00D, 3'd2, s0);   // sw
+        ld_issue(7'd10, 32'h8000_4000, 3'd2, 1'b0);               // lw（单条完整覆盖）
+        drain_store(s0);
+        wait_wb(v, rq);
+        chk(rq == 1, "C4 无直通快路 ⇒ 覆盖也必须等 store 落地后访存（请求 1 笔）");
+        chk(v == 32'hCAFE_F00D, "C4 数据 = 落地后的存储映像");
 
-        // ---------- C5：地址不相交 ⇒ 零转发、结果 = 存储器 ----------
-        st_issue(7'd11, 32'h8000_5000, 32'hFFFF_FFFF, 3'd2);
+        // ---------- C5：地址不相交 ⇒ 无依赖 ⇒ 不等待、结果 = 存储器初值 ----------
+        set_mem(32'h8000_6000, 32'h0BAD_F00D);
+        st_issue(7'd11, 32'h8000_5000, 32'hFFFF_FFFF, 3'd2, s0);
         ld_issue(7'd12, 32'h8000_6000, 3'd2, 1'b0);
-        wait_wb(32'h0BAD_F00D, v, rq);
+        drain_store(s0);
+        wait_wb(v, rq);
         chk(rq == 1, "C5 无命中须访存");
-        chk(v == 32'h0BAD_F00D, "C5 结果应为存储器原值");
+        chk(v == 32'h0BAD_F00D, "C5 结果应为存储器初值");
 
         // ---------- C6：半字 store → 半字 load（掩码 0b0011） ----------
-        st_issue(7'd13, 32'h8000_7000, 32'h0000_7A5A, 3'd1);  // sh
+        set_mem(32'h8000_7000, 32'h1357_2468);
+        st_issue(7'd13, 32'h8000_7000, 32'h0000_7A5A, 3'd1, s0);  // sh
         ld_issue(7'd14, 32'h8000_7000, 3'd1, 1'b1);               // lhu
-        wait_wb(32'h1357_2468, v, rq);
-        chk(v == 32'h0000_7A5A, "C6 半字转发正确");
+        drain_store(s0);
+        wait_wb(v, rq);
+        chk(v == 32'h0000_7A5A, "C6 半字 = store 落地值");
 
         // ---------- C7（第 11 项）：LQ **提交点释放**（2B-3 第二步的释放语义）----------
         //   旧口径是"响应到达即释放槽"；现口径是"响应只置 ld_dn（数据已齐），槽留到该 load
@@ -291,8 +356,9 @@ module tb_back2_lsq_fwd_top;
         begin : c7
             integer occ0, occ1, occ2;
             occ0 = lq_occ();
+            set_mem(32'h8000_9000, 32'h5566_7788);
             ld_issue(7'd20, 32'h8000_9000, 3'd2, 1'b0);
-            wait_wb(32'h5566_7788, v, rq);
+            wait_wb(v, rq);
             occ1 = lq_occ();
             rob_head = 7'd20; cmt_n = 3'd1;          // ROB 提交该 load
             @(posedge clk);
@@ -305,7 +371,7 @@ module tb_back2_lsq_fwd_top;
 
         // ---------- 结果 ----------
         if (n_fail == 0) begin
-            $display("== 检查项合计 %0d 项全部满足（转发掩码/合并/最年轻优先/全转发不访存/无命中走访存/LQ 提交点释放）", n_chk);
+            $display("== 检查项合计 %0d 项全部满足（纯等待：有依赖即等 store 落地后访存 / 无依赖不等待 / 程序序覆盖 / 提交点释放）", n_chk);
             $display("TB_BACK2_LSQ_FWD: PASS");
         end else begin
             $display("== 检查项 %0d 项中失败 %0d 项", n_chk, n_fail);

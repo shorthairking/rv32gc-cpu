@@ -35,7 +35,8 @@
 //   B mode=0 场景：`wb_data`/`wb_data_hi`/`wb_f64` 与参考模型逐位相等
 //   C 每条 load 的 `fwd_hit_w`/`fwd_all_w` 与本夹具**独立**算出的
 //     「字节并集覆盖」/「并集全覆盖」一致（与探针分析器的 I2/I3 互锁）
-//   D 全转发（或 8 B 非对齐）⇒ 访存请求数 = 0；否则 ≥1（复刻 C4 口径）
+//   D ★★ N29B：8 B 非对齐 ⇒ 访存请求数 = 0；其余（含"并集全覆盖"）⇒ ≥1
+//     （纯等待变体无直通快路：凡有依赖都要等 older store 落地后访存）
 //   E mode=2 ⇒ 恰一次 cause 4、无写回、无访存；其余 mode ⇒ 无异常
 //   F load E1 当拍 `iss_ok=1`（闸门有效 ⇒ E1 不会撞上"更老未定址 store"）
 //   G mode=3 闸门场景：**确实**观测到 ≥1 拍 `ld_want & ~iss_ok`（更老 store 未定址阻塞）
@@ -182,8 +183,10 @@ module n12_memstress_lsq_top;
     //    · `ext_load(w, off, sz, uns)` 的字节道口径见 lsq_simple §写回段：
     //      LB 取 w[8*off]、LH 取 w[15:0]/w[31:16]、LW 取 w；
     //      ⇒ 与"返回该地址所在的对齐字"一致（a2=0/2 的半字、a2=0 的字）。
-    //    · store 落地**不改** `memimg`：本夹具的参考模型与读模型同源（自洽），
-    //      目的只测**转发**（真机的 store 落地语义由 lockstep/core_top TB 覆盖）。
+    //    · ★★ N29B（纯等待变体）：**store 落地（CDQ 排空口的写）按 `mem_req_wstrb`
+    //      写进 `memimg`** —— 夹具侧建模"该 store 已对 L1D 真实可见"。被覆盖的字节由
+    //      store 落地提供、其余仍是初值/前轮落地值；参考模型与读模型**同源** ⇒ 写回值
+    //      仍与 N12B 之前的参考**逐位相等**（数据来源从"转发"改成"落地后的存储映像"）。
     //    · 8 B 访问两拍：首拍 VA、次拍 VA+4（各自对齐字）⇒ 拼成 64 bit 小端。
     //==========================================================================
     integer k_mem;
@@ -204,6 +207,12 @@ module n12_memstress_lsq_top;
             mem_rsp_valid <= mem_req_valid & mem_req_ready & ~mem_req_wen;
             mem_rsp_tag   <= mem_req_tag;
             mem_rsp_rdata <= n12_rsp_word;
+            if (mem_req_valid & mem_req_ready & mem_req_wen) begin
+                if (mem_req_wstrb[0]) memimg[n12_wa+0] <= mem_req_wdata[7:0];
+                if (mem_req_wstrb[1]) memimg[n12_wa+1] <= mem_req_wdata[15:8];
+                if (mem_req_wstrb[2]) memimg[n12_wa+2] <= mem_req_wdata[23:16];
+                if (mem_req_wstrb[3]) memimg[n12_wa+3] <= mem_req_wdata[31:24];
+            end
         end
     end
 
@@ -353,6 +362,29 @@ module n12_memstress_lsq_top;
         end
     endtask
 
+    //   ★★ N29B：**粘滞捕获**写回/异常 —— 无依赖的 load 在 E1 后 1~2 拍即写回，而夹具
+    //     此时可能正在驱动更老 store 的提交（`cmt_store` 占若干拍）⇒ 单拍脉冲会被漏掉。
+    reg        wb_seen_m; reg [ROBW-1:0] wb_rob_m;
+    reg [31:0] wb_lo_m, wb_hi_m; reg wb_f64_m, wb_dst_m;
+    reg        exc_seen_m; reg [ROBW-1:0] exc_rob_m;
+    reg [3:0]  exc_cause_m; reg [31:0] exc_tval_m;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wb_seen_m <= 1'b0; wb_rob_m <= {ROBW{1'b0}}; wb_lo_m <= 32'h0; wb_hi_m <= 32'h0;
+            wb_f64_m <= 1'b0; wb_dst_m <= 1'b0;
+            exc_seen_m <= 1'b0; exc_rob_m <= {ROBW{1'b0}}; exc_cause_m <= 4'h0; exc_tval_m <= 32'h0;
+        end else begin
+            if (wb_valid) begin
+                wb_seen_m <= 1'b1; wb_rob_m <= wb_rob; wb_lo_m <= wb_data; wb_hi_m <= wb_data_hi;
+                wb_f64_m <= wb_f64; wb_dst_m <= wb_dst_i | wb_dst_f;
+            end
+            if (exc_valid_o) begin
+                exc_seen_m <= 1'b1; exc_rob_m <= exc_rob_o;
+                exc_cause_m <= exc_cause_o; exc_tval_m <= exc_tval_o;
+            end
+        end
+    end
+
     // ---- 等这条 load 的写回或数据侧异常（有限拍）----
     //   ★ 8 B 非对齐的 `mis_v` 会**同时**给出 `wb_valid`（`wb_dst_*=0`，不写目的寄存器）
     //     与 `exc_valid_o`（cause 4）⇒ 完成判定取"两者任一"，并由调用方按 mode 区分。
@@ -361,19 +393,23 @@ module n12_memstress_lsq_top;
         begin
             got_wb = 1'b0; got_exc = 1'b0;
             obs_wb_dst = 1'b1;
+            //   先看粘滞（可能已在 cmt_store 期间完成），再轮询
             for (t = 0; t < 600; t = t + 1) begin
-                @(posedge clk);
-                if (wb_valid && (wb_rob === rob)) begin
-                    obs_lo = wb_data; obs_hi = wb_data_hi; obs_f64 = wb_f64;
-                    obs_wb_dst = wb_dst_i | wb_dst_f;
+                if (wb_seen_m && (wb_rob_m === rob)) begin
+                    obs_lo = wb_lo_m; obs_hi = wb_hi_m; obs_f64 = wb_f64_m;
+                    obs_wb_dst = wb_dst_m;
                     got_wb = 1'b1;
                 end
-                if (exc_valid_o && (exc_rob_o === rob)) begin
-                    obs_cause = exc_cause_o; obs_tval = exc_tval_o;
+                if (exc_seen_m && (exc_rob_m === rob)) begin
+                    obs_cause = exc_cause_m; obs_tval = exc_tval_m;
                     got_exc = 1'b1;
                 end
                 if (got_wb || got_exc) t = 600;
+                else @(posedge clk);
             end
+            //   清粘滞供下一场景（每场景恰一条 load）
+            wb_seen_m = 1'b0; exc_seen_m = 1'b0;
+            @(negedge clk);
         end
     endtask
 
@@ -574,7 +610,10 @@ module n12_memstress_lsq_top;
                 exp_lo = {w_eb[3], w_eb[2], w_eb[1], w_eb[0]};
                 exp_hi = {w_eb[7], w_eb[6], w_eb[5], w_eb[4]};
             end
-            exp_mem = exp_fwa ? 1'b0 : ((c_mode == 2) ? 1'b0 : 1'b1);
+            //   ★★ N29B：`fwd_all_w`（并集全覆盖）**不再意味着 0 笔访存** —— 纯等待变体
+            //     没有直通快路，凡有依赖都要等 older store 落地后访存。只有 8 B 非对齐
+            //     （mode=2）才不发访存请求（合成 cause 4 写回）。
+            exp_mem = (c_mode == 2) ? 1'b0 : 1'b1;
             exp_exc = (c_mode == 2);
 
             // ---- 分配更老 store ----
@@ -621,10 +660,18 @@ module n12_memstress_lsq_top;
             // ---- 判据 F：E1 当拍闸门有效（不会撞上更老未定址 store）----
             chk(obs_issok === 1'b1, "F load E1 当拍 iss_ok=0（更老 store 未定址竟进入 E1）");
 
+            // ---- ★★ N29B：**先按程序序提交更老 store**（= 对 L1D 可见），load 才能
+            //      通过等待闸门发出访存。旧顺序（先 wait_ld 再提交）在纯等待变体下必然超时。
+            //      mode=2（8 B 非对齐）无更老 store、也不访存，跳过。
+            for (i = 0; i < c_nst; i = i + 1) begin
+                cmt_store(w_sslot[i], w_srob[i], ok);
+                if (!ok) ckfail("H store 提交排空未被 CDQ 收下（dr_take=0）");
+            end
+
             // ---- 等待完成 ----
             wait_ld(rob_load, got_wb, got_exc);
             obs_ldreq = n_ldreq;
-            if (!got_wb && !got_exc) ckfail("A load 未在限期内完成（写回/异常均未出现）");
+            if (!got_wb && !got_exc) ckfail($sformatf("A bench=%0d load 未在限期内完成（写回/异常均未出现）", id));
 
             // ---- 判据 E：异常口径 ----
             if (exp_exc) begin
@@ -636,11 +683,11 @@ module n12_memstress_lsq_top;
                     "E 8 B 非对齐不得写目的寄存器（wb_dst_i|wb_dst_f 应 = 0）");
             end else begin
                 chk(!got_exc, "E 非预期数据侧异常（本场景不应产生异常）");
-                chk(got_wb && (obs_wb_dst === 1'b1), "E 本场景应有写回（且写目的寄存器）");
+                chk(got_wb && (obs_wb_dst === 1'b1), $sformatf("E bench=%0d 本场景应有写回（且写目的寄存器）", id));
             end
             // ---- 判据 D：访存请求口径 ----
-            if (exp_mem) chk(obs_ldreq >= 1, "D 非全转发 load 应至少发 1 笔访存请求");
-            else         chk(obs_ldreq == 0, "D 全转发/非对齐 load 不得发访存请求");
+            if (exp_mem) chk(obs_ldreq >= 1, "D 有依赖 load 应至少发 1 笔访存请求（等待后访存）");
+            else         chk(obs_ldreq == 0, "D 8 B 非对齐 load 不得发访存请求");
             // ---- 判据 B：数据逐位 ----
             if ((c_mode == 0) || (c_mode == 3)) begin
                 n_ld_checked = n_ld_checked + 1;
@@ -651,7 +698,7 @@ module n12_memstress_lsq_top;
                         "B FLD 写回（wb_data/wb_data_hi/wb_f64）与参考不一致");
                 end else begin
                     chk(got_wb && (obs_lo === exp_lo),
-                        "B load 写回 wb_data 与参考（最年轻更老 store 逐字节覆盖 + 访存）不一致");
+                        $sformatf("B bench=%0d load 写回 wb_data 与参考不一致（obs=0x%08x ref=0x%08x）", id, obs_lo, exp_lo));
                 end
             end else if (c_mode == 1) begin
                 // 只判转发形态；数据打印诊断（见文件头 §遗留说明）
@@ -661,11 +708,7 @@ module n12_memstress_lsq_top;
                              obs_lo, exp_lo, (obs_lo === exp_lo) ? 0 : 1);
             end
 
-            // ---- 提交（程序序）：全部 store 排空 → load 提交点释放 ----
-            for (i = 0; i < c_nst; i = i + 1) begin
-                cmt_store(w_sslot[i], w_srob[i], ok);
-                if (!ok) ckfail("H store 提交排空未被 CDQ 收下（dr_take=0）");
-            end
+            // ---- 收尾：load 提交点释放（store 排空已在等待前完成）----
             cmt_load(rob_load);
             wait_idle(ok);
             if (!ok) ckfail("H 场景结束 STQ/LQ/CDQ 未回空（槽泄漏/排空悬挂）");

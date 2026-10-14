@@ -390,8 +390,15 @@ module lsq_simple #(
     //   ★★ `exe_size` 的编码是 **log2(字节数)**，不是字节数！唯一真源 `decoder.v`
     //      `mem_size_o`：LB/SB=3'd0、LH/SH=3'd1、LW/SW=3'd2、AMO=3'd2、flw=3'd2、
     //      fld=3'd3（其注释里的"1/2/4 B"是**字节数说明**，不是字段取值）。
-    //   转发优先级**口径**（沿用）：扫描**更老且地址已确认**的 store（32 候选 × 8 字节道），
-    //      取该字节上**最年轻**的匹配者（age = 离 ROB 头的距离 ⇒ 越大越年轻）。
+    //   ★★★ N29B（本变体的**结构口径**）：**store→load 转发已整体移除** ——
+    //     不再有"取最年轻匹配者 + 逐字节数据选择 + 全转发直通写回"，也没有任何字节合并。
+    //     本段只保留**命中/覆盖的存在性判定** `fwd_hit_w`（"更老且地址已确认的 store 是否
+    //     碰了我所需字节"）—— 它是 §2.3 等待闸门的使能位（N29A §3.1 第 1 项"必须保留"）。
+    //     下面 (a)(b) 的 per-store 年龄 / 字数等值预计算**原样保留**（叶子仍要用它们），
+    //     而 (c) 的 argmax 与 (e) 的 5 级数据选择树**删除**，(d) 只做 OR 归约。
+    //
+    //   历史口径（已废止，仅存档）：扫描更老且地址已确认的 store（32 候选 × 8 字节道），
+    //      取该字节上最年轻的匹配者（age = 离 ROB 头的距离 ⇒ 越大越年轻）。
     //   重写点（只消除重复，不改语义；对应审计 A-A4 的三条方向）：
     //     ① **per-entry 年龄向量**：`(stq_rob - rob_head) & 7'h7F` 每 store 只算一次
     //        （旧：每字节每 store 各算一份，源码 512 份）；
@@ -453,64 +460,39 @@ module lsq_simple #(
     end
     endgenerate
 
-    // ---- (c) 组合两路候选：取 age 大者、数据随之选择、hit 相或（纯函数，只吃入参）----
-    //   平局（age 相等）时按旧实现的"或"语义合并两路数据（年龄唯一时退化为唯一胜者）。
-    //   ★★ EXP-N10（2026-10-01）：**转发树内 age 位宽 8 → 6**（N7 报告 §6 建议 3a 的 sound 收窄）。
-    //     正确性论证（**纯结构性，与 ROB 窗口是否回绕无关**）：
-    //       · `m = (rob − rob_head) & 7'h7F`（rob/rob_head ∈ [0,63]）⇒ m 只可能落在
-    //         S = [0, 63−H] ∪ [128−H, 127]（H = rob_head；H=0 时右段为空）；
-    //       · 命中叶子必过 `fw_live_e`（**本段不动，8 bit 原样保留**）⇒ 其 m < age_rob；
-    //       · `m mod 64` 在 S 上**严格单调且单射**：[0,63−H] → [0,63−H]、
-    //         [128−H,127] → [64−H,63]，两像段相邻不交（64−H > 63−H）⇒ 树内
-    //         "取 age 大者（= 最年轻的更老 store）" 的 argmax 与平局语义逐位不变
-    //         ⇒ 叶子按 `8'h3F` 截断 + 比较器只比 [5:0]，与 8 bit 版**逐拍逐位等价**。
-    //     ★ 口径纠正（N7 报告 §6 建议 3a 的**前提有误**）：**"age_rob < 64"并不成立** ——
-    //       ROB 回绕时 `age_rob` 与"命中叶子"的 age 可达 127（核内实测 MAX_AGE_ROB=127、
-    //       live leaf age 最大 126，见探针）。等价性靠的是上面 S 的两段结构，**不是**
-    //       "窗口内年龄 <64"；标尺 TB 的 3000 例只喂了 age<64 的输入，**不足以**单独支撑结论。
-    //       真正的判据 = 核内 A/B 探针（8-bit 参考锥 ∥ 6-bit 变体锥，喂同一份产品 STQ/load
-    //       输入）：core_top_2b/lockstep/ipc 上 REF_VS_VAR=0、DUT_VS_REF=0。
-    //     ★ **禁止收窄 `fw_live_e` 有效门**（`:250-252` 口径）：`& 7'h7F` 正是"窗口内"与
-    //       "越过 ROB 头"两者的区分依据（收成 6 bit/模 64 会漏转发）；本函数不参与该门。
-    localparam integer FW_AGE_W    = 6;             // 树内 age 位宽（原 8）
-    localparam [7:0]   FW_AGE_MASK = 8'h3F;         // {2'b00, 6'h3F}：树内 age 的合法上界掩码
-    function [16:0] fw_max2(input [7:0] a_age, input [7:0] a_dat, input a_hit,
-                            input [7:0] b_age, input [7:0] b_dat, input b_hit);
-        reg a_ge;
-        begin
-            a_ge = (a_age[FW_AGE_W-1:0] >= b_age[FW_AGE_W-1:0]);
-            fw_max2[16]   = a_hit | b_hit;
-            fw_max2[15:8] = (a_ge ? a_age : b_age) & FW_AGE_MASK;
-            fw_max2[7:0]  = (a_hit &  a_ge ? a_dat : 8'h0) |
-                            (b_hit & (b_age[FW_AGE_W-1:0] >= a_age[FW_AGE_W-1:0]) ? b_dat : 8'h0);
-        end
-    endfunction
-
-    // ---- (d) 每字节 32 候选叶子（gj ≥ STQ_N 恒 0）----
-    //   本字节地址 = `exe_addr + gb`，其字数 = w0 + gcar、字内道 = glane（gcar/glane 只由
-    //   `exe_addr[1:0]` 与常量 gb 决定，与旧实现逐位一致）。
+    // ---- (c) ★★ N29B：**年龄 argmax / 数据选择段已整体删除** ----
+    //   旧实现（EXP-N10 口径）在这里放了 `fw_max2` 函数与 5 级 × 8 字节的"取最年轻更老
+    //   store"比较-选择树（248 个 `fw_max2`，携带 8 bit 年龄 + 8 bit 数据 + 1 bit 命中），
+    //   并有"树内 age 位宽 8→6 的 sound 收窄"论证。纯等待变体不再需要**任何**"谁是胜者"
+    //   的判定（没有转发数据可合并）⇒ 该函数与整棵树删除，只剩下面的命中归约 (d)。
+    //   ★ **唯一必须沿用的纪律**（与 N29B 无关的既有口径）：`fw_live_e` 的有效门是
+    //     `stq_age & 7'h7F`（7 bit 模 128，见 §0 的 `stq_age` 唯一计算点），**禁止**收窄成
+    //     6 bit / 模 64 —— `& 7'h7F` 正是"在 ROB 窗口内"与"已越过 ROB 头（提交但未排空）"
+    //     两者的区分依据，收窄会漏掉应计入的项。本变体同样按原样使用它。
+    // ---- (d) ★★ N29B：每字节 × 32 候选的**命中/覆盖叶子**（纯 OR 归约）----
+    //   本字节地址 = `exe_addr + gb`，其字数 = w0 + gcar、字内道 = gcar/lane（只由
+    //   `exe_addr[1:0]` 与常量 gb 决定 ⇒ 与旧逐字节转发树**逐位同源**，见 `lmask_w8` 注）。
     //   低字候选：store 低字 = 本字节所在字 且 掩码覆盖该道；
     //   高字候选：8 B store 的高字（低字地址 +4）= 本字节所在字。
-    //   ★★ EXP-N10：叶子携带的年龄按 `FW_AGE_MASK`（6 bit）截断 —— 命中叶子（`mt_w`）必然
-    //      通过 `fw_live_e`（`stq_age < age_rob`，而 `age_rob<64`）⇒ 截断是**无损的**
-    //      （上 2 bit 本来就是常量 0，截断只是把它在结构上钉成常量，供综合剪掉该数据通路）。
-    wire [8*32*8-1:0]  fw_a0;                // 叶子年龄（每叶 8 bit，仅低 6 bit 承载信息）
-    wire [8*32*8-1:0]  fw_d0;                // 叶子数据（每叶 8 bit）
-    wire [8*32-1:0]    fw_h0;                // 叶子命中（1 bit/叶）
-    wire [7:0]         fwd_hit_w;
-    wire [63:0]        fwd_data_w;
+    //   ★★ 本变体只保留**命中归约** `fwd_hit_w`（= N29A §3.1 第 1 项："等待闸门的真源"，
+    //      那 796 raw LUT 就是"更老 store 碰我所需字节"的**存在性判定**）——
+    //      年龄 argmax 比较-选择树（248 个 `fw_max2`）、逐字节数据选择、全转发直通写回
+    //      全部删除（N29A §4.1 的 VANISH 8240 raw LUT 主项）。
+    wire [8*32-1:0]    fw_hit_plane;         // 8 字节 × 32 候选的命中位平面（叶子输出）
+    wire [7:0]         fwd_hit_w;            // 每字节"是否被某更老已定址 store 覆盖"
     generate
     for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_b
-        //   ★★ EXP-N1 修复（同上）：`gb` 就是**本访问的字节序号 i**（`in_w = lmask_w8[gb]`，
+        //   ★★ EXP-N1 修复（保留）：`gb` 就是**本访问的字节序号 i**（`in_w = lmask_w8[gb]`，
         //     掩码已按 `exe_addr[1:0]` 移位 ⇒ 被置位的 gb 恰为 i = 0..size-1）。
         //     ⇒ 该字节的字内偏移 = (a+i) = gb（a = exe_addr[1:0]）：
-        //         gsum = gb（0..7）；gcar = 跨字数（0/1）；glane = 字内道。
+        //         gsum = gb（0..7）；gcar = 跨字数（0/1）；lane = 字内道。
         //     旧式 `gsum = exe_addr[1:0] + gb` 只在 a==0 时等于 gb ⇒ 对 a≠0（如 lh@+2）
         //     会取错字/错道（详见上面 `lmask_w8` 处的根因说明）。
         wire [3:0]  gsum_w  = gb[3:0];
         wire [1:0]  gcar_w  = gsum_w[3:2];
         wire [1:0]  lane_w  = gsum_w[1:0];
         wire        in_w    = lmask_w8[gb];                     // 该字节在本次访问内
+        wire [31:0] hit_b;                                      // 本字节的 32 候选命中位
         for (gj = 0; gj < 32; gj = gj + 1) begin : g_fw_j
             if (gj < STQ_N) begin : g_fw_on
                 wire lo_eq_w = (gcar_w == 2'd0) ? fw_eq0_e [gj] :
@@ -519,78 +501,92 @@ module lsq_simple #(
                                (gcar_w == 2'd1) ? fw_eq0_e [gj] : fw_eqp_e [gj];
                 wire lo_w = lo_eq_w & stq_msk[gj][lane_w];
                 wire hi_w = stq_hi[gj] & hi_eq_w;
-                wire mt_w = in_w & fw_live_e[gj] & (lo_w | hi_w);
-                assign fw_a0[(gb*32+gj)*8 +: 8] = mt_w ? (stq_age[gj*8 +: 8] & FW_AGE_MASK) : 8'h0;
-                assign fw_d0[(gb*32+gj)*8 +: 8] = mt_w ? (lo_w ? stq_d [gj][8*lane_w +: 8]
-                                                               : stq_dh[gj][8*lane_w +: 8]) : 8'h0;
-                assign fw_h0[gb*32 + gj] = mt_w;
+                //   叶子 = "更老（`fw_live_e`：v & av & age<age_ld）且覆盖本字节"
+                assign hit_b[gj] = in_w & fw_live_e[gj] & (lo_w | hi_w);
             end else begin : g_fw_off
-                assign fw_a0[(gb*32+gj)*8 +: 8] = 8'h0;
-                assign fw_d0[(gb*32+gj)*8 +: 8] = 8'h0;
-                assign fw_h0[gb*32 + gj] = 1'b0;
+                assign hit_b[gj] = 1'b0;
             end
         end
+        assign fw_hit_plane[gb*32 +: 32] = hit_b;
+        //   命中归约：本字节是否有任何候选命中（旧树第 5 级根结点的 `cc[16]`，逐位等价）
+        assign fwd_hit_w[gb] = |hit_b;
     end
     endgenerate
 
-    // ---- (e) 每字节 32→1 平衡比较-选择树（5 级：32→16→8→4→2→1）----
-    //   每级每结点 = 一次 `fw_max2`；`fwd_hit_w`/`fwd_data_w` 取第 5 级根结点。
-    wire [8*16*8-1:0] fw_a1, fw_d1;  wire [8*16-1:0] fw_h1;
-    wire [8*8*8-1:0]  fw_a2, fw_d2;  wire [8*8-1:0]  fw_h2;
-    wire [8*4*8-1:0]  fw_a3, fw_d3;  wire [8*4-1:0]  fw_h3;
-    wire [8*2*8-1:0]  fw_a4, fw_d4;  wire [8*2-1:0]  fw_h4;
-    generate
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r1
-        for (gk = 0; gk < 16; gk = gk + 1) begin : g_r
-            wire [16:0] cc;
-            assign cc = fw_max2(fw_a0[(gb*32+2*gk  )*8 +: 8], fw_d0[(gb*32+2*gk  )*8 +: 8], fw_h0[gb*32+2*gk  ],
-                                fw_a0[(gb*32+2*gk+1)*8 +: 8], fw_d0[(gb*32+2*gk+1)*8 +: 8], fw_h0[gb*32+2*gk+1]);
-            assign fw_a1[(gb*16+gk)*8 +: 8] = cc[15:8];
-            assign fw_d1[(gb*16+gk)*8 +: 8] = cc[7:0];
-            assign fw_h1[gb*16+gk] = cc[16];
-        end
-    end
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r2
-        for (gk = 0; gk < 8; gk = gk + 1) begin : g_r
-            wire [16:0] cc;
-            assign cc = fw_max2(fw_a1[(gb*16+2*gk  )*8 +: 8], fw_d1[(gb*16+2*gk  )*8 +: 8], fw_h1[gb*16+2*gk  ],
-                                fw_a1[(gb*16+2*gk+1)*8 +: 8], fw_d1[(gb*16+2*gk+1)*8 +: 8], fw_h1[gb*16+2*gk+1]);
-            assign fw_a2[(gb*8+gk)*8 +: 8] = cc[15:8];
-            assign fw_d2[(gb*8+gk)*8 +: 8] = cc[7:0];
-            assign fw_h2[gb*8+gk] = cc[16];
-        end
-    end
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r3
-        for (gk = 0; gk < 4; gk = gk + 1) begin : g_r
-            wire [16:0] cc;
-            assign cc = fw_max2(fw_a2[(gb*8+2*gk  )*8 +: 8], fw_d2[(gb*8+2*gk  )*8 +: 8], fw_h2[gb*8+2*gk  ],
-                                fw_a2[(gb*8+2*gk+1)*8 +: 8], fw_d2[(gb*8+2*gk+1)*8 +: 8], fw_h2[gb*8+2*gk+1]);
-            assign fw_a3[(gb*4+gk)*8 +: 8] = cc[15:8];
-            assign fw_d3[(gb*4+gk)*8 +: 8] = cc[7:0];
-            assign fw_h3[gb*4+gk] = cc[16];
-        end
-    end
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r4
-        for (gk = 0; gk < 2; gk = gk + 1) begin : g_r
-            wire [16:0] cc;
-            assign cc = fw_max2(fw_a3[(gb*4+2*gk  )*8 +: 8], fw_d3[(gb*4+2*gk  )*8 +: 8], fw_h3[gb*4+2*gk  ],
-                                fw_a3[(gb*4+2*gk+1)*8 +: 8], fw_d3[(gb*4+2*gk+1)*8 +: 8], fw_h3[gb*4+2*gk+1]);
-            assign fw_a4[(gb*2+gk)*8 +: 8] = cc[15:8];
-            assign fw_d4[(gb*2+gk)*8 +: 8] = cc[7:0];
-            assign fw_h4[gb*2+gk] = cc[16];
-        end
-    end
-    for (gb = 0; gb < 8; gb = gb + 1) begin : g_fw_r5
-        wire [16:0] cc;
-        assign cc = fw_max2(fw_a4[(gb*2+0)*8 +: 8], fw_d4[(gb*2+0)*8 +: 8], fw_h4[gb*2+0],
-                            fw_a4[(gb*2+1)*8 +: 8], fw_d4[(gb*2+1)*8 +: 8], fw_h4[gb*2+1]);
-        assign fwd_hit_w [gb]        = cc[16];
-        assign fwd_data_w[gb*8 +: 8] = cc[7:0];
-    end
-    endgenerate
-
-    //   ★★ 4c(3/3)：全转发判据按 **8 字节道**掩码（≤4 B 时高 4 道掩码为 0 ⇒ 与旧口径逐位等价）
+    //   ★★ 4c(3/3)：全转发判据按 **8 字节道**掩码（≤4 B 时高 4 道掩码为 0 ⇒ 与旧口径逐位等价）。
+    //   ★★ N29B：本信号在纯等待变体中**不再参与任何功能**（无直通快路）——保留**仅供**
+    //      既有只读探针 `sim/unit/dyn_probe_n12_body.inc` / `dyn_probe_r_body.inc`
+    //      的层次引用（`n12_run.sh` 等采集脚本可继续编译）；综合器会把它当死逻辑剪除。
     wire fwd_all_w = ((fwd_hit_w & lmask_w8) == lmask_w8);
+
+    //==========================================================================
+    // 2.3 ★★ N29B：纯等待变体 —— 「更老且尚未对 L1D 可见的 store」全局最小年龄
+    //--------------------------------------------------------------------------
+    // 【语义（answer.md §四 N22C 硬要求）】load 必须在**它依赖的 older store 对 L1D 真实
+    //   可见**之后才允许访存 —— 不是"已提交到 ROB / 只进了写缓冲"，而是**该 store 已完成
+    //   CDQ 排空 + L1D 写完成**。
+    //   本模块的"可见"真源 = `stq_ret`：它在 `dr_fire` 那一拍置位，即该笔存储在**唯一的
+    //   访存请求口**上被受理（`dr_issue`，`mem_req_wen=1`）；排空口与 load 口共用单请求、
+    //   单笔在途，且**排空拍不发 load 请求**（`ld_fire` 含 `~dr_any`）。
+    // 【闸门】`ld_wait[s] = ld_v & ld_ex & ld_dep_v[s] & ~ld_mis[s] & (stq_old_age < age_ld[s])`
+    //   · `ld_dep_v[s]`：本 load 在 E1 当拍**确有**更老且地址已确认的 store 覆盖其所需字节
+    //     （= `|fwd_hit_w`，即 §2.2 的命中归约；N29A §3.1 第 1 项"必须保留"的那部分）。
+    //     无覆盖 ⇒ 无依赖 ⇒ **不等待**（这是把代价限制在真实依赖 load 上的关键）。
+    //   · `stq_old_age`：STQ 内**全部未落地项**（`stq_und_v = stq_v & ~stq_ret`）年龄的最小
+    //     值；无未落地项时收敛到哨兵 `8'hFF`（恒大于任何 7-bit 年龄 ⇒ 恒放行）。
+    //     ★ `stq_und_v` **不含 `stq_av` 条件** ⇒ **"已分配未执行（地址未解析）"的 store
+    //       同样计入保守等待**（任务书明写的"含地址未解析期 `stq_v&~stq_av` 保守等待"）。
+    //   · `age_ld[s] = (ld_rob[s] − rob_head) & 7'h7F`。
+    // 【为什么"全局最小年龄 < 本 load 年龄"⟺"存在更老未落地项"】年龄 = 离 ROB 头的距离；
+    //   排空严格按程序序（CDQ 是 FIFO，提交序 = 程序序；8 B store 低半在前）⇒ **未落地
+    //   集合在程序序上是后缀**，其最小年龄就是"最老的未落地项"。比本 load 更老的 store
+    //   年龄 < age_ld，更年轻者 > age_ld ⇒ 最小年龄 < age_ld 当且仅当存在更老未落地项。
+    // 【"已提交但尚未排空"的项年龄会落在 65..127（越过 ROB 头），不在本条判据内 —— 由
+    //   请求口的 `~dr_any` 门覆盖】：提交与入 CDQ 是**同一拍原子事件**（`dr_take =
+    //   dr_valid & dr_room_ok`，而 `dr_valid` 已被 `dr_room_ok` 门控）⇒ "已提交未落地"
+    //   ⟺ 仍在 CDQ ⇒ `dr_any=1` ⇒ `ld_fire=0`。两条门合并即完备（已逐 case 论证）。
+    // 【死锁论证】被挡 load 等待的更老 store **必能自行提交**（它们比该 load 更老，不受它
+    //   阻塞）并逐拍排空（CDQ 单笔/拍）⇒ 闸门必然解除；两条兜底：`stq_bad`（页错误/非对齐）
+    //   项走精确陷阱 + `flush_all`；请求口**跳过被挡项**（N12B-fix1 教训，见 §3.2）。
+    //==========================================================================
+    wire [STQ_N-1:0]   stq_und_v;            // 未落地：已分配 且 尚未完成 L1D 写
+    wire [8*STQ_N-1:0] stq_und_age;          // 逐项"未落地则年龄、否则 8'hFF"
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_und
+        assign stq_und_v[gv] = stq_v[gv] & ~stq_ret[gv];
+        assign stq_und_age[gv*8 +: 8] = stq_und_v[gv] ? stq_age[gv*8 +: 8] : 8'hFF;
+    end
+    endgenerate
+    //   32→1 **平衡**最小树（5 级）——与 N12B-fix2 同一教训：**禁用**顺序比较链
+    //   （N12B 实测顺序写法把最长组合路径从 68.4 ns 拉到 118.7 ns，189 级 / 44 CARRY4）。
+    wire [8*16-1:0] und_m1;
+    wire [8*8-1:0]  und_m2;
+    wire [8*4-1:0]  und_m3;
+    wire [8*2-1:0]  und_m4;
+    wire [7:0]      stq_old_age;
+    generate
+    for (gv = 0; gv < 16; gv = gv + 1) begin : g_unm1
+        wire [7:0] ua = stq_und_age[8*(2*gv)   +: 8];
+        wire [7:0] ub = stq_und_age[8*(2*gv+1) +: 8];
+        assign und_m1[8*gv +: 8] = (ua < ub) ? ua : ub;
+    end
+    for (gv = 0; gv < 8; gv = gv + 1) begin : g_unm2
+        wire [7:0] ua = und_m1[8*(2*gv)   +: 8];
+        wire [7:0] ub = und_m1[8*(2*gv+1) +: 8];
+        assign und_m2[8*gv +: 8] = (ua < ub) ? ua : ub;
+    end
+    for (gv = 0; gv < 4; gv = gv + 1) begin : g_unm3
+        wire [7:0] ua = und_m2[8*(2*gv)   +: 8];
+        wire [7:0] ub = und_m2[8*(2*gv+1) +: 8];
+        assign und_m3[8*gv +: 8] = (ua < ub) ? ua : ub;
+    end
+    for (gv = 0; gv < 2; gv = gv + 1) begin : g_unm4
+        wire [7:0] ua = und_m3[8*(2*gv)   +: 8];
+        wire [7:0] ub = und_m3[8*(2*gv+1) +: 8];
+        assign und_m4[8*gv +: 8] = (ua < ub) ? ua : ub;
+    end
+    assign stq_old_age = (und_m4[7:0] < und_m4[15:8]) ? und_m4[7:0] : und_m4[15:8];
+    endgenerate
 
 
     //==========================================================================
@@ -625,9 +621,12 @@ module lsq_simple #(
     reg  [31:0]          ld_addr [0:OUT_N-1];
     reg  [2:0]           ld_size [0:OUT_N-1];
     reg                  ld_uns  [0:OUT_N-1];
-    //   ★★ 4c(3/3)：转发掩码/数据 **按 8 字节道**（8 B 访问要两个 4 B 字的转发合并）
-    reg  [7:0]           ld_hm   [0:OUT_N-1];
-    reg  [63:0]          ld_hd   [0:OUT_N-1];
+    //   ★★ N29B（纯等待变体）：`ld_hm`（逐字节转发掩码 8×8 bit）与 `ld_hd`（逐字节转发
+    //     数据 8×64 bit）**已随转发树一并删除** —— 写回不再做任何字节合并。
+    //     取而代之的是**每项 1 bit 的依赖快照** `ld_dep_v`：E1 当拍"本 load 所需字节里是否
+    //     有更老且地址已确认的 store 覆盖"（= `|fwd_hit_w`）。它是等待闸门 §2.3 的使能位；
+    //     唯一写点 = E1，槽复用 / 提交点释放 / 冲刷拍清零。
+    reg                  ld_dep_v [0:OUT_N-1];
     reg  [TAG_W-1:0]     ld_tag  [0:OUT_N-1];
     //   ★★ 4c(3/3)：8 B（fld）两拍访问的状态
     //     · `ld_hi`  ：本项是 8 B 访问
@@ -730,9 +729,37 @@ module lsq_simple #(
     endgenerate
 
     wire             pend_any   = |pend_vec;
-    wire [LQ_IW-1:0] pend_sel   = pri_enc(pend_vec);
+    //   ★★ N29B：请求口**只从未被等待闸挡住的 pending 项里选** —— 这是 N12B-fix1 的
+    //     **死锁教训**（必须遵守）：**不得按槽号取最低 pending**。槽号 ≠ 程序序（槽在提交点
+    //     释放、按最低空闲号复用）⇒ 旧写法实测让 ROB 头的 load 被一个更年轻的等待项长期
+    //     占住唯一请求口（`p17_fld_fsd` 全核停摆 20 万拍、黄金第 71 条起背离）。
+    //     本变体的口径：**只发"不等待"的项**；若本拍全部 pending 都在等待，则**不发**
+    //     （不能像 N12B 那样"全被挡时回退原口径"—— 纯等待变体没有转发数据可合并，
+    //      发出去会直读**陈旧内存**）。安全性：等待者所需的更老 store 会自行提交/排空
+    //      ⇒ 闸门必然解除（§2.3 死锁论证）。
+    wire [OUT_N-1:0] pend_ok_w  = pend_vec & ~ld_wait;
+    wire             fire_any   = |pend_ok_w;
+    wire [LQ_IW-1:0] fire_sel   = pri_enc(pend_ok_w);
+    //   诊断/探针兼容别名（`tb_back2_lsq_fwd` 的 DBG 打印引用 `u_lsq.pend_sel`）——
+    //   功能上**不再使用**；综合器按死逻辑剪除。
+    wire [LQ_IW-1:0] pend_sel   = fire_sel;
     wire             rsp_ok     = mem_rsp_valid & (|rsp_vec);
     wire [LQ_IW-1:0] rsp_sel    = pri_enc(rsp_vec);
+
+    //   ★★ N29B：**LQ 项等待闸门**（纯组合，只吃寄存器态 ⇒ 无组合环）：
+    //     `ld_wait[s] = 已 E1 的有效项 & 有依赖快照 & 非"8 B 非对齐（不访存）" &
+    //                   存在更老未落地 store`
+    //   `ld_mis` 项**永不等待**：它不发访存请求、由 `mis_v` 合成一次带错写回（cause 4），
+    //   若把它挡在请求口外会造成无谓延迟。
+    wire [OUT_N-1:0] ld_wait;
+    generate
+    for (gv = 0; gv < OUT_N; gv = gv + 1) begin : g_lwait
+        wire [7:0] age_ld_w = (ld_rob[gv] - rob_head) & 7'h7F;
+        assign ld_wait[gv] = ld_v[gv] & ld_ex[gv] & ld_dep_v[gv] & ~ld_mis[gv] &
+                             (stq_old_age < age_ld_w);
+    end
+    endgenerate
+
     // 发射许可（★ 2B-4）：槽位已在**派发期**分配 ⇒ 此处只剩"无更老未定址 store"一条件
     //   （旧口径还要求"有空闲 LQ 槽"，那是"槽在 E1 分配"时代的死锁防护，已不需要）。
     //   ★★ 2B-4 内存序缺口修复（修法 1 的精确定位版，见报告 §B4.18）：**再加"CDQ 已排空"**——
@@ -895,7 +922,8 @@ module lsq_simple #(
     wire              dr_fire = dr_any & mem_req_ready & (dr_ok | dr_bad);   // 离队
     wire              dr_issue= dr_any & mem_req_ready &  dr_ok;             // 真发写
     //   ★ 4c(3/3)：非对齐的 8 B 项**不发访存请求**（由 `mis_v` 合成带错写回）
-    wire              ld_fire = pend_any & ~dr_any & mem_req_ready & ~ld_mis[pend_sel];
+    //   ★★ N29B：只从 `pend_ok_w`（未被等待闸挡住）里取 `fire_sel`；全被挡 ⇒ `ld_fire=0`。
+    wire              ld_fire = fire_any & ~dr_any & mem_req_ready & ~ld_mis[fire_sel];
 
     assign mem_req_valid = dr_issue | ld_fire;
     assign mem_req_wen   = dr_issue;
@@ -903,21 +931,17 @@ module lsq_simple #(
     //     落在下一页，须按该页自己的映射翻译；2A 的 `m_pa_eff = m_pa_q + 4`（连续物理地址）
     //     是其简化，母代理裁决**不降级**：本核按 ISA 正确口径做，差异登记在报告 §B4.41）。
     assign mem_req_addr  = dr_issue ? cdq_pa[cdq_head]  :
-                           (ld_addr[pend_sel] + (ld_beat[pend_sel] ? 32'd4 : 32'd0));
+                           (ld_addr[fire_sel] + (ld_beat[fire_sel] ? 32'd4 : 32'd0));
     assign mem_req_wdata = dr_issue ? cdq_d[cdq_head]   : 32'h0;
     assign mem_req_wstrb = dr_issue ? cdq_m[cdq_head]   : 4'h0;
-    assign mem_req_tag   = dr_issue ? {TAG_W{1'b1}}     : ld_tag[pend_sel];
+    assign mem_req_tag   = dr_issue ? {TAG_W{1'b1}}     : ld_tag[fire_sel];
 
-    // ---- 写回：响应到达 或（部分/全部）转发 + 响应 合并 ----
-    wire [31:0] wb_word = mem_rsp_rdata;
-    //   ★★ 4c(3/3)：转发合并按“本拍对应的 4 字节”取 —— 8 B 访问的首拍取字节道 0..3、
-    //     次拍取 4..7（≤4 B 时 `ld_beat=0` ⇒ 恒取低半，与旧口径逐位等价）
-    wire [3:0]  hm_beat = ld_beat[rsp_sel] ? ld_hm[rsp_sel][7:4] : ld_hm[rsp_sel][3:0];
-    wire [31:0] hd_beat = ld_beat[rsp_sel] ? ld_hd[rsp_sel][63:32] : ld_hd[rsp_sel][31:0];
-    wire [31:0] wb_merge = { hm_beat[3] ? hd_beat[31:24] : wb_word[31:24],
-                             hm_beat[2] ? hd_beat[23:16] : wb_word[23:16],
-                             hm_beat[1] ? hd_beat[15:8]  : wb_word[15:8],
-                             hm_beat[0] ? hd_beat[7:0]   : wb_word[7:0] };
+    // ---- 写回：**纯访存响应**（★ N29B：转发字节合并已删除）----
+    //   旧实现按 `ld_hm` 逐字节在 `ld_hd`（转发数据）与 `mem_rsp_rdata`（内存）之间二选一；
+    //   纯等待变体下 load 只在依赖的 older store **已对 L1D 可见**（CDQ 排空完成）后才发出，
+    //   故读回的就是**最新**存储映像 ⇒ 不再需要任何合并。
+    wire [31:0] wb_word  = mem_rsp_rdata;
+    wire [31:0] wb_merge = wb_word;
     //   ★★ N12-fix（2026-10-01，EXP-N12-STRESS §8.1 定位的非对齐全转发缺陷）：
     //     本函数的入参口径 = **「本次访问的字节 0 已对齐到 bit0」的 32 bit 窗口**
     //     （调用点在下方 `fwdp_wsh` / `wbw_sh` 两处**各自先右移 a2 字节**）。
@@ -944,28 +968,19 @@ module lsq_simple #(
         end
     endfunction
 
-    // 全转发项：E1 次拍直接写回（单寄存器直通）；★ 4c(3/3) 起数据宽 64 bit（8 B 用）
+    //  ★★ N29B：**全转发直通项（`fwdp_*` 9 个寄存器 / 93 FF）已整组删除** ——
+    //     纯等待变体没有"E1 次拍直接写回"的快路：每次 load 都占 LQ 槽、等依赖落地后访存。
     wire        mis_v;                       // ★ 8 B 非对齐 ⇒ 合成一次带错写回（cause 4）
-    reg         fwdp_v;
-    reg [ROB_IDX_W-1:0] fwdp_rob;
-    reg [`BACK2_EPOCH_W-1:0] fwdp_ep;
-    reg         fwdp_di, fwdp_df;
-    reg [PDW_I-1:0] fwdp_pi;
-    reg [PDW_F-1:0] fwdp_pf;
-    reg [63:0]  fwdp_data;                   // ★ 4c(3/3)：8 B 全转发要 64 bit
-    reg [2:0]   fwdp_size;
-    reg [1:0]   fwdp_off;
-    reg         fwdp_uns;
 
     //   ★★ 4c(3/3)：写回源三选一 —— 全转发 / 访存响应 / **8 B 非对齐合成（带错）**；
     //     8 B 访问的**首拍响应不写回**（数据还没齐，等第二拍组装）
     wire        rsp_wb_w     = rsp_ok & (~ld_2b[rsp_sel] | ld_beat[rsp_sel]);
     //   非对齐 8 B：**不发访存请求**，直接合成一次“带错写回”（done+exc 同拍，与 rsp_err 同法）。
     //   判据只吃 `pend` 选择结果 ⇒ 与既有优先级链同源、无新挂起态。
-    assign      mis_v        = pend_any & ld_mis[pend_sel] & ~dr_any;
-    assign wb_valid   = fwdp_v | rsp_wb_w | mis_v;
-    assign wb_rob     = fwdp_v ? fwdp_rob  : (mis_v ? ld_rob[pend_sel] : ld_rob[rsp_sel]);
-    assign wb_epoch   = fwdp_v ? fwdp_ep   : (mis_v ? ld_ep[pend_sel] : ld_ep[rsp_sel]);
+    assign      mis_v        = fire_any & ld_mis[fire_sel] & ~dr_any;
+    assign wb_valid   = rsp_wb_w | mis_v;
+    assign wb_rob     = mis_v ? ld_rob[fire_sel] : ld_rob[rsp_sel];
+    assign wb_epoch   = mis_v ? ld_ep[fire_sel]  : ld_ep[rsp_sel];
     //   ★★ 4b-2b：带错响应**不得写回目的寄存器**（该 load 将以精确异常结束、
     //     永不提交；抑制 PRF 写口是双保险）。转发路径（fwdp_v）不参与本判据。
     //   ★★ 4b-2b-fix（实测回归抓出）：`mem_rsp_err` 必须用 `=== 1'b1` **净化**——
@@ -974,8 +989,8 @@ module lsq_simple #(
     //     ⇒ 整核写回失效（实测 `tb_back2_lockstep` 第 1 个程序后停摆 24 条）。
     //     口径：**只有明确的 1 才算"带错响应"**，z/x/0 一律按正常响应处理。
     wire              rsp_err_w = (mem_rsp_err === 1'b1);
-    assign wb_dst_i   = fwdp_v ? fwdp_di   : (((rsp_ok & rsp_err_w) | mis_v) ? 1'b0 : ld_di[rsp_sel]);
-    assign wb_dst_f   = fwdp_v ? fwdp_df   : (((rsp_ok & rsp_err_w) | mis_v) ? 1'b0 : ld_df[rsp_sel]);
+    assign wb_dst_i   = ((rsp_ok & rsp_err_w) | mis_v) ? 1'b0 : ld_di[rsp_sel];
+    assign wb_dst_f   = ((rsp_ok & rsp_err_w) | mis_v) ? 1'b0 : ld_df[rsp_sel];
     //   ★★ 4b-2b：数据侧精确异常上报。与 `wb_valid`（= 该 load 的 done）**同拍** ⇒
     //     ROB 的 `upd_exc`（异常位）与写回（done 位）在同一沿写入 ⇒ 下一拍 ROB 头部
     //     同时看到 done+exc ⇒ 精确抛陷阱、且该指令**没有**提交（见 rob.v:166/222）。
@@ -991,17 +1006,17 @@ module lsq_simple #(
     //         且置 `stq_bad` ⇒ 该项不排空、以精确陷阱结束 —— 与 store 页错误同法）
     wire st_mis_w = exe_valid & exe_is_store & (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
     assign exc_valid_o = (rsp_ok & rsp_err_w) | stx_flt_rep_w | mis_v | st_mis_w;
-    assign exc_rob_o   = mis_v    ? ld_rob[pend_sel] :
+    assign exc_rob_o   = mis_v    ? ld_rob[fire_sel] :
                          st_mis_w ? exe_rob :
                          stx_flt_rep_w ? stq_rob[stx_idx_q] : ld_rob[rsp_sel];
     assign exc_cause_o = mis_v    ? 4'd4  :
                          st_mis_w ? 4'd6  :
                          stx_flt_rep_w ? 4'd15 : 4'd13;
-    assign exc_tval_o  = mis_v    ? ld_addr[pend_sel] :
+    assign exc_tval_o  = mis_v    ? ld_addr[fire_sel] :
                          st_mis_w ? exe_addr :
                          stx_flt_rep_w ? stq_a[stx_idx_q] : ld_addr[rsp_sel];
-    assign wb_pdest_i = fwdp_v ? fwdp_pi   : (mis_v ? {PDW_I{1'b0}} : ld_pi[rsp_sel]);
-    assign wb_pdest_f = fwdp_v ? fwdp_pf   : (mis_v ? {PDW_F{1'b0}} : ld_pf[rsp_sel]);
+    assign wb_pdest_i = mis_v ? {PDW_I{1'b0}} : ld_pi[rsp_sel];
+    assign wb_pdest_f = mis_v ? {PDW_F{1'b0}} : ld_pf[rsp_sel];
     //   ★★ 4c(3/3)：8 B 装载 = `{高 4 B 合并值, 首拍锁存的低 4 B}`；ISA 口径 **FLD 不做
     //     NaN-box**（后端据此写满 FLEN）。≤4 B 保持原 `ext_load` 语义 ⇒ 零回归。
     //   ★★ N12-fix：两条取数路径都先把窗口**右移 a2 字节**（本次访问的字节 0 落到 bit0）：
@@ -1010,7 +1025,6 @@ module lsq_simple #(
     //     · memory：`wb_merge` 是「`VA&~3` 对齐字」逐字节合并结果 ⇒ 同口径右移。
     //     8 B（fld）两半从**同一个**右移后窗口取（该路径 a2 恒 0：8 B 非对齐在 E1 即
     //     `ld_mis`⇒cause 4，不参与转发）⇒ 高半与低半始终同源、不会各自错位。
-    wire [63:0] fwdp_wsh = fwdp_data >> {fwdp_off, 3'b000};
     wire [31:0] wbw_sh   = wb_merge  >> {ld_addr[rsp_sel][1:0], 3'b000};
     //   ★★ N12B-cross：跨 4 B 字边界的 ≤4 B load —— 两拍已把「低字 = VA 所在对齐字 A
     //     （字节道 0..3）、高字 = 对齐字 A+4（道 4..7）」逐字节合并完成（首拍锁存在
@@ -1019,17 +1033,15 @@ module lsq_simple #(
     //     （旧实现单拍 ⇒ 高字恒缺 ⇒ 写回值高字节为 0）。
     wire [63:0] xw_win   = {wb_merge, ld_lo[rsp_sel]};
     wire [63:0] xw_wsh   = xw_win   >> {ld_addr[rsp_sel][1:0], 3'b000};
-    assign wb_data    = fwdp_v ? ext_load(fwdp_wsh[31:0], fwdp_size, fwdp_uns)
-                               : (ld_hi[rsp_sel] ? ld_lo[rsp_sel]
-                                                 : (ld_xw[rsp_sel] ? ext_load(xw_wsh[31:0],
-                                                                              ld_size[rsp_sel],
-                                                                              ld_uns[rsp_sel])
-                                                                   : ext_load(wbw_sh,
-                                                                              ld_size[rsp_sel],
-                                                                              ld_uns[rsp_sel])));
-    assign wb_data_hi = fwdp_v ? fwdp_wsh[63:32]
-                               : (ld_xw[rsp_sel] ? xw_wsh[63:32] : wb_merge);
-    assign wb_f64     = fwdp_v ? (fwdp_size == 3'd3) : ld_hi[rsp_sel];
+    assign wb_data    = ld_hi[rsp_sel] ? ld_lo[rsp_sel]
+                                       : (ld_xw[rsp_sel] ? ext_load(xw_wsh[31:0],
+                                                                    ld_size[rsp_sel],
+                                                                    ld_uns[rsp_sel])
+                                                         : ext_load(wbw_sh,
+                                                                    ld_size[rsp_sel],
+                                                                    ld_uns[rsp_sel]));
+    assign wb_data_hi = ld_xw[rsp_sel] ? xw_wsh[63:32] : wb_merge;
+    assign wb_f64     = ld_hi[rsp_sel];
 
     assign st_done_valid = exe_valid & exe_is_store;
     assign st_done_rob   = exe_rob;
@@ -1054,10 +1066,6 @@ module lsq_simple #(
             cdq_pv  <= {CDQ_N{1'b0}}; cdq_bad <= {CDQ_N{1'b0}};
             stx_act_q <= 1'b0; stx_src_q <= 1'b0; stx_idx_q <= {STQ_IW{1'b0}};
             stx_va_q  <= 32'h0; stx_ctx_q <= 4'h0;
-            fwdp_v <= 1'b0; fwdp_rob <= {ROB_IDX_W{1'b0}}; fwdp_ep <= {`BACK2_EPOCH_W{1'b0}};
-            fwdp_di <= 1'b0; fwdp_df <= 1'b0; fwdp_pi <= {PDW_I{1'b0}};
-            fwdp_pf <= {PDW_F{1'b0}}; fwdp_data <= 32'h0; fwdp_size <= 3'h0;
-            fwdp_off <= 2'h0; fwdp_uns <= 1'b0;
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0;
                 stq_a[si] <= 32'h0; stq_d[si] <= 32'h0; stq_msk[si] <= 4'h0;
@@ -1071,7 +1079,7 @@ module lsq_simple #(
                 ld_ep[si] <= {`BACK2_EPOCH_W{1'b0}}; ld_di[si] <= 1'b0; ld_df[si] <= 1'b0;
                 ld_pi[si] <= {PDW_I{1'b0}}; ld_pf[si] <= {PDW_F{1'b0}};
                 ld_addr[si] <= 32'h0; ld_size[si] <= 3'h0; ld_uns[si] <= 1'b0;
-                ld_hm[si] <= 4'h0; ld_hd[si] <= 32'h0; ld_tag[si] <= {TAG_W{1'b0}};
+                ld_dep_v[si] <= 1'b0; ld_tag[si] <= {TAG_W{1'b0}};
                 ld_hi[si] <= 1'b0; ld_beat[si] <= 1'b0; ld_mis[si] <= 1'b0;
                 ld_xw[si] <= 1'b0; ld_lo[si] <= 32'h0;
             end
@@ -1137,18 +1145,15 @@ module lsq_simple #(
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
                 ld_hi[si] <= 1'b0; ld_beat[si] <= 1'b0; ld_mis[si] <= 1'b0; ld_lo[si] <= 32'h0;
-                ld_xw[si] <= 1'b0;
+                ld_xw[si] <= 1'b0; ld_dep_v[si] <= 1'b0;
             end
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
-            fwdp_v <= 1'b0;
             //   ★★ (b)：`flush_all` **不清** 在途翻译状态（`stx_act_q/...`）——
             //     被冲刷的那笔翻译可以无害地跑完（STQ 写回有 `stq_v & ~stq_pv` 门，见 §4.5b），
             //     而"已提交但 PA 未到"的项仍靠 **CDQ 源扫描**完成翻译并排空（活性保证）✓。
             //     注意：CDQ 本身不受 `flush_all` 影响（既有设计口径，见 §3.3 头注）✓。
         end else begin
-            // ---- 4.1 默认：清全转发直通项 ----
-            fwdp_v <= 1'b0;
 
             // ---- 4.2 派发分配（store 项）----
             if (alloc_ok) begin
@@ -1192,6 +1197,8 @@ module lsq_simple #(
                         ld_mis [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_xw  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_lo  [lalloc_idx[si*LQ_IW +: LQ_IW]] <= 32'h0;
+                        //   ★★ N29B：依赖快照随槽复用清零（E1 是唯一置位点）
+                        ld_dep_v[lalloc_idx[si*LQ_IW +: LQ_IW]] <= 1'b0;
                         ld_rob[lalloc_idx[si*LQ_IW +: LQ_IW]] <=
                                 lalloc_rob[si*ROB_IDX_W +: ROB_IDX_W];
                     end
@@ -1227,53 +1234,43 @@ module lsq_simple #(
                 if (any_unk_w) cnt_stall_q <= cnt_stall_q + 32'd1;
             end else if (exe_valid) begin
                 cnt_ld_q <= cnt_ld_q + 32'd1;
+                //   ★★ N29B：计数器口径**保持逐位不变**（= 本次 load 是否有更老且地址已确认的
+                //     store 覆盖其所需字节，`|fwd_hit_w`）。纯等待变体下它恰好就是
+                //     "**进入等待路径的 load 数**"（无覆盖的 load 不等待）；锁步/探针口径不变。
                 if (|fwd_hit_w) cnt_fwd_q <= cnt_fwd_q + 32'd1;
-                if (fwd_all_w) begin
-                    // 全字节转发 ⇒ 不占表项、不访存，次拍写回
-                    fwdp_v    <= 1'b1;
-                    fwdp_rob  <= exe_rob;
-                    fwdp_ep   <= exe_epoch;
-                    fwdp_di   <= exe_dst_i;
-                    fwdp_df   <= exe_dst_f;
-                    fwdp_pi   <= exe_pdest_i;
-                    fwdp_pf   <= exe_pdest_f;
-                    fwdp_data <= fwd_data_w;
-                    fwdp_size <= exe_size;
-                    fwdp_off  <= exe_addr[1:0];
-                    fwdp_uns  <= exe_unsign;
-                end else begin
-                    //   ★ 2B-4：槽号来自**派发期**（`exe_lq_idx`），不再是 E1 现选的 `newslot`；
-                    //     全转发的那条在 E1 当拍就把槽还回去（它不需要访存，也不参与提交释放）。
-                    ld_v   [exe_lq_idx] <= ~fwd_all_w;
-                    ld_ex  [exe_lq_idx] <= ~fwd_all_w;
-                    ld_req [exe_lq_idx] <= 1'b0;
-                    ld_dn  [exe_lq_idx] <= 1'b0;
-                    ld_rob [exe_lq_idx] <= exe_rob;
-                    ld_ep  [exe_lq_idx] <= exe_epoch;
-                    ld_di  [exe_lq_idx] <= exe_dst_i;
-                    ld_df  [exe_lq_idx] <= exe_dst_f;
-                    ld_pi  [exe_lq_idx] <= exe_pdest_i;
-                    ld_pf  [exe_lq_idx] <= exe_pdest_f;
-                    ld_addr[exe_lq_idx] <= exe_addr;
-                    ld_size[exe_lq_idx] <= exe_size;
-                    ld_uns [exe_lq_idx] <= exe_unsign;
-                    //   ★★ 4c(3/3)：8 B（fld）两拍态 + 非对齐判据
-                    //     （`va[2:0]!=0` ⇒ cause 4；ISA 允许实现对 8 B 访问要求自然对齐，
-                    //      2A 同口径 `m_fp8_misalign` ⇒ 两核一致）
-                    ld_hi  [exe_lq_idx] <= (exe_size == 3'd3);
-                    ld_beat[exe_lq_idx] <= 1'b0;
-                    ld_mis [exe_lq_idx] <= (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
-                    //   ★★ N12B-cross：≤4 B 非对齐**跨 4 B 对齐字** ⇒ 与 8 B 同一套两拍
-                    //     （判据见 `ld_xw` 声明处；sz=3 由 `ld_hi` 走，两者互斥）。
-                    ld_xw  [exe_lq_idx] <= xw_w;
-                    ld_lo  [exe_lq_idx] <= 32'h0;
-                    ld_hm  [exe_lq_idx] <= fwd_hit_w;
-                    ld_hd  [exe_lq_idx] <= fwd_data_w;
-                    //   ★ 槽号是 LQ_IW bit（LQ 8 ⇒ 3 bit）⇒ 必须零扩展到 TAG_W=4；
-                    //     写 [TAG_W-1:0] 会取到向量外的位 ⇒ tag 为 **x** ⇒ 响应无法匹配（挂死）。
-                    //     最高位恒 0 ⇒ 与 store 排空的"全 1"标签天然不撞车。
-                    ld_tag [exe_lq_idx] <= {{(TAG_W-LQ_IW){1'b0}}, exe_lq_idx};
-                end
+                //   ★★ N29B：**没有直通快路** —— 每次 load 都占用它在**派发期**分到的 LQ 槽
+                //     （槽号 = `exe_lq_idx`，程序序分配、提交点释放），地址/尺寸/依赖快照在
+                //     E1 当拍落地；是否可访存由 §3.2 的等待闸门**组合**决定。
+                ld_v   [exe_lq_idx] <= 1'b1;
+                ld_ex  [exe_lq_idx] <= 1'b1;
+                ld_req [exe_lq_idx] <= 1'b0;
+                ld_dn  [exe_lq_idx] <= 1'b0;
+                ld_rob [exe_lq_idx] <= exe_rob;
+                ld_ep  [exe_lq_idx] <= exe_epoch;
+                ld_di  [exe_lq_idx] <= exe_dst_i;
+                ld_df  [exe_lq_idx] <= exe_dst_f;
+                ld_pi  [exe_lq_idx] <= exe_pdest_i;
+                ld_pf  [exe_lq_idx] <= exe_pdest_f;
+                ld_addr[exe_lq_idx] <= exe_addr;
+                ld_size[exe_lq_idx] <= exe_size;
+                ld_uns [exe_lq_idx] <= exe_unsign;
+                //   ★★ 4c(3/3)：8 B（fld）两拍态 + 非对齐判据
+                //     （`va[2:0]!=0` ⇒ cause 4；ISA 允许实现对 8 B 访问要求自然对齐，
+                //      2A 同口径 `m_fp8_misalign` ⇒ 两核一致）
+                ld_hi  [exe_lq_idx] <= (exe_size == 3'd3);
+                ld_beat[exe_lq_idx] <= 1'b0;
+                ld_mis [exe_lq_idx] <= (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
+                //   ★★ N12B-cross：≤4 B 非对齐**跨 4 B 对齐字** ⇒ 与 8 B 同一套两拍
+                //     （判据见 `ld_xw` 声明处；sz=3 由 `ld_hi` 走，两者互斥）。
+                ld_xw  [exe_lq_idx] <= xw_w;
+                ld_lo  [exe_lq_idx] <= 32'h0;
+                //   ★★ N29B：**依赖快照（唯一写点）** —— "本 load 所需字节里是否有更老且
+                //     地址已确认的 store 覆盖"。等待闸门 = 该位 ∧ "存在更老未落地 store"。
+                ld_dep_v[exe_lq_idx] <= |fwd_hit_w;
+                //   ★ 槽号是 LQ_IW bit（LQ 8 ⇒ 3 bit）⇒ 必须零扩展到 TAG_W=4；
+                //     写 [TAG_W-1:0] 会取到向量外的位 ⇒ tag 为 **x** ⇒ 响应无法匹配（挂死）。
+                //     最高位恒 0 ⇒ 与 store 排空的"全 1"标签天然不撞车。
+                ld_tag [exe_lq_idx] <= {{(TAG_W-LQ_IW){1'b0}}, exe_lq_idx};
             end
 
             // ---- 4.4 请求 / 响应推进 ----
@@ -1282,7 +1279,7 @@ module lsq_simple #(
             //     槽本身留到该 load 按程序序提交时释放**（§4.4b）。`ld_dn` 一旦置位，
             //     该项即退出请求口（`pend_vec`）与响应匹配（`rsp_vec` 要 `ld_req`）⇒
             //     写回只发生一次、不会被后到的响应重复触发。
-            if (ld_fire) ld_req[pend_sel] <= 1'b1;
+            if (ld_fire) ld_req[fire_sel] <= 1'b1;
             //   ★★ 4c(3/3)：8 B 访问**两拍** —— 首拍响应只锁存低 4 B 并**重新挂起**
             //     （`ld_req<=0` ⇒ 回到 pend 队列，下次发 `VA+4`）；第二拍响应才 `ld_dn`。
             //   ★★ N12B-cross：同一套两拍流程现在也服务「跨 4 B 字的 ≤4 B 非对齐 load」
@@ -1299,7 +1296,7 @@ module lsq_simple #(
                 end
             end
             //   非对齐 8 B：合成带错写回的同拍标完成（不发访存）
-            if (mis_v) ld_dn[pend_sel] <= 1'b1;
+            if (mis_v) ld_dn[fire_sel] <= 1'b1;
             // ---- 4.4b 提交点释放（LQ 项；★ 2B-3 第 6 段第二步）----
             //   释放条件：该 LQ 项的 ROB 索引落在**本拍提交组** [head, head+cmt_n) 内。
             //   依据：提交组恒为"从 ROB 头起的连续若干项"（rob.v 的前缀链），故用**窗口算术**
@@ -1317,6 +1314,7 @@ module lsq_simple #(
                     ld_mis[si] <= 1'b0;
                     ld_xw [si] <= 1'b0;
                     ld_lo [si] <= 32'h0;
+                    ld_dep_v[si] <= 1'b0;
                 end
             end
             // ---- 4.5 提交排空：入队（全组）→ 出队（逐拍一笔）→ STQ 项回收 ----
@@ -1430,6 +1428,7 @@ module lsq_simple #(
                         ld_req[si] <= 1'b0;
                         ld_dn[si]  <= 1'b0;
                         ld_ex[si]  <= 1'b0;
+                        ld_dep_v[si] <= 1'b0;
                     end
                 end
             end
