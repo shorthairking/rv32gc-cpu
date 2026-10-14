@@ -203,7 +203,19 @@ module front4_mem_1r1w #(
 
     //   ★ 端口/参数名与 Vivado 2023.2 的 XPM 源码逐字对齐：
     //     SDPRAM **没有** rsta/regcea/READ_LATENCY_A/WRITE_MODE_A（A 口是纯写口，
-    //     写模式固定 read_first），只有 B 口有读延迟寄存器。
+    //     没有"写模式"这个可配项），只有 B 口有读延迟寄存器。
+    //   ★ WRITE_MODE_B 必须**显式**传（N25 修复，2026-10-14）：
+    //     xpm_memory_sdpram 的该参数默认值是 "no_change"（xpm_memory.sv:8584），
+    //     漏传 ⇒ XPM 把 mem 数组属性写成 rw_addr_collision="no" ⇒ Vivado 打印
+    //     `[Synth 8-5775] Setting write mode to NO_CHANGE` 并把 RAMB36E1 实现成
+    //     NO_CHANGE，与下方仿真行为模型（同址同拍写+读 ⇒ 读**旧值**）语义分叉：
+    //     综合侧同址同拍读回 X / 保持值（GLS 会出 X），行为侧读回旧值。
+    //     这里显式写 "read_first"，两侧对齐（对照实验：补该行后 8-5775 归零、
+    //     映射 NO_CHANGE→READ_FIRST、网表碰撞拍读回由 X 变旧值）。
+    //   ★ BTB 语义与安全性：条目写成 {valid, tag=upd_pc[31:2], …}，写索引恒为
+    //     upd_pc[11:2]；因此"条目 tag == 查表 tag" ⇔ 二者是同一个 4B 字 ⇔ 索引相同。
+    //     NO_CHANGE 在同址同拍读回的是**上一拍别的组**的数据，其 tag 不可能等于当前
+    //     tag ⇒ 该分叉最坏只造成一次漏预测（BRU 照常纠正），**不可能假命中**。
     xpm_memory_sdpram #(
         .MEMORY_SIZE        (DEPTH * DW),
         .MEMORY_PRIMITIVE   ("block"),
@@ -226,6 +238,7 @@ module front4_mem_1r1w #(
         .READ_DATA_WIDTH_B  (DW),
         .READ_RESET_VALUE_B ("0"),
         .READ_LATENCY_B     (1),
+        .WRITE_MODE_B       ("read_first"),
         .RST_MODE_A         ("SYNC"),
         .RST_MODE_B         ("SYNC")
     ) u_xpm (
