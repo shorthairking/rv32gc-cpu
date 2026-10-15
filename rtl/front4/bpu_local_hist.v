@@ -95,6 +95,15 @@ module bpu_local_hist #(
     //   · 仿真：initial 显式清零（否则组合读会在上电期读出 x）
     //   · 综合：distributed RAM 的 initial 会被 Vivado 转成 INIT 属性（上电清 0），
     //     与 GPHT/LPHT/选择器（front4_mem_* 的 INIT=弱不跳）口径一致。
+    //     已用 OOC 探针实测：initial 全表清零**不影响** LUTRAM 推断（见
+    //     fpga/scratch/n34b1_lutram_probe.v 的 lht_split_init，LUT as Distributed RAM = 768）。
+    //   · ★ N34B-1 根因：LHT 的写口**必须**放在**无异步复位**的独立 always @(posedge clk)
+    //     里（见本文件 §4 的同步写块）。此前写口与 upd_s*_q/lu_valid_q 共用一个
+    //     `always @(posedge clk or negedge rst_n)`，Vivado 报
+    //     `[Synth 8-4767] RAM is sensitive to asynchronous reset signal. this RTL style is not
+    //      supported` ⇒ 整表退化成 10,240 FF + 3,855 LUT 组合读 mux。把写口移到独立无复位
+    //     进程后，同一 always 内的复位语义完全不变（lht_mem 本来就不在复位分支里赋值），
+    //     RAM 推断成立（探针 lht_split / lht_split_init 均推断为 RAMD64E）。
     integer li;
     initial begin
         for (li = 0; li < LHT_ENTRIES; li = li + 1) lht_mem[li] = {LHT_BITS{1'b0}};
@@ -147,6 +156,15 @@ module bpu_local_hist #(
     reg lu_valid_q;
     assign lu_valid_o = lu_valid_q;
 
+    // ---- LHT 同步写口：独立 always @(posedge clk)，**无异步复位** ----
+    // 语义与原实现逐位相同：upd_fire 当拍写 {LHT_old[8:0], taken}（写优先于同拍组合读）。
+    // 单独成块 = distributed RAM 推断的必要条件（Vivado 不支持带异步复位的 RAM 进程）。
+    // 注意：复位时不清 lht_mem —— 综合侧由 initial→INIT（LUTRAM 上电 = 0）承担；
+    //       仿真侧由上面的 initial 块承担。二者与本模块原有复位口径一致。
+    always @(posedge clk) begin
+        if (upd_fire) lht_mem[upd_pc[11:2]] <= {lht_upd_old[LHT_BITS-2:0], upd_taken};
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             lu_valid_q      <= 1'b0;
@@ -157,13 +175,12 @@ module bpu_local_hist #(
         end else begin
             lu_valid_q <= lu_en;
 
-            // ---- S0：读 LPHT（地址组合得出） + 写 LHT（移位入 taken） ----
+            // ---- S0：读 LPHT（地址组合得出） + 写 LHT（移位入 taken，写口已移至独立块） ----
             if (upd_fire) begin
                 upd_s0_q       <= 1'b1;
                 upd_s1_q       <= 1'b0;
                 upd_taken_q    <= upd_taken;
                 upd_lpht_idx_q <= upd_lpht_idx;         // LHT_old XOR PC[11:2]
-                lht_mem[upd_pc[11:2]] <= {lht_upd_old[LHT_BITS-2:0], upd_taken};
             end else if (upd_s0_q) begin
                 upd_s0_q <= 1'b0;
                 upd_s1_q <= 1'b1;                       // → S1 写 LPHT
