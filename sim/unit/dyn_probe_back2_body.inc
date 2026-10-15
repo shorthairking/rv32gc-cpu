@@ -56,7 +56,6 @@
     reg [2:0] fread_r, cread_i_r, cread_f_r, ncmt_r, nbr_r, nfp_r, nexc_r;
     reg       csr_read_r, cread_csr_r;
     integer   cc;
-    reg [NQ_W-1:0] pn;
     reg [RB_W-1:0] pp;
 
     always @(*) begin
@@ -90,16 +89,17 @@
 
         //   提交期读：端口 11..14（整数）/ 4..7（浮点）；判据 = 提交 lane 的 rd_i/rd_f_wen
         //   提交条数与分支/FP/异常频率来自提交 lane 的载荷（cmt_pay 宽载荷 + cmt_narrow 窄表）
+        //   ★★ EXP-N35B：`nq` 的 `DI/DF` 两位已删除（宽载荷逐位重复）⇒ 判据改从
+        //     **载荷**（`cmt_pay`，与 `backend_top` 提交链同一真源、同一门控）经 `p_di/p_df` 取。
         cread_i_r = 3'd0;  cread_f_r = 3'd0;
         ncmt_r    = 3'd0;  nbr_r     = 3'd0;
         nfp_r     = 3'd0;  nexc_r    = 3'd0;
         for (cc = 0; cc < 4; cc = cc + 1) begin
-            pn = `DYN_BK.cmt_narrow[cc*NQ_W +: NQ_W];
             pp = `DYN_BK.cmt_pay   [cc*RB_W +: RB_W];
             if (`DYN_BK.commit_valid_o[cc]) begin
                 ncmt_r = ncmt_r + 3'd1;
-                if (pn[`BACK2_NQ_DI]) cread_i_r = cread_i_r + 3'd1;
-                if (pn[`BACK2_NQ_DF]) cread_f_r = cread_f_r + 3'd1;
+                if (`DYN_BK.p_di(pp)) cread_i_r = cread_i_r + 3'd1;
+                if (`DYN_BK.p_df(pp)) cread_f_r = cread_f_r + 3'd1;
                 if (pp[`BACK2_UB_IS_BRANCH]) nbr_r = nbr_r + 3'd1;
                 if (pp[`BACK2_UB_IS_FP])     nfp_r = nfp_r + 3'd1;
                 if (pp[`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB] != 4'd0)

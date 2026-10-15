@@ -204,13 +204,23 @@ module rob #(
     //     · **宽字段（PC/TVAL/CSRW/TRTGT/FFLAGS 等）仍在 `pl_q`**，本步不动；
     //     · 本步将 rob.v **自用的关键读**（done/exc/is_store/ckpt/is_branch/trap_cause/epoch）
     //       全部改走 `nq`（行为逐位等价），并导出 `cmt_narrow` 供下一步改造 backend_top。
-    //     字段布局（MSB→LSB）：
-    //       pre{mret,sret,maint_kind[2:0]} trtaken pdf[5:0] pdi[5:0] arn[4:0]
-    //       is_csr is_fp_wen is_int_wen ckpt_valid is_branch is_store exc[3:0] epoch[1:0] done
+    //     ★★ EXP-N35B 后字段布局（MSB→LSB，**13 bit**，真源 = back2_params.vh §2）：
+    //       pre{mret,sret,maint_kind[2:0]} trtaken exc[3:0] epoch[1:0] done
+    //       被删的 23 bit（旧布局里 pre/trtaken 之下的 pdf/pdi/arn/is_csr/is_fp_wen/
+    //       is_int_wen/ckpt_valid/is_branch/is_store）改从**载荷窗口**读，见 §0.1。
     //     ★★ D2：原 `lq[3:0] stq[4:0] csrop[2:0]`（12 bit）在 `nq` 里**只写不读**（唯一"读"
     //       是 §5 自检对 nq/nq_chk 的恒等区间比对）⇒ 已删，`NQ_W` 49→37；
     //       布局真源 = back2_params.vh §2，本文件不得另存一份位号。
     //     ★★ EXP-R2：`pdi` 由 `PREG_I_W` 定宽（7→6）⇒ `NQ_W` 37→36，其上整段下移 1。
+    //     ★★ EXP-N35B：`NQ_W` 36→**13**（沿 N35A §7.3：36 bit 里 **23 bit = 宽载荷逐位重复**）：
+    //       · 删 23 bit = FLAGS 6（is_store/is_branch/ckpt_valid/rd_i_wen/rd_f_wen/is_csr）
+    //         + PDIDST/PDFDST 12 + ARND 5 —— 它们在派发同拍由 `pack_nq` 从载荷抄写、
+    //         此后无第二写源 ⇒ 提交链改读 `win_rd[gi]`（= `win_q[gi]` **直连 FF**，
+    //         本就是提交载荷来源，**零新增 mux**）；`backend_top` 侧改吃**已存在**的
+    //         `p_arn/p_pdi/p_pdf/p_di/p_df/p_csr`（对载荷取字段）。
+    //       · 留 13 bit = pre{mret,sret,maint_kind} 5（派发期前置译码，载荷里没有）
+    //         + trtaken 1 + exc 4 + epoch 2 + done 1（**8 bit 真动态**，各有独立写源）。
+    //       ⚠ 位号真源 = back2_params.vh §2；本文件不得另存一份位号。
     localparam integer NQ_W      = `BACK2_NQ_W;
     localparam integer NQ_DONE   = `BACK2_NQ_DONE;
     localparam integer NQ_EP_L   = `BACK2_NQ_EP_L;
@@ -218,14 +228,14 @@ module rob #(
     localparam integer NQ_STORE  = `BACK2_NQ_STORE;
     localparam integer NQ_BR     = `BACK2_NQ_BR;
     localparam integer NQ_CKV    = `BACK2_NQ_CKV;
-    localparam integer NQ_DI     = `BACK2_NQ_DI;
-    localparam integer NQ_DF     = `BACK2_NQ_DF;
-    localparam integer NQ_CSR    = `BACK2_NQ_CSR;
-    localparam integer NQ_ARN_L  = `BACK2_NQ_ARN_L;
-    localparam integer NQ_PDI_L  = `BACK2_NQ_PDI_L;
-    localparam integer NQ_PDF_L  = `BACK2_NQ_PDF_L;
     localparam integer NQ_TRT    = `BACK2_NQ_TRT;
     localparam integer NQ_MK_L   = `BACK2_NQ_MK_L;
+    //   ★★ EXP-N35B：下列 6 个旧位号宏已删除（20 bit 不再存于 `nq`），此处同步删除
+    //     `NQ_DI/NQ_DF/NQ_CSR/NQ_ARN_L/NQ_PDI_L/NQ_PDF_L` 局部别名 —— 任何残留引用都会在
+    //     编译期报错（fail-closed，不静默取错位）。被删 20 bit 的读取口径（唯一真源）：
+    //       rd_i_wen / rd_f_wen / is_csr         → `p_di/p_df/p_csr(cmt_pay)`（backend_top）
+    //       pdi / pdf / arn                      → `p_pdi/p_pdf/p_arn(cmt_pay)`（backend_top）
+    //     `NQ_STORE/NQ_BR/NQ_CKV` **保留**（理由见 back2_params.vh §2 的 N35B 段）。
     reg  [NQ_W-1:0]      nq    [0:ROB_N-1];
     //   ★★ EXP-B（架构 v0.1 §16–§19）：**三张 typed 单写源更新表**（替代原 102 bit `updq`）
     //     · 动机：原 `updq` 每表项有 8 个写源（4 派发 lane + CSR/BRU/FPU/LSU 四口）⇒
@@ -290,17 +300,15 @@ module rob #(
     //     载荷重排后两者不再重合（唯一仍然重合的是 [19:0] 的 EXC+FLAGS 块，见参数表）。
     //   ★★ D2：删除 `lq[3:0]/stq[4:0]/csrop[2:0]` 三段（只写不读）；其余字段与
     //     `BACK2_NQ_*` 位号一一对应（位号真源在 back2_params.vh）。
+    //   ★★ EXP-N35B：只打包**保留的 13 bit**（位号由 back2_params.vh §2 定）。被删的 23 bit
+    //     是宽载荷的逐位副本（`is_store/is_branch/ckpt_valid/rd_i_wen/rd_f_wen/is_csr` +
+    //     `pdi/pdf/arn`），提交链直接从 `win_rd` 取（见 §0.1 的读取口径）——**不再抄一份**。
+    //     `trtaken` 仍打包（其载荷占位恒 0，真值由 BRU `upd_tr` 动态写 `nq`）。
     function [NQ_W-1:0] pack_nq;
         input [RB_W-1:0] p; input [`BACK2_EPOCH_W-1:0] ep; input dn; input [4:0] pre;
         begin
-            pack_nq = { pre,                                           // [36:32] {mret,sret,maint_kind}
-                        p[`BACK2_RB_TRTAKEN],                          // [31]
-                        p[`BACK2_RB_PDFDST_MSB:`BACK2_RB_PDFDST_LSB],  // [30:25]
-                        p[`BACK2_RB_PDIDST_MSB:`BACK2_RB_PDIDST_LSB],  // [24:18]
-                        p[`BACK2_RB_ARND_MSB:`BACK2_RB_ARND_LSB],      // [17:13]
-                        p[`BACK2_UB_IS_CSR],                           // [12]
-                        p[`BACK2_UB_RD_F_WEN],                         // [11]
-                        p[`BACK2_UB_RD_I_WEN],                         // [10]
+            pack_nq = { pre,                                           // [15:11] {mret,sret,maint_kind}
+                        p[`BACK2_RB_TRTAKEN],                          // [10]
                         p[`BACK2_UB_CKPT_VALID],                       // [9]
                         p[`BACK2_UB_IS_BRANCH],                        // [8]
                         p[`BACK2_UB_IS_STORE],                         // [7]
@@ -458,6 +466,9 @@ module rob #(
         assign slot_in_range[gi] = (cnt_q > gi);
         assign slot_done[gi]     = nq[slot_idx[gi]][NQ_DONE];
         assign slot_exc[gi]      = |nq[slot_idx[gi]][NQ_EXC_L +: 4];
+        //   ★★ EXP-N35B：`is_store` **保留在 `nq`**（不改读窗口）——它是被删位里唯一进入
+        //     rob **自身状态演化**的位（`slot_st_ok → slot_ok → cmt_n_w → head/cnt/hpred`）；
+        //     实测反例见 back2_params.vh §2 的 N35B 段与 n35b_report §6.3。
         assign slot_store[gi]    = nq[slot_idx[gi]][NQ_STORE];
         assign slot_st_ok[gi]    = ~slot_store[gi] | mem_wr_ready;
         //   ★ B3：窗口未命中 ⇒ 本 lane 不可提交（插一拍气泡；**绝不交付错误 PC/tval**）
@@ -474,6 +485,9 @@ module rob #(
         //   ★★ C4：载荷的 EXC/FLAGS 两段按硬约束**保持 uop 原绝对位**（见 back2_params §2
         //     的位域表），故这里 `BACK2_U_EXC_*` / `BACK2_UB_IS_FP` 在载荷上仍逐位成立。
         wire [3:0]                pexc_gi = win_rd[gi][`BACK2_RB_EXC_MSB:`BACK2_RB_EXC_LSB];
+        //   ★★ EXP-N35B：`is_branch` 同样**保留在 `nq`**（它喂 `br_use → merge_upd →
+        //     cmt_payload[TRTGT/TRTAKEN]`，即 rob 的对外载荷；保留 ⇒ rob 边界逐字节一致）。
+        //     `slot_is_fp` 保持"读 `win_rd`"原状（改前即如此，属既有设计口径）。
         assign slot_is_br[gi] = nq[slot_idx[gi]][NQ_BR];
         assign slot_is_fp[gi] = win_rd[gi][`BACK2_UB_IS_FP];
         assign br_use[gi] = br_v_q[slot_idx[gi]] & (br_ep_q[slot_idx[gi]] == ep_gi) & slot_is_br[gi];
@@ -529,8 +543,9 @@ module rob #(
                       ex_use[gi], ex_tval_q[slot_idx[gi]]);
         assign cmt_narrow[gi*NQ_W +: NQ_W]  = nq[slot_idx[gi]];
         assign cmt_st_drain[gi] = cmt_chain[gi] & slot_store[gi];
+        //   ★★ EXP-N35B：`ckpt_valid` 同样**保留在 `nq`**（喂 `cmt_st_ckpt` 对外输出）。
         assign cmt_st_ckpt[gi]  = cmt_chain[gi] & nq[slot_idx[gi]][NQ_CKV];
-        assign cmt_st_branch[gi]= cmt_chain[gi] & nq[slot_idx[gi]][NQ_BR];
+        assign cmt_st_branch[gi]= cmt_chain[gi] & slot_is_br[gi];
     end
     endgenerate
 
@@ -620,6 +635,12 @@ module rob #(
                                     alloc_pre[k*5 +: 5]);
                         //   ★★ EXP-B：派发期**不再**把可更新字段复制进更新表 —— 三张 typed 表
                         //     只由各自的执行部件写（BRU/FPU/LSU），派发写只落 `nq` 与 BRAM 载荷。
+                        //   ★★ EXP-N35B：被删 23 bit 的**仿真影子**（综合侧此段不存在）——
+                        //     与真载荷同源同拍写入，供 §5.6 的提交侧比对。
+`ifndef RV32GC_USE_VIVADO_IP
+                        nq20_sh[idx_add(tail_w, k[ROB_IDX_W:0])] <=
+                            grp20(alloc_payload[k*RB_W +: RB_W]);
+`endif
                     end
                 end
             end
@@ -750,38 +771,43 @@ module rob #(
         end
     end
 
-    //   ★ 2B-5 第 3 步①自检：窄表与宽载荷的共用字段必须**逐位一致**
-    //     （迁移期双写；任何漏写/写错位置都会在此报出）。
-    //   ★★ 2B-5 第 3 步②（自检 `ifdef` 化）：整个自检块只做 `$display`（无任何 RTL 语义），
-    //     但综合侧仍要解析 `if (DBG_CSR && ...)` 并在参数为 0 时做常量折叠。本步把它**整体**
-    //     收进 `` `ifndef RV32GC_USE_VIVADO_IP ``（综合入口 `synth_design` 显式定义该宏，
-    //     见 fpga/tcl/synth.tcl；iverilog/Verilator 回归从不定义 ⇒ 行为模型侧自检**保持等价**）
-    //     ⇒ 综合分支连语句都不存在，零残留、零依赖综合器的折叠能力。
-    //   ★ B2 后自检口径：宽载荷已入 BRAM，改在**预取填充拍**对比：
-    //     读回的载荷拼出的窄字段 必须等于 `nq`（掩掉由 `upd_exc` 写的 `exc[3:0]`）。
+    //   ★★ EXP-N35B 自检（**取代**原"窄表 `nq` vs 宽载荷"恒等自检）：被删的 23 bit 在 `nq`
+    //     之外再存一份**仿真专属影子副本**，在提交同拍把"从载荷窗口读出的 23 bit"与影子
+    //     逐位比对。
+    //     · 影子由**派发写口**（`alloc_payload`，与真载荷同源同拍）写入；
+    //     · 比对侧读**载荷窗口**（`win_rd[gi]` = BRAM 读回 → 窗口 FF）——正是改动后提交链的
+    //       真实数据来源；
+    //     ⇒ 覆盖"这 23 bit 经 BRAM+窗口往返 + 槽位映射 + 位域抽取"的全部新增风险，与改前
+    //       那把尺子（nq vs 载荷）**等效**，只是尺子本身不再进硬件。
+    //     `RV32GC_USE_VIVADO_IP` 由综合入口 `synth_design` 显式定义（fpga/tcl/synth.tcl:62）
+    //     ⇒ 影子数组与比较逻辑**整体不进网表**（对 N35B 的面积结论零影响）。
+    //   ⚠ 改前那条自检的对象是"`nq` 里 23 bit 的**重复副本**"；本改动把重复副本删除后，
+    //     该对象在硬件里已不存在（单一真源），故此处改为"影子验证被删位的**新读路径**"。
 `ifndef RV32GC_USE_VIVADO_IP
-    integer nk;
-    reg [NQ_W-1:0] nq_chk;
+    reg [19:0] nq20_sh [0:ROB_N-1];
+    //   20 bit 抽取（顺序 = 旧 `nq` 布局 MSB→LSB：arn | is_csr | df | di | pdf | pdi）
+    function [19:0] grp20;
+        input [RB_W-1:0] p;
+        begin
+            grp20 = { p[`BACK2_RB_ARND_MSB:`BACK2_RB_ARND_LSB],
+                      p[`BACK2_UB_IS_CSR],
+                      p[`BACK2_UB_RD_F_WEN],
+                      p[`BACK2_UB_RD_I_WEN],
+                      p[`BACK2_RB_PDFDST_MSB:`BACK2_RB_PDFDST_LSB],
+                      p[`BACK2_RB_PDIDST_MSB:`BACK2_RB_PDIDST_LSB] };
+        end
+    endfunction
+    integer gk23;
     always @(posedge clk) begin
-        if (DBG_CSR && rst_n) begin
-            for (nk = 0; nk < 4; nk = nk + 1) begin
-                //   仅在"本拍真的可用"时比对：
-                //     ① 该索引不是本拍/上拍刚分配的（read_first 会读到旧值）
-                //     ② 该项在 ROB 当前范围内（否则读到的是无效位）
-                //     ③ `trtaken` 与 `exc` 由 `upd_tr/upd_exc` 写入 `nq`（载荷侧不再更新）⇒ 掩掉
-                if (!(alloc_idx_v_q[0] & (alloc_idx_q[0] == e_of_r_q[nk]) |
-                      alloc_idx_v_q[1] & (alloc_idx_q[1] == e_of_r_q[nk]) |
-                      alloc_idx_v_q[2] & (alloc_idx_q[2] == e_of_r_q[nk]) |
-                      alloc_idx_v_q[3] & (alloc_idx_q[3] == e_of_r_q[nk])) &&
-                    (((e_of_r_q[nk] - head_q) & 7'h7F) < cnt_q)) begin
-                    nq_chk = pack_nq(pl_rdata[nk], nq[e_of_r_q[nk]][NQ_EP_L +: `BACK2_EPOCH_W], 1'b0,
-                                     nq[e_of_r_q[nk]][NQ_MK_L +: 5]);
-                    if ((nq[e_of_r_q[nk]][NQ_W-1:NQ_TRT+1]   !== nq_chk[NQ_W-1:NQ_TRT+1]) ||
-                        (nq[e_of_r_q[nk]][NQ_TRT-1:NQ_EXC_L+4] !== nq_chk[NQ_TRT-1:NQ_EXC_L+4]) ||
-                        (nq[e_of_r_q[nk]][NQ_EXC_L-1:1]        !== nq_chk[NQ_EXC_L-1:1]))
-                        $display("ROB-NQ-CHK MISMATCH: idx=%0d nq=0x%011x pay=0x%011x",
-                                 e_of_r_q[nk], nq[e_of_r_q[nk]], nq_chk);
-                end
+        if (rst_n) begin
+            for (gk23 = 0; gk23 < COMMIT_W; gk23 = gk23 + 1) begin
+                //   只在"该项本拍真的可提交"时比对（`cmt_valid` 已含 `win_lane_ok` 与
+                //   `slot_in_range` ⇒ 该索引必已被派发写过 ⇒ 影子有效，不会读到 x）。
+                if (cmt_valid[gk23] &&
+                    (grp20(win_rd[gk23]) !== nq20_sh[slot_idx[gk23]]))
+                    $display("ROB-N35B-CHK MISMATCH: lane=%0d idx=%0d win=0x%05x sh=0x%05x",
+                             gk23, slot_idx[gk23], grp20(win_rd[gk23]),
+                             nq20_sh[slot_idx[gk23]]);
             end
         end
     end

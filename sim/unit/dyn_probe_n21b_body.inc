@@ -58,10 +58,12 @@
                       & `N21B_BK.x_i2_uop[4][`BACK2_UB_IS_FPLS];
 
     //   提交级窄读口需求（backend_top.v:1913/1915/1920 的判据逐位等价写法）
-    assign n21b_d[13] = `N21B_BK.commit_valid_o[0] & `N21B_BK.cmt_narrow[`BACK2_NQ_DI];
-    assign n21b_d[14] = `N21B_BK.commit_valid_o[1] & `N21B_BK.cmt_narrow[`BACK2_NQ_W + `BACK2_NQ_DI];
-    assign n21b_d[15] = `N21B_BK.commit_valid_o[0] & `N21B_BK.cmt_narrow[`BACK2_NQ_DF];
-    assign n21b_d[16] = `N21B_BK.commit_valid_o[1] & `N21B_BK.cmt_narrow[`BACK2_NQ_W + `BACK2_NQ_DF];
+    //   ★★ EXP-N35B：`DI/DF` 已从 `nq`（`cmt_narrow`）删除 ⇒ 判据改从**载荷**
+    //     （`cmt_pay`）经 `p_di/p_df` 取（同一真源、同一 `commit_valid_o` 门控）。
+    assign n21b_d[13] = `N21B_BK.commit_valid_o[0] & `N21B_BK.p_di(`N21B_BK.cmt_pay[0*`BACK2_RB_W +: `BACK2_RB_W]);
+    assign n21b_d[14] = `N21B_BK.commit_valid_o[1] & `N21B_BK.p_di(`N21B_BK.cmt_pay[1*`BACK2_RB_W +: `BACK2_RB_W]);
+    assign n21b_d[15] = `N21B_BK.commit_valid_o[0] & `N21B_BK.p_df(`N21B_BK.cmt_pay[0*`BACK2_RB_W +: `BACK2_RB_W]);
+    assign n21b_d[16] = `N21B_BK.commit_valid_o[1] & `N21B_BK.p_df(`N21B_BK.cmt_pay[1*`BACK2_RB_W +: `BACK2_RB_W]);
     assign n21b_d[17] = `N21B_BK.csr_cmt_we;
 
     assign n21b_d[18] = `N21B_BK.x_i2_v[5] & `N21B_BK.x_i2_uop[5][`BACK2_UB_IS_CSR];

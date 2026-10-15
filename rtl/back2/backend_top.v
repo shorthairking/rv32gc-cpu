@@ -595,6 +595,9 @@ module backend_top #(
     wire [6:0]      wb_v;
     wire [7*ROBW-1:0] wb_rob;   // ★ L3：字段宽 = ROBW
     wire [COMMIT_W*`BACK2_NQ_W-1:0] cmt_narrow;  // ★ ROB 窄控制字（第 1 步已导出；本步接线并作为提交判定唯一依据）
+    //   ★★ EXP-N35B：宽度 2×36 → **2×13**（只余 pre{5}/trtaken/exc/epoch/done）；
+    //     被删 23 bit（di/df/arn/pdi/pdf/is_store/is_branch/ckpt_valid）改由 ROB 的
+    //     `cmt_pay`（载荷，含 `win_rd`）经下方 `p_*` 访问函数读取 —— 见 §9 `g_cmt`。
     wire [`BACK2_CMT_CSR_W-1:0] csr_pay_w;     // ★ ② 单 lane 动态 CSR 读口数据
     wire [ROBW-1:0] csr_dyn_idx_w;            // ★ ② 其索引（提交组内 CSR lane 的绝对 ROB 索引；L3：模 ROB_N）
     wire [7*EW-1:0] wb_ep;
@@ -1903,24 +1906,33 @@ module backend_top #(
         //   ★★ 2B-5 第 3 步②-b：**窄字段改吃 `cmt_narrow`**（第 1 步已导出）。
         //     `di/df/arn/pdi/pdf` 均在 `nq`（FF 窄表、组合读）⇒ 宽载荷的这些位**不再被读**，
         //     Vivado 可相应裁掉其 128:1 读 mux 与存储（存储/mux 均只保留 `nq` 一份）。
-        wire [`BACK2_NQ_W-1:0] pn = cmt_narrow[cc*`BACK2_NQ_W +: `BACK2_NQ_W];
+        //   ★★ EXP-N35B：上述 6 位**已从 `nq` 删除**（N35A §7.3：它们是宽载荷的逐位重复）
+        //     ⇒ `di/df/arn/pdi/pdf/csr` 一律改吃**载荷访问函数** `p_di/p_df/p_arn/p_pdi/
+        //     p_pdf/p_csr(p)`（`p = cmt_pay` = `merge_upd(win_rd,…)`：这几位不在 merge 的
+        //     改写范围内 ⇒ 逐位等于 `win_rd` 的同名位 = 派发期写入的同一份位）。
+        //     安全性：`cmt_pay` 的可信前提是"本 lane 的载荷窗口命中"（`win_lane_ok`），
+        //     而下面每一处消费都带 `cmt_raw_m & cmt_ok`（⊆ ROB 的 `cmt_valid` ⊆ `slot_ok`
+        //     ⊆ `win_lane_ok`）或 `commit_valid_o` 门控；对外口 `commit_arch_*` 的两处
+        //     **不带**本 lane 门（见 `commit_valid_o` 的注释：下游一律以 `commit_valid_o`
+        //     为准取用），故与"窗口未命中时输出什么"无关（改前此处也已是 `cmt_pay` 位域）。
+        //     `cmt_narrow` 余下 13 bit（pre/trtaken/exc/epoch/done）仍在下面按 `nq` 读。
         assign commit_valid_o[cc] = cmt_raw_m[cc] & cmt_ok;
         assign commit_pc_o[cc*32 +: 32] = p_pc(p);
-        assign commit_arch_rd_o[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
-        assign commit_arch_we_o[cc] = pn[`BACK2_NQ_DI] | pn[`BACK2_NQ_DF];
+        assign commit_arch_rd_o[cc*5 +: 5] = p_arn(p);
+        assign commit_arch_we_o[cc] = p_di(p) | p_df(p);
         wire [63:0] cval_f = fprf_rd[(NRD_F-2+cc)*64 +: 64];
         assign commit_arch_rd_wdata_o[cc*32 +: 32] =
-            pn[`BACK2_NQ_DI] ? iprf_rd[(NRD_I-3+cc)*32 +: 32] :
-            pn[`BACK2_NQ_DF] ? cval_f[31:0] : 32'h0;
-        assign cmt_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DI];
-        assign cmt_i_arn[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
-        assign cmt_i_pd[cc*PW_I +: PW_I] = pn[`BACK2_NQ_PDI_L +: PW_I];
-        assign rel_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DI];
+            p_di(p) ? iprf_rd[(NRD_I-3+cc)*32 +: 32] :
+            p_df(p) ? cval_f[31:0] : 32'h0;
+        assign cmt_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_di(p);
+        assign cmt_i_arn[cc*5 +: 5] = p_arn(p);
+        assign cmt_i_pd[cc*PW_I +: PW_I] = p_pdi(p);
+        assign rel_i_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_di(p);
         assign rel_i_pd[cc*PW_I +: PW_I] = p_pdio(p);
-        assign cmt_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DF];
-        assign cmt_f_arn[cc*5 +: 5] = pn[`BACK2_NQ_ARN_L +: 5];
-        assign cmt_f_pd[cc*PW_F +: PW_F] = pn[`BACK2_NQ_PDF_L +: PW_F];
-        assign rel_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & pn[`BACK2_NQ_DF];
+        assign cmt_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
+        assign cmt_f_arn[cc*5 +: 5] = p_arn(p);
+        assign cmt_f_pd[cc*PW_F +: PW_F] = p_pdf(p);
+        assign rel_f_we[cc]   = cmt_raw_m[cc] & cmt_ok & p_df(p);
         assign rel_f_pd[cc*PW_F +: PW_F] = p_pdfo(p);
         //   ★★ 4b-2c(2/2) 根因修复：**维护/陷阱/xRET 的整机冲刷不得抑制"更老 store"
         //     的 CDQ 排空入队**（否则已提交写静默丢失——实测 p13：PTE 更新 store 与紧随的
@@ -1985,7 +1997,9 @@ module backend_top #(
             if (commit_valid_o[cw]) begin
                 //   ★ ②：判定改吃 `cmt_narrow` 的 `is_csr`（FF 组合读）；
                 //     宽字段（tval/csrw/csra/csrop）改由 rob.v 的**单 lane 动态读口** `csr_pay_w` 提供
-                if (cmt_narrow[cw*`BACK2_NQ_W + `BACK2_NQ_CSR]) begin
+                //   ★★ EXP-N35B：`is_csr` 已从 `nq` 删除 ⇒ 改吃载荷访问函数（`commit_valid_o[cw]`
+                //     门控下窗口必已命中，逐位等价，见 §9 `g_cmt` 的门控说明）。
+                if (p_csr(cmt_pay[cw*RB_W +: RB_W])) begin
                     csr_cmt_we   = 1'b1;
                     csr_cmt_lane = cw[1:0];
                     csr_cmt_addr = csr_pay_w[14:3];
@@ -2193,8 +2207,9 @@ module backend_top #(
     genvar gcr;
     generate
     for (gcr = 0; gcr < COMMIT_W; gcr = gcr + 1) begin : g_cmtrd
-        assign iprf_ra[(NRD_I-3+gcr)*PW_I +: PW_I] = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDI_L +: PW_I];
-        assign fprf_ra[(NRD_F-2+gcr)*PW_F +: PW_F] = cmt_narrow[gcr*`BACK2_NQ_W + `BACK2_NQ_PDF_L +: PW_F];
+        //   ★★ EXP-N35B：`pdi/pdf` 已从 `nq` 删除 ⇒ 改吃载荷访问函数（等价性与门控见 §9 `g_cmt`）。
+        assign iprf_ra[(NRD_I-3+gcr)*PW_I +: PW_I] = p_pdi(cmt_pay[gcr*RB_W +: RB_W]);
+        assign fprf_ra[(NRD_F-2+gcr)*PW_F +: PW_F] = p_pdf(cmt_pay[gcr*RB_W +: RB_W]);
     end
     endgenerate
     //   ★ PRF 写口判据 = "写回所属 ROB 项仍在 ROB 窗口内"（不能用 epoch，理由见 prf.v）

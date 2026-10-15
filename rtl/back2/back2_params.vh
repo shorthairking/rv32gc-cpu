@@ -528,23 +528,39 @@
 //     `lq` 在载荷侧亦无功能读点（登记为后续 C4 载荷裁剪候选，见 D2 报告）。
 //   ★★ EXP-R2（整数 NREG 96→64 级联）：`pdi` 由 `BACK2_PREG_I_W` 定宽（7→6）⇒ `pdi` 及其
 //     以上整段下移 1（NQ 37→36 bit）；`pdf` 及其以下字段绝对位位置**逐位不变**。
-`define BACK2_NQ_W           36
+//   ★★ EXP-N35B（`nq` 位宽收窄 36→13，沿 N35A §7.3/§8.1 的"23 bit 是宽载荷逐位重复"结论）：
+//     删除 23 bit = {is_store, is_branch, ckpt_valid, is_int_wen(RD_I_WEN), is_fp_wen(RD_F_WEN),
+//     is_csr}（6）+ {pdi(PDIDST), pdf(PDFDST)}（12）+ arn(ARND)（5）。这 23 bit 在**派发同拍**
+//     由 `pack_nq` 从宽载荷同名字段逐位抄写，此后**再无写源**（N35A 实测：唯一其他写源
+//     `upd_*` 只落在 trtaken/exc/done/epoch 上）⇒ 提交同拍改从 `win_rd[gi]`（= `win_q[gi]`，
+//     ROB 头部窗口 FF **直连**，本来就是提交载荷的来源）读取，**不新增任何 mux**。
+//     证据（N35A 报告 §7.3）：`backend_top.v` 的 `p_arn/p_pdi/p_pdf/p_di/p_df/p_csr` 访问函数
+//     已存在（对载荷取字段）；`rob.v` 侧 `slot_store/slot_is_br/cmt_st_ckpt` 与已有先例
+//     `slot_is_fp = win_rd[gi][IS_FP]` 同型。
+//     ★ N35B 实施口径修正（由本轮的 rob 级逐拍对拍实测反推，见 n35b_report §6）：
+//       `is_store` **必须留在 `nq`** —— 它是被删 23 bit 里**唯一进入 rob 自身状态演化**的位
+//       （`slot_store → slot_st_ok → slot_ok → cmt_n_w → head/cnt/alloc_fire/hpred`）。
+//       实测反例：把 `slot_store` 改读载荷窗口后，在"窗口按索引命中但载荷是上一世代"的
+//       冲刷/挤压搅动拍上，`cmt_n_w` 会与改前不同 ⇒ 整机状态分叉（300k 拍对拍实测第
+//       94,486 拍首次分叉）。`is_branch`/`ckpt_valid` 只喂 rob 的**输出**（`merge_upd` 的
+//       br 支路 / `cmt_st_ckpt`），不进状态，但为保证"rob 边界逐字节一致"的可证性一并保留。
+//     保留 16 bit = 真动态 8（done/epoch/exc/trtaken）+ 前置译码 5（pre）+ 上述 3 bit；
+//     删除 20 bit = `{di, df, csr}`（3）+ `{pdidst, pdfdst}`（12）+ `arnd`（5）——
+//     这 20 bit 只被 `backend_top` 的提交路径消费，而在该模块里 `p_pdio/p_pc/p_stq/p_csra/…`
+//     **本来就**取自载荷窗口（`cmt_pay`）⇒ 信任等级与既有设计完全相同，不是新增风险类。
+//     ⚠ 删除这 6 个宏后，任何"再读 `BACK2_NQ_{DI,DF,CSR,ARN_L,PDI_L,PDF_L}`"的
+//       旧代码都会**编译期报错**（有意如此：这 20 bit 已不在 `nq` 里，静默读会取到错位）。
+`define BACK2_NQ_W           16
 `define BACK2_NQ_DONE        0
 `define BACK2_NQ_EP_L        1
 `define BACK2_NQ_EXC_L       3
-`define BACK2_NQ_STORE       7
-`define BACK2_NQ_BR          8
-`define BACK2_NQ_CKV         9
-`define BACK2_NQ_DI          10
-`define BACK2_NQ_DF          11
-`define BACK2_NQ_CSR         12
-`define BACK2_NQ_ARN_L       13
-`define BACK2_NQ_PDI_L       18        // [23:18] 整数新映射（6 bit；宽由 PREG_I_W 定）
-`define BACK2_NQ_PDF_L       (`BACK2_NQ_PDI_L + `BACK2_PREG_I_W)   // [29:24] 浮点新映射
-`define BACK2_NQ_TRT         (`BACK2_NQ_PDF_L + `BACK2_PREG_F_W)   // [30]    分支实际方向
-`define BACK2_NQ_MK_L        (`BACK2_NQ_TRT + 1)   // [33:31] maint_kind[2:0]
-`define BACK2_NQ_SRET        (`BACK2_NQ_MK_L + 3)   // [34]
-`define BACK2_NQ_MRET        (`BACK2_NQ_SRET + 1)   // [35]
+`define BACK2_NQ_STORE       7          // [7]      store 类（**喂提交决策** `slot_st_ok`）
+`define BACK2_NQ_BR          8          // [8]      分支类（喂 `br_use`→`cmt_payload`）
+`define BACK2_NQ_CKV         9          // [9]      携带检查点（喂 `cmt_st_ckpt`）
+`define BACK2_NQ_TRT         10         // [10]     分支实际方向（BRU `upd_tr` 动态写）
+`define BACK2_NQ_MK_L        11         // [13:11]  maint_kind[2:0]（派发期前置译码）
+`define BACK2_NQ_SRET        14         // [14]     sret（派发期前置译码）
+`define BACK2_NQ_MRET        15         // [15]     mret（派发期前置译码）
 //   ★ ② 专用单 lane 动态读口（CSR 提交合成）：{tval[31:0], csrw[31:0], csra[11:0], csrop[2:0]}
 //     ★★ EXP-B：其中 `csrw` 段（rob 侧）改由**载荷 uop.PS1I** 直接给出（原为 updq.CSRW 的
 //        低 7 位）；`tval` 段改由载荷 `BACK2_RB_TVAL`（= 原始指令位）给出 ⇒ 字段布局与宽度不变。
