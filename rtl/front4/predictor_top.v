@@ -272,7 +272,9 @@ module predictor_top #(
     //    / pred_gdir / pred_ldir / btb_hit / btb_way
     localparam integer EV_W = 32 + 5 + 32 + 1 + 1 + 32 + 1 + 1 + 1 + 1 + 1;
 
-    reg [EV_W-1:0] ev_mem [0:TRAIN_FIFO_DEPTH-1];
+    //   ★★ EXP-N34B3：显式声明分布式 RAM（8×108 = 864 bit，远小于 BRAM 最小深度，
+    //      属性只是把推断目标钉死在 LUTRAM；推断能否成功取决于写口进程的敏感性表）。
+    (* ram_style = "distributed" *) reg [EV_W-1:0] ev_mem [0:TRAIN_FIFO_DEPTH-1];
     reg [FIFO_AW-1:0] ev_wp_q, ev_rp_q;
     reg [FIFO_AW:0]   ev_cnt_q;
 
@@ -500,6 +502,25 @@ module predictor_top #(
     //--------------------------------------------------------------------------
     // 6. FIFO 时序
     //--------------------------------------------------------------------------
+    //   ★★ EXP-N34B3（`[Synth 8-4767]` dissolved 修，与 N34B-1 的 `lht_mem` 同一根因）：
+    //     `ev_mem` 的**写口单独成块**，敏感性表里**没有 `negedge rst_n`**。
+    //     Vivado 的 RAM 推断要求存储阵列的写进程是纯 `always @(posedge clk)`；只要
+    //     写口与异步复位同进程，整张表被判为"带异步复位的 RAM"并退化成触发器阵列
+    //     （基线日志 `synth_2b_n34b1_...vivado.log:748` 的 reason 字符串明写
+    //     `RAM is sensitive to asynchronous reset signal`）。
+    //     · **复位语义审计（本阵）**：本阵**从未**在复位分支里被赋值（复位只清
+    //       `ev_wp_q/ev_rp_q/ev_cnt_q`）⇒ 搬家不改复位行为。复位后 `ev_cnt_q = 0`
+    //       ⇒ `ev_empty = 1` ⇒ `ev_pop = 0`；`ev_mem` 的全部组合读（`ev_pc/ev_is_cond/
+    //       …/ev_btb_way`）只经 `ev_pop/ev_g_upd/ev_l_upd/ev_s_upd/ev_b_upd` 与
+    //       统计块 `if (ev_pop & ev_is_cond)` 消费 ⇒ **复位后的任何读都被有效位
+    //       （`ev_cnt_q`）门控**，LUTRAM 无复位不引入任何可观测差异。
+    //     · `rst_n` 作为**同步**使能保留在写条件里 ⇒ 与改前逐位同语义（改前该拍在
+    //       `if (!rst_n)` 分支，不写）。
+    //     · 写条件表达式 `train_valid && !ev_full` 与指针块**同源同拍**，无竞争。
+    always @(posedge clk) begin
+        if (rst_n && train_valid && !ev_full) ev_mem[ev_wp_q] <= ev_in;
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             ev_wp_q  <= {FIFO_AW{1'b0}};
@@ -507,7 +528,6 @@ module predictor_top #(
             ev_cnt_q <= {(FIFO_AW+1){1'b0}};
         end else begin
             if (train_valid && !ev_full) begin
-                ev_mem[ev_wp_q] <= ev_in;
                 ev_wp_q <= ev_wp_q + 1'b1;
             end
             if (ev_pop) begin

@@ -239,14 +239,16 @@ module rob #(
     //       valid/epoch 数组复位清零（仿真下不会出现 x 判定）。
     reg                          br_v_q  [0:ROB_N-1];
     reg  [`BACK2_TBL_EP_W-1:0]   br_ep_q [0:ROB_N-1];
-    reg  [`BACK2_BR_TGT_W-1:0]   br_tgt_q[0:ROB_N-1];
-    reg  [`BACK2_BR_TAKEN_W-1:0] br_taken_q[0:ROB_N-1];
+    //   ★★ EXP-N34B3：四张数据数组显式钉在分布式 RAM（64 深 < BRAM 最小深度，属性只把
+    //      推断目标写死；能否推断取决于下方 §5.3b 写进程的敏感性表）。
+    (* ram_style = "distributed" *) reg [`BACK2_BR_TGT_W-1:0]   br_tgt_q[0:ROB_N-1];
+    (* ram_style = "distributed" *) reg [`BACK2_BR_TAKEN_W-1:0] br_taken_q[0:ROB_N-1];
     reg                          ff_v_q  [0:ROB_N-1];
     reg  [`BACK2_TBL_EP_W-1:0]   ff_ep_q [0:ROB_N-1];
-    reg  [`BACK2_FF_W-1:0]       ff_q    [0:ROB_N-1];
+    (* ram_style = "distributed" *) reg [`BACK2_FF_W-1:0]       ff_q    [0:ROB_N-1];
     reg                          ex_v_q  [0:ROB_N-1];
     reg  [`BACK2_TBL_EP_W-1:0]   ex_ep_q [0:ROB_N-1];
-    reg  [`BACK2_EX_TVAL_W-1:0]  ex_tval_q[0:ROB_N-1];
+    (* ram_style = "distributed" *) reg [`BACK2_EX_TVAL_W-1:0]  ex_tval_q[0:ROB_N-1];
 
     //   拼接：载荷的不可更新部分 + 三张 typed 表的命中值（纯布线 + 单层选择，无多写源 mux）
     //     命中判据由调用方给出（`*_use` = 表 valid && 表 epoch == 项内 epoch && 该字段真被读）；
@@ -640,23 +642,22 @@ module rob #(
             // ---- 5.3 ★★ EXP-B：三张 typed 表写入（**每表恰好一个写源** ⇒ 无共享写口/无仲裁）----
             //   写口与该项的写回（5.2 置 done）**同沿**：此时该项尚未提交 ⇒ 索引不可能被复用
             //   ⇒ `nq[idx].epoch` 就是该项自己的 epoch（写入口径 == 提交比对口径）。
+            //   ★★ EXP-N34B3：**数据数组**（br_tgt/br_taken/ff/ex_tval）的写口已移出本块，
+            //     见下方 §5.3b 的独立无复位写进程；本块只留 `nq` 与三张表的 {valid, epoch}
+            //     （它们**必须**扛复位：复位后 `*_v_q=0` 是读路径的唯一门控，见 §5.3b 头注）。
             if (upd_tr_valid) begin
                 nq[upd_tr_idx][NQ_TRT]   <= upd_tr_taken;   // 提交侧 `tcp_tk` 仍吃 nq（保持原状）
                 br_v_q[upd_tr_idx]       <= 1'b1;
                 br_ep_q[upd_tr_idx]      <= nq[upd_tr_idx][NQ_EP_L +: `BACK2_EPOCH_W];
-                br_tgt_q[upd_tr_idx]     <= upd_tr_target;
-                br_taken_q[upd_tr_idx]   <= upd_tr_taken;
             end
             if (upd_ff_valid) begin
                 ff_v_q[upd_ff_idx]       <= 1'b1;
                 ff_ep_q[upd_ff_idx]      <= nq[upd_ff_idx][NQ_EP_L +: `BACK2_EPOCH_W];
-                ff_q[upd_ff_idx]         <= upd_ff_flags;
             end
             if (upd_exc_valid) begin
                 nq[upd_exc_idx][NQ_EXC_L +: 4] <= upd_exc_code;
                 ex_v_q[upd_exc_idx]      <= 1'b1;
                 ex_ep_q[upd_exc_idx]     <= nq[upd_exc_idx][NQ_EP_L +: `BACK2_EPOCH_W];
-                ex_tval_q[upd_exc_idx]   <= upd_exc_tval;
             end
 
             // ---- 5.35 ★ B3/EXP-N3：头部窗口填充（上一拍发出的预取读在本拍到达）----
@@ -705,6 +706,47 @@ module rob #(
                           + (alloc_fire ? {5'b0, alloc_n} : {(ROB_IDX_W+1){1'b0}});
                 if (cmt_chain[0]) cmt_cnt_q <= cmt_cnt_q + {29'b0, cmt_n_w};
             end
+        end
+    end
+
+    //==========================================================================
+    // 5.3b ★★ EXP-N34B3：三张 typed 表的**数据数组**写口（独立无复位写进程）
+    //==========================================================================
+    //   根因（与 N34B-1 的 `lht_mem` 完全同源）：改前 `br_tgt_q/br_taken_q/ff_q/ex_tval_q`
+    //   的写口与 `nq`/`*_v_q`/`*_ep_q` 共用 §5 的 `always @(posedge clk or negedge rst_n)`。
+    //   Vivado 的 RAM 推断要求存储阵列的写进程敏感性表**不含异步复位**，否则整表被判为
+    //   "带异步复位的 RAM"并退化成触发器阵列 —— 基线日志 `synth_2b_n34b1_...vivado.log`
+    //   `:1046/1050/1054/1058` 的 reason 字符串逐条明写
+    //   `RAM is sensitive to asynchronous reset signal. this RTL style is not supported.`
+    //
+    //   ★★ 复位语义审计（逐阵，结论：四阵全部可搬）：
+    //     · 四张数据数组**从未**在复位分支里被赋值（§5 的 `if (!rst_n)` 只清 `nq` 与
+    //       三张表的 `{valid, epoch}` 以及窗口/指针）⇒ 搬家不改复位行为；
+    //     · 四阵的**全部**读点都在 `merge_upd(...)`（`:525-527`）与陷阱口 `trap_tval`
+    //       （`:543`），命中判据 `br_use/ff_use/ex_use` 恒含 `*_v_q[idx]`：
+    //         `br_use[gi] = br_v_q[idx] & (br_ep_q[idx] == ep_gi) & slot_is_br[gi]`
+    //         `ff_use[gi] = ff_v_q[idx] & (ff_ep_q[idx] == ep_gi) & slot_is_fp[gi]`
+    //         `ex_use[gi] = ex_v_q[idx] & (ex_ep_q[idx] == ep_gi) & …`
+    //       而 `*_v_q` 在复位分支被清 0 ⇒ 复位后 `*_use ≡ 0`（4 态下 `0 & x = 0`，无 x 传播）
+    //       ⇒ `merge_upd` 走常量 0 回落支路、`trap_tval` 走载荷支路
+    //       ⇒ **复位后的任何读都被有效位严格门控**，LUTRAM 无复位不引入可观测差异。
+    //       该前提在源码头注 `:238-239` 已声明（"数据数组不置复位（valid=0 时被 merge 的
+    //       回落支路屏蔽，无 x 传播）；valid/epoch 数组复位清零"），本步只是把该声明
+    //       与综合推断所要求的**写进程形态**对齐。
+    //     · `rst_n` 作为**同步**使能保留在写条件里 ⇒ 与改前逐位同语义（改前 rst_n=0 的拍
+    //       在 `if (!rst_n)` 分支，不写；新块在 `if (rst_n)` 门内，同样不写）。
+    //     · 每张数组在本块内**恰好一个写语句**（br_tgt/br_taken 同属 `upd_tr_valid`，
+    //       但它们是两张独立数组、各一个写口；ff/ex 各自一个）⇒ Vivado 的单写口要求满足。
+    //     · 写条件与 §5.3 的三个 `if` **逐字同源**，同一拍采样同一组输入，无先后竞争
+    //       （新块不读 `nq`，§5.3 里的 `br_ep_q <= nq[...]` 与本块无变量交叠）。
+    always @(posedge clk) begin
+        if (rst_n) begin
+            if (upd_tr_valid) begin
+                br_tgt_q[upd_tr_idx]   <= upd_tr_target;
+                br_taken_q[upd_tr_idx] <= upd_tr_taken;
+            end
+            if (upd_ff_valid)  ff_q[upd_ff_idx]       <= upd_ff_flags;
+            if (upd_exc_valid) ex_tval_q[upd_exc_idx] <= upd_exc_tval;
         end
     end
 
