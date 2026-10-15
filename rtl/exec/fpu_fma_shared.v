@@ -357,7 +357,23 @@ module fpu_fma_shared (
     input  wire        neg_add,
     input  wire [2:0]  rm,
     output wire [63:0] result,
-    output wire [4:0]  fflags
+    output wire [4:0]  fflags,
+    //==========================================================================
+    // ★ N33B：div/sqrt 收尾舍入复用本模块的 u_round（共享双模舍入器）
+    //--------------------------------------------------------------------------
+    // fpu_div_sqrt 不再例化 fpu_round_pipe（删 u_rs 772 + u_rd 1001 官方
+    // Slice LUT），改为在收尾拍把 stage-A 窗口经这些端口注入 u_round。
+    // 互斥仲裁见下方 u_round 例化处。
+    //==========================================================================
+    input  wire        ds_rnd_req,   // 1 = 本拍级 A 入口取 ds_* 窗口
+    input  wire        ds_is_s,      // ds 侧模式位（1 = S）
+    input  wire        ds_sign,
+    input  wire [109:0] ds_sig,      // = (quo<<1)|sticky < 2^110（与 WW=110 吻合）
+    input  wire        ds_sticky,
+    input  wire signed [15:0] ds_exp,
+    input  wire [2:0]  ds_rm,
+    output wire [63:0] ds_rnd_result, // 共享舍入器 post 输出（S 已 NaN-box）
+    output wire [4:0]  ds_rnd_fflags
 );
     localparam [31:0] BOX_HI = 32'hFFFF_FFFF;
 
@@ -560,19 +576,39 @@ module fpu_fma_shared (
     wire [2:0] r5_rm_w = r5_rm;
 
     //---- 级 6~8 + 末级：一次舍入（双模）----
+    // ★★ N33B：同一 `u_round` 也**承接 div/sqrt 的收尾舍入**（入口 mux 在
+    //   **级 A 之前**，不改变 FMA 数据通路；级 A/B/C 与 post 一位不动）。
+    //
+    //   ★ 互斥仲裁（结构性证据链，来源 fpga/scratch/n33a_report.md §4/§7）：
+    //     · fpu.v:276 `ds_can_disp = ~ds_busy & ~ds_pend & ~flush`，而
+    //       `disp_any = req_valid & ds_can_disp`、`disp_sc = disp_any & ~op_ds`
+    //       ⇒ div/sqrt 在途期间 FPU **完全不接收**任何新指令；
+    //     · FMA/非 div-sqrt 流水固定 `FPU_SC_LAT = 8` 拍 ⇒ 在本模块 u_round 的
+    //       级 A 上停留窗口 ≤8 拍；
+    //     · div/sqrt 的收尾舍入发生在派发后约 **111 拍**（N33A §4.1 死参数实测：
+    //       迭代 busy=113 / 总延迟=115），远晚于 8 拍 ⇒ **两窗口不重叠**。
+    //     · 该结论与 FDIV/FSQRT_CYCLES 无关（该参数是死参数：迭代 for 体内全为
+    //       非阻塞赋值，同拍只留最后一次 ⇒ 每拍恒 1 步）。⚠ 若将来把
+    //       SPC_DIV/SPC_SQRT 改成"每拍多步"的活参数，本仲裁必须重评。
+    wire use_ds_round = ds_rnd_req;
     wire [63:0] round_result;
     wire [4:0]  round_flags;
     fpu_round_dual #(.WW(110), .QW(54)) u_round (
         .clk       (clk),
-        .is_s      (r5_is),
-        .sign      (round_sign),
-        .sig       (w_win),
-        .sticky_in (w_win_sticky),
-        .exp       (r5_wexp),
-        .rm        (r5_rm_w),
+        .is_s      (use_ds_round ? ds_is_s    : r5_is),
+        .sign      (use_ds_round ? ds_sign    : round_sign),
+        .sig       (use_ds_round ? ds_sig     : w_win),
+        .sticky_in (use_ds_round ? ds_sticky  : w_win_sticky),
+        .exp       (use_ds_round ? ds_exp     : r5_wexp),
+        .rm        (use_ds_round ? ds_rm      : r5_rm_w),
         .result    (round_result),
         .fflags    (round_flags)
     );
+
+    // N33B：把共享舍入器的末级组合输出回送给 fpu_div_sqrt（它只在 rnd_v[3]
+    // 当拍锁存；其余拍的值不被消费，且互斥保证此时无 FMA 在途）。
+    assign ds_rnd_result = round_result;
+    assign ds_rnd_fflags = round_flags;
 
     localparam integer LAT = 8;
     wire [68:0] sp_d;

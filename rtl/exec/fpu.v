@@ -89,10 +89,14 @@
 //        检查 ⇒ 本文件给它们**原始**操作数（避免双重替换；fmv.x.w / fcvt.d.s
 //        的 D 侧必须见原始 64 位，见 fpu_cvt.v 头注 ④⑥）。
 //   ② **S 结果**写回 fregfile 的 64 位视图时高 32 位必须全 1（NaN-boxing）：
-//      本文件对 32 位宽的子单元输出（fpu_div_sqrt 的 S 路径）补高 32 位 1；
 //      ★ N27B 起算术类的 S 打包改由 `fpu_fma_shared` **在核内**完成（它与 D 的
-//      完整 64 位同口输出），本文件原样透传；fpu_cmp/fpu_cvt 的 result 已按其
-//      头注完成"整数目标高 32 位 0 / 浮点目标 S 补 1 / D 完整 64 位"，本文件不再补。
+//      完整 64 位同口输出），本文件原样透传；
+//      ★ N33B 起 div/sqrt 的收尾舍入改由共享 `u_round`（fpu_round_dual）承担，
+//      但 `fpu_div_sqrt` 的结果契约仍为"S 低 32 bit 有效、未 box" ⇒ S 补位仍由
+//      本文件的 `ds_r_box`（§4.5）统一完成（幂等；保留它使 `result` 总线在每个
+//      cycle 都与改前逐位一致）；
+//      fpu_cmp/fpu_cvt 的 result 已按其头注完成"整数目标高 32 位 0 / 浮点目标
+//      S 补 1 / D 完整 64 位"，本文件不再补。
 //   ③ 算术结果若为 NaN ⇒ canonical NaN（S: 0x7FC0_0000 / D: 0x7FF8_0000_0000_0000），
 //      由各子单元保证；含 sNaN ⇒ 同时置 NV。
 //   ④ rm 解析（**唯一一处**，与 fpu_cvt.v 的解析式逐位一致）：
@@ -270,6 +274,12 @@ module fpu #(
     // 在途 div/sqrt 结果寄存（时序锁存；理由：done 拍上游可能已把
     // fp_op/fmt 换成下一条指令，结果的"选通 + S 结果 NaN-boxing"必须按
     // **派发时**的类别/格式决定，不能看当前输入）。
+    //   ★ N33B：`ds_fmt_d` / `ds_r_box` **保留不动**（与 N33A 集成建议 3 的
+    //     "删 S 分支"不同，理由如下）：交出模块 `fpu_div_sqrt` 的结果契约仍是
+    //     "S 低 32 bit 有效、未 box"，此处统一补位；这使 `ds_r` 与改前逐位相同，
+    //     顶层同树逐拍差分在**每个 cycle**（含 `ds_pend & sc_done` 同时成立的
+    //     "stale 总线"拍——核心因 E 级 `e_stall` 冻结而不可达）也逐字节一致。
+    //     代价仅 ~1 个 32 bit 2:1 mux，不威胁 N33B 的 ≥1500 面积门槛。
     reg  ds_pend;       // 1 = 最近派发的是 div/sqrt，结果尚未被 done 报出
     reg  ds_fmt_d;      // 该指令的格式（1=D，0=S）
 
@@ -278,6 +288,19 @@ module fpu #(
     wire disp_ds     = disp_any & op_ds;               // 送给 fpu_div_sqrt 的 start
     wire disp_sc     = disp_any & ~op_ds;              // 非 div/sqrt（流水类）
 
+    // ---- N33B：div/sqrt 收尾舍入窗口 ↔ fpu_fma_shared 的共享 u_round ----
+    //   互斥仲裁的完整证据链写在 fpu_fma_shared.v 的 u_round 例化处
+    //   （ds_can_disp 挡住新派发 + FMA 流水 ≤8 拍 ≪ div/sqrt 收尾 ~111 拍）。
+    wire         ds_rnd_req;
+    wire         ds_rnd_is_s;
+    wire         ds_rnd_sign;
+    wire [109:0] ds_rnd_sig;
+    wire         ds_rnd_sticky;
+    wire signed [15:0] ds_rnd_exp;
+    wire [2:0]   ds_rnd_rm;
+    wire [63:0]  ds_rnd_result;
+    wire [4:0]   ds_rnd_fflags;
+
     fpu_div_sqrt #(
         .FDIV_CYCLES  (FDIV_CYCLES),      // ★ 参数透传（不在本文件内换算拍数）
         .FSQRT_CYCLES (FSQRT_CYCLES)
@@ -285,7 +308,11 @@ module fpu #(
         .clk (clk), .rst_n (rst_n), .flush (flush),
         .start (disp_ds), .is_sqrt (op_sqrt), .fmt_d (is_d),
         .a (a_ar), .b (b_ar), .rm (rm_eff),
-        .busy (ds_busy), .done (ds_done), .result (ds_r), .fflags (ds_f)
+        .busy (ds_busy), .done (ds_done), .result (ds_r), .fflags (ds_f),
+        .rnd_req (ds_rnd_req), .rnd_is_s (ds_rnd_is_s), .rnd_sign (ds_rnd_sign),
+        .rnd_sig (ds_rnd_sig), .rnd_sticky (ds_rnd_sticky), .rnd_exp (ds_rnd_exp),
+        .rnd_rm (ds_rnd_rm),
+        .rnd_result (ds_rnd_result), .rnd_fflags (ds_rnd_fflags)
     );
 
     always @(posedge clk or negedge rst_n) begin
@@ -303,6 +330,8 @@ module fpu #(
     end
 
     // S 结果补高 32 位 1（NaN-boxing）；D 结果完整 64 位
+    //   ★ N33B：即使 `fpu_div_sqrt` 的共享舍入器对 S 已自带 box，此处再补一次是
+    //     **幂等**的 ⇒ 保留本 mux 使 `result` 总线在**每个 cycle** 都与改前一致。
     wire [63:0] ds_r_box = ds_fmt_d ? ds_r : {BOX_HI, ds_r[31:0]};
 
 
@@ -431,7 +460,12 @@ module fpu #(
         .is_s (is_s_fma),
         .a (a_fma), .b (b_fma), .c (c_fma),
         .neg_prod (ar_neg_np), .neg_add (ar_neg_na),
-        .rm (rm_eff), .result (fma_r), .fflags (fma_f)
+        .rm (rm_eff), .result (fma_r), .fflags (fma_f),
+        // ★ N33B：div/sqrt 收尾舍入窗口注入同一 `u_round`（互斥证据见该文件）
+        .ds_rnd_req (ds_rnd_req), .ds_is_s (ds_rnd_is_s), .ds_sign (ds_rnd_sign),
+        .ds_sig (ds_rnd_sig), .ds_sticky (ds_rnd_sticky), .ds_exp (ds_rnd_exp),
+        .ds_rm (ds_rnd_rm),
+        .ds_rnd_result (ds_rnd_result), .ds_rnd_fflags (ds_rnd_fflags)
     );
 
     //==========================================================================
@@ -472,8 +506,9 @@ module fpu #(
     //   ★★ N27B：原先还有一条 `sc_fmt`（2 bit × FPU_SC_LAT）用于出口选
     //      `out_is_d ? D 结果 : S 结果补 NaN-box`。共享核 `fpu_fma_shared` 已按
     //      随流水携带的 `is_s` 在**核内**完成 S/D 两种打包 ⇒ 该元数据链与其出口
-    //      mux 一并删除（功能等价，省 2×FPU_SC_LAT 个 FF）。div/sqrt 的格式仍由
-    //      它自己的 `ds_fmt_d` 锁存决定（见 §4.5），与这里无关。
+    //      mux 一并删除（功能等价，省 2×FPU_SC_LAT 个 FF）。
+    //   （★ N33B 最终**保留**了 div/sqrt 自己的 `ds_fmt_d` + `ds_r_box`：见 §4.5
+    //     的说明——保留它是为了 `result` 总线在每个 cycle 都与改前逐位一致。）
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -515,6 +550,8 @@ module fpu #(
 
     // 选通：div/sqrt 的 done 拍与在途期间选 div/sqrt 结果（上游 fp_op 已不可信）；
     // 未定义 op 不在任何类别 ⇒ 结果确定 0（不挂死，见头注 §1 ★）
+    //   ★ N33B：`ds_r_box` 保留（见 §4.5）——`fpu_div_sqrt` 交出的是"未 box"的
+    //     S 结果，这里统一补位；对共享舍入器已 box 的值再补一次是幂等的。
     wire sel_ds  = ds_done | ds_pend;
 
     assign result    = sel_ds        ? ds_r_box :

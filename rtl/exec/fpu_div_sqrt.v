@@ -97,6 +97,20 @@
 //     `busy` 在迭代结束后多持续 2 拍（**数值结果逐位不变**：拍数与数值无关，
 //     见上「拍数参数真源」；done 仍是单拍脉冲，busy 落低与 done 同拍）。
 //   时序契约（fpu.v §2）不变：busy 拍数完全由本模块决定，上游按 busy/done 消费。
+//
+// ★ N33B（DIV/SQRT 收尾舍入对删除）：**不再在本模块内例化 `fpu_round_pipe`**
+//   （原 `u_rs` S 管 772 + `u_rd` D 管 1001 = 1773 官方 Slice LUT，全 `u_div_sqrt`
+//   的 51.3%，见 fpga/scratch/n33a_report.md）。收尾舍入改为把 stage-A 窗口经
+//   `rnd_*` 端口送出、复用 `fpu_fma_shared` 内已有的 `u_round`
+//   （`fpu_round_dual #(.WW(110), .QW(54))`），并把其 3 级流水后的
+//   `rnd_result`/`rnd_fflags` 收回锁存。详尽口径与互斥仲裁证据见下方
+//   「N33B：收尾舍入**复用** fpu_fma_shared …」段。
+//   `fpu_round_pipe` 模块体保留在 `fpu_add.v` 内（金标，不再被本模块例化）。
+//   ★ S 的 NaN-box 仍由 `fpu.v` 出口的 `ds_r_box` 统一完成（本模块结果契约不变：
+//     S 低 32 bit 有效、未 box）⇒ `result_r` 与改前逐位相同，顶层同树逐拍差分
+//     在**每个 cycle** 都逐字节一致（含 ds 在途压在 result 总线上的 stale 值）。
+//   ★ 位级等价证据（模块级，N33B 新增）：`bash fpga/scratch/n33b_round_run.sh`
+//     （共享 `u_round` 的**新入口** ↔ 原生 u_rs/u_rd，12,000 向量 0 失配）。
 //==============================================================================
 `include "rv32_defs.vh"
 `include "core_params.vh"
@@ -115,10 +129,23 @@ module fpu_div_sqrt #(
     input  wire [63:0] a,
     input  wire [63:0] b,
     input  wire [2:0]  rm,
+    // ---- N33B：收尾舍入改用 fpu_fma_shared 内已有的共享双模舍入器 u_round ----
+    //   `rnd_result`/`rnd_fflags` 是共享 `fpu_round_dual` 的 3 级流水末级组合输出；
+    //   S 模式其 post 自带 64 bit NaN-box，但本模块只收低 32 bit（见锁存处）。
+    input  wire [63:0] rnd_result,
+    input  wire [4:0]  rnd_fflags,
     output wire        busy,         // 迭代期间为 1（冻结前端）
     output wire        done,         // 结果有效的单拍脉冲
     output wire [63:0] result,       // 结果（S 路径低 32 bit 有效，未 NaN-box）
-    output wire [4:0]  fflags
+    output wire [4:0]  fflags,
+    // ---- N33B：送往共享舍入器级 A 的窗口 + 模式/仲裁位 ----
+    output wire        rnd_req,      // 1 = 本拍把 rnd_* 送入共享舍入器级 A
+    output wire        rnd_is_s,     // 1 = S 模式（运行期双模选择）
+    output wire        rnd_sign,
+    output wire [109:0] rnd_sig,     // sig = (quo<<1)|sticky < 2^110
+    output wire        rnd_sticky,   // 恒 0（sticky 已压在 rnd_sig 的 bit0）
+    output wire signed [15:0] rnd_exp,
+    output wire [2:0]  rnd_rm
 );
     //==========================================================================
     // 规模（D 与 S 共用 256 bit 域；S 使用其低位部分）
@@ -205,6 +232,11 @@ module fpu_div_sqrt #(
     wire signed [15:0] b_eunb = (b_exp == 0) ? (16'sd1 - bias_w)
                                              : ($signed({5'b0, b_exp}) - bias_w);
 
+    // ★ N33B：S 的 NaN-box 仍由 fpu.v 出口的 `ds_r_box` 统一完成（见 fpu.v §4.5）
+    //   ——本模块的 S 结果**保持"低 32 bit 有效、未 box"**的原有契约。共享双模
+    //   舍入器 post 虽然自带 64 bit 打包，但本模块在锁存时截回低 32 bit，使
+    //   `result_r` 与改前**逐位相同**（含 ds 在途期间压在 result 总线上的 stale 值）
+    //   ⇒ 顶层同树逐拍差分的**每一个 cycle** 都逐字节一致（不只是可观测拍）。
     localparam [63:0] CANON_S = 64'h0000_0000_7FC0_0000;
     localparam [63:0] CANON_D = 64'h7FF8_0000_0000_0000;
 
@@ -240,33 +272,45 @@ module fpu_div_sqrt #(
     reg  [3:0]        rnd_v;
 
     //==========================================================================
-    // 迭代结果 → 已验证的舍入原语（组合）
+    // ★ N33B：收尾舍入**复用** fpu_fma_shared 内已有的共享双模舍入器 u_round
+    //--------------------------------------------------------------------------
+    // 本模块**不再例化** fpu_round_pipe（原 `u_rs` S 管 / `u_rd` D 管两个实例，
+    // 官方 Slice LUT 772 + 1001 = 1773，见 fpga/scratch/n33a_report.md §0/§6）。
+    // 交付/接口：把 stage-A 入口窗口 + 运行期模式位送出（`rnd_*`），把共享舍入器
+    //   3 级流水后的 post 组合输出收回来（`rnd_result`/`rnd_fflags`）。
+    //
+    // 位宽吻合（N33A §4）：quo_r 累积 STEPS_MAX = 109 位 ⇒
+    //   sig = (quo<<1)|sticky < 2^110，且 pack 拍 `rem_r <= (quo<<1)|sticky`
+    //   会把高位清零 ⇒ rem_r[109:0] 即全部有效位；共享实例是
+    //   `fpu_round_dual #(.WW(110), .QW(54))` **恰好覆盖**（原 u_rs/u_rd 的
+    //   WW=112 只是多 2 个恒 0 的高位）。
+    //
+    // ★★ 互斥仲裁（写死的结构前提，必须连同 fpu.v 的证据一起读）：
+    //   fpu.v:276 `ds_can_disp = ~ds_busy & ~ds_pend & ~flush`，且
+    //   `disp_any = req_valid & ds_can_disp`、`disp_sc = disp_any & ~op_ds`
+    //   ⇒ div/sqrt 在途期间 FPU **完全不接收**任何新指令；非 div/sqrt（FMA）流水
+    //   只可能在 div/sqrt 派发**之前**的 ≤8 拍内在途（FPU_SC_LAT=8）。而本模块的
+    //   收尾舍入发生在派发后约 111 拍（N33A §4.1 死参数实测：busy=113 / 总延迟=115）
+    //   ⇒ 共享窗口**不重叠**，且与 FDIV/FSQRT_CYCLES 无关（该参数在 RTL 内是死参数：
+    //   迭代 for 体内全为非阻塞赋值，同拍只留最后一次 ⇒ 每拍恒 1 步）。
+    //   ⚠ 若将来有人把 SPC_DIV/SPC_SQRT 改成真正的"多步/拍"活参数，本门必须重评。
+    //
+    // 拍数：`rnd_v` 4 拍链与原来**逐拍相同**——pack 后第 1 拍 `rnd_v==4'b0001` 即
+    //   级 A 采样拍（`rnd_req=1`），第 4 拍 `rnd_v[3]=1` 即末级 post 有效拍；
+    //   共享 `fpu_round_dual` 与 `fpu_round_pipe` 同为 3 级 ⇒ busy/done 拍数不变。
     //==========================================================================
-    // ★ 必须传**完整**的 sig（S 时可达 110 位）：quo_r 累积 STEPS_MAX 位，
-    //   sig = (quo<<1)|sticky 直接落在 rem_r 上，截断会丢掉全部有效位、
-    //   结果恒为 0（实测踩到）。重写后窄域原语只需 WW = 112 位窗口：
-    //   quo_r < 2^STEPS_MAX = 2^109 ⇒ (quo<<1)|sticky < 2^110 ≤ 2^112 ✓
-    //   （pack 拍 rem_r <= (quo_r<<1)|sticky 会把高位清零，故窗口外无有效位）。
-    // ★ 仿真吞吐优化（2026-09-17，语义不变）：只让**当前格式**的舍入原语活动。
-    //   `result_r <= r_fmt_d ? rd_res : {32'b0, rs_res}` 只取对应格式的结果，
-    //   另一格式的输出恒被丢弃 ⇒ 把它的 sig 输入钳 0（iverilog 事件驱动下
-    //   该实例不再求值）。位级语义与钳零前一致。
-    localparam integer RWW = 112;                  // 舍入窗口位宽（≥ 110，S/D 共用）
-    wire [RWW-1:0] sig_round_s = r_fmt_d ? {RWW{1'b0}} : rem_r[RWW-1:0];
-    wire [RWW-1:0] sig_round_d = r_fmt_d ? rem_r[RWW-1:0] : {RWW{1'b0}};
+    localparam integer RWW = 110;                  // 共享舍入器窗口位宽（= u_round 的 WW）
+    wire [RWW-1:0] sig_round_w = rem_r[RWW-1:0];
 
-    wire [31:0] rs_res;  wire [4:0] rs_fl;
-    wire [63:0] rd_res;  wire [4:0] rd_fl;
     // sticky_in = 0：迭代末把"余数非零"已经压进 sig 的 bit0（sig = (quo<<1)|sticky），
-    // 故舍入窗口是精确值、无窗口外信息（与旧全宽实现同一 sig）。
-    fpu_round_pipe #(.FB(23), .WW(RWW), .RW(32), .EB(8),
-                     .MIN_SUB(-149), .E_MAXF(255), .BIAS(127)) u_rs (
-        .clk(clk), .sign(r_sign), .sig(sig_round_s), .sticky_in(1'b0), .exp(exp_r),
-        .rm(r_rm), .result(rs_res), .fflags(rs_fl));
-    fpu_round_pipe #(.FB(52), .WW(RWW), .RW(64), .EB(11),
-                     .MIN_SUB(-1074), .E_MAXF(2047), .BIAS(1023)) u_rd (
-        .clk(clk), .sign(r_sign), .sig(sig_round_d), .sticky_in(1'b0), .exp(exp_r),
-        .rm(r_rm), .result(rd_res), .fflags(rd_fl));
+    // 故舍入窗口是精确值、无窗口外信息（与旧 u_rs/u_rd 的同一 sig）。
+    assign rnd_req    = (rnd_v == 4'd1);          // = 级 A 采样拍（pack 的下一拍）
+    assign rnd_is_s   = ~r_fmt_d;                 // 运行期双模：S/D 由格式位选
+    assign rnd_sign   = r_sign;
+    assign rnd_sig    = sig_round_w;
+    assign rnd_sticky = 1'b0;
+    assign rnd_exp    = exp_r;
+    assign rnd_rm     = r_rm;
 
     // 开方：打包阶段的指数 = ((E+nb+p) >>> 1) − STEPS − 1
     //   ★ 三个加数恒为偶和 ⇒ 算术右移 1 位即精确减半；
@@ -378,8 +422,12 @@ module fpu_div_sqrt #(
             if (rnd_v[3]) begin
                 busy_r   <= 1'b0;
                 done_r   <= 1'b1;
-                result_r <= r_fmt_d ? rd_res : {32'b0, rs_res};
-                fflags_r <= r_fmt_d ? rd_fl  : rs_fl;
+                // ★ N33B：共享双模舍入器 post 对 S 自带 64 bit 打包，但本模块
+                //   仍按原契约**只收低 32 bit**（S 的 NaN-box 由 fpu.v 出口的
+                //   `ds_r_box` 统一做）⇒ `result_r` 与改前逐位相同，顶层逐拍
+                //   差分在**每个 cycle**（含 ds 在途的 stale 拍）都一致。
+                result_r <= r_fmt_d ? rnd_result : {32'b0, rnd_result[31:0]};
+                fflags_r <= rnd_fflags;
             end
 
             if (start && !busy_r) begin
