@@ -102,6 +102,18 @@
 - **验证边界（能力事实，非缺陷）**：headless 一次性 profile **无法**复现 Web 的 preset 作用域——`modelSelectionSettings: true` 只在 `@deepseek-ai/dsh-web-app/presets/standard.patch.yml` 的 delegation 组里给出（base 的 `tool-subagent` 是关闭状态），因此"新会话采样 allowedModels"只能在**新 Web 会话**里实证；headless 里即便打开该开关也不会挂出 `subagent`/`list_subagent_models`。另注：profile patch 层的 `config` 是**整块替换**而非深合并（要给已存在 entry 加字段必须重写其全部字段）。
 - **恢复后的续办清单（NEXT_SESSION §1.5.6 待办 2–6 顺延）**：D2/D3/D4/D6/D7/D8 审计修复批（D3/D4/D5/D7 需各自口径确认，D7 需架构裁决）→ AUDIT3 §6-1 零影响 28 条 → 送审池三项（N34B-2 与锦标赛预测器硬指标冲突须需求裁决）→ 下一批面积候选（win_idx epoch 等）→ 文档口径同步 → arch-test 接入 2B。远端：`bd622ee`/`a40947c` 待 push（origin=git@github.com:shorthairking/rv32gc-cpu.git）。
 
+### 1.5.8 📋 交接存档点 #19（2026-10-18：路由复验通过 + D2/D6/D8 修复入库，**★派活纪律收紧：必须走子 Agent 模板**）
+
+- **★ds-official 路由复验通过（本 session 实测）**：新会话 `list_subagent_models provider=deepseek-official` 列出 `deepseek-official/deepseek-flash — DeepSeek-V4.1-Flash`，宿主 allowedModels 放行生效，§1.5.1/§1.5.7 的"须新开会话"阻塞正式解除。仅列出 `deepseek-flash` 一个 id（未挂 `deepseek-v4-pro`），项目口径不受影响。
+- **★派活纪律（用户 2026-10-18 指令，最高优先级）**：分派子 Agent **必须**把 `prompts/subagent-{coding,testing,info}.md` 模板**全文** + §5 任务填空（【任务目标】【涉及文件/范围】【验收判据】【禁止事项】【参考（可选）】）一起作为 prompt 传入，禁止模板以外方式派活。要点：子代理**不 git commit**（母 Agent 统一提交）；回复格式【结论】【证据】【遗留/风险】。本日实测：首派（cbbeb145）未带模板且误令其 commit → 中止重派（d260aa01，合规）。
+- **D2/D6/D8 审计修复批 ✅（commit `7e2e730`，母 Agent 亲跑四套判据验收）**：
+  - D2：`rtl/csr/trap_ctrl.v` S 级中断使能改 `M→0 / U→1 / S→SIE` 三分支（ISA supervisor.adoc：U 模式 SIE 被忽略）；2A/2B 共用同一 trap_ctrl，一处修复两核生效。
+  - D6：`rtl/csr/csr_file.v` mtvec/stvec WARL 写路径按 `mode_new==VECTORED` 清 `d[7:2]`（256B 对齐）、Direct 仍清低 2 位，与 trap 路径 `trap_ctrl.v:270-273` 实际掩码口径一致 ⇒ "写→读回 == 实际向量基址"；保留 Vectored（§5.4 裁决不变）。
+  - D8：①`alu.v` 头注真源改指 `rtl/decode/decoder.v` 的 `ALU_*` localparam（`rv32_defs.vh` 无 `ALU_*`；`ALU_AUIPC=11` 死编码已标注）；②`back2_params.vh:615-620` 非对齐 cause 4/6 注释纠偏；③`bru_act_tk` 在 `backend_top.v:1571-1578` 数据源头收口 `is_ctl` 门控（不改 bru.v 端口，消费者等价性已枚举）。
+  - **验收**：tb_core_top_2b 219/219 + tb_back2_iq 151/151 + 锁步 57 项/821 提交/FAIL 0 + regress 33/33（母 Agent 复跑）；子代理另做定向闭环 TB（/tmp，未入库）：修复后 18/18 ALL-PASS、HEAD 基线 FAIL n=6（D6×3+D2×3），证明缺陷确实修掉。
+- **★新发现待用户裁决（D2 修复时子代理额外暴露，本轮未动）**：`trap_ctrl.v:189-191` 既有"委托门控"疑似 ISA 偏差——S 级中断在 `mideleg[i]=0` 时于 M/S/U 三种模式下**都不可见**；ISA `machine.adoc`（norm:intrmipmie_op）要求 (a) priv==M&MIE=1 或 priv<M、(b) mip&mie、(c) mideleg[i]=0 ⇒ **应进 M**。AUDIT2 §② 当时把这处记作"无差异"（误判）。定向 TB 仅 NOTE 未作判据。**处置待裁决：另开审计/修复条目（建议编号 D9），若修需补 U/S 模式非委托 S 中断用例**。
+- **续办清单顺延（§1.5.7 原序不变）**：D3/D4/D5 口径建议（未派）→ D7 架构裁决（未决）→ AUDIT3 §6-1 零影响 28 条 → 送审池三项 → 下一批面积候选 → 文档口径同步 → arch-test 接入 2B。远端：`7e2e730` 已 push。
+
 ### 1.5.6 📋 交接存档点 #17（2026-10-15：Gate E 收官 + 三轮审计完成，**迁移下一 session 处置审计发现**）
 
 - **★当前状态**：RTL 冻结在 **`d00eb03`**（工作树干净；文档 HEAD `201d88d` = 总结报告 Gate E 收官版）。**基线 = 126,699 Slice LUT（94.13%，首破器件容量）/ 49,597 FF（18.42%）/ 40 RAMB36 / 6 RAMB18 / 21 DSP / WNS ≈ −52ns**。累计 366,483→126,699 = **−65.43%**；目标 ≤80%（107,680）仍差 **−19,019**。综合证据 `fpga/out/synth_2b_n35b_16.667ns_utilization.rpt`（sha256 `0a7faefe…07e8`）。
