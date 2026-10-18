@@ -93,6 +93,14 @@
 - **正确性收获（本阶段，比面积更重要）**：rename 回滚取点 pdi 撞车（51a06cf）、PRF busy 表 epoch 死锁（20da16e）、TRQ 三记账缺陷、LSQ 非对齐转发错字（dc36336）、FMUL 零符号（bf7b3e7）。div/sqrt 参数 RV32GC_FDIV/FSQRT_CYCLES=32 是死参数（实际 114 拍位串行），非面积杠杆，文档口径待澄清。
 - **遗留**：文档口径滞后（NREG 96→64/nq 49→37/RB 416→229/commit 4→2/FPU 6→2 算术单元）；动态探针 dyn_probe_r 需适配 EXP-R1 后 rename 接口；NREG=64 余量仅 6 号；时序 WNS≈−50ns 深度不收敛。
 
+### 1.5.7 📋 交接存档点 #18（2026-10-18：D1 修复入库 + 审计证据入库 + 路由口径更新，**等宿主开通 deepseek-official 路由**）
+
+- **D1 修复 ✅（commit `bd622ee`，母 Agent 亲跑验收）**：`rtl/back2/lsq_simple.v`（新增 STQ 项 4bit 高字掩码 `stq_mh`：E1 跨字判定 `st_nb_w/st_sum_w/st_hi_w/st_spill_w/st_mh_w/st_dh_w`，两处 CDQ 高字掩码由硬编码 4'hF 改 `stq_mh`（8B 恒 0xF 逐位等价），转发高字命中加 `& stq_mh[lane]`；`st_mis_w` 未动，仍仅 8B 抛 cause6）+ `sim/unit/dyn_probe_n12_body.inc`（N12A 探针镜像同步）。**验收**：`AUDIT2_LSQ_MIS: ALL-PASS`（基线 `d00eb03` 实测 FAIL n=2，B2/C2 跨字节）+ `./scripts/regress.sh` 33/33 PASS（含 2b/iq/lockstep）。**残留**：①2A（任意非对齐抛 cause6）与 2B（≤4B 硬件完成）语义分叉，锁步程序暂不含跨界 store，若纳入须先统一 2A；②跨 4K 页第二笔沿用 8B PA+4 简化；③低字 fire 即置 `stq_ret` 属 8B 既有特性未动。详情 `sim/audit/audit2_lsq_mis_report.md`（330 行，已入库）。
+- **审计证据入库**：`sim/audit/`——audit1/2/3 三报告 + audit2_gate.sh/audit1_check.sh/audit3_check.py + audit2_lsq_mis_tb.sv 夹具（原 fpga/scratch/ 为 .gitignore 区，现在 repo 内有常驻副本；今后 gate 以 sim/audit/ 为准）。
+- **★子 Agent 路由口径已更新（用户 2026-10-18 裁决，commit `a40947c`）**：`provider: "deepseek-official"`、`model: "ds-flash"`、`reasoning_effort: "high"`；旧 opencode-go 两路由 `deepseek-v4.1-flash` 与 xhigh 口径作废。已同步 AGENT.md §0.2/§2、NEXT_SESSION.md（本条+§2+§7）、USAGE.md、README.md、prompts/×3；`memory_write` 已记（mem-ea81a10b）。
+- **★阻塞（须用户操作）**：本会话实查 `deepseek-official` 报 "not allowed for this Session"（宿主 `allowedModels` 仅 opencode-go×2/openai-codex）⇒ **下一步：用户在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 加入 `{provider: deepseek-official, model: ds-flash}`，然后新开会话**（路由是会话首组装快照）。开通前子 Agent 派活一律暂停（不得用旧路由，§0.2）。
+- **恢复后的续办清单（NEXT_SESSION §1.5.6 待办 2–6 顺延）**：D2/D3/D4/D6/D7/D8 审计修复批（D3/D4/D5/D7 需各自口径确认，D7 需架构裁决）→ AUDIT3 §6-1 零影响 28 条 → 送审池三项（N34B-2 与锦标赛预测器硬指标冲突须需求裁决）→ 下一批面积候选（win_idx epoch 等）→ 文档口径同步 → arch-test 接入 2B。远端：`bd622ee`/`a40947c` 待 push（origin=git@github.com:shorthairking/rv32gc-cpu.git）。
+
 ### 1.5.6 📋 交接存档点 #17（2026-10-15：Gate E 收官 + 三轮审计完成，**迁移下一 session 处置审计发现**）
 
 - **★当前状态**：RTL 冻结在 **`d00eb03`**（工作树干净；文档 HEAD `201d88d` = 总结报告 Gate E 收官版）。**基线 = 126,699 Slice LUT（94.13%，首破器件容量）/ 49,597 FF（18.42%）/ 40 RAMB36 / 6 RAMB18 / 21 DSP / WNS ≈ −52ns**。累计 366,483→126,699 = **−65.43%**；目标 ≤80%（107,680）仍差 **−19,019**。综合证据 `fpga/out/synth_2b_n35b_16.667ns_utilization.rpt`（sha256 `0a7faefe…07e8`）。
