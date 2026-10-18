@@ -18,10 +18,11 @@
 ### 0.2 子 Agent 一律用 dsh 工具调用，并显式指定模型
 
 - 子 Agent 一律用 **dsh 的 `subagent` / `subagent_fork` 工具**调用，**不使用 opencode 本体**。
-- 每次调用必须显式携带模型路由字段（**2026-10-01 用户裁决（最新口径）：两个 opencode-go provider 并存、档位 `high`**；早前 xhigh 口径与 deepseek-official/deepseek-flash 口径均作废）：
-  - `provider`：`"opencode-go"` **或** `"opencode-go-chat"`（**两者都放行**，OpenCode Go 网关；精确 provider 名用 `list_subagent_models` 实查确认）
-  - `model: "deepseek-v4.1-flash"`（两条路由都指向 OpenCode Go 网关的 DeepSeek V4.1 Flash）
-  - `reasoning_effort: "high"`（**每次调用一律 high 档**：用户 2026-10-01 明确允许由 xhigh 降档；`opencode-go` 侧实查档位只有 low/high/max，`high` 是两条路由的公共可用档）。
+- 每次调用必须显式携带模型路由字段（**2026-10-18 用户裁决（最新口径）：DeepSeek 官方路由、档位 `high`**；早前 xhigh 口径与两个 opencode-go 路由的 `deepseek-v4.1-flash` 口径均作废）：
+  - `provider: "deepseek-official"`（DeepSeek 官方路由；精确 provider 名用 `list_subagent_models` 实查确认）
+  - `model: "ds-flash"`
+  - `reasoning_effort: "high"`（**每次调用一律 high 档**）。
+- **宿主开通状态（2026-10-18 实查）**：本会话 `list_subagent_models` 仅见 `opencode-go` / `opencode-go-chat` / `openai-codex`，`deepseek-official` 实测报 "not allowed for this Session" ⇒ **须先由用户在宿主配置**（`~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels`）加入 `{provider: deepseek-official, model: ds-flash}`，并**新开会话**才生效（见下条快照事实）。**开通前跨会话派活一律暂停上报，不得退化用旧路由或母 Agent 自身模型。**
 - **宿主事实（2026-10-01 实测）**：① 子 Agent 模型选择是**会话首次组装时快照**，宿主配置（`~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings`）改动后**已存在的会话不会重算**，必须**新开会话**才生效；② `subagent_fork` 不带 `provider`/`model` 字段是**设计如此**（未开 `modelSelectionSettings`，以保持与父 Agent 同路由、复用 KV cache），不要据此判定环境缺失——只有 `subagent`（spawn）会暴露 `provider`/`model`/`reasoning_effort` 与 `list_subagent_models`。
 - 若当前会话的 `subagent` 工具参数里**没有** `provider`/`model` 字段：先调用 `list_subagent_models`（若已注册）核实；仍没有 → **停止并报告用户**（宿主未开启子 Agent 模型选择，见 `USAGE.md` §2），不得退化成用母 Agent 自身模型跑子 Agent。
 - 任务拆分、派活格式与分工边界见 §5。
@@ -100,7 +101,7 @@
 | 工具链 | `/opt/riscv/bin/riscv32-unknown-linux-gnu-`（GCC 16.1.0） |
 | 仿真器 | Verilator 5.020、Icarus Verilog 12.0（已安装，可用） |
 | 参考模型 | Spike（需重新编译到新项目；旧编译产物在旧项目内，不复制） |
-| 子 Agent 模型 | dsh 已开启"子 Agent 模型选择"（配置在 profile `cordis.patch.yml` 的 `subagent-model-selection-settings`；**`~/.dsh/settings.yaml` 已被 dsh 移除，勿再引用**），放行 `opencode-go` 与 `opencode-go-chat` 两条路由的 `deepseek-v4.1-flash`（**high 档**，§0.2；精确 provider 名以 `list_subagent_models` 实查为准） |
+| 子 Agent 模型 | **2026-10-18 用户裁决（最新口径）**：`provider: "deepseek-official"` + `model: "ds-flash"` + `reasoning_effort: "high"`（DeepSeek 官方路由；**宿主开通前暂停派活**——本会话实查该路由 "not allowed"，须用户改 profile `cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 并新开会话，§0.2；精确 provider 名以 `list_subagent_models` 实查为准）。旧 opencode-go 两路由 `deepseek-v4.1-flash` 口径作废 |
 | 知识库 | 常驻 riscv-kb：`kb_search` 工具 / CLI `node dsh-extension/bin/riscv-kb.js search` |
 | 网络 / sudo | 网络可用；`sudo` 不可用（系统包安装需请用户在沙箱外执行） |
 
