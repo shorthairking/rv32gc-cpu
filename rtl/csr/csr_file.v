@@ -461,13 +461,22 @@ module csr_file (
                     // ---- ② mtvec/stvec：BASE 4 B 对齐 + MODE∈{0,1}；2/3 保留 ⇒ 保持现值 ----
                     //   ★ 注意重组写法：`{d[31:2], 2'b00} | MODE`，不是 `{d[31:2], mode}`
                     //     （后者等价于把 d 左移 30 位，实测踩过）。
+                    //   ★★ D6 修复（AUDIT2）：MODE=Vectored 时 trap_ctrl 取向量按
+                    //     BASE **256 B 对齐**（`{base[31:8], 8'h00}`）。WARL 写路径必须与
+                    //     实际使用口径一致地清 `d[7:2]`，否则「写→读回」的 base ≠ 中断向量
+                    //     实际基址（例：读回 0x8000_0121，硬件却从 0x8000_0100 取向量）。
+                    //     Direct 仍只清低 2 位（trap_ctrl 对 Direct 也只做 4 B 规范化）。
                     `RV32GC_CSR_MTVEC: begin
                         mode_new    = (d[1:0] <= 2'b01) ? d[1:0] : mtvec_cur[1:0];
-                        csr_landing = {d[31:2], 2'b00} | {30'b0, mode_new};
+                        csr_landing = (mode_new == `RV32GC_TVEC_MODE_VECTORED)
+                                      ? ({d[31:8], 8'h00} | {30'b0, mode_new})
+                                      : ({d[31:2], 2'b00} | {30'b0, mode_new});
                     end
                     `RV32GC_CSR_STVEC: begin
                         mode_new    = (d[1:0] <= 2'b01) ? d[1:0] : stvec_cur[1:0];
-                        csr_landing = {d[31:2], 2'b00} | {30'b0, mode_new};
+                        csr_landing = (mode_new == `RV32GC_TVEC_MODE_VECTORED)
+                                      ? ({d[31:8], 8'h00} | {30'b0, mode_new})
+                                      : ({d[31:2], 2'b00} | {30'b0, mode_new});
                     end
                     // ---- ② menvcfg/senvcfg：FIOM/CBCFE 取写数据；CBIE=2'b10 保留 ⇒ 保持现值 ----
                     //   ★ 按字段掩码替换（先清 [5:4] 再置入），不做位拼接以免位宽错位。

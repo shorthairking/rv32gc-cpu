@@ -6,8 +6,11 @@
 //             「整数算术/逻辑/移位/比较；lui/auipc」；
 //             in: a, b, alu_op, pc；out: result；**纯组合，assign/function 为主**。
 //           AGENT.md §4 红线 3（禁止 `always @(*)` 给多个 reg 赋值）。
-// 唯一真源: 本模块**不新增任何编码**；`RV32GC_ALU_*` 的编号即
-//           `rtl/pkg/rv32_defs.vh` 的 alu_op 编码（见本文件「编码公约」）。
+// 唯一真源: `RV32GC_ALU_*` 编号**不在 pkg**（`rtl/pkg/rv32_defs.vh` 无任何 `ALU_*`
+//           定义，AUDIT2 D8 实测零命中）；alu_op 编码真源是
+//           `rtl/decode/decoder.v` 的 `ALU_*` localparam
+//           （ADD..AND = 0..9、PASSB = 10、NONE = 15，见本文件「编码公约」）。
+//           本模块**不新增任何编码**，只做可读镜像。
 // 引用    : [ISA:riscv-isa-manual/src/unpriv/rv-32-64g.adoc] 整数指令语义；
 //           [DOC:docs/kb/isa-notes.md]；[ENC:binutils riscv-opc.h MATCH/MASK]。
 //==============================================================================
@@ -24,11 +27,15 @@
 //   pc     [31:0] : 本条指令 PC，**仅供 auipc**（result = pc + imm，imm 由 b 传入）
 //   result [31:0] : 运算结果，与输入同拍组合有效（0 拍延迟）
 //
-// 三、编码公约（alu_op，与 rv32_defs.vh 的 ALU 编码一一对应）
+// 三、编码公约（alu_op；编号真源 = rtl/decode/decoder.v 的 ALU_* localparam）
 //   ALU_ADD(0)  ALU_SUB(1)  ALU_SLL(2)  ALU_SLT(3)  ALU_SLTU(4)
 //   ALU_XOR(5)  ALU_SRL(6)  ALU_SRA(7)  ALU_OR(8)   ALU_AND(9)
-//   ALU_LUI(10) ALU_AUIPC(11)
-//   ※ 未定义编码（12–15）⇒ result = 0（确定行为，无 latch、无异常）。
+//   ALU_LUI(10) —— 编号 = decoder 的 ALU_PASSB(10)（直接传 b）
+//   ALU_AUIPC(11) —— ★ **死编码**：decoder 从不产生 11（auipc 走 ALU_ADD + a=pc，
+//                   result 由 ADD 算出）。保留仅为本文件 case 的完整性/可读性，
+//                   不得据此扩展译码（AUDIT2 D8）。
+//   ※ 未定义编码（12–15，含 decoder 的 ALU_NONE=15）⇒ result = 0
+//     （确定行为，无 latch、无异常）。
 //   ※ lui/auipc 之所以放在 ALU 而不是别处：二者都是「立即数装载」，
 //     与 ALU 共用 E 级单发射口（08 §5.3 首句「共享单发射口，每拍只派一条」）。
 //     auipc 必须拿 pc，故本模块**带 pc 输入**（与 08 §5.3 端口表一致）。
@@ -76,8 +83,8 @@ module alu (
 );
 
     //--------------------------------------------------------------------------
-    // 1. alu_op 局部编码（**与 rv32_defs.vh 的 ALU 编号严格一致**）
-    //    这里用 localparam 而非 `define：本文件不是真源，编码真源在 pkg；
+    // 1. alu_op 局部编码（**与 rtl/decode/decoder.v 的 ALU_* 编号严格一致**）
+    //    这里用 localparam 而非 `define：本文件不是真源，编码真源是 decoder.v；
     //    此处只做「可读的镜像」，避免在 15 处比较里散落裸数字。
     //--------------------------------------------------------------------------
     localparam [3:0] ALU_ADD   = 4'd0;
@@ -90,8 +97,8 @@ module alu (
     localparam [3:0] ALU_SRA   = 4'd7;
     localparam [3:0] ALU_OR    = 4'd8;
     localparam [3:0] ALU_AND   = 4'd9;
-    localparam [3:0] ALU_LUI   = 4'd10;
-    localparam [3:0] ALU_AUIPC = 4'd11;
+    localparam [3:0] ALU_LUI   = 4'd10;   // = decoder.v 的 ALU_PASSB
+    localparam [3:0] ALU_AUIPC = 4'd11;   // ★ 死编码：无产生方（AUDIT2 D8）
 
     //--------------------------------------------------------------------------
     // 2. 组合逻辑：function 实现（无 always、无 reg）
@@ -119,6 +126,8 @@ module alu (
                 // lui ：U 型立即数已由 D 级左移 12 位并经 b 端口送入
                 ALU_LUI  : alu_calc = f_b;
                 // auipc：pc + U 型立即数（同样经 b 端口送入）
+                //   ★ 死编码（AUDIT2 D8）：decoder 用 ALU_ADD + a=pc 实现 auipc，
+                //     不会送 11 进来；保留本分支只为编码表完整、行为确定。
                 ALU_AUIPC: alu_calc = f_pc + f_b;
                 // 未定义编码：确定输出 0（无 latch；译码器保证不出现）
                 default  : alu_calc = 32'd0;

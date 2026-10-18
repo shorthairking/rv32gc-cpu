@@ -1568,13 +1568,19 @@ module backend_top #(
                .taken(bru_taken), .target(bru_target));
     wire        bru_isjal  = (w_opt(x_i2_uop[2]) == OPT_JAL);
     wire        bru_isjalr = (w_opt(x_i2_uop[2]) == OPT_JALR);
-    wire        bru_act_tk = bru_isjal | bru_isjalr | bru_taken;
+    wire [2:0]  bru_cls    = w_cls(x_i2_uop[2]);
+    wire        bru_is_ctl = (bru_cls != 3'd0);
+    //   ★★ D8（AUDIT2）：`bru_act_tk` 显式按"本指令是控制转移"收口，与下游
+    //     `bru_mis`（本就 `& bru_is_ctl`）及 `upd_tr_v`（`w_is_br`）的门控语义
+    //     对齐。bru.v 的 `taken` 只由 jal/jalr/br_taken 组成，非控制转移 lane
+    //     的 br_f3 未定义 ⇒ 旧写法可能凑出 1，当前仅靠"消费者都会门控"兜住。
+    //     不改 bru.v 端口，只在数据源头收口（等价行为，消除潜在坑）。
+    wire        bru_act_tk = bru_is_ctl & (bru_isjal | bru_isjalr | bru_taken);
     wire [31:0] bru_ilen   = w_il32(x_i2_uop[2]) ? 32'd4 : 32'd2;
     wire [31:0] bru_link   = w_pc(x_i2_uop[2]) + bru_ilen;
     wire [31:0] bru_npc    = bru_act_tk ? bru_target : bru_link;
     wire [31:0] bru_pred_t = {32{w_pred_tk(x_i2_uop[2])}} & w_predtgt(x_i2_uop[2]);
     wire [31:0] bru_pred_n = w_pred_tk(x_i2_uop[2]) ? w_predtgt(x_i2_uop[2]) : bru_link;
-    wire [2:0]  bru_cls    = w_cls(x_i2_uop[2]);
     //   ★ 误判判定必须覆盖**全部控制转移**（cls != 0）：
     //     · 方向：任何控制转移都要与实际方向比（条件分支的条件分支走向是预测出来的，
     //       是最常见的误判源）；
@@ -1583,7 +1589,6 @@ module backend_top #(
     //   旧实现把 `bru_cmp` 写成只含 3/4/6 ⇒ **条件分支误判永不被发现**（无重定向、
     //   错路径照常提交）。实测：程序 0 第 26 条起走错路（循环回边未重定向，
     //   提交流出现循环外的 PC 0x8000_0068，与黄金轨迹分歧）。
-    wire        bru_is_ctl = (bru_cls != 3'd0);
     wire        bru_cmp_t  = (bru_cls == 3'd3) | (bru_cls == 3'd4) | (bru_cls == 3'd6);
     wire        bru_mis    = bru_is_ctl &
                              ((bru_act_tk != w_pred_tk(x_i2_uop[2])) |

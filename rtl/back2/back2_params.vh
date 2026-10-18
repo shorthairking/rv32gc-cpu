@@ -612,8 +612,12 @@
 // ---- 异常码（与 rv32_defs.vh 的 cause 口径一致，只列本里程碑用到的）----
 `define BACK2_EXC_NONE     4'd0
 `define BACK2_EXC_ILLEGAL  4'd2          // 非法指令
-`define BACK2_EXC_LOAD_MIS 4'd4          // load 非对齐（保留，本里程碑不产生）
-`define BACK2_EXC_ST_MIS   4'd6          // store 非对齐（保留）
+`define BACK2_EXC_LOAD_MIS 4'd4          // load 非对齐（lsq_simple.v 对 8 B 非对齐 load 产生，cause 4）
+`define BACK2_EXC_ST_MIS   4'd6          // store 非对齐（lsq_simple.v 对 8 B 非对齐 store 产生，cause 6）
+//   ★ D8（AUDIT2）修正：旧注释「保留，本里程碑不产生」已过期——
+//     `rtl/back2/lsq_simple.v` 的 `mis_v`/`st_mis_w` 确实产生这两个 cause
+//     （8 B 访问 va[2:0]!=0）。≤4 B 的 load/store 非对齐由硬件完成（不分界），
+//     只有 8 B（fld/fsd）非对齐走 cause 4/6 精确陷阱路径。
 //   ★ 2B-4 第 4a 段：特权/断点异常码（与 rv32_defs.vh 的 cause 口径一致）
 `define BACK2_EXC_BREAK    4'd3          // ebreak（断点）
 `define BACK2_EXC_ECALL_U  4'd8          // U 模式 ecall
