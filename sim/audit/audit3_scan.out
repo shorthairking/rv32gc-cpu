@@ -1,0 +1,95 @@
+### A. assign 总数: 848
+### B. 非阻塞写总数: 1717  阻塞写总数: 261
+
+## A1 assign 自赋值 (assign X = X;)
+  count= 0
+
+## A2 纯搬运链 (assign 链长>=2, 各级 rhs 均为单一标识符)
+  len=2 rtl/exec/fpu.v:570  fflags_we -> done -> done_q
+      driver locs: rtl/exec/fpu.v:570, rtl/exec/mdu.v:641
+  len=2 rtl/top/core_top_2b.v:1329  l1d_fill_data -> rdata -> rd_mux
+      driver locs: rtl/top/core_top_2b.v:1329, rtl/back2/b2_csr.v:130
+  len=2 rtl/top/core_top_2b.v:1333  l1i_fill_data -> rdata -> rd_mux
+      driver locs: rtl/top/core_top_2b.v:1333, rtl/back2/b2_csr.v:130
+  len=2 rtl/top/core_top.v:2520  pmp_addr_flat -> pmp_addr_o -> pmp_addr_r
+      driver locs: rtl/top/core_top.v:2520, rtl/csr/csr_file.v:758
+  len=2 rtl/top/core_top.v:2519  pmp_cfg_flat -> pmp_cfg_o -> pmp_cfg_r
+      driver locs: rtl/top/core_top.v:2519, rtl/csr/csr_file.v:757
+  len=2 rtl/back2/backend_top.v:1834  wk_i_tag_w -> wki_tag -> wbi_tag
+      driver locs: rtl/back2/backend_top.v:1834, rtl/back2/backend_top.v:1832
+  chain_count= 6
+
+## A3 同一 LHS 多 driver (assign 覆盖链)
+  rel_n_w x2: rtl/back2/rename.v:308, rtl/back2/rename.v:310
+  a_dout_r x2: rtl/cache/cache_array_bram.v:98, rtl/cache/cache_array_bram.v:145
+  fflags x5: rtl/exec/fpu_add.v:435, rtl/exec/fpu_add.v:1049, rtl/exec/fpu_add.v:1230, rtl/exec/fpu_add.v:1478, rtl/exec/fpu_add.v:1696
+  q x2: rtl/exec/fpu_add.v:226, rtl/exec/fpu_add.v:230
+  result x4: rtl/exec/fpu_add.v:1048, rtl/exec/fpu_add.v:1229, rtl/exec/fpu_add.v:1477, rtl/exec/fpu_add.v:1695
+  rr_d x2: rtl/exec/fpu_add.v:1042, rtl/exec/fpu_add.v:1223
+  sp_d x4: rtl/exec/fpu_add.v:1031, rtl/exec/fpu_add.v:1214, rtl/exec/fpu_add.v:1469, rtl/exec/fpu_add.v:1687
+  fflags x2: rtl/exec/fpu_fma_shared.v:234, rtl/exec/fpu_fma_shared.v:624
+  fflags x2: rtl/exec/fpu_mul.v:156, rtl/exec/fpu_mul.v:257
+  result x2: rtl/exec/fpu_mul.v:155, rtl/exec/fpu_mul.v:256
+  rr_d x2: rtl/exec/fpu_mul.v:149, rtl/exec/fpu_mul.v:250
+  sp_d x2: rtl/exec/fpu_mul.v:140, rtl/exec/fpu_mul.v:241
+  a_dout x2: rtl/front4/front4_mem.v:134, rtl/front4/front4_mem.v:165
+  b_dout x4: rtl/front4/front4_mem.v:135, rtl/front4/front4_mem.v:166, rtl/front4/front4_mem.v:263, rtl/front4/front4_mem.v:286
+  multi_driver_signal_count= 14
+
+## A4 同一 RHS 表达式在 >=4 处重复出现（同周期重复计算候选）
+  x7  {sp_r, sp_f}
+        at: rtl/exec/fpu_add.v:1031, rtl/exec/fpu_add.v:1214, rtl/exec/fpu_add.v:1469, rtl/exec/fpu_add.v:1687, rtl/exec/fpu_fma_shared.v:615, rtl/exec/fpu_mul.v:140, rtl/exec/fpu_mul.v:241
+  x4  owner_q
+        at: rtl/axi/axi_master_ctrl.v:230, rtl/axi/axi_master_ctrl.v:332, rtl/cache/mshr_simple.v:75, rtl/cache/mshr_simple.v:88
+  x4  {round_result, round_flags}
+        at: rtl/exec/fpu_add.v:1042, rtl/exec/fpu_add.v:1223, rtl/exec/fpu_mul.v:149, rtl/exec/fpu_mul.v:250
+  x4  sp_e_q ? sp_r_q : rr_r
+        at: rtl/exec/fpu_add.v:1048, rtl/exec/fpu_add.v:1229, rtl/exec/fpu_mul.v:155, rtl/exec/fpu_mul.v:256
+  x4  sp_e_q ? sp_f_q : rr_f
+        at: rtl/exec/fpu_add.v:1049, rtl/exec/fpu_add.v:1230, rtl/exec/fpu_mul.v:156, rtl/exec/fpu_mul.v:257
+  x4  lu_valid_q
+        at: rtl/front4/bpu_btb.v:156, rtl/front4/bpu_gshare.v:148, rtl/front4/bpu_local_hist.v:157, rtl/front4/bpu_selector.v:121
+
+## A5 同一信号非阻塞/阻塞写次数 >=3 (僵尸写口候选)
+  rtl/top/core_top.v: m_state_q x43: rtl/top/core_top.v:3416, rtl/top/core_top.v:3756, rtl/top/core_top.v:3807, rtl/top/core_top.v:3809, rtl/top/core_top.v:3812, rtl/top/core_top.v:3827, rtl/top/core_top.v:3836, rtl/top/core_top.v:3839, rtl/top/core_top.v:3844, rtl/top/core_top.v:3855, rtl/top/core_top.v:3862, rtl/top/core_top.v:3878, rtl/top/core_top.v:3882, rtl/top/core_top.v:3892, rtl/top/core_top.v:3894, rtl/top/core_top.v:3946 ...
+  rtl/csr/ptw.v: st x20: rtl/csr/ptw.v:381, rtl/csr/ptw.v:399, rtl/csr/ptw.v:413, rtl/csr/ptw.v:423, rtl/csr/ptw.v:426, rtl/csr/ptw.v:441, rtl/csr/ptw.v:446, rtl/csr/ptw.v:452, rtl/csr/ptw.v:455, rtl/csr/ptw.v:460, rtl/csr/ptw.v:469, rtl/csr/ptw.v:471, rtl/csr/ptw.v:481, rtl/csr/ptw.v:485, rtl/csr/ptw.v:490, rtl/csr/ptw.v:493 ...
+  rtl/top/core_top.v: m_done_q x17: rtl/top/core_top.v:3425, rtl/top/core_top.v:3437, rtl/top/core_top.v:3821, rtl/top/core_top.v:3947, rtl/top/core_top.v:4000, rtl/top/core_top.v:4006, rtl/top/core_top.v:4014, rtl/top/core_top.v:4018, rtl/top/core_top.v:4027, rtl/top/core_top.v:4030, rtl/top/core_top.v:4057, rtl/top/core_top.v:4113, rtl/top/core_top.v:4136, rtl/top/core_top.v:4146, rtl/top/core_top.v:4154, rtl/top/core_top.v:4158 ...
+  rtl/top/core_top_2b.v: ad_st_q x17: rtl/top/core_top_2b.v:1059, rtl/top/core_top_2b.v:1085, rtl/top/core_top_2b.v:1092, rtl/top/core_top_2b.v:1103, rtl/top/core_top_2b.v:1110, rtl/top/core_top_2b.v:1119, rtl/top/core_top_2b.v:1130, rtl/top/core_top_2b.v:1135, rtl/top/core_top_2b.v:1145, rtl/top/core_top_2b.v:1147, rtl/top/core_top_2b.v:1153, rtl/top/core_top_2b.v:1155, rtl/top/core_top_2b.v:1167, rtl/top/core_top_2b.v:1176, rtl/top/core_top_2b.v:1181, rtl/top/core_top_2b.v:1186 ...
+  rtl/exec/fpu_div_sqrt.v: done_r x13: rtl/exec/fpu_div_sqrt.v:383, rtl/exec/fpu_div_sqrt.v:393, rtl/exec/fpu_div_sqrt.v:397, rtl/exec/fpu_div_sqrt.v:424, rtl/exec/fpu_div_sqrt.v:450, rtl/exec/fpu_div_sqrt.v:455, rtl/exec/fpu_div_sqrt.v:460, rtl/exec/fpu_div_sqrt.v:467, rtl/exec/fpu_div_sqrt.v:488, rtl/exec/fpu_div_sqrt.v:493, rtl/exec/fpu_div_sqrt.v:502, rtl/exec/fpu_div_sqrt.v:510, rtl/exec/fpu_div_sqrt.v:515
+  rtl/csr/ptw.v: fault_r x12: rtl/csr/ptw.v:391, rtl/csr/ptw.v:404, rtl/csr/ptw.v:421, rtl/csr/ptw.v:439, rtl/csr/ptw.v:444, rtl/csr/ptw.v:450, rtl/csr/ptw.v:467, rtl/csr/ptw.v:479, rtl/csr/ptw.v:483, rtl/csr/ptw.v:488, rtl/csr/ptw.v:505, rtl/csr/ptw.v:511
+  rtl/csr/ptw.v: fault_cause_r x11: rtl/csr/ptw.v:392, rtl/csr/ptw.v:422, rtl/csr/ptw.v:440, rtl/csr/ptw.v:445, rtl/csr/ptw.v:451, rtl/csr/ptw.v:468, rtl/csr/ptw.v:480, rtl/csr/ptw.v:484, rtl/csr/ptw.v:489, rtl/csr/ptw.v:506, rtl/csr/ptw.v:512
+  rtl/exec/fpu_div_sqrt.v: result_r x11: rtl/exec/fpu_div_sqrt.v:384, rtl/exec/fpu_div_sqrt.v:429, rtl/exec/fpu_div_sqrt.v:448, rtl/exec/fpu_div_sqrt.v:453, rtl/exec/fpu_div_sqrt.v:458, rtl/exec/fpu_div_sqrt.v:465, rtl/exec/fpu_div_sqrt.v:486, rtl/exec/fpu_div_sqrt.v:491, rtl/exec/fpu_div_sqrt.v:499, rtl/exec/fpu_div_sqrt.v:507, rtl/exec/fpu_div_sqrt.v:512
+  rtl/exec/fpu_div_sqrt.v: fflags_r x11: rtl/exec/fpu_div_sqrt.v:385, rtl/exec/fpu_div_sqrt.v:430, rtl/exec/fpu_div_sqrt.v:449, rtl/exec/fpu_div_sqrt.v:454, rtl/exec/fpu_div_sqrt.v:459, rtl/exec/fpu_div_sqrt.v:466, rtl/exec/fpu_div_sqrt.v:487, rtl/exec/fpu_div_sqrt.v:492, rtl/exec/fpu_div_sqrt.v:501, rtl/exec/fpu_div_sqrt.v:509, rtl/exec/fpu_div_sqrt.v:514
+  rtl/front4/ifetch4.v: pack_e x10: rtl/front4/ifetch4.v:220, rtl/front4/ifetch4.v:221, rtl/front4/ifetch4.v:222, rtl/front4/ifetch4.v:223, rtl/front4/ifetch4.v:224, rtl/front4/ifetch4.v:225, rtl/front4/ifetch4.v:226, rtl/front4/ifetch4.v:227, rtl/front4/ifetch4.v:228, rtl/front4/ifetch4.v:229
+  rtl/cache/l1d.v: ms_state_q x9: rtl/cache/l1d.v:457, rtl/cache/l1d.v:489, rtl/cache/l1d.v:532, rtl/cache/l1d.v:582, rtl/cache/l1d.v:591, rtl/cache/l1d.v:614, rtl/cache/l1d.v:637, rtl/cache/l1d.v:651, rtl/cache/l1d.v:660
+  rtl/top/core_top.v: m_rd_data_q x9: rtl/top/core_top.v:3422, rtl/top/core_top.v:3981, rtl/top/core_top.v:3994, rtl/top/core_top.v:4003, rtl/top/core_top.v:4008, rtl/top/core_top.v:4016, rtl/top/core_top.v:4054, rtl/top/core_top.v:4122, rtl/top/core_top.v:4130
+  rtl/top/core_top.v: m_amo_phase_q x9: rtl/top/core_top.v:3758, rtl/top/core_top.v:3777, rtl/top/core_top.v:3984, rtl/top/core_top.v:3996, rtl/top/core_top.v:4025, rtl/top/core_top.v:4110, rtl/top/core_top.v:4125, rtl/top/core_top.v:4132, rtl/top/core_top.v:4144
+  rtl/back2/backend_top.v: csr_pend_q x8: rtl/back2/backend_top.v:2029, rtl/back2/backend_top.v:2033, rtl/back2/backend_top.v:2037, rtl/back2/backend_top.v:2044, rtl/back2/backend_top.v:2062, rtl/back2/backend_top.v:2064, rtl/back2/backend_top.v:2066, rtl/back2/backend_top.v:2068
+  rtl/exec/fpu_div_sqrt.v: rem_r x8: rtl/exec/fpu_div_sqrt.v:381, rtl/exec/fpu_div_sqrt.v:407, rtl/exec/fpu_div_sqrt.v:476, rtl/exec/fpu_div_sqrt.v:526, rtl/exec/fpu_div_sqrt.v:554, rtl/exec/fpu_div_sqrt.v:557, rtl/exec/fpu_div_sqrt.v:564, rtl/exec/fpu_div_sqrt.v:567
+  rtl/back2/b2_csr.v: mstatus_q x7: rtl/back2/b2_csr.v:144, rtl/back2/b2_csr.v:151, rtl/back2/b2_csr.v:152, rtl/back2/b2_csr.v:153, rtl/back2/b2_csr.v:156, rtl/back2/b2_csr.v:157, rtl/back2/b2_csr.v:158
+  rtl/back2/iq.v: valid_q x7: rtl/back2/iq.v:470, rtl/back2/iq.v:475, rtl/back2/iq.v:478, rtl/back2/iq.v:486, rtl/back2/iq.v:493, rtl/back2/iq.v:500, rtl/back2/iq.v:507
+  rtl/cache/l1d.v: cap_rd_q x7: rtl/cache/l1d.v:476, rtl/cache/l1d.v:495, rtl/cache/l1d.v:531, rtl/cache/l1d.v:588, rtl/cache/l1d.v:616, rtl/cache/l1d.v:618, rtl/cache/l1d.v:622
+  rtl/exec/fpu_div_sqrt.v: quo_r x7: rtl/exec/fpu_div_sqrt.v:382, rtl/exec/fpu_div_sqrt.v:477, rtl/exec/fpu_div_sqrt.v:527, rtl/exec/fpu_div_sqrt.v:555, rtl/exec/fpu_div_sqrt.v:558, rtl/exec/fpu_div_sqrt.v:565, rtl/exec/fpu_div_sqrt.v:568
+  rtl/front4/bpu_btb.v: pack_entry x7: rtl/front4/bpu_btb.v:104, rtl/front4/bpu_btb.v:105, rtl/front4/bpu_btb.v:106, rtl/front4/bpu_btb.v:107, rtl/front4/bpu_btb.v:108, rtl/front4/bpu_btb.v:109, rtl/front4/bpu_btb.v:110
+  rtl/back2/iq.v: rdy_q x6: rtl/back2/iq.v:471, rtl/back2/iq.v:480, rtl/back2/iq.v:487, rtl/back2/iq.v:494, rtl/back2/iq.v:501, rtl/back2/iq.v:508
+  rtl/cache/l1d.v: fill_taken_q x6: rtl/cache/l1d.v:459, rtl/cache/l1d.v:491, rtl/cache/l1d.v:595, rtl/cache/l1d.v:642, rtl/cache/l1d.v:650, rtl/cache/l1d.v:659
+  rtl/exec/fpu_div_sqrt.v: cnt x6: rtl/exec/fpu_div_sqrt.v:373, rtl/exec/fpu_div_sqrt.v:392, rtl/exec/fpu_div_sqrt.v:479, rtl/exec/fpu_div_sqrt.v:530, rtl/exec/fpu_div_sqrt.v:577, rtl/exec/fpu_div_sqrt.v:580
+  rtl/exec/mdu.v: state_q x6: rtl/exec/mdu.v:551, rtl/exec/mdu.v:566, rtl/exec/mdu.v:587, rtl/exec/mdu.v:596, rtl/exec/mdu.v:612, rtl/exec/mdu.v:623
+  rtl/top/core_top.v: m_page_fault_q x6: rtl/top/core_top.v:3419, rtl/top/core_top.v:3757, rtl/top/core_top.v:3780, rtl/top/core_top.v:3801, rtl/top/core_top.v:3847, rtl/top/core_top.v:3945
+  rtl/top/core_top.v: m_hi_q x6: rtl/top/core_top.v:3420, rtl/top/core_top.v:3759, rtl/top/core_top.v:3776, rtl/top/core_top.v:4009, rtl/top/core_top.v:4022, rtl/top/core_top.v:4149
+  rtl/back2/iq.v: wk_hit_w x6: rtl/back2/iq.v:260, rtl/back2/iq.v:265, rtl/back2/iq.v:268, rtl/back2/iq.v:271, rtl/back2/iq.v:274, rtl/back2/iq.v:277
+  rtl/csr/csr_file.v: csr_landing x6: rtl/csr/csr_file.v:458, rtl/csr/csr_file.v:466, rtl/csr/csr_file.v:470, rtl/csr/csr_file.v:478, rtl/csr/csr_file.v:482, rtl/csr/csr_file.v:498
+  rtl/back2/backend_top.v: mdu_wb_pend_q x5: rtl/back2/backend_top.v:2677, rtl/back2/backend_top.v:2709, rtl/back2/backend_top.v:2712, rtl/back2/backend_top.v:2717, rtl/back2/backend_top.v:2719
+  rtl/back2/iq.v: rob_q x5: rtl/back2/iq.v:472, rtl/back2/iq.v:488, rtl/back2/iq.v:495, rtl/back2/iq.v:502, rtl/back2/iq.v:509
+  rtl/back2/iq.v: ep_q x5: rtl/back2/iq.v:473, rtl/back2/iq.v:489, rtl/back2/iq.v:496, rtl/back2/iq.v:503, rtl/back2/iq.v:510
+  rtl/back2/lsq_simple.v: ld_v x5: rtl/back2/lsq_simple.v:1077, rtl/back2/lsq_simple.v:1146, rtl/back2/lsq_simple.v:1244, rtl/back2/lsq_simple.v:1308, rtl/back2/lsq_simple.v:1427
+  rtl/back2/lsq_simple.v: ld_req x5: rtl/back2/lsq_simple.v:1246, rtl/back2/lsq_simple.v:1290, rtl/back2/lsq_simple.v:1294, rtl/back2/lsq_simple.v:1309, rtl/back2/lsq_simple.v:1428
+  rtl/back2/rename.v: fhead_q x5: rtl/back2/rename.v:843, rtl/back2/rename.v:927, rtl/back2/rename.v:942, rtl/back2/rename.v:960, rtl/back2/rename.v:1024
+  rtl/cache/l1d.v: wb_taken_q x5: rtl/cache/l1d.v:461, rtl/cache/l1d.v:493, rtl/cache/l1d.v:530, rtl/cache/l1d.v:621, rtl/cache/l1d.v:631
+  rtl/cache/l1d.v: wb_want_q x5: rtl/cache/l1d.v:462, rtl/cache/l1d.v:494, rtl/cache/l1d.v:527, rtl/cache/l1d.v:583, rtl/cache/l1d.v:632
+  rtl/cache/l1i.v: miss_q x5: rtl/cache/l1i.v:257, rtl/cache/l1i.v:271, rtl/cache/l1i.v:299, rtl/cache/l1i.v:308, rtl/cache/l1i.v:314
+  rtl/exec/fpu_div_sqrt.v: busy_r x5: rtl/exec/fpu_div_sqrt.v:372, rtl/exec/fpu_div_sqrt.v:391, rtl/exec/fpu_div_sqrt.v:423, rtl/exec/fpu_div_sqrt.v:480, rtl/exec/fpu_div_sqrt.v:531
+  rtl/exec/fpu_div_sqrt.v: exp_r x5: rtl/exec/fpu_div_sqrt.v:378, rtl/exec/fpu_div_sqrt.v:414, rtl/exec/fpu_div_sqrt.v:416, rtl/exec/fpu_div_sqrt.v:475, rtl/exec/fpu_div_sqrt.v:529
+  rtl/exec/fpu_div_sqrt.v: num_r x5: rtl/exec/fpu_div_sqrt.v:379, rtl/exec/fpu_div_sqrt.v:473, rtl/exec/fpu_div_sqrt.v:524, rtl/exec/fpu_div_sqrt.v:560, rtl/exec/fpu_div_sqrt.v:570
+
+## A6 同一文件内 if 条件文本出现 >=3 次（可合并/冗余判定候选）

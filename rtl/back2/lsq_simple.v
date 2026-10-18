@@ -192,11 +192,16 @@ module lsq_simple #(
     reg  [31:0]          stq_a   [0:STQ_N-1];        // ★ **虚拟地址**（E1 的 AGU 结果；
                                                      //   转发比较 / 翻译请求的 VA 来源）
     reg  [31:0]          stq_d   [0:STQ_N-1];        // 已对位到字内字节道
-    //   ★★ 4c(3/3)：8 B store（fsd）的高 4 B（`stq_dh`）与“本项是 8 B”标志（`stq_hi`）
+    //   ★★ 4c(3/3)：8 B store（fsd）的高 4 B（`stq_dh`）与“本项拆两笔”标志（`stq_hi`）
     //     · 存储数据来自 FP RF 的 64 bit；高字对应 VA+4 的字（fsd 已保证 8 B 对齐 ⇒ 无字内偏移）
     //     · 后端对外还是**单笔 4 B**（L1D/AXI 零改动）：提交排空时拆成**两条 CDQ 项**（低/ 高）
+    //   ★★ D1-fix（方案 A，见 §4.3）：`stq_hi` 同时覆盖「≤4 B 非对齐 store 跨 4 B 字边界」——
+    //     这类 store 的低字只盖住首字剩余的 (4-a2) 个字节，越界字节必须由**第二笔**写到
+    //     地址 VA+4 的字上（`stq_dh` = `wdata >> 8*(4-a2)`）。第二笔的字节掩码随项存放于
+    //     `stq_mh`（8 B store 恒 4'hF ⇒ 与其旧口径逐位一致；≤4 B 跨界 = (1<<越界字节数)-1）。
     reg  [31:0]          stq_dh  [0:STQ_N-1];
     reg                  stq_hi  [0:STQ_N-1];
+    reg  [3:0]           stq_mh  [0:STQ_N-1];
     reg  [3:0]           stq_msk [0:STQ_N-1];
     reg  [ROB_IDX_W-1:0] stq_rob [0:STQ_N-1];
     reg                  stq_ret [0:STQ_N-1];
@@ -435,6 +440,27 @@ module lsq_simple #(
                           (exe_size == 3'd1) ? (8'h03 << exe_addr[1:0]) :
                                                (8'h0F << exe_addr[1:0]);
 
+    //   ★★ D1-fix（方案 A）：≤4 B 非对齐 store 的**跨 4 B 字拆分**真源（E1 与 CDQ 入队共用）
+    //     背景（审计 D1）：旧实现 `lmask_w` 是 4 bit ⇒ `sw@+1` 的掩码截断成 0xE、`wdata<<a2`
+    //     把越界字节移出 32 bit 后**无处可去**，且 `st_mis_w` 只覆盖 8 B ⇒ 「部分落地且不报
+    //     异常」，违反 ISA（rv32.adoc：非对齐访问要么完整完成、要么抛异常）。本修复选**硬件
+    //     完成**：越界字节复用 8 B store 既有的「高字 = VA+4、第二条 CDQ 项」通路。
+    //     · `st_nb_w`    = 本笔字节数 1/2/4/8（`exe_size` 是 log2(字节数)）
+    //     · `st_sum_w`   = 字节数 + 字内偏移 a2；> 4 ⇒ 有字节越出本 4 B 字
+    //     · `st_spill_w` = 越出字节数（= 高字要落的字节数；8 B 对齐时恰为 4）
+    //     · `st_mh_w`    = 高字字节掩码 (1<<spill)-1（spill≥4 ⇒ 移位出界 ⇒ 自然得 4'hF）
+    //     · `st_dh_w`    = 高字数据：`wdata >> 8*(4-a2)`，把越界字节右移到高字道 0 起
+    //     对齐/非跨界的 store：`st_sum_w ≤ 4` ⇒ `st_hi_w=0` ⇒ 高字数据/掩码**不被消费**，
+    //     与旧实现逐位一致（同时 `st_mis_w` 仍只对 8 B 非对齐抛 cause 6，不进入本拆分）。
+    wire [3:0]  st_nb_w    = 4'd1 << exe_size;                       // 1/2/4/8 字节
+    wire [3:0]  st_sum_w   = st_nb_w + {2'b0, exe_addr[1:0]};        // 末字节相对本字序号 + 1
+    wire        st_hi_w    = (st_sum_w > 4'd4);                      // 有字节越出本 4 B 字
+    wire [2:0]  st_spill_w = st_hi_w ? (st_sum_w[2:0] - 3'd4) : 3'd0;// 越出字节数（≤4）
+    wire [3:0]  st_mh_w    = (4'h1 << st_spill_w) - 4'h1;            // 高字字节掩码
+    wire [31:0] st_dh_w    = (exe_size == 3'd3) ? exe_wdata_hi :
+                             (exe_addr[1:0] == 2'd0) ? 32'h0 :
+                             (exe_wdata >> (6'd32 - ({4'b0, exe_addr[1:0]} << 3)));
+
     // ---- (a) per-store 预计算：年龄 + "更老且地址已确认"（每 store 一次）----
     //   ★ C8：年龄不再在本段另算一份 —— 直接用 §0 的 STQ 唯一年龄向量 `stq_age`。
     wire [STQ_N-1:0]   fw_live_e;            // 更老 且 地址已确认（v & av & age<age_rob）
@@ -500,7 +526,10 @@ module lsq_simple #(
                 wire hi_eq_w = (gcar_w == 2'd0) ? fw_eqm_e [gj] :
                                (gcar_w == 2'd1) ? fw_eq0_e [gj] : fw_eqp_e [gj];
                 wire lo_w = lo_eq_w & stq_msk[gj][lane_w];
-                wire hi_w = stq_hi[gj] & hi_eq_w;
+                //   ★★ D1-fix：高字是否覆盖本字节必须按**该笔自己的高字掩码**判 ——
+                //     8 B store ⇒ `stq_mh=4'hF` ⇒ 与旧“恒覆盖 4 道”逐位等价；
+                //     ≤4 B 跨界 store ⇒ 只覆盖真正越界的那几道（防误判为整字覆盖）。
+                wire hi_w = stq_hi[gj] & hi_eq_w & stq_mh[gj][lane_w];
                 //   叶子 = "更老（`fw_live_e`：v & av & age<age_ld）且覆盖本字节"
                 assign hit_b[gj] = in_w & fw_live_e[gj] & (lo_w | hi_w);
             end else begin : g_fw_off
@@ -799,11 +828,12 @@ module lsq_simple #(
     //     ⇒ 窗口内有"未定妥"的 store 时，整条提交前缀链在该 store 处停住）
     //   ★★ 4c(3/3)：8 B store 会拆成**两条** CDQ 项 ⇒ 余量门改为“≥ 2W”（保守；
     //     CDQ_N=8 时最坏 8 条同拍入队，余量不足则提交窗口等一拍，无死锁）
-    wire [CDQ_PW:0] dr_need_w = (W * 2);            // ★ 4c(3/3)：8 B store 最坏占 2 条
+    //   ★★ D1-fix：≤4 B 非对齐跨字 store 同样最坏占 2 条 ⇒ 该余量门已天然覆盖，无需改。
+    wire [CDQ_PW:0] dr_need_w = (W * 2);            // ★ 4c(3/3)：拆两笔的 store 最坏占 2 条
     assign dr_room_ok = (((CDQ_N[CDQ_PW:0]) - cdq_cnt) >= dr_need_w) && !stq_blk_any_w;
     wire [W-1:0] dr_take = dr_valid & {W{dr_room_ok}};
     //   组内压缩序号（rank）：第 k 个被收下的 lane 写到 tail+k
-    //   ★★ 4c(3/3)：每 lane 占的 CDQ 条数 = 1（普通）/ 2（8 B store）
+    //   ★★ 4c(3/3)：每 lane 占的 CDQ 条数 = 1（普通）/ 2（8 B 或 ≤4 B 跨字 store）
     wire [1:0] dr_n [0:W-1];
     generate
     for (gv = 0; gv < W; gv = gv + 1) begin : g_drn
@@ -1069,6 +1099,7 @@ module lsq_simple #(
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0;
                 stq_a[si] <= 32'h0; stq_d[si] <= 32'h0; stq_msk[si] <= 4'h0;
+                stq_mh[si] <= 4'h0;
                 stq_rob[si] <= {ROB_IDX_W{1'b0}}; stq_ret[si] <= 1'b0;
                 stq_pa[si] <= 32'h0; stq_pv[si] <= 1'b0; stq_ctx[si] <= 4'h0;
                 stq_bad[si] <= 1'b0;
@@ -1116,6 +1147,9 @@ module lsq_simple #(
                     //     `stx_en_w` 下的页跨越 store 按 ISA 应分页翻译，但 2A 本身就是
                     //     连续 PA 口径 ⇒ 本轮**与 2A 逐位一致**；该差异已登记（报告 §B4.41）。
                     //     注：载入（fld）第二拍走 **VA+4 完整翻译**（母代理裁决）。
+                    //   ★★ D1-fix：`stq_hi` 现在也含「≤4 B 非对齐跨字 store」⇒ 同一条通路
+                    //     为它拆第二笔（低字 = VA、高字 = VA+4），掩码取该项**自己的**
+                    //     `stq_mh`（8 B ⇒ 4'hF，与旧硬编码逐位一致；≤4 B 跨界 ⇒ 仅越界道）。
                     if (stq_hi[dr_idx[si*STQ_IW +: STQ_IW]]) begin
                         cdq_v  [cdq_wp[si] + 1'b1] <= 1'b1;
                         cdq_idx[cdq_wp[si] + 1'b1] <= dr_idx[si*STQ_IW +: STQ_IW];
@@ -1128,7 +1162,7 @@ module lsq_simple #(
                         cdq_bad[cdq_wp[si] + 1'b1] <= 1'b0;
                         cdq_ctx[cdq_wp[si] + 1'b1] <= st_xlate_ctx;
                         cdq_d  [cdq_wp[si] + 1'b1] <= stq_dh[dr_idx[si*STQ_IW +: STQ_IW]];
-                        cdq_m  [cdq_wp[si] + 1'b1] <= 4'hF;
+                        cdq_m  [cdq_wp[si] + 1'b1] <= stq_mh[dr_idx[si*STQ_IW +: STQ_IW]];
                     end
                 end
             end
@@ -1141,6 +1175,7 @@ module lsq_simple #(
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0; stq_ret[si] <= 1'b0;
                 stq_hi[si] <= 1'b0;
+                stq_mh[si] <= 4'h0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
@@ -1169,6 +1204,7 @@ module lsq_simple #(
                         stq_pv [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         stq_dh [alloc_idx[si*STQ_IW +: STQ_IW]] <= 32'h0;
                         stq_hi [alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_mh [alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
                         stq_ctx[alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
                         stq_bad[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         //   ★★ 2B-3 第 6 段第二步（报告 §B3.6.4 的必办项）：ROB 索引在
@@ -1225,8 +1261,13 @@ module lsq_simple #(
                 stq_d[exe_stq_idx]   <= exe_wdata << {exe_addr[1:0], 3'b000};
                 //   ★★ 4c(3/3)：8 B store —— 高字直存（fsd 已保证 8 B 对齐）；
                 //     非对齐的 8 B store 已置 `stq_bad`（不排空），此处的值无意义。
-                stq_dh[exe_stq_idx]  <= exe_wdata_hi;
-                stq_hi[exe_stq_idx]  <= (exe_size == 3'd3);
+                //   ★★ D1-fix（方案 A）：≤4 B 非对齐跨字 store **复用同一条高字通路**（见 §2.2
+                //     的 `st_hi_w/st_mh_w/st_dh_w`）——`stq_hi=1` ⇒ 提交排空时自动拆两条 CDQ
+                //     （低字 = VA、高字 = VA+4），`stq_mh` 给出高字掩码 ⇒ L1D 只写真正越界的
+                //     那几个字节；对齐 store（`st_sum_w≤4`）`stq_hi=0`，与旧实现逐位一致。
+                stq_dh[exe_stq_idx]  <= st_dh_w;
+                stq_hi[exe_stq_idx]  <= st_hi_w;
+                stq_mh[exe_stq_idx]  <= st_mh_w;
                 stq_msk[exe_stq_idx] <= (exe_size == 3'd3) ? 4'hF : lmask_w;
                 //   `stq_rob` 已在**分配期**写入（§4.2）⇒ 此处不再重复写（唯一写点纪律）。
                 //   实测语义：分配期写入的 rob == 该 store 的 E1 rob（同一 ROB 项）。
@@ -1352,7 +1393,7 @@ module lsq_simple #(
                         cdq_bad[cdq_wp[si] + 1'b1] <= 1'b0;
                         cdq_ctx[cdq_wp[si] + 1'b1] <= st_xlate_ctx;
                         cdq_d  [cdq_wp[si] + 1'b1] <= stq_dh[dr_idx[si*STQ_IW +: STQ_IW]];
-                        cdq_m  [cdq_wp[si] + 1'b1] <= 4'hF;
+                        cdq_m  [cdq_wp[si] + 1'b1] <= stq_mh[dr_idx[si*STQ_IW +: STQ_IW]];
                     end
                 end
             end

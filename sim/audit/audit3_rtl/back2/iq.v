@@ -1,0 +1,516 @@
+//==============================================================================
+// rtl/back2/iq.v —— 分布式发射队列（RIQ）：唤醒广播 + 最老优先选择 + 单端口发射
+//==============================================================================
+// 项目  : rv32gc-cpu（阶段二 2B-2）
+// 规格  : docs/design/03-out-of-order.md §4.2（每部件独立队列、深度 16/16/8/8/12/8、
+//         ★ C2 面积杠杆后为 12/12/6/6/8/6 = 50 ≤ ROB_N=64，见 back2_params.vh §1、
+//         写口 ≤4/拍、读口 1/拍、队列满 ⇒ **整块 4 路停顿**）、§4.3（唤醒=写回广播
+//         （物理号+数据）；选择=**最老优先**（按 ROB 索引比较，保证无饥饿且异常/分支
+//         尽早暴露）；单端口：每部件每拍最多发射 1 条，不设超发射与投机发射）、
+//         §8.2（epoch 过滤：冲刷不逐项删除，靠 epoch 比较在发射时丢弃）；
+//         docs/design/02-pipeline.md §3.8（I1 选择）/§3.9（I2 读口，唤醒-选择-读寄存器
+//         拆两级）。
+//
+// 【无活锁论证】（TB tb_back2_iq 逐项断言）：
+//   ① 选择无条件"最老优先"且只依赖就绪位与年龄 ⇒ 同一状态下选择结果唯一、确定；
+//   ② 就绪位是**单调置位**（唤醒只在写回时置 1，入队时写初值，出队时随项消失）
+//      ⇒ 不存在"选了又变回未就绪"的循环；
+//   ③ 每拍至多出队 1 项，只要有 ≥1 项就绪就必定出队 ⇒ 有界时间内队列项数单调下降；
+//   ④ 冲刷项由 epoch 比较**照样被选出并丢弃**（不阻塞就绪项）⇒ 冲刷后队列同样收敛。
+//
+// 【实现要点】
+//   · 有效位/就绪位/年龄/ROB 索引一律用**打包向量**（非存储器）⇒ 选择与唤醒全组合，
+//     满足"唤醒当拍即可选择"（§4.3 的 I1/I2 拆分）。
+//   · ★★ C1（IQ 载荷瘦身）：阵列里存的是**窄载荷** `np_q[0:DEPTH-1]`（`BACK2_IQN_W`
+//     = 38 bit（★ EXP-R2：40→38），布局见 `back2_params.vh` §2.5），不再是整条 uop。逐槽只留
+//       ① 唤醒用：5 个源物理号 + 5 个 `S*_USE`；
+//       ② 出队/发射门控用：`IS_LOAD` / `IS_CSR` / `RM==7` 三个门控位。
+//     宽字段（PC/IMM/PREDTGT/ALUOP/…）改由 `backend_top.v` 在**发射拍按 rob 索引**从
+//     一张 4 bank SDP BRAM 读回（`u_iwmem`）⇒ IQ 的存储/写 mux/读 mux 只按 40 bit 计。
+//   · 出队时按动态索引取出窄载荷（`np_q[sel]`，与 2A 核 GPR 读口同一写法），经
+//     `o_sel_nq` 给 backend_top 做门控。
+//   · ★★ N10（IQ 窄载荷写口 4W → 2×(2W) bank）：`np_q` 按**槽号奇偶**拆成 2 个 bank
+//     （bank0 = 偶槽、bank1 = 奇槽），**每 bank 2 个写口**（合计 4 个物理写口不变）。
+//     4-wide 派发的一个派发块最多给本队列 4 条，由本模块的**局部、固定路径**均衡拆分
+//     （§3）摊到 2 个 bank：`b0 = clamp(ceil(a/2), a−cap1, cap0)`、`b1 = a−b0`
+//     ⇒ **每 bank 每拍 ≤2 条**，2 写口**结构性永不欠配**。
+//     ★ 因此这里**不需要**入队暂存寄存器（staging）：staging 只能吸收"写口超额"，而
+//     超额在本拆分下不存在；它**无法**吸收"某 bank 槽位用尽"（那需要"槽→暂存项"的
+//     旁路比较 + 逐槽 (STAGE+1):1 载荷 mux，代价远大于它省下的 2:1 写 mux）。
+//     bank 槽位用尽的处理 = **背压**：`wr_cap = min(2,free_b0)+min(2,free_b1)` 是
+//     "本拍可接纳条数上界"的**唯一真源**（新输出口），派发侧必须用 `q_wr_n ≤ wr_cap`
+//     判余量；`a ≤ wr_cap ⇔ 全部写口可写`（§3 有穷举论证），**绝不出现"接下了写不下"
+//     的静默丢项**。暂存深度口径（n7：ALU0 需 6 深）来自"**单个** 2 写口 sink"的漏桶
+//     需求，与本 2×(2W) 结构不对应（见报告 §0）。
+//   · 读侧：槽号在逐槽比较/门控里是**编译期常量** ⇒ `np_rd[gi]` 是两 bank 的**纯拼接**
+//     （无 mux，与原 `np_q[gi]` 逐位等价）；只有出队动态索引 `o_sel_nq` 需要一次
+//     `sel_idx[0]` bank 选择 + bank 内 6:1 mux。
+//   · ★ 接口契约（N10 新增，必须保持）：`wr_valid` 必须**从写口 0 起连续**
+//     （即 `wr_valid == (1<<a)-1`）。两个驱动方都满足：`backend_top.v` 的 `q_ord`
+//     按 lane 顺序自 0 递增；`tb_back2_iq` 只驱动写口 0。非连续掩码不在契约内。
+//   · ★ `DEPTH` 必须为**偶数**（6 个队列 12/12/6/6/8/6 全为偶数；奇数深度需同时改分 bank 索引）。
+//   · 端口 `iss_uop`/`o_sel_uop`（UOPW 宽）**仅为接口兼容保留**（单测 TB 仍按 uop 宽
+//     连接）：C1 后 IQ 不再持有宽字段，两者输出的是"窄载荷零扩展"，backend_top
+//     **不再消费**（综合时被剪除）。语义真源是 `o_sel_nq`。
+//   · ★ 不在 function 内读存储器（iverilog 12.0 会返回错误结果，front4 README §7.1）。
+//
+// 风格  : 组合逻辑用 `assign` + 打包向量 function；两处 always 块分别为
+//         "最老优先选择"（纯组合、只读打包向量——优先级编码的少量必要场合）与
+//         "存储体/指针"（时序元件）。
+//==============================================================================
+
+`timescale 1ns / 1ps
+
+`include "rtl/back2/back2_params.vh"
+
+module iq #(
+    parameter integer DEPTH      = `BACK2_IQ_ALU0_D,
+    parameter integer UOPW       = `BACK2_UOP_W,
+    parameter integer IQW        = `BACK2_IQN_W,   // ★ C1：窄载荷宽度（存储真源）
+    parameter integer PDW_I      = `BACK2_PREG_I_W,
+    parameter integer PDW_F      = `BACK2_PREG_F_W,
+    parameter integer ROB_IDX_W  = `BACK2_ROB_IDX_W,
+    parameter integer WRP        = `BACK2_IQ_WR_PORTS,
+    parameter integer WK_N       = `BACK2_WB_N,
+    parameter integer SRC_N      = 5,             // {s1i, s2i, s1f, s2f, s3f}
+    parameter integer DBG        = 0,             // 1 = 每拍打印队内项与唤醒广播（诊断用）
+    //   B28 队列级闸门开关：load 不得越过更老的未就绪项（仅 LSU 队列置 1）。
+    //   动机（第 16/17/18 轮）：store 与其后的 load 同块同拍进入 LSU，store 数据未就绪时 load 抢跑
+    //   ⇒ 转发扫描看不到该 store（其 STQ 项 av=0 且 stq_rob 不可用）⇒ 读到旧内存值。
+    //   门控只加在 load 项上：更老的 store 不受限，仍可在就绪后自行发射 ⇒ 不会死锁
+    //   （第 18 轮把门控加在发射许可上、要求 load 是队首，因过强而死锁；此处是队列内、仅对 load 的版本）。
+    parameter integer INORD_LOAD = 0
+) (
+    input  wire                  clk,
+    input  wire                  rst_n,
+
+    // ---- 冲刷 ----
+    input  wire                  flush_all,        // 提交点异常：整队列清空
+    //   ★ 重定向冲刷：**只作废比 squash_idx 更年轻**的项。更老的项（含正在
+    //     执行/等待唤醒的）必须照常发射，否则 ROB 里那些"被保留的更老项"永远等不到
+    //     写回 ⇒ 头卡死（实测：head pc=0x8000_0030、hdone=0、IQ 全空、永久停顿）。
+    input  wire                  squash,
+    input  wire [ROB_IDX_W-1:0]  squash_idx,
+    //   ★★ C8：ROB 侧**统一年龄输出** = `(squash_idx − rob_head) mod ROB_N`
+    //     （唯一真源见 `rob.v` §1.1）。本队列只**消费**它，不再自算
+    //     `squash_idx - rob_head`（原 6 个队列实例各算一份 ROB_IDX_W 位减法器）。
+    input  wire [ROB_IDX_W-1:0]  squash_age,
+    input  wire [`BACK2_EPOCH_W-1:0] epoch,
+
+    // ---- 入队（D3 派发）----
+    input  wire [WRP-1:0]        wr_valid,
+    input  wire [WRP*UOPW-1:0]   wr_uop,
+    input  wire [WRP*ROB_IDX_W-1:0] wr_rob,
+    input  wire [WRP*SRC_N-1:0]  wr_rdy,           // 入队时就绪掩码（未用源恒 1）
+    output wire [4:0]            free_cnt,         // 剩余空位（派发侧判 S4；深度 ≤16 ⇒ 5 bit）
+    //   ★★ N10：**bank 余量可接纳上界**（0..4）—— "本拍最多能收几条"的**唯一真源**。
+    //     派发侧必须用 `q_wr_n ≤ wr_cap` 判余量；若仍用总空位 `free_cnt`，会在
+    //     "总空位够、某 bank 放不下"时让 iq 内部 `wr_ok=0` ⇒ **静默丢项**。
+    output wire [4:0]            wr_cap,
+
+    // ---- 唤醒广播（写回拍：物理号 + 数据）----
+    input  wire [WK_N-1:0]       wki_v,
+    input  wire [WK_N*PDW_I-1:0] wki_tag,
+    input  wire [WK_N-1:0]       wkf_v,
+    input  wire [WK_N*PDW_F-1:0] wkf_tag,
+
+    // ---- 选择/发射（I1）----
+    input  wire [ROB_IDX_W-1:0]  rob_head,         // 年龄基准（最老优先）
+    //   ★ ROB 有效项数（窗口大小 0..ROB_N）。队列项若落在窗口之外（已被提交越过、
+    //     或已被冲刷），必须**永久作废**：否则它会一直占着槽位、并被"最老优先"
+    //     误判成最年轻项而永不发射（实测：ALU0 内滞留 rob=7/9/12/38/45 等早已
+    //     提交过的项，槽位泄漏后新项无处可放 ⇒ 后端停顿）。
+    input  wire [ROB_IDX_W:0]    rob_cnt,
+    input  wire                  iss_ready,        // 下游执行部件可接收
+    output wire                  iss_valid,
+    output wire [UOPW-1:0]       iss_uop,
+    output wire [ROB_IDX_W-1:0]  iss_rob,
+    output wire [`BACK2_EPOCH_W-1:0] iss_epoch,
+    output wire                  iss_dead,         // 选中项 epoch 过期（丢弃、不发执行）
+    output wire [4:0]            cnt_o,
+    // ---- 未被 iss_ready 门控的选择观察口（供 CSR "只在 ROB 头执行" 之类的外部门控）----
+    output wire                  o_sel_v,
+    output wire [UOPW-1:0]       o_sel_uop,        // ★ C1：兼容保留（= 窄载荷零扩展，综合被剪）
+    output wire [ROB_IDX_W-1:0]  o_sel_rob,
+    //   ★★ C1：**窄载荷**选择观察口（真源）—— backend_top 由它取 is_csr/is_load/RM_DYN
+    //     三个门控位（宽字段不再存在于 IQ，不能从 o_sel_uop 取）。
+    output wire [IQW-1:0]        o_sel_nq
+);
+    genvar ge;
+    //   ★★ C1：窄载荷打包（宽 uop ⇒ 40 bit）。UOPW 与 IQW 的布局真源分别是
+    //     `back2_params.vh` §2 与 §2.5；本函数是两者之间**唯一**的映射点。
+    function [IQW-1:0] pack_iqn;
+        input [UOPW-1:0] u;
+        begin
+            pack_iqn = {
+                (u[`BACK2_U_RM_MSB:`BACK2_U_RM_LSB] == 3'b111),          // [39]   RM_DYN
+                u[`BACK2_UB_IS_CSR],                                     // [38]   IS_CSR
+                u[`BACK2_UB_IS_LOAD],                                    // [37]   IS_LOAD
+                u[`BACK2_UB_S3_F_USE], u[`BACK2_UB_S2_F_USE],            // [36:35]
+                u[`BACK2_UB_S1_F_USE], u[`BACK2_UB_S2_I_USE],            // [34:33]
+                u[`BACK2_UB_S1_I_USE],                                   // [32]
+                u[`BACK2_U_PS3F_MSB:`BACK2_U_PS3F_LSB],                  // [31:26]
+                u[`BACK2_U_PS2F_MSB:`BACK2_U_PS2F_LSB],                  // [25:20]
+                u[`BACK2_U_PS1F_MSB:`BACK2_U_PS1F_LSB],                  // [19:14]
+                u[`BACK2_U_PS2I_MSB:`BACK2_U_PS2I_LSB],                  // [13:7]
+                u[`BACK2_U_PS1I_MSB:`BACK2_U_PS1I_LSB] };                // [6:0]
+        end
+    endfunction
+    //   窄载荷字段取用（与 `BACK2_IQN_*` 宏逐位对应；纯位选函数，**不读存储器**）
+    function [PDW_I-1:0] iqn_ps1i; input [IQW-1:0] n; begin iqn_ps1i = n[`BACK2_IQN_PS1I_L +: PDW_I]; end endfunction
+    function [PDW_I-1:0] iqn_ps2i; input [IQW-1:0] n; begin iqn_ps2i = n[`BACK2_IQN_PS2I_L +: PDW_I]; end endfunction
+    function [PDW_F-1:0] iqn_ps1f; input [IQW-1:0] n; begin iqn_ps1f = n[`BACK2_IQN_PS1F_L +: PDW_F]; end endfunction
+    function [PDW_F-1:0] iqn_ps2f; input [IQW-1:0] n; begin iqn_ps2f = n[`BACK2_IQN_PS2F_L +: PDW_F]; end endfunction
+    function [PDW_F-1:0] iqn_ps3f; input [IQW-1:0] n; begin iqn_ps3f = n[`BACK2_IQN_PS3F_L +: PDW_F]; end endfunction
+    //   ★★ N10：出队**动态索引**读 = bank 选择（`sel_idx[0]`）+ bank 内 6:1 mux
+    //     （`sel_idx>>1`）。逐槽静态读走上面的 `np_rd[]` 纯拼接，不含 mux。
+    wire [IQW-1:0] np_sel = sel_idx[0] ? np_b1[sel_idx >> 1] : np_b0[sel_idx >> 1];
+    assign o_sel_uop = {{(UOPW-IQW){1'b0}}, np_sel};   // C1：仅兼容（宽字段恒 0）
+    assign o_sel_nq  = np_sel;
+    assign o_sel_rob = rob_q[sel_idx*ROB_IDX_W +: ROB_IDX_W];
+    assign iss_uop   = {{(UOPW-IQW){1'b0}}, np_sel};   // C1：同上；backend_top 不接
+    assign iss_rob   = rob_q[sel_idx*ROB_IDX_W +: ROB_IDX_W];
+    assign iss_epoch = ep_q[sel_idx*`BACK2_EPOCH_W +: `BACK2_EPOCH_W];
+    //   ★ `iss_dead` 必须恒 0：错路径条目已在**冲刷拍按 squash_idx 一次性作废**
+    //     （见 §5 的 squash_kill），留下的条目全部属于"必须真正执行"的集合。
+    //     若仍按 epoch 标 dead，后端会把它当作"作废项"而不写 I2 寄存器
+    //     ⇒ 该条既不执行也不写回 ⇒ 它若被 ROB 保留（比分支更老）就永久卡死
+    //     （实测：iss_dead=111111、rob 头 hdone=0、IQ 抽空、后端永久停顿）。
+    assign iss_dead  = 1'b0;
+
+    //==========================================================================
+    // 1. 队列存储（★ 第 18 轮末重建：原文此段在自动回退中被误删，按接口与语义重写）
+    //    约定：全部用**打包向量**；禁止"读存储器的 function"（iverilog 12 + 综合口径）。
+    //==========================================================================
+    reg  [DEPTH-1:0]                 valid_q;
+    //   ★★ C1：载荷阵列改为**窄载荷**（`BACK2_IQN_W`）。写口仍收 UOPW 宽的 `wr_uop`
+    //     （backend_top 原样驱动 ⇒ 接口/单测不变），入队沿用 `pack_iqn()` 抽出窄载荷。
+    //   ★★ N10：窄载荷阵列按**槽号奇偶**拆 2 bank、每 bank **2 写口**（见文件头）。
+    //     `np_rd[]` 是**静态读视图**（槽号为编译期常量 ⇒ 纯拼接，无 mux）。
+    localparam integer HB = DEPTH / 2;                    // 每 bank 槽数（DEPTH 为偶数）
+    reg  [IQW-1:0]                   np_b0 [0:HB-1];      // 偶槽（slot 2*j）—— 2 写口
+    reg  [IQW-1:0]                   np_b1 [0:HB-1];      // 奇槽（slot 2*j+1）—— 2 写口
+    wire [IQW-1:0]                   np_rd [0:DEPTH-1];   // 静态读视图
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_nprd
+        if ((ge % 2) == 0) assign np_rd[ge] = np_b0[ge/2];
+        else               assign np_rd[ge] = np_b1[ge/2];
+    end
+    endgenerate
+    reg  [DEPTH*ROB_IDX_W-1:0]       rob_q;
+    reg  [DEPTH*`BACK2_EPOCH_W-1:0]  ep_q;
+    reg  [DEPTH*SRC_N-1:0]           rdy_q;
+    reg  [WK_N-1:0]                  wki_v_q, wkf_v_q;
+    reg  [WK_N*PDW_I-1:0]            wki_tag_q;
+    reg  [WK_N*PDW_F-1:0]            wkf_tag_q;
+
+    //   ★★ 两代唤醒：写回是**单拍脉冲**，而队列项可能在入队当拍就被唤醒。
+    //      每个通道只有一组 (valid,tag)，若只与"当拍"比较，同一通道**上一拍**的广播会被
+    //      当拍广播顶掉 ⇒ 漏唤醒 ⇒ 项永不就绪（实测：IQ 抽空、后端停摆）。故当拍与上一拍
+    //      **各自独立**参与匹配。
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wki_v_q   <= {WK_N{1'b0}};
+            wkf_v_q   <= {WK_N{1'b0}};
+            wki_tag_q <= {(WK_N*PDW_I){1'b0}};
+            wkf_tag_q <= {(WK_N*PDW_F){1'b0}};
+        end else begin
+            wki_v_q   <= wki_v;
+            wkf_v_q   <= wkf_v;
+            wki_tag_q <= wki_tag;
+            wkf_tag_q <= wkf_tag;
+        end
+    end
+
+    //==========================================================================
+    // 2. 就绪判定（源级唤醒命中）与最老优先选择
+    //==========================================================================
+    wire [DEPTH*SRC_N-1:0] wk_hit;
+    reg  [DEPTH-1:0]       e_rdy, e_sel;
+    reg  [DEPTH*SRC_N-1:0] wk_hit_w;
+    reg  [DEPTH-1:0]       sel_blk;    // 存在更老的未就绪项（⇒ load 项暂缓可选）
+    //   ★★ C8：`best_age` 由 8 bit 收窄到 ROB_IDX_W+1 bit —— 哨兵值必须**严格大于**
+    //     任何合法年龄：合法年龄 ≤ ROB_N−1，而满窗口（rob_cnt=ROB_N）时最新项年龄
+    //     恰为 ROB_N−1 ⇒ 哨兵取 ROB_N（否则该哨兵会用 `<` 把满窗口里最年轻的那一项
+    //     永久排除在"最老优先"之外）。
+    reg  [ROB_IDX_W:0]     best_age;
+    reg  [7:0]             sel_idx;
+    integer                gi, gk;
+
+    //   ★★ C8：**模块内唯一年龄计算点** —— `age_q[gi] = (rob_q[gi] − rob_head) mod ROB_N`。
+    //     原实现把同一表达式算了两份且宽度不同：`e_age`（8 bit，供最老优先选择，含
+    //     完整借位链）与 §5 的 `age_e`（ROB_IDX_W bit，供冲刷作废/窗口判定）⇒ 两份
+    //     减法器阵列互不共享。统一为一份 ROB_IDX_W 位年龄后：
+    //       ① 减法器阵列由 2 份降为 1 份（同一模块内真正 CSE）；
+    //       ② "最老优先"比较器由 8 bit 收窄到 ROB_IDX_W+1 bit。
+    //     语义等价性：合法在队项（未被 `squash_kill`/`out_window` 作废）必有
+    //     `rob_head ≤ age < rob_head + rob_cnt`（模 N）⇒ 其模 N 年龄 ∈ [0, ROB_N−1]；
+    //     8 bit 写法只在这些项上产生同样的低 ROB_IDX_W 位（高位为 0），故可达状态逐位一致。
+    wire [DEPTH*ROB_IDX_W-1:0] age_q;
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_age
+        assign age_q[ge*ROB_IDX_W +: ROB_IDX_W] =
+               rob_q[ge*ROB_IDX_W +: ROB_IDX_W] - rob_head;
+    end
+    endgenerate
+
+    //  源序（与 SRC_N 注释一致）：0=s1i 1=s2i 2=s1f 3=s2f 4=s3f
+    //  ★★ C1：所有逐槽比较/门控一律读**窄载荷** `np_rd[gi]`（宽字段已不在 IQ 内）
+    always @(*) begin
+        wk_hit_w = {(DEPTH*SRC_N){1'b0}};
+        for (gi = 0; gi < DEPTH; gi = gi + 1) begin
+            for (gk = 0; gk < WK_N; gk = gk + 1) begin
+                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps1i(np_rd[gi]))) ||
+                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps1i(np_rd[gi]))))
+                    wk_hit_w[gi*SRC_N + 0] = 1'b1;
+                if ((wki_v[gk]   && (wki_tag[gk*PDW_I +: PDW_I]   == iqn_ps2i(np_rd[gi]))) ||
+                    (wki_v_q[gk] && (wki_tag_q[gk*PDW_I +: PDW_I] == iqn_ps2i(np_rd[gi]))))
+                    wk_hit_w[gi*SRC_N + 1] = 1'b1;
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps1f(np_rd[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps1f(np_rd[gi]))))
+                    wk_hit_w[gi*SRC_N + 2] = 1'b1;
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps2f(np_rd[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps2f(np_rd[gi]))))
+                    wk_hit_w[gi*SRC_N + 3] = 1'b1;
+                if ((wkf_v[gk]   && (wkf_tag[gk*PDW_F +: PDW_F]   == iqn_ps3f(np_rd[gi]))) ||
+                    (wkf_v_q[gk] && (wkf_tag_q[gk*PDW_F +: PDW_F] == iqn_ps3f(np_rd[gi]))))
+                    wk_hit_w[gi*SRC_N + 4] = 1'b1;
+            end
+        end
+        for (gi = 0; gi < DEPTH; gi = gi + 1) begin
+            sel_blk[gi] = 1'b0;
+            for (gk = 0; gk < DEPTH; gk = gk + 1)
+                if (valid_q[gk] &&
+                    (age_q[gk*ROB_IDX_W +: ROB_IDX_W] < age_q[gi*ROB_IDX_W +: ROB_IDX_W]) &&
+                    ~e_rdy[gk]) sel_blk[gi] = 1'b1;
+        end
+        for (gi = 0; gi < DEPTH; gi = gi + 1) begin
+            e_rdy[gi] = (~np_rd[gi][`BACK2_IQN_S1I_USE] | rdy_q[gi*SRC_N+0] | wk_hit_w[gi*SRC_N+0]) &
+                        (~np_rd[gi][`BACK2_IQN_S2I_USE] | rdy_q[gi*SRC_N+1] | wk_hit_w[gi*SRC_N+1]) &
+                        (~np_rd[gi][`BACK2_IQN_S1F_USE] | rdy_q[gi*SRC_N+2] | wk_hit_w[gi*SRC_N+2]) &
+                        (~np_rd[gi][`BACK2_IQN_S2F_USE] | rdy_q[gi*SRC_N+3] | wk_hit_w[gi*SRC_N+3]) &
+                        (~np_rd[gi][`BACK2_IQN_S3F_USE] | rdy_q[gi*SRC_N+4] | wk_hit_w[gi*SRC_N+4]);
+            e_sel[gi] = valid_q[gi] & e_rdy[gi] &
+                        ~(INORD_LOAD[0] & np_rd[gi][`BACK2_IQN_IS_LOAD] & sel_blk[gi]);
+        end
+    end
+    assign wk_hit = wk_hit_w;
+
+    //  最老优先（年龄原点 = ROB 头；同拍唤醒即可选）
+    //  ★ C8：年龄取 §2 的唯一年龄向量 `age_q`；比较宽度 = ROB_IDX_W+1（零扩展后与
+    //     7 bit 哨兵 ROB_N 比较），与旧 8 bit 写法在可达状态上逐位一致。
+    always @(*) begin
+        sel_idx  = 8'h0;
+        best_age = {(ROB_IDX_W+1){1'b1}};
+        for (gi = 0; gi < DEPTH; gi = gi + 1)
+            if (e_sel[gi] && ({1'b0, age_q[gi*ROB_IDX_W +: ROB_IDX_W]} < best_age)) begin
+                best_age = {1'b0, age_q[gi*ROB_IDX_W +: ROB_IDX_W]};
+                sel_idx  = gi[7:0];
+            end
+    end
+    wire sel_valid = |e_sel;
+    wire iss_fire  = sel_valid & iss_ready;      // 出队与本拍发射严格同一条件
+    wire [DEPTH-1:0] sel_onehot;
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_sel
+        assign sel_onehot[ge] = iss_fire & (sel_idx == ge);
+    end
+    endgenerate
+    assign iss_valid = iss_fire;
+    assign o_sel_v   = sel_valid;
+    //  诊断用合并视角（DBG 打印引用）
+    wire [WK_N-1:0]       wki_v_e = wki_v | wki_v_q;
+    wire [WK_N*PDW_I-1:0] wki_tag_e = wki_tag;
+
+    //==========================================================================
+    // 3. 空位分配（★ N10：**按 bank 均衡拆分** + 每 bank 贪心扫 2 个最低空位）
+    //    · `free_cnt` 口径**不变**（总空位；供 DBG / 兼容）。
+    //    · `wr_cap`（新）= "本拍可接纳条数上界"，是派发侧**唯一**判据。
+    //    · 拆分（纯组合、只依赖 `valid_q` 与 `wr_valid`，**不构成组合环**）：
+    //         a  = |wr_valid|（契约：自写口 0 起连续）
+    //         b0 = clamp(ceil(a/2), a − min(2,free_b0) , min(2,free_b0))
+    //         b1 = a − b0
+    //      ⇒ 每 bank 每拍**至多 2 条**（2 写口永不欠配）；某 bank 满时 b0 自动向
+    //        有余侧夹取。**可达性等价**：`a ≤ wr_cap = min(2,free_b0)+min(2,free_b1)`
+    //        ⇔ 存在可行 (b0,b1)（b0_lo ≤ b0_hi 即该不等式；穷举 0≤a≤4、
+    //        0≤free_b0,free_b1≤HB 已逐点验证，见 fpga/scratch/n10_iq_bank_tb.sv）
+    //        ⇒ **绝不出现"接下了写不下"的静默丢项**；只可能在两 bank 都放不下时停顿。
+    //==========================================================================
+    // 空闲槽计数（打包向量 function，无存储器读）
+    function [4:0] popc(input [DEPTH-1:0] v);
+        integer i;
+        begin
+            popc = 5'd0;
+            for (i = 0; i < DEPTH; i = i + 1) popc = popc + {4'b0, v[i]};
+        end
+    endfunction
+
+    wire [DEPTH-1:0] free_v = ~valid_q;
+    wire [4:0]       free_n = popc(free_v);
+    assign free_cnt = free_n;
+
+    // ---- bank 占用/余量（偶槽 = bank0，奇槽 = bank1）----
+    wire [DEPTH-1:0] ev_valid, od_valid;
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_bv
+        assign ev_valid[ge] = ((ge % 2) == 0) ? valid_q[ge] : 1'b0;
+        assign od_valid[ge] = ((ge % 2) == 1) ? valid_q[ge] : 1'b0;
+    end
+    endgenerate
+    wire [4:0] free_b0 = HB - popc(ev_valid);      // bank0（偶槽）余量
+    wire [4:0] free_b1 = HB - popc(od_valid);      // bank1（奇槽）余量
+    wire [4:0] cap0 = (free_b0 > 5'd2) ? 5'd2 : free_b0;   // min(2, free_b0)
+    wire [4:0] cap1 = (free_b1 > 5'd2) ? 5'd2 : free_b1;   // min(2, free_b1)
+    assign wr_cap = cap0 + cap1;                            // 0..4
+
+    // ---- 本拍到达条数与 bank 拆分 ----
+    wire [2:0] a_n    = {2'b0, wr_valid[0]} + {2'b0, wr_valid[1]} +
+                        {2'b0, wr_valid[2]} + {2'b0, wr_valid[3]};
+    wire [2:0] a_half = (a_n + 3'd1) >> 1;                                  // ceil(a/2)
+    wire [2:0] b0_lo  = (a_n > cap1[2:0]) ? (a_n - cap1[2:0]) : 3'd0;
+    wire [2:0] b0_hi  = (cap0 >= 5'd2) ? 3'd2 : cap0[2:0];
+    wire [2:0] b0     = (a_half < b0_lo) ? b0_lo : ((a_half > b0_hi) ? b0_hi : a_half);
+    wire [2:0] b1     = a_n - b0;
+    wire       wr_ok  = (a_n <= wr_cap[2:0]);
+
+    // ---- 每 bank 内贪心扫 2 个最低空位（bank-local 索引 0..HB-1）----
+    reg [2:0] wi0 [0:1];
+    reg [2:0] wi1 [0:1];
+    integer   bj, c0, c1;
+    always @(*) begin
+        wi0[0] = 3'd0; wi0[1] = 3'd0; wi1[0] = 3'd0; wi1[1] = 3'd0;
+        c0 = 0;
+        for (bj = 0; bj < HB; bj = bj + 1)
+            if (!valid_q[2*bj] && (c0 < 2)) begin wi0[c0] = bj[2:0]; c0 = c0 + 1; end
+        c1 = 0;
+        for (bj = 0; bj < HB; bj = bj + 1)
+            if (!valid_q[2*bj+1] && (c1 < 2)) begin wi1[c1] = bj[2:0]; c1 = c1 + 1; end
+    end
+
+    // ---- 4 个物理写口 → 全局槽号 + 使能 ----
+    //   bank0 p0 ← 到达 0；bank0 p1 ← 到达 1；bank1 p0 ← 到达 b0；bank1 p1 ← 到达 b0+1
+    //   （bank0 侧数据源是**固定**写口 0/1 ⇒ 无 mux；bank1 侧按 b0 做 3:1 选择）
+    wire [3:0] g0a = {wi0[0], 1'b0};
+    wire [3:0] g0b = {wi0[1], 1'b0};
+    wire [3:0] g1a = {wi1[0], 1'b1};
+    wire [3:0] g1b = {wi1[1], 1'b1};
+    wire we0 = wr_ok & ~squash & (b0 >= 3'd1);
+    wire we1 = wr_ok & ~squash & (b0 >= 3'd2);
+    wire we2 = wr_ok & ~squash & (b1 >= 3'd1);
+    wire we3 = wr_ok & ~squash & (b1 >= 3'd2);
+    //   窄载荷：先按**静态写口**抽 4 份（38 bit），再对 bank1 做 3:1 选择。
+    //   ★ 不能对 `wr_uop` 做变量 part-select：那会变成 300 bit × 3:1 的 mux。
+    wire [IQW-1:0] pn0 = pack_iqn(wr_uop[0*UOPW +: UOPW]);
+    wire [IQW-1:0] pn1 = pack_iqn(wr_uop[1*UOPW +: UOPW]);
+    wire [IQW-1:0] pn2 = pack_iqn(wr_uop[2*UOPW +: UOPW]);
+    wire [IQW-1:0] pn3 = pack_iqn(wr_uop[3*UOPW +: UOPW]);
+    wire [IQW-1:0] pn_b1p0 = (b0 == 3'd0) ? pn0 : ((b0 == 3'd1) ? pn1 : pn2);
+    wire [IQW-1:0] pn_b1p1 = (b0 == 3'd0) ? pn1 : ((b0 == 3'd1) ? pn2 : pn3);
+    //   同两路的 rob/rdy（窄 mux：6/5 bit）
+    wire [ROB_IDX_W-1:0] rb_l [0:3];
+    wire [SRC_N-1:0]     rd_l [0:3];
+    generate
+    for (ge = 0; ge < WRP; ge = ge + 1) begin : g_wl
+        assign rb_l[ge] = wr_rob[ge*ROB_IDX_W +: ROB_IDX_W];
+        assign rd_l[ge] = wr_rdy[ge*SRC_N +: SRC_N];
+    end
+    endgenerate
+
+    // ---- 诊断打印（DBG=1 时；默认 0 ⇒ 不产生任何仿真开销/输出）----
+    integer dsi;
+    always @(posedge clk) begin
+        if (DBG && rst_n && (valid_q != {DEPTH{1'b0}})) begin
+            for (dsi = 0; dsi < DEPTH; dsi = dsi + 1) begin
+                if (valid_q[dsi])
+                    $display("[iq-dbg %m] slot=%0d rob=%0d rdy=%b ps1i=%0d ps2i=%0d use=%b%b",
+                             dsi, rob_q[dsi*ROB_IDX_W +: ROB_IDX_W],
+                             rdy_q[dsi*SRC_N +: SRC_N],
+                             iqn_ps1i(np_rd[dsi]),
+                             iqn_ps2i(np_rd[dsi]),
+                             np_rd[dsi][`BACK2_IQN_S1I_USE],
+                             np_rd[dsi][`BACK2_IQN_S2I_USE]);
+            end
+            $display("[iq-dbg %m] wki_v_e=%b wki_tag_e=%b wk_hit=%b rob_head=%0d rob_cnt=%0d",
+                     wki_v_e, wki_tag_e, wk_hit, rob_head, rob_cnt);
+        end
+    end
+
+    //==========================================================================
+    // 4. 计数输出
+    //==========================================================================
+    assign cnt_o = popc(valid_q);
+
+    //==========================================================================
+    // 5. 时序：唤醒置位 / 出队 / 入队
+    //==========================================================================
+    // ---- 冲刷作废掩码（组合；只读打包向量）----
+    //   年轻判据必须以 **ROB 头为年龄原点**：age = (idx - head) mod ROB_N，
+    //   "更年轻" ⇔ age(项) > age(squash_idx)。不能写成 (idx - squash_idx) != 0 ——
+    //   模 N 下 idx 更小会得到一个很大的年龄（看起来"非零"），会把**更老**的项一起误杀
+    //   （实测：squash_idx=21 时把 idx=20 的项也杀掉，队列 3→1 而非 3→2）。
+    wire [DEPTH-1:0] squash_kill;
+    wire [DEPTH-1:0] out_window;      // 落在 ROB 窗口之外（已提交越过 / 已冲刷）
+    //   ★ C8：年龄基准改由 ROB 单点提供（`squash_age`）；本模块不再重算
+    //     `squash_idx - rob_head`。逐位等价（两侧同为 ROB_IDX_W 位模 ROB_N 减法）。
+    wire [ROB_IDX_W-1:0] age_sq = squash_age;
+    generate
+    for (ge = 0; ge < DEPTH; ge = ge + 1) begin : g_kill
+        //   ★ C8：本项年龄复用 §2 的唯一计算点 `age_q`（原此处再算一份同式减法）。
+        assign squash_kill[ge] = squash & valid_q[ge] &
+                                 (age_q[ge*ROB_IDX_W +: ROB_IDX_W] > age_sq);
+        //   比较必须零扩展到 rob_cnt 的宽度（ROB_IDX_W+1）：rob_cnt=ROB_N 时在
+        //   ROB_IDX_W 位里表示为 0 ⇒ 窄位比较会把"满窗口"误判成"空窗口"而全清。
+        assign out_window[ge]  = valid_q[ge] &
+                                 ({1'b0, age_q[ge*ROB_IDX_W +: ROB_IDX_W]} >= rob_cnt);
+    end
+    endgenerate
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            valid_q <= {DEPTH{1'b0}};
+            rdy_q   <= {(DEPTH*SRC_N){1'b0}};
+            rob_q   <= {(DEPTH*ROB_IDX_W){1'b0}};
+            ep_q    <= {(DEPTH*`BACK2_EPOCH_W){1'b0}};
+        end else if (flush_all) begin
+            valid_q <= {DEPTH{1'b0}};
+        end else begin
+            // ---- 5.1 出队 + 冲刷作废（比 squash_idx 更年轻的项）----
+            valid_q <= (valid_q & ~sel_onehot) & ~squash_kill & ~out_window;
+            // ---- 5.2 唤醒置位（单调置 1；出队项无损）----
+            rdy_q <= (rdy_q | wk_hit);
+            // ---- 5.3 入队（★ N10：4 个物理写口 → 2 bank×2 写口；冲刷拍**不接受**新项）----
+            //   ★ 四条写语句的槽号互不相同（同 bank 两口的空位由贪心扫描保证不同；
+            //     跨 bank 由 ox 奇偶保证）⇒ 4 张打包阵列（valid/rdy/rob/ep）在本段里
+            //     仍是"4 写口"，与改前同构；只有 `np_b0/np_b1` 落到"每 bank 2 写口"。
+            if (we0) begin                                         // bank0 p0 ← 到达 0
+                valid_q[g0a] <= 1'b1;
+                rdy_q [g0a*SRC_N +: SRC_N] <= rd_l[0];
+                rob_q [g0a*ROB_IDX_W +: ROB_IDX_W] <= rb_l[0];
+                ep_q  [g0a*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b0 [wi0[0]] <= pn0;
+            end
+            if (we1) begin                                         // bank0 p1 ← 到达 1
+                valid_q[g0b] <= 1'b1;
+                rdy_q [g0b*SRC_N +: SRC_N] <= rd_l[1];
+                rob_q [g0b*ROB_IDX_W +: ROB_IDX_W] <= rb_l[1];
+                ep_q  [g0b*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b0 [wi0[1]] <= pn1;
+            end
+            if (we2) begin                                         // bank1 p0 ← 到达 b0
+                valid_q[g1a] <= 1'b1;
+                rdy_q [g1a*SRC_N +: SRC_N] <= rd_l[b0];
+                rob_q [g1a*ROB_IDX_W +: ROB_IDX_W] <= rb_l[b0];
+                ep_q  [g1a*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b1 [wi1[0]] <= pn_b1p0;
+            end
+            if (we3) begin                                         // bank1 p1 ← 到达 b0+1
+                valid_q[g1b] <= 1'b1;
+                rdy_q [g1b*SRC_N +: SRC_N] <= rd_l[b0 + 3'd1];
+                rob_q [g1b*ROB_IDX_W +: ROB_IDX_W] <= rb_l[b0 + 3'd1];
+                ep_q  [g1b*`BACK2_EPOCH_W +: `BACK2_EPOCH_W] <= epoch;
+                np_b1 [wi1[1]] <= pn_b1p1;
+            end
+        end
+    end
+
+endmodule

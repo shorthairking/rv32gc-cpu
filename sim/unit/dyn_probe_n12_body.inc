@@ -18,7 +18,8 @@
 //       unk_v[0:31] :380        = v & ~av & (age < age_iss)（发射闸门口径）
 //       age_rob :272            E1 项年龄（转发窗口基准）
 //       fw_eqm_e/fw_eq0_e/fw_eqp_e/fw_eqp2_e :443  逐 store 字数等值（w0-1/w0/w0+1/w0+2）
-//       stq_msk[0:31][3:0] :200 / stq_hi[0:31] :199  store 字节掩码 / 8 B 高字标志
+//       stq_msk[0:31][3:0] :200 / stq_hi[0:31] :199 / stq_mh[0:31][3:0] :204
+//                                  store 低字掩码 / 拆两笔标志 / 高字掩码（D1-fix 新增）
 //       lmask_w8 :425 / fwd_hit_w :499 / fwd_all_w :592
 //       iss_ok :863             = ~any_unk_w（load 发射闸门）
 //       （backend_top）lsu_ld_block :1228 —— 队头是 load 且被 iss_ok/csr 挡住
@@ -89,7 +90,9 @@
     //     其中 gcar = I[3:2]、lane = I[1:0]，
     //     lo_eq = (gcar==0)?eq0:(gcar==1)?eqp:eqp2   （store 低字对齐本字节所在字）
     //     hi_eq = (gcar==0)?eqm:(gcar==1)?eq0:eqp    （8 B store 的高字 = 低字地址+4）
-    //     lo_w  = lo_eq & stq_msk[gj][lane]；hi_w = stq_hi[gj] & hi_eq
+    //     lo_w  = lo_eq & stq_msk[gj][lane]；hi_w = stq_hi[gj] & hi_eq & stq_mh[gj][lane]
+    //     （★ D1-fix 同步：高字覆盖按该项**自己的高字掩码** `stq_mh` 判 —— 8 B store
+    //       `stq_mh=4'hF` ⇒ 与旧“恒覆盖 4 道”逐位等价；≤4 B 跨字 store 只覆盖越界道。）
     //   打包成 8×32 bit（与 n7 探针的打包口径一致，避免非可综合的 unpacked wire 数组）。
     wire [8*32-1:0] n12_cov;
     generate
@@ -105,7 +108,7 @@
                                (gcar_w == 2'd1) ? `DYN_LSU.fw_eq0_e [n12_gj] :
                                                   `DYN_LSU.fw_eqp_e [n12_gj];
                 wire lo_w = lo_eq_w & `DYN_LSU.stq_msk[n12_gj][lane_w];
-                wire hi_w = `DYN_LSU.stq_hi[n12_gj] & hi_eq_w;
+                wire hi_w = `DYN_LSU.stq_hi[n12_gj] & hi_eq_w & `DYN_LSU.stq_mh[n12_gj][lane_w];
                 assign n12_cov[(n12_gb*32) + n12_gj] = `DYN_LSU.fw_live_e[n12_gj] & (lo_w | hi_w);
             end else begin : g_off
                 assign n12_cov[(n12_gb*32) + n12_gj] = 1'b0;
