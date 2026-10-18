@@ -20,7 +20,7 @@
 
 ### 1.5.1 📋 交接存档点 #11（2026-09-24 夜，用户新开 session 继续；本会话已停）
 
-- **★子 Agent 路由口径（用户 2026-10-18 裁决，最高优先级，覆盖 2026-10-01 口径）**：**DeepSeek 官方路由、档位 `high`**——`provider: "deepseek-official"`、`model: "ds-flash"`、`reasoning_effort: "high"`。旧口径（两个 opencode-go 路由的 `deepseek-v4.1-flash`、xhigh、更早 deepseek-flash）全部作废。**宿主开通状态（2026-10-18 实查）**：本会话该路由报 "not allowed for this Session"（`allowedModels` 未含）⇒ 须用户在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 加入 `{provider: deepseek-official, model: ds-flash}` 并**新开会话**（路由是会话首组装快照，已有会话不重算）。开通前派活暂停上报；精确 provider 名以新会话 `list_subagent_models` 实查为准；注意 `subagent_fork` 无路由字段属设计如此。
+- **★子 Agent 路由口径（用户 2026-10-18 裁决，最高优先级，覆盖 2026-10-01 口径）**：**DeepSeek 官方路由、档位 `high`**——`provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "high"`。旧口径（两个 opencode-go 路由的 `deepseek-v4.1-flash`、xhigh）全部作废。**★模型 id 更正（2026-10-18 实测）**：`ds-flash` 是**无效 id**（官方 Messages 接口返回 400 `The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed ds-flash`），有效 id 只有 `deepseek-flash`（=DeepSeek-V4.1-Flash）与 `deepseek-v4-pro`；旧记录中的 `ds-flash` 全部改为 `deepseek-flash`。**宿主开通状态（2026-10-18 已修复）**：`~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 已加入 `{provider: deepseek-official, model: deepseek-flash}`（原先只有 opencode-go×2/openai-codex ⇒ 报 "not allowed for this Session"），已用 `dsh --profile web --dump-config` 复验合成树含该条目与 `llm-deepseek` entry。**但路由是会话首组装快照、已有会话不重算 ⇒ 仍须新开会话**；新会话先用 `list_subagent_models provider=deepseek-official` 复验（应列出 `deepseek-flash`/`deepseek-v4-pro`）再派活；注意 `subagent_fork` 无路由字段属设计如此。
 - **一句话现状**：2B 功能仿真全部完成（tb_core_top_2b 219/219、regress 33/33、锁步 57/57、iq 151/151）；2B-5 面积压缩主干已落地（ROB BRAM 化完成），最新 tag **2B-4.45**（本地 b13e4cc 已 push 成功）。**面积仍超器件**：全核 366 483 LUT = 272.28%（xc7a200t 134 600）。
 - **面积现状（综合实测，tag 2B-4.45）**：ROB LUT 133 034→106 704(-19.8%)、ROB FF→15 246(-44.8%)、BRAM 19→35(+16)、全核 FF 142 259→129 899。剩余大头（hier 报告）：u_rob 106.7k、u_ren_i 50 248、u_ren_f 49 894、u_lsu 43 357、u_prf_i 23 696、u_fpu 23 811、u_front 18 488。
 - **★用户优化方向（新会话照此执行）**：①**先分析后分配**——先派一个只读子代理（info/testing 型）深挖综合/布局报告（`fpga/out/synth_2b_16.667ns_utilization_hier.rpt` + 对 `post_synth_2b*.dcp` 跑 `report_utilization -cells`），定位各模块 LUT 的具体去向（是比较逻辑 / 冗余 tag / 写口 mux / 多写源表项 mux 等），把结论回报母代理；母代理拿到报告**分析后再**进行任务分配；②**多子代理并行**——后端（rename/LSU/ROB 剩余 nq+updq 写 mux/prf 等）多个模块并行派 coding 优化，各自保四套判据绿（深 219/219+iq151+lockstep57+regress33、浅 219/219+regress33），文件不冲突。
@@ -93,12 +93,13 @@
 - **正确性收获（本阶段，比面积更重要）**：rename 回滚取点 pdi 撞车（51a06cf）、PRF busy 表 epoch 死锁（20da16e）、TRQ 三记账缺陷、LSQ 非对齐转发错字（dc36336）、FMUL 零符号（bf7b3e7）。div/sqrt 参数 RV32GC_FDIV/FSQRT_CYCLES=32 是死参数（实际 114 拍位串行），非面积杠杆，文档口径待澄清。
 - **遗留**：文档口径滞后（NREG 96→64/nq 49→37/RB 416→229/commit 4→2/FPU 6→2 算术单元）；动态探针 dyn_probe_r 需适配 EXP-R1 后 rename 接口；NREG=64 余量仅 6 号；时序 WNS≈−50ns 深度不收敛。
 
-### 1.5.7 📋 交接存档点 #18（2026-10-18：D1 修复入库 + 审计证据入库 + 路由口径更新，**等宿主开通 deepseek-official 路由**）
+### 1.5.7 📋 交接存档点 #18（2026-10-18：D1 修复入库 + 审计证据入库 + 路由口径更新，**宿主路由已放行、模型 id 已更正，待新会话复验**）
 
 - **D1 修复 ✅（commit `bd622ee`，母 Agent 亲跑验收）**：`rtl/back2/lsq_simple.v`（新增 STQ 项 4bit 高字掩码 `stq_mh`：E1 跨字判定 `st_nb_w/st_sum_w/st_hi_w/st_spill_w/st_mh_w/st_dh_w`，两处 CDQ 高字掩码由硬编码 4'hF 改 `stq_mh`（8B 恒 0xF 逐位等价），转发高字命中加 `& stq_mh[lane]`；`st_mis_w` 未动，仍仅 8B 抛 cause6）+ `sim/unit/dyn_probe_n12_body.inc`（N12A 探针镜像同步）。**验收**：`AUDIT2_LSQ_MIS: ALL-PASS`（基线 `d00eb03` 实测 FAIL n=2，B2/C2 跨字节）+ `./scripts/regress.sh` 33/33 PASS（含 2b/iq/lockstep）。**残留**：①2A（任意非对齐抛 cause6）与 2B（≤4B 硬件完成）语义分叉，锁步程序暂不含跨界 store，若纳入须先统一 2A；②跨 4K 页第二笔沿用 8B PA+4 简化；③低字 fire 即置 `stq_ret` 属 8B 既有特性未动。详情 `sim/audit/audit2_lsq_mis_report.md`（330 行，已入库）。
 - **审计证据入库**：`sim/audit/`——audit1/2/3 三报告 + audit2_gate.sh/audit1_check.sh/audit3_check.py + audit2_lsq_mis_tb.sv 夹具（原 fpga/scratch/ 为 .gitignore 区，现在 repo 内有常驻副本；今后 gate 以 sim/audit/ 为准）。
-- **★子 Agent 路由口径已更新（用户 2026-10-18 裁决，commit `a40947c`）**：`provider: "deepseek-official"`、`model: "ds-flash"`、`reasoning_effort: "high"`；旧 opencode-go 两路由 `deepseek-v4.1-flash` 与 xhigh 口径作废。已同步 AGENT.md §0.2/§2、NEXT_SESSION.md（本条+§2+§7）、USAGE.md、README.md、prompts/×3；`memory_write` 已记（mem-ea81a10b）。
-- **★阻塞（须用户操作）**：本会话实查 `deepseek-official` 报 "not allowed for this Session"（宿主 `allowedModels` 仅 opencode-go×2/openai-codex）⇒ **下一步：用户在 `~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 加入 `{provider: deepseek-official, model: ds-flash}`，然后新开会话**（路由是会话首组装快照）。开通前子 Agent 派活一律暂停（不得用旧路由，§0.2）。
+- **★子 Agent 路由口径已更新（用户 2026-10-18 裁决，commit `a40947c`）**：`provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "high"`；旧 opencode-go 两路由 `deepseek-v4.1-flash` 与 xhigh 口径作废。已同步 AGENT.md §0.2/§2、NEXT_SESSION.md（本条+§2+§7）、USAGE.md、README.md、prompts/×3；`memory_write` 已记（mem-ea81a10b）。**★同日晚修复补记：原记录 `model: "ds-flash"` 是无效 id**——实测官方 Messages 接口 `deepseek-flash` → HTTP 200、`ds-flash` → HTTP 400 `invalid_request_error`（"supported API model names are deepseek-flash, deepseek-v4-pro"）；本仓库 8 处文档已由 `ds-flash` 更正为 `deepseek-flash`。
+- **★阻塞已解除（2026-10-18，母 Agent 亲改宿主配置）**：`~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 首条已插入 `{provider: deepseek-official, model: deepseek-flash}`（原文件仅 opencode-go / opencode-go-chat / openai-codex）；`dsh --profile web --dump-config` 复验合成树含 `id: llm-deepseek → '@deepseek-ai/dsh-llm-deepseek-api-key'`（即 provider `deepseek-official`）与新的 allowedModels 条目。**残留步骤：新开会话**（路由是会话首组装快照，本会话快照仍是旧三条），新会话先跑 `list_subagent_models provider=deepseek-official`（预期列出 `deepseek-flash`、`deepseek-v4-pro` 与档位）后才恢复派活。
+- **验证边界（能力事实，非缺陷）**：headless 一次性 profile **无法**复现 Web 的 preset 作用域——`modelSelectionSettings: true` 只在 `@deepseek-ai/dsh-web-app/presets/standard.patch.yml` 的 delegation 组里给出（base 的 `tool-subagent` 是关闭状态），因此"新会话采样 allowedModels"只能在**新 Web 会话**里实证；headless 里即便打开该开关也不会挂出 `subagent`/`list_subagent_models`。另注：profile patch 层的 `config` 是**整块替换**而非深合并（要给已存在 entry 加字段必须重写其全部字段）。
 - **恢复后的续办清单（NEXT_SESSION §1.5.6 待办 2–6 顺延）**：D2/D3/D4/D6/D7/D8 审计修复批（D3/D4/D5/D7 需各自口径确认，D7 需架构裁决）→ AUDIT3 §6-1 零影响 28 条 → 送审池三项（N34B-2 与锦标赛预测器硬指标冲突须需求裁决）→ 下一批面积候选（win_idx epoch 等）→ 文档口径同步 → arch-test 接入 2B。远端：`bd622ee`/`a40947c` 待 push（origin=git@github.com:shorthairking/rv32gc-cpu.git）。
 
 ### 1.5.6 📋 交接存档点 #17（2026-10-15：Gate E 收官 + 三轮审计完成，**迁移下一 session 处置审计发现**）
@@ -136,7 +137,7 @@
 
 1. 新项目载体 = **就地沿用 `rv32gc-cpu/` dev 分支**（不再另建 rv32gc-cpu-v2/；旧实现文件已从磁盘移除，历史在 master）。
 2. 用户已发"开始阶段一"指令：info 复核 → coding 重写 docs/design+porting+kb → 收尾提交 → 停下审阅。
-3. 子 Agent 路由（2026-10-18 更新）：`provider: "deepseek-official"`、`model: "ds-flash"`、`reasoning_effort: "high"`（DeepSeek 官方路由；旧 xhigh、opencode-go 两路由 `deepseek-v4.1-flash` 口径作废；宿主开通见 §1.5.1 最新条目）。
+3. 子 Agent 路由（2026-10-18 更新）：`provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "high"`（DeepSeek 官方路由；旧 xhigh、opencode-go 两路由 `deepseek-v4.1-flash` 口径作废；宿主 `allowedModels` 已放行该路由、模型 id 已由无效的 `ds-flash` 更正为 `deepseek-flash`；**须新开会话生效**，见 §1.5.1/§1.5.7 最新条目）。
 4. **★任务要求口径更新（2026-10-04 用户拍板，覆盖此前"4 发射是禁区"）**：**4 发射 + 目标平台（chiplab, xc7a200t）是底线、不允许改**。具体：**前端一次取 4 条指令（hard）；后端至少支持一次提交 2 条指令，即底线 IPC 在 2 附近（hard）**。其余（FU 数量、资源占用率、时钟频率等）**可改，但需经用户审阅后再改**。⇒ 后端可从"4-wide 提交 + 6 FU"降为"4-fetch / 2-commit / 更少 FU"，这是关闭 133.69%→80% 结构缺口的关键路径；但 FU 数量/频率改动必须先报用户审阅。
 5. **总结性 report 固定内容（2026-10-04，下次提"总结性 report"即照此、勿再声明）**：①项目当前大概状况（架构/技术/资源占用率，快速获取整体框架）；②目前主要问题与成因（详细 + **原始数据印证，禁止编造/夸大或减小**）；③可能的解决方案与优化路径（简写方向）；④其他补充信息。**一律写在同一个 md（`fpga/area-optimization-report.md`）上修改，禁止新建 md。**
 
@@ -208,7 +209,7 @@ spike --version     # 预期 /opt/riscv/bin/spike
 ## 7. 纪律提醒（对本文件读者）
 
 - **kb 检索环境（2026-09-14 发现，待处理）**：常驻 `kb_search` 的 LSA 语义层已退化（返回无关命中）；`kb_get`（path+行号）与直接 `read` 手册源文件完全正常。已做：CLI `node dsh-extension/bin/riscv-kb.js build --no-lsa` 把磁盘索引重建为纯词法版；**待用户重启 `dsh web` 使常驻进程重载**。重启前子 Agent 查 ISA 细节一律用 `kb_get`/`read`（`riscv-isa-manual/src/**`），不依赖 `kb_search` 排序。
-- 母 Agent 只调度；子 Agent 路由 `deepseek-official` 的 `ds-flash`（2026-10-18 用户裁决，DeepSeek 官方路由；宿主开通前暂停派活，见 §1.5.1），**reasoning_effort 一律 "high"**；知识盲区：kb → 联网 → 自试≤3 → 上报。
+- 母 Agent 只调度；子 Agent 路由 `deepseek-official` 的 `deepseek-flash`（2026-10-18 用户裁决，DeepSeek 官方路由；宿主 `allowedModels` 已放行该路由，**须新开会话生效**，见 §1.5.1/§1.5.7），**reasoning_effort 一律 "high"**；知识盲区：kb → 联网 → 自试≤3 → 上报。
 - **goal 纪律（AGENT.md §0.7，2026-09-17 收紧）**：母 Agent 未在自己 session 运行实质性任务（bash 验证/文件读写）时禁止 create_goal/update_goal resume；派发子 Agent 后结束回合等宿主完成通知（子 Agent 结束自动唤醒母 Agent 交接）；禁止轮询；子 Agent 自驱一次做完；goal 工具仅顶层 Agent 可用。历史 goal（goal-783b30b5）已 paused 且按新规不再 resume。
 - 旧项目（master 分支、kb 中 rv32gc-project 来源）只作反面教训，禁止照抄。
 - 阶段一结束必须停下等用户审阅后再进阶段二（2A 顺序 5 级基线核）。

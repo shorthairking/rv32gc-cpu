@@ -19,22 +19,22 @@
 用户裁决口径（**2026-10-18 最新**）：**DeepSeek 官方路由、档位 `high`**（旧 opencode-go 两路由 `deepseek-v4.1-flash` 口径、xhigh 口径全部作废）。在本 dsh 环境中该模型的准确路由是：
 
 - `provider: "deepseek-official"` —— DeepSeek 官方路由（**精确 provider 名以新会话 `list_subagent_models` 实查为准**）
-- `model: "ds-flash"`
+- `model: "deepseek-flash"` —— 官方模型 id（**旧记录里的 `ds-flash` 是无效 id**：2026-10-18 实测官方接口只接受 `deepseek-flash` / `deepseek-v4-pro`，传 `ds-flash` 返回 400 `invalid_request_error`）
 - `reasoning_effort: "high"` —— 思考强度 high 档
 
-**宿主开通状态（2026-10-18 实查）**：本会话 `list_subagent_models` 仅见 `opencode-go` / `opencode-go-chat` / `openai-codex`，`deepseek-official` 报 "not allowed for this Session" ⇒ **须先由用户**在 profile patch `~/.dsh/profiles/web/cordis.patch.yml` 的 `subagent-model-selection-settings.allowedModels` 里加入 `{provider: deepseek-official, model: ds-flash}`（`enabled: true` 已开），然后**新开会话**才生效。开通前派活暂停上报，不得退化用旧路由或母 Agent 自身模型。
+**宿主开通状态（2026-10-18 已修复）**：原先 `allowedModels` 只有 `opencode-go` / `opencode-go-chat` / `openai-codex`，`deepseek-official` 报 "not allowed for this Session"；现已在该文件中加入 `{provider: deepseek-official, model: deepseek-flash}`。**路由是会话首次组装时快照 ⇒ 改完必须新开会话**；新会话里先复验再派活。旧路由仍留在 `allowedModels`（未强制移除），但按 `AGENT.md` §0.2 口径一律不用于派活。
 
-**配置落在哪里（2026-10-01 起，重要）**：新版 dsh **已移除 `~/.dsh/settings.yaml`**，设置统一写进 profile patch `~/.dsh/profiles/web/cordis.patch.yml`。本机已在该文件的 `subagent-model-selection-settings` entry 里写入 `enabled: true` 与上述两条 `allowedModels`。因此：
+**配置落在哪里（2026-10-01 起，重要）**：新版 dsh **已移除 `~/.dsh/settings.yaml`**，设置统一写进 profile patch `~/.dsh/profiles/web/cordis.patch.yml`。本机已在该文件的 `subagent-model-selection-settings` entry 里写入 `enabled: true` 与 `allowedModels`（含 `deepseek-official/deepseek-flash`）。因此：
 
 - **不需要在 WSL 里安装 opencode 本体**；模型路由由宿主 dsh 配置提供。
-- 母 Agent 每次调用 `subagent` 时，在参数里**显式携带 `provider`/`model`/`reasoning_effort`**（`AGENT.md` §0.2：`provider: "deepseek-official"`、`model: "ds-flash"`、`reasoning_effort: "high"`）。
+- 母 Agent 每次调用 `subagent` 时，在参数里**显式携带 `provider`/`model`/`reasoning_effort`**（`AGENT.md` §0.2：`provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "high"`）。
 - **`subagent_fork` 不带这三个字段是设计如此**（standard preset 未开 `modelSelectionSettings`，以保持与父 Agent 同路由、复用 KV cache）；只有 `subagent`（spawn）会暴露它们。
 - **改配置后必须新开会话**：子 Agent 模型选择是会话首次组装时快照，已存在的会话不会重算。
 
 验证方法（新会话里让母 Agent 执行）：
 
-- 调用 `list_subagent_models`（无参数 → 列出可用 provider；`provider=deepseek-official` → 列出该 provider 的模型与档位）。
-- 若 `list_subagent_models` 未列出 `deepseek-official`（或对其查询报 not allowed）→ 说明宿主尚未放行该路由，**报告用户**在 `cordis.patch.yml` 的 `allowedModels` 加入后新开会话（这是环境缺失，按红线不能自行绕过或退化成用母 Agent 模型跑子 Agent）。
+- 调用 `list_subagent_models`（无参数 → 列出可用 provider；`provider=deepseek-official` → 列出该 provider 的模型与档位，应见 `deepseek-flash`）。
+- 若 `list_subagent_models` 未列出 `deepseek-official`（或对其查询报 not allowed）→ 说明宿主还未放行该路由，**报告用户**在 `cordis.patch.yml` 的 `allowedModels` 确认后新开会话（这是环境缺失，按红线不能自行绕过或退化成用母 Agent 模型跑子 Agent）。
 
 ## 3. 创建新母 Agent（dsh 会话）
 
@@ -59,14 +59,14 @@ subagent(
 【禁止事项】禁止使用原语；禁止自写 AXI 相关逻辑；禁止修改 rtl/pkg/*.vh 之外的定义
 【参考】AGENT.md §4 红线；docs/design/spec/02-uop-and-decode.md（如已存在）",
   provider: "deepseek-official",
-  model: "ds-flash",
+  model: "deepseek-flash",
   reasoning_effort: "high",
   run_in_background: true
 )
 ```
 
 - 新任务用 `subagent`；需要延续母 Agent 会话上下文的任务用 `subagent_fork`（**fork 无路由字段，路由随父 Agent——设计如此**）。
-- `reasoning_effort` 固定 `"high"`（用户 2026-10-18 裁决）；`provider: "deepseek-official"`（**宿主开通前暂停派活**，见 §2 开通状态）。
+- `reasoning_effort` 固定 `"high"`（用户 2026-10-18 裁决）；`provider: "deepseek-official"` / `model: "deepseek-flash"`（宿主已放行，见 §2；**新会话才生效**）。
 - 三个子 Agent 的职责/写权限边界见 `AGENT.md` §5：testing 与 info 默认只读；coding 只动指派范围。
 
 ## 5. 常见问题
@@ -74,7 +74,8 @@ subagent(
 | 问题 | 处置 |
 |---|---|
 | 子 Agent 工具没有 `provider`/`model` 参数 | 见 §2：先 `list_subagent_models` 核实；仍无 → 报告用户（宿主能力未开启），不得绕过。注意 **`subagent_fork` 本来就没有，属设计如此** |
-| `list_subagent_models` 列出的 provider 不含 `deepseek-official`（或查询报 not allowed） | 报告用户：宿主 `allowedModels` 未放行该路由，由用户配置后新开会话 |
+| `list_subagent_models` 列出的 provider 不含 `deepseek-official`（或查询报 not allowed） | 确认处于**新开会话**（路由是首组装快照）；仍缺 → 报告用户核查 `~/.dsh/profiles/web/cordis.patch.yml` 的 `allowedModels` |
+| 子 Agent 报模型不存在（400 `invalid_request_error`） | 检查 `model` 是否写成 `ds-flash` —— 有效 id 只有 `deepseek-flash` / `deepseek-v4-pro`（§2） |
 | 子 Agent 报环境缺失（工具未装/版本不符） | 按红线报告用户，由用户在 WSL 中配置安装 |
 | 子 Agent 声称通过 | 母 Agent 必须复跑判定命令后才算验收（AGENT.md §0.6） |
 | 母 Agent 想自己写代码 | 违反 AGENT.md §0.1，属于红线；用户可在首条消息中再次强调 |

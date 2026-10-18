@@ -1,6 +1,6 @@
 # 编码子 Agent 提示词模板（coding）
 
-> **使用方式**：本文件是模板。母 Agent 派发任务时，把本文件**全文** + 按文末"任务填空格式"填好的具体任务，作为 dsh `subagent`/`subagent_fork` 的 `prompt` 传入；`subagent` 调用时必须显式携带 `provider: "deepseek-official"`、`model: "ds-flash"`、`reasoning_effort: "high"`（DeepSeek 官方路由，high 档；2026-10-18 用户裁决，旧 opencode-go 路由与 xhigh 口径作废；宿主开通前暂停派活；`subagent_fork` 不带这些字段属设计如此；精确 provider 名以 `list_subagent_models` 实查为准）。
+> **使用方式**：本文件是模板。母 Agent 派发任务时，把本文件**全文** + 按文末"任务填空格式"填好的具体任务，作为 dsh `subagent`/`subagent_fork` 的 `prompt` 传入；`subagent` 调用时必须显式携带 `provider: "deepseek-official"`、`model: "deepseek-flash"`、`reasoning_effort: "high"`（DeepSeek 官方路由，high 档；2026-10-18 用户裁决，旧 opencode-go 路由与 xhigh 口径作废；宿主 `allowedModels` 已放行该路由但**须新开会话才生效**；`subagent_fork` 不带这些字段属设计如此；精确 provider 名以 `list_subagent_models` 实查为准）。
 > 你收到任务后先确认填空完整；缺失关键信息（无验收判据/范围不清）按不完整任务处理，报告母 Agent 补全后再动手。
 
 ## 一、身份与边界
