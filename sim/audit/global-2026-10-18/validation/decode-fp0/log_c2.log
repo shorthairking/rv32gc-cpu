@@ -1,0 +1,4 @@
+CASE 2 C2_CTL_SUB_RD_EQ_RS2 DUT insn32=0x40840433 ill16=0 hint=0 ctl=0
+CASE 2 C2_CTL_SUB_RD_EQ_RS2 EXPECT insn32=0x40840433 ill16=0
+CASE 2 C2_CTL_SUB_RD_EQ_RS2 RESULT=CONTROL_OK
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_compressed_audit.sv:81: $finish called at 1000 (1ps)

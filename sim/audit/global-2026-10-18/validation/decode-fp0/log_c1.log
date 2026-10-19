@@ -1,0 +1,4 @@
+CASE 1 C1_C_SUB_X8_X9 DUT insn32=0x409484b3 ill16=0 hint=0 ctl=0
+CASE 1 C1_C_SUB_X8_X9 EXPECT insn32=0x40940433 ill16=0
+CASE 1 C1_C_SUB_X8_X9 RESULT=DEFECT_REPRODUCED
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_compressed_audit.sv:81: $finish called at 1000 (1ps)

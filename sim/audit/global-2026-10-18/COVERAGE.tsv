@@ -1,0 +1,248 @@
+path	category	depth	evidence	limitation
+fpga/run_vivado_batch.sh	综合/板级脚本	全文 1–150	08	不在 245 冻结哈希内；按 HEAD blob 只读
+fpga/soc_up.xdc	约束文件	全文 1–31	08	不在 245 冻结哈希内；仅 aclk，无 I/O delay/false_path
+fpga/tcl/create_ip.tcl	综合/实现脚本	全文 1–339	08	未运行 Vivado；impl 忽略 TOP_TAG
+fpga/tcl/impl.tcl	综合/实现脚本	全文 1–188	08	未运行 Vivado；impl 忽略 TOP_TAG
+fpga/tcl/report_timing_detail.tcl	综合/实现脚本	全文 1–76	08	未运行 Vivado；impl 忽略 TOP_TAG
+fpga/tcl/synth.tcl	综合/实现脚本	全文 1–338	08	未运行 Vivado；impl 忽略 TOP_TAG
+rtl/axi/axi_master_ctrl.v	RTL	全文 1–508	04	AXI 事务/错误路径静态；未动态
+rtl/axi/axi_req_desc.v	RTL	全文 1–193	04	AXI 事务/错误路径静态；未动态
+rtl/back2/b2_csr.v	RTL	全文 1–177	02	后端直驱测试桩，非现役 core CSR
+rtl/back2/back2_params.vh	RTL	全文 1–627	02	全文件静态；无整核动态
+rtl/back2/backend_top.v	RTL	全文 1–2818	02	01/03 接口段另读；无整核动态
+rtl/back2/iq.v	RTL	全文 1–516	02	全文件静态；无整核动态
+rtl/back2/lsq_simple.v	RTL	全文 1–1524（分三段）	03	动态仅 LQ 释放状态转移
+rtl/back2/prf.v	RTL	全文 1–99	02	全文件静态；无整核动态
+rtl/back2/rename.v	RTL	全文 1–1029	02	全文件静态；无整核动态
+rtl/back2/rob.v	RTL	全文 1–918	02	全文件静态；无整核动态
+rtl/back2/rob_wide_mem.v	RTL	全文 1–162	02；08	read_first 已修，不重报
+rtl/cache/cache_array_bram.v	RTL	全文 1–179	04；08	缓存/错误路径静态；未动态
+rtl/cache/cache_tag_array.v	RTL	全文 1–190	04	缓存/错误路径静态；未动态
+rtl/cache/l1d.v	RTL	全文 1–697	04	缓存/错误路径静态；未动态
+rtl/cache/l1i.v	RTL	全文 1–351	04	缓存/错误路径静态；未动态
+rtl/cache/mshr_simple.v	RTL	全文 1–140	04	缓存/错误路径静态；未动态
+rtl/clint/clint.v	RTL	全文 1–164	01	动态仅 MTIP 相等边界（模块级）
+rtl/csr/csr_file.v	RTL	全文 1–1127	01	PMP 自锁/TVM/time 等静态
+rtl/csr/priv_ctrl.v	RTL	全文 1–259	01	CSR/特权/翻译静态；未动态
+rtl/csr/ptw.v	RTL	全文 1–595	04	CSR/特权/翻译静态；未动态
+rtl/csr/tlb.v	RTL	全文 1–449	04	CSR/特权/翻译静态；未动态
+rtl/csr/trap_ctrl.v	RTL	全文 1–328	01	委托/EPC 静态
+rtl/decode/compressed_expand.v	RTL	全文 1–469	05	动态 5 例（C MISC-ALU/EBREAK）
+rtl/decode/dec_csr.v	RTL	全文 1–243	01	译码字段静态；抽样非穷举
+rtl/decode/dec_imm.v	RTL	全文 1–250	05	译码字段静态；抽样非穷举
+rtl/decode/decoder.v	RTL	全文 1–799	05	01 仅 700–799；动态 5 例 FP
+rtl/exec/alu.v	RTL	全文 1–143	06	执行/FPU 静态；未跑向量
+rtl/exec/bru.v	RTL	全文 1–144	06	执行/FPU 静态；未跑向量
+rtl/exec/exe_ctrl.v	RTL	全文 1–167	06	执行/FPU 静态；未跑向量
+rtl/exec/fpu.v	RTL	全文 1–572	06	SC→DS 仅接口风险，当前 top 单在飞屏蔽
+rtl/exec/fpu_add.v	RTL	部分 214–860、1491–1590	06	活跃 helper 全读；保留金标主体未读
+rtl/exec/fpu_cmp.v	RTL	全文 1–275	06	执行/FPU 静态；未跑向量
+rtl/exec/fpu_cvt.v	RTL	全文 1–595	06	执行/FPU 静态；未跑向量
+rtl/exec/fpu_div_sqrt.v	RTL	全文 1–597	06	拍数参数问题静态
+rtl/exec/fpu_fma_shared.v	RTL	全文 1–625	06	执行/FPU 静态；未跑向量
+rtl/exec/fpu_mul.v	RTL	全文 1–258	06	保留金标，非当前 FMUL 路径
+rtl/exec/fregfile.v	RTL	全文 1–86	06	f0 可写；后端 f0 归 02
+rtl/exec/mdu.v	RTL	全文 1–644	06；08；11	商余已修；行为模型非 Vivado IP；历史副本已比对
+rtl/fetch/fetch_unit.v	RTL	全文 1–489	05	高半起始为历史局限，不报当前四宽停摆
+rtl/fetch/parcel_align.v	RTL	全文 1–113	05	单宽取指/对齐静态
+rtl/fetch/pc_gen.v	RTL	全文 1–180	05	单宽取指/对齐静态
+rtl/front4/bpu_btb.v	RTL	全文 1–213	05；08	四宽前端/预测静态
+rtl/front4/bpu_gshare.v	RTL	全文 1–191	05	四宽前端/预测静态
+rtl/front4/bpu_local_hist.v	RTL	全文 1–205	05	四宽前端/预测静态
+rtl/front4/bpu_ras.v	RTL	全文 1–174	05	仅恢复深度，内容回滚未测
+rtl/front4/bpu_selector.v	RTL	全文 1–158	05	四宽前端/预测静态
+rtl/front4/front4_mem.v	RTL	全文 1–289	05；08	wrapper 与 IP 行为差异（接口）
+rtl/front4/front4_params.vh	RTL	全文 1–127	05	四宽前端/预测静态
+rtl/front4/front4_table_2lu_1upd.v	RTL	全文 1–87	05；08	四宽前端/预测静态
+rtl/front4/front4_top.v	RTL	全文 1–361	05	四宽前端/预测静态
+rtl/front4/ifetch4.v	RTL	全文 1–900	05	fault/checkpoint/F2/反压静态
+rtl/front4/pc_gen4.v	RTL	全文 1–134	05	四宽前端/预测静态
+rtl/front4/predictor_top.v	RTL	全文 1–564	05	四宽前端/预测静态
+rtl/mem/amo_unit.v	RTL	全文 1–233	04	访存/PMP 静态；未动态
+rtl/mem/cmo_unit.v	RTL	全文 1–128	04	访存/PMP 静态；未动态
+rtl/mem/lsu.v	RTL	全文 1–572	04	访存/PMP 静态；未动态
+rtl/mem/mmio_route.v	RTL	全文 1–174	01；04	窗口截获静态，最终 top 门控未读全
+rtl/mem/pmp_check.v	RTL	全文 1–476	01	04 仅检索权限段
+rtl/pkg/core_params.vh	RTL	全文 1–260	08	参数/编码定义静态
+rtl/pkg/rv32_defs.vh	RTL	全文 1–646	08	参数/编码定义静态
+rtl/plic/plic.v	RTL	全文 1–443	01	gateway/threshold 静态
+rtl/top/core_top.v	RTL	全文 1–4226	08	01 接口抽查；08 全文；无动态
+rtl/top/core_top_2b.v	RTL	全文 1–1749	03	01/04 接口抽查
+scripts/env.sh	回归入口	全文 1–198	07	环境变量/工具选择静态
+scripts/regress.sh	回归入口	全文 1–321	07	默认 SKIP 可 rc0；编译降级条件过宽
+sim/arch_test/boot_stub.S	单元测试程序	全文 1–23	10	占位启动，非完整固件
+sim/arch_test/dm_csr_raw.S	单元测试程序	全文 1–115	10	距离 2/3 未重新换值，部分被前组遮蔽
+sim/arch_test/dm_htif.S	单元测试程序	全文 1–71	10	HTIF 窄用例
+sim/arch_test/dm_smoke.S	单元测试程序	全文 1–92	10	冒烟用例
+sim/arch_test/dm_sv32_fetch.S	单元测试程序	全文 1–144	10	Sv32 取指窄用例
+sim/arch_test/exclude.list	架构测试配置	全文 1–173	07	排除 Misalign/ExceptionsSv 族，不得外推全绿
+sim/arch_test/link.ld	链接脚本	全文 1–109	10	固定 boot/TEST_BASE；有 RAM 范围与 tohost 断言
+sim/arch_test/run.sh	架构测试入口	全文 1–868	07	长度/超时/签名约束有效；缺 regress 同级 FAIL/PASS 唯一过滤
+sim/arch_test/rv32gc-2a.yaml	架构测试配置	全文 1–90	10	人工维护；非完整 ACT4 UDB 约束
+sim/arch_test/rvmodel_macros.h	架构测试配置	全文 1–184	10	PLIC M/S 偏移与现役译码不符（10 P2）；外部中断默认不跑
+sim/arch_test/rvtest_config.h	架构测试配置	全文 1–92	10	进入实际编译；与 RTL 差异归 01
+sim/arch_test/sail.json	架构测试配置	全文 1–53	10	中断发生器标 supported 但未建模
+sim/arch_test/test_config.yaml	架构测试配置	全文 1–63	10	非 runner 单一真源；改字段可能静默不生效
+sim/lockstep/cmp_commit.py	锁步	全文 1–335	07	只比 PC/整数写回；缺 store/CSR/FP 状态
+sim/lockstep/prog/csr_hazard.S	单元测试程序	全文 1–87	10	保留 CSR 间隔，紧邻例在单独入口
+sim/lockstep/prog/link.ld	链接脚本	全文 1–40	10	无 MEMORY 范围约束；当前两程序无栈
+sim/lockstep/prog/lock_hello.S	单元测试程序	全文 1–171	10	主动保留 CSR 间隔；压缩/计数器/浮点排除
+sim/lockstep/run.sh	锁步	全文 1–267	07	产物共用 trace/vvp/cmp；无跨运行锁
+sim/lockstep/tb_lockstep.sv	锁步	全文 1–845	09	32 位 trace；400 拍 drain；UART 只要求有写
+sim/tb/prog/m1_uart.S	单元测试程序	全文 1–80	10	M1 无 load/压缩/CSR，仅首取与 14 字符
+sim/tb/sim_mem_model.sv	共享TB/模型	全文 1–530	09	最小模型非协议 VIP；未知字节清零/恒 OKAY
+sim/tb/tb_arch_test.sv	共享TB	全文 1–860	09	DUT=2A；stub/HTIF 边界见 09
+sim/tb/tb_core_top.sv	共享TB	全文 1–498	09	M1 缩减场景；SERIAL_EN=0
+sim/tb/uart_ser_decoder.sv	共享TB/模型	全文 1–228	09	不检查停止位；不自行产生 PASS
+sim/unit/b29_wire_probe.sv	历史探针	未逐行（仅登记分类）	—	未单独审计；非当前 formal/DUT
+sim/unit/dyn_probe_back2_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_inject.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_lsqfwd.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n12_stress.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n15s_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_k1_stress.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n21b_stress.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_robcore.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_robprobe.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n28_stress.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_lsqfwd.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n29b_stress.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n4_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n4_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n4_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n4_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n4_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n6_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n6_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n6_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n6_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n6_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n7_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n7_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n7_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n7_inject.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n7_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_n7_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_r_body.inc	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_r_core.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_r_core_top.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_r_ipc.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/dyn_probe_r_lockstep.sv	历史探针/压力（非正式DUT）	未逐行（07 分类/检索）	07	不匹配正式 glob；非当前 DUT；不据名称断言已失配
+sim/unit/n12_memstress_lsq.sv	诊断/压力	全文 1–777（分两段）	03	非正式入口；部分非对齐仅打印差异
+sim/unit/n12b_unalign_fwd.sv	诊断/压力	全文 1–680	03	关闭翻译；固定响应，无乱序/旧 epoch
+sim/unit/n15s_fpstress_core.sv	诊断/压力	部分 1–180、410–584	06	非正式入口；未全读；提交比较仅 32 位
+sim/unit/n25_bp_probe.sv	历史诊断	未逐行（05 明示未读）	05	不据历史数字下结论
+sim/unit/n25_btb_collide_tb.sv	历史诊断	全文 1–222	05	历史诊断，非本轮运行
+sim/unit/n25_btb_probe.sv	历史诊断	全文 1–84	05	历史只读探针
+sim/unit/n25_collision_probe.sv	历史诊断	未逐行（05 明示未读）	05	不据历史数字下结论
+sim/unit/n4_defer_stress.sv	历史压力	未逐行（仅登记分类）	—	未单独审计；非当前 formal/DUT
+sim/unit/pkg_check.v	单元支持	未逐行（仅登记分类）	—	非正式 glob；未单独审计
+sim/unit/prog/back2_lockstep.ld	链接脚本	全文 1–27	10	两活动链接脚本同址同偏移；生成器只查前 0x1000
+sim/unit/prog/back2_lockstep_data.svh	黄金数据	生成数据：文件身份登记	07	87,071 行未逐向量重算；生成器口径见 07
+sim/unit/prog/back2_lockstep_spike.ld	链接脚本	全文 1–22	10	Spike 侧链接布局
+sim/unit/prog/back2_p10_csr.S	单元测试程序	全文 1–106	10	排除 mip/计数值
+sim/unit/prog/back2_p11_maint.S	单元测试程序	全文 1–86	10	维护路径窄场景
+sim/unit/prog/back2_p12_cbo.S	单元测试程序	全文 1–61	10	无 Spike 黄金，硬编码 TB oracle
+sim/unit/prog/back2_p13_sv32.S	单元测试程序	全文 1–172	10	补第二次 sfence 规避在途旧遍历
+sim/unit/prog/back2_p14_storepf.S	单元测试程序	全文 1–152	10	store page fault 窄场景
+sim/unit/prog/back2_p15_priv.S	单元测试程序	全文 1–141	10	无 Spike 黄金；claim 地址与现役一致
+sim/unit/prog/back2_p16_fcsr.S	单元测试程序	全文 1–121	10	补 FP/flags，无 f0
+sim/unit/prog/back2_p17_fld_fsd.S	单元测试程序	全文 1–145	10	所谓跨 4K 实为 0xFF8+4=0xFFC，未设 satp
+sim/unit/prog/back2_p1_int.S	单元测试程序	全文 1–62	10	硬编码/Spike 黄金边界见 10
+sim/unit/prog/back2_p2_branch.S	单元测试程序	全文 1–70	10	硬编码/Spike 黄金边界见 10
+sim/unit/prog/back2_p3_memcsr.S	单元测试程序	全文 1–53	10	硬编码/Spike 黄金边界见 10
+sim/unit/prog/back2_p4_fpu.S	单元测试程序	全文 1–127	10	绕过 f0/动态 rm/flags
+sim/unit/prog/back2_p5_mdu.S	单元测试程序	全文 1–90	10	硬编码黄金边界见 10
+sim/unit/prog/back2_p6_l1d.S	单元测试程序	全文 1–71	10	硬编码黄金边界见 10
+sim/unit/prog/back2_p7_trap.S	单元测试程序	全文 1–107	10	硬编码黄金边界见 10
+sim/unit/prog/back2_p8_int.S	单元测试程序	全文 1–134	10	无 Spike 黄金，硬编码 TB oracle
+sim/unit/prog/back2_p9_trapvec.S	单元测试程序	全文 1–124	10	无 Spike 黄金，硬编码 TB oracle
+sim/unit/prog/boot_stub_probe.S	单元测试程序	全文 1–48	10	无栈/CSR，仅写 5 字邮箱
+sim/unit/prog/boot_stub_words.svh	黄金数据	生成字表：身份/内部一致性	10；09	未逐向量重算；非源码再生等价
+sim/unit/prog/ddr3_memtest.S	单元测试程序	全文 1–1022（分三段）	10	7 模式缩减/占位，非全 DDR 遍历
+sim/unit/prog/fp_load_use.S	单元测试程序	全文 1–116	06；10	默认档关键重叠不可达
+sim/unit/prog/front4_int.S	单元测试程序	全文 1–82	05；10	交替分支激励退化（10 P1）
+sim/unit/prog/front4_int.ld	链接脚本	全文 1–12	05；10	固定地址布局
+sim/unit/prog/front4_int_data.svh	黄金数据	抽查 1–70/286	05	未逐项核 248 PC；PC 轨迹非独立 oracle
+sim/unit/prog/gen_back2_lockstep_data.py	黄金生成器	全文 1–312	07	无终止符号/类型/64 位绑定；固定 /tmp
+sim/unit/prog/gen_front4_int_data.py	黄金生成器	全文 1–90	07	接受空 PC 日志；无 ELF 绑定
+sim/unit/tb_alu.sv	正式单元TB	全文	06	非端到端依赖流
+sim/unit/tb_axi_master_ctrl.sv	正式单元TB	全文	04	不代替核级 access fault
+sim/unit/tb_back2_ipc.sv	正式单元TB	全文	02	理想 ALU 流，未证派发全部提交
+sim/unit/tb_back2_iq.sv	正式单元TB	全文	02	7 位 ROB 配置≠集成配置
+sim/unit/tb_back2_lockstep.sv	正式单元TB	全文（联合）	02；09	理想环境前 5 程序；共模数据错误不查
+sim/unit/tb_back2_lsq_fwd.sv	正式单元TB	全文	03	非历史全部转发压力档
+sim/unit/tb_back2_rob_wide_mem.sv	正式单元TB	全文（联合）	02；07	冲突首拍/独立随机读地址偏弱
+sim/unit/tb_boot_stub.sv	正式单元TB	全文（联合）	08；09	占位 payload；常量 OKAY，无错误注入
+sim/unit/tb_bru.sv	正式单元TB	全文	06	无流水误预测恢复
+sim/unit/tb_clint.sv	正式单元TB	全文	01	恒零 AXI 证明无效；相等 oracle 反向
+sim/unit/tb_core_top_2b.sv	正式单元TB	全文	03	硬编码 oracle；gold+delta；无独立黄金
+sim/unit/tb_csr_file.sv	正式单元TB	全文	01	不代表串行化/同拍竞争；PMP 锁期望反向
+sim/unit/tb_decoder.sv	正式单元TB	全文	05	抽样非编码穷举
+sim/unit/tb_exe_ctrl.sv	正式单元TB	全文	06	无整流水依赖交互
+sim/unit/tb_fetch_unit.sv	正式单元TB	全文	05	翻译/存储由夹具驱动
+sim/unit/tb_fp_load_use.sv	正式单元TB	全文（联合）	06；09	默认档不保证关键重叠场景
+sim/unit/tb_fpu.sv	正式单元TB	全文	06	固化向量；done 拍/动态 frm 断言弱
+sim/unit/tb_fpu_cmp_cvt.sv	正式单元TB	全文（联合）	06；09	有限固化 oracle，非全部输入
+sim/unit/tb_fregfile.sv	正式单元TB	全文	06	非多提交口 FP 通路
+sim/unit/tb_front4_frontend.sv	正式单元TB	全文	05	不证明持续 4 宽吞吐
+sim/unit/tb_front4_integration.sv	正式单元TB	全文（联合）	05；07	只比 lane PC，不比指令位/长度
+sim/unit/tb_front4_predictor.sv	正式单元TB	全文	05	固定种子，非随机穷举
+sim/unit/tb_l1d.sv	正式单元TB	全文	04	fill 模型不证核级错误响应
+sim/unit/tb_l1i.sv	正式单元TB	全文	04	不代替翻译取指整链
+sim/unit/tb_lsu.sv	正式单元TB	全文	04	组合接口≠2B LSQ 异常链
+sim/unit/tb_m3_ddr3.sv	正式单元TB	全文（联合）	08；09	缩小窗口；常量 OKAY；无中断边界
+sim/unit/tb_mdu.sv	正式单元TB	全文	06	行为模型；done 拍/flush 断言弱
+sim/unit/tb_parcel_align.sv	正式单元TB	全文	05	独立组合单元，非完整取指流
+sim/unit/tb_pc_gen.sv	正式单元TB	全文	05	不证明整个前后端恢复
+sim/unit/tb_plic.sv	正式单元TB	全文	01	恒零 AXI；threshold oracle 反向
+sim/unit/tb_pmp_check.sv	正式单元TB	全文	01	不等于 PTW/LSQ 集成全组合
+sim/unit/tb_ptw.sv	正式单元TB	全文	04	显式 SVADE=0；无 PTW→TLB→store 连测
+sim/unit/tb_trap_ctrl.sv	正式单元TB	全文	01	输入直驱，非 ROB 精确陷阱全链
+sw/boot/boot_stub.S	板级构建/验证	全文 1–184	11	板级验证链静态；未执行构建/烧录/真板
+sw/boot/boot_stub.ld	板级构建/验证	全文 1–50	11	板级验证链静态；未执行构建/烧录/真板
+sw/boot/build_opensbi_rv32.sh	板级构建/验证	全文 1–262	11	板级验证链静态；未执行构建/烧录/真板
+sw/boot/build_spi_image.sh	板级构建/验证	全文 1–443	11	板级验证链静态；未执行构建/烧录/真板
+sw/boot/check_stub_layout.sh	板级构建/验证	全文 1–417	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/build.sh	板级构建/验证	全文 1–497	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/m5_board.S	板级构建/验证	全文 1–1027	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/confreg_axi_filter.v	板级构建/验证	全文 1–608	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ctrl/build_ctrl.sh	板级构建/验证	全文 1–63	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ctrl/ct_delay_probe.S	板级构建/验证	全文 1–150	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ctrl/ct_selftest.S	板级构建/验证	全文 1–202	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ctrl/diff_equiv.py	板级构建/验证	全文 1–86	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ctrl/make_scaled.py	板级构建/验证	全文 1–73	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ip/mdu_ipfix.v	板级构建/验证	全文 1–644	11	历史修复/反证副本；非当前 DUT；SHA256 已比对
+sw/m5_board/tb/ip/mdu_prefix_ref.v	板级构建/验证	全文 1–626	11	历史修复/反证副本；非当前 DUT；SHA256 已比对
+sw/m5_board/tb/ip/run_ip_div_xsim.sh	板级构建/验证	全文 1–93	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ip/run_mdu_ip_xsim.sh	板级构建/验证	全文 1–109	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ip/tb_ip_div.v	板级构建/验证	全文 1–125	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/ip/tb_mdu_ip.v	板级构建/验证	全文 1–123	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/make_oldrtl_overlay.sh	板级构建/验证	全文 1–75	11	当前树+68ff5fd 两文件的混合注入，非整旧版本
+sw/m5_board/tb/run_diag_matrix.sh	板级构建/验证	全文 1–172	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/run_tb.sh	板级构建/验证	全文 1–128	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/tb/tb_m5_board.sv	板级构建/验证	全文 1–859	11	板级验证链静态；未执行构建/烧录/真板
+sw/m5_board/verify_m5.sh	板级构建/验证	全文 1–150	11	旧交付自检；锁 2026-09-21 旧 md5，非当前发布门禁

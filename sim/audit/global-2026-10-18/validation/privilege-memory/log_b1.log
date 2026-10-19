@@ -1,0 +1,4 @@
+CASE 1 B1_CTL_MTIME_T_MINUS_1 DUT mtime_target=0x0000000000000fff mtimecmp=0x0000000000001000 mtip_asserted=0/16 readback_ok=1 rb_mtime=0x0000000000000fff rb_cmp=0x0000000000001000
+CASE 1 B1_CTL_MTIME_T_MINUS_1 EXPECT (mtime >= mtimecmp) => mtip=1 every cycle; case_mode=control exp_mtip=0
+CASE 1 B1_CTL_MTIME_T_MINUS_1 RESULT=CONTROL_OK
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/privilege-memory/tb_clint_edge.sv:126: $finish called at 276000 (1ps)

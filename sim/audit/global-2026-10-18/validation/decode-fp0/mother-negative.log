@@ -1,0 +1,8 @@
+FIXTURE runner sync: OK (2/2 byte-identical)
+NEGATIVE empty-manifest: PASS (rc!=0, 0/24, missing listed, no 24/24)
+NEGATIVE missing-one: PASS (rc!=0, only run_f10.sh missing, no case executed)
+NEGATIVE bad-ref-anchor: PASS (rc!=0 on missing/mismatched REF_CHECK anchor)
+NEGATIVE bad-ref-exit: PASS (rc!=0 on ref_calc rc=1)
+NEGATIVE bad-args: PASS (kind/mode/range/canonical whitelist all rejected)
+------------------------------------------------------------
+NEGATIVE: 5/5

@@ -1,0 +1,4 @@
+CASE 6 C6_C_JR_X0_RESERVED DUT insn32=0x00000067 ill16=0 hint=0 ctl=1
+CASE 6 C6_C_JR_X0_RESERVED EXPECT insn32=0x00000067 ill16=1
+CASE 6 C6_C_JR_X0_RESERVED RESULT=DEFECT_REPRODUCED
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_compressed_audit.sv:81: $finish called at 1000 (1ps)

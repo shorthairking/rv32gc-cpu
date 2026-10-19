@@ -1,0 +1,5 @@
+CASE 1 B1_FADD_S_F0 DUT captured=1 optype=11 uop_rd=0 dst_fp=0 dst_int=0 is_fp=1 is_fpls=0 illegal=0
+CASE 1 B1_FADD_S_F0 EXPECT dst_fp=1 (rd=f0 是合法 FP 目的寄存器, 规范无 f0 抑制) insn=0x00208053
+CASE 1 B1_FADD_S_F0 E2E commit_seen=1 commit_arch_we=0 commit_rd=0 fp_prf_we_seen=0
+CASE 1 B1_FADD_S_F0 RESULT=DEFECT_REPRODUCED
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_backend_f0.sv:199: $finish called at 2055000 (1ps)

@@ -1,0 +1,4 @@
+CASE 4 C4_C_ANDI_X8_5 DUT insn32=0x0056f693 ill16=0 hint=0 ctl=0
+CASE 4 C4_C_ANDI_X8_5 EXPECT insn32=0x00547413 ill16=0
+CASE 4 C4_C_ANDI_X8_5 RESULT=DEFECT_REPRODUCED
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_compressed_audit.sv:81: $finish called at 1000 (1ps)

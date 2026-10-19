@@ -1,0 +1,7 @@
+FIXTURE runner sync: OK (2/2 byte-identical)
+NEGATIVE empty-manifest: PASS (rc!=0, 0/11, missing listed, no 11/11)
+NEGATIVE bad-ref-anchor: PASS (rc!=0 on mismatched REF_CHECK anchor)
+NEGATIVE bad-ref-exit: PASS (rc!=0 on ref_calc rc=1)
+NEGATIVE bad-args: PASS (kind/mode/range/canonical whitelist all rejected)
+------------------------------------------------------------
+NEGATIVE: 4/4

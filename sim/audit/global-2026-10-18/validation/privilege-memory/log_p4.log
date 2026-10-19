@@ -1,0 +1,4 @@
+CASE 4 P4_U_MRET DUT priv=00 captured=1 d1_illegal=0 commit_seen=1 commit_we=0 trap2_seen=0 csr_we_seen=0 xret_seen=1
+CASE 4 P4_U_MRET EXPECT priv=00 insn=0x30200073 illegal=1 trap2=1 csr_we=0 xret=0
+CASE 4 P4_U_MRET RESULT=DEFECT_REPRODUCED
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/privilege-memory/tb_priv_backend.sv:201: $finish called at 2055000 (1ps)

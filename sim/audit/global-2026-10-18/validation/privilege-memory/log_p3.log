@@ -1,0 +1,4 @@
+CASE 3 P3_CTL_M_CSRRW_MSTATUS DUT priv=11 captured=1 d1_illegal=0 commit_seen=1 commit_we=1 trap2_seen=0 csr_we_seen=1 xret_seen=0
+CASE 3 P3_CTL_M_CSRRW_MSTATUS EXPECT priv=11 insn=0x300010f3 illegal=0 trap2=0 csr_we=1 xret=0
+CASE 3 P3_CTL_M_CSRRW_MSTATUS RESULT=CONTROL_OK
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/privilege-memory/tb_priv_backend.sv:201: $finish called at 2055000 (1ps)

@@ -1,0 +1,4 @@
+CASE 1 F1_FSQRT_RS2_NZ DUT ill_instr=0 insn32=0x58100053 optype=11 fp_we=1
+CASE 1 F1_FSQRT_RS2_NZ EXPECT ill_instr=1
+CASE 1 F1_FSQRT_RS2_NZ RESULT=DEFECT_REPRODUCED
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_decoder_fp_audit.sv:83: $finish called at 1000 (1ps)

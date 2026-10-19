@@ -1,0 +1,4 @@
+CASE 2 L2_CTL_HEAD0_CMT2 DUT head=0 cmt_n=2 pre_alloc v0=1 rob0=0 v1=1 rob1=1 AFTER v0=0 v1=0
+CASE 2 L2_CTL_HEAD0_CMT2 EXPECT both LQ slots released (v0=0,v1=0); spec ages=(rob-head)%64 < 2
+CASE 2 L2_CTL_HEAD0_CMT2 RESULT=CONTROL_OK
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/privilege-memory/tb_lsq_release.sv:164: $finish called at 76000 (1ps)

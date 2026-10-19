@@ -1,0 +1,4 @@
+CASE 9 F9_CTL_FMV_W_X_RS2_0 DUT ill_instr=0 insn32=0xf0000053 optype=11 fp_we=1
+CASE 9 F9_CTL_FMV_W_X_RS2_0 EXPECT ill_instr=0
+CASE 9 F9_CTL_FMV_W_X_RS2_0 RESULT=CONTROL_OK
+/home/shorthair/dsh/rv32-cpu/rv32gc-cpu/sim/audit/global-2026-10-18/validation/decode-fp0/tb_decoder_fp_audit.sv:83: $finish called at 1000 (1ps)
