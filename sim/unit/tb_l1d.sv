@@ -84,22 +84,28 @@ module tb_l1d_top;
     logic         inval_all, clean_all, idle;
     logic [31:0]  wb_paddr_seen;      // ★ C6：clean 写回观察（地址/数据）
     logic [31:0]  wb_word2_seen;
+    // ★★ 04-07：错误通路端口（**必须显式驱动**，不得悬空；悬空 = z ⇒ 不算"无错"）
+    logic         fill_err;           // 与 fill_valid 同拍：该 beat R 响应非 OKAY
+    logic         wb_err;             // 与 wb_done 同拍：该 B 响应非 OKAY
+    logic         fill_fail, wb_fail, maint_err, cs_err, err_sticky;
 
     l1d dut (
         .clk (clk), .rst_n (rst_n),
         .cs_req (cs_req), .cs_we (cs_we), .cs_wstrb (cs_wstrb),
         .cs_paddr (cs_paddr), .cs_vaddr (cs_vaddr), .cs_wdata (cs_wdata),
         .cs_ready (cs_ready), .cs_rdata (cs_rdata), .cs_miss (cs_miss),
-        .cs_stall (cs_stall), .cs_wr_done (cs_wr_done),
+        .cs_stall (cs_stall), .cs_wr_done (cs_wr_done), .cs_err (cs_err),
         .fill_req (fill_req), .fill_paddr (fill_paddr), .fill_owner (fill_owner),
         .fill_beats (fill_beats), .fill_accepted (fill_accepted),
         .fill_valid (fill_valid), .fill_data (fill_data),
         .fill_word_idx (fill_word_idx), .fill_done (fill_done),
+        .fill_err (fill_err), .fill_fail (fill_fail),
         .wb_req (wb_req), .wb_paddr (wb_paddr), .wb_way (wb_way),
         .wb_owner (wb_owner), .wb_beats (wb_beats), .wb_accepted (wb_accepted),
         .wb_word_idx (wb_word_idx), .wb_data (wb_data), .wb_done (wb_done),
-        .wb_ready (wb_ready),
-        .inval_all (inval_all), .clean_all (clean_all), .idle (idle)
+        .wb_err (wb_err), .wb_ready (wb_ready), .wb_fail (wb_fail),
+        .inval_all (inval_all), .clean_all (clean_all), .idle (idle),
+        .maint_err (maint_err), .err_sticky (err_sticky)
     );
 
     //--------------------------------------------------------------------------
@@ -113,6 +119,7 @@ module tb_l1d_top;
             fill_word_idx = 5'h0; fill_done = 1'b0;
             wb_accepted = 1'b0; wb_word_idx = 5'h0; wb_done = 1'b0;
             inval_all = 1'b0; clean_all = 1'b0;
+            fill_err = 1'b0; wb_err = 1'b0;   // ★ 04-07：无错环境，显式驱动
             repeat (3) @(posedge clk);
             rst_n = 1'b1;
             @(posedge clk);

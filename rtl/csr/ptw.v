@@ -35,6 +35,15 @@
 //      svadu 且 ACT env 显式清 menvcfg.ADUE=0（tests/env/rvtest_setup.h:1010）；
 //      项目裁决见 06-csr-privilege.md §11 P-6（2A 取 Svade 备选方案，
 //      arch-test 的 Svade 组正是据此判定）。pte_ad_* 端口保留但恒 0。
+//  W7. **CBM 类别（acc=2'b11）= Zicbom clean/flush/inval**（2026-10，F3 MMU 包）：
+//      页权限 = load **或** store（ISA [norm:cbm_access]，Sv32 下 W⇒R ⇒ 等价 load 可读），
+//      **检查 A、不检查 D**（[norm:cbmunpermtranslate] + NOTE），异常 cause 仍按 store 类
+//      （页故障 15 / 访问故障 7）。原 acc=2'b11 的 cbo.zero 语义在本核**不可达**
+//      （Zicboz 未实现，见 rtl/pkg/rv32_defs.vh §3.11）。
+//  W8. **物理地址宽度 = 平台 32 bit，内部按 Sv32 的 34 bit 计算**（2026-10，审计 04-03）：
+//      根表基址/下级表基址/4 KiB 叶/4 MiB 叶的高位（bit[33:32]）任一非零 ⇒
+//      **原访问类型 access fault**（1/5/7），且该级 PTE 物理读**不发出**；
+//      绝不把不可达高 PA 截断别名到低地址。
 //  W6. **可中止（kill）**：外层引擎一旦放弃本笔（陷阱/xRET/fence.i/sfence.vma），
 //      本模块必须立即回 IDLE，否则 req_ready 永久为 0（PTE 响应不会再回来）⇒
 //      死锁；同拍还要压住 fill_valid（sfence 失效竞态，见端口注释）。
@@ -75,7 +84,7 @@ module ptw #(
     //--------------------------------------------------------------------------
     input  wire        req_valid,
     input  wire [31:0] req_va,
-    input  wire [1:0]  req_acc,        // 00=取指(X) 01=load(R) 10=store/AMO(W) 11=cbo.zero(W)
+    input  wire [1:0]  req_acc,        // 00=取指(X) 01=load(R) 10=store/AMO(W) 11=CBM(见 W7)
     input  wire [1:0]  req_priv,       // 有效特权级（含 MPRV/MPP 语义，来自 priv_ctrl）
     input  wire        req_sum,        // ★ SUM 有效值（仅影响页权限，**不进 PMP**）
     input  wire        req_mxr,        // ★ MXR 有效值（仅影响页权限，**不进 PMP**）
@@ -129,10 +138,23 @@ module ptw #(
     // 1. 常量
     //==========================================================================
     // ---- 访问类型编码 ----
+    //   ★ 2026-10（F3 MMU 包，审计 04-06）：2'b11 由 "cbo.zero(W)" 重新定义为
+    //     **CBM（Zicbom clean/flush/inval）**。理由：
+    //       · 本核**不实现 Zicboz**（rtl/pkg/rv32_defs.vh §3.11 不定义 cbo.zero 编码，
+    //         cmo_unit 只生成 clean/flush/inval，两 top 从不驱动 2'b11）⇒ 该码原语义
+    //         在整核内**不可达**，复用不改变任何既有可达行为；
+    //       · Zicbom 的权限口径与 store 不同：ISA [norm:cbm_access]
+    //         （cmo.adoc:311-406）规定 "load **或** store 允许即可访问"，
+    //         且 [norm:cbmunpermfault] 的 NOTE 明确 **不检查 D 位**；
+    //         若沿用 store 口径会把"只读页上的 cbo.clean/flush/inval"误判为异常。
+    //     ⇒ CBM 类别在页权限上按 **load 口径**（R | MXR·X；Sv32 下 W⇒R，故
+    //       "load 或 store" 的并集恰等于 load 可读条件），A/D 上**查 A 不查 D**，
+    //       异常 cause 仍按 **store 类**（页故障 15 / 访问故障 7）。
+    //     位宽/端口不变 ⇒ 不引入接口变更。
     localparam [1:0] ACC_FETCH = 2'b00;
     localparam [1:0] ACC_LOAD  = 2'b01;
     localparam [1:0] ACC_STORE = 2'b10;
-    localparam [1:0] ACC_CBOZ  = 2'b11;   // cbo.zero 按 store 判定（06 §5.2）
+    localparam [1:0] ACC_CBM   = 2'b11;   // Zicbom clean/flush/inval（load OR store 权限）
 
     // ---- access-fault cause（W1：跟随**原访问类型**） ----
     localparam [4:0] CAUSE_INSN_AF  = `RV32GC_EXC_INSN_ACCESS_FAULT;   // 1
@@ -144,13 +166,14 @@ module ptw #(
     localparam [4:0] CAUSE_STORE_PF = `RV32GC_EXC_STORE_PAGE_FAULT;    // 15
 
     // ---- 访问类型 → access-fault cause ----
+    //   ★ CBM 同 store 类（[norm:cbmunpermfault]：翻译不允许 ⇒ store 类故障）。
     function [4:0] af_cause;
         input [1:0] acc;
         begin
             case (acc)
                 ACC_FETCH: af_cause = CAUSE_INSN_AF;
                 ACC_LOAD:  af_cause = CAUSE_LOAD_AF;
-                default:   af_cause = CAUSE_STORE_AF;  // STORE / CBO.ZERO
+                default:   af_cause = CAUSE_STORE_AF;  // STORE / CBM
             endcase
         end
     endfunction
@@ -162,17 +185,27 @@ module ptw #(
             case (acc)
                 ACC_FETCH: pf_cause = CAUSE_INSN_PF;
                 ACC_LOAD:  pf_cause = CAUSE_LOAD_PF;
-                default:   pf_cause = CAUSE_STORE_PF;  // STORE / CBO.ZERO
+                default:   pf_cause = CAUSE_STORE_PF;  // STORE / CBM
             endcase
         end
     endfunction
 
-    // ---- 是否按"写/store"判定（AMO/cbo.zero 恒按 store） ----
+    // ---- 是否按"写/store"判定 **D 位**（AMO/cbo.zero 恒按 store） ----
     //   ISA NOTE：AMO 永不抛 load page fault（不可读页必然不可写）。
+    //   ★ CBM **不在**此列：cmo.adoc NOTE 明确 CBO 不检查 D 位
+    //     （"a cache-block management instruction does not check the dirty bit"）。
     function is_write_acc;
         input [1:0] acc;
         begin
-            is_write_acc = (acc == ACC_STORE) | (acc == ACC_CBOZ);
+            is_write_acc = (acc == ACC_STORE);
+        end
+    endfunction
+
+    // ---- 是否 CBM（Zicbom clean/flush/inval） ----
+    function is_cbm_acc;
+        input [1:0] acc;
+        begin
+            is_cbm_acc = (acc == ACC_CBM);
         end
     endfunction
 
@@ -240,7 +273,7 @@ module ptw #(
     reg [31:0] pa_r;           // 翻译结果
     reg        fault_r;
     reg [4:0]  fault_cause_r;
-    reg [7:0]  perm_r;         // 权限位 {G,U,X,W,R,0,0,0}
+    reg [7:0]  perm_r;         // {G,U,X,W,R,D,A,0}（D=[2] A=[1]；见 §7 fill_perm 注释）
     // ---- ★ 叶子来自哪一级：必须在 S_L1_W/S_L0_W 时**锁存**。
     //   理由：pa_leaf 在 S_AD 里被使用时，cur_is_l1 已为假（st=S_AD），
     //   直接用 cur_is_l1 会把 4 MiB 大页错当成 4 KiB 页（实测踩到）。
@@ -249,14 +282,25 @@ module ptw #(
     // ---- 各级 PTE 物理地址 ----
     //   一级：a = satp.ppn × 4KiB；pte_pa = a + VPN[1] × 4
     //   二级：a = 一级 PTE 的 PPN × 4KiB；pte_pa = a + VPN[0] × 4
-    wire [31:0] root_base   = {satp_r[21:0], 12'h000};
-    wire [31:0] l1_pte_pa   = root_base + {20'b0, va_vpn1, 2'b00};
-    wire [31:0] l0_base     = {pte_ppn_r, 12'h000};
-    wire [31:0] l0_pte_pa   = l0_base + {20'b0, va_vpn0, 2'b00};
+    //   ★ 2026-10（F3 MMU 包，审计 04-03）：**内部一律 34 bit**。
+    //     Sv32 的 PPN 是 22 bit，拼 12 bit 页内偏移后是 **34 bit 物理地址**；
+    //     本平台物理地址只有 32 bit（`rtl/pkg/core_params.vh` 的 AXI/存储器窗口全在
+    //     0x0000_0000–0xFFFF_FFFF）⇒ 34 bit 里 bit[33:32] 必须为 0。
+    //     原实现把它们在拼接时静默丢弃 ⇒ 高 PPN 的页表/叶子会被**别名到低地址**
+    //     （例如叶 PPN=22'h100001 期望 PA=0x1_0000_1000，实际得到 0x0000_1000），
+    //     访问到完全无关的对象且不报错。修法：内部保留 34 bit 直到**物理范围判定**，
+    //     任一高位非零 ⇒ 按**原访问类型**报 access fault（1/5/7），且**绝不**发出
+    //     该级 PTE 物理读（不给低地址别名访问的机会）。
+    wire [33:0] root_base   = {satp_r[21:0], 12'h000};               // 22+12 = 34 bit
+    wire [33:0] l1_pte_pa   = root_base + {{22{1'b0}}, va_vpn1, 2'b00};
+    wire [33:0] l0_base     = {pte_ppn_r, 12'h000};                  // 22+12 = 34 bit
+    wire [33:0] l0_pte_pa   = l0_base + {{22{1'b0}}, va_vpn0, 2'b00};
 
     // ---- 当前级是否一级（S_L1/S_L1_W） ----
     wire cur_is_l1 = (st == S_L1) | (st == S_L1_W);
-    wire [31:0] cur_pte_pa = cur_is_l1 ? l1_pte_pa : l0_pte_pa;
+    wire [33:0] cur_pte_pa = cur_is_l1 ? l1_pte_pa : l0_pte_pa;
+    //   平台可实现物理地址 = 32 bit ⇒ 高位必须为 0（见上）
+    wire        cur_pte_hi = |cur_pte_pa[33:32];
 
     //==========================================================================
     // 5. PTE 合法性判定（纯组合 function，W3/W4）
@@ -298,6 +342,11 @@ module ptw #(
                          (pte_ppn0(pte_q) != 10'h0);  // 4 MiB 大页要求 PPN[0]=0
 
     // ---- 页权限判定（仅此处使用 SUM/MXR：**不进 PMP 路径**，06 §3.1 末段） ----
+    //   ★ CBM（acc=2'b11）：ISA [norm:cbm_access] —— "load 指令**或** store 指令被允许
+    //     访问即可"。Sv32 下 W=1 ⇒ R=1（[pteperm] 保留 R=0,W=1 编码 ⇒ 已由
+    //     pte_reserved 拦为 page-fault），故 "R 或 W" ≡ "R"；
+    //     ⇒ CBM 的页权限条件与 load 完全相同（R | MXR·X，且 S 模式对 U=1 页仍需 SUM）。
+    //     异常 cause 仍为 store 类（见 pf_cause/af_cause）。
     function perm_ok;
         input [1:0] acc;
         input [1:0] cur_priv;
@@ -317,6 +366,7 @@ module ptw #(
                 perm_ok = u_bit & (
                     (acc == ACC_FETCH) ? x_bit :
                     (acc == ACC_LOAD ) ? (r_bit | (mxr & x_bit)) :
+                    (acc == ACC_CBM  ) ? (r_bit | (mxr & x_bit)) :   // CBM = load OR store
                                          (w_bit & r_bit) );   // store 需 W=1（AMO 同）
             end else begin
                 // ---- 有效特权级 == S ----
@@ -326,7 +376,7 @@ module ptw #(
                 end else begin
                     // S 数据访问：U=1 页需 SUM=1
                     if (u_bit & ~sum) perm_ok = 1'b0;
-                    else if (acc == ACC_LOAD) perm_ok = r_bit | (mxr & x_bit);
+                    else if ((acc == ACC_LOAD) | (acc == ACC_CBM)) perm_ok = r_bit | (mxr & x_bit);
                     else                      perm_ok = w_bit & r_bit;
                 end
             end
@@ -357,16 +407,18 @@ module ptw #(
     // ---- 二级需再走一级（指针）：pte 为指针 ⇒ 下到二级 ----
     wire need_l0 = leaf_ok & ~pte_is_leaf;
 
-    // ---- 翻译成功算出的 PA ----
+    // ---- 翻译成功算出的 PA（★ 内部 34 bit，见 §4 的物理地址宽度口径）----
     //   4 KiB 页（i=0 叶子）：pa = (pte.ppn << 12) | va.offset
-    //   4 MiB 大页（i=1 叶子）：pa = (pte.ppn[1] << 22) | va[21:0]
-    //     注意：4 MiB 大页时 va[21:12] 直接来自 VA，故用 {pte_ppn1, va[21:12], va[11:0]}
-    wire [31:0] pa_4k = {pte_ppn1(pte_q), pte_ppn0(pte_q), va_offset};
-    //   ★ 4 MiB 大页（i=1 叶子）：pa = (pte.ppn[1] << 22) | va[21:0]
-    //     其中 pte.ppn[1] = pte[31:20]（12 bit）。注意**不能**写 `{ppn1, va[21:0]}`
-    //     ——那是 34 bit 拼接，会被截断并把位错开（实测踩到：产出 0x123）。
-    wire [31:0] pa_4m = ({20'b0, pte_ppn1(pte_q)} << 22) | {10'b0, va_r[21:0]};
-    wire [31:0] pa_leaf = leaf_from_l1 ? pa_4m : pa_4k;
+    //     = {PPN[1](12), PPN[0](10), offset(12)} —— **恰 34 bit 拼接，不截断**
+    //   4 MiB 大页（i=1 叶子）：pa = (PPN[1] << 22) | va[21:0]
+    //     = {PPN[1](12), va[21:0](22)} —— 同样**恰 34 bit**（原实现先左移进 32 bit
+    //       再或，高两位在此处就被丢掉，属于审计 04-03 的同一根因）
+    wire [33:0] pa_4k = {pte_ppn1(pte_q), pte_ppn0(pte_q), va_offset};
+    wire [33:0] pa_4m = {pte_ppn1(pte_q), va_r[21:0]};
+    wire [33:0] pa_leaf = leaf_from_l1 ? pa_4m : pa_4k;
+    //   平台物理地址 = 32 bit ⇒ 高位非零的叶子**不可达**：报原访问类型 access fault，
+    //   绝不截断后访问（审计 04-03：把不可达高 PA 别名成低 PA 才是错误）。
+    wire        pa_leaf_hi = |pa_leaf[33:32];
 
     // ---- 组合：本次 PTE 访问的 PMP 结果 ----
     //   ★ 时序口径：pmp_req_valid 在 S_L1 / S_L0（发 PTE 读的同一拍）拉高，
@@ -375,6 +427,11 @@ module ptw #(
     //     ⇒ 这保证"页表隐式访存**过** PMP"不是事后补判，而是前置拦截。
     wire pte_pmp_ok = pmp_resp_ok;
     wire pmp_block  = ~pte_pmp_ok;
+    //   ★ 2026-10（F3 MMU 包，审计 04-03）：PTE 物理地址超出平台 32 bit ⇒ 与 PMP 拒
+    //     **同口径前置拦截**：该级 PTE 读**绝不发出**，直接报原访问类型 access fault。
+    //     两者都不改变 cause 口径（af_cause(acc_r)），故可共用同一条分支。
+    wire pa_hi_block = cur_pte_hi;
+    wire pte_block   = pmp_block | pa_hi_block;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -416,8 +473,9 @@ module ptw #(
             //------------------------------------------------------------------
             // 一级页表：发 PTE 读
             S_L1: begin
-                // ★ W1 前置拦截：PMP 拒 ⇒ 不读物理内存，直接 access-fault
-                if (pmp_block) begin
+                // ★ W1/04-03 前置拦截：PMP 拒 或 PTE 物理地址超出 32 bit
+                //   ⇒ 不读物理内存（绝不产生低地址别名访问），直接 access-fault
+                if (pte_block) begin
                     fault_r       <= 1'b1;
                     fault_cause_r <= af_cause(acc_r);
                     st            <= S_DONE;
@@ -463,7 +521,8 @@ module ptw #(
             end
             //------------------------------------------------------------------
             S_L0: begin
-                if (pmp_block) begin
+                // ★ 04-03：二级 PTE 地址同样可能超出 32 bit（父指针 PPN 高位）
+                if (pte_block) begin
                     fault_r       <= 1'b1;
                     fault_cause_r <= af_cause(acc_r);
                     st            <= S_DONE;
@@ -501,7 +560,16 @@ module ptw #(
             //   架构可见行为，只决定内部走哪一支。
             //------------------------------------------------------------------
             S_AD: begin
-                if (!perm_granted) begin
+                if (pa_leaf_hi) begin
+                    // ★ 04-03：叶子算出的 PA 超出平台 32 bit ⇒ **原访问类型 access fault**，
+                    //   绝不截断成低地址后"成功"（截断会访问无关对象且不报错）。
+                    //   判定放在权限之后、A/D 之前：权限不足仍是 page-fault（ISA 步骤 8
+                    //   先于步骤 9），而物理不可达属于物理侧 ⇒ access fault。
+                    //   注：此处只可能出现在叶子级（PTE 地址本身已在前置拦截里挡住）。
+                    fault_r       <= 1'b1;
+                    fault_cause_r <= af_cause(acc_r);
+                    st            <= S_DONE;
+                end else if (!perm_granted) begin
                     fault_r       <= 1'b1;
                     fault_cause_r <= pf_cause(acc_r);
                     st            <= S_DONE;
@@ -514,14 +582,20 @@ module ptw #(
                 end else if (ad_missing) begin
                     // ---- SVADE=0：硬件原子更新通路（外层写回后回 pte_ad_done）----
                     if (pte_ad_done) begin
-                        pa_r  <= pa_leaf;
-                        perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb, 3'b000};
+                        pa_r  <= pa_leaf[31:0];
+                        //   ★ F3 MMU 包（审计 04-01/04-06）：TLB 现在会复核 A/D，
+                        //     故这里必须填**更新后**的 A/D（A=1；写访问时 D=1），
+                        //     不能用 pte_q 的旧值——否则新填表项 A=0，
+                        //     下一次 TLB 命中会被误判为 page fault。
+                        perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb,
+                                   (pte_db | acc_is_write), 1'b1, 1'b0}; // {G,U,X,W,R,D,A=1,0}
                         st    <= S_DONE;
                     end
                     // 否则停在 S_AD 等 pte_ad_done / pte_ad_update 握手
                 end else begin
-                    pa_r  <= pa_leaf;
-                    perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb, 3'b000};
+                    pa_r  <= pa_leaf[31:0];
+                    perm_r <= {pte_gb, pte_ub, pte_xb, pte_wb, pte_rb,
+                               pte_db, pte_ab, 1'b0};
                     st    <= S_DONE;
                 end
             end
@@ -537,9 +611,12 @@ module ptw #(
     //==========================================================================
     assign req_ready = (st == S_IDLE) & ~kill;
 
-    // ---- PTE 读请求：只在 S_L1 / S_L0 拉高，且 **PMP 未拒**（W1 前置拦截） ----
-    assign pte_req_valid = ((st == S_L1) | (st == S_L0)) & ~pmp_block;
-    assign pte_req_pa    = cur_pte_pa;
+    // ---- PTE 读请求：只在 S_L1 / S_L0 拉高，且 **PMP 未拒 且 地址在平台范围内**
+    //      （W1 + 04-03 前置拦截）----
+    assign pte_req_valid = ((st == S_L1) | (st == S_L0)) & ~pte_block;
+    //   ★ 端口是 32 bit（平台物理地址宽度）⇒ 只有**已证明高位为 0**时才驱动；
+    //     高位非零的拍 pte_req_valid 恒 0，故低位取值不可观察（不给别名访问机会）。
+    assign pte_req_pa    = cur_pte_pa[31:0];
 
     // ---- ★ W1：PMP 检查请求（每次 PTE 读都发；**权限口径恒为 LOAD**） ----
     //   地址 = PTE 物理地址；**权限口径 = LOAD（R）**；特权级 = 有效特权级。
@@ -554,8 +631,10 @@ module ptw #(
     //     "取指"一项各少一条 instruction access fault（DUT 少记 1 条 trap 签名，
     //     其后所有签名整体偏移）。
     //   ★ SUM/MXR **不进 PMP 路径**（06 §3.1 末段）⇒ 这两个信号不出现在本端口。
-    assign pmp_req_valid = (st == S_L1) | (st == S_L0);
-    assign pmp_req_addr  = cur_pte_pa;
+    //   ★ 04-03：高位非零时**不发 PMP 请求**（该拍已直接判 access fault；
+    //     让 pmp_check 看到一个截断地址会掩盖"物理不可达"这一根因）。
+    assign pmp_req_valid = ((st == S_L1) | (st == S_L0)) & ~pa_hi_block;
+    assign pmp_req_addr  = cur_pte_pa[31:0];
     assign pmp_req_acc   = ACC_LOAD;   // ★ 固定 LOAD（Spike 同口径；cause 仍随 acc_r）
     assign pmp_req_priv  = priv_r;
 
@@ -565,7 +644,8 @@ module ptw #(
     assign pte_ad_update = (SVADE == 0) & (st == S_AD) & ad_missing;
     //   pte_ad_pa = 需要更新的那个 PTE 的物理地址（二级叶子 ⇒ l0_pte_pa；
     //   一级叶子（4 MiB 大页）⇒ l1_pte_pa，由 cur_is_l1 选择）
-    assign pte_ad_pa     = (st == S_AD) ? (cur_is_l1 ? l1_pte_pa : l0_pte_pa) : 32'h0;
+    assign pte_ad_pa     = (st == S_AD) ? (cur_is_l1 ? l1_pte_pa[31:0]
+                                                      : l0_pte_pa[31:0]) : 32'h0;
     //   pte_ad_data = 置 A（写访问时同时置 D）后的 PTE 值
     assign pte_ad_data   = pte_q | (32'h1 << `RV32GC_PTE_A_BIT) |
                            (acc_is_write ? (32'h1 << `RV32GC_PTE_D_BIT) : 32'h0);
@@ -589,7 +669,16 @@ module ptw #(
     //     `{ppn, off}` 拼 34 bit 后截断 ⇒ ppn[21:20]≠0 的页（PA ≥ 0x4000_0000，
     //     **本平台 RAM 全在此区间**）PA 被整体错位（实测：VA 0x4000_00a4 ⇒
     //     TLB 给出 PA 0x0000_00a4，取指打到未登记区 ⇒ DECERR/cause 1）。
+    //   ★ 04-03 后 pa_r 只可能是**平台内**地址（高位非零已在 S_AD 报 access fault
+    //     ⇒ 不产生 fill），故 PA[31:12] 是完整页号，无截断歧义。
     assign fill_ppn   = {2'b00, pa_r[31:12]};
+    //   ★ 2026-10（F3 MMU 包，审计 04-01/04-06）：fill_perm 的保留位改为携带 **A/D**：
+    //       fill_perm = {G(7), U(6), X(5), W(4), R(3), D(2), A(1), 1'b0(0)}
+    //     理由：TLB 命中路径**不再经过 PTW**，若 TLB 不保存 A/D，则
+    //       · load 填表（A=1,D=0）后同 VA 的 store 命中 TLB ⇒ 漏掉 Svade 的 D 检查
+    //         （审计 04-01：应 page fault 且不得写）；
+    //       · CBM 命中路径也无法检查 A（[norm:cbmunpermtranslate]）。
+    //     ⇒ 由 TLB 在命中拍按当前访问类型复核（见 tlb.v §4）。位宽不变（8 bit）。
     assign fill_perm  = perm_r;
 
 endmodule

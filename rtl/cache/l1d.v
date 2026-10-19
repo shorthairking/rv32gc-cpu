@@ -64,6 +64,9 @@ module l1d #(
     output wire                 cs_miss,      // 未命中（含在途）
     output wire                 cs_stall,     // 需停顿（缺失/写回在途）
     output wire                 cs_wr_done,   // 写命中当拍完成（store 可提交）
+    // ★★ 04-07：本笔挂起访问**失败**（单拍，与失败完成同拍）。失败时 cs_rdata 不可
+    //   采信：调用方（LSU）必须以原访问类型的 access fault 终结该笔，不得提交数据。
+    output wire                 cs_err,
 
     //------------------------------------------------------------------
     // MSHR / AXI 控制器 <-> L1D
@@ -77,6 +80,13 @@ module l1d #(
     input  wire [31:0]          fill_data,
     input  wire [4:0]           fill_word_idx,
     input  wire                 fill_done,
+    // ★★ 04-07：**与 fill_valid 同拍**的"该 beat 的 R 响应非 OKAY"（逐 beat 对齐，
+    //   由 axi_master_ctrl 的 rdata_error 直接驱动）。模块内从 fill_take 起累计，
+    //   fill_done 拍连同当拍一起结算 ⇒ 早/中/末 beat 错误都不漏。
+    //   caller 必须**显式驱动**（不得悬空；本包不改两 top，集成接线由母单点完成）。
+    input  wire                 fill_err,
+    // 失败完成：与 fill_done 同拍的单拍脉冲（事务级累计错）。
+    output wire                 fill_fail,
 
     // ---- 脏行写回 ----
     output wire                 wb_req,       // 需要一笔脏行写回
@@ -87,15 +97,27 @@ module l1d #(
     input  wire                 wb_accepted,  // 控制器接受
     input  wire [4:0]           wb_word_idx,  // 本 beat 取行缓冲的哪一字
     output wire [31:0]          wb_data,      // 写回 beat 数据
-    input  wire                 wb_done,      // 写回完成（最后一拍）
+    input  wire                 wb_done,
+    // ★★ 04-07：wb_done 语义 = "**B 响应已收到**（成功或失败）"，不再是"最后一拍 W
+    //   发出"。wb_err 与 wb_done **同拍**：1 = 该 B 为非 OKAY。仅 (wb_done & ~wb_err)
+    //   才允许清 dirty / 腾路 / 进填充；(wb_done & wb_err) ⇒ 中止，脏数据**保留**。
+    input  wire                 wb_err,
     output wire                 wb_ready,     // 本拍可接收写回数据（MS_WB_BUS 阶段）
+    // 失败完成：写回（含维护扫描发起的写回）失败的单拍脉冲；脏行仍保留。
+    output wire                 wb_fail,
 
     //------------------------------------------------------------------
     // 维护（cbo.clean / flush / inval）
     //------------------------------------------------------------------
     input  wire                 inval_all,    // 全部失效
     input  wire                 clean_all,    // 全部 clean（清 dirty，不失效）
-    output wire                 idle
+    output wire                 idle,
+    // ★★ 04-07：维护扫描**失败完成**。`idle` 只表示"扫描已停下"，无法区分"全部脏行
+    //   成功写回"与"某路写回失败后中止" ⇒ 调用方（cmo/lsu）会把失败的 clean/flush
+    //   当成功。故新增：`maint_err`（与扫描结束同拍的单拍脉冲）+ `err_sticky`
+    //   （电平，任一失败置位、inval_all 清；诊断/告警用，不阻断后续重试装行）。
+    output wire                 maint_err,
+    output wire                 err_sticky
 );
     //--------------------------------------------------------------------------
     // 1. 派生常量
@@ -179,11 +201,15 @@ module l1d #(
     reg [WAY_W-1:0]        wb_way_q;        // 写回源路
     reg [LINE_BYTES*8-1:0] wb_buf_q;        // 写回行缓冲（8 字）
     reg [WIDX_BITS:0]      cap_rd_q;        // 抓行读地址（0..WORDS，需多 1 位存 WORDS）
+    reg [WIDX_BITS-1:0]    cap_wr_q;        // 抓行**写**指针（0..7，防有符号回绕丢字）
     reg [SETS-1:0]         plru_l0_q;       // PLRU 树根方向位
     reg [SETS-1:0]         plru_l1a_q;      // PLRU 左子树方向位
     reg [SETS-1:0]         plru_l1b_q;      // PLRU 右子树方向位
     // 抓行阶段的读地址（受害者路的行内逐字读）
     reg [DATA_ADDR_W-1:0]  cap_raddr_q;
+    // ---- ★★ 04-07 错误状态 ----
+    reg                    fill_err_acc_q;  // 本笔填充事务内曾收到非 OKAY 的 R beat
+    reg                    err_sticky_q;    // 曾发生总线错误（电平；inval_all 清）
 
     //--------------------------------------------------------------------------
     // 4. 命中判定（4 路；tag 与 data 同步读，S0 末同拍有效）
@@ -275,19 +301,44 @@ module l1d #(
     wire fill_take   = fill_go & fill_accepted;
     wire fill_finish = fill_active_q & fill_valid & fill_done;
 
+    // ★★ 04-07：**事务级**填充错误累计（不是"末 beat 才看"）。
+    //   fill_err 与 fill_valid 同拍（由 axi_master_ctrl.rdata_error 逐 beat 对齐给出）
+    //   ⇒ 早/中/末 beat 的错误都在同一笔事务里累计；fill_take 清累计器（重试是
+    //   新事务，重试成功必须能正常装行）。fill_done 拍连同当拍 fill_err 一起结算。
+    wire fill_err_beat = fill_active_q & fill_valid & fill_err;
+    wire fill_any_err  = fill_err_acc_q | fill_err_beat;
+    //   失败完成：与 fill_done 同拍（事务结束拍）给出，供调用方终结挂起的访问。
+    wire fill_fail_w   = fill_finish & fill_any_err;
+
     // 写回请求/接受握手
     // 本拍 FSM 决定写回（MS_IDLE 捕获到脏受害者缺失）⇒ 立即拉高 wb_req
-    wire wb_decide   = (ms_state_q == MS_IDLE) & missing_new & repl_dirty;
+    //   ★ ~maint_q：维护扫描有自己的写回发起路径（见 §11 维护分支），
+    //     两者不得同拍争用 wb_line_q（否则决定拍的组合描述符会指向扫描行）。
+    wire wb_decide   = (ms_state_q == MS_IDLE) & ~maint_q & missing_new & repl_dirty;
     wire wb_go       = wb_req & wb_accepted;
     // 若控制器在同一拍就接受了（决定拍），也算握手成功：进入 MS_WB_CAP 后
     // 直接开始抓行，不再等第二次 accepted。
     wire wb_take_now = wb_go;
+
+    // ★★ 04-04 修复（P0）：写回**首次** valid 必须描述**本次**受害者。
+    //   缺陷：决定拍只把 wb_line_q/wb_way_q 排到下一沿锁存，而 wb_paddr/wb_way 直接
+    //   取这两个寄存器 ⇒ 首个 wb_valid 拍（= 决定拍）输出的是**上一笔**（首次为 0）
+    //   的描述符。控制器若在该拍接受（always-ready / 0 延迟），就把本次受害者数据
+    //   写到旧地址；若接受发生在下一拍，又因决定拍没记 wb_taken_q 而可能重复握手。
+    //   修法：决定拍用**当拍组合可用**的受害者描述符（victim_tag + acc_index_q +
+    //   repl_way，与命中判定同源同拍）直接驱动 wb_paddr/wb_way；决定拍被接受时
+    //   同拍记 wb_taken_q（见 MS_IDLE 分支），此后描述符由 wb_line_q/wb_way_q 保持。
+    wire [31:0] wb_line_now = {victim_tag, acc_index_q, {OFF_BITS{1'b0}}};
 
     // 写回总线阶段完成
     // ★ 写回节拍仅在 MS_WB_BUS（推总线）阶段被接受：抓行阶段的拍必须被忽略，
     //   否则控制器提前送来的拍会被当成数据拍（本 TB 实测到 wb_finish 提前触发）。
     /**/
     wire wb_finish   = wb_ready & wb_done;
+    // ★★ 04-07：B 响应失败 ⇒ 写回**失败**（不得清 dirty / 腾路 / 进填充）。
+    //   wb_err 与 wb_done 同拍（同一 B 握手）⇒ 与 wb_finish 严格同拍。
+    wire wb_fail_w   = wb_finish & wb_err;
+    wire wb_ok_w     = wb_finish & ~wb_err;
 
     //--------------------------------------------------------------------------
     // 8. 阵列例化
@@ -314,7 +365,9 @@ module l1d #(
     //   ★ 清 dirty：**该路写回完成那一拍**用它自己的 tag 位置回写（保留 tag/valid，只清 dirty）
     //     —— 不用原来那个"整组清 dirty"的专用口：它一次清**全组 4 路**，若一组多路脏会把
     //       还没写回的路也标干净（丢数据）；逐路清则天然支持"一组多路脏、逐路写回再清"。
-    wire                  maint_wb_fin_w = (ms_state_q == MS_WB_BUS) & wb_finish & maint_wb_q;
+    wire                  maint_wb_fin_w = (ms_state_q == MS_WB_BUS) & wb_ok_w & maint_wb_q;
+    // ★★ 04-07：维护扫描的写回**失败**（B 非 OKAY）⇒ 中止扫描、保留脏行。
+    wire                  maint_wb_bad_w = (ms_state_q == MS_WB_BUS) & wb_fail_w & maint_wb_q;
     wire                  maint_dirty_clr = 1'b0;   // （原整组清 dirty 口不再使用，见上）
     wire                  cap_phase    = (ms_state_q == MS_WB_CAP) & wb_taken_q;
     // ★ 读地址用**本拍发出**的访问（rd_en 本拍），读数据下一拍到 ⇒ 与命中判定同拍。
@@ -332,6 +385,10 @@ module l1d #(
         for (gw = 0; gw < WAYS; gw = gw + 1) begin : g_way
             wire way_fill_dat = fill_active_q & fill_valid & (fill_way_q == gw[WAY_W-1:0]);
             wire way_fill_tag = fill_active_q & fill_done  & (fill_way_q == gw[WAY_W-1:0]);
+            // ★★ 04-07：错误行**不装 valid** —— 末 beat 仍改写目标路，但 valid=0/dirty=0，
+            //   把被 beat 数据污染的那一项作废（旧 tag 不会假命中）。
+            //   判据直接写进下方 `.wr_valid(way_fill_tag ? ~fill_any_err : ...)`，
+            //   不额外造一个只在注释里出现的信号（避免"声明未用"的死代码）。
             wire way_st       = st_hit & (hit_way == gw[WAY_W-1:0]);
             // ★ 维护（inval/clean）：在扫描拍对**所有路**的 maint_idx_q 组写入。
             //   必须有独立的扫描索引；用访问索引或全局电平都会误写/漏写。
@@ -358,8 +415,8 @@ module l1d #(
                                                           : acc_index_q)),
                 .wr_tag     (way_fill_tag ? fill_line_q[31 -: TAG_W]
                                           : (way_clr ? tag_rdata[gw] : acc_tag_q)),
-                // valid：inval 扫描清 0；其余（填充/store/clean）保持 1
-                .wr_valid   (way_fill_tag ? 1'b1
+                // valid：inval 扫描清 0；**填充失败**清 0（不装垃圾行）；其余保持 1
+                .wr_valid   (way_fill_tag ? ~fill_any_err
                                           : (way_maint ? 1'b0 : 1'b1)),
                 // dirty：inval/写回完成清 0；填充清 0；store 置 1
                 .wr_dirty   (way_fill_tag ? 1'b0
@@ -421,8 +478,11 @@ module l1d #(
     //     组合判断，控制器在 MS_IDLE 拍的握手会丢失（本 TB 实测到该死锁）。
     //   因此用 wb_want_q 寄存"要写回"，wb_req = (wb_want_q | 本拍决定) & ~已接受。
     assign wb_req   = (wb_want_q | wb_decide) & ~wb_taken_q;
-    assign wb_paddr = wb_line_q;
-    assign wb_way   = wb_way_q;
+    // ★★ 04-04：决定拍（尚未锁存）输出**当拍受害者**描述符；锁存后输出寄存器值。
+    //   注意 wb_decide 隐含 ms_state_q==MS_IDLE，而 MS_IDLE 下 wb_taken_q 必为 0
+    //   （离开 MS_IDLE 时清），故二者互斥、选择无歧义。
+    assign wb_paddr = wb_decide ? wb_line_now : wb_line_q;
+    assign wb_way   = wb_decide ? repl_way    : wb_way_q;
     assign wb_owner = OWNER_WRBACK;
     assign wb_beats = WORDS[4:0] - 5'd1;
     assign wb_data  = wb_data_sel;
@@ -437,6 +497,22 @@ module l1d #(
     assign fill_paddr = fill_line_q;
     assign fill_owner = OWNER_D_FILL;
     assign fill_beats = WORDS[4:0] - 5'd1;
+
+    //--------------------------------------------------------------------------
+    // 10b. ★★ 04-07：错误可见性输出
+    //--------------------------------------------------------------------------
+    //   `fill_fail`：与 fill_done 同拍的事务级失败（见 §7 的 fill_any_err）。
+    //   `cs_err`   ：失败落在**本笔挂起访问**上 ⇒ 与失败完成同拍给 LSU 的终结信号。
+    //                · 填充失败：失败行就是本笔缺失要的行（fill 只服务挂起访问）
+    //                · 写回失败：受害者脏数据未能落内存 ⇒ 该笔访问不得当作完成
+    //   `wb_fail`  ：写回（含维护扫描）失败的单拍脉冲；脏行保留。
+    //   `maint_err`：维护扫描因写回失败而**中止**的完成脉冲（区分"成功清干净"）。
+    //   `err_sticky`：任一失败置位，`inval_all` 清（诊断；不阻断后续重试装行）。
+    assign fill_fail  = fill_fail_w;
+    assign wb_fail    = wb_fail_w;
+    assign cs_err     = fill_fail_w | wb_fail_w;
+    assign maint_err  = maint_wb_bad_w;
+    assign err_sticky = err_sticky_q;
 
     //--------------------------------------------------------------------------
     // 11. 时序：显式 FSM + 数据通路寄存器
@@ -474,11 +550,16 @@ module l1d #(
             wb_way_q      <= {WAY_W{1'b0}};
             wb_buf_q      <= {(LINE_BYTES*8){1'b0}};
             cap_rd_q      <= {(WIDX_BITS+1){1'b0}};
+            cap_wr_q      <= {WIDX_BITS{1'b0}};
+            fill_err_acc_q<= 1'b0;
+            err_sticky_q  <= 1'b0;
             plru_l0_q     <= {SETS{1'b0}};
             plru_l1a_q    <= {SETS{1'b0}};
             plru_l1b_q    <= {SETS{1'b0}};
         end else if ((inval_all | clean_all) & ~maint_q) begin
             // 启动全阵列维护扫描（逐组进行；完成后自动退出并清 PLRU）
+            // ★ 04-07：`inval_all` 是 `err_sticky_q` 的**唯一清零条件**（诊断电平）
+            if (inval_all) err_sticky_q <= 1'b0;
             maint_q       <= 1'b1;
             maint_clean_q <= clean_all;                // ★ clean/flush 都要"读 tag + 写回"
             maint_flush_q <= clean_all & inval_all;    // ★ flush = clean + inval
@@ -493,6 +574,8 @@ module l1d #(
             wb_taken_q    <= 1'b0;
             wb_want_q     <= 1'b0;
             cap_rd_q      <= {(WIDX_BITS+1){1'b0}};
+            //   ★ 04-07：`err_sticky_q` **只由 inval_all 清**（见本分支开头条件与下方
+            //     inval 分支），维护扫描启动不清 ⇒ 上一轮失败诊断不会在新一轮被静默抹掉。
         //   ★★ 注意：维护扫描只在**写回 FSM 空闲**时推进（`ms_state_q == MS_IDLE`）——
         //     维护发起的写回要复用 `MS_WB_CAP/MS_WB_BUS` 两态，而这两态的推进在下面
         //     `case (ms_state_q)` 里 ⇒ 若扫描分支无条件抢占，写回永不推进（实测：
@@ -529,6 +612,7 @@ module l1d #(
                 wb_way_q     <= maint_way_w;
                 wb_taken_q   <= 1'b0;
                 cap_rd_q     <= {(WIDX_BITS+1){1'b0}};
+                cap_wr_q     <= {WIDX_BITS{1'b0}};
                 ms_state_q   <= MS_WB_CAP;      // 抓行（读该路整行）→ 推总线
             end else begin
                 // ---- 本组已无脏路 ⇒ 本拍完成该组（清 dirty 或 flush 失效）并前进 ----
@@ -581,8 +665,12 @@ module l1d #(
                             //   虚拟地址，L1D 索引与页偏移对齐 ⇒ 与物理地址同页等价）。
                             ms_state_q <= MS_WB_CAP;
                             wb_want_q  <= 1'b1;
-                            wb_line_q  <= {victim_tag, acc_index_q, {OFF_BITS{1'b0}}};
+                            wb_line_q  <= wb_line_now;
                             wb_way_q   <= repl_way;
+                            // ★★ 04-04：决定拍即被接受（0 延迟 accepted）⇒ 同拍记握手，
+                            //   否则 MS_WB_CAP 会再等一次 accepted（重复握手/卡死）。
+                            //   wb_go 已在 wb_req 里含 wb_decide ⇒ 同拍 valid&&ready。
+                            if (wb_go) wb_taken_q <= 1'b1;
                             // 本笔待填行（= 发起请求的行），跨写回保持
                             pend_line_q<= {acc_paddr_q[31:OFF_BITS], {OFF_BITS{1'b0}}};
                             cap_rd_q   <= {(WIDX_BITS+1){1'b0}};
@@ -604,29 +692,49 @@ module l1d #(
                     if (wb_taken_q) begin
                         // ★ 时序：cap_phase 变高的**首拍**只是把读地址 0 送进阵列，
                         //   其数据要到下一拍才到；因此首拍不装配，从第二拍起把
-                        //   (cap_rd_q-1) 对应的字写入行缓冲。
+                        //   上一拍地址对应的字写入行缓冲。
                         // 地址 0..7 逐拍发出；每拍装配上一拍地址对应的数据。
                         // 需要 9 拍（cap_rd_q 从 0 走到 8）才能把 word 7 也装配好。
+                        // ★★ 数据丢失修复（8 字全数据核暴露）：原写法
+                        //   `wb_buf_q[(cap_rd_q[2:0] - 1'b1)*32 +: 32]` 在 cap_rd_q==8
+                        //   时，`0 - 1` 按**有符号 32 bit** 求值成 -1 ⇒ 下标 -32 越界，
+                        //   word 7 的写被**静默丢弃**（每次脏行写回都少最后一字）。
+                        //   改用显式 3 bit 写指针 cap_wr_q（0..7，天然无回绕）。
                         if (cap_rd_q != {WIDX_BITS{1'b0}}) begin
-                            wb_buf_q[(cap_rd_q[WIDX_BITS-1:0] - 1'b1)*32 +: 32] <= cap_word;
+                            wb_buf_q[cap_wr_q*32 +: 32] <= cap_word;
+                            cap_wr_q <= cap_wr_q + 1'b1;
                         end
                         if (cap_rd_q == WORDS[WIDX_BITS:0]) begin
                             ms_state_q <= MS_WB_BUS;
                             wb_active_q<= 1'b1;
                             cap_rd_q   <= {(WIDX_BITS+1){1'b0}};
+                            cap_wr_q   <= {WIDX_BITS{1'b0}};
                         end else begin
                             cap_rd_q   <= cap_rd_q + 1'b1;
                         end
                     end else if (wb_go) begin
                         wb_taken_q <= 1'b1;
                         cap_rd_q   <= {(WIDX_BITS+1){1'b0}};
+                        cap_wr_q   <= {WIDX_BITS{1'b0}};
                         wb_buf_q   <= {(LINE_BYTES*8){1'b0}};
                     end
                 end
 
                 // ---------------- 写回总线：逐 beat 推出 ----------------
                 MS_WB_BUS: begin
-                    if (wb_finish) begin
+                    // ★★ 04-07：wb_done = 本次 B 事务终结（成功/失败），wb_err 同拍区分。
+                    if (wb_fail_w) begin
+                        // ---- B 失败：**脏数据必须保留**，不腾路、不填充、不谎报完成 ----
+                        wb_active_q <= 1'b0;
+                        wb_taken_q  <= 1'b0;
+                        wb_want_q   <= 1'b0;
+                        // 维护扫描：中止（maint_err 已由组合输出给调用方），脏行保留
+                        if (maint_wb_q) maint_wb_q <= 1'b0;
+                        // 普通 miss 路径：该笔访问以 cs_err 终结（不回填充），
+                        // 受害者行 valid/dirty 原样保留 ⇒ 之后重试仍会再次写回。
+                        ms_state_q  <= MS_IDLE;
+                        err_sticky_q<= 1'b1;
+                    end else if (wb_ok_w) begin
                         wb_active_q <= 1'b0;
                         wb_taken_q  <= 1'b0;
                         wb_want_q   <= 1'b0;
@@ -649,15 +757,27 @@ module l1d #(
                         fill_active_q <= 1'b1;
                         fill_taken_q  <= 1'b1;
                         ms_state_q    <= MS_FILL_BUS;
+                        // ★ 04-07：新填充事务开始 ⇒ 清错误累计（重试可正常装行）
+                        fill_err_acc_q<= 1'b0;
                     end
                 end
 
                 // ---------------- 填充总线：逐 beat 收下 ----------------
                 MS_FILL_BUS: begin
+                    // ★ 04-07：逐 beat 累计 R 错误（与 fill_valid 同拍，含末 beat）
+                    if (fill_err_beat) begin
+                        fill_err_acc_q <= 1'b1;
+                        err_sticky_q   <= 1'b1;
+                    end
                     if (fill_finish) begin
                         fill_active_q <= 1'b0;
                         fill_taken_q  <= 1'b0;
                         ms_state_q    <= MS_IDLE;
+                        fill_err_acc_q<= 1'b0;
+                        // ★★ 04-07：错误行**不装 valid** —— 目标路写 valid=0/dirty=0
+                        //   （清掉被 beat 数据污染的那一项，旧 tag 不会假命中）。
+                        //   该写口由 §8 的 way_fill_tag 分支按 fill_bad 选 valid=0。
+                        if (fill_any_err) err_sticky_q <= 1'b1;
                     end
                 end
 

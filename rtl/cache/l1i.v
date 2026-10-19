@@ -68,6 +68,9 @@ module l1i #(
     output wire [31:0]          cs_rdata,      // 返回的对齐 32 bit 字
     output wire                 cs_uncached,   // 1 = XIP 旁路（走 uncached 直通）
     output wire                 cs_miss,       // 1 = 未命中（含在途填充）
+    // ★★ 04-07：本笔挂起取指**失败**（单拍，与失败完成同拍）。失败时 cs_rdata 不可
+    //   采信：调用方必须以 instruction access fault 终结该笔，不得用该数据。
+    output wire                 cs_err,
 
     //------------------------------------------------------------------
     // MSHR / AXI 控制器 <-> L1I
@@ -81,12 +84,19 @@ module l1i #(
     input  wire [31:0]          fill_data,     // 回填 beat 数据
     input  wire [4:0]           fill_word_idx, // 本 beat 行内字序号（0..7）
     input  wire                 fill_done,     // 最后一 beat 已收（mshr done）
+    // ★★ 04-07：**与 fill_valid 同拍**的"该 beat 的 R 响应非 OKAY"（逐 beat 对齐，
+    //   由 axi_master_ctrl 的 rdata_error 直接驱动）。caller 必须显式驱动。
+    input  wire                 fill_err,
+    // 失败完成：与 fill_done 同拍的单拍脉冲（事务级累计错）；错误行**不装 valid**。
+    output wire                 fill_fail,
 
     //------------------------------------------------------------------
     // 维护
     //------------------------------------------------------------------
     input  wire                 inval_all,     // 整体失效（fence.i / cbo.inval）
-    output wire                 idle           // 无在途事务
+    output wire                 idle,          // 无在途事务
+    // ★★ 04-07：总线错误曾发生（电平；inval_all 清）。诊断用，不阻断重试装行。
+    output wire                 err_sticky
 );
     //--------------------------------------------------------------------------
     // 1. 派生常量
@@ -137,6 +147,25 @@ module l1i #(
     reg [INDEX_BITS-1:0] va_index_q; // 该笔访问的组索引（伪 LRU 更新用）
     reg [31:0]       cs_paddr_q;     // 该笔访问的物理地址（填充行基址来源）
     reg              fill_done_q;    // ★ 填充收尾拍：阵列同址被写 ⇒ 读数据需再取一拍
+    // ---- ★★ 04-07 错误状态 ----
+    reg              fill_err_acc_q; // 本笔填充事务内曾收到非 OKAY 的 R beat
+    reg              err_sticky_q;   // 曾发生总线错误（电平；inval_all 清）
+
+    //--------------------------------------------------------------------------
+    // 4.2 ★★ 04-07：填充错误（事务级累计）—— 必须在 §5 generate 之前声明，
+    //     因为填充落 tag 的 valid 由 `fill_any_err` 决定（错误行不装 valid）。
+    //   fill_err 与 fill_valid **同拍**（逐 beat 对齐，来自 axi_master_ctrl.rdata_error）
+    //   ⇒ 早/中/末 beat 的错误都在同一笔事务里累计；`fill_take` 清累计器（重试是
+    //   新事务）。因此"两个不同错误行交替"不会留下可命中的垃圾行。
+    //--------------------------------------------------------------------------
+    wire fill_err_beat = fill_active_q & fill_valid & fill_err;
+    wire fill_any_err  = fill_err_acc_q | fill_err_beat;
+    wire fill_finish   = fill_active_q & fill_valid & fill_done;
+    wire fill_fail_w   = fill_finish & fill_any_err;
+
+    assign fill_fail  = fill_fail_w;
+    assign cs_err     = fill_fail_w;     // I 侧：该笔挂起取指以 access fault 终结
+    assign err_sticky = err_sticky_q;
 
     //--------------------------------------------------------------------------
     // 5. Tag 阵列（每路）与数据阵列（每路）
@@ -166,11 +195,13 @@ module l1i #(
                 // 写优先级：失效 > 填充落 tag
                 // ★ inval_all 必须真正清 valid：否则 fence.i / cbo.inval 后
                 //   旧 tag 仍命中 ⇒ 取到陈旧指令（静默错）。
+                // ★★ 04-07：填充事务内有 R 错误 ⇒ 该路写 valid=0（不装垃圾行，
+                //   旧 tag 不会假命中）；重试成功后可正常装行（累计器在 fill_take 清）。
                 .wr_en      (inval_all | way_fill_tag),
                 .wr_addr    (inval_all ? va_index
                                        : fill_line_q[OFF_BITS +: INDEX_BITS]),
                 .wr_tag     (fill_tag),
-                .wr_valid   (inval_all ? 1'b0 : 1'b1),
+                .wr_valid   (inval_all ? 1'b0 : ~fill_any_err),
                 .wr_dirty   (1'b0),                  // I-Cache 无 dirty
                 .rd_en      (access),
                 .rd_addr    (va_index),
@@ -247,6 +278,7 @@ module l1i #(
     // 请求已被接受（本拍握手成功）
     wire fill_take = fill_req & fill_accepted;
 
+
     //--------------------------------------------------------------------------
     // 9. 时序：状态更新
     //    必须用 always 块：状态元件（寄存器），无法用 assign 表达。
@@ -265,6 +297,8 @@ module l1i #(
             va_index_q    <= {INDEX_BITS{1'b0}};
             cs_paddr_q    <= 32'h0;
             fill_done_q   <= 1'b0;
+            fill_err_acc_q<= 1'b0;
+            err_sticky_q  <= 1'b0;
         end else if (inval_all) begin
             // 整体失效（fence.i / cbo.inval）：同时丢弃在途访问的判定资格
             //   （失效写口刚改过阵列 ⇒ 本拍读数据不再可信，下一拍再重读）
@@ -274,6 +308,8 @@ module l1i #(
             plru_q        <= {SETS{1'b0}};
             acc_q         <= 1'b0;
             fill_done_q   <= 1'b1;
+            fill_err_acc_q<= 1'b0;
+            err_sticky_q  <= 1'b0;   // ★ 04-07：inval_all 是错误电平的唯一清零条件
         end else begin
             // ---- ★ 请求接受打拍：把本拍被接受的请求（连同其地址字段）锁存 ----
             //   下次判定/选路只用这组寄存器值（阵列读数据与它们同沿产生）。
@@ -297,16 +333,25 @@ module l1i #(
                 fill_line_q   <= fill_paddr;
                 fill_way_q    <= fill_way_sel;
                 miss_q        <= 1'b1;
+                fill_err_acc_q<= 1'b0;   // ★ 04-07：新事务，清上一笔的累计
+            end
+
+            // ---- ★ 04-07：逐 beat 累计 R 错误（与 fill_valid 同拍，含末 beat）----
+            if (fill_err_beat) begin
+                fill_err_acc_q <= 1'b1;
+                err_sticky_q   <= 1'b1;
             end
 
             // ---- 在途填充推进：最后一 beat 到齐 ⇒ 释放 ----
             //   同拍落 tag/valid（写口）⇒ 触发 fill_done_q 压制下一拍判定，
             //   让阵列重读一次（消除"刚填完却报 miss ⇒ 重复填充"）。
-            if (fill_active_q & fill_valid & fill_done) begin
+            if (fill_finish) begin
                 fill_active_q <= 1'b0;
                 fill_taken_q  <= 1'b0;
                 miss_q        <= 1'b0;
                 fill_done_q   <= 1'b1;
+                fill_err_acc_q<= 1'b0;
+                if (fill_any_err) err_sticky_q <= 1'b1;
             end
 
             // ---- 命中 ⇒ 清 miss ----

@@ -254,6 +254,41 @@ module rename #(
     reg  [PDW-1:0]       rb_pd_b2  [0:GRP_N-1];
     reg  [PDW-1:0]       rb_pd_b3  [0:GRP_N-1];
 
+    //==========================================================================
+    // 0.2 EXP-F2：**环绕分裂影子**（修审计 02-3）
+    //==========================================================================
+    //   缺陷：组快照按"组号 + 组内 lane **索引**前缀"组织，隐含前提 = "组内 4 条 lane 按
+    //   ROB 索引递增顺序派发"。当 tail 在 head 仍位于该组内时环绕回该组 lane 0
+    //   （`is_base` ⇒ 重写组基并清 mask），组内**旧段** [h..3]（更老的活 lane）的快照被
+    //   新世代覆盖 ⇒ 之后回滚到旧段任一存活 lane 时读到新世代状态：`undo_fhead` 偏高
+    //   （free list 多放 = 同一物理号二次分配）且 `rat_restore` 取到错段增量。
+    //   该分裂组**必然就是 head 所在组**（旧段有活 lane ⇒ head ∈ 该组，且 head lane ≥ 1），
+    //   head 只有一个 ⇒ 同一时刻最多一个组处于分裂态 ⇒ 只需**一份共享影子**保存旧段。
+    //
+    //   影子内容 = 旧段整段状态：组基 {fhead, log, RAT} + 组内 4 lane 的原始 (arn, pd)
+    //   + 旧段 dst mask + `sh_t`（新段已派发的最高 lane）。
+    //   旧/新判定：lane k 属旧段 ⟺ `k > sh_t`。活 lane 只能是"旧段 ≥ h"或"新段 ≤ sh_t"
+    //   （新段最多长到 h-1，因为 lane h..3 仍活）⇒ 判据不需要知道 head。
+    //   影子必须独立保存 (arn,pd)：新段 lane 0..t 会把组表 bank 覆盖，而旧段前缀重建
+    //   （fhead 计数与 RAT 应用）仍要用旧 lane 的原始 (arn,pd)（它们多已退休，但仍是
+    //   旧段链的一部分；注意 mask 位 <h 的退休 lane 保留 **是正确的**：组基取在旧段
+    //   首 lane 之前，前缀必须含它们）。
+    reg                  sh_val;
+    reg  [GRP_AW-1:0]    sh_grp;
+    reg  [FL_PTR_W-1:0]  sh_fhead;
+    reg  [LOG_PTR_W-1:0] sh_log;
+    reg  [SNAP_W-1:0]    sh_rat;
+    reg  [3:0]           sh_mask;
+    reg  [1:0]           sh_t;
+    reg  [ARN_W-1:0]     sh_arn [0:3];
+    reg  [PDW-1:0]       sh_pd  [0:3];
+
+    //   ★★ EXP-F2 审阅 P1：本实例**跟随**的"下一次派发索引"（= ROB tail，由 rob_snap_idx
+    //     跟随；回滚/冲刷后由本实例按同源口径改写）。折叠影子时需要它来精确判定
+    //     "哪些 lane 落在本次回滚的杀伤弧 (restore_rob_idx, tail) 内" ——
+    //     仅凭两个索引无法判定环上先后（需要 head，而 rename 拿不到 head）。
+    reg  [ROB_IDX_W-1:0] tail_q;
+
     reg  [15:0]          cnt_rst_q;
 
     reg                  rb_act;
@@ -483,6 +518,8 @@ module rename #(
     wire [FL_PTR_W*GRP_N-1:0]  grp_bf_w;      // 新组基 fhead（按组拼接）
     wire [LOG_PTR_W*GRP_N-1:0] grp_bl_w;      // 新组基 log（按组拼接）
     wire [2*GRP_N-1:0]         grp_first_w;   // 组内**首条命中 lane** 的块内位置（EXP-R1）
+    wire [2*GRP_N-1:0]         grp_max_w;     // 组内**末条命中 lane** 的块内位置（EXP-F2）
+    wire [GRP_N-1:0]           grp_split_w;   // 该组本拍发生"环绕分裂"（EXP-F2，修 02-3）
 
     generate
     for (g = 0; g < GRP_N; g = g + 1) begin : g_d1g
@@ -497,6 +534,16 @@ module rename #(
                              (hit[2] & (lane_bit[2] == 2'd0)) |
                              (hit[3] & (lane_bit[3] == 2'd0));
         wire       do_init = has & (is_base | ~rb_g_init[g]);
+        //   ★★ EXP-F2（修 02-3）：末条命中 lane 的**组内 lane 号**（= 新段前沿 sh_t 的量纲；
+        //     ★ 必须取 `lane_bit` 而不是块内位置 —— 后者是 `grp_first_w` 的量纲，两者在
+        //       块跨组/非对齐时不同值）。
+        //     分裂 = 命中 lane 0（is_base）且该组已在本世代进入过（rb_g_init=1）。
+        //     正常前进不会在旧 lane 1..3 仍活时回到 lane 0；回卷重入（rollback 到前一组
+        //     末 lane）也会命中 lane 0，此时旧段其实已死 —— 保存影子无害（死 lane 不可能
+        //     成为 squash 目标），故两类重入统一按分裂保存。
+        wire [1:0] maxlane = hit[3] ? lane_bit[3] : hit[2] ? lane_bit[2] :
+                             hit[1] ? lane_bit[1] : lane_bit[0];
+        wire       split   = do_init & is_base & rb_g_init[g];
         wire [3:0] set_b;
         assign set_b[0] = (hit[0] & (lane_bit[0] == 2'd0) & lane_need_dst[0]) |
                           (hit[1] & (lane_bit[1] == 2'd0) & lane_need_dst[1]) |
@@ -517,6 +564,8 @@ module rename #(
         assign grp_has_w [g]        = has;
         assign grp_init_w[g]        = do_init;
         assign grp_first_w[2*g +: 2] = first;
+        assign grp_max_w  [2*g +: 2] = maxlane;
+        assign grp_split_w[g]        = split;
         assign grp_mask_w[4*g +: 4] = (do_init ? 4'b0 : rb_g_ndst[g]) | set_b;
         assign grp_bf_w  [FL_PTR_W*g +: FL_PTR_W] =
                    fhead_q + {{(FL_PTR_W-3){1'b0}}, ord_d[first]};
@@ -524,6 +573,62 @@ module rename #(
                    log_wr_q + {{(LOG_PTR_W-3){1'b0}}, lg_rank[first]};
     end
     endgenerate
+
+    // ---- 1.6e EXP-F2：环绕分裂影子控制（组合，唯一真源；修 02-3）----
+    //   同一拍最多一个组分裂（lane 0 命中；块内索引连续 ⇒ 不可能两个组同时含 lane 0）。
+    wire               split_any = |grp_split_w;
+    wire [GRP_AW-1:0]  split_grp = grp_split_w[0]  ? 4'd0  : grp_split_w[1]  ? 4'd1  :
+                                   grp_split_w[2]  ? 4'd2  : grp_split_w[3]  ? 4'd3  :
+                                   grp_split_w[4]  ? 4'd4  : grp_split_w[5]  ? 4'd5  :
+                                   grp_split_w[6]  ? 4'd6  : grp_split_w[7]  ? 4'd7  :
+                                   grp_split_w[8]  ? 4'd8  : grp_split_w[9]  ? 4'd9  :
+                                   grp_split_w[10] ? 4'd10 : grp_split_w[11] ? 4'd11 :
+                                   grp_split_w[12] ? 4'd12 : grp_split_w[13] ? 4'd13 :
+                                   grp_split_w[14] ? 4'd14 : 4'd15;
+    wire [1:0]         split_max = grp_max_w[2*split_grp +: 2];
+    //   影子写数据源 = 该组**当前**表项（保存后组表才被 do_init 重建为新段基）。
+    wire [SNAP_W-1:0]  shw_rat_rd   = split_grp[0] ? rb_rat_o[split_grp[GRP_AW-1:1]]
+                                                   : rb_rat_e[split_grp[GRP_AW-1:1]];
+    wire [FL_PTR_W-1:0]  shw_fhead_rd = rb_g_fhead[split_grp];
+    wire [LOG_PTR_W-1:0] shw_log_rd   = rb_g_log  [split_grp];
+    wire [ARN_W-1:0]   shw_arn_rd [0:3];
+    wire [PDW-1:0]     shw_pd_rd  [0:3];
+    assign shw_arn_rd[0] = rb_arn_b0[split_grp];
+    assign shw_arn_rd[1] = rb_arn_b1[split_grp];
+    assign shw_arn_rd[2] = rb_arn_b2[split_grp];
+    assign shw_arn_rd[3] = rb_arn_b3[split_grp];
+    assign shw_pd_rd [0] = rb_pd_b0 [split_grp];
+    assign shw_pd_rd [1] = rb_pd_b1 [split_grp];
+    assign shw_pd_rd [2] = rb_pd_b2 [split_grp];
+    assign shw_pd_rd [3] = rb_pd_b3 [split_grp];
+    //   新段前沿维护：分裂拍取本块新段最高 lane，其余拍对该组新命中 lane 取 max。
+    wire               sh_hit     = sh_val & grp_has_w[sh_grp];
+    wire [1:0]         sh_hit_max = grp_max_w[2*sh_grp +: 2];
+    wire [1:0]         sh_t_next  = split_any ? split_max :
+                                    (sh_hit ? ((sh_hit_max > sh_t) ? sh_hit_max : sh_t) : sh_t);
+    //   ★★ EXP-F2 审阅 P1（回滚杀新段时把旧段折回组表）：影子组 4 条 lane 的 ROB 索引，
+    //     以及"是否比本次重启点更年轻（= 被本次回滚杀掉）"。环上
+    //       age(a) > age(b)  ⟺  ((a − b) mod 64) ∈ (0,32)
+    //     （两侧环距之和恒为 64 ⇒ 判据不需要知道 ROB head，也不会与 6 bit 模运算冲突）。
+    //   本拍块的"下一次派发索引"（有效 lane 自 lane0 连续 ⇒ 取最高有效 lane 的索引 +1）。
+    wire [ROB_IDX_W-1:0] dsp_next = lane_valid[3] ? (lane_ridx[3] + 1'b1) :
+                                    lane_valid[2] ? (lane_ridx[2] + 1'b1) :
+                                    lane_valid[1] ? (lane_ridx[1] + 1'b1) :
+                                                    (lane_ridx[0] + 1'b1);
+    //   本次回滚的杀伤弧长度：LANE 落在 (restore_rob_idx, tail_q) 内即"比回滚点年轻"。
+    wire [LOG_AW-1:0] tail_dlt = tail_q - restore_rob_idx[LOG_AW-1:0];
+    genvar gsh;
+    wire [LOG_AW-1:0] sh_lidx [0:3];
+    wire [LOG_AW-1:0] sh_dlt  [0:3];
+    wire              sh_kill [0:3];
+    generate
+    for (gsh = 0; gsh < 4; gsh = gsh + 1) begin : g_shk
+        assign sh_lidx[gsh] = {sh_grp, 2'b00} + gsh[LOG_AW-1:0];
+        assign sh_dlt [gsh] = sh_lidx[gsh] - restore_rob_idx[LOG_AW-1:0];
+        assign sh_kill[gsh] = (sh_dlt[gsh] != {LOG_AW{1'b0}}) & (sh_dlt[gsh] < tail_dlt);
+    end
+    endgenerate
+    wire [3:0] sh_killm = {sh_kill[3], sh_kill[2], sh_kill[1], sh_kill[0]};
 
     // ---- 1.6c EXP-R1：RAT 快照写侧（组基宽快照候选 + 每 bank 增量写口）----
     //   `blk_pre[j]` = 本块**前 j 条 lane 已应用后**的整份 RAT（j = 0..3；j=0 即当前
@@ -700,34 +805,42 @@ module rename #(
     //   ★★ D1：压缩后按 restore_rob_idx 重建该 lane 的快照（组基 + 组内前缀计数）。
     wire [GRP_AW-1:0] urst_grp  = restore_rob_idx[LOG_AW-1:2];
     wire [1:0]        urst_lane = restore_rob_idx[1:0];
-    wire [3:0]        urst_mask = rb_g_ndst[urst_grp];
+    //   ★★ EXP-F2（修 02-3）：回滚点落在**旧段**（lane > sh_t 且影子属于本组）时，
+    //     组基 / dst 掩码 / 4 bank 全部改从影子读；lane ≤ sh_t 或非影子组照旧读组表。
+    wire              urst_is_sh = sh_val & (sh_grp == urst_grp) & (urst_lane > sh_t);
+    //   本 lane 及更老 lane 的"保留"掩码（逐项清理用，见 §3.2）
+    wire [3:0]        urst_le     = (urst_lane == 2'd0) ? 4'b0001 :
+                                    (urst_lane == 2'd1) ? 4'b0011 :
+                                    (urst_lane == 2'd2) ? 4'b0111 : 4'b1111;
+    wire [3:0]        urst_mask = urst_is_sh ? sh_mask : rb_g_ndst[urst_grp];
     //   dst 前缀计数 = mask[0..k] 的 popcount（k = urst_lane）：mask[b] = 索引 4g+b 是否
     //   消耗目的寄存器。fhead(i) = 组基 + Σ_{b<=k} mask[b]（含 i 自身，见 §1.6）。
     wire [2:0]        urst_cnt  = {2'b0, urst_mask[0]}
                                 + {2'b0, (urst_mask[1] & (urst_lane != 2'd0))}
                                 + {2'b0, (urst_mask[2] &  urst_lane[1])}
                                 + {2'b0, (urst_mask[3] & (urst_lane == 2'd3))};
-    wire [LOG_PTR_W-1:0] undo_tgt_w  = rb_g_log[urst_grp] +
+    wire [LOG_PTR_W-1:0] undo_tgt_w  = (urst_is_sh ? sh_log : rb_g_log[urst_grp]) +
                                        {{(LOG_PTR_W-3){1'b0}}, urst_lane} +
                                        {{(LOG_PTR_W-1){1'b0}}, 1'b1};
-    wire [FL_PTR_W-1:0]  undo_fhead_w= rb_g_fhead[urst_grp] +
+    wire [FL_PTR_W-1:0]  undo_fhead_w= (urst_is_sh ? sh_fhead : rb_g_fhead[urst_grp]) +
                                        {{(FL_PTR_W-3){1'b0}}, urst_cnt};
 
     // ---- 1.6d EXP-R1：回滚点整份 RAT（组基快照 + 组内 lane 0..k 正向增量）----
     //   组基：按组号奇偶取 `rb_rat_e` / `rb_rat_o`（每张平面表每拍只有 1 个写口，
     //   避免"16 深 × 224 bit × 2 写口"每 FF 一个数据 mux 的 LUT 爆炸）。
-    wire [SNAP_W-1:0] urst_base = urst_grp[0] ? rb_rat_o[urst_grp[GRP_AW-1:1]]
-                                              : rb_rat_e[urst_grp[GRP_AW-1:1]];
+    wire [SNAP_W-1:0] urst_base = urst_is_sh ? sh_rat :
+                                  (urst_grp[0] ? rb_rat_o[urst_grp[GRP_AW-1:1]]
+                                               : rb_rat_e[urst_grp[GRP_AW-1:1]]);
     wire [ARN_W-1:0]  urst_arn [0:3];
     wire [PDW-1:0]    urst_pd  [0:3];
-    assign urst_arn[0] = rb_arn_b0[urst_grp];
-    assign urst_arn[1] = rb_arn_b1[urst_grp];
-    assign urst_arn[2] = rb_arn_b2[urst_grp];
-    assign urst_arn[3] = rb_arn_b3[urst_grp];
-    assign urst_pd [0] = rb_pd_b0 [urst_grp];
-    assign urst_pd [1] = rb_pd_b1 [urst_grp];
-    assign urst_pd [2] = rb_pd_b2 [urst_grp];
-    assign urst_pd [3] = rb_pd_b3 [urst_grp];
+    assign urst_arn[0] = urst_is_sh ? sh_arn[0] : rb_arn_b0[urst_grp];
+    assign urst_arn[1] = urst_is_sh ? sh_arn[1] : rb_arn_b1[urst_grp];
+    assign urst_arn[2] = urst_is_sh ? sh_arn[2] : rb_arn_b2[urst_grp];
+    assign urst_arn[3] = urst_is_sh ? sh_arn[3] : rb_arn_b3[urst_grp];
+    assign urst_pd [0] = urst_is_sh ? sh_pd [0] : rb_pd_b0 [urst_grp];
+    assign urst_pd [1] = urst_is_sh ? sh_pd [1] : rb_pd_b1 [urst_grp];
+    assign urst_pd [2] = urst_is_sh ? sh_pd [2] : rb_pd_b2 [urst_grp];
+    assign urst_pd [3] = urst_is_sh ? sh_pd [3] : rb_pd_b3 [urst_grp];
     //   组内 lane b 生效 = mask[b]（该 lane 需目的寄存器，且已派发）且 b <= urst_lane；
     //   同一 arn 被多条 lane 写过时**索引更大（更年轻）者胜** ⇒ 优先级 3 > 2 > 1 > 0。
     wire urst_app1 = urst_mask[1] & (urst_lane != 2'd0);
@@ -853,6 +966,9 @@ module rename #(
             log_wr_q  <= {LOG_PTR_W{1'b0}};
             rb_act    <= 1'b0; rb_cnt <= 9'd0; rb_head <= {FL_PTR_W{1'b0}};
             cnt_rst_q <= 16'h0;
+            sh_val    <= 1'b0; sh_grp <= {GRP_AW{1'b0}}; sh_mask <= 4'b0;
+            sh_t      <= 2'd0; sh_fhead <= {FL_PTR_W{1'b0}}; sh_log <= {LOG_PTR_W{1'b0}};
+            tail_q    <= {ROB_IDX_W{1'b0}};
             ar_used_q <= {{(NREG-ARCH_N){1'b0}}, {ARCH_N{1'b1}}};
             for (j2 = 0; j2 < ARCH_N; j2 = j2 + 1) begin
                 rat_q [j2] <= j2[PDW-1:0];
@@ -928,6 +1044,9 @@ module rename #(
                 rb_act   <= 1'b1;
                 rb_cnt   <= 9'd0;
                 rb_head  <= {FL_PTR_W{1'b0}};
+                //   ★★ EXP-F2：整机冲刷后 ROB 清空 ⇒ 所有"环绕分裂"旧段都不再可能成为
+                //     squash 目标，影子必须失效（否则新世代 lane k > sh_t 会被误判成旧段）。
+                sh_val   <= 1'b0;
             end else if (rb_act) begin
                 if (rb_cnt < NREG) begin
                     if (!ar_used_q[rb_cnt[PDW-1:0]]) begin
@@ -961,7 +1080,42 @@ module rename #(
                 //   `log_wr_q` 仍按原口径回卷到回滚点（= 已派发有效 lane 计数），
                 //   仅供 `log_wr_o` 观测端口与既有死逻辑；不影响任何功能路径。
                 log_wr_q  <= undo_tgt_w;
+                //   ★★ EXP-F2 修 02-2（逐项清理）：该组被杀的更年轻 lane（> urst_lane）
+                //     的 dst 掩码位必须清掉。bank 不必清（mask=0 ⇒ 不会被应用），
+                //     重新派发时自然覆盖。旧实现只在 do_init 清 mask ⇒ 回滚后正确路径在
+                //     同一 lane 落"不写目的"指令时陈旧位留存，随后回滚到更年轻 lane 会
+                //     多计 free-head 并把陈旧 bank（可能是 nop 的垃圾 arn/pd）应用到 RAT。
+                rb_g_ndst[urst_grp] <= rb_g_ndst[urst_grp] & urst_le;
+                //   ★★ EXP-F2 修 02-3（审阅 P1 修正）：**影子维护**。
+                //     影子成立（sh_val=1）当且仅当"分裂组的新段仍有活 lane"——因为分裂组
+                //     就是 head 所在组、且新段只能长到 h-1 ⇒ tail 被挡在该组内，其它组
+                //     不可能出现 lane0 重入。一旦回滚点**不落在新段内**（不是
+                //     `sh_grp==urst_grp && urst_lane<=sh_t`），新段整段都比它年轻、全部被杀：
+                //     旧段随即成为该组唯一/当前段 ⇒ 必须把影子**折回组表**并让影子失效。
+                //     若不折回（旧实现的错）：任何"死组重入"（其它组 lane0 重入、其旧 lane
+                //     已被更早的回滚杀掉）都会被 `split` 判为分裂，把仍活旧组的影子无条件
+                //     覆盖 ⇒ 之后回滚该旧段 lane 时 sh_grp 不匹配、只能读新段基 ⇒
+                //     fhead（free list 多放/少放）与 RAT 全错。
+                //     折回时按"比重启点更年轻"逐项清理旧段 mask 位：这些 lane 会被重新派发，
+                //     残留位会让后续回滚多计 fhead（与 02-2 同一条清理口径）。
+                if (sh_val & ~((sh_grp == urst_grp) & (urst_lane <= sh_t))) begin
+                    rb_g_fhead[sh_grp] <= sh_fhead;
+                    rb_g_log  [sh_grp] <= sh_log;
+                    rb_g_ndst [sh_grp] <= sh_mask & ~sh_killm;
+                    rb_arn_b0 [sh_grp] <= sh_arn[0];
+                    rb_arn_b1 [sh_grp] <= sh_arn[1];
+                    rb_arn_b2 [sh_grp] <= sh_arn[2];
+                    rb_arn_b3 [sh_grp] <= sh_arn[3];
+                    rb_pd_b0  [sh_grp] <= sh_pd [0];
+                    rb_pd_b1  [sh_grp] <= sh_pd [1];
+                    rb_pd_b2  [sh_grp] <= sh_pd [2];
+                    rb_pd_b3  [sh_grp] <= sh_pd [3];
+                    if (~sh_grp[0]) rb_rat_e[sh_grp[GRP_AW-1:1]] <= sh_rat;
+                    else            rb_rat_o[sh_grp[GRP_AW-1:1]] <= sh_rat;
+                    sh_val <= 1'b0;
+                end
                 if (restore_valid) ck_val[restore_id] <= 1'b0;
+                tail_q    <= restore_rob_idx + 1'b1;   // ★ 回滚后 tail = 冲刷点 + 1（ROB 语义）
                 cnt_rst_q <= cnt_rst_q + 16'd1;
             end else begin
                 //------------------------------------------------------------------
@@ -1019,9 +1173,34 @@ module rename #(
                         rb_rat_o[ck_w0_g[0] ? ck_w0_g[GRP_AW-1:1] : ck_w1_g[GRP_AW-1:1]]
                             <= ck_w0_g[0] ? ck_w0_dat : ck_w1_dat;
                     end
+                    //   ★★ EXP-F2（修 02-3）：**环绕分裂** —— 命中 lane 0 且该组已进入过
+                    //     ⇒ 组内旧段 [h..3] 仍可能有活 lane，而组表基/mask 即将被 do_init
+                    //     重建成新段（lane 0..）。在**同一拍**先把旧段整段状态搬进共享影子
+                    //     （读的是寄存器旧值 ⇒ 与组表本拍的 `<=` 写入互不干扰）。
+                    if (split_any) begin
+                        sh_val    <= 1'b1;
+                        sh_grp    <= split_grp;
+                        sh_fhead  <= shw_fhead_rd;
+                        sh_log    <= shw_log_rd;
+                        sh_rat    <= shw_rat_rd;
+                        sh_mask   <= rb_g_ndst[split_grp];
+                        sh_arn[0] <= shw_arn_rd[0];
+                        sh_arn[1] <= shw_arn_rd[1];
+                        sh_arn[2] <= shw_arn_rd[2];
+                        sh_arn[3] <= shw_arn_rd[3];
+                        sh_pd [0] <= shw_pd_rd [0];
+                        sh_pd [1] <= shw_pd_rd [1];
+                        sh_pd [2] <= shw_pd_rd [2];
+                        sh_pd [3] <= shw_pd_rd [3];
+                    end
+                    //   新段前沿：分裂拍取本块新段最高 lane；其余拍对影子组新命中 lane 取 max。
+                    //   判据 `lane k 属旧段 ⟺ k > sh_t` 对**活** lane 恒正确（见 §0.2）。
+                    sh_t <= sh_t_next;
                 end
                 log_wr_q <= log_wr_q + {{(LOG_PTR_W-3){1'b0}}, valid_n_f};   // 每条有效 lane 一条日志
                 fhead_q  <= fhead_q + {{(FL_PTR_W-3){1'b0}}, alloc_n_f};     // 仅需目的寄存器的 lane 消耗 free list
+                //   ★★ EXP-F2（审阅 P1）：跟随 ROB tail（真实派发才推进；lane 连续取最高者 +1）
+                if (|lvf) tail_q <= dsp_next;
             end
         end
     end

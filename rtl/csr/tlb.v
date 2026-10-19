@@ -16,11 +16,21 @@
 //      命中 ⇔ 有效 && (VA 的 VPN 部分相等) &&
 //              (G==1 || ASID == satp.ASID)。
 //      ⇒ G=1 的映射对所有 ASID 有效，**ASID 切换时不得失效**。
-//  L3. **sfence.vma rs1, rs2 语义**：
+//  L3. **sfence.vma rs1, rs2 语义**（2026-10 修正，审计 04-02）：
 //      rs1==x0 && rs2==x0 ⇒ 全冲刷（含 G 项）；
-//      rs1!=0 ⇒ 只失效 VA 页号匹配的项（G=1 的项**也不失效**，见 §4 注释）；
-//      rs2!=0 ⇒ 只失效 ASID 匹配的项（G=1 的项不失效）；
-//      两者都非 0 ⇒ 交集。
+//      rs1==x0 && rs2!=x0 ⇒ 只失效 ASID 匹配的项，**G=1 项保留**
+//                           （ISA [norm:sfencevmaasid_only]）；
+//      rs1!=0 && rs2==x0 ⇒ 只失效 VA 页号匹配的项，**G=1 项也失效**
+//                           （ISA [norm:sfencevmavaallasid]：按 VA 全 ASID，
+//                             该条**没有** global 例外）；
+//      rs1!=0 && rs2!=0 ⇒ VA 与 ASID 交集，G=1 项保留
+//                           （ISA [norm:sfencevmava_asid]）。
+//      ★ 判据是 rs2 的**寄存器字段**是否为 x0（端口 sfence_all_asid），
+//        不是"值是否为 0"——`sfence.vma a0, t0`（t0=0）仍属 rs2!=x0 组合，
+//        必须保留 global。
+//  L6. **A/D 位随表项保存**（2026-10 新增，审计 04-01/04-06）：命中路径不再经过 PTW，
+//      故必须由 TLB 复核：A=0 ⇒ page fault；acc==store/AMO 且 D=0 ⇒ page fault；
+//      CBM（acc=2'b11）与取指/load **不查 D**。
 //  L4. **satp 写（含 ASID 变化）不自动冲刷**：ISA 未要求，由软件显式 sfence.vma。
 //      但本模块提供 satp_asid 变化的**可选**自动失效开关
 //      （参数 `AUTO_FLUSH_ON_ASID`，默认 0 = 严格按 ISA：不自动失效）。
@@ -46,7 +56,7 @@ module tlb #(
     input  wire        lookup_valid,
     input  wire [31:0] lookup_va,
     input  wire [8:0]  lookup_asid,      // 当前 satp.ASID
-    input  wire [1:0]  lookup_acc,       // 00=取指 01=load 10=store/AMO 11=cbo.zero
+    input  wire [1:0]  lookup_acc,       // 00=取指 01=load 10=store/AMO 11=CBM(clean/flush/inval)
     input  wire [1:0]  lookup_priv,      // 有效特权级
     input  wire        lookup_sum,       // SUM 有效值（只影响页权限）
     input  wire        lookup_mxr,       // MXR 有效值（只影响页权限）
@@ -82,7 +92,7 @@ module tlb #(
     input  wire        fill_valid,
     input  wire [31:0] fill_va,
     input  wire [21:0] fill_ppn,
-    input  wire [7:0]  fill_perm,        // {G,U,X,W,R,3'b0}
+    input  wire [7:0]  fill_perm,        // {G,U,X,W,R,D,A,1'b0}：D=[2] A=[1]（见 L6）
     input  wire [8:0]  fill_asid,        // 填充时使用的 ASID（= 当时的 satp.ASID）
 
     //--------------------------------------------------------------------------
@@ -126,17 +136,23 @@ module tlb #(
     reg [8:0]         asid_i [0:ENTRIES-1];
     reg               g_bit  [0:ENTRIES-1];
     reg [21:0]        ppn    [0:ENTRIES-1];
-    reg [4:0]         perm_i [0:ENTRIES-1];   // {U,X,W,R,G?} 见下：存 {U,X,W,R,1'b0}
+    //   ★ 2026-10（审计 04-01/04-06）：A/D 随表项保存 —— 命中路径不经 PTW，必须能复核。
+    reg [4:0]         perm_i [0:ENTRIES-1];   // 存 {U,X,W,R,1'b0}（见 §4 位序陷阱）
+    reg               a_bit  [0:ENTRIES-1];   // PTE.A
+    reg               d_bit  [0:ENTRIES-1];   // PTE.D
     reg [IDX_W-1:0]   repl_ptr;               // 轮转替换指针
 
     // ---- 表项格式（与 PTW 的 fill_perm 对接） ----
-    //   fill_perm = {G,U,X,W,R,3'b000}
-    //   本模块把 G 单独存（因为匹配规则要单独用），权限存 {U,X,W,R}
+    //   fill_perm = {G,U,X,W,R,D,A,1'b0}（D=[2], A=[1], [0] 恒 0）
+    //   本模块把 G 单独存（因为匹配规则要单独用），权限存 {U,X,W,R}，A/D 各自单存。
     wire       fp_g = fill_perm[7];
     wire       fp_u = fill_perm[6];
     wire       fp_x = fill_perm[5];
     wire       fp_w = fill_perm[4];
     wire       fp_r = fill_perm[3];
+    //   位序：fill_perm = {G(7),U(6),X(5),W(4),R(3), D(2), A(1), 1'b0(0)}
+    wire       fp_d = fill_perm[2];
+    wire       fp_a = fill_perm[1];
 
     //==========================================================================
     // 3. 组合匹配（全相联：ENTRIES 路并行比较；用 generate 展开）
@@ -177,22 +193,31 @@ module tlb #(
     //   （ENTRIES=64 时 OR 树 64 项，综合为 LUT 树，不影响时序预算。）
     wire [21:0] ppn_way  [0:ENTRIES-1];
     wire [4:0]  perm_way [0:ENTRIES-1];
+    wire        a_way    [0:ENTRIES-1];
+    wire        d_way    [0:ENTRIES-1];
     generate
         for (gw = 0; gw < ENTRIES; gw = gw + 1) begin : g_sel
             assign ppn_way[gw]  = way_match[gw] ? ppn[gw]    : 22'h0;
             assign perm_way[gw] = way_match[gw] ? perm_i[gw] : 5'h0;
+            assign a_way[gw]    = way_match[gw] & a_bit[gw];
+            assign d_way[gw]    = way_match[gw] & d_bit[gw];
         end
     endgenerate
     // ---- OR 归约（因匹配路至多一条，OR 等于 mux） ----
     reg [21:0] ppn_sel;
     reg [4:0]  perm_sel;
+    reg        a_sel, d_sel;
     integer    si;
     always @(*) begin
         ppn_sel  = 22'h0;
         perm_sel = 5'h0;
+        a_sel    = 1'b0;
+        d_sel    = 1'b0;
         for (si = 0; si < ENTRIES; si = si + 1) begin
             ppn_sel  = ppn_sel  | ppn_way[si];
             perm_sel = perm_sel | perm_way[si];
+            a_sel    = a_sel    | a_way[si];
+            d_sel    = d_sel    | d_way[si];
         end
     end
 
@@ -215,10 +240,12 @@ module tlb #(
         input       w_bit;
         input       x_bit;
         begin
+            //   ★ CBM（acc=2'b11，Zicbom clean/flush/inval）的页权限 = load **或** store
+            //     （ISA [norm:cbm_access]）；Sv32 下 W=1⇒R=1，故与 load 条件相同。
             if (cur_priv == `RV32GC_PRIV_U) begin
                 tlb_perm_ok = u_bit & (
                     (acc == 2'b00) ? x_bit :
-                    (acc == 2'b01) ? (r_bit | (mxr & x_bit)) :
+                    ((acc == 2'b01) | (acc == 2'b11)) ? (r_bit | (mxr & x_bit)) :
                                      (w_bit & r_bit) );
             end else begin
                 // 有效特权级 == S（M 模式 Bare 直通，不走 TLB）
@@ -227,7 +254,7 @@ module tlb #(
                     tlb_perm_ok = ~u_bit & x_bit;
                 end else if (u_bit & ~sum) begin
                     tlb_perm_ok = 1'b0;
-                end else if (acc == 2'b01) begin
+                end else if ((acc == 2'b01) | (acc == 2'b11)) begin
                     tlb_perm_ok = r_bit | (mxr & x_bit);
                 end else begin
                     tlb_perm_ok = w_bit & r_bit;
@@ -242,8 +269,16 @@ module tlb #(
     //   写反会把 R 与 X 对调（实测踩到：X-only 页被当成可 load）。
     wire perm_ok_w  = tlb_perm_ok(lookup_acc, lookup_priv, lookup_sum, lookup_mxr,
                                   perm_sel[4], perm_sel[1], perm_sel[2], perm_sel[3]);
-    wire hit_w      = lookup_valid & any_match & perm_ok_w;
-    wire perm_bad_w = lookup_valid & any_match & ~perm_ok_w;
+
+    // ---- A/D 复核（L6；Svade 口径，与 ptw 的 W5 一致）----
+    //   · A=0 ⇒ page fault（取指/load/store/CBM 一律）；
+    //   · acc==store/AMO（2'b10）且 D=0 ⇒ page fault；
+    //     CBM（2'b11）/取指/load **不查 D**（cmo.adoc NOTE：CBO 不检查 dirty 位）。
+    //   本核不做硬件 A/D 更新（Svade）⇒ 只报异常，不改表项。
+    wire ad_bad_w   = (~a_sel) | ((lookup_acc == 2'b10) & ~d_sel);
+    wire acc_ok_w   = perm_ok_w & ~ad_bad_w;
+    wire hit_w      = lookup_valid & any_match & acc_ok_w;
+    wire perm_bad_w = lookup_valid & any_match & ~acc_ok_w;
 
     assign hit_o        = hit_w;
     assign perm_fault_o = perm_bad_w;
@@ -272,10 +307,14 @@ module tlb #(
     wire             any_match2 = |way_match2;
     wire [21:0]      ppn_way2  [0:ENTRIES-1];
     wire [4:0]       perm_way2 [0:ENTRIES-1];
+    wire             a_way2    [0:ENTRIES-1];
+    wire             d_way2    [0:ENTRIES-1];
     generate
         for (gw = 0; gw < ENTRIES; gw = gw + 1) begin : g_sel2
             assign ppn_way2[gw]  = way_match2[gw] ? ppn[gw]    : 22'h0;
             assign perm_way2[gw] = way_match2[gw] ? perm_i[gw] : 5'h0;
+            assign a_way2[gw]    = way_match2[gw] & a_bit[gw];
+            assign d_way2[gw]    = way_match2[gw] & d_bit[gw];
         end
     endgenerate
 
@@ -283,31 +322,45 @@ module tlb #(
     //   （同一 wire 多次 assign 会触发线网多驱动解析）。
     reg [21:0] ppn_sel2;
     reg [4:0]  perm_sel2;
+    reg        a_sel2, d_sel2;
     integer    si2;
     always @(*) begin
         ppn_sel2  = 22'h0;
         perm_sel2 = 5'h0;
+        a_sel2    = 1'b0;
+        d_sel2    = 1'b0;
         for (si2 = 0; si2 < ENTRIES; si2 = si2 + 1) begin
             ppn_sel2  = ppn_sel2  | ppn_way2[si2];
             perm_sel2 = perm_sel2 | perm_way2[si2];
+            a_sel2    = a_sel2    | a_way2[si2];
+            d_sel2    = d_sel2    | d_way2[si2];
         end
     end
 
+    //   第二端口（取指）同样做 A/D 复核：取指**查 A 不查 D**（acc 恒 2'b00）。
     wire perm_ok_w2  = tlb_perm_ok(lookup2_acc, lookup2_priv, lookup2_sum, lookup2_mxr,
                                    perm_sel2[4], perm_sel2[1], perm_sel2[2], perm_sel2[3]);
-    assign hit2_o        = lookup2_valid & any_match2 & perm_ok_w2;
-    assign perm_fault2_o = lookup2_valid & any_match2 & ~perm_ok_w2;
+    wire ad_bad_w2   = (~a_sel2) | ((lookup2_acc == 2'b10) & ~d_sel2);
+    wire acc_ok_w2   = perm_ok_w2 & ~ad_bad_w2;
+    assign hit2_o        = lookup2_valid & any_match2 & acc_ok_w2;
+    assign perm_fault2_o = lookup2_valid & any_match2 & ~acc_ok_w2;
     assign pa2_o         = {ppn_sel2[19:0], lookup2_off};  // 口径同 pa_o（恰 32 bit）
 
     //==========================================================================
     // 5. sfence.vma 失效判定（L3）—— 纯组合 function，逐路算"是否失效"
     //==========================================================================
-    //   规则（ISA supervisor.adoc › sfence.vma）：
-    //     rs1==x0 && rs2==x0 ⇒ 全部失效（含 G=1）
-    //     rs1!=x0 ⇒ 失效 VA 页号等于 rs1 页号的项（G=1 项**除外**）
-    //     rs2!=x0 ⇒ 失效 ASID 等于 rs2 的项（G=1 项**除外**）
-    //   注：G=1 的项在任何"部分冲刷"下都保留（ISA：global mapping 不因 ASID 切换失效；
-    //       部分冲刷按 VA 过滤时，G 项亦保留——本设计按此口径，见 TB 覆盖）。
+    //   规则（ISA supervisor.adoc › sfence.vma，四条 norm 逐条对应）：
+    //     rs1==x0 && rs2==x0 ⇒ 全部失效（含 G=1）            [sfencevmaallasidva]
+    //     rs1==x0 && rs2!=x0 ⇒ 失效 ASID 匹配项，G=1 保留     [sfencevmaasid_only]
+    //     rs1!=x0 && rs2==x0 ⇒ 失效 VA 匹配项，**G=1 也失效** [sfencevmavaallasid]
+    //     rs1!=x0 && rs2!=x0 ⇒ VA∩ASID，G=1 保留              [sfencevmava_asid]
+    //   ★ 2026-10 修正（审计 04-02）：原实现"只要不是双全范围就先排除 G"，
+    //     把 `rs1!=x0, rs2==x0` 这一组合也当成"global 保留" ⇒ 按 VA、全 ASID 的
+    //     sfence 无法失效 global 映射（软件改成新映射后仍命中旧翻译，破坏隔离）。
+    //     规范只在 **rs2!=x0** 的三条里写"global mapping 不被 order/invalidate"，
+    //     rs2==x0 的按 VA 冲刷**没有** global 例外。
+    //   ★ 判据用 `sf_all_asid`（= rs2 **寄存器字段**为 x0），不是"值==0"：
+    //     `sfence.vma a0, t0`（t0 值为 0）属 rs2!=x0 组合，必须保留 global。
     //   ★ 可移植性要点（与 trap_ctrl/ptw 同一类）：function 内**不得读模块级寄存器/线网**
     //   （如 sfence_all_va / sfence_va），否则 iverilog 12.0 不会在其变化时重求值
     //   调用该 function 的连续赋值 ⇒ 实测表现为"sfence 完全无效"。
@@ -326,15 +379,18 @@ module tlb #(
                 way_flush = 1'b0;
             end else if (sf_all_va && sf_all_asid) begin
                 way_flush = 1'b1;                       // 全冲刷（含 G）
-            end else begin
-                // 部分冲刷：G=1 的项保留（global 映射不因 ASID 切换失效）
+            end else if (!sf_all_asid) begin
+                // ---- rs2 != x0（三个组合）：global 映射保留 ----
+                //   此时 G=1 的项**不因 ASID 定向冲刷失效**（规范明确 global 例外）。
                 if (w_g) way_flush = 1'b0;
-                else if (!sf_all_va && !sf_all_asid)
-                    way_flush = (w_vpn == sf_va[31:12]) && (w_asid == sf_asid);
                 else if (!sf_all_va)
-                    way_flush = (w_vpn == sf_va[31:12]);
+                    way_flush = (w_vpn == sf_va[31:12]) && (w_asid == sf_asid);
                 else
                     way_flush = (w_asid == sf_asid);
+            end else begin
+                // ---- rs2 == x0（rs1 != x0）：按 VA、**全 ASID** ----
+                //   规范此组合**没有** global 例外 ⇒ G=1 的项同样必须失效。
+                way_flush = (w_vpn == sf_va[31:12]);
             end
         end
     endfunction
@@ -370,6 +426,8 @@ module tlb #(
                 g_bit[i]  <= 1'b0;
                 ppn[i]    <= 22'h0;
                 perm_i[i] <= 5'h0;
+                a_bit[i]  <= 1'b0;
+                d_bit[i]  <= 1'b0;
             end
             repl_ptr <= {IDX_W{1'b0}};
         end else begin
@@ -418,6 +476,8 @@ module tlb #(
                     g_bit [fill_idx] <= fp_g;
                     ppn   [fill_idx] <= fill_ppn;
                     perm_i[fill_idx] <= {fp_u, fp_x, fp_w, fp_r, 1'b0};
+                    a_bit [fill_idx] <= fp_a;
+                    d_bit [fill_idx] <= fp_d;
 
                     if (all_valid)
                         repl_ptr <= repl_ptr + {{(IDX_W-1){1'b0}}, 1'b1};

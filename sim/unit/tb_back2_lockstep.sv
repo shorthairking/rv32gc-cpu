@@ -340,6 +340,40 @@ module tb_back2_lockstep_top #(
     wire        tb_csr_we;     wire [11:0] tb_csr_waddr;  wire [31:0] tb_csr_wdata;
     wire [2:0]  tb_csr_frm;    wire [4:0]  tb_csr_fflags;
 
+    //   ★★ F1 后端包接口契约修复（母批准，仅本 TB + tb_back2_ipc）：
+    //     审计 01 P0-01 修复后 `backend_top` 的 `priv_i` 成为**实际权限判据**
+    //     （原先把 `decoder.priv_i` 硬接 `RV32GC_PRIV_M`，故这些口长期悬空也无碍）。
+    //     本处由 bench **显式驱动环境模型**，**不是**把 DUT 恢复硬接 M；DUT 仍按实际 priv 判定。
+    //       · priv_i        = RV32GC_PRIV_M：本 bench 是 M 态裸机直驱环境；
+    //                         U/S 非法矩阵由定向包 `sim/functional/tb_backend_semantics.sv`
+    //                         覆盖，本 bench 不承担。
+    //       · maint_rdy_i   = 1'b1：维护动作（fence.i/sfence.vma/cbo）立即可开始
+    //                         —— 本 bench 无 L1D/维护队列建模（顶层真源为 `l1d_idle`）。
+    //       · cbo_perm_i    = 2'b00：{CBCFE, CBIE≠0}；本 bench 无 csr_file（menvcfg 等价
+    //                         复位值 0）⇒ cbo.* 未使能（程序不含 cbo）。
+    //       · mem_rsp_err_i = 1'b0：存储模型**永不返回错误**（无总线错误注入）。
+    //       · st_xlate_en_i = 1'b0：Sv32 关闭 ⇒ **裸地址身份翻译**（LSQ 内部 PA=VA，
+    //                         不产生翻译请求）；ctx 给合法 M/SUM=0/MXR=0。
+    //       · 翻译握手：下方是**身份翻译适配器**（万一有请求则 1 拍内 PA=VA 完成），
+    //                         不靠 Z 绕门控、不丢请求、不增 DUT 接口。
+    wire        tb_stx_valid;   wire [31:0] tb_stx_va;
+    wire        tb_stx_ready;   wire        tb_stx_done;
+    wire [31:0] tb_stx_pa;      wire        tb_stx_fault;
+    reg         tb_stx_act;     reg  [31:0] tb_stx_va_q;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tb_stx_act <= 1'b0; tb_stx_va_q <= 32'h0;
+        end else if (!tb_stx_act) begin
+            if (tb_stx_valid) begin tb_stx_act <= 1'b1; tb_stx_va_q <= tb_stx_va; end
+        end else begin
+            tb_stx_act <= 1'b0;
+        end
+    end
+    assign tb_stx_ready = ~tb_stx_act;   // 空闲即可接受
+    assign tb_stx_done  =  tb_stx_act;   // 接受后一拍完成
+    assign tb_stx_pa    =  tb_stx_va_q;  // 身份翻译：PA = VA
+    assign tb_stx_fault =  1'b0;         // 裸地址无翻译故障
+
     backend_top u_back (
         .clk(clk), .rst_n(rst_n),
         .blk_valid_i(blk_valid), .blk_ready_o(blk_ready), .blk_mask_i(blk_mask),
@@ -354,6 +388,14 @@ module tb_back2_lockstep_top #(
         .lane_btb_ret_i(lane_btb_ret), .lane_btb_target_i(lane_btb_target),
         .lane_fault_i(lane_fault), .lane_fault_cause_i(lane_fault_cause),
         .lane_fault_tval_i(lane_fault_tval),
+        //   ★★ F1 后端包接口契约修复：显式环境模型（逐项含义见上方声明块注释）；
+        //     这些输入原先悬空(=z)，修复后必须由 bench 明确驱动，**不靠 Z 绕门控**。
+        .priv_i(`RV32GC_PRIV_M), .maint_rdy_i(1'b1), .cbo_perm_i(2'b00),
+        .mem_rsp_err_i(1'b0),
+        .st_xlate_en_i(1'b0), .st_xlate_ctx_i({`RV32GC_PRIV_M, 1'b0, 1'b0}),
+        .st_xlate_valid_o(tb_stx_valid), .st_xlate_va_o(tb_stx_va),
+        .st_xlate_ready_i(tb_stx_ready), .st_xlate_done_i(tb_stx_done),
+        .st_xlate_pa_i(tb_stx_pa), .st_xlate_fault_i(tb_stx_fault),
         .lane_ckpt_i(lane_ckpt), .lane_ckpt_valid_i(lane_ckpt_valid),
         .fe_fetch_fault_i(fe_fetch_fault),
         .redirect_valid_o(redirect_valid), .redirect_pc_o(redirect_pc),

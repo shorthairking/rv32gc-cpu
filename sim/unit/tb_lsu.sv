@@ -755,10 +755,12 @@ module tb_lsu_top;
             $fatal(1, "TB_LSU FAIL");
         end
         n_checks = n_checks + 1;
-        // G-4：CMO 的类型判定 ⇒ need_perm = W（store/AMO 同族）
+        // G-4：CMO 的类型判定 ⇒ need_perm = **R**（load OR store；审计 04-06）
+        //   [norm:cbm_access]：load **或** store 允许即可 ⇒ 只读页可用；
+        //   原判据期望 W(01) 是错误口径（审计明确点名 tb_lsu:758-764）。
         mem_kind = A_CBO; cbo_rs2 = `RV32GC_CBO_INVAL; #1;
-        if (need_perm !== 2'b01) begin
-            $display("FAIL[G4]: CMO need_perm 期望 W(01) 实际 %b", need_perm);
+        if (need_perm !== 2'b10) begin
+            $display("FAIL[G4]: CMO need_perm 期望 R(10) 实际 %b", need_perm);
             $fatal(1, "TB_LSU FAIL");
         end
         n_checks = n_checks + 1;
@@ -772,6 +774,76 @@ module tb_lsu_top;
         n_checks = n_checks;                            // 已计入
 
         $display("  [AMO]    5 例通过（AMO/LR/SC/CMO 类型判定；AMO 被拒恒 cause 7）");
+
+        //======================================================================
+        // 组 H：★ CBM 的 PMP 权限 = load **或** store（审计 04-06）
+        //   [norm:cbm_access]：只读区（PMP 给 R 不给 W）上的 cbo.clean/flush/inval
+        //   必须允许；两者都拒才拒，且 cause **恒 7**（[norm:cbmunpermfault]）。
+        //======================================================================
+        env_default;
+        cur_priv = PRIV_S;                       // S 模式受 PMP 约束
+        rs1 = 32'h0000_E000; imm = 32'd0;
+        ptw_pa = 32'h0000_E000;
+        mem_kind = A_CBO; cbo_rs2 = `RV32GC_CBO_CLEAN; req_valid = 1'b1;
+
+        // H-1：PMP 只给 R（L=1, R=1, W=0）⇒ CBM **必须放行**（原实现误报 cause 7）
+        set_entry(0, A_NA4, 1'b1, 1'b1, 1'b0, 1'b0);
+        set_addr (0, 32'h0000_E000);
+        #1;
+        if (exc !== 1'b0) begin
+            $display("FAIL[H1]: 只读区上的 CBM 必须允许，实际 exc=%b cause=%0d",
+                     exc, exc_cause);
+            $fatal(1, "TB_LSU FAIL");
+        end
+        if (pmp_deny !== 1'b0 || beat0_ok !== 1'b1) begin
+            $display("FAIL[H1]: CBM 只读区 pmp_deny=%b beat0_ok=%b（应 0/1）",
+                     pmp_deny, beat0_ok);
+            $fatal(1, "TB_LSU FAIL");
+        end
+        n_checks = n_checks + 2;
+
+        // H-2：PMP 只给 W（L=1, R=0, W=1）⇒ CBM 同样**必须放行**（store 侧允许）
+        set_entry(0, A_NA4, 1'b1, 1'b0, 1'b1, 1'b0);
+        #1;
+        if (exc !== 1'b0) begin
+            $display("FAIL[H2]: 只写区上的 CBM 必须允许，实际 exc=%b cause=%0d",
+                     exc, exc_cause);
+            $fatal(1, "TB_LSU FAIL");
+        end
+        n_checks = n_checks + 1;
+
+        // H-3：R/W 全拒（只给 X）⇒ CBM 拒，且 cause **恒 7**（store 类）
+        set_entry(0, A_NA4, 1'b1, 1'b0, 1'b0, 1'b1);
+        #1;
+        check_cause("H3-CBM-no-rw-deny", C_ST_ACC);     // 7
+        // H-4：全无权限（L=1, R=W=X=0）⇒ 同样 cause 7
+        set_entry(0, A_NA4, 1'b1, 1'b0, 1'b0, 1'b0);
+        #1;
+        check_cause("H4-CBM-no-perm-deny", C_ST_ACC);
+
+        // H-5：**对照** —— 同一只读区上的 **store** 仍必须拒（证明 H-1 是 CBM 专属口径）
+        mem_kind = A_STORE; size = SZ_4B; store_data = 32'h1234_5678;
+        set_entry(0, A_NA4, 1'b1, 1'b1, 1'b0, 1'b0);    // 只给 R
+        #1;
+        check_cause("H5-store-on-RO-still-deny", C_ST_ACC);
+        // H-6：**对照** —— 同一只写区上的 **load** 仍必须拒（证明 H-2 是 CBM 专属口径）
+        mem_kind = A_LOAD; size = SZ_4B;
+        set_entry(0, A_NA4, 1'b1, 1'b0, 1'b1, 1'b0);    // 只给 W
+        #1;
+        check_cause("H6-load-on-WO-still-deny", C_LOAD_ACC);
+
+        // H-7：CBM 无匹配项 + S 模式 ⇒ 拒（[norm:pmpnoentry_match]），cause 7
+        env_default;                                     // PMP 全 OFF
+        cur_priv = PRIV_S; req_valid = 1'b1;
+        mem_kind = A_CBO; cbo_rs2 = `RV32GC_CBO_FLUSH; size = SZ_4B;
+        #1;
+        check_cause("H7-CBM-nomatch-S-deny", C_ST_ACC);
+        // H-8：CBM + M 模式 + 无匹配 ⇒ 放行（M 不受无匹配约束）
+        cur_priv = PRIV_M;
+        #1;
+        check_no_exc("H8-CBM-nomatch-M-allow");
+
+        $display("  [CBM]    8 例通过（load OR store 权限；仅 cause 恒 7；store/load 对照）");
 
         //======================================================================
         // 汇总

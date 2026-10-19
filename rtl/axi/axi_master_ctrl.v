@@ -128,6 +128,16 @@ module axi_master_ctrl #(
     output wire [ADDR_W-1:0]    done_addr,
     output wire                 resp_error,  // bresp/rresp ≠ OKAY（脉冲）
     output wire [1:0]           resp_code,   // 最近一次非 OKAY 的 resp 编码
+    // ★★ 04-07（审计 04-07 的最小错误通路；集成侧由母单点接线，本包不改 top）：
+    //   · rdata_error：**与 rdata_valid/rdata_data/rdata_id/rdata_last 同拍同 beat**
+    //     的"该 beat 的 R 响应非 OKAY"。cache 行填充按它做**事务级**错误累计，
+    //     因此必须与控制器**实际转发出去的那个 beat**严格对齐（不能用延迟一拍的
+    //     fill_valid 去与当前 m_rresp 相与 —— 那会把错误记到相邻 beat 上）。
+    //   · done_error ：与 done **同拍**的"本逻辑请求（含 4 K 拆分两笔）内曾出现
+    //     非 OKAY"。累计器 err_acc_q 只在接受**新逻辑请求**时清，拆分两笔之间不清
+    //     ⇒ 首笔 R 错、第二笔成功时，最终唯一 done 拍仍报错（不静默丢错）。
+    output wire                 rdata_error,
+    output wire                 done_error,
 
     //================================================================
     // AXI4 主端口（五通道；位宽与平台 config.h 一致）
@@ -225,12 +235,20 @@ module axi_master_ctrl #(
     reg [LEN_W:0]    first_beats_q;     // 首笔 beat 数（算第二笔地址用）
     reg [LEN_W:0]    second_beats_q;    // 第二笔 beat 数
     reg              split_write_q;
+    // ★★ 04-05：**逻辑请求**（含拆分第二笔）的起始地址。
+    //   `done` 只在整个逻辑请求结束时给一次，`done_addr` 必须报逻辑请求的起始地址
+    //   （而不是第二笔的接续地址），否则消费者按 done_addr 记账会记错行。
+    reg [ADDR_W-1:0] req_addr_q;        // 逻辑请求起始地址（本笔事务的"身份"）
 
     assign busy  = busy_q;
     assign owner = owner_q;
 
     // 接受新请求：仅在完全空闲且无待发第二笔时
     assign req_ready = ~busy_q & ~split_pending_q;
+
+    // ★★ 04-05：本拍是否"还要发第二笔"（仅 ST_DONE 有意义）。
+    //   首笔完成时若 split_req_q=1 且尚未发过第二笔 ⇒ 本拍**不是**整个逻辑请求的完成。
+    wire split_issue_now = split_req_q & ~split_issued_q;
 
     //--------------------------------------------------------------------------
     // 3. 组合推进条件（一律 valid && ready）
@@ -262,9 +280,10 @@ module axi_master_ctrl #(
 
     reg  err_pending_q;
     reg [1:0] err_code_q;
+    // ★★ 04-07：逻辑请求级错误累计（跨 4 K 拆分两笔保持；接受新逻辑请求时清）。
+    reg       err_acc_q;
     assign resp_error = b_err | r_err | err_pending_q;
     assign resp_code  = b_err ? m_bresp : (r_err ? m_rresp : err_code_q);
-
     //--------------------------------------------------------------------------
     // 4. 输出（组合）：所有 AXI 引脚由状态 + 寄存器直接映射
     //--------------------------------------------------------------------------
@@ -288,6 +307,8 @@ module axi_master_ctrl #(
     assign rdata_data  = m_rdata;
     assign rdata_id    = m_rid;
     assign rdata_last  = m_rlast;
+    // ★★ 04-07：逐 beat 错误 = **同一个 r_fire 拍**的响应译码（与上面三路同拍同源）。
+    assign rdata_error = r_err;
     // ★ R 数据锁存值：`r_fire` 拍（且仅该拍）把 `m_rdata` 落进 `rdata_hold_q`。
     //   握手之后的任何拍（含 core_top 的 `axi_done_q` 拍 = 握手后第 2 拍）读到的
     //   都是**本笔事务**的数据；下一次 R 握手才会覆盖它（本控制器单笔在途 +
@@ -328,9 +349,19 @@ module axi_master_ctrl #(
     assign m_bready  = b_go;
 
     // ---- 完成脉冲 ----
-    assign done       = (state_q == ST_DONE) & ~split_pending_q;
+    // ★★ 04-05 修复（P1）：`done` 只在整个**逻辑请求**（含 4 K 拆分第二笔）结束时
+    //   给**一次**。缺陷：首笔进 ST_DONE 时 split_pending_q 尚为 0（它在同一拍末才
+    //   置位）⇒ 首笔就产生了 done；第二笔完成时又 done 一次 ⇒ 消费者可能提前释放
+    //   owner/提交未齐数据。修法：done 的抑制条件用**同拍组合**可判的
+    //   `split_issue_now`（= split_req_q & ~split_issued_q），而不是晚一拍才有效的
+    //   split_pending_q；`done_addr` 报逻辑请求起始地址（req_addr_q）。
+    //   由此 busy/owner 也覆盖整个逻辑请求：首笔 ST_DONE 拍仍 busy=1，
+    //   下一拍由 ST_IDLE 的 split_pending 分支直接发第二笔（中间不复位 busy）。
+    assign done       = (state_q == ST_DONE) & ~split_issue_now & ~split_pending_q;
     assign done_owner = owner_q;
-    assign done_addr  = addr_q;
+    assign done_addr  = req_addr_q;
+    // ★★ 04-07：done 拍的错误可见（跨拆分累计；成功请求恒 0）。
+    assign done_error = done & err_acc_q;
 
     //--------------------------------------------------------------------------
     // 5. 时序：状态机
@@ -377,8 +408,10 @@ module axi_master_ctrl #(
             split_write_q   <= 1'b0;
             first_beats_q   <= {LEN_W+1{1'b0}};
             second_beats_q  <= {LEN_W+1{1'b0}};
+            req_addr_q      <= {ADDR_W{1'b0}};
             err_pending_q   <= 1'b0;
             err_code_q      <= 2'b00;
+            err_acc_q       <= 1'b0;
             cache_q         <= `RV32GC_AXI_CACHE_CACHED;
             strb_q          <= {STRB_W{1'b1}};
             rdata_hold_q    <= {DATA_W{1'b0}};
@@ -389,9 +422,13 @@ module axi_master_ctrl #(
             if (r_fire) rdata_hold_q <= m_rdata;
 
             // 错误标志自动清零（脉冲可见一拍）
+            //   ★ 04-07：err_code_q 必须**按错误来源选源**（原实现无条件锁 m_bresp，
+            //     读错时把 B 通道的旧值当成 R 的错误码 = 错码）。
             if (b_err | r_err) begin
                 err_pending_q <= 1'b1;
-                err_code_q    <= m_bresp;      // 近似：以最后一次错误为准
+                err_code_q    <= b_err ? m_bresp : m_rresp;
+                // ★ 04-07：逻辑请求级累计（跨拆分保持；新请求接受时清，见 ST_IDLE）
+                err_acc_q     <= 1'b1;
             end else if (err_pending_q) begin
                 err_pending_q <= 1'b0;
             end
@@ -416,6 +453,9 @@ module axi_master_ctrl #(
                         busy_q     <= 1'b1;
                         owner_q    <= req_owner;
                         addr_q     <= req_addr;          // ★ 唯一赋值点
+                        req_addr_q <= req_addr;          // 逻辑请求起始地址（done_addr）
+                        // ★ 04-07：新逻辑请求 ⇒ 清跨请求的错误累计（拆分两笔之间不清）
+                        err_acc_q  <= 1'b0;
                         // AxLEN = 本笔 beat 数 - 1（**由 beat 数派生**，不信任外部
                         // 传入的 req_len：4 K 拆分后首笔长度已变，外部容易忘同步）
                         len_q      <= req_beats_1[LEN_W-1:0] - 4'd1;
@@ -469,15 +509,19 @@ module axi_master_ctrl #(
 
                 // ---------------- 收尾：拆分或释放 ----------------
                 ST_DONE: begin
-                    // 本笔完成。若首笔声明需拆第二笔 ⇒ 锁存第二笔描述符并释放 busy，
-                    // 下一拍由 ST_IDLE 的 split_pending 分支自动发出第二笔。
-                    busy_q <= 1'b0;
-                    if (split_req_q && !split_pending_q && !split_issued_q) begin
+                    // ★★ 04-05：本拍 done 已由 §4 的组合式抑制（split_issue_now）。
+                    //   若首笔声明需拆第二笔 ⇒ 锁存第二笔描述符；busy **保持 1**
+                    //   （本拍不清），由 ST_IDLE 的 split_pending 分支直接发第二笔 ⇒
+                    //   busy/owner 连续覆盖整个逻辑请求（消费者不会在首笔后看到空闲）。
+                    if (split_issue_now) begin
                         split_pending_q <= 1'b1;
                         split_addr_q    <= addr_q + {13'b0, first_beats_q[LEN_W:0], 2'b00};
                         split_beats_q   <= second_beats_q;
                         split_write_q   <= is_write_q;
                         split_issued_q  <= 1'b1;
+                    end else begin
+                        // 整个逻辑请求（含第二笔）完成 ⇒ 释放单笔在途
+                        busy_q <= 1'b0;
                     end
                     state_q <= ST_IDLE;
                 end

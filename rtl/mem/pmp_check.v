@@ -72,7 +72,9 @@
 //   acc_bytes_i[4:0]    : 本笔访问字节数（1/2/4；非对齐拆分后每笔为 1 或多个字节）
 //   acc_priv_i[1:0]     : 发起访问的有效特权级（MPRV=1 时已由 lsu 换成 MPP）
 //   acc_type_i[1:0]     : 访问类型 —— 0=load、1=store、2=execute、3=AMO/LRSC/CMO
-//   allow_o             : 本笔是否放行（1=通过）
+//   allow_o             : 本笔是否放行（1=通过，按 acc_type_i 的单一访问类型判权）
+//   allow_rw_o          : **附加**：同一笔若按 "R **或** W" 判权是否放行
+//                         （Zicbom 的 CBM 用；见端口注释。既有 caller 可不连接）
 //   fault_cause_o[4:0]  : allow_o=0 时给出的 cause 码（1/5/7，见下）
 //   hit_o               : 本笔是否命中了某项 PMP（诊断/覆盖用）
 //   hit_idx_o[3:0]      : 命中的最低编号项（hit_o=1 时有效）
@@ -108,11 +110,24 @@ module pmp_check #(
     input  wire [1:0]               acc_type_i,     // 0=load 1=store 2=execute 3=AMO/LRSC/CMO
 
     // ---- 结果 ----
-    output wire                     allow_o,        // 1=放行
+    output wire                     allow_o,        // 1=放行（按 acc_type_i 的单一访问类型）
     output wire [`RV32GC_CAUSE_W-1:0] fault_cause_o, // allow_o=0 时的 cause
     output wire                     hit_o,          // 是否命中某项
     output wire [3:0]               hit_idx_o,      // 命中的最低编号项
-    output wire                     denied_by_full_o// 因整笔未全覆盖而失败
+    output wire                     denied_by_full_o,// 因整笔未全覆盖而失败
+    //--------------------------------------------------------------------------
+    // ★ 2026-10（F3 MMU 包；母 Agent 批准的**最小**扩展）：同一笔访问若按
+    //   "**R 或 W**"（load **或** store）判权是否放行。
+    //   存在理由：Zicbom 的 CBM（cbo.clean/flush/inval）按
+    //   [norm:cbm_access]（cmo.adoc:311-406）"load **或** store 允许即可访问"，
+    //   用单一 acc_type_i 无法表达"或"；本输出**共享**既有的最低命中项选择、
+    //   整笔覆盖判定与 M 无锁旁路，只是把权限位判据换成 (R|W)，
+    //   因此**不新增**匹配器/容量/频率，也不改变 allow_o/fault_cause_o 的语义。
+    //   既有 caller（fetch_unit ×2 / core_top 的 PTE 检查 / lsu ×2）可不连接本输出。
+    //   注：acc_type_i = 3（AMO/LRSC/CMO）的**原有**语义（需 W）保持不变，
+    //       "R|W" 只体现在本附加输出上，绝不改写 acc_type 编码域。
+    //--------------------------------------------------------------------------
+    output wire                     allow_rw_o
 );
 
     //==========================================================================
@@ -288,6 +303,7 @@ module pmp_check #(
     wire              ent_any  [0:PMP_ENTRIES-1];
     wire              ent_all  [0:PMP_ENTRIES-1];
     wire              ent_ok   [0:PMP_ENTRIES-1];   // 命中且权限足够（该项可放行）
+    wire              ent_rw_ok[0:PMP_ENTRIES-1];   // 命中且 (R|W) 允许（CBM 用）
     wire [1:0]        ent_a    [0:PMP_ENTRIES-1];
     wire              ent_l    [0:PMP_ENTRIES-1];
 
@@ -350,6 +366,9 @@ module pmp_check #(
                             (need_w && c[`RV32GC_PMP_W_BIT]) ||
                             (need_x && c[`RV32GC_PMP_X_BIT]);
             assign ent_ok[gi] = ent_all[gi] && (m_bypass || perm_ok);
+            // ---- ★ 附加输出用：同一项按 "R 或 W" 判权（见端口 allow_rw_o 注释）----
+            wire perm_rw_ok = c[`RV32GC_PMP_R_BIT] | c[`RV32GC_PMP_W_BIT];
+            assign ent_rw_ok[gi] = ent_all[gi] && (m_bypass || perm_rw_ok);
         end
     endgenerate
 
@@ -452,6 +471,12 @@ module pmp_check #(
                                    ent_ok[7],   ent_ok[6],   ent_ok[5],   ent_ok[4],
                                    ent_ok[3],   ent_ok[2],   ent_ok[1],   ent_ok[0]});
 
+    //   ★ 附加输出：**同一**最低命中项上的 (R|W) 判权结果（不复制匹配/优先级网络）
+    wire sel_rw_ok = |(sel_onehot & {ent_rw_ok[15], ent_rw_ok[14], ent_rw_ok[13], ent_rw_ok[12],
+                                     ent_rw_ok[11], ent_rw_ok[10], ent_rw_ok[9],  ent_rw_ok[8],
+                                     ent_rw_ok[7],  ent_rw_ok[6],  ent_rw_ok[5],  ent_rw_ok[4],
+                                     ent_rw_ok[3],  ent_rw_ok[2],  ent_rw_ok[1],  ent_rw_ok[0]});
+
     //==========================================================================
     // 6. 判定输出
     //==========================================================================
@@ -460,6 +485,9 @@ module pmp_check #(
     wire no_match_m_ok = is_m_mode || (PMP_ENTRIES == 0);
 
     assign allow_o = hit_any_flat ? sel_ok : no_match_m_ok;
+    //   ★ CBM 用的附加口径：同一命中项、同一整笔覆盖判定，只把权限换成 (R|W)；
+    //     无匹配时的语义与 allow_o 完全一致（M 成功 / S/U 失败）。
+    assign allow_rw_o = hit_any_flat ? sel_rw_ok : no_match_m_ok;
 
     // 失败原因分类：
     //   · 有命中但整笔未全覆盖 ⇒ denied_by_full_o=1（权益与 R/W/X 无关）

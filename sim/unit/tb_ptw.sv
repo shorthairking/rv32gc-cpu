@@ -9,7 +9,14 @@
 //           ④ **★ 页表隐式访存过 PMP 被拒 ⇒ access-fault**（判据⑤核心）：
 //              取指原访问 ⇒ cause 1；load ⇒ cause 5；store/AMO ⇒ cause 7；
 //              **不是** page-fault。且 PMP 被拒时**不得**发出 PTE 物理读。
-//           ⑤ A/D 位：A=0 或（写且 D=0）⇒ 触发硬件更新流程（pte_ad_update）。
+//           ⑤ A/D 位：A=0 或（写且 D=0）⇒ 触发硬件更新流程（pte_ad_update）；
+//              且 fill_perm 必须把 A/D 带给 TLB（审计 04-01/04-06 的接口口径）。
+//           ⑥ **CBM 类别**（acc=2'b11 = Zicbom clean/flush/inval）：页权限 = load
+//              或 store（只读页可用）、查 A **不查 D**、异常仍按 store 类 cause
+//              （审计 04-06）。
+//           ⑦ **32 bit 平台上的 34 bit PA**：根表/下级表/4KiB 叶/4MiB 叶的高两位
+//              非零 ⇒ 原访问类型 access fault，且**不发** PTE 物理读
+//              （绝不把不可达高 PA 别名成低地址；审计 04-03）。
 // 怎么判  : 每条断言具体数值；失败即 $fatal（非零退出）；兜底分支不含 PASS。
 // 失败长什么样: `TB_PTW FAIL: <项> got=... exp=...` 后 $fatal(1, "TB_PTW_UNIT: FAIL")。
 // 顶层    : tb_ptw_top（验收命令用 -s tb_ptw_top）
@@ -448,9 +455,12 @@ module tb_ptw_top;
         do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
         expect_eq32("D3: ★ store/AMO 原访问 ⇒ cause 7（store access fault）",
                     {27'b0, fault_cause_o}, 32'h0000_0007);
-        //   ---- cbo.zero（acc=11）按 store 判定 ⇒ cause 7 ----
+        //   ---- ★ CBM（acc=11，Zicbom clean/flush/inval）的访问故障仍按 store 类 ⇒ 7 ----
+        //     2026-10（F3 MMU 包）：acc=11 由 "cbo.zero" 重定义为 CBM（Zicboz 未实现，
+        //     原语义不可达）。[norm:cbmunpermfault] 要求 CBM 不可访问时报
+        //     **store** access-fault ⇒ cause 仍为 7（权限口径见判据 ⑥）。
         do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
-        expect_eq32("D3: cbo.zero(acc=11) ⇒ 按 store ⇒ cause 7",
+        expect_eq32("D3: CBM(acc=11) 访问故障 ⇒ store 类 cause 7",
                     {27'b0, fault_cause_o}, 32'h0000_0007);
 
         //   ---- D4：只拒**二级** PTE（一级放行）⇒ 仍按原访问类型报 access-fault ----
@@ -497,6 +507,13 @@ module tb_ptw_top;
         while (!req_done && k < 100) begin @(posedge clk); #1; k = k + 1; end
         expect_eq1("E: 更新后翻译成功", fault_o, 1'b0);
         expect_eq32("E: 更新后 PA 正确", pa_o, 32'h0005_5123);
+        //   ★ F3 MMU 包：SVADE=0 硬件更新后填进 TLB 的 A/D 必须是**更新后**的值
+        //     （A=1；写访问 D=1）——否则 TLB 的 A/D 复核会把该表项判成 page fault。
+        expect_eq1("E: 更新后 fill_valid 拉高（观测粘存）", fill_latch, 1'b1);
+        expect_eq32("E: ★ SVADE=0 更新后 fill_perm[1] = A = 1",
+                    {31'b0, fill_perm_l[1]}, 32'h1);
+        expect_eq32("E: ★ SVADE=0 写访问更新后 fill_perm[2] = D = 1",
+                    {31'b0, fill_perm_l[2]}, 32'h1);
 
         //   ---- A=1,D=1 ⇒ 不需要更新，直接完成 ----
         pte_mem[pte_index(L1_BASE + (32'h002 << 2))] =
@@ -513,6 +530,133 @@ module tb_ptw_top;
         do_translate(32'hDEAD_B000, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
         expect_eq32("F: 故障 tval = VA（非 PTE 物理地址）",
                     fault_tval_o, 32'hDEAD_B000);
+
+        //======================================================================
+        // G. ★ 判据⑥：CBM 类别（acc=2'b11 = Zicbom clean/flush/inval）
+        //    [norm:cbm_access]：load **或** store 允许即可 ⇒ 只读页必须可用；
+        //    cmo.adoc NOTE：CBO **不检查 D 位**；异常仍按 store 类 cause。
+        //======================================================================
+        //   二级叶子 = 只读（R=1,W=0）、A=1、D=0、U=0
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] = mk_pte(L1_PPN, 1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b0, 1'b1);
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h00055, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1);  // RO, A=1, D=0
+        pmp_deny_en = 1'b0;
+        //   G1：只读页 + D=0 ⇒ CBM **成功**（不得因"需 W / 需 D"报异常）
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("G1: ★ CBM 在只读页(D=0) ⇒ 允许（load OR store 权限、不查 D）",
+                   fault_o, 1'b0);
+        expect_eq32("G1: CBM 翻译出的 PA 正确", pa_o, 32'h0005_5123);
+        //   G2：对照 —— 同一只读页上的 **store** 必须 page fault（cause 15）
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("G2: 对照 store 在只读页 ⇒ fault", fault_o, 1'b1);
+        expect_eq32("G2: 对照 store cause = 15（store page fault）",
+                    {27'b0, fault_cause_o}, 32'h0000_000F);
+        //   G3：A=0 的页 + CBM ⇒ 必须 page fault（[norm:cbmunpermtranslate] 查 A）
+        //       ★ 本 TB 例化 SVADE=0（硬件 A/D 更新通路）⇒ A=0 走"更新后重试"，
+        //         不是直接报错；CBM 的关键判据是"**不置 D**"（只置 A）。
+        //         默认 Svade=1 下 A=0 ⇒ 直接 page fault，由功能包 tb_mmu_semantics 覆盖。
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h00055, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1);  // RO, A=0, D=0
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("G3: CBM 在 A=0 页 ⇒ 触发 A/D 更新（SVADE=0 通路）", saw_ad_update, 1'b1);
+        expect_eq1("G3: 更新完成后 CBM 成功（A=1 后允许）", fault_o, 1'b0);
+        expect_eq32("G3: ★ CBM 的 A/D 更新**只置 A、不置 D**",
+                    pte_mem[pte_index(L1_BASE + (32'h002 << 2))] &
+                    ((32'h1 << `RV32GC_PTE_A_BIT) | (32'h1 << `RV32GC_PTE_D_BIT)),
+                    (32'h1 << `RV32GC_PTE_A_BIT));
+        //   G4：X-only 页 + MXR=0 ⇒ CBM 不可读 ⇒ fault；MXR=1 ⇒ 允许
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h00055, 1'b1, 1'b1, 1'b0, 1'b0, 1'b1, 1'b0, 1'b0, 1'b1);  // X-only
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("G4: CBM 在 X-only 页且 MXR=0 ⇒ fault", fault_o, 1'b1);
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b1);
+        expect_eq1("G4: CBM + MXR=1 ⇒ 允许（同 load 口径）", fault_o, 1'b0);
+        //   G5：CBM 在 S 模式访问 U=1 页仍需 SUM（页权限同 load）
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h00055, 1'b1, 1'b1, 1'b0, 1'b1, 1'b0, 1'b0, 1'b1, 1'b1);  // U=1 RO
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("G5: CBM 在 U=1 页且 SUM=0 ⇒ fault", fault_o, 1'b1);
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b1, 1'b0);
+        expect_eq1("G5: CBM + SUM=1 ⇒ 允许", fault_o, 1'b0);
+
+        //======================================================================
+        // H. ★ 判据⑦：32 bit 平台上的 34 bit PA（审计 04-03）
+        //    Sv32 的 22 bit PPN 拼 12 bit offset = 34 bit；本平台物理地址 32 bit
+        //    ⇒ bit[33:32] 必须为 0。任一非零 ⇒ 原访问类型 access fault，
+        //    **绝不**截断后访问低地址，且**不发**该级 PTE 物理读。
+        //======================================================================
+        //   H1：4 KiB 叶 PPN = 22'h100001（bit21=1 ⇒ PA 高两位 = 01）
+        //       期望 PA = 0x1_0000_1000 ⇒ 不可达 ⇒ load access fault（5）
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] = mk_pte(L1_PPN, 1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b0, 1'b1);
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h100001, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H1: ★ 4KiB 叶高 PPN ⇒ fault（不截断）", fault_o, 1'b1);
+        expect_eq32("H1: ★ load ⇒ cause 5（access fault，非 page fault）",
+                    {27'b0, fault_cause_o}, 32'h0000_0005);
+        expect_eq1("H1: ★ 失败时不得产生 fill（不得把别名 PA 灌进 TLB）",
+                   fill_latch, 1'b0);
+        //   H2：同页取指 / store / CBM 的 cause 跟随原访问类型（1 / 7 / 7）
+        do_translate(32'h8040_2123, 2'b00, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("H2: 高 PA + 取指 ⇒ cause 1", {27'b0, fault_cause_o}, 32'h0000_0001);
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("H2: 高 PA + store ⇒ cause 7", {27'b0, fault_cause_o}, 32'h0000_0007);
+        do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("H2: 高 PA + CBM ⇒ cause 7", {27'b0, fault_cause_o}, 32'h0000_0007);
+        //   H3：4 MiB 大页 PPN[1] = 0x800（bit11=1 ⇒ PA[33:32]=10）⇒ access fault
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] =
+            mk_pte(22'h200_000, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);  // PPN[0]=0
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H3: ★ 4MiB 大页高 PPN[1] ⇒ fault", fault_o, 1'b1);
+        expect_eq32("H3: 4MiB 高 PA ⇒ cause 5", {27'b0, fault_cause_o}, 32'h0000_0005);
+        //   H4：**根页表基址**高位（satp.ppn bit21=1）⇒ PTE 地址不可达
+        //       ⇒ access fault，且**不得**发出该级 PTE 物理读（无低地址别名）
+        satp = 32'h8020_0000 | 22'h100000;   // satp.ppn = 22'h100000
+        pmp_deny_en = 1'b0;
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H4: ★ 根表基址高 PPN ⇒ fault", fault_o, 1'b1);
+        expect_eq32("H4: 根表高地址 ⇒ cause 5（access fault）",
+                    {27'b0, fault_cause_o}, 32'h0000_0005);
+        expect_eq1("H4: ★ 根表高地址 ⇒ **不发** PTE 物理读（无低地址别名访问）",
+                   saw_pte_req, 1'b0);
+        //   H5：**下级表基址**高位（一级 PTE 的 PPN bit21=1）⇒ 二级 PTE 地址不可达
+        satp = SATP_SV32;
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] =
+            mk_pte(22'h100030, 1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b0, 1'b1);   // 指针 PPN 高
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H5: ★ 下级表基址高 PPN ⇒ fault", fault_o, 1'b1);
+        expect_eq32("H5: 下级表高地址 + store ⇒ cause 7",
+                    {27'b0, fault_cause_o}, 32'h0000_0007);
+        //   H6：**对照** —— 同样的 VA，PPN 低 20 位相同但高位为 0 ⇒ 正常成功
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] = mk_pte(L1_PPN, 1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b0, 1'b1);
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h000001, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H6: 对照 低 PPN ⇒ 成功（H1 的差异只来自高位）", fault_o, 1'b0);
+        expect_eq32("H6: 对照 PA 正确", pa_o, 32'h0000_1123);
+
+        //======================================================================
+        // I. ★ 判据⑤扩展：fill_perm 必须携带 A/D（TLB 命中路径的唯一来源）
+        //    fill_perm = {G(7),U(6),X(5),W(4),R(3),D(2),A(1),1'b0(0)}
+        //======================================================================
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] = mk_pte(L1_PPN, 1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b0, 1'b1);
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h00055, 1'b0, 1'b1, 1'b1, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);  // A=1 D=0 G=1
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("I1: A=1 D=0 页 load 成功", fault_o, 1'b0);
+        expect_eq32("I1: ★ fill_perm[1] = A = 1", {31'b0, fill_perm_l[1]}, 32'h1);
+        expect_eq32("I1: ★ fill_perm[2] = D = 0（load 填表时 D 仍为 0）",
+                    {31'b0, fill_perm_l[2]}, 32'h0);
+        expect_eq32("I1: fill_perm[7] = G = 1（既有口径不变）",
+                    {31'b0, fill_perm_l[7]}, 32'h1);
+        expect_eq32("I1: fill_perm[3] = R = 1（既有口径不变）",
+                    {31'b0, fill_perm_l[3]}, 32'h1);
+        //   I2：D=1 的页 ⇒ fill_perm[1] 必须为 1
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h00055, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("I2: ★ fill_perm[2] = D = 1", {31'b0, fill_perm_l[2]}, 32'h1);
+        expect_eq32("I2: fill_perm[1] = A = 1", {31'b0, fill_perm_l[1]}, 32'h1);
 
         //======================================================================
         // 汇总

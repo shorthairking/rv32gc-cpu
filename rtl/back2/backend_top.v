@@ -696,7 +696,12 @@ module backend_top #(
         wire [4:0]  cbo_kind;
 
         decoder u_dec (
-            .insn_i(insn), .priv_i(`RV32GC_PRIV_M),
+            //   ★★ F1-后端修复（01 P0-01 / 02-4）：译码器必须吃**实际当前特权级 priv_i**，
+            //     不能硬接 `RV32GC_PRIV_M`。旧接线使 U/S 下的机器 CSR（csrrw mstatus 等）
+            //     通过 dec_csr 的 `priv >= csr_minplvl` 检查（恒真）⇒ 非法编码被当成合法。
+            //     本包只修"入口译码权限"这一段；真正的 csr_file 提交合法性/TVM/TSR/计数器
+            //     门控仍待后续集成（见包内边界说明），此处不新增端口、不自造常量。
+            .insn_i(insn), .priv_i(priv_i),
             .menvcfg_cbie_i(2'b00), .menvcfg_cbcfe_i(1'b0),
             .senvcfg_cbie_i(2'b00), .senvcfg_cbcfe_i(1'b0),
             .insn32_o(insn32), .tval_o(tval), .ill_instr_o(ill_instr),
@@ -731,9 +736,17 @@ module backend_top #(
         //     · mret/sret ⇒ 不非法；执行期是 no-op，**提交点特权动作**由顶层 trap FSM 做
         //       （读 mepc/mstatus + 重定向），识别方式见 `xret_cmt_o`；
         //     · wfi 仍留 unsup（本里程碑不需要）。
-        //   ★ 4b-2a：`sfence.vma` 归 `OPT_SYS`，加进白名单（2A 只对 U 模式判非法；
-        //     本核 priv 恒 M ⇒ 直接放行）
+        //   ★ 4b-2a：`sfence.vma` 归 `OPT_SYS`，加进白名单（2A 只对 U 模式判非法）
         wire is_sys_ok = ecall | ebreak | mret | sret | sfence;
+        //   ★★ F1-后端修复（01 P0-01 / 02-4）：**入口特权级权限补判**（用现有端口 `priv_i`）。
+        //     译码器只对 CSR 地址做最低特权级检查（`dec_csr.priv_ok`），xRET/SFENCE 的
+        //     当前模式检查不在其中 ⇒ 必须在 D1 入口按 ISA 补齐，否则 U 下 mret/sret、
+        //     U 下 sfence.vma 会被当作合法控制指令，提交点触发特权切换（提权路径）。
+        //     ISA 口径：MRET 仅 M 合法；SRET 在 U 非法（S/M 合法）；SFENCE.VMA 在 U 非法
+        //     （S/M 合法）。TSR/TVM 对 S 的额外门控属后续集成边界，本包不在此自造端口。
+        wire xret_priv_ill   = (mret & (priv_i != `RV32GC_PRIV_M)) |
+                               (sret & (priv_i == `RV32GC_PRIV_U));
+        wire sfence_priv_ill = sfence & (priv_i == `RV32GC_PRIV_U);
         //   ★ 4b-2a：`cbo.*`（opt 10）**摘出 `unsup`**；其合法性改由 `cbo_perm_i`
         //     按动作码精确判定（不再用译码器内部的 `cbo_gate_ill` —— 本核前端未接
         //     menvcfg/senvcfg 到译码器，那两位是悬空 ⇒ 直接用会引入 x）
@@ -751,7 +764,8 @@ module backend_top #(
         //     menvcfg/senvcfg 驱动，而本核前端未接那两位（悬空 z）⇒ 它会给出 x；
         //     本核改用 `cbo_ill_perm`（由顶层从 `csr_file.menvcfg_o` 译出的两位许可）判。
         //     `ill_instr & ~cbo_valid`：cbo 时恒 0（x & 0 = 0），非 cbo 时原样通过 ✓
-        wire illegal = (ill_instr & ~cbo_valid) | (opt == 4'd15) | csr_ill | cbo_ill_perm;
+        wire illegal = (ill_instr & ~cbo_valid) | (opt == 4'd15) | csr_ill | cbo_ill_perm |
+                       xret_priv_ill | sfence_priv_ill;
         wire kill    = unsup | illegal;
 
         wire rs1_used = ((opt == 4'd0) | (opt == 4'd1) | (opt == 4'd3) | (opt == 4'd4) |
@@ -777,7 +791,14 @@ module backend_top #(
         wire rs2_f    = (fp_two_fp_src | is_fma |
                          ((opt == 4'd12) & (memop == 4'd8))) & ~kill;
         wire rs3_f    = is_fma & ~kill;
-        wire dst_fp   = fp_we & (drd != 5'd0) & ~kill;
+        //   ★★ F1-后端修复（02-1）：**FP 目的寄存器 f0 不是 x0**，不得沿用整数 x0 的
+        //     "硬连零/丢弃写"规则。旧式 `dst_fp = fp_we & (drd != 0) & ~kill` 使
+        //     `flw/fadd.s/fcvt.s.w f0,…` 不请求重命名、不分配物理寄存器、不写 FP PRF、
+        //     提交也不更新 FP ARAT ⇒ 后续消费者永远读到旧值（f0 被静默吞掉）。
+        //     ISA 依据：RISC-V 只有整数 x0 是硬连零；浮点寄存器组 f0..f31 全部可写。
+        //     整数侧 `dst_int` 的 `drd != 0` 保持不变（x0 仍硬零）。
+        //     与 `dst_fp` 同源的 `~kill` 保留：非法/不支持指令不得请求任何目的写。
+        wire dst_fp   = fp_we & ~kill;
         wire dst_int  = ~fp_we & (drd != 5'd0) & (wbsel != WB_NONE) & ~kill;
         wire is_load_u  = (((opt == 4'd4) & (memop == 4'd1)) |
                            ((opt == 4'd12) & (memop == 4'd7))) & ~kill;

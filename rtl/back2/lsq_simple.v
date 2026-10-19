@@ -16,7 +16,7 @@
 //     更老 store 均已定址 ⇒ 放行（重叠字节由转发/合并兜住）。
 //   · **LQ**：load 在 **D3 派发期**分配槽位（程序序；2B-4 第二步），响应按 `ld_tag` 标签
 //     **乱序写回**（`ld_dn` 标记数据已齐），槽位本身**在提交点释放**（§4.4b：
-//     `(ld_rob - rob_head) & 7'h7F < cmt_n`，冲刷/陷阱拍 `cmt_n=0`）。
+//     `((ld_rob - rob_head) mod 2^ROB_IDX_W) < cmt_n`，冲刷/陷阱拍 `cmt_n=0`）。
 //   · **字节级 load→store 转发**（§6.2）：扫描**更老且地址已确认**的 store（32 候选 ×
 //     4 字节道），取**最年轻**的更老匹配者；全部字节命中 ⇒ 不访问存储、次拍直接写回。
 //   · **store 提交排空**：地址/数据在 E1 生成后驻留 STQ，**只在 ROB 提交该 store 时**
@@ -220,6 +220,21 @@ module lsq_simple #(
     //         精确上报（`upd_exc`），并作为"不得提交"的解阻塞位（否则提交门会死等 PA）。
     //         只有 **STQ 源**（= 执行期，见 §3.4/§4.5c）的故障才置位；CDQ 源故障另走 fail-safe。
     reg                  stq_bad [0:STQ_N-1];
+    //   ★★ F1/F2/F4/F5（LSQ 语义修复批次）新增的**显式生命周期/高字翻译**状态：
+    //     · `stq_cmt`：该项**已提交进 CDQ**（程序序上已退休）。年龄（ROB 环绕距离）只描述
+    //       "离 ROB 头多远"，**不能**区分"在窗口内待提交"与"已提交未排空" ⇒ 二者必须用
+    //       独立状态位区分（禁止再用 `& 7'h7F` 魔数把已越过 ROB 头的项推到大年龄区间）：
+    //         - `stq_win_w` / `unk_v` / 转发快照都只对 `~stq_cmt` 的项成立；
+    //         - squash（分支误判冲刷）**不得**清除已提交项（其写已由 CDQ 携带，见 F4）；
+    //         - `stq_ret`（已排空/已出 CDQ）仍是队头回收的唯一依据。
+    //     · `stq_xpg`：本项为拆笔 store（`stq_hi`）且**高字地址 VA+4 跨 4 KB 页** ⇒ 高字
+    //       必须**独立翻译**（F5：不得沿用低字 PA+4）。
+    //     · `stq_hpa/stq_hpv/stq_hctx`：高字独立翻译结果（PA / 定妥 / 上下文）。
+    reg                  stq_cmt [0:STQ_N-1];
+    reg  [31:0]          stq_hpa  [0:STQ_N-1];
+    reg                  stq_hpv  [0:STQ_N-1];
+    reg  [3:0]           stq_hctx [0:STQ_N-1];
+    reg                  stq_xpg  [0:STQ_N-1];
 
     //==========================================================================
     // 0b. ★★ (b2) 新增输入的**悬空净化** + **提交窗"翻译定妥"门**
@@ -252,34 +267,62 @@ module lsq_simple #(
     //     defined as a genvar` + `8-8891 'gv' is already declared`（首次 2B 综合实测）。
     //     仅声明位置变化，**零行为差异**。
     genvar gv, gb, gk, gj;
-    //   ★★ C8：**STQ 每项年龄的唯一计算点** —— `stq_age[gv] = (stq_rob[gv] − rob_head) & 7'h7F`。
-    //     宽度/掩码与旧实现**逐位一致**（7 bit 模 128：越过 ROB 头的项落在 65..127，
-    //     恒大于任何窗口内年龄 <64 ⇒ **不能**收窄成 6 bit 模 64，B27 口径见下方 ld 释放注）。
-    //     旧实现把同一表达式在三处各算一遍：`stq_win_w`（提交窗，STQ_N 项）、`unk_v`
-    //     （更老未定址闸门，STQ_N 项）、`fw_age_e`（转发窗口，STQ_N 项）⇒ 本线是它们的
-    //     共同真源（审计 §A-A1 第 3 条 / §C8 的方向③）。
+    //   ★★ F1：**ROB 环绕年龄的唯一计算点** —— `age = (idx − rob_head) mod 2^ROB_IDX_W`
+    //     （先按 `ROB_IDX_W` 位取模、再零扩展到 8 bit）。
+    //     旧实现 `(a − b) & 7'h7F` 把距离算成模 128：ROB 只有 64 项 ⇒ `head=63` 时下一条
+    //     （`rob=0`）的年龄是 65 而不是 1 ⇒ 提交窗口/发射闸门/转发窗口全部漏判（F1）。
+    //   ★ "已越过 ROB 头（已提交未排空）"与"仍在头前方窗口内"的区分**不再靠大年龄**，
+    //     而由显式状态 `stq_cmt`（已入 CDQ）与 `stq_ret`（已排空）表达 —— 见 §0 声明。
+    localparam [ROB_IDX_W-1:0] ROB_AGE_MOD = {ROB_IDX_W{1'b1}};
     wire [8*STQ_N-1:0] stq_age;
+    //   本项"按当前上下文定妥"的两个独立判定（低字 / 高字）—— 提交窗门与扫描器同源：
+    //     · 低字：`~stx_en | (stq_pv & ctx 一致)`；
+    //     · 高字：不拆笔/不跨页时随低字（恒 1）；跨页时必须独立翻译定妥。
+    wire [STQ_N-1:0] stq_low_ok_w, stq_hi_ok_w;
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqok
+        assign stq_low_ok_w[gv] = ~stx_en_w |
+                                  (stq_pv[gv]  & (stq_ctx[gv]  == st_xlate_ctx));
+        assign stq_hi_ok_w[gv]  = ~stx_en_w | ~stq_hi[gv] | ~stq_xpg[gv] |
+                                  (stq_hpv[gv] & (stq_hctx[gv] == st_xlate_ctx));
+    end
+    endgenerate
+    //   ★★ 修复（初审 #1）：高字（拆笔第二笔）地址统一为**对齐的下一个 4 B 字基址**
+    //     `HA(VA) = (VA & ~3) + 4`。旧式 `VA+4` 对 `sh@0xFFF` 得 0x1003：既不是真正被写的
+    //     字节地址（0x1000），也会让第二页故障的 mtval 报错“故障部分 VA”。
+    //     · `stq_hva_w[gv]` = 高字 VA（提交/翻译/CDQ 共用）；
+    //     · `stq_lpa_w[gv]` = 提交拍口径的低字有效 PA（需翻译取 `stq_pa`，否则 VA）；
+    //     · `stq_hpa_same_w[gv]` = 不跨页时的高字 PA = `HA(低字有效 PA)`。
+    wire [32*STQ_N-1:0] stq_hva_w, stq_lpa_w, stq_hpa_same_w;
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqaddr
+        assign stq_hva_w[gv*32 +: 32]      = {stq_a[gv][31:2], 2'b00} + 32'd4;
+        assign stq_lpa_w[gv*32 +: 32]      = stx_en_w ? stq_pa[gv] : stq_a[gv];
+        assign stq_hpa_same_w[gv*32 +: 32] = {stq_lpa_w[gv*32 + 2 +: 30], 2'b00} + 32'd4;
+    end
+    endgenerate
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqage
-        assign stq_age[gv*8 +: 8] = (stq_rob[gv] - rob_head) & 7'h7F;
+        assign stq_age[gv*8 +: 8] = {2'b0, ((stq_rob[gv] - rob_head) & ROB_AGE_MOD)};
     end
     endgenerate
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stqblk
-        assign stq_win_w[gv] = stq_v[gv] & stq_av[gv] & ~stq_ret[gv] &
+        assign stq_win_w[gv] = stq_v[gv] & stq_av[gv] & ~stq_ret[gv] & ~stq_cmt[gv] &
                                (stq_age[gv*8 +: 8] < W[7:0]);
         assign stq_blk_w[gv] = stq_win_w[gv] & ~stq_bad[gv] &
-                               ~(~stx_en_w | (stq_pv[gv] & (stq_ctx[gv] == st_xlate_ctx)));
+                               ~(stq_low_ok_w[gv] & stq_hi_ok_w[gv]);
     end
     endgenerate
     wire stq_blk_any_w = |stq_blk_w;
 
-    wire [7:0] age_rob  = (exe_rob - rob_head) & 7'h7F;      // E1 项年龄（转发窗口）
+    wire [7:0] age_rob  = {2'b0, ((exe_rob - rob_head) & ROB_AGE_MOD)};   // E1 项年龄（转发窗口）
     //   ★★ 2B-3 第 6 段第二步：**发射闸门必须按"候选（i4_sel）"判年龄**。
     //     旧实现用 `age_rob`（= 正在 E1 的那条，即上一拍发射的项）⇒ 闸门判的是别人，
     //     只在"load 紧跟在 store 之后发射"这一拍凑巧正确（INORD_LOAD 队列门兜底）。
     //     本段把闸门改为候选年龄 `age_iss`，"更老未定址 store"判定逐条精确。
-    wire [7:0] age_iss  = (iss_rob - rob_head) & 7'h7F;      // I1 候选年龄（发射闸门）
+    wire [7:0] age_iss  = {2'b0, ((iss_rob - rob_head) & ROB_AGE_MOD)};   // I1 候选年龄（发射闸门）
+    wire [7:0] age_sq   = {2'b0, ((squash_idx - rob_head) & ROB_AGE_MOD)};// 冲刷点年龄（squash 比较）
 
     //==========================================================================
     // 1. D3 分配（store 项）
@@ -385,7 +428,7 @@ module lsq_simple #(
     wire [STQ_N-1:0] unk_v;
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_unk
-        assign unk_v[gv] = stq_v[gv] & ~stq_av[gv] &
+        assign unk_v[gv] = stq_v[gv] & ~stq_av[gv] & ~stq_cmt[gv] &
                            (stq_age[gv*8 +: 8] < age_iss);   // ★ C8：复用 STQ 唯一年龄向量
     end
     endgenerate
@@ -405,7 +448,7 @@ module lsq_simple #(
     //   历史口径（已废止，仅存档）：扫描更老且地址已确认的 store（32 候选 × 8 字节道），
     //      取该字节上最年轻的匹配者（age = 离 ROB 头的距离 ⇒ 越大越年轻）。
     //   重写点（只消除重复，不改语义；对应审计 A-A4 的三条方向）：
-    //     ① **per-entry 年龄向量**：`(stq_rob - rob_head) & 7'h7F` 每 store 只算一次
+    //     ① **per-entry 年龄向量**：`(stq_rob - rob_head) mod 2^ROB_IDX_W` 每 store 只算一次
     //        （旧：每字节每 store 各算一份，源码 512 份）；
     //     ② **高字加法器移出字节循环**：load 侧只保留 **w0-1 / w0 / w0+1 / w0+2** 四个
     //        字数，与 store 低字 `stq_a[31:2]` 做 4 个等值比较（旧：每字节每 store 一次
@@ -477,7 +520,7 @@ module lsq_simple #(
     wire [STQ_N-1:0]   fw_eqm_e, fw_eq0_e, fw_eqp_e, fw_eqp2_e;
     generate
     for (gj = 0; gj < STQ_N; gj = gj + 1) begin : g_fw_pre
-        assign fw_live_e[gj]       = stq_v[gj] & stq_av[gj] &
+        assign fw_live_e[gj]       = stq_v[gj] & stq_av[gj] & ~stq_cmt[gj] &
                                      (stq_age[gj*8 +: 8] < age_rob);
         assign fw_eqm_e[gj]        = (stq_a[gj][31:2] == fw_lwm1);
         assign fw_eq0_e[gj]        = (stq_a[gj][31:2] == exe_addr[31:2]);
@@ -491,10 +534,9 @@ module lsq_simple #(
     //   store"比较-选择树（248 个 `fw_max2`，携带 8 bit 年龄 + 8 bit 数据 + 1 bit 命中），
     //   并有"树内 age 位宽 8→6 的 sound 收窄"论证。纯等待变体不再需要**任何**"谁是胜者"
     //   的判定（没有转发数据可合并）⇒ 该函数与整棵树删除，只剩下面的命中归约 (d)。
-    //   ★ **唯一必须沿用的纪律**（与 N29B 无关的既有口径）：`fw_live_e` 的有效门是
-    //     `stq_age & 7'h7F`（7 bit 模 128，见 §0 的 `stq_age` 唯一计算点），**禁止**收窄成
-    //     6 bit / 模 64 —— `& 7'h7F` 正是"在 ROB 窗口内"与"已越过 ROB 头（提交但未排空）"
-    //     两者的区分依据，收窄会漏掉应计入的项。本变体同样按原样使用它。
+    //   ★ **口径修正（F1）**：`fw_live_e` 的有效门用 §0 的 `stq_age`（**模 2^ROB_IDX_W** 的
+    //     ROB 环绕距离）并显式排除 `stq_cmt`（已提交项）。"在 ROB 窗口内"与"已越过 ROB 头
+    //     （提交但未排空）"由 `stq_cmt`/`stq_ret` 显式区分 —— 不再靠 7 bit 大年龄区间。
     // ---- (d) ★★ N29B：每字节 × 32 候选的**命中/覆盖叶子**（纯 OR 归约）----
     //   本字节地址 = `exe_addr + gb`，其字数 = w0 + gcar、字内道 = gcar/lane（只由
     //   `exe_addr[1:0]` 与常量 gb 决定 ⇒ 与旧逐字节转发树**逐位同源**，见 `lmask_w8` 注）。
@@ -565,7 +607,7 @@ module lsq_simple #(
     //     值；无未落地项时收敛到哨兵 `8'hFF`（恒大于任何 7-bit 年龄 ⇒ 恒放行）。
     //     ★ `stq_und_v` **不含 `stq_av` 条件** ⇒ **"已分配未执行（地址未解析）"的 store
     //       同样计入保守等待**（任务书明写的"含地址未解析期 `stq_v&~stq_av` 保守等待"）。
-    //   · `age_ld[s] = (ld_rob[s] − rob_head) & 7'h7F`。
+    //   · `age_ld[s] = (ld_rob[s] − rob_head) mod 2^ROB_IDX_W`。
     // 【为什么"全局最小年龄 < 本 load 年龄"⟺"存在更老未落地项"】年龄 = 离 ROB 头的距离；
     //   排空严格按程序序（CDQ 是 FIFO，提交序 = 程序序；8 B store 低半在前）⇒ **未落地
     //   集合在程序序上是后缀**，其最小年龄就是"最老的未落地项"。比本 load 更老的 store
@@ -582,7 +624,7 @@ module lsq_simple #(
     wire [8*STQ_N-1:0] stq_und_age;          // 逐项"未落地则年龄、否则 8'hFF"
     generate
     for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_und
-        assign stq_und_v[gv] = stq_v[gv] & ~stq_ret[gv];
+        assign stq_und_v[gv] = stq_v[gv] & ~stq_ret[gv] & ~stq_cmt[gv];
         assign stq_und_age[gv*8 +: 8] = stq_und_v[gv] ? stq_age[gv*8 +: 8] : 8'hFF;
     end
     endgenerate
@@ -746,6 +788,20 @@ module lsq_simple #(
         end
     endfunction
 
+    //   ★★ F2：**STQ 专用优先级编码器**（输入 = 完整 STQ_N 槽向量，输出 = STQ_IW 下标）。
+    //     旧实现把 32 位 `stx_s_v` 喂给 `pri_enc`（形参只有 `OUT_N=8` 位、返回 `LQ_IW=3` 位）
+    //     ⇒ 唯一待翻译项落在 STQ8..31 时高位被截断：`stx_s_any=1` 但索引变 0
+    //     ⇒ 真正候选的阻塞位永不解除（提交前缀死锁 + 重复翻译错槽）。本函数按 STQ 宽度
+    //     独立编码，覆盖槽 0..STQ_N-1。
+    function [STQ_IW-1:0] stq_pri_enc(input [STQ_N-1:0] v);
+        integer pi;
+        begin
+            stq_pri_enc = {STQ_IW{1'b0}};
+            for (pi = STQ_N-1; pi >= 0; pi = pi - 1)
+                if (v[pi]) stq_pri_enc = pi[STQ_IW-1:0];
+        end
+    endfunction
+
     wire [OUT_N-1:0] ld_free;
     wire [OUT_N-1:0] pend_vec;
     wire [OUT_N-1:0] rsp_vec;
@@ -783,7 +839,7 @@ module lsq_simple #(
     wire [OUT_N-1:0] ld_wait;
     generate
     for (gv = 0; gv < OUT_N; gv = gv + 1) begin : g_lwait
-        wire [7:0] age_ld_w = (ld_rob[gv] - rob_head) & 7'h7F;
+        wire [7:0] age_ld_w = {2'b0, ((ld_rob[gv] - rob_head) & ROB_AGE_MOD)};
         assign ld_wait[gv] = ld_v[gv] & ld_ex[gv] & ld_dep_v[gv] & ~ld_mis[gv] &
                              (stq_old_age < age_ld_w);
     end
@@ -817,6 +873,14 @@ module lsq_simple #(
     reg  [31:0]       cdq_d   [0:CDQ_N-1];
     reg  [3:0]        cdq_m   [0:CDQ_N-1];
     reg  [CDQ_N-1:0]  cdq_v;
+    //   ★★ F4：CDQ 每笔的**身份/生命周期**：
+    //     · `cdq_split`：本笔是拆笔 store 的**低字**（= 非最后一笔）⇒ 出队时**不得**置
+    //       `stq_ret`（旧实现低字 fire 即置 ret ⇒ STQ 槽在低字落地后就被回收复用，
+    //       而高字仍持旧槽号；高字 fire 时给**新占用者**置 ret ⇒ 新项被提前退休/丢写）。
+    //     · `cdq_link`：本笔仍与 STQ 槽**同一代**（可用于回写 `stq_ret`）。整机冲刷清 STQ
+    //       后，在途 CDQ 项失去归属 ⇒ 全部清 0，防止其出队时误置新占用者的 ret。
+    reg  [CDQ_N-1:0]  cdq_split;
+    reg  [CDQ_N-1:0]  cdq_link;
     reg  [CDQ_N-1:0]  cdq_pv;                    // ★ (b)：该笔 PA 已定（可排空）
     reg  [CDQ_N-1:0]  cdq_bad;                   // ★ (b)：该笔翻译故障（作废：不写只弹出）
     reg  [3:0]        cdq_ctx [0:CDQ_N-1];       // ★ (b)：该笔的**提交拍**翻译上下文
@@ -887,16 +951,28 @@ module lsq_simple #(
     reg  [3:0]        stx_ctx_q;                 // 在途翻译上下文（接受拍锁存）
     reg               stx_act_q;                 // 在途标志
     reg               stx_src_q;                 // 0 = 源为 STQ 槽 / 1 = 源为 CDQ 项
+    reg               stx_hi_q;                  // ★★ F5：在途请求是该项的**高字**（VA=低字VA+4）
 
     //   ① E1 拍预翻译请求（一次性，优先于 CDQ 候选）
     //   （输入的悬空净化 `stx_*_w` 已上移到 §0b —— 提交门也要用，必须先声明。）
     wire stx_e1_w = exe_valid & exe_is_store & stx_en_w;
-    //   ② STQ 扫描：**提交窗内"未定妥"的 store**（= §0b 的 `stq_blk_w`，逐项同式）。
-    //      与提交门**同源** ⇒ 既保证"门挡住的项一定有人去翻译"（无死锁），又天然限定为
-    //      "马上要提交的那几条"（不做无谓的投机翻译，也不给投机项打投机异常）。
-    wire [STQ_N-1:0] stx_s_v = stq_blk_w;
-    wire             stx_s_any = |stx_s_v;
-    wire [STQ_IW-1:0] stx_s_idx = pri_enc(stx_s_v);
+    //   ② STQ 扫描：**提交窗内"未定妥"的 store**。
+    //      ★★ F2：下标编码改用 **STQ 宽 `stq_pri_enc`**（旧实现喂 `pri_enc` 把 32 位截成
+    //        8 位 ⇒ STQ8..31 的唯一候选索引恒为 0，真正阻塞位永不解除）。
+    //      ★★ F5：低字与高字（跨 4 KB 的拆笔）**各占一个独立候选**，高字请求的 VA = 低字
+    //        VA+4、由**现有 `st_xlate_*` 接口**独立翻译（不新增端口、不得用 PA+4）。
+    wire [STQ_N-1:0] stx_l_v, stx_h_v;
+    generate
+    for (gv = 0; gv < STQ_N; gv = gv + 1) begin : g_stx_s
+        assign stx_l_v[gv] = stq_win_w[gv] & ~stq_bad[gv] & ~stq_low_ok_w[gv];
+        assign stx_h_v[gv] = stq_win_w[gv] & ~stq_bad[gv] &
+                             stq_hi[gv] & stq_xpg[gv] & ~stq_hi_ok_w[gv];
+    end
+    endgenerate
+    wire              stx_l_any = |stx_l_v;
+    wire              stx_h_any = |stx_h_v;
+    wire [STQ_IW-1:0] stx_l_idx = stq_pri_enc(stx_l_v);
+    wire [STQ_IW-1:0] stx_h_idx = stq_pri_enc(stx_h_v);
     //   ③ CDQ 候选（已提交、PA 未定、未判坏）—— 提交门之后的 fail-safe/活性兜底
     wire [CDQ_N-1:0] stx_c_v;
     generate
@@ -905,18 +981,23 @@ module lsq_simple #(
     end
     endgenerate
     wire              stx_c_any = |stx_c_v;
-    //   CDQ 候选复用 `pri_enc`（32 宽口径）：高位补 0 ⇒ 结果即最低有效候选的下标
+    //   CDQ 候选复用 `pri_enc`（OUT_N 位宽 ≥ CDQ_N）：高位补 0 ⇒ 结果即最低有效候选下标
     wire [OUT_N-1:0]  stx_c_pad = {{(OUT_N-CDQ_N){1'b0}}, stx_c_v};
-    wire [STQ_IW-1:0] stx_c_enc = pri_enc(stx_c_pad);
-    wire [STQ_IW-1:0] stx_c_idx = {{(STQ_IW-CDQ_PW){1'b0}}, stx_c_enc[CDQ_PW-1:0]};
-    //   优先级：E1 预翻译 > **STQ 扫描（提交窗）** > CDQ 扫描
-    wire              stx_pick_c  = ~stx_e1_w & ~stx_s_any;  // 选中的是 CDQ 源
-    wire              stx_sel_v   = stx_e1_w | stx_s_any | stx_c_any;
+    wire [LQ_IW-1:0]  stx_c_enc = pri_enc(stx_c_pad);
+    wire [STQ_IW-1:0] stx_c_idx = {{(STQ_IW-LQ_IW){1'b0}}, stx_c_enc};
+    //   优先级：E1 预翻译 > STQ 低字 > STQ 高字 > CDQ 扫描
+    wire              stx_pick_c  = ~stx_e1_w & ~stx_l_any & ~stx_h_any;   // 选中的是 CDQ 源
+    wire              stx_pick_h  = ~stx_e1_w & ~stx_l_any &  stx_h_any;   // 选中的是 STQ 高字
+    wire              stx_sel_v   = stx_e1_w | stx_l_any | stx_h_any | stx_c_any;
     wire              stx_sel_src = stx_pick_c;              // 1 = CDQ 源
+    wire              stx_sel_hi  = stx_pick_h;              // 1 = STQ 项的高字
     wire [STQ_IW-1:0] stx_sel_idx = stx_e1_w ? exe_stq_idx :
-                                    (stx_pick_c ? stx_c_idx : stx_s_idx);
+                                    (stx_pick_c ? stx_c_idx :
+                                     (stx_pick_h ? stx_h_idx : stx_l_idx));
     wire [31:0]       stx_sel_va  = stx_e1_w ? exe_addr :
-                                    (stx_pick_c ? cdq_a[stx_c_idx] : stq_a[stx_s_idx]);
+                                    (stx_pick_c ? cdq_a[stx_c_idx] :
+                                     (stx_pick_h ? stq_hva_w[stx_h_idx*32 +: 32]
+                                                 : stq_a[stx_l_idx]));
     //   STQ 扫描与 E1 预翻译都用**当下**上下文（提交窗内的项 ⇒ 当下上下文即提交序上下文）
     wire [3:0]        stx_sel_ctx = stx_pick_c ? cdq_ctx[stx_c_idx] : st_xlate_ctx;
 
@@ -928,11 +1009,13 @@ module lsq_simple #(
     wire   stx_accept_w   = st_xlate_valid & stx_ready_w & ~stx_act_q;
     //   完成拍（只在"有在途项"时认；冲刷打断后的**迟到 done** 一律忽略）
     wire   stx_done_w     = stx_dn_w & stx_act_q;
-    //   ★★ (b2) **精确页错误上报**（cause 15 / mtval = VA / rob = 该 store 的 ROB 项）：
+    //   ★★ (b2) **精确页错误上报**（cause 15 / mtval = 故障部分 VA / rob = 该 store 的 ROB 项）：
     //     · 只认 **STQ 源**（执行期、项仍在 STQ ⇒ 尚未提交 ⇒ 可以精确）；
     //     · 只认**提交窗内**的项（窗口外是投机项：上下文可能偏旧 ⇒ 不报，等它进窗口再重译）；
     //     · `~stq_ret`：已退役项不再报。CDQ 源的故障 ⇒ 该项**已提交**（提交门失效的兜底）
     //       ⇒ 不报异常，只走 `cdq_bad`（只弹出、不写；口径登记为已知边界）。
+    //     · ★★ F5：高字故障时 mtval = **高字 VA（= 低字 VA+4）**（ISA：mtval = 故障部分的
+    //       虚拟地址），故 `exc_tval_o` 用 `stx_hi_q` 选 VA+4。
     wire   stx_flt_rep_w = stx_done_w & ~stx_src_q & stx_flt_w &
                            stq_v[stx_idx_q] & ~stq_ret[stx_idx_q] & stq_win_w[stx_idx_q];
 
@@ -1000,6 +1083,13 @@ module lsq_simple #(
 
     //  ★★ N29B：**全转发直通项（`fwdp_*` 9 个寄存器 / 93 FF）已整组删除** ——
     //     纯等待变体没有"E1 次拍直接写回"的快路：每次 load 都占 LQ 槽、等依赖落地后访存。
+    //   ★★ 初审（跨 flush 代际/同拍 done）**本模块可局部收口的部分**：
+    //     `flush_all` 拍（陷阱/维护）不许再向 ROB/PRF 发**推测性副作用**：
+    //       · `wb_valid`（load 写回/异常完成）与 `exc_valid_o`（数据侧精确异常）；
+    //       · 该拍被冲刷的 ROB 项本就会作废，抑制它们是架构正确的。
+    //     残留的“响应代际”问题（响应在途跨冲刷 + 槽复用）需要顶层合同/更宽 tag，
+    //     见 §3.4 头注的注册说明，本模块不越界改端口。
+    wire        fl_flush = (flush_all === 1'b1);
     wire        mis_v;                       // ★ 8 B 非对齐 ⇒ 合成一次带错写回（cause 4）
 
     //   ★★ 4c(3/3)：写回源三选一 —— 全转发 / 访存响应 / **8 B 非对齐合成（带错）**；
@@ -1008,7 +1098,7 @@ module lsq_simple #(
     //   非对齐 8 B：**不发访存请求**，直接合成一次“带错写回”（done+exc 同拍，与 rsp_err 同法）。
     //   判据只吃 `pend` 选择结果 ⇒ 与既有优先级链同源、无新挂起态。
     assign      mis_v        = fire_any & ld_mis[fire_sel] & ~dr_any;
-    assign wb_valid   = rsp_wb_w | mis_v;
+    assign wb_valid   = (rsp_wb_w | mis_v) & ~fl_flush;
     assign wb_rob     = mis_v ? ld_rob[fire_sel] : ld_rob[rsp_sel];
     assign wb_epoch   = mis_v ? ld_ep[fire_sel]  : ld_ep[rsp_sel];
     //   ★★ 4b-2b：带错响应**不得写回目的寄存器**（该 load 将以精确异常结束、
@@ -1035,16 +1125,20 @@ module lsq_simple #(
     //       （store 在 E1 当拍上报：其 ROB `done` 已由 `st_done_valid` 给出，故无需合成写回；
     //         且置 `stq_bad` ⇒ 该项不排空、以精确陷阱结束 —— 与 store 页错误同法）
     wire st_mis_w = exe_valid & exe_is_store & (exe_size == 3'd3) & (exe_addr[2:0] != 3'd0);
-    assign exc_valid_o = (rsp_ok & rsp_err_w) | stx_flt_rep_w | mis_v | st_mis_w;
+    assign exc_valid_o = ((rsp_ok & rsp_err_w) | stx_flt_rep_w | mis_v | st_mis_w) & ~fl_flush;
     assign exc_rob_o   = mis_v    ? ld_rob[fire_sel] :
                          st_mis_w ? exe_rob :
                          stx_flt_rep_w ? stq_rob[stx_idx_q] : ld_rob[rsp_sel];
     assign exc_cause_o = mis_v    ? 4'd4  :
                          st_mis_w ? 4'd6  :
                          stx_flt_rep_w ? 4'd15 : 4'd13;
+    //   ★★ F5：store 翻译故障的 mtval = **故障部分**的 VA —— 低字故障取低字 VA，
+    //     高字（跨 4 KB 拆笔）故障取高字 VA（= 低字 VA+4）。
     assign exc_tval_o  = mis_v    ? ld_addr[fire_sel] :
                          st_mis_w ? exe_addr :
-                         stx_flt_rep_w ? stq_a[stx_idx_q] : ld_addr[rsp_sel];
+                         stx_flt_rep_w ? (stx_hi_q ? stq_hva_w[stx_idx_q*32 +: 32]
+                                                  : stq_a[stx_idx_q])
+                                      : ld_addr[rsp_sel];
     assign wb_pdest_i = mis_v ? {PDW_I{1'b0}} : ld_pi[rsp_sel];
     assign wb_pdest_f = mis_v ? {PDW_F{1'b0}} : ld_pf[rsp_sel];
     //   ★★ 4c(3/3)：8 B 装载 = `{高 4 B 合并值, 首拍锁存的低 4 B}`；ISA 口径 **FLD 不做
@@ -1093,9 +1187,10 @@ module lsq_simple #(
             cnt_ld_q <= 32'h0; cnt_st_q <= 32'h0; cnt_fwd_q <= 32'h0; cnt_stall_q <= 32'h0;
             cdq_cnt <= {(CDQ_PW+1){1'b0}}; cdq_head <= {CDQ_PW{1'b0}}; cdq_tail <= {CDQ_PW{1'b0}};
             cdq_v   <= {CDQ_N{1'b0}};
+            cdq_split <= {CDQ_N{1'b0}}; cdq_link <= {CDQ_N{1'b0}};
             cdq_pv  <= {CDQ_N{1'b0}}; cdq_bad <= {CDQ_N{1'b0}};
             stx_act_q <= 1'b0; stx_src_q <= 1'b0; stx_idx_q <= {STQ_IW{1'b0}};
-            stx_va_q  <= 32'h0; stx_ctx_q <= 4'h0;
+            stx_va_q  <= 32'h0; stx_ctx_q <= 4'h0; stx_hi_q <= 1'b0;
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0;
                 stq_a[si] <= 32'h0; stq_d[si] <= 32'h0; stq_msk[si] <= 4'h0;
@@ -1103,6 +1198,9 @@ module lsq_simple #(
                 stq_rob[si] <= {ROB_IDX_W{1'b0}}; stq_ret[si] <= 1'b0;
                 stq_pa[si] <= 32'h0; stq_pv[si] <= 1'b0; stq_ctx[si] <= 4'h0;
                 stq_bad[si] <= 1'b0;
+                stq_cmt[si] <= 1'b0;
+                stq_hpa[si] <= 32'h0; stq_hpv[si] <= 1'b0; stq_hctx[si] <= 4'h0;
+                stq_xpg[si] <= 1'b0;
             end
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
@@ -1129,6 +1227,8 @@ module lsq_simple #(
             for (si = 0; si < W; si = si + 1) begin
                 if (dr_take[si]) begin
                     cdq_v  [cdq_wp[si]] <= 1'b1;
+                    //   ★★ F1/F4：提交状态在**唯一写点**置位 —— 与 CDQ 入队同拍、原子。
+                    stq_cmt[dr_idx[si*STQ_IW +: STQ_IW]] <= 1'b1;
                     cdq_idx[cdq_wp[si]] <= dr_idx[si*STQ_IW +: STQ_IW];
                     cdq_a  [cdq_wp[si]] <= stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
                     //   PA 判定口径与 §4.5 正常分支**逐字相同**（提交拍权威；见 §3.4 头注）
@@ -1141,42 +1241,75 @@ module lsq_simple #(
                     cdq_ctx[cdq_wp[si]] <= st_xlate_ctx;
                     cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
                     cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
+                    //   ★★ F4：拆笔 store 的**低字**标 "非最后一笔" ⇒ 出队不置 ret；
+                    //     单笔 store `stq_hi=0` ⇒ 出队即最后一笔（照常退休）。
+                    cdq_split[cdq_wp[si]] <= stq_hi[dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_link [cdq_wp[si]] <= 1'b1;   // （flush 分支随后整体清 0）
                     //   ★★ 4c(3/3)：8 B store ⇒ **高半另立一条 CDQ 项**（紧跟低半，
-                    //     程序序：低地址先发）。高半的 PA = 低半 PA + 4（**2A 同口径**：
-                    //     `core_top.v:1640` 的 `m_pa_eff = m_pa_q + (m_hi_q ? 4 : 0)`；虽然
-                    //     `stx_en_w` 下的页跨越 store 按 ISA 应分页翻译，但 2A 本身就是
-                    //     连续 PA 口径 ⇒ 本轮**与 2A 逐位一致**；该差异已登记（报告 §B4.41）。
-                    //     注：载入（fld）第二拍走 **VA+4 完整翻译**（母代理裁决）。
+                    //     程序序：低地址先发）。
+                    //   ★★ F5（本批修正）：高半 PA **不再无条件取低半 PA+4** ——
+                    //     · 不跨 4 KB 页（`~stq_xpg`）：同一页翻译，PA = 低半 PA + 4（与旧口径
+                    //       逐位一致，覆盖 2A 的连续 PA 语义）；
+                    //     · 跨 4 KB 页（`stq_xpg`）：高半 VA+4 落在下一页 ⇒ 必须由 §3.4 的扫描器
+                    //       经**现有 `st_xlate_*` 接口**独立翻译，PA 取 `stq_hpa`，并传播其故障
+                    //       （提交门前定妥；故障 ⇒ `stq_bad` + 精确 cause 15 / mtval=VA+4）。
                     //   ★★ D1-fix：`stq_hi` 现在也含「≤4 B 非对齐跨字 store」⇒ 同一条通路
                     //     为它拆第二笔（低字 = VA、高字 = VA+4），掩码取该项**自己的**
                     //     `stq_mh`（8 B ⇒ 4'hF，与旧硬编码逐位一致；≤4 B 跨界 ⇒ 仅越界道）。
                     if (stq_hi[dr_idx[si*STQ_IW +: STQ_IW]]) begin
                         cdq_v  [cdq_wp[si] + 1'b1] <= 1'b1;
                         cdq_idx[cdq_wp[si] + 1'b1] <= dr_idx[si*STQ_IW +: STQ_IW];
-                        cdq_a  [cdq_wp[si] + 1'b1] <= stq_a [dr_idx[si*STQ_IW +: STQ_IW]] + 32'd4;
-                        cdq_pa [cdq_wp[si] + 1'b1] <= (stx_en_w ? stq_pa[dr_idx[si*STQ_IW +: STQ_IW]]
-                                                               : stq_a [dr_idx[si*STQ_IW +: STQ_IW]]) + 32'd4;
+                        cdq_a  [cdq_wp[si] + 1'b1] <= stq_hva_w[dr_idx[si*STQ_IW +: STQ_IW]*32 +: 32];
+                        //   ★★ F5：高字 PA = 跨页时**独立翻译结果** `stq_hpa`；同页才允许
+                        //     低字 PA+4。禁止无条件 PA+4（旧实现把第二页写到连续物理地址）。
+                        cdq_pa [cdq_wp[si] + 1'b1] <= stq_xpg[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                      ? stq_hpa[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                      : stq_hpa_same_w[dr_idx[si*STQ_IW +: STQ_IW]*32 +: 32];
                         cdq_pv [cdq_wp[si] + 1'b1] <= ~stx_en_w |
-                                                     (stq_pv[dr_idx[si*STQ_IW +: STQ_IW]] &
-                                                      (stq_ctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx));
+                                                     (stq_xpg[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                      ? (stq_hpv [dr_idx[si*STQ_IW +: STQ_IW]] &
+                                                         (stq_hctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx))
+                                                      : (stq_pv  [dr_idx[si*STQ_IW +: STQ_IW]] &
+                                                         (stq_ctx [dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx)));
                         cdq_bad[cdq_wp[si] + 1'b1] <= 1'b0;
                         cdq_ctx[cdq_wp[si] + 1'b1] <= st_xlate_ctx;
                         cdq_d  [cdq_wp[si] + 1'b1] <= stq_dh[dr_idx[si*STQ_IW +: STQ_IW]];
                         cdq_m  [cdq_wp[si] + 1'b1] <= stq_mh[dr_idx[si*STQ_IW +: STQ_IW]];
+                        cdq_split[cdq_wp[si] + 1'b1] <= 1'b0;   // 高字 = 最后一笔
+                        cdq_link [cdq_wp[si] + 1'b1] <= 1'b1;   // （flush 分支随后整体清 0）
                     end
                 end
             end
             if (dr_push_n != {(CDQ_PW+1){1'b0}}) begin
                 cdq_tail <= cdq_tail + dr_push_n[CDQ_PW-1:0];
-                cdq_cnt  <= cdq_cnt + dr_push_n;
             end
-            //   注意：本分支**不**推进 CDQ 出队（下拍照常，`dr_fire` 侧不受影响）——
-            //   代价至多 1 拍，换取"最小改动 + 不触碰排空握手"。
+            //   ★★ F3：**flush 拍也必须做 CDQ 出队记账**（与正常分支同一握手 `dr_fire`）。
+            //     旧实现只在正常分支弹出：flush 与 `dr_fire` 同拍时适配器已接管并**真的写了
+            //     设备/内存**，但 CDQ 仍持原项 ⇒ 后续重复发送（重复副作用）；持续 flush
+            //     （`maint_wait_cdq` 期间保持冲刷）时 CDQ 永不减少 ⇒ 队空等待死锁。
+            //     入队（`dr_push_n`）与出队（`dr_fire`）在本拍**互斥**（入队要求 CDQ 全空、
+            //     出队要求 CDQ 非空）⇒ 单条计数式 `cdq_cnt <= +push −fire` 无竞争。
+            //     本分支**不置 `stq_ret`**：STQ 槽在同拍被清空；且这些 CDQ 项的 `cdq_link`
+            //     被清 0 ⇒ 出队时不会误置（可能已被复用的）槽的 `ret`（F4）。
+            if (dr_fire) begin
+                cdq_v    [cdq_head] <= 1'b0;
+                cdq_pv   [cdq_head] <= 1'b0;
+                cdq_bad  [cdq_head] <= 1'b0;
+                cdq_split[cdq_head] <= 1'b0;
+                cdq_link [cdq_head] <= 1'b0;
+                cdq_head <= cdq_head + 1'b1;
+            end
+            cdq_cnt <= cdq_cnt + dr_push_n - {{CDQ_PW{1'b0}}, dr_fire};
             for (si = 0; si < STQ_N; si = si + 1) begin
                 stq_v[si] <= 1'b0; stq_av[si] <= 1'b0; stq_dv[si] <= 1'b0; stq_ret[si] <= 1'b0;
                 stq_hi[si] <= 1'b0;
                 stq_mh[si] <= 4'h0;
+                stq_cmt[si] <= 1'b0;
+                stq_hpv[si] <= 1'b0; stq_xpg[si] <= 1'b0;
             end
+            //   ★★ F4：整机冲刷后，仍在 CDQ 里的项**失去 STQ 归属**（槽已清、且会被复用）
+            //     ⇒ 这些项出队时**不得**回写 `stq_ret`。
+            cdq_link <= {CDQ_N{1'b0}};
             for (si = 0; si < OUT_N; si = si + 1) begin
                 ld_v[si] <= 1'b0; ld_req[si] <= 1'b0; ld_dn[si] <= 1'b0; ld_ex[si] <= 1'b0;
                 ld_hi[si] <= 1'b0; ld_beat[si] <= 1'b0; ld_mis[si] <= 1'b0; ld_lo[si] <= 32'h0;
@@ -1184,9 +1317,15 @@ module lsq_simple #(
             end
             stq_head_q <= {STQ_IW{1'b0}};
             stq_tail_q <= {STQ_IW{1'b0}};
-            //   ★★ (b)：`flush_all` **不清** 在途翻译状态（`stx_act_q/...`）——
-            //     被冲刷的那笔翻译可以无害地跑完（STQ 写回有 `stq_v & ~stq_pv` 门，见 §4.5b），
-            //     而"已提交但 PA 未到"的项仍靠 **CDQ 源扫描**完成翻译并排空（活性保证）✓。
+            //   ★★ 初审（STQ 翻译 act 跨 flush 代际）：**本拍丢弃在途翻译事务**。
+            //     旧口径“允许它无害跑完”不成立：`flush_all` 清空 STQ 槽后，同号槽**立即
+            //     复用**；迟到 done 会命中新占用者（`stq_v[idx]=1 & ~stq_pv`）并把旧 PA
+            //     写进新项 —— 这是可复现的代际混用，不是“将来才可能”。
+            //     丢弃后：迟到的 `st_xlate_done` 因 `stx_act_q=0` 被忽略（§3.4 的
+            //     `stx_done_w = done & stx_act_q`）；**已提交但 PA 未定**的 CDQ 项仍由
+            //     CDQ 源扫描重新发起翻译（活性不变）；顶层适配器需满足“每接受一次请求恰好
+            //     回一次 done、且 done 早于下一次接受”的单笔在途合同（见 §3.4 头注）。
+            stx_act_q <= 1'b0;
             //     注意：CDQ 本身不受 `flush_all` 影响（既有设计口径，见 §3.3 头注）✓。
         end else begin
 
@@ -1207,6 +1346,12 @@ module lsq_simple #(
                         stq_mh [alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
                         stq_ctx[alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
                         stq_bad[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        //   ★★ F1/F4/F5：显式生命周期与高字翻译状态随槽复用清零。
+                        stq_cmt[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_hpa[alloc_idx[si*STQ_IW +: STQ_IW]] <= 32'h0;
+                        stq_hpv[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
+                        stq_hctx[alloc_idx[si*STQ_IW +: STQ_IW]] <= 4'h0;
+                        stq_xpg[alloc_idx[si*STQ_IW +: STQ_IW]] <= 1'b0;
                         //   ★★ 2B-3 第 6 段第二步（报告 §B3.6.4 的必办项）：ROB 索引在
                         //     **分配期**即写入 ⇒ `stq_rob` 从这一刻起就是真年龄。
                         //     旧实现在 E1 才写 ⇒ "已分配未执行"的 store 里是上一占用者的
@@ -1269,6 +1414,19 @@ module lsq_simple #(
                 stq_hi[exe_stq_idx]  <= st_hi_w;
                 stq_mh[exe_stq_idx]  <= st_mh_w;
                 stq_msk[exe_stq_idx] <= (exe_size == 3'd3) ? 4'hF : lmask_w;
+                //   ★★ F5：**高字（VA+4）是否跨 4 KB 页** —— 高字起始地址的 bit12 为 1
+                //     即跨页（`{1'b0,VA[11:0]}+4 ≥ 0x1000`）。跨页 ⇒ 高字必须由 §3.4 的
+                //     扫描器用**现有 `st_xlate_*` 接口**按 VA+4 独立翻译；同页才能沿用低字
+                //     PA+4。非拆笔项（`st_hi_w=0`）恒不跨，高字状态无效。
+                stq_xpg[exe_stq_idx] <= st_hi_w & (({1'b0, exe_addr[11:0]} + 13'd4) >= 13'h1000);
+                //   ★★ 修复（初审 #1）：高字地址统一取**对齐的下一个 4 B 字基址**
+                //     `(VA & ~3) + 4`（不是 VA+4）：后者对 `sh@0xFFF` 会得到 0x1003，
+                //     既不是真正被写的字节地址（0x1000），也会让故障 mtval 报错部分 VA。
+                stq_hpa[exe_stq_idx] <= {exe_addr[31:2], 2'b00} + 32'd4;
+                stq_hpv[exe_stq_idx] <= 1'b0;
+                stq_hctx[exe_stq_idx]<= st_xlate_ctx;
+                //   ★★ F1/F4：新项尚未提交 —— `stq_cmt` 在分配期已清 0，这里不重复写
+                //     （唯一写点纪律：置位只在提交入队 §4.5/§4.5-flush）。
                 //   `stq_rob` 已在**分配期**写入（§4.2）⇒ 此处不再重复写（唯一写点纪律）。
                 //   实测语义：分配期写入的 rob == 该 store 的 E1 rob（同一 ROB 项）。
                 cnt_st_q <= cnt_st_q + 32'd1;
@@ -1341,11 +1499,11 @@ module lsq_simple #(
             // ---- 4.4b 提交点释放（LQ 项；★ 2B-3 第 6 段第二步）----
             //   释放条件：该 LQ 项的 ROB 索引落在**本拍提交组** [head, head+cmt_n) 内。
             //   依据：提交组恒为"从 ROB 头起的连续若干项"（rob.v 的前缀链），故用**窗口算术**
-            //   `(ld_rob - rob_head) & 7'h7F < cmt_n` 判定（禁掩码写法，B27 口径）；
+            //   `((ld_rob - rob_head) mod 2^ROB_IDX_W) < cmt_n` 判定（F1 环绕口径）；
             //   释放是**幂等**的：不在窗口内的项保持占用，写回后的项靠 `ld_dn` 与请求口隔离。
             //   `cmt_n` 由 backend_top 按 `cmt_ok`（非 squash/flush）门控后送入 ⇒ 冲刷拍恒 0。
             for (si = 0; si < OUT_N; si = si + 1) begin
-                if (ld_v[si] & (((ld_rob[si] - rob_head) & 7'h7F) < {5'b0, cmt_n})) begin
+                if (ld_v[si] & ({2'b0, ((ld_rob[si] - rob_head) & ROB_AGE_MOD)} < {5'b0, cmt_n})) begin
                     ld_v  [si] <= 1'b0;
                     ld_req[si] <= 1'b0;
                     ld_dn [si] <= 1'b0;
@@ -1364,6 +1522,8 @@ module lsq_simple #(
             for (si = 0; si < W; si = si + 1) begin
                 if (dr_take[si]) begin
                     cdq_v  [cdq_wp[si]] <= 1'b1;
+                    //   ★★ F1/F4：提交状态在**唯一写点**置位 —— 与 CDQ 入队同拍、原子。
+                    stq_cmt[dr_idx[si*STQ_IW +: STQ_IW]] <= 1'b1;
                     cdq_idx[cdq_wp[si]] <= dr_idx[si*STQ_IW +: STQ_IW];
                     cdq_a  [cdq_wp[si]] <= stq_a  [dr_idx[si*STQ_IW +: STQ_IW]];
                     //   ★★ (b)：PA 三件套随提交拷贝（与 `cdq_a/d/m` 同构），且**提交拍口径
@@ -1381,19 +1541,31 @@ module lsq_simple #(
                     cdq_ctx[cdq_wp[si]] <= st_xlate_ctx;
                     cdq_d  [cdq_wp[si]] <= stq_d  [dr_idx[si*STQ_IW +: STQ_IW]];
                     cdq_m  [cdq_wp[si]] <= stq_msk[dr_idx[si*STQ_IW +: STQ_IW]];
+                    //   ★★ F4：拆笔 store 的**低字**标 "非最后一笔" ⇒ 出队不置 ret；
+                    //     单笔 store `stq_hi=0` ⇒ 出队即最后一笔（照常退休）。
+                    cdq_split[cdq_wp[si]] <= stq_hi[dr_idx[si*STQ_IW +: STQ_IW]];
+                    cdq_link [cdq_wp[si]] <= 1'b1;   // （flush 分支随后整体清 0）
                     if (stq_hi[dr_idx[si*STQ_IW +: STQ_IW]]) begin
                         cdq_v  [cdq_wp[si] + 1'b1] <= 1'b1;
                         cdq_idx[cdq_wp[si] + 1'b1] <= dr_idx[si*STQ_IW +: STQ_IW];
-                        cdq_a  [cdq_wp[si] + 1'b1] <= stq_a [dr_idx[si*STQ_IW +: STQ_IW]] + 32'd4;
-                        cdq_pa [cdq_wp[si] + 1'b1] <= (stx_en_w ? stq_pa[dr_idx[si*STQ_IW +: STQ_IW]]
-                                                               : stq_a [dr_idx[si*STQ_IW +: STQ_IW]]) + 32'd4;
+                        cdq_a  [cdq_wp[si] + 1'b1] <= stq_hva_w[dr_idx[si*STQ_IW +: STQ_IW]*32 +: 32];
+                        //   ★★ F5：高字 PA = 跨页时**独立翻译结果** `stq_hpa`；同页才允许
+                        //     低字 PA+4。禁止无条件 PA+4（旧实现把第二页写到连续物理地址）。
+                        cdq_pa [cdq_wp[si] + 1'b1] <= stq_xpg[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                      ? stq_hpa[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                      : stq_hpa_same_w[dr_idx[si*STQ_IW +: STQ_IW]*32 +: 32];
                         cdq_pv [cdq_wp[si] + 1'b1] <= ~stx_en_w |
-                                                     (stq_pv[dr_idx[si*STQ_IW +: STQ_IW]] &
-                                                      (stq_ctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx));
+                                                     (stq_xpg[dr_idx[si*STQ_IW +: STQ_IW]]
+                                                      ? (stq_hpv [dr_idx[si*STQ_IW +: STQ_IW]] &
+                                                         (stq_hctx[dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx))
+                                                      : (stq_pv  [dr_idx[si*STQ_IW +: STQ_IW]] &
+                                                         (stq_ctx [dr_idx[si*STQ_IW +: STQ_IW]] == st_xlate_ctx)));
                         cdq_bad[cdq_wp[si] + 1'b1] <= 1'b0;
                         cdq_ctx[cdq_wp[si] + 1'b1] <= st_xlate_ctx;
                         cdq_d  [cdq_wp[si] + 1'b1] <= stq_dh[dr_idx[si*STQ_IW +: STQ_IW]];
                         cdq_m  [cdq_wp[si] + 1'b1] <= stq_mh[dr_idx[si*STQ_IW +: STQ_IW]];
+                        cdq_split[cdq_wp[si] + 1'b1] <= 1'b0;   // 高字 = 最后一笔
+                        cdq_link [cdq_wp[si] + 1'b1] <= 1'b1;   // （flush 分支随后整体清 0）
                     end
                 end
             end
@@ -1402,13 +1574,20 @@ module lsq_simple #(
                 cdq_v[cdq_head] <= 1'b0;
                 cdq_pv[cdq_head] <= 1'b0;      // （同拍入队不会撞队头：见 §3.4 的 `cdq_wp` 论证）
                 cdq_bad[cdq_head] <= 1'b0;
+                cdq_split[cdq_head] <= 1'b0;
+                cdq_link [cdq_head] <= 1'b0;
                 cdq_head        <= cdq_head + 1'b1;
             end
             cdq_cnt <= cdq_cnt + dr_push_n - {{CDQ_PW{1'b0}}, dr_fire};
             //   队头回收：已排空（stq_ret）或已作废（冲刷/未执行前被清）⇒ 指针前移。
             //   ★ 若本拍分配器正好要写队头槽（队头无效时才可能），本拍不回收，
             //     否则会把新项顶掉（下拍再回收，不会饿死）。
-            if (dr_fire) stq_ret[dr_sel] <= 1'b1;
+            //   ★★ F4：**只有"最后一笔"出队才置 `stq_ret`**：
+            //     · 拆笔 store 的低字（`cdq_split=1`）出队时**不退休** —— 其 STQ 槽必须留到
+            //       高字也落地，否则槽被回收复用后，高字出队会把新占用者误标为已退休；
+            //     · `cdq_link=0`（整机冲刷后失去 STQ 归属的孤儿项）**不退休**任何槽。
+            if (dr_fire && ~cdq_split[cdq_head] && cdq_link[cdq_head])
+                stq_ret[dr_sel] <= 1'b1;
             if (!alloc_hits_head && (!stq_v[stq_head_q] | stq_ret[stq_head_q])) begin
                 stq_v[stq_head_q] <= 1'b0;
                 stq_head_q <= stq_head_q + 1'b1;
@@ -1421,17 +1600,31 @@ module lsq_simple #(
                 stx_va_q  <= stx_sel_va;
                 stx_ctx_q <= stx_sel_ctx;
                 stx_src_q <= stx_sel_src;
+                stx_hi_q  <= stx_sel_hi;      // ★★ F5：本次请求是否为该项高字
             end else if (stx_done_w) begin
                 stx_act_q <= 1'b0;
             end
             if (stx_done_w) begin
                 if (stx_src_q == 1'b0) begin
-                    //   STQ 源（E1 预翻译 / 提交窗扫描）：成功则记 PA **并记下本次用的上下文**
-                    //   （提交门按"上下文是否仍一致"判是否需要用新上下文重译）；
-                    //   故障 ⇒ 仅在**提交窗内**时判坏（`stq_bad` ⇒ 精确陷阱 + 解提交阻塞），
-                    //   窗口外（投机）不判坏、留待进窗后重译（避免用偏旧上下文打投机异常）。
+                    //   STQ 源（E1 预翻译 / 提交窗扫描）。
+                    //   ★★ F5：**低字与高字分别写回**：
+                    //     · 高字（`stx_hi_q=1`，仅跨页拆笔项会出现）：成功 ⇒ 写 `stq_hpa/hpv/hctx`；
+                    //       故障且在提交窗内 ⇒ 判坏（`stq_bad`，精确陷阱 cause 15，mtval=VA+4）。
+                    //     · 低字：原有三态（成功/重译/窗内故障判坏）。
                     if (stq_v[stx_idx_q] & ~stq_ret[stx_idx_q]) begin
-                        if (stx_flt_w) begin
+                        if (stx_hi_q) begin
+                            if (stx_flt_w) begin
+                                if (stq_win_w[stx_idx_q]) stq_bad[stx_idx_q] <= 1'b1;
+                            end else if (~stq_hpv[stx_idx_q]) begin
+                                stq_hpa [stx_idx_q] <= st_xlate_pa;
+                                stq_hpv [stx_idx_q] <= 1'b1;
+                                stq_hctx[stx_idx_q] <= stx_ctx_q;
+                            end else if (stq_hctx[stx_idx_q] != stx_ctx_q) begin
+                                //   重译（新上下文）：覆盖既有高字 PA
+                                stq_hpa [stx_idx_q] <= st_xlate_pa;
+                                stq_hctx[stx_idx_q] <= stx_ctx_q;
+                            end
+                        end else if (stx_flt_w) begin
                             if (stq_win_w[stx_idx_q]) stq_bad[stx_idx_q] <= 1'b1;
                         end else if (~stq_pv[stx_idx_q]) begin
                             stq_pa [stx_idx_q] <= st_xlate_pa;
@@ -1456,15 +1649,19 @@ module lsq_simple #(
             end
 
             // ---- 4.6 冲刷 ----
+            //   ★★ F1/F4：**已提交（`stq_cmt`）的 store 绝不能被年轻分支的 squash 清掉** ——
+            //     它的写已由 CDQ 携带，且其 STQ 槽仍用于"最后一笔出队才置 ret"的生命周期
+            //     （F4 拆笔低/高字身份）；旧实现用模 128 年龄把已越过 ROB 头的项算成大年龄，
+            //     刚好落进"更年轻"一侧 ⇒ 被误清。这里显式排除 `stq_cmt`。
             if (squash) begin
                 for (si = 0; si < STQ_N; si = si + 1) begin
-                    if (stq_v[si] &&
-                        (((stq_rob[si] - rob_head) & 7'h7F) > ((squash_idx - rob_head) & 7'h7F)))
+                    if (stq_v[si] && ~stq_cmt[si] &&
+                        (stq_age[si*8 +: 8] > age_sq))
                         stq_v[si] <= 1'b0;
                 end
                 for (si = 0; si < OUT_N; si = si + 1) begin
                     if (ld_v[si] &&
-                        (((ld_rob[si] - rob_head) & 7'h7F) > ((squash_idx - rob_head) & 7'h7F))) begin
+                        ({2'b0, ((ld_rob[si] - rob_head) & ROB_AGE_MOD)} > age_sq)) begin
                         ld_v[si]   <= 1'b0;
                         ld_req[si] <= 1'b0;
                         ld_dn[si]  <= 1'b0;
@@ -1507,16 +1704,16 @@ module lsq_simple #(
             if (pend_any) begin
                 $display("[lsu-dbg %m] PEND sel=%0d addr=0x%08x size=%0d rob=%0d rob_head=%0d age_l=%0d",
                          pend_sel, ld_addr[pend_sel], ld_size[pend_sel], ld_rob[pend_sel],
-                         rob_head, ((ld_rob[pend_sel] - rob_head) & 7'h7F));
+                         rob_head, ({2'b0, ((ld_rob[pend_sel] - rob_head) & ROB_AGE_MOD)}));
                 for (dl = 0; dl < STQ_N; dl = dl + 1)
                     if (stq_v[dl])
                         $display("[lsu-dbg %m]   stq[%0d] av=%b msk=%b a=0x%08x age_s=%0d addr_eq=%b mskhit=%b age_lt=%b",
                                  dl, stq_av[dl], stq_msk[dl], stq_a[dl],
-                                 ((stq_rob[dl] - rob_head) & 7'h7F),
+                                 {2'b0, ((stq_rob[dl] - rob_head) & ROB_AGE_MOD)},
                                  (stq_a[dl][31:2] == ld_addr[pend_sel][31:2]),
                                  stq_msk[dl][ld_addr[pend_sel][1:0]],
-                                 (((stq_rob[dl] - rob_head) & 7'h7F) <
-                                  ((ld_rob[pend_sel] - rob_head) & 7'h7F)));
+                                 ({2'b0, ((stq_rob[dl] - rob_head) & ROB_AGE_MOD)} <
+                                  {2'b0, ((ld_rob[pend_sel] - rob_head) & ROB_AGE_MOD)}));
             end
         end
     end

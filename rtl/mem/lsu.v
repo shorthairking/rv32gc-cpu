@@ -25,6 +25,8 @@
 //      [首字节..边界) 与 [边界..末字节] 两笔。
 //  4 AMO 被 PMP 拒 **恒 cause 7**：AMO/LRSC/CMO 走 `amo_unit`/`cmo_unit`，
 //      其 PMP 拒绝统一映射为 cause 7（见 §6 cause 选择）。
+//      ★ CBM（Zicbom clean/flush/inval）的**权限判定**是 load **或** store
+//        （[norm:cbm_access]），只有 cause 恒 7 —— 见 §6.3b 的实例 C。
 //  5 PMP 粒度 G=0 ⇒ NA4 可用：pmp_check 参数直通真源，本模块不做低位掩码。
 //  6 无 PMP 匹配：M 成功 / S/U 失败：由 pmp_check 内部按特权级判定（本模块只传 priv）。
 //  7 **mtval 恒 VA**（即使物理 access fault）：本模块输出 `mtval_o = mem_va_i`，
@@ -256,7 +258,9 @@ module lsu #(
 
     // 访问类型（传给 pmp_check）：
     //   · LR        ⇒ PT_LOAD（读；PMP 拒 ⇒ cause 5）
-    //   · AMO/SC/CMO⇒ PT_AMO （T4：恒 cause 7）
+    //   · AMO/SC    ⇒ PT_AMO （T4：恒 cause 7）
+    //   · CBM       ⇒ 见下（load **或** store 都允许；本模块用"两路实例取或"表达，
+    //                  **不**扩大 pmp_check 的端口/权限表达 —— 它只认单一访问类型）
     //   · load      ⇒ PT_LOAD
     //   · store     ⇒ PT_STORE
     wire [1:0] pmp_acc_type = is_load ? PT_LOAD :
@@ -264,12 +268,28 @@ module lsu #(
                               is_lr    ? PT_LOAD :
                               (amo_like_pmp || is_cbo) ? PT_AMO : PT_LOAD;
 
+    // ---- ★ CBM（Zicbom clean/flush/inval）的 PMP 权限口径（2026-10，审计 04-06）----
+    //   ISA [norm:cbm_access]（cmo.adoc:311-406）：
+    //     "A cache-block management instruction is permitted to access the specified
+    //      cache block whenever a **load instruction or store instruction** is
+    //      permitted to access the corresponding physical addresses."
+    //   ⇒ 只读区（PMP 给 R 不给 W）上的 cbo.clean/flush/inval **必须允许**；
+    //     原实现一律按 PT_AMO（需 W）⇒ 误报 store access fault（cause 7）。
+    //   实现（母 Agent 批准的**最小**扩展）：pmp_check 新增一个**共享同一匹配/优先级
+    //     网络**的组合输出 `allow_rw_o`（"同一命中项按 R 或 W 判权"），CBM 用它；
+    //     **不**再例化第二套 16 项匹配器，也不改 pmp_check 的 allow_o/cause/acc_type
+    //     语义（acc_type=3 的 AMO 口径仍是"需 W"）。
+    //   被拒时 cause 仍恒 7（[norm:cbmunpermfault]）。
+
     // 所需权限（供 TLB/PTW 页权限解释；PMP 侧由 pmp_check 按类型自行判）
-    //   LR 需 R；AMO/SC/CMO 需 W（store/AMO 同族）；store 需 W；load 需 R
+    //   LR 需 R；AMO/SC 需 W（store/AMO 同族）；store 需 W；load 需 R
+    //   ★ CBM（Zicbom clean/flush/inval）需 **R**（load **或** store 均可，
+    //     [norm:cbm_access]）；原实现给 W ⇒ 只读页被误判。审计 04-06。
     assign need_perm_o = is_load ? 2'b10 :              // {R,W}
                          is_store? 2'b01 :
                          is_lr   ? 2'b10 :
-                         (amo_like_pmp || is_cbo) ? 2'b01 : 2'b10;
+                         is_cbo  ? 2'b10 :
+                         amo_like_pmp ? 2'b01 : 2'b10;
 
     //==========================================================================
     // 5. 非对齐判定（**先于 PMP**，抉择 1）与拆笔
@@ -357,6 +377,7 @@ module lsu #(
 
     // 6.2 PMP 实例 A：本笔（单笔时即为全部；拆笔时为笔 0）
     wire        pmp_a_allow, pmp_a_hit, pmp_a_full;
+    wire        pmp_a_allow_rw;          // ★ CBM 用：同一命中项按 R|W 判权
     wire [3:0]  pmp_a_idx;
     wire [`RV32GC_CAUSE_W-1:0] pmp_a_cause;
 
@@ -375,7 +396,8 @@ module lsu #(
         .fault_cause_o  (pmp_a_cause),
         .hit_o          (pmp_a_hit),
         .hit_idx_o      (pmp_a_idx),
-        .denied_by_full_o (pmp_a_full)
+        .denied_by_full_o (pmp_a_full),
+        .allow_rw_o     (pmp_a_allow_rw)
     );
 
     // 6.3 PMP 实例 B：笔 1（仅拆笔时有效）
@@ -401,13 +423,20 @@ module lsu #(
         .denied_by_full_o (pmp_b_full)
     );
 
-    assign beat0_ok_o = pmp_a_allow;
+    // 6.3b CBM 的 load-OR-store 权限（[norm:cbm_access]）—— **单实例**表达：
+    //   CBM 时取 pmp_check 的附加输出 `allow_rw_o`（同一最低命中项 + 同一整笔覆盖判定，
+    //   只把权限位换成 R|W）；其它访存类型仍用 allow_o（语义逐位不变）。
+    //   ⇒ 不新增匹配器/容量，也不把 acc_type=3（AMO/LRSC/CMO）改成 CBM 口径。
+    wire   pmp_a_eff_allow = is_cbo ? pmp_a_allow_rw : pmp_a_allow;
+
+    assign beat0_ok_o = pmp_a_eff_allow;
     assign beat1_ok_o = pmp_b_allow;
 
     // 6.4 PMP 汇总：**每笔独立**。任一笔记被拒 ⇒ 整体异常。
     //   本设计口径：非对齐拆笔时，**先**检查笔 0，笔 0 过则笔 1 独立判；
     //   两笔各自的副作用允许部分落地（规范明确允许）。
-    wire pmp_deny_any = !pmp_a_allow || (do_split && !pmp_b_allow);
+    //   ★ CBM 走 pmp_a_eff_allow（load OR store，见 6.3b）；CBM 不拆笔（无对齐要求）。
+    wire pmp_deny_any = !pmp_a_eff_allow || (do_split && !pmp_b_allow);
     assign pmp_deny_o = pmp_deny_any;
 
     //==========================================================================
@@ -518,6 +547,9 @@ module lsu #(
     //==========================================================================
     // 10. 异常优先级与 cause 选择（**固定顺序**，见文件头）
     //==========================================================================
+    //  ★ 2026-10（F3 MMU 包，审计 04-06）：CBM 的 PMP 权限 = load **或** store
+    //    （见 §6.3b 的实例 C）；被拒时 cause **仍恒 7**（[norm:cbmunpermfault]：
+    //    "raises a store access-fault exception"），故下面的 cause 选择不变。
     // ① 非对齐优先（抉择 1 / T3）：先于 PMP 与 page fault。
     //    · load             ⇒ cause 4（load address misaligned）
     //    · store/AMO/LRSC   ⇒ cause 6（store/AMO address misaligned）

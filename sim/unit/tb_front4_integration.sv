@@ -210,7 +210,9 @@ module tb_front4_integration_top;
         .fill_owner(l1i_fill_owner), .fill_beats(l1i_fill_beats),
         .fill_accepted(l1i_fill_accepted), .fill_valid(l1i_fill_valid),
         .fill_data(l1i_fill_data), .fill_word_idx(l1i_fill_word_idx),
-        .fill_done(l1i_fill_done), .inval_all(l1i_inval_all), .idle(l1i_idle)
+        .fill_done(l1i_fill_done), .inval_all(l1i_inval_all), .idle(l1i_idle),
+        // ★★ 04-07：无错环境模型 ⇒ 新增错误输入显式接 0（不悬空）
+        .fill_err(1'b0), .cs_err(), .fill_fail(), .err_sticky()
     );
 
     reg     filling;

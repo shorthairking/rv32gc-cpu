@@ -78,6 +78,9 @@ module tb_l1i_top;
     logic         fill_done;
     logic         inval_all;
     logic         idle;
+    // ★★ 04-07：错误通路端口（**必须显式驱动**，不得悬空）
+    logic         fill_err;
+    logic         fill_fail, cs_err, err_sticky;
 
     l1i dut (
         .clk           (clk),
@@ -98,8 +101,12 @@ module tb_l1i_top;
         .fill_data     (fill_data),
         .fill_word_idx (fill_word_idx),
         .fill_done     (fill_done),
+        .fill_err      (fill_err),
+        .fill_fail     (fill_fail),
         .inval_all     (inval_all),
-        .idle          (idle)
+        .idle          (idle),
+        .cs_err        (cs_err),
+        .err_sticky    (err_sticky)
     );
 
     //--------------------------------------------------------------------------
@@ -117,6 +124,7 @@ module tb_l1i_top;
             fill_data    = 32'h0;
             fill_word_idx= 5'h0;
             fill_done    = 1'b0;
+            fill_err     = 1'b0;   // ★ 04-07：无错环境，显式驱动
             inval_all    = 1'b0;
             repeat (3) @(posedge clk);
             rst_n = 1'b1;
@@ -168,6 +176,7 @@ module tb_l1i_top;
             end
             fill_valid = 1'b0;
             fill_done  = 1'b0;
+            fill_err   = 1'b0;
             @(posedge clk);
         end
     endtask
