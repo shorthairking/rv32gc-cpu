@@ -25,15 +25,15 @@
 |---|---|---|
 | G0 Git 基线 | 生成物忽略、复现源码/夹具保留、精选冻结证据保留；文档与审计成果分清提交并推送 `dev`，不夹带功能 RTL 修复 | 已完成：`8556b6b` + `201acf6` 已推送且当时工作树干净；97 个临时生成物忽略，源码与 41 份精选冻结日志保留 |
 | F0 测试基础设施 | fail-closed、输出隔离/留档、正确行为回归及旧基线反证；原 33 个正式 TB 不删除，新增清单不可为空/缺例，跳过算失败 | 第一包已通过：独审先后7项问题均关闭；母最终复跑237项隔离断言、执行输入哈希和旧共享证据内容/mtime/inode均不变；独立探针确认旧误绿路径拒绝及合法正控通过。其余oracle随对应功能包修；9个真实功能包尚未齐全，非阶段完成。旧基线33/33仅作对照 |
-| F1 基础语义与特权 | C 译码、f0、CSR 权限/锁/计数/TVM、中断和 CLINT/PLIC；测试 oracle 同步修正 | 译码/设备已含DUT_ROOT编译隔离并独审0，母最终同源重验：译码80向量/260检查、旧61检查红，正式driver异地+fresh各5正控/19反证；设备55检查、旧8标签且CTRL0、25自证，原3个unit均通过。后端基础包剩2P1退修（同记录重复字段、SHA非零管道吞错）；CSR RTL已窄审0，剩脚本早退初始化P2退修（41向量/101检查主体已自测）。均不表示整核权限接线已完成 |
-| F2 重命名与 LSQ | 回滚 mask/快照、ROB 环绕年龄、STQ 编码、CDQ flush/拆笔身份/跨页 store；不靠缩窗口/单发射隐藏缺陷 | 已派发；同路由遇TRANSPORT/TIMEOUT后有限恢复，不改模型。LSQ本体已交付15向量/258检查新绿、旧69失败且5控制绿，F1–F5待独审；最终PA/设备门禁/跨flush响应代际仍须集成处理。重命名包编码中，未作通过声明 |
+| F1 基础语义与特权 | C 译码、f0、CSR 权限/锁/计数/TVM、中断和 CLINT/PLIC；测试 oracle 同步修正 | 译码/设备已含DUT_ROOT编译隔离并独审0，母最终同源重验：译码80向量/260检查、旧61检查红，正式driver异地+fresh各5正控/19反证；设备55检查、旧8标签且CTRL0、25自证，原3个unit均通过。后端基础包剩2P1退修（同记录重复字段、SHA非零管道吞错）；CSR整包已复审0并母复跑41向量/101检查、旧51检查失败且CTRL0、47自证及2原unit通过，输入哈希不变；将单独归档。均不表示整核权限接线已完成 |
+| F2 重命名与 LSQ | 回滚 mask/快照、ROB 环绕年龄、STQ 编码、CDQ flush/拆笔身份/跨页 store；不靠缩窗口/单发射隐藏缺陷 | 已派发；同路由遇TRANSPORT/TIMEOUT后有限恢复，不改模型。LSQ本体15向量/258检查初审4P1退修（第二beat故障VA/四态/实际输入冻结/ID名称覆盖），原F1–F5主线待收口；最终PA/设备门禁及STQ翻译/LQ响应跨flush代际必须集成处理。重命名已交16向量（7触发9控制）及独立黄金模型，新增旧段shadow的单分裂组前提待独审，不作通过声明 |
 | F3 MMU/Cache/总线 | D 位/SFENCE/高 PA/CMO 权限、写回地址/错误回填、拆分 done；最终 PMP/异常通路与设备副作用 | Cache/AXI与MMU叶模块已独立派发；必要错误/权限接口先报母确认，顶层最后单点合并。memory总包须两个真实子域齐备，缺例不得占位通过 |
 | F4 集成 | 前端取指 fault/跨页 parcel、后端权限/CSR/副作用门控、2A load-use/重定向/EPC，端口/位域变更单点串行合并 | 待做 |
 | F5 阶段验收 | 独立审计、严格完整正式回归、新正确行为回归及受影响集成/锁步；每个确认修复根因至少触发例旧基线红/修复树绿，控制例也须正确；证据绑定版本/配置/同次运行 | 待做 |
 
 不可变旧基线回归已采收：提交 `201acf61e118a3fb533e1a96768687a35efa1751`，源码快照在 `build/functional/baseline-201acf6/src/`，与原冻结清单 245/245 SHA 相同；[回归日志](build/functional/baseline-201acf6/regress.log)记载 33/33、skip=0、fail=0，[退出码](build/functional/baseline-201acf6/exit_code.txt)为0。此为未修复旧树对照，不能作为修复树验收；后台任务已结束并采收。
 
-已验收的局部证据（生成物不代表 Git 已追踪）：F0 [母最终237项自证与输入/旧证据保护记录](build/functional/runner/mother-final-CxIEVQ7h/)，[独立入口反证前后表](build/functional/runner-review-tests/results/candidate.tsv)；译码包[母正向/旧树/19反证/正式unit及输入哈希](build/functional/mother-decode-2cbWh3kD/)。两包均有独立静态复审0剩余；编译隔离最后稿的[母最终同源复测](build/functional/mother-basic-final-oVSA4E5x/)覆盖译码80/260、旧61失败、真实树与fresh各5+19、设备55/旧8标签控制0/25自证/原3unit通过，17输入前后哈希一致。提交前仅修设备脚本一处注释尾空格，[母按最新字节重验设备55/旧8标签/25自证](build/functional/mother-basic-release-yoYSdLqt/)并确认其余16输入未变；未借旧脚本SHA冒充新结果。当前树完整CPU/9包验收未完成。
+已验收的局部证据（生成物不代表 Git 已追踪）：F0 [母最终237项自证与输入/旧证据保护记录](build/functional/runner/mother-final-CxIEVQ7h/)，[独立入口反证前后表](build/functional/runner-review-tests/results/candidate.tsv)；译码包[母正向/旧树/19反证/正式unit及输入哈希](build/functional/mother-decode-2cbWh3kD/)。两包均有独立静态复审0剩余；编译隔离最后稿的[母最终同源复测](build/functional/mother-basic-final-oVSA4E5x/)覆盖译码80/260、旧61失败、真实树与fresh各5+19、设备55/旧8标签控制0/25自证/原3unit通过，17输入前后哈希一致。提交前仅修设备脚本一处注释尾空格，[母按最新字节重验设备55/旧8标签/25自证](build/functional/mother-basic-release-yoYSdLqt/)并确认其余16输入未变；未借旧脚本SHA冒充新结果。[CSR母复测](build/functional/mother-privilege-tmhESGLz/)记录41/101、旧51检查失败/CTRL0、47自证与原CSR/trap两个unit通过及输入前后SHA一致，整包独立复审剩余0。当前树完整CPU/9包验收未完成。
 
 不得放宽断言、保留反向 oracle、删减硬指标来换取成功；冻结审计目录的 `DEFECT_REPRODUCED` 是旧错误复现证据，不能直接当修复树的正确行为门禁。新验证源码与生成输出分开，生成输出放已忽略的 `build/` 下。A 能力声明等既有重大裁决项不得擅自降档，L2 未实现不扩成此次新架构任务；未完成的 ISA/综合/板级能力须明示。以下 D3–D9 保留追溯，**不是本次全部发现清单**。
 

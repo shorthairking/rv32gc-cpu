@@ -122,7 +122,7 @@ module tb_trap_ctrl_top;
     reg     sim_ok = 1'b0;   // 仅在全部检查通过后置 1
 
     task expect_eq32;
-        input [8*40-1:0] name; input [31:0] got; input [31:0] exp;
+        input [8*256-1:0] name; input [31:0] got; input [31:0] exp;
         begin
             if (got !== exp) begin
                 $display("TB_TRAP FAIL: %0s got=0x%08x exp=0x%08x", name, got, exp);
@@ -132,7 +132,7 @@ module tb_trap_ctrl_top;
     endtask
 
     task expect_eq1;
-        input [8*40-1:0] name; input got; input exp;
+        input [8*256-1:0] name; input got; input exp;
         begin
             if (got !== exp) begin
                 $display("TB_TRAP FAIL: %0s got=%0b exp=%0b", name, got, exp);
@@ -464,6 +464,84 @@ module tb_trap_ctrl_top;
         p_mstatus_i = 32'h0; #1;
 
         //======================================================================
+        // G10. 【P1-06】同拍旁路必须为**替换**语义：1→0 可清（旧树 OR ⇒ 必 FAIL）
+        //   旧式 `(old & ~new) | (new & csr_wdata)` 代数等于 `old | csr_wdata`
+        //   ⇒ 只能同拍置位、不能同拍清位。本节全部"1→0"断言即反证实验：
+        //   把 priv_ctrl 的旁路改回 OR 语义，本节的清位断言必须 FAIL。
+        //   ★ 只用真实接口（csr_wen/waddr/wdata、mstatus_i、mprv_o/sum_o/mxr_o/tvm_o/
+        //     tw_o/tsr_o/mpp_o/eff_priv_o、mstatus_set/clr），不 force 内部状态。
+        //======================================================================
+        p_xret_valid = 1'b0; p_trap_valid = 1'b0;
+        //   ---- G10a：MPRV/SUM/MXR/TVM/TW/TSR 全 1，同拍 csrw mstatus,0 ⇒ 全清 ----
+        //     置 MPRV=1 && MPP=S 使有效特权级 = S（此时 SUM/MXR 才可能为 1）。
+        p_mstatus_i = mk_mstatus(1'b1, 1'b1, 1'b1, 1'b1, 1'b1,
+                                 1'b1, 1'b1, 1'b1, `RV32GC_PRIV_S) |
+                      (32'h1 << `RV32GC_MSTATUS_TVM_BIT) |
+                      (32'h1 << `RV32GC_MSTATUS_TW_BIT)  |
+                      (32'h1 << `RV32GC_MSTATUS_TSR_BIT);
+        p_csr_wen = 1'b0; p_csr_waddr = `RV32GC_CSR_MSTATUS; p_csr_wdata = 32'h0; #1;
+        expect_eq1("G10a 前置：MPRV=1 && MPP=S ⇒ eff_priv=S 时 sum_o=1", p_sum_o, 1'b1);
+        expect_eq1("G10a 前置：MXR=1 且 eff_priv=S ⇒ mxr_o=1", p_mxr_o, 1'b1);
+        //   ---- 同拍写 mstatus=0 ----
+        p_csr_wen = 1'b1; p_csr_wdata = 32'h0; #1;
+        expect_eq1("★ G10a 同拍清 MPRV（旧树 OR 残留 1 ⇒ FAIL）", p_mprv_o, 1'b0);
+        expect_eq32("★ G10a MPRV 清后 eff_priv = 当前特权级 M",
+                    {30'b0, p_eff_priv_o}, 32'h3);
+        expect_eq1("★ G10a 同拍清 SUM（旧树 OR 残留 1 ⇒ FAIL）", p_sum_o, 1'b0);
+        expect_eq1("★ G10a 同拍清 MXR", p_mxr_o, 1'b0);
+        expect_eq1("★ G10a 同拍清 TVM", p_tvm_o, 1'b0);
+        expect_eq1("★ G10a 同拍清 TW",  p_tw_o,  1'b0);
+        expect_eq1("★ G10a 同拍清 TSR", p_tsr_o, 1'b0);
+        expect_eq32("★ G10a 同拍清 MPP ⇒ mpp_o=U(0)", {30'b0, p_mpp_o}, 32'h0);
+        //   ---- G10b：MPP 1→0（S→U）同拍生效（旧树 OR 把 MPP 留成 S ⇒ eff=S）----
+        p_mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0,
+                                 1'b1, 1'b0, 1'b0, `RV32GC_PRIV_S);   // MPRV=1, MPP=S
+        p_csr_wdata = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0,
+                                 1'b1, 1'b0, 1'b0, `RV32GC_PRIV_U);   // MPRV=1, MPP=U
+        #1;
+        expect_eq32("★ G10b 同拍把 MPP 由 S 改 U ⇒ eff_priv=U（旧树残留 S ⇒ FAIL）",
+                    {30'b0, p_eff_priv_o}, 32'h0);
+        //   ---- G10c：sstatus 写掩码不得越界清 MPRV/MPP/TVM（也不得漏清 SUM/MXR）----
+        p_mstatus_i = mk_mstatus(1'b1, 1'b1, 1'b1, 1'b1, 1'b1,
+                                 1'b1, 1'b1, 1'b1, `RV32GC_PRIV_S) |
+                      (32'h1 << `RV32GC_MSTATUS_TVM_BIT);
+        p_csr_waddr = `RV32GC_CSR_SSTATUS; p_csr_wdata = 32'h0; #1;
+        expect_eq1("★ G10c sstatus 写清 SUM（旧树 OR 残留 ⇒ FAIL）", p_sum_o, 1'b0);
+        expect_eq1("★ G10c sstatus 写清 MXR（掩码内含 MXR）", p_mxr_o, 1'b0);
+        expect_eq1("G10c sstatus 写**不**清 MPRV（掩码外，保留 1）", p_mprv_o, 1'b1);
+        expect_eq1("G10c sstatus 写**不**清 TVM（掩码外，保留 1）", p_tvm_o, 1'b1);
+        expect_eq32("G10c sstatus 写**不**改 MPP（仍 S）", {30'b0, p_mpp_o}, 32'h1);
+        expect_eq32("G10c MPRV=1 && MPP=S ⇒ eff_priv 仍 S", {30'b0, p_eff_priv_o}, 32'h1);
+        //   ---- G10d：MPP 保留编码 WARL 合法性（写 2'b10 ⇒ 使用点合法化为 S）----
+        p_csr_waddr = `RV32GC_CSR_MSTATUS;
+        p_csr_wdata = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0,
+                                 1'b1, 1'b0, 1'b0, 2'b10);   // MPRV=1, MPP=2'b10(保留)
+        #1;
+        expect_eq32("G10d MPP=2'b10(保留) ⇒ mpp_o 合法化为 S", {30'b0, p_mpp_o}, 32'h1);
+        expect_eq32("G10d MPP 合法化后 eff_priv=S", {30'b0, p_eff_priv_o}, 32'h1);
+        //   ---- G10e：MIE 1→0 同拍可见（用 trap 入口的 mstatus_set 真实输出观测）----
+        //     同拍：csrw mstatus,0（清 MIE） + 陷阱进 M ⇒ MPIE ← f_mie 必须为 0。
+        p_mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0,
+                                 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);   // 架构 MIE=1
+        p_csr_wen = 1'b0; p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_M; #1;
+        expect_eq1("G10e 前置（无 CSR 写）：陷阱进 M ⇒ MPIE ← MIE(1)",
+                   p_mstatus_set[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
+        //   同一组合拍内加入 CSR 写（无时钟沿）：MIE 必须立刻被清 ⇒ MPIE ← 0。
+        p_csr_wen = 1'b1; p_csr_waddr = `RV32GC_CSR_MSTATUS; p_csr_wdata = 32'h0; #1;
+        expect_eq1("★ G10e 同拍清 MIE ⇒ 陷阱 MPIE ← 0（旧树 OR 残留 MIE=1 ⇒ FAIL）",
+                   p_mstatus_set[`RV32GC_MSTATUS_MPIE_BIT], 1'b0);
+        //   ---- G10f：SIE 1→0 同拍可见（sstatus 写 + 陷阱进 S ⇒ SPIE ← f_sie = 0）----
+        p_csr_wen = 1'b0; p_trap_valid = 1'b0; #1;
+        p_mstatus_i = mk_mstatus(1'b0, 1'b1, 1'b0, 1'b0, 1'b0,
+                                 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);   // 架构 SIE=1
+        p_csr_waddr = `RV32GC_CSR_SSTATUS; p_csr_wdata = 32'h0;
+        p_csr_wen = 1'b1;
+        p_trap_valid = 1'b1; p_trap_target = `RV32GC_PRIV_S; #1;
+        expect_eq1("★ G10f 同拍清 SIE ⇒ S 陷阱 SPIE ← 0（旧树 OR 残留 SIE=1 ⇒ FAIL）",
+                   p_mstatus_set[`RV32GC_MSTATUS_SPIE_BIT], 1'b0);
+        p_csr_wen = 1'b0; p_trap_valid = 1'b0; #1;
+
+        //======================================================================
         // H. 特权级状态机：陷阱改特权级 + flush_req
         //======================================================================
         //   ---- 先回到 M（复位），再委托一个陷阱到 S ⇒ 特权级变化 ⇒ flush_req=1 ----
@@ -571,6 +649,173 @@ module tb_trap_ctrl_top;
         expect_eq1("★ I4b MPIE 进 clr（替换；旧 MPIE=1 不得残留）",
                    p_mstatus_clr[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
         @(posedge clk); #1; p_trap_valid = 1'b0; #1;
+
+        //======================================================================
+        // J. 【P1-04】未委托的 SSI/STI/SEI 必须成为 **M 目标候选**
+        //   规范：先按每 bit 实际委托定目标，再按目标与当前模式决定全局使能。
+        //   旧实现：is_s_irq=1 恒要求 mideleg=1 ⇒ mideleg=0 时 1/5/9 永久屏蔽。
+        //   ★ 本节的 M 目标非委托断言在旧树必 FAIL；cause 必须保持**原源号**
+        //     （1/5/9），不得改写为机器源号 3/7/11。
+        //   （trap_ctrl 的 `priv` 输入与 priv_ctrl 的架构级寄存器独立，此处直接驱动。）
+        //======================================================================
+        p_csr_wen = 1'b0; p_trap_valid = 1'b0;
+        commit_valid = 1'b1;
+        commit_pc = 32'h8000_3000; commit_pc_next = 32'h8000_3004;
+        exc_valid = 1'b0;
+        mtvec = 32'h1C00_5001;   // Vectored, BASE=0x1C00_5000
+        stvec = 32'h1C00_6001;   // Vectored, BASE=0x1C00_6000
+
+        //   ---- J1：M + mideleg=0 + STIE/STIP + MIE=1 ⇒ M 目标，cause=0x8000_0005 ----
+        priv = `RV32GC_PRIV_M;
+        mideleg = 32'h0;
+        mie = (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mip = (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        #1;
+        expect_eq1("★ J1 M 模式未委托 STI 被取（旧树被永久屏蔽 ⇒ FAIL）", trap_valid, 1'b1);
+        expect_eq1("J1 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        expect_eq32("★ J1 cause 保持 S 源号 0x8000_0005", trap_cause, 32'h8000_0005);
+        expect_eq1("J1 trap_we[0]=1（写 M 侧组）", trap_we[0], 1'b1);
+        expect_eq32("J1 M 取向量的 pc = mtvec BASE + 4×5", trap_pc, 32'h1C00_5000 + 32'h14);
+        //   ---- J2：M + mideleg=0 + MIE=0 ⇒ M 目标被全局门控（对照）----
+        mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        #1;
+        expect_eq1("J2 M 模式 MIE=0 ⇒ M 目标中断不取（对照）", trap_valid, 1'b0);
+        //   ---- J3：S + mideleg=0 + SIE=0 + MIE=0 ⇒ 仍进 M（< M 恒开放）----
+        priv = `RV32GC_PRIV_S;
+        mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        #1;
+        expect_eq1("★ J3 S 模式未委托 STI ⇒ 进 M（SIE/MIE 均不掩蔽）", trap_valid, 1'b1);
+        expect_eq1("J3 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        expect_eq32("J3 cause = 0x8000_0005", trap_cause, 32'h8000_0005);
+        //   ---- J4：U + mideleg=0 + SSIE/SSIP ⇒ 进 M，cause=0x8000_0001 ----
+        priv = `RV32GC_PRIV_U;
+        mie = (32'h1 << `RV32GC_MIP_SSIP_BIT);
+        mip = (32'h1 << `RV32GC_MIP_SSIP_BIT);
+        #1;
+        expect_eq1("★ J4 U 模式未委托 SSI ⇒ 进 M", trap_valid, 1'b1);
+        expect_eq1("J4 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        expect_eq32("★ J4 cause 保持源号 0x8000_0001", trap_cause, 32'h8000_0001);
+        //   ---- J5：非委托 SEI ⇒ M 目标，cause=0x8000_0009 ----
+        mie = (32'h1 << `RV32GC_MIP_SEIP_BIT);
+        mip = (32'h1 << `RV32GC_MIP_SEIP_BIT);
+        #1;
+        expect_eq1("★ J5 非委托 SEI ⇒ 进 M", trap_valid, 1'b1);
+        expect_eq32("★ J5 cause 保持源号 0x8000_0009", trap_cause, 32'h8000_0009);
+        //   ---- J6：S + mideleg[5]=1 + SIE=1 ⇒ 目标 S（合法委托路径，两树一致）----
+        priv = `RV32GC_PRIV_S;
+        mideleg = (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mie = (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mip = (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mstatus_i = mk_mstatus(1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        #1;
+        expect_eq1("J6 S + 已委托 STI + SIE=1 ⇒ 被取", trap_valid, 1'b1);
+        expect_eq1("J6 目标 = S", trap_target == `RV32GC_PRIV_S, 1'b1);
+        expect_eq1("J6 trap_we[1]=1（写 S 侧组）", trap_we[1], 1'b1);
+        expect_eq32("J6 cause = 0x8000_0005（原源号）", trap_cause, 32'h8000_0005);
+        expect_eq32("J6 S 取 stvec BASE + 4×5", trap_pc, 32'h1C00_6000 + 32'h14);
+        //   ---- J7：S + 已委托 + SIE=0 ⇒ 不取 ----
+        mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        #1;
+        expect_eq1("J7 已委托 S 源 + SIE=0 ⇒ 不取（SIE 门控委托目标）", trap_valid, 1'b0);
+        //   ---- J8：M + 已委托 ⇒ 委托位在 M 屏蔽（两树一致）----
+        priv = `RV32GC_PRIV_M;
+        mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        #1;
+        expect_eq1("J8 M 模式不取已委托的 S 源中断", trap_valid, 1'b0);
+        //   ---- J9：U + 已委托 + SIE=0 ⇒ < S 不受 SIE 掩蔽，目标 S ----
+        priv = `RV32GC_PRIV_U;
+        #1;
+        expect_eq1("J9 U 模式已委托 STI ⇒ 被取（SIE 忽略）", trap_valid, 1'b1);
+        expect_eq1("J9 目标 = S", trap_target == `RV32GC_PRIV_S, 1'b1);
+        //   ---- J10：优先级未被破坏 —— 六源同挂起且全部未委托 ⇒ MEI(11) ----
+        priv = `RV32GC_PRIV_M;
+        mideleg = 32'h0;
+        mie = 32'h0000_0AAA;
+        mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        mip = (32'h1<<`RV32GC_MIP_MEIP_BIT)|(32'h1<<`RV32GC_MIP_MTIP_BIT)|
+              (32'h1<<`RV32GC_MIP_MSIP_BIT)|(32'h1<<`RV32GC_MIP_SEIP_BIT)|
+              (32'h1<<`RV32GC_MIP_STIP_BIT)|(32'h1<<`RV32GC_MIP_SSIP_BIT);
+        #1;
+        expect_eq32("★ J10 六源同挂起 ⇒ 仍取 M 级最高优先 MEI(11)",
+                    trap_cause, 32'h8000_000B);
+        //   ---- J11：部分委托（仅 STI）时 MEI/SEI 优先级与目标不变 ----
+        mideleg = (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mip = (32'h1<<`RV32GC_MIP_MEIP_BIT)|(32'h1<<`RV32GC_MIP_SEIP_BIT)|
+              (32'h1<<`RV32GC_MIP_STIP_BIT);
+        #1;
+        expect_eq32("J11 部分委托下 MEI 仍最高优先", trap_cause, 32'h8000_000B);
+        expect_eq1("J11 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        //   ---- J12：已委托 SEI 在 M 屏蔽，但非委托 SSI 仍进 M（每 bit 独立定目标）----
+        mideleg = (32'h1 << `RV32GC_MIP_SEIP_BIT);
+        mie = (32'h1 << `RV32GC_MIP_SEIP_BIT) | (32'h1 << `RV32GC_MIP_SSIP_BIT);
+        mip = (32'h1 << `RV32GC_MIP_SEIP_BIT) | (32'h1 << `RV32GC_MIP_SSIP_BIT);
+        #1;
+        expect_eq32("★ J12 已委托 SEI 屏蔽后取非委托 SSI（cause=0x8000_0001）",
+                    trap_cause, 32'h8000_0001);
+        expect_eq1("J12 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+
+        //   ---- J13..J18：【首轮独审 P1】选中优先级 = **目标特权级 M 优先，再组内源序** ----
+        //     反证：只按固定源序（SEI 在 STI 之前）会把"已委托 SEI→S"压在
+        //     "未委托 STI→M"之前；本节 IRQ_MFIRST_* 断言在旧树必 FAIL。
+        //     控制项 CTRL_* 在两树都必须通过（组内源序、M 源优先、IE 门控口径不变）。
+        //     J13：U + mideleg=0x200 + mie=mip=0x220 ⇒ M 目标 STI(5) 胜 S 目标 SEI(9)
+        priv = `RV32GC_PRIV_U;
+        mideleg = (32'h1 << `RV32GC_MIP_SEIP_BIT);            // 0x200：SEI 委托
+        mie = (32'h1 << `RV32GC_MIP_SEIP_BIT) | (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mip = (32'h1 << `RV32GC_MIP_SEIP_BIT) | (32'h1 << `RV32GC_MIP_STIP_BIT);
+        mstatus_i = 32'h0; #1;
+        expect_eq1("★ J13 U 混合委托竞争：取 M 目标（不被 S 目标抢）", trap_valid, 1'b1);
+        expect_eq1("★ J13 目标 = M（未委托 STI）", trap_target == `RV32GC_PRIV_M, 1'b1);
+        expect_eq32("★ J13 cause = 0x8000_0005（源号 STI）", trap_cause, 32'h8000_0005);
+        //     J14：S + 同配置 + SIE=1 ⇒ 仍 M 目标优先
+        priv = `RV32GC_PRIV_S;
+        mstatus_i = mk_mstatus(1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        #1;
+        expect_eq1("★ J14 S 混合委托竞争：取 M 目标", trap_valid, 1'b1);
+        expect_eq1("★ J14 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        expect_eq32("★ J14 cause = 0x8000_0005", trap_cause, 32'h8000_0005);
+        //     J15：M + mideleg=0x200 + MIE=1 ⇒ 委托 SEI 在 M 屏蔽，未委托 STI 进 M
+        priv = `RV32GC_PRIV_M;
+        mstatus_i = mk_mstatus(1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_M);
+        #1;
+        expect_eq1("★ J15 M 模式：已委托 SEI 屏蔽、未委托 STI 进 M", trap_valid, 1'b1);
+        expect_eq32("★ J15 cause = 0x8000_0005", trap_cause, 32'h8000_0005);
+        expect_eq1("J15 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        //     J16（控制）：S + mideleg=0x202 + mie=mip=0x202 + SIE=1 ⇒ S 组内 SEI(9)>SSI(1)
+        priv = `RV32GC_PRIV_S;
+        mideleg = (32'h1 << `RV32GC_MIP_SEIP_BIT) | (32'h1 << `RV32GC_MIP_SSIP_BIT);
+        mie = mideleg; mip = mideleg;
+        mstatus_i = mk_mstatus(1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        #1;
+        expect_eq1("CTRL J16 S 组内多源 ⇒ 取 SEI", trap_valid, 1'b1);
+        expect_eq32("CTRL J16 cause = 0x8000_0009（SEI，组内源序）",
+                    trap_cause, 32'h8000_0009);
+        expect_eq1("CTRL J16 目标 = S", trap_target == `RV32GC_PRIV_S, 1'b1);
+        //     J17（控制）：U + mideleg=0x200 + MEI 同时挂起 ⇒ M 源 MEI(11) 优先
+        priv = `RV32GC_PRIV_U;
+        mideleg = (32'h1 << `RV32GC_MIP_SEIP_BIT);
+        mie = (32'h1 << `RV32GC_MIP_MEIP_BIT) | (32'h1 << `RV32GC_MIP_SEIP_BIT);
+        mip = mie;
+        mstatus_i = 32'h0; #1;
+        expect_eq1("CTRL J17 M 源 MEI 压过 S 目标 SEI", trap_valid, 1'b1);
+        expect_eq32("CTRL J17 cause = 0x8000_000B", trap_cause, 32'h8000_000B);
+        expect_eq1("CTRL J17 目标 = M", trap_target == `RV32GC_PRIV_M, 1'b1);
+        //     J18a（控制）：U + 已委托 SEI + SIE=0 ⇒ 取（< S 不受 SIE 掩蔽）
+        mideleg = (32'h1 << `RV32GC_MIP_SEIP_BIT);
+        mie = mideleg; mip = mideleg;
+        mstatus_i = 32'h0; #1;
+        expect_eq1("CTRL J18a U 已委托 SEI 且 SIE=0 ⇒ 取", trap_valid, 1'b1);
+        expect_eq32("CTRL J18a cause = 0x8000_0009", trap_cause, 32'h8000_0009);
+        expect_eq1("CTRL J18a 目标 = S", trap_target == `RV32GC_PRIV_S, 1'b1);
+        //     J18b（控制）：S + 已委托 SEI + SIE=0 ⇒ 不取（IE 门控委托目标）
+        priv = `RV32GC_PRIV_S;
+        mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
+        #1;
+        expect_eq1("CTRL J18b S 已委托 + SIE=0 ⇒ 不取", trap_valid, 1'b0);
+
+        //   ---- 收尾：清中断请求，避免影响后续/收尾判定 ----
+        mip = 32'h0; mideleg = 32'h0; #1;
 
         //======================================================================
         // 汇总

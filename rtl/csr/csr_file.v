@@ -18,8 +18,9 @@
 //     （riscv-arch-test/tests/env/rvtest_setup.h:1059-1129；08 §8.2.1(b)）。
 //  4. U 模式 CSR（ustatus/uie/utvec/uscratch/uepc/ucause/utval/uip）在门控 = 0 时
 //     按**未实现**处理 ⇒ U/S 访问报非法（08 §6.2 "U 模式 CSR 不落地"裁决）。
-//  5. pmpcfg/pmpaddr 的 L 位锁定：L=1 的项及其 TOR 前驱地址寄存器写入被忽略
-//     （06 §6.2 norm:pmplbitwriteprotection）。
+//  5. pmpcfg/pmpaddr 的 L 位锁定：pmpcfg[i].L=1 ⇒ 本项 cfg/addr 写入被忽略；
+//     若其后项 cfg[i+1].L=1 且 A=TOR ⇒ 本项 addr 写入也被忽略（06 §6.2
+//     norm:pmplbitwriteprotection；P0-02 修复本项 L 分支与 i=15 边界）。
 //  6. satp.MODE 写保留值 ⇒ WARL 写入被忽略（不改值）（06 §9）。
 //     ★ RV32 的 satp.MODE 只有 1 bit、{0,1} 全合法 ⇒ 本设计无保留编码；该判定以
 //       "显式占位"形式落在 §2.5 的 csr_landing()（见其注释）。
@@ -428,7 +429,7 @@ module csr_file (
     //   三类语义在此收口：
     //     ① 吞写（wr_mask==0，含 misa/mcountinhibit/mhpmevent/未列举项）⇒ 读回不变（= cur）；
     //     ② 字段级 WARL（mtvec/stvec MODE、menvcfg/senvcfg CBIE）⇒ 保留值取自"现值"入参；
-    //     ③ PMP：cfg 逐项 L 锁定、addr 的 TOR 前驱锁定 ⇒ 锁定项保持现值。
+    //     ③ PMP：cfg 逐项 L 锁定、addr 的本项 L / 后项 (L&&TOR) 锁定 ⇒ 锁定项保持现值。
     //   三个调用点共用本函数（消除双份漂移）：
     //     · §7 写通道落地（waddr/wdata，wval_final）
     //     · §6 写口旁路读 rdata_w（raddr==waddr ⇒ 落盘值）
@@ -448,9 +449,11 @@ module csr_file (
         input [31:0] menvcfg_cur;       // 现值（保留 CBIE 用）
         input [31:0] senvcfg_cur;       // 现值（保留 CBIE 用）
         input [`RV32GC_PMP_ENTRIES*8-1:0] pmp_cfg_cur;   // PMP cfg 现值（跨项 L 位判定）
+        input [31:0] mideleg_p;         // ★ 本次写落地后生效的 mideleg（SIE/SIP 别名口径）
         reg [31:0] m;
         reg [1:0]  mode_new;
         reg [1:0]  cbie_new;
+        reg        sip_ssip_new;
         begin
             m = wr_mask(a);
             if (m == 32'h0000_0000) begin
@@ -490,12 +493,33 @@ module csr_file (
                         cbie_new    = (d[5:4] == 2'b10) ? senvcfg_cur[5:4] : d[5:4];
                         csr_landing = (d & m & ~32'h0000_0030) | ({30'b0, cbie_new} << 4);
                     end
+                    // ---- ② SIE/SIP：**delegation-aware 别名落地**（P1-05 旁路一致性修复）----
+                    //   规范（machine.adoc，KB chunk 10554）：只有 mideleg 置位的位在
+                    //   sie/sip 中可见/可写，未委托位 read-only zero。
+                    //   ⇒ 落盘后的**读回值**必须按 mideleg_p 掩码：
+                    //     · sie：写入只改变已委托位（未委托的 mie 底层位不动，也不可见），
+                    //            落盘读回 = d & mideleg_p；
+                    //     · sip：SSIP 已委托才可写（否则整笔被忽略），其余已委托位置保持，
+                    //            最后整体 & mideleg_p。
+                    //   ★ mideleg_p 是"本次写落地后生效"的 mideleg —— 由调用点给出：
+                    //     写通道/写口旁路取 W 级落盘的 mideleg（同拍写 mideleg 时为**新值**）；
+                    //     M 级预览取"W 级落盘后"的 mideleg。这样"未/部分/全委托"下
+                    //     rdata_w / byp_rdata 与真实落盘读取逐位一致，且未委托底层位不被误清。
+                    `RV32GC_CSR_SIE: csr_landing = d & mideleg_p;
+                    `RV32GC_CSR_SIP: begin
+                        sip_ssip_new = mideleg_p[`RV32GC_MIP_SSIP_BIT] ? d[`RV32GC_MIP_SSIP_BIT]
+                                                                        : cur[`RV32GC_MIP_SSIP_BIT];
+                        csr_landing = ((cur & ~(32'h1 << `RV32GC_MIP_SSIP_BIT)) |
+                                       ({31'b0, sip_ssip_new} << `RV32GC_MIP_SSIP_BIT)) & mideleg_p;
+                    end
                     // ---- ③ PMP cfg：逐项 L 位锁定（L=1 的项写入被忽略，保持现值）----
                     `RV32GC_CSR_PMPCFG0: csr_landing = pmp_cfg_landing(d, pmp_cfg_cur[31:0]);
                     `RV32GC_CSR_PMPCFG1: csr_landing = pmp_cfg_landing(d, pmp_cfg_cur[63:32]);
                     `RV32GC_CSR_PMPCFG2: csr_landing = pmp_cfg_landing(d, pmp_cfg_cur[95:64]);
                     `RV32GC_CSR_PMPCFG3: csr_landing = pmp_cfg_landing(d, pmp_cfg_cur[127:96]);
-                    // ---- ③ PMP addr：项 (i+1) 被 L 锁定且 A=TOR ⇒ 本项（前驱）写入被忽略 ----
+                    // ---- ③ PMP addr：本项 L **或** 后项 (L && A=TOR) ⇒ 写入被忽略 ----
+                    //   ★ P0-02 修复：旧实现只看后项 L&&TOR，且 i=15 直接不锁 ⇒
+                    //     「置本项 cfg.L=1 后可继续改写本项 pmpaddr」的安全漏洞。
                     `RV32GC_CSR_PMPADDR0,  `RV32GC_CSR_PMPADDR1,
                     `RV32GC_CSR_PMPADDR2,  `RV32GC_CSR_PMPADDR3,
                     `RV32GC_CSR_PMPADDR4,  `RV32GC_CSR_PMPADDR5,
@@ -504,10 +528,10 @@ module csr_file (
                     `RV32GC_CSR_PMPADDR10, `RV32GC_CSR_PMPADDR11,
                     `RV32GC_CSR_PMPADDR12, `RV32GC_CSR_PMPADDR13,
                     `RV32GC_CSR_PMPADDR14, `RV32GC_CSR_PMPADDR15:
-                        csr_landing = pmp_tor_locked(a, pmp_cfg_cur) ? cur : (d & m);
+                        csr_landing = pmp_addr_locked(a, pmp_cfg_cur) ? cur : (d & m);
                     // ---- 通用：可写位取写数据，其余位保持当前读回值 ----
                     //   （mstatus/sstatus 的 SD 等派生位即使略旧也会被 core_top 的
-                    //    FS/SD 覆盖逻辑重新派生；mip/sip 的只读设备位由此保持）
+                    //    FS/SD 覆盖逻辑重新派生；mip 的只读设备位由此保持）
                     default: csr_landing = (d & m) | (cur & ~m);
                 endcase
             end
@@ -539,19 +563,27 @@ module csr_file (
         end
     endfunction
 
-    // ---- PMP addr 的 TOR 前驱锁定判定：项 (i+1) 的 L=1 且 A=TOR ⇒ 项 i 写入被忽略 ----
-    //   （末尾项没有后继 ⇒ 不锁定；与 ISA norm:pmplbitwriteprotection 及旧口径一致）
-    function pmp_tor_locked;
+    // ---- PMP addr 的写锁判定：**本项 L** 或 **后项 (L && A=TOR)** ----
+    //   ISA machine.adoc `norm:pmplbitwriteprotection`（KB chunk 10614，源行 3544–3565）：
+    //     「If PMP entry i is locked, writes to pmpicfg and pmpaddri are ignored.
+    //       Additionally, if PMP entry i is locked and pmpicfg.A is set to TOR,
+    //       writes to pmpaddri-1 are ignored.」
+    //     NOTE：「Setting the L bit locks the PMP entry even when the A field is set to OFF.」
+    //   ⇒ 对 pmpaddr[i]：own = cfg[i].L；succ = cfg[i+1].L && cfg[i+1].A==TOR。
+    //     i=15 没有后项 ⇒ 只看 own.L（旧实现把 i=15 判为"恒不锁" ⇒ 漏锁，P0-02）。
+    //     own.L 对 OFF/NA4/NAPOT/TOR 四种 A 一律锁定（NOTE 明确 OFF 也锁）。
+    function pmp_addr_locked;
         input [11:0] a;                                  // 0x3B0..0x3BF
         input [`RV32GC_PMP_ENTRIES*8-1:0] cfg;
         reg [4:0] i;
         begin
             i = a[4:0] - 5'd16;                          // 0x3B0 ⇒ 0 … 0x3BF ⇒ 15
             if (i >= 5'd15) begin
-                pmp_tor_locked = 1'b0;
+                pmp_addr_locked = cfg[i*8+7];            // 末项：无后项，仅本项 L
             end else begin
-                pmp_tor_locked = cfg[(i+1)*8+7] &&
-                                 (cfg[(i+1)*8+3 +: 2] == `RV32GC_PMP_A_TOR);
+                pmp_addr_locked = cfg[i*8+7] ||          // 本项 L（任意 A）
+                                  (cfg[(i+1)*8+7] &&
+                                   (cfg[(i+1)*8+3 +: 2] == `RV32GC_PMP_A_TOR));
             end
         end
     endfunction
@@ -603,7 +635,34 @@ module csr_file (
     wire [1:0]  need_priv    = csr_min_priv(chk_addr);
     wire        priv_ok      = priv_ge(priv, need_priv);
     // 未实现地址 ⇒ 非法；特权级不足 ⇒ 非法（08 §6.2「访问权限」）
-    assign chk_illegal  = ~impl_hit | ~priv_ok;
+    //   ★ P1-01/P1-02 修复（2026-10-19 F1 特权包）：在**既有 chk_illegal 接口内**
+    //     补动态门控（不新增/不改端口；位宽与地址口径不变）：
+    //     · counteren：cycle/time/instret + 高半影子按特权级受 mcounteren/scounteren 门控；
+    //     · TVM：S 模式访问 satp（读或写）在 TVM=1 时非法。
+    //   这两项是"地址级 CSR 权限"，与静态白名单/特权级判定取或。
+    //   ★ 未闭环项（明确不在本包）：SFENCE.VMA 的 TVM 拦截、整核执行权限复查、
+    //     以及本输出到 dec_csr/两 top 的接线 —— 见 01-privilege.md P1-02/P0-01，
+    //     由消费者/顶层另包接；本模块只保证"地址检查输出"正确。
+    //
+    //   counteren 位映射（machine.adoc/supervisor.adoc counteren 段）：
+    //     bit0=CY(cycle/cycleh)、bit1=TM(time/timeh)、bit2=IR(instret/instreth)；
+    //     高半与低半共用同一位。门控口径：M 不受限；S 需 mcounteren 位；
+    //     U 需 mcounteren 位 && scounteren 位。
+    wire        cntr_cy  = (chk_addr == `RV32GC_CSR_CYCLE)   || (chk_addr == `RV32GC_CSR_CYCLEH);
+    wire        cntr_tm  = (chk_addr == `RV32GC_CSR_TIME)    || (chk_addr == `RV32GC_CSR_TIMEH);
+    wire        cntr_ir  = (chk_addr == `RV32GC_CSR_INSTRET) || (chk_addr == `RV32GC_CSR_INSTRETH);
+    wire [1:0]  cntr_bit = cntr_cy ? 2'd0 : cntr_tm ? 2'd1 : 2'd2;
+    wire        cntr_sel = cntr_cy | cntr_tm | cntr_ir;
+    wire        cntr_en  = (priv == PRIV_M) ? 1'b1 :
+                           (priv == PRIV_S) ? mcounteren_r[cntr_bit] :
+                                               (mcounteren_r[cntr_bit] & scounteren_r[cntr_bit]);
+    wire        cntr_ill = cntr_sel & ~cntr_en;
+    //   TVM 现值取 mstatus 软件存储位（组合读）。★ 不做"同拍 W 级 mstatus 写旁路"：
+    //   地址级检查发生在译码/执行级，旁路口径由消费者/顶层统一处理（另包），
+    //   本模块不假造输入、不引入第二份旁路真源。
+    wire        tvm_now  = mstat_sw[`RV32GC_MSTATUS_TVM_BIT];
+    wire        tvm_ill  = (chk_addr == `RV32GC_CSR_SATP) && (priv == PRIV_S) && tvm_now;
+    assign chk_illegal  = ~impl_hit | ~priv_ok | cntr_ill | tvm_ill;
     // 写只读 CSR ⇒ 非法（08 §6.2；06 §9）
     assign chk_ro_write = addr_ro;
 
@@ -669,8 +728,8 @@ module csr_file (
         end
     endgenerate
 
-    // ---- PMP L 位锁定（cfg 项级 + addr 的 TOR 前驱） ----
-    //   ★ 判定逻辑已收口到 §2.5 的 csr_landing()（pmp_cfg_landing / pmp_tor_locked），
+    // ---- PMP L 位锁定（cfg 项级 + addr 本项 L/后项 TOR） ----
+    //   ★ 判定逻辑已收口到 §2.5 的 csr_landing()（pmp_cfg_landing / pmp_addr_locked），
     //     写通道不再需要单独的 lock0/lock1/pmp_lock_all 副本（旧实现是第二份逻辑）。
 
     //==========================================================================
@@ -713,9 +772,13 @@ module csr_file (
     assign mie_o = mie_r & ((32'h1<<`RV32GC_MIP_SSIP_BIT) | (32'h1<<`RV32GC_MIP_MSIP_BIT) |
                             (32'h1<<`RV32GC_MIP_STIP_BIT) | (32'h1<<`RV32GC_MIP_MTIP_BIT) |
                             (32'h1<<`RV32GC_MIP_SEIP_BIT) | (32'h1<<`RV32GC_MIP_MEIP_BIT));
-    wire [31:0] sie_view = mie_o & ((32'h1<<`RV32GC_MIP_SSIP_BIT) |
-                                    (32'h1<<`RV32GC_MIP_STIP_BIT) |
-                                    (32'h1<<`RV32GC_MIP_SEIP_BIT));
+    //   ★ P1-05 修复：sie 是 mie 的**受限别名** —— 只有 mideleg 置位的位可见/可写。
+    //   ISA machine.adoc（KB chunk 10554，源行 1327–1522）：
+    //     「If an interrupt is delegated to S-mode by setting a bit in mideleg, it becomes
+    //       visible in the sip register and is maskable using the sie register. Otherwise,
+    //       the corresponding bits in sip and sie are read-only zero.」
+    //   mideleg_r 只存实现位（写通道掩码 = MIDELEG_IMPL_MSK = 0x222）⇒ 直接相与。
+    wire [31:0] sie_view = mie_o & mideleg_r;
 
     // ---- mip 视图：软件位（SSIP/STIP/SEIP）+ 核内设备驱动位 ----
     //      MEIP/MTIP/MSIP 只读，由 CLINT/PLIC 驱动（08 §6.6）
@@ -730,9 +793,8 @@ module csr_file (
         (mip_sw[1] << `RV32GC_MIP_STIP_BIT) |
         (mip_sw[2] << `RV32GC_MIP_SEIP_BIT);
     assign mip_o   = mip_sw_all | mip_dev;
-    wire [31:0] sip_view = mip_o & ((32'h1<<`RV32GC_MIP_SSIP_BIT) |
-                                    (32'h1<<`RV32GC_MIP_STIP_BIT) |
-                                    (32'h1<<`RV32GC_MIP_SEIP_BIT));
+    //   ★ P1-05：sip 同 sie —— 未委托位在 sip 中 read-only zero（同一 ISA 条文）。
+    wire [31:0] sip_view = mip_o & mideleg_r;
 
     // ---- misa：RV32IMAFDC + Zicsr/Zifencei/Zicntr/Zicbom 的 A 扩展位 ----
     //      [ISA:misa 扩展位 = A(0)B(1)C(2)D(3)E(4)F(5)G(6)H(7)I(8)J(9)K(10)L(11)
@@ -924,13 +986,21 @@ module csr_file (
     //==========================================================================
     //   cur 口径：
     //     · pmpaddr 地址：走专用 one-hot 读（pmpaddr_wr，waddr 视角）—— 只有它真正
-    //       依赖"该项现值"（TOR 前驱锁定 ⇒ 锁定项落盘值 = 现值）；
+    //       依赖"该项现值"（本项 L / 后项 TOR 锁定 ⇒ 锁定项落盘值 = 现值）；
     //     · 其余地址：rdataw_r（waddr 视角读视图；未列举项回退 rdata_r）。该回退
     //       不影响任何落地点：§7 的每个写点都以 wr_mask(...) 或字段掩码收口，掩码外
     //       的 cur 位一律被丢弃；而 mtvec/stvec/menvcfg/senvcfg 的"保留字段"走显式
     //       现值入参（mtvec_r/stvec_r/menvcfg_r/senvcfg_r），不依赖 cur。
+    //   ★ P1-05 旁路一致性（2026-10-19 复审）：SIE/SIP 是 delegation-aware 别名 ⇒
+    //     落盘值/读回值必须按"本拍末生效的 mideleg"掩码。本拍若 W 级写 mideleg
+    //     （sw_en 有效），则新 mideleg = 写数据 & MIDELEG_IMPL_MSK；否则现值。
+    //     `mideleg_w` 同时供 rdata_w（W 级旁路）与 byp_cur（M 级预览）使用 ⇒
+    //     "委托本身同拍变化"的合同一致：SIE/SIP 的预览与真实落盘读取逐位相同。
+    wire [31:0] mideleg_w = (sw_en && (waddr == `RV32GC_CSR_MIDELEG))
+                            ? (wdata & `RV32GC_MIDELEG_IMPL_MSK) : mideleg_r;
     wire [31:0] wval_final = csr_landing(waddr, wdata, rd_waddr_cur,
-                                         mtvec_r, stvec_r, menvcfg_r, senvcfg_r, pmp_cfg_r);
+                                         mtvec_r, stvec_r, menvcfg_r, senvcfg_r, pmp_cfg_r,
+                                         mideleg_w);
 
     //==========================================================================
     // 6.4 写口旁路读（rdata_w）+ M 级旁路预览（byp_rdata）—— 都取 post-WARL 落盘值
@@ -941,25 +1011,33 @@ module csr_file (
     //     旁路值必须是"落盘后**读回**值"而不是"掩码后写值"：吞写类与 PMP 锁定项的
     //     落盘值 = **现值不变**（掩码后写值会给出 0，同样错）。
     //   · rdata_w（W 级旁路：写指令在 W、读指令在 E）：raddr == waddr ⇒ 本拍末将落盘的
-    //     该 CSR 值；其余情形退回普通读视图（与"写口旁路读"的语义一致）。
+    //     该 CSR 值；否则退回该地址的读视图。★ SIE/SIP 的读视图按 `mideleg_w` 取
+    //     （委托同拍变化的合同）；其余地址仍为普通读视图 rdata。
     //   · byp_rdata（M 级旁路：写指令在 M、读指令在 E）：把**更年轻**的 M 级写数据
     //     byp_wdata 写进 raddr 之后的读回值；core_top 只在 em 槽地址 == de_csr_addr
     //     （csr_em_hit）时采用 ⇒ 与 rdata_w 一起实现"距离 0/1 两级旁路"。
     //   ⇒ 二者与 §6.3 的写通道落地值共用同一个 csr_landing() 引擎（单一真源）。
-    assign rdata_w  = (raddr == waddr) ? wval_final : rdata;
+    wire [31:0] rd_view_w = (raddr == `RV32GC_CSR_SIE) ? (mie_o & mideleg_w) :
+                            (raddr == `RV32GC_CSR_SIP) ? (mip_o & mideleg_w) : rdata;
+    assign rdata_w  = (raddr == waddr) ? wval_final : rd_view_w;
 
     //   M 级预览的"既有状态"必须取**本拍末 W 级写落地之后**的值（M 槽比 W 槽年轻，
     //   程序序上更年轻的写作用在"更老那条已落盘"的状态上）：
     //     · raddr == waddr（= W 槽正在写读者要读的 CSR）⇒ 该地址现值即 W 级落盘值；
+    //     · SIE/SIP：既有读视图必须按 W 级落盘后的 mideleg（`mideleg_w`）取
+    //       （否则同拍写 mideleg 时预览会漏掉新委托位）；
     //     · PMP cfg 分组同理（L 位判定必须基于 W 级写之后的 cfg）。
-    wire [31:0]  byp_cur = (raddr == waddr) ? wval_final : rdata;
+    wire [31:0]  byp_cur = (raddr == waddr) ? wval_final :
+                           (raddr == `RV32GC_CSR_SIE) ? (mie_o & mideleg_w) :
+                           (raddr == `RV32GC_CSR_SIP) ? (mip_o & mideleg_w) : rdata;
     wire [127:0] pmp_cfg_byp = {
         (wr_pmpcfg[3] & sw_en) ? wval_final : pmp_cfg_r[127: 96],
         (wr_pmpcfg[2] & sw_en) ? wval_final : pmp_cfg_r[ 95: 64],
         (wr_pmpcfg[1] & sw_en) ? wval_final : pmp_cfg_r[ 63: 32],
         (wr_pmpcfg[0] & sw_en) ? wval_final : pmp_cfg_r[ 31:  0] };
     assign byp_rdata = csr_landing(raddr, byp_wdata, byp_cur,
-                                   mtvec_r, stvec_r, menvcfg_r, senvcfg_r, pmp_cfg_byp);
+                                   mtvec_r, stvec_r, menvcfg_r, senvcfg_r, pmp_cfg_byp,
+                                   mideleg_w);
 
     //==========================================================================
     // 7. 时序：唯一的存储写点
@@ -990,8 +1068,9 @@ module csr_file (
 
     // ---- pmpaddr 写入辅助 task（静态索引，见 §7.8 注释） ----
     //   task 用于时序块（always）内，iverilog / Vivado 均可综合。
-    //   ★ TOR 前驱锁定（项 idx 写被忽略）已收口在 wval_final 内部（csr_landing →
-    //     pmp_tor_locked），本 task 只做"该地址被写"的静态展开 ⇒ 无双份锁定逻辑。
+    //   ★ 写锁（项 idx 本项 L 或后项 L&&TOR ⇒ 写被忽略）已收口在 wval_final 内部
+    //     （csr_landing → pmp_addr_locked），本 task 只做"该地址被写"的静态展开
+    //     ⇒ 无双份锁定逻辑。
     task pmpaddr_write;
         input integer idx;
         begin
@@ -1047,15 +1126,19 @@ module csr_file (
             if (sw_en && (waddr == `RV32GC_CSR_MIE)) begin
                 mie_r <= wval_final & wr_mask(`RV32GC_CSR_MIE);
             end else if (sw_en && (waddr == `RV32GC_CSR_SIE)) begin
-                mie_r <= (mie_r & ~(`RV32GC_MIDELEG_IMPL_MSK)) |
-                         (wval_final & `RV32GC_MIDELEG_IMPL_MSK);
+                //   ★ P1-05：sie 写只触及 mideleg 置位的位；未委托底层位
+                //   （mie_r 的 M 专属位与其他 S 位）逐位保持，不清不改。
+                mie_r <= (mie_r & ~mideleg_r) | (wval_final & mideleg_r);
             end
 
             // ---- 7.3 mip 的软件可写位 {SEIP,STIP,SSIP} ----
             if (sw_en && (waddr == `RV32GC_CSR_MIP)) begin
                 mip_sw <= { wval_final[`RV32GC_MIP_SEIP_BIT], wval_final[`RV32GC_MIP_STIP_BIT],
                             wval_final[`RV32GC_MIP_SSIP_BIT] };
-            end else if (sw_en && (waddr == `RV32GC_CSR_SIP)) begin
+            end else if (sw_en && (waddr == `RV32GC_CSR_SIP) &&
+                         mideleg_r[`RV32GC_MIP_SSIP_BIT]) begin
+                //   ★ P1-05：SSIP 未委托时在 sip 中 read-only zero ⇒ 整笔写被忽略；
+                //   委托时只改 SSIP 一位，STIP/SEIP 软件位保持（不清改未委托底层位）。
                 mip_sw <= { mip_sw[2], mip_sw[1], wval_final[`RV32GC_MIP_SSIP_BIT] };
             end
 
@@ -1112,9 +1195,9 @@ module csr_file (
             if (wr_pmpcfg[2] & sw_en) pmp_cfg_r[ 95: 64] <= wval_final;
             if (wr_pmpcfg[3] & sw_en) pmp_cfg_r[127: 96] <= wval_final;
 
-            // ---- 7.8 PMP addr（16 项定序展开；TOR 前驱锁定在 csr_landing 内） ----
-            //   ISA norm:pmplbitwriteprotection：若项 i 被 L 锁定且 A=TOR，
-            //   则对 pmpaddr[i-1] 的写被忽略。
+            // ---- 7.8 PMP addr（16 项定序展开；写锁在 csr_landing 内） ----
+            //   ISA norm:pmplbitwriteprotection：若项 i 被 L 锁定，则对 pmpaddr[i]
+            //   的写被忽略；若项 i 被 L 锁定且 A=TOR，则对 pmpaddr[i-1] 的写也被忽略。
             //   理由（红线 3 例外）：16 项逐一条件写入，展开为静态索引的时序分支，
             //   比 always 内动态索引数组更安全（避免动态 part-select 的可综合性问题）。
             pmpaddr_write( 0); pmpaddr_write( 1); pmpaddr_write( 2); pmpaddr_write( 3);

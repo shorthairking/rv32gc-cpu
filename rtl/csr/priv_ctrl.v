@@ -75,24 +75,49 @@ module priv_ctrl (
     //==========================================================================
     // 1. mstatus 字段抽取（组合；含同拍旁路）
     //==========================================================================
-    // ---- 同拍旁路：若本拍提交一条对 mstatus 的 CSR 写，则用其新值参与判定 ----
-    //   键 = "CSR 写已提交"（csr_wen 由 W 级在已通过冲刷判定后给出）。
-    //   用 assign 三元表达（红线 3：不用 always 块）。
-    //   注意：写 mstatus 与写 sstatus 都可能改这些字段 ⇒ 两个地址都要命中。
+    // ---- 同拍旁路：若本拍提交一条对 mstatus/sstatus 的 CSR 写，则用其**落盘后**值 ----
+    //   ★ P1-06 修复（2026-10-19 F1 特权包）：旧式
+    //       `(old & ~new) | (new & csr_wdata)` = `old | csr_wdata`（OR 语义）
+    //     只能置位、不能同拍清位（1→0 失效）。正确形式是**按可写字段掩码替换**：
+    //       eff = (old & ~mask) | (wdata & mask)
+    //   掩码必须与 csr_file 的 WARL 掩码一致（csr_file.v §2 `wr_mask()`）：
+    //     · mstatus：SIE/MIE/SPIE/MPIE/SPP/FS/MPP/MPRV/SUM/MXR/TVM/TW/TSR
+    //       （UIE/UBE/XS/SD 只读，不在掩码内；SD 由 FS 派生，保留 old 值即可）
+    //     · sstatus：SIE/SPIE/SPP/FS/SUM/MXR（**不含** MIE/MPIE/MPP/MPRV/TVM/TW/TSR）
+    //   这两份掩码与 csr_file 逐位对齐（位号全部取自 rv32_defs.vh 唯一真源）；
+    //   若将来 csr_file 增删可写字段，本处必须同步（本模块无第二份 WARL 引擎，
+    //   只做"字段级替换"，MPP 的合法性仍由下方 `mpp_legal()` 在使用点保证）。
+    //   ★ 端口/位宽不变：不改接口、不新增输入；写数据仍走既有 csr_wdata。
+    localparam [31:0] MSTATUS_WR_MSK =
+        (32'h1 << `RV32GC_MSTATUS_SIE_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_MIE_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_SPIE_BIT) |
+        (32'h1 << `RV32GC_MSTATUS_MPIE_BIT) |
+        (32'h1 << `RV32GC_MSTATUS_SPP_BIT)  |
+        (`RV32GC_MSTATUS_FS_MSK  << `RV32GC_MSTATUS_FS_LSB)  |
+        (`RV32GC_MSTATUS_MPP_MSK << `RV32GC_MSTATUS_MPP_LSB) |
+        (32'h1 << `RV32GC_MSTATUS_MPRV_BIT) |
+        (32'h1 << `RV32GC_MSTATUS_SUM_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_MXR_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_TVM_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_TW_BIT)   |
+        (32'h1 << `RV32GC_MSTATUS_TSR_BIT);
+    localparam [31:0] SSTATUS_WR_MSK =
+        (32'h1 << `RV32GC_MSTATUS_SIE_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_SPIE_BIT) |
+        (32'h1 << `RV32GC_MSTATUS_SPP_BIT)  |
+        (`RV32GC_MSTATUS_FS_MSK << `RV32GC_MSTATUS_FS_LSB) |
+        (32'h1 << `RV32GC_MSTATUS_SUM_BIT)  |
+        (32'h1 << `RV32GC_MSTATUS_MXR_BIT);
+
     wire        mstat_hit = csr_wen &&
                             ((csr_waddr == `RV32GC_CSR_MSTATUS) ||
                              (csr_waddr == `RV32GC_CSR_SSTATUS));
-    // sstatus 只携 S 相关位；按位合并（sstatus 写不影响 MPP/MPIE/MPRV/TVM/TW/TSR）
-    wire [31:0] mstat_bypass =
-        (csr_waddr == `RV32GC_CSR_MSTATUS) ? csr_wdata :
-        (csr_wdata & ((32'h1 << `RV32GC_MSTATUS_SIE_BIT)  |
-                      (32'h1 << `RV32GC_MSTATUS_SPIE_BIT) |
-                      (32'h1 << `RV32GC_MSTATUS_SPP_BIT)  |
-                      (32'h1 << `RV32GC_MSTATUS_SUM_BIT)  |
-                      (32'h1 << `RV32GC_MSTATUS_MXR_BIT)  |
-                      (`RV32GC_MSTATUS_FS_MSK << `RV32GC_MSTATUS_FS_LSB)));
-    wire [31:0] mstat_eff = mstat_hit ? ((mstatus_i & ~mstat_bypass) | (mstat_bypass & csr_wdata))
-                                      : mstatus_i;
+    wire [31:0] mstat_byp_msk = ~mstat_hit ? 32'h0 :
+                                (csr_waddr == `RV32GC_CSR_MSTATUS) ? MSTATUS_WR_MSK :
+                                                                     SSTATUS_WR_MSK;
+    //   ★ 替换语义（先清掩码内旧值，再置入写数据）；mstat_hit=0 时掩码为 0 ⇒ = 架构值。
+    wire [31:0] mstat_eff = (mstatus_i & ~mstat_byp_msk) | (csr_wdata & mstat_byp_msk);
 
     // ---- 字段抽取（显式位选，便于 lint） ----
     wire       f_mie   = mstat_eff[`RV32GC_MSTATUS_MIE_BIT];

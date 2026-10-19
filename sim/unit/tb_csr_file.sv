@@ -38,6 +38,9 @@ module tb_csr_file_top;
     reg  [31:0] wdata = 32'h0;
     reg         w_illegal = 0;
     wire [31:0] rdata_w;
+    //   ★ 首轮独审 P1：两路预览端口必须实际接出并对照（旧 TB 未接 byp_wdata/byp_rdata）
+    reg  [31:0] byp_wdata = 32'h0;
+    wire [31:0] byp_rdata;
     reg  [1:0]  priv = `RV32GC_PRIV_M;
     reg  [11:0] chk_addr = 12'h0;
     wire        chk_illegal, chk_ro_write;
@@ -75,6 +78,7 @@ module tb_csr_file_top;
         .raddr(raddr), .rdata(rdata),
         .wen(wen), .waddr(waddr), .wdata(wdata), .w_illegal(w_illegal),
         .rdata_w(rdata_w),
+        .byp_wdata(byp_wdata), .byp_rdata(byp_rdata),
         .priv(priv),
         .chk_addr(chk_addr), .chk_illegal(chk_illegal), .chk_ro_write(chk_ro_write),
         .mstatus_o(mstatus_o),
@@ -120,7 +124,7 @@ module tb_csr_file_top;
     reg     sim_ok = 1'b0;   // 仅在全部检查通过后置 1
 
     task expect_eq32;
-        input [255:0] name;
+        input [8*256-1:0] name;
         input [31:0]  got;
         input [31:0]  exp;
         begin
@@ -134,7 +138,7 @@ module tb_csr_file_top;
     endtask
 
     task expect_eq1;
-        input [255:0] name;
+        input [8*256-1:0] name;
         input         got;
         input         exp;
         begin
@@ -163,7 +167,7 @@ module tb_csr_file_top;
 
     // ---- 读 CSR（组合） ----
     task csr_read_chk;
-        input [255:0] name;
+        input [8*256-1:0] name;
         input [11:0]  addr;
         input [31:0]  exp;
         begin
@@ -450,11 +454,120 @@ module tb_csr_file_top;
         priv = `RV32GC_PRIV_U;
         chk_addr = `RV32GC_CSR_SSTATUS; #1;
         expect_eq1("U 访问 sstatus ⇒ chk_illegal=1", chk_illegal, 1'b1);
-        chk_addr = `RV32GC_CSR_CYCLE; #1;
-        expect_eq1("U 访问 cycle ⇒ chk_illegal=0", chk_illegal, 1'b0);
         priv = `RV32GC_PRIV_M;
         chk_addr = `RV32GC_CSR_SATP; #1;
         expect_eq1("M 访问 satp ⇒ chk_illegal=0", chk_illegal, 1'b0);
+
+        //======================================================================
+        // M2. 【P1-01】counteren 动态门控（cycle/time/instret + 高半影子）
+        //   规范：S 需 mcounteren[bit]；U 需 mcounteren[bit] && scounteren[bit]；
+        //   M 不受限（machine.adoc/supervisor.adoc counteren 段）。
+        //   ★ 旧实现无此门控（01-privilege.md P1-01）；本节的"未使能 ⇒ illegal"
+        //     断言在旧树必须 FAIL，使能后的"合法对照"两树都应通过。
+        //======================================================================
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_MCOUNTEREN, 32'h0);
+        csr_write(`RV32GC_CSR_SCOUNTEREN, 32'h0);
+        //   ---- M 模式不受 counteren 约束（合法对照）----
+        chk_addr = `RV32GC_CSR_CYCLE;   #1;
+        expect_eq1("M 访问 cycle 不受 counteren 门控 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_TIME;    #1;
+        expect_eq1("M 访问 time 不受 counteren 门控 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_INSTRETH;#1;
+        expect_eq1("M 访问 instreth 不受 counteren 门控 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        //   ---- S 模式：mcounteren=0 ⇒ 三个计数器与高半全非法 ----
+        priv = `RV32GC_PRIV_S;
+        chk_addr = `RV32GC_CSR_CYCLE;   #1;
+        expect_eq1("★ S 访问 cycle 且 mcounteren.CY=0 ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        chk_addr = `RV32GC_CSR_TIME;    #1;
+        expect_eq1("S 访问 time 且 mcounteren.TM=0 ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        chk_addr = `RV32GC_CSR_INSTRET; #1;
+        expect_eq1("S 访问 instret 且 mcounteren.IR=0 ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        chk_addr = `RV32GC_CSR_CYCLEH;  #1;
+        expect_eq1("S 访问 cycleh 与 cycle 共用 CY 位 ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        //   ---- S 模式：mcounteren=7 ⇒ 六个计数器地址全合法（合法对照）----
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_MCOUNTEREN, 32'h0000_0007);
+        priv = `RV32GC_PRIV_S;
+        chk_addr = `RV32GC_CSR_CYCLE;   #1;
+        expect_eq1("S 访问 cycle 且 mcounteren.CY=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_TIME;    #1;
+        expect_eq1("S 访问 time 且 mcounteren.TM=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_INSTRET; #1;
+        expect_eq1("S 访问 instret 且 mcounteren.IR=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_CYCLEH;  #1;
+        expect_eq1("S 访问 cycleh 且 mcounteren.CY=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_TIMEH;   #1;
+        expect_eq1("S 访问 timeh 且 mcounteren.TM=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_INSTRETH;#1;
+        expect_eq1("S 访问 instreth 且 mcounteren.IR=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        //   ---- U 模式：需两级 AND；scounteren=0 ⇒ 全部非法 ----
+        priv = `RV32GC_PRIV_U;
+        chk_addr = `RV32GC_CSR_CYCLE;   #1;
+        expect_eq1("★ U 访问 cycle 且 scounteren.CY=0 ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        chk_addr = `RV32GC_CSR_TIME;    #1;
+        expect_eq1("★ U 访问 time 且 scounteren.TM=0 ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        //   ---- U 模式：scounteren=1（仅 CY）⇒ cycle 合法、time 仍非法 ----
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_SCOUNTEREN, 32'h0000_0001);
+        priv = `RV32GC_PRIV_U;
+        chk_addr = `RV32GC_CSR_CYCLE;   #1;
+        expect_eq1("U 访问 cycle 且两级 CY=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_CYCLEH;  #1;
+        expect_eq1("U 访问 cycleh 且两级 CY=1 ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_TIME;    #1;
+        expect_eq1("U 访问 time 且 scounteren.TM=0 ⇒ chk_illegal=1（两级 AND）", chk_illegal, 1'b1);
+        //   ---- U 模式：mcounteren 清 0 而 scounteren=7 ⇒ 仍非法（外层门控优先）----
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_SCOUNTEREN, 32'h0000_0007);
+        csr_write(`RV32GC_CSR_MCOUNTEREN, 32'h0);
+        priv = `RV32GC_PRIV_U;
+        chk_addr = `RV32GC_CSR_CYCLE;   #1;
+        expect_eq1("★ U 访问 cycle 且 mcounteren.CY=0（scounteren=1）⇒ chk_illegal=1",
+                   chk_illegal, 1'b1);
+        //   ---- 非计数器地址不受 counteren 影响（合法对照）----
+        chk_addr = `RV32GC_CSR_SSTATUS; #1;
+        expect_eq1("U 访问 sstatus 仍因特权级非法（非 counteren 门控）", chk_illegal, 1'b1);
+        priv = `RV32GC_PRIV_S;
+        chk_addr = `RV32GC_CSR_SSTATUS; #1;
+        expect_eq1("counteren=0 不影响 sstatus ⇒ S 合法", chk_illegal, 1'b0);
+
+        //======================================================================
+        // M3. 【P1-02】TVM：S 访问 satp（读或写）在 TVM=1 时非法；M 不受限
+        //   ★ 旧实现无该判定（01-privilege.md P1-02）；本节的 S+TVM=1 非法断言
+        //     在旧树必须 FAIL。"SFENCE.VMA 拦截/整核权限"不在本包（消费者/顶层另包接）。
+        //======================================================================
+        //   ---- 基线：TVM=0，S 访问 satp 合法（合法对照）----
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0);      // TVM=0
+        priv = `RV32GC_PRIV_S;
+        chk_addr = `RV32GC_CSR_SATP; #1;
+        expect_eq1("TVM=0 时 S 访问 satp ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        //   ---- TVM=1：S 非法，M 合法 ----
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_MSTATUS, (32'h1 << `RV32GC_MSTATUS_TVM_BIT));
+        priv = `RV32GC_PRIV_S;
+        chk_addr = `RV32GC_CSR_SATP; #1;
+        expect_eq1("★ TVM=1 时 S 访问 satp ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        //   ---- TVM 只拦 satp：同拍 S 访问 stvec/sstatus 仍合法 ----
+        chk_addr = `RV32GC_CSR_STVEC; #1;
+        expect_eq1("TVM=1 不影响 S 访问 stvec ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        chk_addr = `RV32GC_CSR_SSTATUS; #1;
+        expect_eq1("TVM=1 不影响 S 访问 sstatus ⇒ chk_illegal=0", chk_illegal, 1'b0);
+        priv = `RV32GC_PRIV_M;
+        chk_addr = `RV32GC_CSR_SATP; #1;
+        expect_eq1("TVM=1 时 M 访问 satp ⇒ chk_illegal=0（不拦 M）", chk_illegal, 1'b0);
+        //   ---- U 访问 satp 恒非法（特权级门控，与 TVM 无关）----
+        priv = `RV32GC_PRIV_U;
+        chk_addr = `RV32GC_CSR_SATP; #1;
+        expect_eq1("U 访问 satp ⇒ chk_illegal=1", chk_illegal, 1'b1);
+        //   ---- 收尾：清 TVM、清 counteren，恢复 priv=M 供后续小节使用 ----
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0);
+        csr_write(`RV32GC_CSR_MCOUNTEREN, 32'h0);
+        csr_write(`RV32GC_CSR_SCOUNTEREN, 32'h0);
+        chk_addr = `RV32GC_CSR_MSTATUS; #1;
+        expect_eq1("M3 收尾：TVM 已清 ⇒ S 访问 satp 恢复合法", chk_illegal, 1'b0);
 
         //======================================================================
         // N. mie / mip 与中断请求
@@ -496,6 +609,147 @@ module tb_csr_file_top;
                     mie_o & 32'h0000_0888, 32'h0000_0888);
         csr_read_chk("mie 合并视图 = M 位 | S 位",
                      `RV32GC_CSR_MIE, 32'h0000_0AAA);
+
+        //   ★ P1-05：sie/sip 是按 mideleg 受限的别名 —— 未委托位 read-only zero，
+        //     写只能触及已委托位，不得清改未委托的底层 mie/mip 位。
+        //     ISA machine.adoc（KB chunk 10554）："If an interrupt is delegated to
+        //     S-mode by setting a bit in mideleg, it becomes visible in sip and is
+        //     maskable using sie. Otherwise, the corresponding bits ... are read-only zero."
+        //     ★ 旧树（201acf61）sie/sip 只按固定 1/5/9 掩码，与 mideleg 无关 ⇒ 本段 FAIL。
+        priv = `RV32GC_PRIV_M;
+        //   ---- A. mideleg=0：sie/sip 读 0；对 sie/sip 的写不得改底层 ----
+        csr_write(`RV32GC_CSR_MIE,    32'h0000_0222);
+        csr_write(`RV32GC_CSR_MIDELEG,32'h0000_0000);
+        csr_read_chk("★ A mideleg=0 ⇒ sie 读 0", `RV32GC_CSR_SIE, 32'h0);
+        csr_write(`RV32GC_CSR_MIP,    32'h0000_0222);
+        csr_read_chk("★ A mideleg=0 ⇒ sip 读 0", `RV32GC_CSR_SIP, 32'h0);
+        csr_write(`RV32GC_CSR_SIE,    32'h0000_0000);   // 清委托位 ⇒ 全忽略
+        csr_read_chk("★ A 未委托时写 sie 不得清底层 mie", `RV32GC_CSR_MIE, 32'h0000_0222);
+        csr_write(`RV32GC_CSR_SIP,    32'h0000_0000);   // 清 SSIP ⇒ 未委托 ⇒ 忽略
+        csr_read_chk("★ A 未委托时写 sip 不得清底层 mip", `RV32GC_CSR_MIP, 32'h0000_0222);
+        //   ---- B. 部分委托（仅 STI=mideleg[5]）：只有该位可见/可写 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0020);
+        csr_read_chk("★ B 部分委托 ⇒ sie 只显示 STIE", `RV32GC_CSR_SIE, 32'h0000_0020);
+        csr_write(`RV32GC_CSR_SIE,    32'h0000_0000);   // 只清已委托的 bit5
+        csr_read_chk("★ B sie 写只清已委托位 ⇒ 未委托位保留", `RV32GC_CSR_MIE, 32'h0000_0202);
+        csr_read_chk("B sie 读回 = 0（已委托位已清）", `RV32GC_CSR_SIE, 32'h0);
+        //   ---- C. 委托 SSIP：sip 显示且可写 SSIP；写 0 只清该位 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0002);
+        csr_write(`RV32GC_CSR_MIP,     32'h0000_0222);
+        csr_read_chk("★ C 委托 SSIP ⇒ sip 只显示 SSIP", `RV32GC_CSR_SIP, 32'h0000_0002);
+        csr_write(`RV32GC_CSR_SIP,     32'h0000_0000);
+        csr_read_chk("★ C sip 写 0 只清已委托的 SSIP", `RV32GC_CSR_MIP, 32'h0000_0220);
+        //   ---- 收尾：恢复全委托并按 M 写恢复 mie/mip 基线 ----
+        csr_write(`RV32GC_CSR_MIDELEG, `RV32GC_MIDELEG_IMPL_MSK);
+        csr_write(`RV32GC_CSR_MIE,     32'h0000_0222);
+        csr_write(`RV32GC_CSR_MIP,     32'h0000_0222);
+        csr_read_chk("O 收尾 mie 恢复 0x222", `RV32GC_CSR_MIE, 32'h0000_0222);
+        csr_read_chk("O 收尾 mip 恢复 0x222", `RV32GC_CSR_MIP, 32'h0000_0222);
+
+        //======================================================================
+        // O2. 【首轮独审 P1】SIE/SIP 两路预览（rdata_w / byp_rdata）与落盘一致
+        //   根因：csr_landing 的 SIE/SIP 分支原先只按固定 wr_mask，落了 W 级
+        //   预览 0x222，但实际写通道按 mideleg 过滤后读回 0 ⇒ 预览 ≠ 实际读取。
+        //   ★ 反证：把 csr_landing 的 SIE/SIP 分支改回固定掩码，本节断言必 FAIL。
+        //   覆盖：未委托(0) / 部分(0x020) / 全(0x222) 三档；含"写 mideleg 同拍
+        //   改变委托"时 SIE 读视图与 M 级预览的合同；底层未委托位不得被误清。
+        //======================================================================
+        //   ---- 预置：mie 全 S 位 + M 位；mip 软件 S 位 ----
+        csr_write(`RV32GC_CSR_MIE, 32'h0000_0AAA);
+        csr_write(`RV32GC_CSR_MIP, 32'h0000_0222);
+        //   ---- A. 未委托（mideleg=0）：SIE 写 0x222 预览=0，落盘读=0 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0000);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIE; waddr = `RV32GC_CSR_SIE; wdata = 32'h0000_0222;
+        wen = 1'b1; w_illegal = 1'b0; byp_wdata = 32'h0000_0222; #1;
+        expect_eq32("★ O2-A SIE 写 0x222 且 mideleg=0：rdata_w 预览 = 0",
+                    rdata_w, 32'h0);
+        expect_eq32("★ O2-A M 级 byp_rdata 预览 = 0", byp_rdata, 32'h0);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        @(posedge clk); #1;
+        csr_read_chk("★ O2-A 落盘实际读 SIE = 0（与预览一致）", `RV32GC_CSR_SIE, 32'h0);
+        expect_eq32("O2-A 未委托写不清底层 mie（S 位仍在）", mie_o & 32'h0000_0222, 32'h0000_0222);
+        //   ---- B. 部分委托（仅 STI=0x020）：写 0x222 预览/落盘 = 0x020；
+        //        再写 0 只清已委托位，未委托底层位保留 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0020);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIE; waddr = `RV32GC_CSR_SIE; wdata = 32'h0000_0222;
+        wen = 1'b1; byp_wdata = 32'h0000_0000; #1;
+        expect_eq32("★ O2-B 部分委托：SIE 写 0x222 的 rdata_w 预览 = 0x020",
+                    rdata_w, 32'h0000_0020);
+        expect_eq32("★ O2-B M 级预览（清 0x222）= 0", byp_rdata, 32'h0);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        @(posedge clk); #1;
+        csr_read_chk("★ O2-B 落盘实际读 SIE = 0x020", `RV32GC_CSR_SIE, 32'h0000_0020);
+        expect_eq32("O2-B 未委托底层 S 位未被误清（SIE 显示层只看委托位）",
+                    mie_o & 32'h0000_0222, 32'h0000_0222);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIE; waddr = `RV32GC_CSR_SIE; wdata = 32'h0000_0000;
+        wen = 1'b1; byp_wdata = 32'h0000_0222; #1;
+        expect_eq32("O2-B2 写 0：rdata_w 预览 = 0（只清委托位后读回）", rdata_w, 32'h0);
+        expect_eq32("O2-B2 M 级预览（置 0x222）= 0x020", byp_rdata, 32'h0000_0020);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        @(posedge clk); #1;
+        csr_read_chk("O2-B2 落盘 SIE = 0", `RV32GC_CSR_SIE, 32'h0);
+        expect_eq32("★ O2-B2 未委托底层位保留（仅 bit5 被清）",
+                    mie_o & 32'h0000_0222, 32'h0000_0202);
+        //   ---- C. 全委托（0x222）：写 0x202 ⇒ 预览/落盘 = 0x202 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0222);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIE; waddr = `RV32GC_CSR_SIE; wdata = 32'h0000_0202;
+        wen = 1'b1; byp_wdata = 32'h0000_0002; #1;
+        expect_eq32("O2-C 全委托：rdata_w 预览 = 0x202", rdata_w, 32'h0000_0202);
+        expect_eq32("O2-C M 级预览（写 0x002）= 0x002", byp_rdata, 32'h0000_0002);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        @(posedge clk); #1;
+        csr_read_chk("O2-C 落盘实际读 SIE = 0x202", `RV32GC_CSR_SIE, 32'h0000_0202);
+        //   ---- D. 委托同拍变化：W 写 mideleg=0（撤委托），读 SIE 的预览必须按新值 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0222);   // 先全委托
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIE; waddr = `RV32GC_CSR_MIDELEG; wdata = 32'h0000_0000;
+        wen = 1'b1; byp_wdata = 32'h0000_0222; #1;
+        expect_eq32("★ O2-D 同拍撤委托：SIE 读视图 rdata_w = mie & 新 mideleg = 0",
+                    rdata_w, 32'h0);
+        expect_eq32("★ O2-D 同拍撤委托：M 级 SIE 预览 = 写数据 & 新 mideleg = 0",
+                    byp_rdata, 32'h0);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        @(posedge clk); #1;
+        csr_read_chk("O2-D 落盘：mideleg=0 ⇒ SIE 读 0", `RV32GC_CSR_SIE, 32'h0);
+        expect_eq32("O2-D 撤委托不清底层 mie", mie_o & 32'h0000_0222, 32'h0000_0202);
+        //   ---- E. SIP 未委托：写 0 被忽略；预览/落盘 = 0，不清底层 mip ----
+        csr_write(`RV32GC_CSR_MIP, 32'h0000_0222);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIP; waddr = `RV32GC_CSR_SIP; wdata = 32'h0000_0000;
+        wen = 1'b1; byp_wdata = 32'h0000_0000; #1;
+        expect_eq32("★ O2-E SIP 未委托：rdata_w 预览 = 0", rdata_w, 32'h0);
+        expect_eq32("★ O2-E SIP 未委托：M 级预览 = 0", byp_rdata, 32'h0);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0;
+        @(posedge clk); #1;
+        csr_read_chk("★ O2-E 落盘实际读 SIP = 0", `RV32GC_CSR_SIP, 32'h0);
+        expect_eq32("★ O2-E 未委托写不清底层 mip（SSIP/STIP/SEIP 仍在）",
+                    mip_o & 32'h0000_0222, 32'h0000_0222);
+        //   ---- F. SIP 部分委托（仅 SSIP）：写 0 清 SSIP；STIP/SEIP 底层位保留 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0002);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_SIP; waddr = `RV32GC_CSR_SIP; wdata = 32'h0000_0000;
+        wen = 1'b1; byp_wdata = 32'h0000_0002; #1;
+        expect_eq32("O2-F SIP 部分委托：rdata_w 预览 = 0", rdata_w, 32'h0);
+        expect_eq32("O2-F SIP 部分委托：M 级预览（置 SSIP）= 0x002", byp_rdata, 32'h0000_0002);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0;
+        @(posedge clk); #1;
+        csr_read_chk("O2-F 落盘实际读 SIP = 0", `RV32GC_CSR_SIP, 32'h0);
+        expect_eq32("O2-F 只清已委托 SSIP，STIP/SEIP 保留",
+                    mip_o & 32'h0000_0222, 32'h0000_0220);
+        //   ---- 收尾：恢复 mideleg=0x222、mie/mip 基线 ----
+        csr_write(`RV32GC_CSR_MIDELEG, 32'h0000_0222);
+        csr_write(`RV32GC_CSR_MIP, 32'h0000_0222);
 
         //======================================================================
         // P. 计数器：mcycle/minstret 高半与 cycle/instret 只读视图
@@ -550,15 +804,65 @@ module tb_csr_file_top;
         expect_eq32("mstatus_set 置 MPP=M", (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h3);
 
         //======================================================================
-        // R. PMP L 位锁定行为（cfg 与 addr）
+        // R. PMP L 位写锁（P0-02 修复）：本项 L **或** 后项 (L && A=TOR)
+        //   ISA norm:pmplbitwriteprotection：
+        //     「若项 i 被锁，写 pmpcfg[i]/pmpaddr[i] 被忽略；若项 i 被锁且 A=TOR，
+        //       写 pmpaddr[i-1] 也被忽略」；NOTE：A=OFF 时 L 仍锁本项。
+        //   ★ 旧树（201acf61）只看后项 L&&TOR 且 i=15 恒不锁 ⇒ R1/R4 必 FAIL。
+        //   ★ 锁定写是**静默忽略**（不抛异常）：同时断言 chk_illegal/chk_ro_write=0。
+        //   ★ 本 TB 原先把"L 项自身 pmpaddr 仍可写"当正确口径（错误 oracle）；
+        //     现按规范修正，并保留未锁项的合法读写对照（R2a/R3/R4 的前驱项）。
         //======================================================================
-        csr_write(`RV32GC_CSR_PMPCFG0, 32'h0000_008F);   // 项0: L=1 A=NAPOT(3) RWX=7
-        csr_read_chk("pmpcfg0 项0 L=1", `RV32GC_CSR_PMPCFG0, 32'h0000_008F);
+        //   ---- R1：item0 本项 L（A=TOR）⇒ pmpcfg0/pmpaddr0 写均被忽略 ----
+        csr_write(`RV32GC_CSR_PMPCFG0, 32'h0000_008F);   // 项0: L=1 A=TOR RWX=7
+        csr_read_chk("R1 pmpcfg0 项0 L=1", `RV32GC_CSR_PMPCFG0, 32'h0000_008F);
         csr_write(`RV32GC_CSR_PMPCFG0, 32'h0000_000F);   // 撤 L ⇒ 写被忽略
-        csr_read_chk("L=1 时 pmpcfg0 写入被忽略", `RV32GC_CSR_PMPCFG0, 32'h0000_008F);
-        csr_write(`RV32GC_CSR_PMPADDR0, 32'h0000_1234);
-        csr_read_chk("L 项自身的 pmpaddr 仍可写（本设计口径）",
-                     `RV32GC_CSR_PMPADDR0, 32'h0000_1234);
+        csr_read_chk("R1 L=1 时 pmpcfg0 写入被忽略", `RV32GC_CSR_PMPCFG0, 32'h0000_008F);
+        csr_write(`RV32GC_CSR_PMPADDR0, 32'h0000_1234);  // 本项 L ⇒ 写被忽略
+        csr_read_chk("★ R1 本项 L 锁定 pmpaddr0（旧树可写，必 FAIL）",
+                     `RV32GC_CSR_PMPADDR0, 32'h0000_0001);
+        expect_eq32("R1 pmp_addr_o[31:0] 未被改动", pmp_addr_o[31:0], 32'h0000_0001);
+        chk_addr = `RV32GC_CSR_PMPADDR0; priv = `RV32GC_PRIV_M; #1;
+        expect_eq1("R1 锁定写不抛非法（chk_illegal=0）", chk_illegal, 1'b0);
+        expect_eq1("R1 锁定写不判只读写（chk_ro_write=0）", chk_ro_write, 1'b0);
+
+        //   ---- R2a：未锁项合法写（合法覆盖保留）----
+        csr_write(`RV32GC_CSR_PMPADDR2, 32'h0000_00A5);
+        csr_read_chk("R2a 未锁项 pmpaddr2 合法可写", `RV32GC_CSR_PMPADDR2, 32'h0000_00A5);
+
+        //   ---- R2b：item1 本项 L、item3 本项 L（均 A=TOR）----
+        csr_write(`RV32GC_CSR_PMPCFG0, 32'h8800_888F);
+        csr_read_chk("R2b pmpcfg0 = item0(L,TOR)+item1(L,TOR)+item3(L,TOR)",
+                     `RV32GC_CSR_PMPCFG0, 32'h8800_888F);
+        //   ---- R2c：pmpaddr2 本项 L=0，但**后项 item3 L&&TOR** ⇒ 写被忽略 ----
+        csr_write(`RV32GC_CSR_PMPADDR2, 32'h0000_00FF);
+        csr_read_chk("★ R2c 后项 (L&&TOR) 锁定前驱 pmpaddr2（合法覆盖保留）",
+                     `RV32GC_CSR_PMPADDR2, 32'h0000_00A5);
+        //   ---- R2d：pmpaddr1 本项 L=1 ⇒ 写被忽略 ----
+        csr_write(`RV32GC_CSR_PMPADDR1, 32'h0000_00FF);
+        csr_read_chk("R2d 中间项本项 L 锁定 pmpaddr1", `RV32GC_CSR_PMPADDR1, 32'h0000_0002);
+        //   ---- R2e：pmpaddr0 同时被本项 L 与后项 TOR 锁 ⇒ 仍不可写 ----
+        csr_write(`RV32GC_CSR_PMPADDR0, 32'h0000_00FF);
+        csr_read_chk("R2e pmpaddr0 仍被锁（本项+后项双重）", `RV32GC_CSR_PMPADDR0, 32'h0000_0001);
+
+        //   ---- R3：后项 L 但 A≠TOR ⇒ **不**锁前驱（合法覆盖保留）----
+        csr_write(`RV32GC_CSR_PMPCFG1, 32'h1F0F_9F0F);   // item5: L=1 A=NAPOT
+        csr_read_chk("R3 pmpcfg1 item5 L=1 A=NAPOT", `RV32GC_CSR_PMPCFG1, 32'h1F0F_9F0F);
+        csr_write(`RV32GC_CSR_PMPADDR4, 32'h0000_0BAD);
+        csr_read_chk("★ R3 后项 L 但 A=NAPOT ⇒ 前驱 pmpaddr4 仍可写",
+                     `RV32GC_CSR_PMPADDR4, 32'h0000_0BAD);
+        csr_write(`RV32GC_CSR_PMPADDR5, 32'h0000_DEAD);  // 本项 L=1 ⇒ 忽略
+        csr_read_chk("R3 本项 L 锁定 pmpaddr5", `RV32GC_CSR_PMPADDR5, 32'h0000_0000);
+
+        //   ---- R4：i=15 边界 —— 本项 L（A=OFF）仍锁 pmpaddr15；前驱不受影响 ----
+        csr_write(`RV32GC_CSR_PMPCFG3, 32'h8000_0000);   // item15: L=1 A=OFF
+        csr_read_chk("R4 pmpcfg3 item15 L=1 A=OFF", `RV32GC_CSR_PMPCFG3, 32'h8000_0000);
+        csr_write(`RV32GC_CSR_PMPADDR15, 32'h0000_DEAD);
+        csr_read_chk("★ R4 i=15 本项 L（A=OFF）锁定 pmpaddr15（旧树 i=15 恒不锁，必 FAIL）",
+                     `RV32GC_CSR_PMPADDR15, 32'h0000_8000);
+        csr_write(`RV32GC_CSR_PMPADDR14, 32'h0000_0BAD);
+        csr_read_chk("R4 i=15 的 A=OFF ⇒ 前驱 pmpaddr14 仍可写",
+                     `RV32GC_CSR_PMPADDR14, 32'h0000_0BAD);
 
         //======================================================================
         // S. 【R3 根因修复】陷阱/xRET 的 mstatus 语义 —— csr_file×priv_ctrl 闭环

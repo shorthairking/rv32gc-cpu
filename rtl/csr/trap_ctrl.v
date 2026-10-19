@@ -149,74 +149,102 @@ module trap_ctrl (
     wire exc_deleg_bit = medeleg[exc_cause];
     wire exc_delegated = exc_valid & src_lower_m & exc_deleg_bit;
 
-    // ---- 中断：逐位构造"可在本模式取"的中断集合 ----
-    //   M 专属中断（3/7/11）：mideleg 中硬连 0（08 §6.2）⇒ 恒进 M。
-    //   S 级中断（1/5/9）：mideleg 置位且在 S/U 模式 ⇒ 进 S；否则进 M。
+    // ---- 中断：逐位构造"可在本模式取"的中断集合，**先定目标特权级再组内源序** ----
+    //   ★ P1-04 修复（2026-10-19 F1 特权包）：**先按每 bit 的实际委托定目标，再按目标
+    //     与该模式决定全局使能**；不能按 cause 名称把 S 源（1/5/9）等同 S 目标。
+    //   ★★ 复审修复（首轮独审 P1）：选中优先级必须是
+    //     **「目标特权级 M 优先，再组内源序」**，而不是全局固定源序。理由：
+    //     只按固定源序（MEI,MSI,MTI,SEI,SSI,STI）会让"已委托 SEI(9)→S"压过
+    //     "未委托 STI(5)→M"，违反 M 级/高特权目标优先（同时会让低特权目标先取，
+    //     与 norm:trap_never_trans_lower 的取向相反）。cause 仍写**原源号**。
+    //     规范依据：
+    //       · machine.adoc norm:intr_M_mode_highest_pri：M 级中断在低特权级恒开放；
+    //       · supervisor.adoc：S 级中断在 < S 的特权级（U）不受 SIE 掩蔽；
+    //       · machine.adoc norm:trap_del_intr_priv_lvl：被委托的中断在委托者特权级
+    //         （M）被屏蔽；**未委托**的 S 源中断按普通中断投递到 M。
+    //   per-bit 目标判定：
+    //     tgt_s = is_s_irq && mideleg[code]       （只有 S 源可被委托；M 源恒 M 目标）
+    //     全局使能（目标 + 当前模式）：
+    //       tgt_s=1：priv==M ⇒ 0（委托位在 M 屏蔽）
+    //                priv==U ⇒ 1（< S 不受 SIE 掩蔽）
+    //                priv==S ⇒ mstatus.SIE
+    //       tgt_s=0：priv==M ⇒ mstatus.MIE
+    //                否则（S/U）⇒ 1（< M 恒开放）
     //   ★ 可移植性要点（本会话实测）：function 若**直接读模块级寄存器**
     //   （如 mstatus_i），Icarus Verilog 12.0 不会在该寄存器变化时重新求值
     //   调用它的连续赋值（Vivado/Verilator 会）。⇒ 所有被读的寄存器都必须
     //   作为**显式 input** 传入函数。
-    function irq_visible;
+    //   —— 每个源算两个"可见"位：v_m（目标 M）/ v_s（目标 S），互斥。
+    function irq_vis_m;              // 目标 = M：M 源，或**未委托**的 S 源
         input [31:0] mip_v;
         input [31:0] mie_v;
         input [31:0] mideleg_v;
-        input [31:0] mstatus_v;   // ★ 显式传入，勿改为读模块级 mstatus_i
+        input [31:0] mstatus_v;
         input [1:0]  cur_priv;
         input        is_s_irq;
         input [4:0]  code;
+        reg          tgt_s, gen;
         begin
-            // 挂起 & 使能
-            //   ★★ G1 修复（2B-4 第 4b-3 段，母代理裁决："放开 2A 一行"+理由）：
-            //     **M 级中断在下特权级恒开放** —— ISA（machine.adoc, mstatus.MIE/SIE 与中断取用
-            //     条件）："an interrupt i will trap to M-mode if ... the privilege mode is less
-            //     than M, **or** mstatus.MIE=1" ⇒ `priv < M` 时 M 级中断**不受 MIE/SIE 掩蔽**。
-            //     旧式对"非 M 特权级"一律取 SIE ⇒ S 模式下已使能的 MEI 被误屏蔽（实测 p15：
-            //     `mip.MEIP=1 & mie.MEIE=1 & mstatus.MIE=1` 仍不投递；置 `sstatus.SIE=1` 才投递）。
-            //     M 级（is_s_irq=0）：(priv==M) ? MIE : 1'b1
-            //     S 级（is_s_irq=1）：(priv==M) ? 0 : (priv==U) ? 1 : SIE
-            //       ★★ D2 修复（AUDIT2）：U 模式下 SIE 位被**忽略**。ISA（supervisor.adoc）：
-            //       "An interrupt i will trap to S-mode if ... either the current privilege
-            //       mode is S and the SIE bit ... is set, **or the current privilege mode
-            //       has less privilege than S-mode**" ⇒ 特权级 < S（即 U）时 S 级中断
-            //       不受 SIE 掩蔽；旧式在 U 模式仍取 SIE ⇒ S 中断被误屏蔽。
-            //     —— 最小加法：只改"全局使能"一项的取值口径，其余（挂起/使能/委托门控）不变。
-            irq_visible = mip_v[code] & mie_v[code] &
-                          ( is_s_irq ? ((cur_priv == PRIV_M) ? 1'b0 :
-                                        (cur_priv == PRIV_U) ? 1'b1 :
-                                                               mstatus_v[`RV32GC_MSTATUS_SIE_BIT])
-                                     : ((cur_priv == PRIV_M) ? mstatus_v[`RV32GC_MSTATUS_MIE_BIT]
-                                                             : 1'b1) ) &
-                          // 委托门控：被委托给 S 的中断**不在 M 模式取**
-                          // （norm:trap_del_intr_priv_lvl）；未被委托的中断恒进 M
-                          ( is_s_irq ? ((cur_priv != PRIV_M) ? mideleg_v[code] : 1'b0)
-                                     : 1'b1 );
+            tgt_s = is_s_irq && mideleg_v[code];
+            gen = tgt_s ? 1'b0 :
+                  (cur_priv == PRIV_M) ? mstatus_v[`RV32GC_MSTATUS_MIE_BIT] : 1'b1;
+            irq_vis_m = mip_v[code] & mie_v[code] & gen;
         end
     endfunction
 
-    // ---- 各中断的可见性（M 专属中断 is_s_irq=0 ⇒ 恒进 M） ----
-    wire irq_mei_v = irq_visible(mip, mie, mideleg, mstatus_i, priv, 1'b0, IRQ_MEI);
-    wire irq_msi_v = irq_visible(mip, mie, mideleg, mstatus_i, priv, 1'b0, IRQ_MSI);
-    wire irq_mti_v = irq_visible(mip, mie, mideleg, mstatus_i, priv, 1'b0, IRQ_MTI);
-    wire irq_sei_v = irq_visible(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_SEI);
-    wire irq_ssi_v = irq_visible(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_SSI);
-    wire irq_sti_v = irq_visible(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_STI);
+    function irq_vis_s;              // 目标 = S：仅**已委托**的 S 源
+        input [31:0] mip_v;
+        input [31:0] mie_v;
+        input [31:0] mideleg_v;
+        input [31:0] mstatus_v;
+        input [1:0]  cur_priv;
+        input        is_s_irq;
+        input [4:0]  code;
+        reg          tgt_s, gen;
+        begin
+            tgt_s = is_s_irq && mideleg_v[code];
+            gen = ~tgt_s ? 1'b0 :
+                  (cur_priv == PRIV_M) ? 1'b0 :
+                  (cur_priv == PRIV_U) ? 1'b1 :
+                                         mstatus_v[`RV32GC_MSTATUS_SIE_BIT];
+            irq_vis_s = mip_v[code] & mie_v[code] & gen;
+        end
+    endfunction
+
+    // ---- 各中断的可见性（M 源 is_s_irq=0 ⇒ 恒 M 目标；只有 v_m 可能为 1）----
+    wire irq_mei_vm = irq_vis_m(mip, mie, mideleg, mstatus_i, priv, 1'b0, IRQ_MEI);
+    wire irq_msi_vm = irq_vis_m(mip, mie, mideleg, mstatus_i, priv, 1'b0, IRQ_MSI);
+    wire irq_mti_vm = irq_vis_m(mip, mie, mideleg, mstatus_i, priv, 1'b0, IRQ_MTI);
+    wire irq_sei_vm = irq_vis_m(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_SEI);
+    wire irq_ssi_vm = irq_vis_m(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_SSI);
+    wire irq_sti_vm = irq_vis_m(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_STI);
+    //   S 目标：只有 S 源可能（M 源 v_s 恒 0）
+    wire irq_sei_vs = irq_vis_s(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_SEI);
+    wire irq_ssi_vs = irq_vis_s(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_SSI);
+    wire irq_sti_vs = irq_vis_s(mip, mie, mideleg, mstatus_i, priv, 1'b1, IRQ_STI);
+
+    // ---- ★ 两级优先级编码：**先 M 目标组**（组内固定源序 MEI>MSI>MTI>SEI>SSI>STI），
+    //      无 M 目标候选时才取 **S 目标组**（组内 SEI>SSI>STI）----
+    wire [4:0] irq_sel_m = irq_mei_vm ? IRQ_MEI :
+                           irq_msi_vm ? IRQ_MSI :
+                           irq_mti_vm ? IRQ_MTI :
+                           irq_sei_vm ? IRQ_SEI :
+                           irq_ssi_vm ? IRQ_SSI :
+                           irq_sti_vm ? IRQ_STI : 5'd0;
+    wire [4:0] irq_sel_s = irq_sei_vs ? IRQ_SEI :
+                           irq_ssi_vs ? IRQ_SSI :
+                           irq_sti_vs ? IRQ_STI : 5'd0;
 
     // ---- ★ E4：中断只在"已提交指令边界之后"取 ----
     //   本设计纪律（T6；规范未明说）。实现为中断候选与 commit_valid 相与。
-    wire any_irq_v = (irq_mei_v | irq_msi_v | irq_mti_v | irq_sei_v | irq_ssi_v | irq_sti_v)
-                     & commit_valid & ~exc_valid;   // 同步异常优先于中断（同拍）
+    wire irq_cand_v = (irq_sel_m != 5'd0) | (irq_sel_s != 5'd0);
+    wire any_irq_v  = irq_cand_v & commit_valid & ~exc_valid;   // 同步异常优先于中断（同拍）
 
-    // ---- 中断优先级编码（first-match，M 级优先） ----
-    wire [4:0] irq_sel = irq_mei_v ? IRQ_MEI :
-                         irq_msi_v ? IRQ_MSI :
-                         irq_mti_v ? IRQ_MTI :
-                         irq_sei_v ? IRQ_SEI :
-                         irq_ssi_v ? IRQ_SSI :
-                         irq_sti_v ? IRQ_STI : 5'd0;
-    // 被委托的中断 ⇒ 进 S；否则进 M
-    wire irq_sel_is_s  = (irq_sel == IRQ_SEI) | (irq_sel == IRQ_SSI) | (irq_sel == IRQ_STI);
-    wire irq_goes_s    = any_irq_v & irq_sel_is_s & src_lower_m & mideleg[irq_sel];
-    wire irq_goes_m    = any_irq_v & ~irq_goes_s;
+    // 目标：有 M 目标候选 ⇒ M（高特权优先）；否则取 S 目标候选。
+    wire irq_sel_is_s = (irq_sel_m == 5'd0) && (irq_sel_s != 5'd0);
+    wire [4:0] irq_sel = irq_sel_is_s ? irq_sel_s : irq_sel_m;
+    wire irq_goes_s = any_irq_v & irq_sel_is_s;
+    wire irq_goes_m = any_irq_v & ~irq_sel_is_s;
 
     //==========================================================================
     // 3. 合并：同步异常优先于中断
