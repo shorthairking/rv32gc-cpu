@@ -16,11 +16,15 @@
 //      只有 bit0 有语义（SiFive CLINT 口径：msip 为 32 位寄存器，仅 bit0 有效）。
 //   2. mtime：**由 aclk 每拍 +1** 的自由计数器（RV32GC_TIMEBASE_HZ = 33 MHz，
 //      1 tick ≈ 30.3 ns）。软件可写（整 64 位可读写）。
-//   3. mtimecmp：64 位可写比较值。当 mtime > mtimecmp（**无符号、严格大于**，
-//      SiFive/ACLINT 口径）⇒ MTIP 置位（cause 7 MTI）。软件写 mtimecmp 使
-//      mtime <= mtimecmp 后 MTIP 随之清 0 —— 这是**纯组合**的
-//      `mtip = (mtime > mtimecmp)`，因此"写 mtimecmp 清 MTIP"天然成立，
-//      无需任何状态机，也**杜绝了"清中断需要额外写 CLINT 寄存器"的偏差**。
+//   3. mtimecmp：64 位可写比较值。当 mtime >= mtimecmp（**无符号、大于等于**，
+//      ISA `#norm:mtimeintrpending` 明文："A machine timer interrupt becomes
+//      pending whenever mtime contains a value greater than or equal to
+//      mtimecmp, treating the values as unsigned integers"）⇒ MTIP 置位
+//      （cause 7 MTI）。软件写 mtimecmp 使 mtime < mtimecmp 后 MTIP 随之清 0
+//      —— 这是**纯组合**的 `mtip = (mtime >= mtimecmp)`，因此"写 mtimecmp
+//      清 MTIP"天然成立，无需任何状态机，也**杜绝了"清中断需要额外写 CLINT
+//      寄存器"的偏差**。ISA `#norm:mtimeintrmtip_visibility` 另许"比较结果
+//      变化到 MTIP 反映"有界传播延迟，但**不**允许把相等定义为不挂起。
 //
 // 中断输出（只出核内总线侧信号，**不产生任何 AXI 请求**）:
 //   msip_o —— 接 mip.MSIP（rv32_defs.vh RV32GC_MIP_MSIP_BIT = 3）
@@ -88,12 +92,20 @@ module clint (
     // 其余偏移（含未实现空洞）不命中 ⇒ 由 mmio_route 按平台默认通路处理。
     assign resp_hit = sel_msip | sel_mtimecmp | sel_mtimecmph | sel_mtime | sel_mtimeh;
 
-    // 写命中选择（组合）
-    wire wr_msip      = req_valid & req_write & sel_msip;
-    wire wr_mtimecmp  = req_valid & req_write & sel_mtimecmp;
-    wire wr_mtimecmph = req_valid & req_write & sel_mtimecmph;
-    wire wr_mtime     = req_valid & req_write & sel_mtime;
-    wire wr_mtimeh    = req_valid & req_write & sel_mtimeh;
+    // 字节使能合并 —— 本设计只支持 32 位整字访问（核内 MMIO 一律字对齐、
+    // 由 lsu 保证），故用"任一字节使能有效即整字写"的简化口径；
+    // 该口径在注释中固定，避免后续被误当通用字节写实现。
+    // ★ 全字使能门控：`wr_en == 0`（req_wstrb=4'h0，非法/空掩码访问）时
+    //   **任何寄存器都不得被改写**（无副作用）。保留既有"任一字节有效 ⇒ 整字写"
+    //   与地址命中（resp_hit 不看 strobe）契约不变 —— 只新增"空掩码无副作用"。
+    wire wr_en = |req_wstrb;
+
+    // 写命中选择（组合；统一受 wr_en 门控 ⇒ 空字节掩码写无副作用）
+    wire wr_msip      = req_valid & req_write & sel_msip      & wr_en;
+    wire wr_mtimecmp  = req_valid & req_write & sel_mtimecmp  & wr_en;
+    wire wr_mtimecmph = req_valid & req_write & sel_mtimecmph & wr_en;
+    wire wr_mtime     = req_valid & req_write & sel_mtime     & wr_en;
+    wire wr_mtimeh    = req_valid & req_write & sel_mtimeh    & wr_en;
 
     // 读命中选择（组合）
     wire rd_msip      = req_valid & ~req_write & sel_msip;
@@ -101,11 +113,6 @@ module clint (
     wire rd_mtimecmph = req_valid & ~req_write & sel_mtimecmph;
     wire rd_mtime     = req_valid & ~req_write & sel_mtime;
     wire rd_mtimeh    = req_valid & ~req_write & sel_mtimeh;
-
-    // 字节使能合并 —— 本设计只支持 32 位整字访问（核内 MMIO 一律字对齐、
-    // 由 lsu 保证），故用"任一字节使能有效即整字写"的简化口径；
-    // 该口径在注释中固定，避免后续被误当通用字节写实现。
-    wire wr_en = |req_wstrb;
 
     //--------------------------------------------------------------------------
     // 3. 状态寄存器
@@ -118,9 +125,10 @@ module clint (
     // 4. 组合输出（只出核内总线侧信号；**无 AXI 端口 ⇒ 绝不产生 AXI 请求**）
     //--------------------------------------------------------------------------
     assign msip_o = msip_r;
-    // MTIP = (mtime > mtimecmp)，无符号严格大于（SiFive / ACLINT 口径）。
-    // 纯组合 ⇒ 软件写 mtimecmp 抬高比较值后 MTIP 立刻自清（08 §6.6 / 验收判据 ③）。
-    assign mtip_o = (mtime_r > mtimecmp_r);
+    // MTIP = (mtime >= mtimecmp)，无符号大于等于（ISA `#norm:mtimeintrpending`）。
+    // 纯组合 ⇒ 软件写 mtimecmp 抬高比较值（使 mtime < mtimecmp）后 MTIP 立刻
+    // 自清（08 §6.6 / 验收判据 ③）；mtime == mtimecmp 时**必须**保持挂起。
+    assign mtip_o = (mtime_r >= mtimecmp_r);
 
     // 读数据：多路选择用连续赋值（红线 3）
     assign resp_rdata = rd_msip      ? {31'b0, msip_r}          :
@@ -157,7 +165,7 @@ module clint (
             if (wr_mtimecmph) mtimecmp_r[63:32] <= req_wdata;
 
             // ---- msip：写 1 置位（MSI），写 0 清位 ----
-            if (wr_msip && wr_en) msip_r <= req_wdata[0];
+            if (wr_msip) msip_r <= req_wdata[0];
         end
     end
 

@@ -638,6 +638,110 @@ module tb_decoder_top;
         `CHK(alu_op_o === 4'd2,          "sll 应为 ALU_SLL")
 
         //======================================================================
+        // 5.6 F1 译码包回归锚点（2026-10-19，缺陷 F05-01/03/04）
+        //     期望编码来源：riscv32-unknown-linux-gnu-{as,objdump} 实测
+        //     （-march=rv32imafdc_zca）+ 纯位域重算；规范依据见
+        //     sim/functional/tb_decode_semantics.sv 头注与
+        //     sim/audit/global-2026-10-18/05-frontend-decode.md F05-01/03/04。
+        //     ★ 本节只**追加**回归锚点，不改动上面任何既有检查的期望值。
+        //======================================================================
+
+        // ---- (a) CA/CB 的 rd′/rs1′ = c[9:7]（旧实现误用 c[4:2] 的 rs2′ 域）----
+        cexp_in = 16'h8c05;              // c.sub x8,x9
+        #1;
+        `CHK(cexp_ill === 1'b0,          "F05-01：c.sub x8,x9 应可展开")
+        `CHK(cexp_insn32 === 32'h40940433, "F05-01：c.sub x8,x9 应展开为 sub x8,x8,x9")
+        drv_m(32'h00008c05);
+        `CHK(ill_instr_o === 1'b0,       "F05-01：c.sub x8,x9 不应非法")
+        `CHK(insn32_o === 32'h40940433,  "F05-01：decoder 展开应为 0x40940433")
+        `CHK(rd_o === 5'd8,              "F05-01：c.sub rd 应为 x8")
+        `CHK(rs1_o === 5'd8,             "F05-01：c.sub rs1 应为 x8")
+        `CHK(rs2_o === 5'd9,             "F05-01：c.sub rs2 应为 x9")
+
+        cexp_in = 16'h8015;              // c.srli x8,5
+        #1;
+        `CHK(cexp_insn32 === 32'h00545413, "F05-01：c.srli x8,5 应展开为 srli x8,x8,5")
+        cexp_in = 16'h8415;              // c.srai x8,5
+        #1;
+        `CHK(cexp_insn32 === 32'h40545413, "F05-01：c.srai x8,5 应展开为 srai x8,x8,5")
+        cexp_in = 16'h8815;              // c.andi x8,5
+        #1;
+        `CHK(cexp_insn32 === 32'h00547413, "F05-01：c.andi x8,5 应展开为 andi x8,x8,5")
+        cexp_in = 16'h8c25;              // c.xor x8,x9
+        #1;
+        `CHK(cexp_insn32 === 32'h00944433, "F05-01：c.xor x8,x9 应展开为 xor x8,x8,x9")
+        cexp_in = 16'h8c45;              // c.or x8,x9
+        #1;
+        `CHK(cexp_insn32 === 32'h00946433, "F05-01：c.or x8,x9 应展开为 or x8,x8,x9")
+        cexp_in = 16'h8c65;              // c.and x8,x9
+        #1;
+        `CHK(cexp_insn32 === 32'h00947433, "F05-01：c.and x8,x9 应展开为 and x8,x8,x9")
+        cexp_in = 16'h8c01;              // 控制：c.sub x8,x8（rd′=rs2′）
+        #1;
+        `CHK(cexp_insn32 === 32'h40840433, "F05-01 控制：c.sub x8,x8 应展开为 sub x8,x8,x8")
+        // CL/CS 的 rd′（c[4:2]）不得被本修复波及
+        drv_m(32'h00004044);             // c.lw x9,4(x8)
+        `CHK(ill_instr_o === 1'b0,       "F05-01 控制：c.lw 不应非法")
+        `CHK(insn32_o === 32'h00442483,  "F05-01 控制：c.lw 应展开为 lw x9,4(x8)")
+        drv_m(32'h0000c044);             // c.sw x9,4(x8)
+        `CHK(ill_instr_o === 1'b0,       "F05-01 控制：c.sw 不应非法")
+        `CHK(insn32_o === 32'h00942223,  "F05-01 控制：c.sw 应展开为 sw x9,4(x8)")
+
+        // ---- (b) c.ebreak 合法 / c.jr x0 保留 ----
+        drv_m(32'h00009002);             // c.ebreak
+        `CHK(ill_instr_o === 1'b0,       "F05-03：c.ebreak 不应非法")
+        `CHK(insn32_o === 32'h00100073,  "F05-03：c.ebreak 应展开为 ebreak")
+        `CHK(ebreak_o === 1'b1,          "F05-03：c.ebreak 标志应为 1")
+        drv_m(32'h00008002);             // c.jr x0（保留）
+        `CHK(ill_instr_o === 1'b1,       "F05-03：c.jr x0 应判保留（非法）")
+        `CHK(tval_o === 32'h00008002,    "F05-03：c.jr x0 tval 应为 0x00008002")
+        drv_m(32'h00008282);             // c.jr x5
+        `CHK(ill_instr_o === 1'b0,       "F05-03 控制：c.jr x5 不应非法")
+        `CHK(insn32_o === 32'h00028067,  "F05-03 控制：c.jr x5 应展开为 jalr x0,0(x5)")
+        drv_m(32'h00009282);             // c.jalr x5
+        `CHK(ill_instr_o === 1'b0,       "F05-03 控制：c.jalr x5 不应非法")
+        `CHK(insn32_o === 32'h000280e7,  "F05-03 控制：c.jalr x5 应展开为 jalr x1,0(x5)")
+
+        // ---- (c) OP-FP 保留/不支持字段 ⇒ 非法 ----
+        drv_m(32'h58100053);             // fsqrt.s rs2=1（rs2 域固定 00000）
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fsqrt.s rs2=1 应判非法")
+        drv_m(32'hc0200053);             // fcvt.l.s（RV64-only）
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fcvt.l.s 在 RV32 应判非法")
+        drv_m(32'hd0200053);             // fcvt.s.l（RV64-only）
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fcvt.s.l 在 RV32 应判非法")
+        drv_m(32'he0100053);             // fmv.x.w rs2=1
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fmv.x.w rs2=1 应判非法")
+        drv_m(32'hf0100053);             // fmv.w.x rs2=1
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fmv.w.x rs2=1 应判非法")
+        drv_m(32'h40000053);             // fcvt.s.d rs2=0（F↔D 配对错）
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fcvt.s.d rs2=0 应判非法")
+        drv_m(32'he2000053);             // fmv.x.d（RV64-only）
+        `CHK(ill_instr_o === 1'b1,       "F05-04：fmv.x.d 在 RV32 应判非法")
+
+        // ---- (d) 合法对照（不得被上面的收紧误伤）----
+        drv_m(32'h58008053);             // fsqrt.s rs2=0
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fsqrt.s rs2=0 不应非法")
+        `CHK(fp_op_o === 6'd5,           "F05-04 控制：fsqrt.s fp_op 应为 FP_SQRT")
+        drv_m(32'hc0008053);             // fcvt.w.s rs2=0
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fcvt.w.s 不应非法")
+        drv_m(32'hc0108053);             // fcvt.wu.s rs2=1
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fcvt.wu.s 不应非法")
+        drv_m(32'hd0008053);             // fcvt.s.w rs2=0
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fcvt.s.w 不应非法")
+        drv_m(32'he0008053);             // fmv.x.w rs2=0
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fmv.x.w rs2=0 不应非法")
+        drv_m(32'he0009053);             // fclass.s rs2=0
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fclass.s rs2=0 不应非法")
+        drv_m(32'he2009053);             // fclass.d rs2=0（RV32D 合法）
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fclass.d rs2=0 不应非法")
+        drv_m(32'hf0008053);             // fmv.w.x rs2=0
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fmv.w.x rs2=0 不应非法")
+        drv_m(32'h42008053);             // fcvt.d.s rs2=0（F↔D 合法配对）
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fcvt.d.s 不应非法")
+        drv_m(32'h00208053);             // fadd.s（rs2 是操作数）
+        `CHK(ill_instr_o === 1'b0,       "F05-04 控制：fadd.s 不应非法")
+
+        //======================================================================
         // 6. 汇总判定（fail-closed）
         //======================================================================
         $display("checks = %0d, fails = %0d", n_checks, n_fail);

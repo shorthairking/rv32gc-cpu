@@ -6,8 +6,10 @@
 //                 读回一致；写非 bit0（如 0xFFFFFFFE，bit0=0）⇒ 清位（只有 bit0 有语义）。
 //             (2) **mtime 递增**：复位后 mtime 由 aclk 每拍 +1（用连续若干拍验证计数
 //                 增量 == 拍数），且软件可整字写 mtime 的高低字。
-//             (3) **mtimecmp 溢出 ⇒ MTIP**：mtime 追上（>）mtimecmp 时 mtip_o 置位；
-//                 **软件写 mtimecmp 抬高比较值后 MTIP 立即自清**（纯组合口径）。
+//             (3) **mtimecmp 到达 ⇒ MTIP**：mtime >= mtimecmp 时 mtip_o 置位
+//                 （ISA `#norm:mtimeintrpending`：相等即挂起，无符号比较）；
+//                 **软件写 mtimecmp 抬高比较值（mtime < mtimecmp）后 MTIP 立即自清**
+//                 （纯组合口径）。
 //             (4) 地址映射：msip=+0x0、mtimecmp=+0x4000、mtime=+0xBFF8 逐条读写命中；
 //                 未实现偏移不命中（resp_hit=0）。
 //
@@ -139,6 +141,38 @@ module tb_clint;
         end
     endtask
 
+    // 带**显式字节使能**的写（用于"空/非法掩码无副作用"核查）；同样断言无 AXI 活动
+    task automatic mmio_write_strb(input [31:0] off, input [31:0] data, input [3:0] strb);
+        begin
+            @(negedge aclk);
+            req_addr  = off;
+            req_wdata = data;
+            req_wstrb = strb;
+            req_write = 1'b1;
+            req_valid = 1'b1;
+            @(posedge aclk);
+            #1;
+            req_valid = 1'b0;
+            req_write = 1'b0;
+            `CK(axi_like_activity === 1'b0, "写 CLINT 后出现 AXI 活动（不应存在）")
+        end
+    endtask
+
+    // 把 mtime 钉在 val 一拍（wr_mtime 优先于自增）；调用后（posedge+1ns）
+    // mtime_r == val，可在同一处做组合 MTIP 断言或紧接一次精确读回。
+    task automatic pin_mtime(input [31:0] val);
+        begin
+            @(negedge aclk);
+            req_addr  = MTIME_OFF;
+            req_wdata = val;
+            req_wstrb = 4'hF;
+            req_write = 1'b1;
+            req_valid = 1'b1;
+            @(posedge aclk);
+            #1;
+        end
+    endtask
+
     //--------------------------------------------------------------------------
     // 6. 主流程
     //--------------------------------------------------------------------------
@@ -151,6 +185,7 @@ module tb_clint;
     localparam [31:0] MTIME_OFF    = `RV32GC_CLINT_MTIME_OFF;      // 0xBFF8
     localparam [31:0] MTIMEH_OFF   = `RV32GC_CLINT_MTIMEH_OFF;     // 0xBFFC
     localparam [31:0] MTIMECMPH_OFF= `RV32GC_CLINT_MTIMECMPH_OFF;  // 0x4004
+    localparam [31:0] T            = 32'h0000_1234;                // 边界测试基准值
 
     integer k;
 
@@ -276,11 +311,10 @@ module tb_clint;
         #1;
         `CK(mtip_o === 1'b0, "软件写 mtimecmp 抬高后 MTIP 应立即清 0")
 
-        // 3.4 严格大于（非 >=）边界：
-        //     难点：mtime 每拍自增，无法"停住"再比较，因此先读出一个当前值 T，
-        //     然后把 mtimecmp 设成 **T 的上一拍值** 与 **远大于 T 的值** 两种情形，
-        //     分别验证 MTIP=1 / MTIP=0；"等于"边界用"mtimecmp >= 读到的 mtime"
-        //     的单边断言表达（读值 T 后续 mtime 只会更大，故 >=T 保证 >=mtime）。
+        // 3.4 单边边界（mtime 每拍自增，无法"停住"）：
+        //     先写出一个已知 mtime，再把 mtimecmp 设成远小/远大于它，验证
+        //     MTIP=1 / MTIP=0。**真"相等"边界**在 3.6 用"每拍持续钉住 mtime"
+        //     的方式精确构造（那才是 `>` vs `>=` 的区分点）。
         mmio_write(MTIMEH_OFF, 32'h0000_0000);
         mmio_write(MTIME_OFF,  32'd1000);
         #1;
@@ -310,83 +344,57 @@ module tb_clint;
         #1;
         `CK(mtip_o === 1'b1, "mtimecmp 清零后 mtime > mtimecmp ⇒ MTIP 应置位")
 
-        // 3.6 ★ 严格大于的**真边界**测试（`>` vs `>=` 的唯一区分点）：
-        //     难点：mtime 每拍自增，无法"停住"再比较。做法：用**每拍持续的 mtime 写**
-        //     把 mtime 钉死在一个常量（wr_mtime 优先于自增），同时把 mtimecmp 设为同一值，
-        //     断言 MTIP == 0；若实现误用 >=，此处必为 1 ⇒ 该变异被抓。
-        //     随后把 mtimecmp 设为 T-1，断言 MTIP == 1。
+        // 3.6 ★ mtime >= mtimecmp 的**真边界**（`>` vs `>=` 的唯一区分点）：
+        //     规范 ISA `#norm:mtimeintrpending`："A machine timer interrupt becomes
+        //     pending whenever mtime contains a value **greater than or equal to**
+        //     mtimecmp, treating the values as unsigned integers.  The interrupt
+        //     remains posted until mtimecmp becomes greater than mtime."
+        //     做法：固定 mtimecmp = T（高半 0，读回确认），用**每拍持续的 mtime 写**
+        //     把 mtime 钉死在常量（wr_mtime 优先于自增），依次取 T-1 / T / T+1，
+        //     各**连续保持 4 拍**并断言 MTIP = 0 / 1 / 1；每点后立即精确读回 mtime。
+        //     旧实现 `>` 在 mtime == mtimecmp 时给 0 ⇒ 本段 T 点必失败。
         begin : eq_boundary
-            // ---- 阶段 a：把 mtime 钉死在 0x0000_1234（持续写 3 拍） ----
-            for (k = 0; k < 3; k = k + 1) begin
-                @(negedge aclk);
-                req_addr  = MTIME_OFF;
-                req_wdata = 32'h0000_1234;
-                req_wstrb = 4'hF;
-                req_write = 1'b1;
-                req_valid = 1'b1;
-                @(posedge aclk);
-                #1;
-            end
-            // 此刻 mtime == 0x1234（最后一拍写入生效）
-            // ---- 阶段 b：写 mtimecmp = 0x1234（== mtime） ----
-            @(negedge aclk);
-            req_addr  = MTIMECMP_OFF;
-            req_wdata = 32'h0000_1234;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            // 同拍 mtime 未收到写 ⇒ 会自增 1?? 否：本拍 req_addr 是 mtimecmp，
-            // 故 mtime 自增 1（0x1235）。为消除歧义，本拍同时把 mtime 重新钉回。
-            // ⇒ 改为在下一拍同时写 mtime（见阶段 c 的双写策略）。
-            // ---- 阶段 c：同拍写 mtime=T 且用 mtimecmp 已等于 T 判定 MTIP ----
-            //     先读回 mtimecmp 确认写入生效
-            req_valid = 1'b0;
-            req_write = 1'b0;
-            @(negedge aclk);
-            req_addr  = MTIMECMP_OFF;
-            req_write = 1'b0;
-            req_valid = 1'b1;
-            #1;
-            `CK(resp_rdata === 32'h0000_1234, "mtimecmp 低字应已写为 0x1234")
-            @(posedge aclk);
-            #1;
-            req_valid = 1'b0;
-            // 现在把 mtime 钉在 T，且 mtimecmp 恰为 T：
-            // mtimecmp 已固定为 T；只要让 mtime == T，MTIP 必须为 0。
-            // 由于 mtime 已自增若干拍，先把 mtimecmp 重写为与 mtime 相同的值：
-            //   —— 用一个"先钉 mtime 再同拍比较"的循环：每拍写 mtime=T，
-            //      然后 3 拍后 mtimecmp 仍为 T，若 mtime 真的被钉住则 MTIP==0。
+            // ---- 固定 mtimecmp = T（高半 0）并读回确认 ----
+            mmio_write(MTIMEH_OFF,     32'h0000_0000);
+            mmio_write(MTIMECMPH_OFF,  32'h0000_0000);
+            mmio_write(MTIMECMP_OFF,   T);
+            mmio_read(MTIMECMP_OFF, rd, hit);
+            `CK(hit === 1'b1 && rd === T, $sformatf("mtimecmp 低字应读回 T=0x%08x", T))
+            mmio_read(MTIMECMPH_OFF, rd, hit);
+            `CK(rd === 32'h0000_0000, "mtimecmp 高字应读回 0")
+
+            // ---- (a) mtime = T-1（连续 4 拍）⇒ MTIP 必须为 0，且读回确认 ----
             for (k = 0; k < 4; k = k + 1) begin
-                @(negedge aclk);
-                req_addr  = MTIME_OFF;
-                req_wdata = 32'h0000_1234;
-                req_write = 1'b1;
-                req_valid = 1'b1;
-                @(posedge aclk);
-                #1;
-                // mtime 在本拍被写为 T；mtimecmp 亦为 T ⇒ MTIP 必须为 0
-                `CK(mtip_o === 1'b0, "mtime == mtimecmp == 0x1234 时 MTIP 必须为 0")
+                pin_mtime(T - 32'd1);
+                `CK(mtip_o === 1'b0,
+                    $sformatf("mtime=T-1 < mtimecmp=T 时 MTIP 应为 0（连续保持第 %0d 拍）", k))
             end
-            // ---- 阶段 d：mtimecmp = T-1 ⇒ MTIP 必须为 1 ----
-            @(negedge aclk);
-            req_addr  = MTIMECMP_OFF;
-            req_wdata = 32'h0000_1233;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            req_valid = 1'b0;
-            req_write = 1'b0;
-            // 再把 mtime 钉在 T ⇒ mtimecmp = T-1 < T ⇒ MTIP 必须为 1
-            @(negedge aclk);
-            req_addr  = MTIME_OFF;
-            req_wdata = 32'h0000_1234;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            `CK(mtip_o === 1'b1, "mtime == mtimecmp+1 时 MTIP 必须为 1")
+            mmio_read(MTIME_OFF, rd, hit);
+            `CK(hit === 1'b1 && rd === (T - 32'd1),
+                $sformatf("mtime 应精确读回 T-1=0x%08x（实得 0x%08x）", T - 32'd1, rd))
+
+            // ---- (b) mtime = T（连续 4 拍）⇒ MTIP 必须为 1（相等即挂起） ----
+            for (k = 0; k < 4; k = k + 1) begin
+                pin_mtime(T);
+                `CK(mtip_o === 1'b1,
+                    $sformatf("mtime == mtimecmp == T 时 MTIP 必须为 1（ISA mtimeintrpending；连续保持第 %0d 拍）", k))
+            end
+            mmio_read(MTIME_OFF, rd, hit);
+            `CK(rd === T, $sformatf("mtime 应精确读回 T=0x%08x（实得 0x%08x）", T, rd))
+
+            // ---- (c) mtime = T+1（连续 4 拍）⇒ MTIP 必须为 1 ----
+            for (k = 0; k < 4; k = k + 1) begin
+                pin_mtime(T + 32'd1);
+                `CK(mtip_o === 1'b1,
+                    $sformatf("mtime=T+1 > mtimecmp=T 时 MTIP 必须为 1（连续保持第 %0d 拍）", k))
+            end
+            mmio_read(MTIME_OFF, rd, hit);
+            `CK(rd === (T + 32'd1), $sformatf("mtime 应精确读回 T+1=0x%08x（实得 0x%08x）", T + 32'd1, rd))
+
+            // ---- (d) 软件写 mtimecmp 抬高到 > mtime ⇒ MTIP 立即自清 ----
+            mmio_write(MTIMECMP_OFF, T + 32'h10);
+            pin_mtime(T);
+            `CK(mtip_o === 1'b0, "mtimecmp 抬高到 > mtime 后 MTIP 应立即自清 0")
             req_valid = 1'b0;
             req_write = 1'b0;
             @(posedge aclk);
@@ -395,85 +403,66 @@ module tb_clint;
         mmio_write(MTIMECMP_OFF,  32'hFFFF_FFFF);
         mmio_write(MTIMECMPH_OFF, 32'hFFFF_FFFF);
 
-        // 3.7 ★ 64 位比较中**高字单独决定结果**（漏判高字则本段必失败）：
-        //     钉住 mtime = 0x0000_1234（高字 0），令：
-        //       a) mtimecmp = {高字 0, 低字 0x0000_1234}  ⇒ 相等 ⇒ MTIP 必须 0
-        //          此时低字已足够大于任何"仅比较低字"的实现…为使高字**成为决定项**，
-        //          改用 b) 的构型。
-        //       b) mtimecmp = {高字 0x0000_0001, 低字 0x0000_0000}
-        //          ⇒ 64 位比较 0x1_0000_0000 > 0x0000_1234 ⇒ MTIP 必须 0；
-        //          而**只看低字**的实现（0x1234 > 0x0000）会错误地给出 MTIP=1
-        //          ⇒ 该变异被本断言抓住。
+        // 3.7 ★ 64 位比较中**高字参与决策**（漏判高字则本段必失败）：
+        //     mtime 钉在 T=0x0000_1234（高半 0），四种 mtimecmp 构型：
+        //       a) {高 0, 低 T}      ⇒ 64 位相等 ⇒ MTIP 必须 1（>= 口径）
+        //       b) {高 1, 低 0}      ⇒ 0x1_0000_0000 > mtime ⇒ MTIP 必须 0
+        //          （只看低字的实现会错误给出 1 ⇒ 抓住"漏高字"变异）
+        //       c) {高 0, 低 T-1}    ⇒ 小于 mtime ⇒ MTIP 必须 1
+        //       d) {高 0, 低 T+1}    ⇒ 大于 mtime ⇒ MTIP 必须 0
         begin : hi_word_decisive
-            // 钉住 mtime = 0x0000_1234（连续写 2 拍）
-            for (k = 0; k < 2; k = k + 1) begin
-                @(negedge aclk);
-                req_addr  = MTIME_OFF;
-                req_wdata = 32'h0000_1234;
-                req_wstrb = 4'hF;
-                req_write = 1'b1;
-                req_valid = 1'b1;
-                @(posedge aclk);
-                #1;
-            end
-            // 写 mtimecmp 高字 = 1、低字 = 0
-            @(negedge aclk);
-            req_addr  = MTIMECMP_OFF;
-            req_wdata = 32'h0000_0000;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            @(negedge aclk);
-            req_addr  = MTIMECMPH_OFF;
-            req_wdata = 32'h0000_0001;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            req_valid = 1'b0;
-            req_write = 1'b0;
-            // 重新钉 mtime = 0x0000_1234，并断言 MTIP == 0（高字主导）
-            @(negedge aclk);
-            req_addr  = MTIME_OFF;
-            req_wdata = 32'h0000_1234;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
+            mmio_write(MTIMECMPH_OFF, 32'h0000_0000);
+            // a) 相等（低字 T、高字 0）
+            mmio_write(MTIMECMP_OFF, T);
+            pin_mtime(T);
+            `CK(mtip_o === 1'b1, "64 位 mtimecmp == mtime == T 时 MTIP 必须为 1（相等挂起）")
+            // b) 高字 = 1、低字 = 0 ⇒ 64 位大于 mtime ⇒ MTIP 0
+            mmio_write(MTIMECMP_OFF,  32'h0000_0000);
+            mmio_write(MTIMECMPH_OFF, 32'h0000_0001);
+            pin_mtime(T);
             `CK(mtip_o === 1'b0,
-                "mtimecmp 高字=1（64位 0x1_0000_0000 > mtime 0x1234）时 MTIP 必须为 0（高字参与比较）")
-            req_valid = 1'b0;
-            req_write = 1'b0;
-            // 反向：高字 0、低字 0x0000_1233 < mtime 0x1234 ⇒ MTIP 必须 1
-            @(negedge aclk);
-            req_addr  = MTIMECMPH_OFF;
-            req_wdata = 32'h0000_0000;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            @(negedge aclk);
-            req_addr  = MTIMECMP_OFF;
-            req_wdata = 32'h0000_1233;
-            @(posedge aclk);
-            #1;
-            req_valid = 1'b0;
-            req_write = 1'b0;
-            @(negedge aclk);
-            req_addr  = MTIME_OFF;
-            req_wdata = 32'h0000_1234;
-            req_write = 1'b1;
-            req_valid = 1'b1;
-            @(posedge aclk);
-            #1;
-            `CK(mtip_o === 1'b1, "mtimecmp 低字 0x1233 < mtime 0x1234 时 MTIP 必须为 1")
+                "mtimecmp 高字=1（64 位 0x1_0000_0000 > mtime 0x1234）时 MTIP 必须为 0（高字参与比较）")
+            // c) 高字 0、低字 T-1 ⇒ 小于 mtime ⇒ MTIP 1
+            mmio_write(MTIMECMPH_OFF, 32'h0000_0000);
+            mmio_write(MTIMECMP_OFF,  T - 32'd1);
+            pin_mtime(T);
+            `CK(mtip_o === 1'b1, "mtimecmp 低字 T-1 < mtime T 时 MTIP 必须为 1")
+            // d) 高字 0、低字 T+1 ⇒ 大于 mtime ⇒ MTIP 0
+            mmio_write(MTIMECMP_OFF,  T + 32'd1);
+            pin_mtime(T);
+            `CK(mtip_o === 1'b0, "mtimecmp 低字 T+1 > mtime T 时 MTIP 必须为 0")
             req_valid = 1'b0;
             req_write = 1'b0;
             @(posedge aclk);
         end
         mmio_write(MTIMECMP_OFF,  32'hFFFF_FFFF);
         mmio_write(MTIMECMPH_OFF, 32'hFFFF_FFFF);
+
+        // 3.8 ★ 空/非法字节掩码写**无副作用**（保留既有"整字访问"契约）：
+        //     用 req_wstrb=4'h0 写 msip/mtimecmp，读回必须与写前一致。
+        begin : strobe_no_side_effect
+            // msip：先置 1，再用空掩码写 0 ⇒ 必须仍为 1
+            mmio_write(MSIP_OFF, 32'h0000_0001);
+            mmio_read(MSIP_OFF, rd, hit);
+            `CK(rd === 32'h0000_0001, "msip 置 1 后读回应为 1")
+            mmio_write_strb(MSIP_OFF, 32'h0000_0000, 4'h0);
+            mmio_read(MSIP_OFF, rd, hit);
+            `CK(rd === 32'h0000_0001, "空字节掩码写 msip=0 不得产生副作用（应仍为 1）")
+            `CK(msip_o === 1'b1, "空字节掩码写后 msip_o 应保持 1")
+            // mtimecmp：先写 T+0x100，再用空掩码写 T-0x100 ⇒ 读回应仍为 T+0x100
+            mmio_write(MTIMECMPH_OFF, 32'h0000_0000);
+            mmio_write(MTIMECMP_OFF,  T + 32'h100);
+            mmio_write_strb(MTIMECMP_OFF, T - 32'h100, 4'h0);
+            mmio_read(MTIMECMP_OFF, rd, hit);
+            `CK(rd === (T + 32'h100),
+                $sformatf("空字节掩码写 mtimecmp 不得产生副作用（应仍为 0x%08x，实得 0x%08x）",
+                          T + 32'h100, rd))
+            // 非全字（但非空）掩码仍按既有"整字写"契约生效（4'h1 ⇒ 整字写）
+            mmio_write_strb(MTIMECMP_OFF, T + 32'h200, 4'h1);
+            mmio_read(MTIMECMP_OFF, rd, hit);
+            `CK(rd === (T + 32'h200), "任一字节有效的非全字掩码仍按既有整字写契约生效")
+            mmio_write(MSIP_OFF, 32'h0000_0000);
+        end
 
         //----------------------------------------------------------------------
         // (4) 地址映射命中/不命中

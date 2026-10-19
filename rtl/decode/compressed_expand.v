@@ -71,9 +71,19 @@ module compressed_expand (
     wire [2:0]  rd_3   = c_insn[4:2];
     wire [2:0]  rs2_3  = c_insn[4:2];
     // 3 位域 → 实际 5 位寄存器号（+8）
-    wire [4:0]  rs1_p  = {2'b01, rs1_3};            // 8 + rs1'
-    wire [4:0]  rd_p   = {2'b01, rd_3};             // 8 + rd'
-    wire [4:0]  rs2_p  = {2'b01, rs2_3};            // 8 + rs2'
+    //   ★ 两个"rd′"域必须分开（2026-10-19 修复 F05-01）：
+    //     · CIW/CL/CS 格式：rd′/rs1′ 在 c[9:7]、rd′(目的) 在 c[4:2] ⇒ rd_p；
+    //     · CA/CB 格式：rd′/rs1′ 在 c[9:7]、rs2′ 在 c[4:2]
+    //       （zca.adoc「Compressed Instruction Formats」表：
+    //        CA = `funct6 | rd'/rs1' | funct2 | rs2' | op`，
+    //        CB = `funct3 | imm | rd'/rs1' | funct2 | rs2' | op`）⇒ rd_ca_cb = rs1_p。
+    //     修复前 MISC-ALU（c.srli/c.srai/c.andi/c.sub/c.xor/c.or/c.and）把 rd_p 同时
+    //     当 rd 与 rs1 ⇒ rd′/rs1′ 取成了 rs2′ 域（如 0x8c05 c.sub x8,x9 被展开为
+    //     sub x9,x9,x9，0x8015 c.srli x8,5 被展开为 srli x13,x13,5）。
+    wire [4:0]  rs1_p  = {2'b01, rs1_3};            // 8 + rs1'（c[9:7]）
+    wire [4:0]  rd_p   = {2'b01, rd_3};             // 8 + rd'（c[4:2]，CL/CS/CIW 目的域）
+    wire [4:0]  rs2_p  = {2'b01, rs2_3};            // 8 + rs2'（c[4:2]）
+    wire [4:0]  rd_ca_cb = rs1_p;                   // CA/CB 的 rd′/rs1′（= c[9:7]）
 
     //==========================================================================
     // 2. RVC 立即数（本地 function）
@@ -197,9 +207,14 @@ module compressed_expand (
     wire c_addi16sp_ok  = (im_addi16sp != 32'b0);
     // ---- c.lwsp：rd!=x0（norm:c-lwsp_rsv）----
     wire c_lwsp_ok      = (rd_5 != 5'd0);
-    // ---- c.jr / c.jalr：rs1!=x0（norm:c-jr_rsv / c-jalr_ebreak）----
-    //      insn[12]=0 且 rs2=0：insn[12]=1 ⇒ jalr，=0 ⇒ jr；rs1=x0 时分别是
-    //      c.jalr 的保留点与 c.jr 的保留点（j[12]=1,rs1=0,rs2=0 是 c.ebreak）。
+    // ---- c.jr / c.jalr / c.ebreak：CR 格式（f3=100、rs2=0）----
+    //      insn[12]=0 且 rs2=0：c.jr（rs1=x0 ⇒ 保留，norm:c-jr_rsv）
+    //      insn[12]=1 且 rs2=0：rd=0 ⇒ c.ebreak（合法）；rd≠0 ⇒ c.jalr
+    //                            （rs1=x0 的编码点即 c.ebreak，norm:c-jalr_ebreak）
+    //   ★ 修复（2026-10-19，F05-03）：旧判据 `(c[12] && rs2==0) ? c_jr_ok : 1'b1`
+    //     把 c.ebreak（rd=rs1=0）也套上 rs1≠0 检查 ⇒ 误拒合法 0x9002；
+    //     同时 c[12]=0 的 c.jr 完全绕开检查 ⇒ 误放行保留编码 0x8002（c.jr x0）。
+    //     现行判据：**只有真正的 c.jr/c.jalr 传输点**才要求 rs1≠x0，c.ebreak 除外。
     wire c_is_cr_jr     = (f3 == 3'b100) && (c_insn[12] == 1'b0) && (rs2_5 == 5'd0);
     wire c_is_cr_jalr   = (f3 == 3'b100) && (c_insn[12] == 1'b1) && (rs2_5 == 5'd0);
     wire c_jr_ok        = (rs1_5 != 5'd0);
@@ -291,27 +306,28 @@ module compressed_expand (
     //        C_AND=0x8c61 MASK=0xfc63（riscv-opc.h:682-699）]
     //   c.srli → srli rd', rd', shamt  = OP-IMM f3=101 f7=0000000
     //   ★ I 型移位：imm[11:5]=funct7、shamt[4:0]=imm[4:0]
-    wire [31:0] q1_srli = {`RV32GC_F7_SRLI, c_insn[6:2], rd_p,
-                           `RV32GC_F3_SRLI_SRAI, rd_p, `RV32GC_OP_IMM};
+    //   ★ rd′/rs1′ = c[9:7] ⇒ rd_ca_cb（**不是** rd_p，见 §1 修复说明 F05-01）
+    wire [31:0] q1_srli = {`RV32GC_F7_SRLI, c_insn[6:2], rd_ca_cb,
+                           `RV32GC_F3_SRLI_SRAI, rd_ca_cb, `RV32GC_OP_IMM};
     //   c.srai → srai rd', rd', shamt  = OP-IMM f3=101 f7=0100000
-    wire [31:0] q1_srai = {`RV32GC_F7_SRAI, c_insn[6:2], rd_p,
-                           `RV32GC_F3_SRLI_SRAI, rd_p, `RV32GC_OP_IMM};
+    wire [31:0] q1_srai = {`RV32GC_F7_SRAI, c_insn[6:2], rd_ca_cb,
+                           `RV32GC_F3_SRLI_SRAI, rd_ca_cb, `RV32GC_OP_IMM};
     //   c.andi → andi rd', rd', imm[5:0]
-    wire [31:0] q1_andi = {im_ci[11:0], rd_p, `RV32GC_F3_ANDI,
-                           rd_p, `RV32GC_OP_IMM};
+    wire [31:0] q1_andi = {im_ci[11:0], rd_ca_cb, `RV32GC_F3_ANDI,
+                           rd_ca_cb, `RV32GC_OP_IMM};
     //   c.sub → sub rd', rd', rs2'  = OP f7=0100000 f3=000
     //   ★ R 型规范字段序：funct7 | rs2 | rs1 | funct3 | rd | opcode
-    wire [31:0] q1_sub = {`RV32GC_F7_OP_ALT, rs2_p, rd_p, `RV32GC_F3_ADD_SUB,
-                          rd_p, `RV32GC_OP_OP};
+    wire [31:0] q1_sub = {`RV32GC_F7_OP_ALT, rs2_p, rd_ca_cb, `RV32GC_F3_ADD_SUB,
+                          rd_ca_cb, `RV32GC_OP_OP};
     //   c.xor → xor rd', rd', rs2'  = OP f7=0000000 f3=100
-    wire [31:0] q1_xor = {`RV32GC_F7_OP_BASE, rs2_p, rd_p, `RV32GC_F3_XOR,
-                          rd_p, `RV32GC_OP_OP};
+    wire [31:0] q1_xor = {`RV32GC_F7_OP_BASE, rs2_p, rd_ca_cb, `RV32GC_F3_XOR,
+                          rd_ca_cb, `RV32GC_OP_OP};
     //   c.or  → or  rd', rd', rs2'  = OP f7=0000000 f3=110
-    wire [31:0] q1_or  = {`RV32GC_F7_OP_BASE, rs2_p, rd_p, `RV32GC_F3_OR,
-                          rd_p, `RV32GC_OP_OP};
+    wire [31:0] q1_or  = {`RV32GC_F7_OP_BASE, rs2_p, rd_ca_cb, `RV32GC_F3_OR,
+                          rd_ca_cb, `RV32GC_OP_OP};
     //   c.and → and rd', rd', rs2'  = OP f7=0000000 f3=111
-    wire [31:0] q1_and = {`RV32GC_F7_OP_BASE, rs2_p, rd_p, `RV32GC_F3_AND,
-                          rd_p, `RV32GC_OP_OP};
+    wire [31:0] q1_and = {`RV32GC_F7_OP_BASE, rs2_p, rd_ca_cb, `RV32GC_F3_AND,
+                          rd_ca_cb, `RV32GC_OP_OP};
 
     // f3=100 的选择：insn[11:10] 区分 CB(shift/andi, 00/01/10) 与 CA(100)
     wire [1:0] misc_h2 = c_insn[11:10];
@@ -399,6 +415,9 @@ module compressed_expand (
     //   c.ebreak 判定必须在 q2_cr_hi 之前（rs2=0,rd=0）
     wire        c_is_ebreak = (f3 == 3'b100) && (c_insn[12] == 1'b1) &&
                               (rs2_5 == 5'd0) && (rd_5 == 5'd0);
+    //   ★ c.ebreak 与 c.jr/c.jalr 共享 f3=100/rs2=0 编码组，但 ebreak 无 rs1≠0 约束
+    //     （CR 格式 rd/rs1 同域 c[11:7]；ebreak 即 rd=rs1=0）⇒ 先剔除再检查。
+    wire        c_is_cr_xfer = (c_is_cr_jr | c_is_cr_jalr) & ~c_is_ebreak;
 
     // c.swsp → sw rs2, offset(x2)  (S 型)
     //   [ENC:C_SWSP=0xc002 MASK=0xe003（riscv-opc.h:726-727）]
@@ -418,7 +437,7 @@ module compressed_expand (
     wire q2_special_ok =
         (f3 == 3'b000) ? c_shamt_ok  :   // c.slli：RV32 的 shamt[5] 必须为 0
         (f3 == 3'b010) ? c_lwsp_ok   :   // c.lwsp：rd != x0
-        (f3 == 3'b100) ? ((c_insn[12] && rs2_5 == 5'd0) ? c_jr_ok : 1'b1) :
+        (f3 == 3'b100) ? (c_is_cr_xfer ? c_jr_ok : 1'b1) :  // c.jr/c.jalr：rs1 != x0（ebreak 除外）
                          1'b1;
 
     //==========================================================================

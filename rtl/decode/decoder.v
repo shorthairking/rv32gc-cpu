@@ -427,12 +427,16 @@ module decoder (
     //--------------------------------------------------------------------------
     wire fmt_ok = (fp_fmt == `RV32GC_FMT_S) || (fp_fmt == `RV32GC_FMT_D);
 
-    // fadd/fsub/fmul/fdiv/fsqrt：f3 = rm（任意，2A 接受全部 rm 编码）
-    wire fp_arith5_ok = (fp_f5 == `RV32GC_FP_F5_FADD) |
+    // fadd/fsub/fmul/fdiv：f3 = rm（任意，2A 接受全部 rm 编码）
+    //   ★ 2026-10-19 修复 F05-04：fsqrt 的 rs2 域是**固定 00000**的操作数域，
+    //     不是寄存器号（真源 rv-32-64g.adoc RV32F/RV32D 表：
+    //     `0101100 | 00000 | rs1 | rm | rd | 1010011 <| FSQRT.S`）⇒ rs2≠0 为保留编码。
+    wire fp_arith4_ok = (fp_f5 == `RV32GC_FP_F5_FADD) |
                         (fp_f5 == `RV32GC_FP_F5_FSUB) |
                         (fp_f5 == `RV32GC_FP_F5_FMUL) |
-                        (fp_f5 == `RV32GC_FP_F5_FDIV) |
-                        (fp_f5 == `RV32GC_FP_F5_FSQRT);
+                        (fp_f5 == `RV32GC_FP_F5_FDIV);
+    wire fp_fsqrt_ok  = (fp_f5 == `RV32GC_FP_F5_FSQRT) & (rs2_f == 5'd0);
+    wire fp_arith5_ok = fp_arith4_ok | fp_fsqrt_ok;
     // fsgnj/fsgnjn/fsgnjx：f3 = 000/001/010
     wire fp_sgnj_f3_ok = (f3 == `RV32GC_FP_F3_FSGNJ)  |
                          (f3 == `RV32GC_FP_F3_FSGNJN) |
@@ -447,7 +451,12 @@ module decoder (
     //         rs2[0]=0 ⇒ W、=1 ⇒ WU
     //     funct5=11010（FCVT_S_W=0xd0000053 等）：**入口**，写 **FP**；fmt=目标精度，
     //         rs2[0]=0 ⇒ W、=1 ⇒ WU
-    //   ⇒ 本设计按上述三组识别；rs2[4:2] 必须为 0（其余编码保留）。
+    //   ⇒ 本设计按上述三组识别；rs2 变体必须逐字段限定（2026-10-19 修复 F05-04）：
+    //     · 出口/入口（funct5=11000/11010）：RV32 只有 rs2=00000(W)/00001(WU)；
+    //       rs2[1:0]=10(L)/11(LU) 属 RV64（rv-32-64g.adoc「RV64F/RV64D Standard
+    //       Extension (in addition to RV32…)」表），rs2[4:2]≠0 亦保留 ⇒ 一律非法。
+    //     · F↔D 互转（funct5=01000）：源/目标精度必须配对 ——
+    //       fcvt.s.d ⇒ fmt=S(00) 且 rs2=00001；fcvt.d.s ⇒ fmt=D(01) 且 rs2=00000。
     //
     //   历史沿革（绕行已回收）：
     //     真源 rtl/pkg/rv32_defs.vh:212 的 `RV32GC_FP_F5_FCVT` 原写作 `('h8 >> 3)`，
@@ -458,34 +467,39 @@ module decoder (
     //     现**直接使用真源宏** `` `RV32GC_FP_F5_FCVT ``，不再保留任何本地副本。
     localparam [4:0] FP_F5_FCVT_OUT = 5'b11000;   // 写整数（出口）
     localparam [4:0] FP_F5_FCVT_IN  = 5'b11010;   // 写 FP（入口）
-    wire fp_cvt_rs2_ok  = (rs2_f[4:2] == 3'b000);
     wire fp_cvt_f5_fd   = (fp_f5 == `RV32GC_FP_F5_FCVT);   // F↔D（真源宏，2026-09-14 修复）
     wire fp_cvt_f5_out  = (fp_f5 == FP_F5_FCVT_OUT);  // → 整数
     wire fp_cvt_f5_in   = (fp_f5 == FP_F5_FCVT_IN);   // → FP
-    wire fp_cvt_any_ok  = (fp_cvt_f5_fd | fp_cvt_f5_out | fp_cvt_f5_in) &
-                          fp_cvt_rs2_ok;
-    //   F↔D 互转：rs2 表示源精度（S=0/D=1），目标精度由 fmt 给出
-    wire fp_cvt_fd_ok   = fp_cvt_f5_fd & fp_cvt_rs2_ok & (rs2_f[1:0] <= 2'b01);
-    // fmv.x.w/fclass：funct5=11100，f3 = 001（fmt 位选择 S/D 视图）
+    //   W/WU 变体：rs2 ∈ {00000, 00001}（L/LU 与 rs2[4:2]≠0 全部非法）
+    wire fp_cvt_rs2_wwu_ok = (rs2_f == 5'd0) | (rs2_f == 5'd1);
+    //   F↔D 配对的精确 match
+    wire fp_cvt_fd_ok   = (fp_cvt_f5_fd & (fp_fmt == `RV32GC_FMT_S) & (rs2_f == 5'd1)) |
+                          (fp_cvt_f5_fd & (fp_fmt == `RV32GC_FMT_D) & (rs2_f == 5'd0));
+    wire fp_cvt_out_ok  = fp_cvt_f5_out & fp_cvt_rs2_wwu_ok;
+    wire fp_cvt_in_ok   = fp_cvt_f5_in  & fp_cvt_rs2_wwu_ok;
+    wire fp_cvt_any_ok  = fp_cvt_fd_ok | fp_cvt_out_ok | fp_cvt_in_ok;
+    // fmv.x.w/fclass：funct5=11100，rs2 必须为 00000（真源表：`1110000 | 00000 | rs1 | ...`）
+    //   · f3=000 ⇒ fmv.x.w：仅 fmt=S（fmt=D 的 fmv.x.d 属 RV64D ⇒ 非法）
+    //   · f3=001 ⇒ fclass ：fmt=S/D 均合法（RV32D 定义 FCLASS.D）
     wire fp_mvx_f5_ok  = (fp_f5 == `RV32GC_FP_F5_FMV_CMP);
-    // fmv.w.x：funct5=11110
-    wire fp_mvw_f5_ok  = (fp_f5 == `RV32GC_FP_F5_FMV_W_X);
-    // feq/flt/fle（fmv.x.w/fclass 的 fmt=? 二者 funct5 相同，靠 fmt 区分 S/D）
+    wire fp_mvx_f3_ok  = (f3 == 3'b000) | (f3 == `RV32GC_FP_F3_FCLASS);
+    wire fp_mvx_ok     = fp_mvx_f5_ok & fp_mvx_f3_ok & (rs2_f == 5'd0) &
+                         ((f3 == 3'b000) ? (fp_fmt == `RV32GC_FMT_S) : 1'b1);
+    // fmv.w.x：funct5=11110，f3=000、rs2=00000、仅 fmt=S（fmv.d.x 属 RV64D）
+    wire fp_mvw_ok     = (fp_f5 == `RV32GC_FP_F5_FMV_W_X) & (f3 == 3'b000) &
+                         (rs2_f == 5'd0) & (fp_fmt == `RV32GC_FMT_S);
     //   ★ 依据真源：FCMP 的 funct5=10100；MV_X_W/CLASS 的 funct5=11100
     wire fp_cmp_f5_ok  = (fp_f5 == `RV32GC_FP_F5_FCMP);
     wire fp_cmp_f3_ok  = (f3 == `RV32GC_FP_F3_FLE) | (f3 == `RV32GC_FP_F3_FLT) |
                          (f3 == `RV32GC_FP_F3_FEQ);
-    // fmv.x.w/fclass 的 f3：fclass=001，fmv.x.w=000（真源 §3.13 把 f3=001 记为
-    //   FCLASS；fmv.x.w 实际为 f3=000，见 [ENC:FMV_X_W=0xe0000053]）
-    wire fp_mvx_f3_ok  = (f3 == 3'b000) | (f3 == `RV32GC_FP_F3_FCLASS);
 
     wire fp_ok = fmt_ok & (
                     fp_arith5_ok |
                     ((fp_f5 == `RV32GC_FP_F5_FSGNJ)  & fp_sgnj_f3_ok)  |
                     ((fp_f5 == `RV32GC_FP_F5_FMINMAX) & fp_minmax_f3_ok) |
                     fp_cvt_any_ok |
-                    (fp_mvx_f5_ok & fp_mvx_f3_ok) |
-                    fp_mvw_f5_ok |
+                    fp_mvx_ok |
+                    fp_mvw_ok |
                     (fp_cmp_f5_ok & fp_cmp_f3_ok)
                  );
 
@@ -677,19 +691,19 @@ module decoder (
     //   出口（写**整数**寄存器 rd 的 FP 指令）：
     //     * fmv.x.w：funct5=11100、f3=000
     //     * fclass ：funct5=11100、f3=001
-    //     * fcvt.*.w / fcvt.*.wu（把 FP 转成整数）：funct5=01000，
-    //       **rs2[1]=1 表示"出口"**（真源 §3.13 转换矩阵：
-    //         FCVT_W_S =0xc0000053 ⇒ funct5=11000（w 出口，写整数）
-    //         FCVT_S_W =0xd0000053 ⇒ funct5=11010（w 入口，写 FP）
-    //       注意：fcvt 的**入口/出口由 funct5 的 bit0 与 rs2 共同表达**，
-    //       本设计按真源「出口口径（写整数）：源 fmt 由 insn[26:25] 给出」实现，
-    //       并用 rs2[1] 区分出口/入口（rs2[1]=1 ⇒ 出口）。)
-    //   入口（写 **FP** 寄存器）：fcvt.w.s 之外的全部 fcvt 方向 + 其余 FP 计算。
-    wire fp_is_fmvx  = is_opfp & (fp_f5 == `RV32GC_FP_F5_FMV_CMP) & fp_mvx_f3_ok;
+    //     * fcvt.*.w / fcvt.*.wu（把 FP 转成整数）：funct5=**11000**，
+    //       **rs2[0] 选 W/WU**（真源 rv-32-64g.adoc RV32F/RV32D 表：
+    //         FCVT_W_S =0xc0000053 ⇒ funct5=11000、rs2=00000（出口，写整数）
+    //         FCVT_WU_S=0xc0100053 ⇒ funct5=11000、rs2=00001
+    //         FCVT_S_W =0xd0000053 ⇒ funct5=11010、rs2=00000（入口，写 FP）
+    //       注意：出口/入口由 **funct5**（11000 vs 11010）决定，rs2[1:0] 只选 W/WU；
+    //       F↔D（funct5=01000，rs2 表源精度）既不写整数也不写 FP 结果。）
+    //   入口（写 **FP** 寄存器）：fcvt.*.w/.wu 入口 + F↔D + 其余 FP 计算。
+    wire fp_is_fmvx  = is_opfp & fp_mvx_ok;
     wire fp_is_fcmp  = is_opfp & (fp_f5 == `RV32GC_FP_F5_FCMP);
-    //   fcvt 出口：funct5=01000 且 rs2[1]=1（见上；rs2[0] 选 W/WU）
-    //   出口 = funct5=11000（写整数）；入口 = funct5=11010（写 FP）
-    wire fp_is_cvt_out = is_opfp & fp_cvt_f5_out & fp_cvt_rs2_ok;
+    //   fcvt 出口：funct5=11000（写整数）且 rs2 = W(00000)/WU(00001)
+    //   入口 = funct5=11010（写 FP）；F↔D（01000）既不出口也不入口
+    wire fp_is_cvt_out = is_opfp & fp_cvt_out_ok;
     //   写整数寄存器（FP → 整数）：fmv.x.w / fclass / fcmp / fcvt 出口
     wire fp_to_int = fp_is_fmvx | fp_is_fcmp | fp_is_cvt_out;
 
@@ -762,12 +776,19 @@ module decoder (
         (is_opfp & fp_f5 == `RV32GC_FP_F5_FMINMAX) ? (f3 == `RV32GC_FP_F3_FMIN ? FP_MIN : FP_MAX) :
         (is_opfp & fp_cvt_any_ok)                 ? FP_CVT :
         (is_opfp & fp_mvx_f5_ok)                  ? FP_MV_X :
-        (is_opfp & fp_mvw_f5_ok)                  ? FP_MV_W :
+        (is_opfp & fp_mvw_ok)                     ? FP_MV_W :
         (is_opfp & fp_cmp_f5_ok)                  ? FP_CMP :
                                                     FP_NONE;
     // ---- 写 FP 寄存器：写 FP 的浮点计算（含 FMA）与 flw（load-FP）；
     //      **出口**（fmv.x.w/fclass/fcmp/fcvt 出口）写整数，不写 FP ----
-    assign fp_we_o = is_loadfp | ((is_opfp | is_fma) & ~fp_to_int);
+    //   ★ 2026-10-19（F1 复审）：非法指令**不得**发出 FP 写请求。
+    //     背景：FP 保留/不支持编码在收紧后仍会走到本行（如 fsqrts rs2≠0、
+    //     fmv.x.w rs2≠0），旧式 `~fp_to_int` 会让其 fp_we_o=1；虽然 backend 侧
+    //     `kill = unsup|illegal` 已把 dst_fp 门控为 0（不会真的写 PRF），但译码级
+    //     仍暴露"非法指令请求写 FP"。此处仅对 fp_we_o 增加 `~ill_instr_o` 抑制——
+    //     **不**要求 op_type/fp_op/其它旁带字段全部清零（非法时 op_type=OPT_ILL、
+    //     消费者按 kill 处理），也不改动任何合法指令的取值。
+    assign fp_we_o = is_loadfp | ((is_opfp | is_fma) & ~fp_to_int & ~ill_instr_o);
 
     assign rv32_is_amo_o = is_amo;
 

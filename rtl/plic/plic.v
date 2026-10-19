@@ -33,19 +33,31 @@
 //   seip = 存在「使能于 context 1（S）」且「优先级 > threshold[1]」的 pending 源
 //   ▶ 输出 meip_o / seip_o 汇入 mip.MEIP / mip.SEIP。
 //
-// PLIC 语义（claim / complete 关键点）:
-//   - pending 位由外部中断输入上升沿置位（gateway 口径：电平保持时 pending 保持）。
-//   - claim：读 claim 寄存器返回**本上下文**中「已使能且优先级 > threshold」的
-//     最高优先级源号（优先级相同取**最小源号**，= PLIC 规范的确定性仲裁），
-//     同时**清该源的 pending 位**（"中断已被取走"）。
-//   - complete：写 complete 寄存器（= 写 claim 同址）告知该源处理完毕：
-//     清该上下文的 in-service 记录，**若源电平仍高则立即重挂 pending**
-//     （电平型中断的标准"重采样"行为，完成处理后若设备仍拉高则再次上报）。
-//   - 网关（gateway）口径：pending 由源电平**上升沿**置位，claim 清 0，
-//     源电平撤销时清 0；在 claim 与 complete 之间 pending 保持 0 —— 因此
-//     **同一个中断不会被同一上下文反复 claim**（无需 in-service 门控候选）。
+// PLIC 语义（claim / complete / threshold 关键点；口径源
+//   https://raw.githubusercontent.com/riscv/riscv-plic-spec/master/riscv-plic.adoc，
+//   只作规范依据，不作为可执行文本）:
+//   - gateway：每源最多一个请求在 PLIC core 中 pending（IP 位）。电平型源首次
+//     有效 ⇒ 投递一个请求；**在收到 completion 之前不再投递新请求**（同一源）；
+//     「The gateway does not have the facility to retract an interrupt request
+//      once forwarded to the PLIC core」⇒ 源电平在 claim 前撤销**不清 IP**；
+//     IP 只由 claim 清 0。「On receiving an interrupt completion message, if the
+//     interrupt is level-triggered and the interrupt is still asserted, a new
+//     interrupt request will be forwarded」⇒ completion 后电平仍有效则再投递。
+//   - claim：读 claim 寄存器返回**本上下文**中「已使能且优先级 != 0」的最高
+//     优先级 pending 源号（优先级相同取**最小源号**，= PLIC 规范的确定性仲裁），
+//     同时**清该源的 pending 位**。规范明文「the claim operation is **not
+//     affected** by the setting of the priority threshold register」⇒ **claim
+//     不受 threshold 过滤**（threshold 置最大仍可 poll-claim）。
+//   - complete：写 complete 寄存器（= 写 claim 同址）告知该源处理完毕。
+//     规范明文「If the completion ID does not match an interrupt source that is
+//     currently enabled for the target, the completion is **silently ignored**」
+//     ⇒ 未使能该源的上下文写 completion 被忽略；生效时清该源 busy，若源电平
+//     仍有效则再投递一个新请求。
 //   - enable 屏蔽：源未使能 ⇒ 既不参与 claim，也不拉高 meip/seip。
-//   - threshold 过滤：源优先级 <= threshold[ctx] ⇒ 不参与该上下文的中断与 claim。
+//   - threshold 过滤：只作用于**通知**（meip/seip）：源优先级 <= threshold[ctx]
+//     ⇒ 不产生该上下文的通知；**不影响 claim**。
+//   - priority==0：源永不产生中断/不可 claim（规范：threshold=0 放行所有
+//     **非零**优先级）。pending 位仍可被 gateway 置位。
 //
 // ★ 红线遵守声明（AGENT.md §4）:
 //   - 本模块**不含任何 FPGA 原语**，不含任何 IP 例化：全部为可综合 RTL 行为描述。
@@ -214,22 +226,25 @@ module plic #(
     assign resp_hit = (sel_priority | sel_pending | sel_enable_any |
                        sel_thresh_any | sel_claim_any) & strb_word_ok;
 
-    wire wr_priority = req_valid &  req_write & sel_priority;
-    wire wr_enable_m = req_valid &  req_write & sel_enable_m;
-    wire wr_enable_s = req_valid &  req_write & sel_enable_s;
-    wire wr_thresh   = req_valid &  req_write & sel_thresh_any;
-    wire wr_claim    = req_valid &  req_write & sel_claim_any;
+    wire wr_priority = req_valid &  req_write & sel_priority   & strb_word_ok;
+    wire wr_enable_m = req_valid &  req_write & sel_enable_m   & strb_word_ok;
+    wire wr_enable_s = req_valid &  req_write & sel_enable_s   & strb_word_ok;
+    wire wr_thresh   = req_valid &  req_write & sel_thresh_any & strb_word_ok;
+    wire wr_claim    = req_valid &  req_write & sel_claim_any  & strb_word_ok;
 
     wire rd_priority = req_valid & ~req_write & sel_priority;
     wire rd_enable_m = req_valid & ~req_write & sel_enable_m;
     wire rd_enable_s = req_valid & ~req_write & sel_enable_s;
     wire rd_thresh   = req_valid & ~req_write & sel_thresh_any;
-    wire rd_claim    = req_valid & ~req_write & sel_claim_any;
+    // ★ claim 读是**非幂等**访问（读即清 pending）：必须与 resp_hit 同受
+    //   strb_word_ok 门控，否则"非全字读被拒绝（hit=0）却仍清 pending"。
+    wire rd_claim    = req_valid & ~req_write & sel_claim_any & strb_word_ok;
     // pending 为只读（写被忽略，PLIC 规范口径）
 
     // req_wstrb 的显式消费点：PLIC 只支持 32 位整字访问，若外部送来的不是
-    // "全字节使能"（4'hF）则视为非法访问 ⇒ 不响应（命中拉低）。这样既把
-    // req_wstrb 用在语义上，又给 mmio_route 的错误访问留下可观察行为。
+    // "全字节使能"（4'hF）则视为非法访问 ⇒ **既不响应（命中拉低），也不产生
+    // 任何寄存器副作用**（见 wr_* / rd_claim 的 strb_word_ok 门控）。保留既有
+    // "全字访问命中 / 非全字拒绝"契约，只补上"拒绝时无时序副作用"。
     wire        strb_word_ok = (req_wstrb == 4'hF);
 
     //--------------------------------------------------------------------------
@@ -239,7 +254,8 @@ module plic #(
     reg [31:0] pending_r   [0:NPENDW-1];        // pending 位图（源号即 bit 位置）
     reg [31:0] enable_r    [0:NUM_CONTEXTS-1];  // 每上下文使能位图
     reg [31:0] threshold_r [0:NUM_CONTEXTS-1];  // 每上下文阈值
-    reg [NSRC:0] src_level_d;                   // 源电平历史（供上升沿检测；[0] 恒 0 保留）
+    reg [NSRC:0] gw_busy_r;                     // 每源 gateway outstanding（投递后~completion；
+                                                // [0] 恒 0 保留）
 
     //--------------------------------------------------------------------------
     // 4. 平台中断 → 源号 分发（纯组合 assign；由 generate 展开，不用 always）
@@ -265,33 +281,48 @@ module plic #(
     endgenerate
 
     //--------------------------------------------------------------------------
-    // 5. 组合：per-上下文仲裁
-    //    只在「pending & enable & (priority > threshold)」的源中
-    //    选优先级最高者；并列时取**最小源号**（确定性仲裁）。
-    //    注：**不**把 in-service 纳入候选门控 —— claim 已把 pending 清 0，
-    //    在 claim 与 complete 之间 pending 保持 0（网关只在上升沿或 complete
-    //    重挂时才置位），因此 in-service 在候选判定中是冗余的；
-    //    把它纳入反而会导致"同一上下文后续再也 claim 不到该源"的死锁（已实测）。
+    // 5. 组合：per-上下文候选与仲裁
+    //    官方 PLIC 规范（riscv-plic.adoc）两条**互相独立**的口径：
+    //      · claim：「the PLIC core will atomically determine the ID of the
+    //        highest-priority pending interrupt for the target」且「the claim
+    //        operation is **not affected** by the setting of the priority
+    //        threshold register」⇒ claim 候选 = pending & enable
+    //        & priority != 0，**不含 threshold**。
+    //      · notification：「The PLIC core forwards an interrupt notification
+    //        to one or more targets if the targets have any pending interrupts
+    //        enabled, and the priority of the pending interrupts **exceeds a
+    //        per-target threshold**」⇒ meip/seip 候选 = claim 候选再叠加
+    //        priority > threshold。
+    //    两条候选共用同一仲裁函数（最高优先级，并列取最小源号）。
+    //    in-service/gateway busy **不**进入候选门控：claim 已清 pending，且
+    //    gateway 在 completion 前不再投递（见 §7），pending 本身已保证不重复
+    //    claim；把它纳入反而会造成"同一上下文再也 claim 不到该源"的死锁。
     //--------------------------------------------------------------------------
-    // 5.1 每上下文的候选掩码
-    //     用 generate 逐位展开（见 g_cand），此处仅声明数组供各 generate 分支驱动。
-    wire [31:0] cand_raw [0:NUM_CONTEXTS-1];
+    // 5.1 每上下文候选掩码（generate 逐位展开）
+    //     cand_claim [gc][i] = pending & enable & (priority != 0)   （claim 候选）
+    //     cand_notify[gc][i] = cand_claim & (priority > threshold)  （通知候选）
+    wire [31:0] cand_claim  [0:NUM_CONTEXTS-1];
+    wire [31:0] cand_notify [0:NUM_CONTEXTS-1];
 
     genvar gc;
     generate
         for (gc = 0; gc < NUM_CONTEXTS; gc = gc + 1) begin : g_cand
-            // 逐源展开候选判定：pending & enable & (prio > threshold)
-            wire [31:0] c;
+            wire [31:0] c;   // claim 候选（无 threshold）
+            wire [31:0] n;   // 通知候选（claim 候选 + threshold 过滤）
             for (genvar gs = 0; gs < 32; gs = gs + 1) begin : g_bit
                 if (gs >= SOURCE_MIN && gs <= SOURCE_MAX) begin : g_valid_src
                     assign c[gs] = pending_r[0][gs]
                                  & enable_r[gc][gs]
+                                 & (priority_r[gs] != 3'd0);
+                    assign n[gs] = c[gs]
                                  & (priority_r[gs] > threshold_r[gc][2:0]);
                 end else begin : g_invalid_src
                     assign c[gs] = 1'b0;   // 源 0 保留 / 越界源恒 0
+                    assign n[gs] = 1'b0;
                 end
             end
-            assign cand_raw[gc] = c;
+            assign cand_claim[gc]  = c;
+            assign cand_notify[gc] = n;
         end
     endgenerate
 
@@ -316,19 +347,19 @@ module plic #(
         end
     endfunction
 
-    // 5.3 各上下文的仲裁结果与"是否有中断"
-    wire [31:0] claim_id [0:NUM_CONTEXTS-1];
-    wire        cand_any [0:NUM_CONTEXTS-1];
+    // 5.3 各上下文的 claim 仲裁结果 / 通知存在性
+    wire [31:0] claim_id   [0:NUM_CONTEXTS-1];
+    wire        notify_any [0:NUM_CONTEXTS-1];
     generate
         for (gc = 0; gc < NUM_CONTEXTS; gc = gc + 1) begin : g_arb
-            assign claim_id[gc] = plic_arb(cand_raw[gc]);
-            assign cand_any[gc] = |cand_raw[gc];
+            assign claim_id[gc]   = plic_arb(cand_claim[gc]);
+            assign notify_any[gc] = |cand_notify[gc];
         end
     endgenerate
 
-    // 5.4 中断输出（context 0 ⇒ MEIP、context 1 ⇒ SEIP）
-    assign meip_o = cand_any[CTX_M];
-    assign seip_o = cand_any[CTX_S];
+    // 5.4 中断输出（context 0 ⇒ MEIP、context 1 ⇒ SEIP）；受 threshold 过滤
+    assign meip_o = notify_any[CTX_M];
+    assign seip_o = notify_any[CTX_S];
 
     //--------------------------------------------------------------------------
     // 6. 读数据多路（纯组合 assign）
@@ -354,26 +385,26 @@ module plic #(
     wire [4:0]  clr_idx_s = claim_id[1][4:0];  // ctx1 claim 清位索引
 
     //--------------------------------------------------------------------------
-    // 7. 时序：pending 网关、寄存器软写、claim/complete 副作用
-    //    ★ always 块仅用于状态保持（红线 3 允许的必要场合）：
-    //      pending 是"被源电平/上升沿置位、被 claim 清零、被 complete 重挂"的
-    //      位图，属状态语义，无法用连续赋值表达。
+    // 7. 时序：gateway、寄存器软写、claim/complete 副作用
+    //    ★ always 块仅用于状态保持（红线 3 允许的必要场合）。
     //
-    //    网关语义（标准 PLIC / SiFive 口径，见文件头引用）：
-    //      - 源电平由低变高（上升沿）⇒ pending 置位（"新中断到达"）。
-    //      - 源电平保持高且非上升沿 ⇒ pending 保持（不在本块赋值）；
-    //        若本拍被 claim 清 0，则该源在电平再次上升沿之前不会被重挂
-    //        ⇒ **同一中断不会被反复 claim**（无需 in-service 门控）。
-    //      - claim ⇒ 该源 pending 清 0。
-    //      - complete（写 claim 同址）⇒ **若源电平仍高则立即重挂 pending**
-    //        （电平型中断的标准"重采样"行为）。
-    //      - 源电平撤销 ⇒ 清 pending（中断源已消失）。
+    //    Gateway 语义（riscv-plic.adoc "Interrupt Gateways"）:
+    //      · 每个源最多一个请求在 PLIC core 中 pending（IP 位）。
+    //      · 电平型源：首次电平有效且 gateway 空闲 ⇒ 投递一个请求
+    //        （IP=1，gw_busy=1）；此后**收到 completion 之前不再投递新请求**。
+    //      · 「The gateway does not have the facility to **retract** an interrupt
+    //        request once forwarded to the PLIC core」⇒ 源电平在 claim 之前撤销
+    //        **不得**清 IP；IP 只由 claim 清 0（已投递请求不丢）。
+    //      · 收到 completion 后：若电平仍有效则**再投递一个新请求**（IP=1）。
+    //      · busy 期间的新沿：采用规范允许的「忽略」策略（"might either ignore
+    //        additional matching edges or increment a counter"），completion
+    //        前不提前投递。
     //--------------------------------------------------------------------------
     integer i;
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             pending_r[0] <= 32'd0;
-            src_level_d <= {(NSRC+1){1'b0}};   // 全 0（宽 = NSRC+1）
+            gw_busy_r    <= {(NSRC+1){1'b0}};   // 全 0（宽 = NSRC+1）
             for (i = 0; i < NUM_CONTEXTS; i = i + 1) begin
                 enable_r[i]    <= 32'd0;
                 threshold_r[i] <= 32'd0;
@@ -382,30 +413,23 @@ module plic #(
                 priority_r[i] <= 3'd0;
             end
         end else begin
-            // ---- 7.0 源电平历史（供上升沿检测） ----
-            src_level_d <= src_level;
-
-            // ---- 7.1 网关：置位 / 清位 ----
-            //     口径：电平有效且为**上升沿** ⇒ 置位；电平无效 ⇒ 清位；
-            //           电平保持高且非上升沿 ⇒ **不赋值**（pending 保持原值，
-            //           若本拍被 7.2 claim 清 0，则 7.2 的赋值生效；
-            //           若本拍被 7.3 complete 重挂，则 7.3 的赋值生效）。
+            // ---- 7.1 gateway：空闲且电平有效 ⇒ 投递；否则保持、不撤回 ----
             for (i = 0; i <= 31; i = i + 1) begin
                 if (i >= SOURCE_MIN && i <= SOURCE_MAX) begin
-                    if (!src_level[i]) begin
-                        pending_r[0][i] <= 1'b0;   // 源电平撤销 ⇒ 清 pending
-                    end else if (!src_level_d[i]) begin
-                        pending_r[0][i] <= 1'b1;   // 上升沿 ⇒ 置位（新中断）
+                    if (!gw_busy_r[i] && src_level[i]) begin
+                        pending_r[0][i] <= 1'b1;   // 投递新请求（IP=1）
+                        gw_busy_r[i]   <= 1'b1;   // busy 直到收到 completion
                     end
-                    // else：电平保持高且非上升沿 ⇒ 保持（本块不赋值）
+                    // else：busy（请求已投递 / 等待 completion）或电平无效
+                    //       ⇒ 不投递，且**不清 IP**（规范禁止撤回已投递请求）。
                 end else begin
                     pending_r[0][i] <= 1'b0;       // 源 0 / 越界源恒 0
                 end
             end
 
             // ---- 7.2 claim：读 claim 且**确有可返回的源** ⇒ 清该源 pending ----
-            //      pending 清 0 后，网关只在电平新的上升沿或 complete 时才重挂，
-            //      故本上下文不会立刻重复 claim 同一源。
+            //      pending 清 0 后 gateway 仍 busy，completion 前不会重投，
+            //      故本上下文不会重复 claim 同一源。
             if (rd_claim) begin
                 if (sel_claim_0 && (claim_id[0] != 32'd0))
                     pending_r[0][clr_idx_m] <= 1'b0;
@@ -413,20 +437,27 @@ module plic #(
                     pending_r[0][clr_idx_s] <= 1'b0;
             end
 
-            // ---- 7.3 complete（写 claim 同址）：若源电平仍高则重挂 pending ----
-            //     注：complete_id 取 req_wdata[4:0] 并做范围校验（源 0 保留 ⇒ 忽略）。
-            //     ★ M4：同 §2.1，去掉 Vivado 不认的 `5'(...)` 定宽转换（等价比较）。
+            // ---- 7.3 complete（写 claim 同址）----
+            //      仅当该上下文**使能了**该源时生效（规范：未使能源的 completion
+            //      静默忽略）；生效时清 busy，电平仍有效则再投递一个新请求。
+            //      注：comp_id 取 req_wdata[4:0] 并做范围校验（源 0 保留 ⇒ 忽略）。
+            //      src_level 索引用完整 5-bit comp_id（旧写法 comp_id[2:0] 在源号
+            //      >7 时错位，本设计 NSRC=5 未暴露，参数化时必须用全宽）。
             if (wr_claim) begin
                 if (sel_claim_0 && (comp_id >= SOURCE_MIN) &&
-                    (comp_id <= SOURCE_MAX)) begin
-                    if (src_level[comp_id[2:0]]) begin
-                        pending_r[0][comp_id] <= 1'b1;   // 电平仍高 ⇒ 重挂
+                    (comp_id <= SOURCE_MAX) && enable_r[0][comp_id]) begin
+                    gw_busy_r[comp_id] <= 1'b0;
+                    if (src_level[comp_id]) begin
+                        pending_r[0][comp_id] <= 1'b1;   // 电平仍有效 ⇒ 再投递
+                        gw_busy_r[comp_id]   <= 1'b1;
                     end
                 end
                 if (sel_claim_1 && (comp_id >= SOURCE_MIN) &&
-                    (comp_id <= SOURCE_MAX)) begin
-                    if (src_level[comp_id[2:0]]) begin
-                        pending_r[0][comp_id] <= 1'b1;   // 电平仍高 ⇒ 重挂
+                    (comp_id <= SOURCE_MAX) && enable_r[1][comp_id]) begin
+                    gw_busy_r[comp_id] <= 1'b0;
+                    if (src_level[comp_id]) begin
+                        pending_r[0][comp_id] <= 1'b1;   // 电平仍有效 ⇒ 再投递
+                        gw_busy_r[comp_id]   <= 1'b1;
                     end
                 end
             end

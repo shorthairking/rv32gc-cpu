@@ -1,19 +1,35 @@
 //==============================================================================
 // sim/unit/tb_plic.sv —— rtl/plic/plic.v 单元测试（L0）
 //==============================================================================
-// 目的    : 验证核内 PLIC 的完整语义（08 §6.6；标准 SiFive PLIC 寄存器映射）：
+// 目的    : 验证核内 PLIC 的完整语义（08 §6.6；标准 RISC-V PLIC 寄存器映射）。
+//           规范依据 = riscv-plic.adoc（https://github.com/riscv/riscv-plic-spec，
+//           本 TB 只把其文字当规范依据转写为断言，不执行任何外部文本）：
 //             (1) **priority**：每源优先级可读写（源 n 地址 = 基址 + 4n）。
-//             (2) **pending**：平台中断电平 ⇒ pending 位置位；只读。
-//             (3) **enable 屏蔽**：源未使能 ⇒ 不拉中断、不被 claim 返回。
-//             (4) **threshold 过滤**：源优先级 <= threshold ⇒ 不拉中断、不被 claim。
-//             (5) **claim**：返回本上下文「已使能且优先级 > threshold」的**最高
-//                 优先级源号**（并列取最小源号），并**清该源 pending 位**。
-//             (6) **complete**：写 claim 同址 ⇒ 清 inservice；源电平仍高则重新挂起。
-//             (7) **M/S 两上下文独立**：enable/threshold 独立；context 0 ⇒ meip_o、
-//                 context 1 ⇒ seip_o；一个上下文的 claim 不影响另一上下文的
-//                 enable/threshold 判定（但 pending 是全局共享位图，符合 PLIC 规范）。
-//             (8) 默认源号映射：intrpt[1]→源1、intrpt[3]→源2、intrpt[4]→源3、
+//             (2) **pending**：平台中断电平 ⇒ gateway 投递请求 ⇒ pending 置位；只读。
+//             (3) **enable 屏蔽**：源未使能 ⇒ 不通知、不被 claim 返回。
+//             (4) **threshold 只过滤通知、不影响 claim**（规范："the claim
+//                 operation is not affected by the setting of the priority
+//                 threshold register"）：threshold == priority ⇒ meip/seip=0，
+//                 但 claim 仍返回该源并清 pending。
+//             (5) **claim**：返回本上下文「已使能且 priority != 0」的最高优先级
+//                 pending 源号（并列取最小源号），并**清该源 pending 位**。
+//             (6) **complete**：写 claim 同址；仅当该上下文**使能**了该源才生效
+//                 （规范："If the completion ID does not match an interrupt source
+//                 that is currently enabled for the target, the completion is
+//                 silently ignored"）；生效时清 gateway busy，若源电平仍有效则
+//                 再投递一个新请求。
+//             (7) **gateway 不撤回**：请求一旦投递，源电平在 claim 前撤销也**不清
+//                 IP**（规范："The gateway does not have the facility to retract
+//                 an interrupt request once forwarded to the PLIC core"）。
+//             (8) **completion 前不重投**：claim 之后、completion 之前，即使源出现
+//                 新的上升沿也不得重投/再 claim（规范：gateway 收到 completion 前
+//                 不再转发；本设计采用"忽略新沿"策略）。
+//             (9) **M/S 两上下文独立**：enable/threshold 独立；context 0 ⇒ meip_o、
+//                 context 1 ⇒ seip_o；pending 是全局共享位图（符合规范）。
+//            (10) 默认源号映射：intrpt[1]→源1、intrpt[3]→源2、intrpt[4]→源3、
 //                 intrpt[2]→源4、intrpt[0]→源5（08 §6.6 表）。
+//            (11) **空/非法字节掩码 MMIO 写无副作用**（保留"全字命中 / 非全字拒绝"
+//                 既有契约）。
 //
 // ★「PLIC 访问绝不产生 AXI 请求」断言口径（本 TB 的说明性断言）:
 //   PLIC 是**核内设备**：plic.v 的端口里**根本不存在** AXI 相关信号
@@ -77,6 +93,8 @@ module tb_plic;
     localparam integer SRC_SPI  = `RV32GC_INTRPT_SRC_SPI;   // 4，针 2
     localparam integer SRC_NAND = `RV32GC_INTRPT_SRC_NAND;  // 2，针 3
     localparam integer SRC_DMA  = `RV32GC_INTRPT_SRC_DMA;   // 3，针 4
+    // 针（src[] 下标）与源号是两张表：默认映射下针1==源1，其余不同
+    localparam integer PIN_MAC  = 0, PIN_UART = 1, PIN_SPI = 2, PIN_NAND = 3, PIN_DMA = 4;
 
     //--------------------------------------------------------------------------
     // 2. DUT 端口
@@ -136,7 +154,7 @@ module tb_plic;
     always #(CLK_PERIOD/2.0) aclk = ~aclk;
 
     //--------------------------------------------------------------------------
-    // 5. 任务：MMIO 写 / 读
+    // 5. 任务：MMIO 写 / 读（含显式字节使能变体）
     //--------------------------------------------------------------------------
     task automatic mmio_write(input [31:0] off, input [31:0] data);
         begin
@@ -154,11 +172,28 @@ module tb_plic;
         end
     endtask
 
+    task automatic mmio_write_strb(input [31:0] off, input [31:0] data, input [3:0] strb);
+        begin
+            @(negedge aclk);
+            req_addr  = off;
+            req_wdata = data;
+            req_wstrb = strb;
+            req_write = 1'b1;
+            req_valid = 1'b1;
+            @(posedge aclk);
+            #1;
+            req_valid = 1'b0;
+            req_write = 1'b0;
+            `CK(axi_like_activity === 1'b0, "写 PLIC（带 strobe）后出现 AXI 活动（不应存在）")
+        end
+    endtask
+
     task automatic mmio_read(input [31:0] off, output [31:0] data, output hit);
         begin
             @(negedge aclk);
             req_addr  = off;
             req_wdata = 32'd0;
+            req_wstrb = 4'hF;
             req_write = 1'b0;
             req_valid = 1'b1;
             #1;
@@ -171,16 +206,88 @@ module tb_plic;
         end
     endtask
 
+    task automatic mmio_read_strb(input [31:0] off, input [3:0] strb,
+                                  output [31:0] data, output hit);
+        begin
+            @(negedge aclk);
+            req_addr  = off;
+            req_wdata = 32'd0;
+            req_wstrb = strb;
+            req_write = 1'b0;
+            req_valid = 1'b1;
+            #1;
+            data = resp_rdata;
+            hit  = resp_hit;
+            @(posedge aclk);
+            #1;
+            req_valid = 1'b0;
+            `CK(axi_like_activity === 1'b0, "读 PLIC（带 strobe）后出现 AXI 活动（不应存在）")
+        end
+    endtask
+
     // 源 n 的优先级寄存器偏移
     function [31:0] prio_off(input integer n);
         prio_off = PRIO_OFF + (n * 4);
     endfunction
+
+    // 设置平台源电平（整字节）并在 3 拍后做组合判定采样
+    task automatic set_src(input [7:0] mask);
+        begin
+            @(negedge aclk);
+            src = mask;
+            repeat (3) @(posedge aclk);
+            #1;
+        end
+    endtask
+
+    //--------------------------------------------------------------------------
+    // 5b. 场景前置：把 PLIC 复位到"干净"状态（电平全撤、pending 清空、
+    //     gateway busy 清空、两上下文使能/阈值归零、优先级恢复非零默认）
+    //     注意：completion 必须以"该上下文已使能该源"为前提，故先使能再 complete。
+    //--------------------------------------------------------------------------
+    task automatic quiesce;
+        integer q;
+        begin
+            src = 8'h00;
+            repeat (2) @(posedge aclk);
+            #1;
+            // 优先级恢复非零（保证 pending 可被 claim drain）
+            mmio_write(prio_off(SRC_UART), 32'd7);
+            mmio_write(prio_off(SRC_NAND), 32'd3);
+            mmio_write(prio_off(SRC_DMA),  32'd5);
+            mmio_write(prio_off(SRC_SPI),  32'd2);
+            mmio_write(prio_off(SRC_MAC),  32'd1);
+            mmio_write(EN_OFF_M, 32'hFFFF_FFFE);
+            mmio_write(EN_OFF_S, 32'hFFFF_FFFE);
+            mmio_write(THRESH_OFF_0, 32'd0);
+            mmio_write(THRESH_OFF_1, 32'd0);
+            // drain pending（每上下文逐次 claim）
+            for (q = 0; q < 8; q = q + 1) begin
+                mmio_read(CLAIM_OFF_0, rd, hit);
+                mmio_read(CLAIM_OFF_1, rd, hit);
+            end
+            // 清 gateway busy（电平已低 ⇒ 不重投）
+            for (q = 1; q <= 5; q = q + 1) begin
+                mmio_write(CLAIM_OFF_0, q);
+                mmio_write(CLAIM_OFF_1, q);
+            end
+            // 归零使能/阈值；关闭两上下文
+            mmio_write(EN_OFF_M, 32'h0);
+            mmio_write(EN_OFF_S, 32'h0);
+            mmio_write(THRESH_OFF_0, 32'd0);
+            mmio_write(THRESH_OFF_1, 32'd0);
+            #1;
+            mmio_read(PEND_OFF, rd, hit);
+            `CK(rd === 32'h0, "quiesce 后 pending 应清空（场景前置）")
+        end
+    endtask
 
     //--------------------------------------------------------------------------
     // 6. 主流程
     //--------------------------------------------------------------------------
     reg [31:0] rd;
     reg        hit;
+    reg [31:0] v_before, v_after;
     integer    i;
 
     initial begin
@@ -236,27 +343,27 @@ module tb_plic;
         `CK(rd  === 32'd7, "priority(源1) 应为 7")
         mmio_read(prio_off(SRC_DMA), rd, hit);
         `CK(rd === 32'd5, "priority(源3) 应为 5")
-        // 源 0 保留：对 4*0 = 偏移 0 的写... 注意偏移 0 即 priority[0]，
-        // 本设计 SOURCE_MIN=1 ⇒ 不应命中（源 0 保留为「无中断」）
+        // 源 0 保留：偏移 0 即 priority[0]，SOURCE_MIN=1 ⇒ 不应命中
         mmio_read(PRIO_OFF, rd, hit);
         `CK(hit === 1'b0, "源 0 的 priority 地址不应命中（源 0 保留）")
 
         //----------------------------------------------------------------------
-        // (2) pending 置位：仅置电平，未使能 ⇒ 不应拉中断
+        // (2) pending 置位：仅置电平，未使能 ⇒ 不拉中断
         //----------------------------------------------------------------------
-        mmio_write(EN_OFF_M, 32'h0);   // M 上下文使能全关
-        mmio_write(EN_OFF_S, 32'h0);   // S 上下文使能全关
+        mmio_write(EN_OFF_M, 32'h0);
+        mmio_write(EN_OFF_S, 32'h0);
         mmio_write(THRESH_OFF_0, 32'd0);
         mmio_write(THRESH_OFF_1, 32'd0);
-        // 抬高针 1（UART ⇒ 源 1）
-        @(negedge aclk);
-        src[1] = 1'b1;
-        repeat (3) @(posedge aclk);
-        #1;
+        set_src(8'h02);   // 针 1（UART ⇒ 源 1）抬高
         mmio_read(PEND_OFF, rd, hit);
         `CK(rd[SRC_UART] === 1'b1, "UART 源置电平后 pending 对应位应为 1")
         `CK(meip_o === 1'b0, "源未使能时 meip_o 应为 0（enable 屏蔽）")
         `CK(seip_o === 1'b0, "源未使能时 seip_o 应为 0（enable 屏蔽）")
+        // ★ gateway 不撤回：撤电平后再置高、或撤电平不 claim，pending 都保持
+        set_src(8'h00);
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "撤电平但未 claim 时 pending 应保持 1（gateway 不撤回）")
+        set_src(8'h02);
 
         //----------------------------------------------------------------------
         // (3) enable 屏蔽：只使能 M 上下文的源 1 ⇒ 仅 meip_o 拉高
@@ -273,165 +380,285 @@ module tb_plic;
         mmio_read(EN_OFF_M, rd, hit);
         `CK(rd[0] === 1'b0, "enable bit0 应恒 0（源 0 保留为「无中断」）")
         `CK(rd[SRC_UART] === 1'b1, "enable 其余位应可写 1")
-        // 恢复：只使能源 1
         mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
 
         //----------------------------------------------------------------------
-        // (4) threshold 过滤：threshold >= priority ⇒ 不拉中断、claim 返回 0
+        // (4) threshold 只过滤通知、不影响 claim（P1-11 修复点）
+        //     状态：源 1 pending、M 使能源 1、priority(源1)=7、threshold(M)=0
         //----------------------------------------------------------------------
-        mmio_write(THRESH_OFF_0, 32'd7);   // == priority(源1)=7 ⇒ 被过滤
+        mmio_write(THRESH_OFF_0, 32'd7);   // == priority(源1)=7 ⇒ 通知被屏蔽
         #1;
-        `CK(meip_o === 1'b0, "threshold == priority 时应被过滤（meip_o=0）")
+        `CK(meip_o === 1'b0, "threshold == priority 时通知应被屏蔽（meip_o=0）")
         mmio_read(CLAIM_OFF_0, rd, hit);
-        `CK(hit === 1'b1,  "读 claim(ctx0) 应命中")
-        `CK(rd  === 32'd0, "被 threshold 过滤时 claim 应返回 0")
-        // threshold = 6 < 7 ⇒ 通过
-        mmio_write(THRESH_OFF_0, 32'd6);
-        #1;
-        `CK(meip_o === 1'b1, "threshold < priority 时应通过（meip_o=1）")
-
-        //----------------------------------------------------------------------
-        // (5) claim：返回最高优先级源，且优先清 pending 位
-        //----------------------------------------------------------------------
-        // 抬高多个源电平：源 1(UART,prio7)、源 3(DMA,prio5)、源 2(NAND,prio3)
-        @(negedge aclk);
-        src[1] = 1'b1;   // 源 1
-        src[4] = 1'b1;   // 源 3 (DMA)
-        src[3] = 1'b1;   // 源 2 (NAND)
-        repeat (3) @(posedge aclk);
-        #1;
+        `CK(hit === 1'b1, "读 claim(ctx0) 应命中")
+        `CK(rd  === SRC_UART,
+            $sformatf("threshold == priority 时 claim 仍应返回源 %0d（claim 不受 threshold 影响），实得 %0d",
+                      SRC_UART, rd))
+        // claim 已清该源 pending
         mmio_read(PEND_OFF, rd, hit);
-        `CK(rd[SRC_UART] === 1'b1 && rd[SRC_NAND] === 1'b1 && rd[SRC_DMA] === 1'b1,
-            "三个源 pending 位都应置位")
-        // 使能三个源
-        mmio_write(EN_OFF_M, (32'h1 << SRC_UART) | (32'h1 << SRC_NAND) | (32'h1 << SRC_DMA));
-        mmio_write(THRESH_OFF_0, 32'd0);
-        #1;
-        `CK(meip_o === 1'b1, "多源 pending 且使能 ⇒ meip_o 应拉高")
-        // claim ⇒ 应返回优先级最高的源 1（priority 7）
-        mmio_read(CLAIM_OFF_0, rd, hit);
-        `CK(rd === SRC_UART, $sformatf("claim 应返回最高优先级源 %0d，实得 %0d", SRC_UART, rd))
-        // 该源的 pending 位应被清
-        mmio_read(PEND_OFF, rd, hit);
-        `CK(rd[SRC_UART] === 1'b0, "claim 后该源 pending 位应被清零")
-        `CK(rd[SRC_NAND] === 1'b1 && rd[SRC_DMA] === 1'b1, "其他源 pending 应保持")
-        // 再次 claim ⇒ 应返回次高优先级源 3（priority 5），而不是同一个源
-        mmio_read(CLAIM_OFF_0, rd, hit);
-        `CK(rd === SRC_DMA, $sformatf("第二次 claim 应返回次高优先级源 %0d，实得 %0d", SRC_DMA, rd))
-        // 第三次 claim ⇒ 源 2（priority 3）
-        mmio_read(CLAIM_OFF_0, rd, hit);
-        `CK(rd === SRC_NAND, $sformatf("第三次 claim 应返回源 %0d，实得 %0d", SRC_NAND, rd))
-        // 第四次 claim ⇒ 无候选 ⇒ 返回 0（且必须已无 pending 候选）
-        mmio_read(CLAIM_OFF_0, rd, hit);
-        `CK(rd === 32'd0, "无候选时 claim 应返回 0")
-
-        //----------------------------------------------------------------------
-        // (6) complete：写 claim 同址 ⇒ 清 inservice；此时源电平已撤 ⇒ pending 不再挂
-        //     先撤走全部源电平，再 complete 掉源 1
-        //----------------------------------------------------------------------
-        @(negedge aclk);
-        src[1] = 1'b0;
-        src[4] = 1'b0;
-        src[3] = 1'b0;
-        repeat (3) @(posedge aclk);
-        #1;
-        // complete 源 1（写 claim 同址，数据 = 源号）
+        `CK(rd[SRC_UART] === 1'b0, "claim 后该源 pending 应被清 0")
+        `CK(meip_o === 1'b0, "claim 清 pending 且 threshold 屏蔽 ⇒ meip_o 仍为 0")
+        // complete（M 使能源 1、电平仍高）⇒ 重投；threshold 仍屏蔽
         mmio_write(CLAIM_OFF_0, SRC_UART);
         #1;
         mmio_read(PEND_OFF, rd, hit);
-        `CK(rd[SRC_UART] === 1'b0, "complete 后（源电平已撤）pending 应保持 0")
-        `CK(meip_o === 1'b0, "全部源撤销后 meip_o 应为 0")
+        `CK(rd[SRC_UART] === 1'b1, "complete 后源电平仍高 ⇒ pending 应重投为 1")
+        `CK(meip_o === 1'b0, "重投后 threshold 仍屏蔽通知（meip_o=0）")
+        // threshold < priority ⇒ 通知通过
+        mmio_write(THRESH_OFF_0, 32'd6);
+        #1;
+        `CK(meip_o === 1'b1, "threshold < priority 时应通过（meip_o=1）")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, "threshold=6 时 claim 仍返回源 1")
+        // 撤电平后 complete ⇒ 不再重投
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0, "撤电平后 complete ⇒ pending 应保持 0")
+        `CK(meip_o === 1'b0, "撤电平后无 pending ⇒ meip_o 应为 0")
 
         //----------------------------------------------------------------------
-        // (7) 并列优先级 ⇒ 取最小源号（确定性仲裁）
+        // (5) claim：返回最高优先级源，并清 pending 位
         //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(prio_off(SRC_NAND), 32'd3);
+        mmio_write(prio_off(SRC_DMA),  32'd5);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART) | (32'h1 << SRC_NAND) | (32'h1 << SRC_DMA));
+        mmio_write(THRESH_OFF_0, 32'd0);
+        // 抬高源 1(UART,prio7)、源 3(DMA,prio5)、源 2(NAND,prio3)
+        set_src(8'h1A);   // 针 1、3、4
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1 && rd[SRC_NAND] === 1'b1 && rd[SRC_DMA] === 1'b1,
+            "三个源 pending 位都应置位")
+        `CK(meip_o === 1'b1, "多源 pending 且使能 ⇒ meip_o 应拉高")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, $sformatf("claim 应返回最高优先级源 %0d，实得 %0d", SRC_UART, rd))
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0, "claim 后该源 pending 位应被清零")
+        `CK(rd[SRC_NAND] === 1'b1 && rd[SRC_DMA] === 1'b1, "其他源 pending 应保持")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_DMA, $sformatf("第二次 claim 应返回次高优先级源 %0d，实得 %0d", SRC_DMA, rd))
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_NAND, $sformatf("第三次 claim 应返回源 %0d，实得 %0d", SRC_NAND, rd))
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === 32'd0, "无候选时 claim 应返回 0（且不得清任何 pending）")
+        // 清理：撤电平 + 对被 claim 的源逐个 complete（M 已使能）
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        mmio_write(CLAIM_OFF_0, SRC_DMA);
+        mmio_write(CLAIM_OFF_0, SRC_NAND);
+        #1;
+        `CK(meip_o === 1'b0, "清理后 meip_o 应为 0")
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd === 32'h0, "清理后 pending 应为 0")
+
+        //----------------------------------------------------------------------
+        // (6) gateway 不撤回已投递请求（P1-10 触发 A）
+        //     源高 → pending=1 → **claim 前**撤电平 ⇒ IP 必须保持、仍可 claim
+        //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        mmio_write(THRESH_OFF_0, 32'd0);
+        set_src(8'h02);   // 源 1 投递
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "源 1 投递后 pending 应为 1")
+        set_src(8'h00);   // ★ claim 之前撤电平
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1,
+            "claim 前撤电平后 pending 必须保持 1（gateway 不撤回已投递请求）")
+        `CK(meip_o === 1'b1, "请求未丢 ⇒ meip_o 应仍为 1")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART,
+            $sformatf("撤电平后仍应能 claim 到源 %0d（请求未丢），实得 %0d", SRC_UART, rd))
+        `CK(meip_o === 1'b0, "claim 清 pending 后 meip_o 应为 0")
+        mmio_write(CLAIM_OFF_0, SRC_UART);   // complete（电平低）
+        #1;
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0, "complete 后（电平低）pending 应保持 0")
+
+        //----------------------------------------------------------------------
+        // (7) completion 之前不得重投：claim 后、complete 前出现新上升沿
+        //     （P1-10 触发 B）
+        //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        mmio_write(THRESH_OFF_0, 32'd0);
+        set_src(8'h02);   // 投递
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, "首次 claim 应返回源 1")
+        `CK(meip_o === 1'b0, "claim 后 pending=0 ⇒ meip_o 应为 0")
+        // ★ completion 之前制造新边沿：低 → 高
+        set_src(8'h00);
+        set_src(8'h02);
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0,
+            "completion 之前的新上升沿不得重投 pending（gateway busy 中忽略新沿）")
+        `CK(meip_o === 1'b0, "completion 之前不得产生新通知（meip_o=0）")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === 32'd0, "completion 之前不得再次 claim 到同一源")
+        // 对照：M 上下文 complete（使能、电平高）⇒ 正常重投
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "completion 后电平仍高 ⇒ 应正常重投（对照，防过度抑制）")
+        `CK(meip_o === 1'b1, "重投后 meip_o 应为 1")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, "重投后应能再次 claim 到源 1")
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+
+        //----------------------------------------------------------------------
+        // (8) completion 对**未使能**该源的上下文应静默忽略（P1-10 触发 C）
+        //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        mmio_write(EN_OFF_S, 32'h0);   // S 上下文不使能源 1
+        mmio_write(THRESH_OFF_0, 32'd0);
+        mmio_write(THRESH_OFF_1, 32'd0);
+        set_src(8'h02);   // 源 1 投递
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, "M 上下文 claim 应返回源 1")
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0, "claim 后 pending 应为 0（busy=1）")
+        // S 上下文写 completion（未使能源 1）⇒ 必须忽略：不得重挂/清 busy
+        mmio_write(CLAIM_OFF_1, SRC_UART);
+        #1;
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0,
+            "未使能源的上下文写 completion 必须被忽略（不得重挂 pending）")
+        `CK(meip_o === 1'b0, "被忽略的 completion 不得产生 meip_o")
+        `CK(seip_o === 1'b0, "S 未使能源 1 ⇒ seip_o 应为 0")
+        mmio_read(CLAIM_OFF_1, rd, hit);
+        `CK(rd === 32'd0, "S 上下文未使能源 1 ⇒ claim 应返回 0")
+        // 对照：M 上下文 complete（已使能、电平高）⇒ 正常重投
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "M 上下文 complete 生效 ⇒ 应重投")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, "重投后 M 应能再次 claim 到源 1")
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+
+        //----------------------------------------------------------------------
+        // (9) 并列优先级 ⇒ 取最小源号（确定性仲裁）
+        //----------------------------------------------------------------------
+        quiesce();
         mmio_write(prio_off(SRC_NAND), 32'd4);   // 源 2 = 4
         mmio_write(prio_off(SRC_DMA),  32'd4);   // 源 3 = 4（并列）
         mmio_write(prio_off(SRC_MAC),  32'd4);   // 源 5 = 4（并列）
         mmio_write(EN_OFF_M, (32'h1 << SRC_NAND) | (32'h1 << SRC_DMA) | (32'h1 << SRC_MAC));
         mmio_write(THRESH_OFF_0, 32'd0);
-        @(negedge aclk);
-        src[3] = 1'b1;   // 源 2 (NAND)
-        src[4] = 1'b1;   // 源 3 (DMA)
-        src[0] = 1'b1;   // 源 5 (MAC)
-        repeat (3) @(posedge aclk);
-        #1;
+        set_src(8'h19);   // 针 0(源5)、针 3(源2)、针 4(源3)
         mmio_read(CLAIM_OFF_0, rd, hit);
         `CK(rd === SRC_NAND, $sformatf("并列优先级应取最小源号 %0d，实得 %0d", SRC_NAND, rd))
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_NAND);
+        mmio_write(CLAIM_OFF_0, SRC_DMA);
+        mmio_write(CLAIM_OFF_0, SRC_MAC);
+        #1;
 
         //----------------------------------------------------------------------
-        // (8) M/S 两上下文独立 claim
-        //     清空状态后：源 1 只使能 S、源 3 只使能 M ⇒
-        //       ctx0(M) claim 得到源 3；ctx1(S) claim 得到源 1
+        // (10) M/S 两上下文独立 claim
         //----------------------------------------------------------------------
-        @(negedge aclk);
-        src = 8'h00;
-        repeat (3) @(posedge aclk);
-        // complete 清掉 inservice 残留（全部源）
-        for (i = 1; i <= 5; i = i + 1) begin
-            mmio_write(CLAIM_OFF_0, i);
-            mmio_write(CLAIM_OFF_1, i);
-        end
-        mmio_read(PEND_OFF, rd, hit);
-        `CK(rd === 32'h0, "清空后 pending 应为 0")
-        // 优先级：源 1 = 7、源 3 = 5
+        quiesce();
         mmio_write(prio_off(SRC_UART), 32'd7);
         mmio_write(prio_off(SRC_DMA),  32'd5);
-        mmio_write(prio_off(SRC_NAND), 32'd3);
-        mmio_write(prio_off(SRC_SPI),  32'd2);
-        mmio_write(prio_off(SRC_MAC),  32'd1);
-        // M 上下文：只使能源 3；S 上下文：只使能源 1
-        mmio_write(EN_OFF_M, (32'h1 << SRC_DMA));
-        mmio_write(EN_OFF_S, (32'h1 << SRC_UART));
+        mmio_write(EN_OFF_M, (32'h1 << SRC_DMA));     // M 只使能源 3
+        mmio_write(EN_OFF_S, (32'h1 << SRC_UART));    // S 只使能源 1
         mmio_write(THRESH_OFF_0, 32'd0);
         mmio_write(THRESH_OFF_1, 32'd0);
-        // 抬高源 1 与源 3
-        @(negedge aclk);
-        src[1] = 1'b1;   // 源 1 UART
-        src[4] = 1'b1;   // 源 3 DMA
-        repeat (3) @(posedge aclk);
-        #1;
+        set_src(8'h12);   // 针 1(源1)、针 4(源3)
         `CK(meip_o === 1'b1, "M 上下文使能源 3 ⇒ meip_o 应为 1")
         `CK(seip_o === 1'b1, "S 上下文使能源 1 ⇒ seip_o 应为 1")
-        // M claim ⇒ 源 3（源 1 在 M 未使能）
         mmio_read(CLAIM_OFF_0, rd, hit);
         `CK(rd === SRC_DMA, $sformatf("ctx0(M) claim 应得源 %0d，实得 %0d", SRC_DMA, rd))
-        // S claim ⇒ 源 1
         mmio_read(CLAIM_OFF_1, rd, hit);
         `CK(rd === SRC_UART, $sformatf("ctx1(S) claim 应得源 %0d，实得 %0d", SRC_UART, rd))
-        // M 的 claim 已清源 3 的 pending ⇒ M 侧 meip 应降；S 侧 seip 应仍为 1（源 1 未被 M 取走）
         #1;
         `CK(meip_o === 1'b0, "ctx0 claim 源 3 后 meip_o 应降为 0")
         `CK(seip_o === 1'b0, "ctx1 claim 源 1 后 seip_o 应降为 0")
-
-        // 两上下文 enable 相互独立：改 M 的 enable 不应影响 S 的判定
+        // 清 busy（电平已撤）
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_DMA);
+        mmio_write(CLAIM_OFF_1, SRC_UART);
+        #1;
+        // 两上下文 enable 相互独立：M 关使能、S 保持；源 1 新电平
         mmio_write(EN_OFF_M, 32'h0);
         mmio_write(EN_OFF_S, (32'h1 << SRC_UART));
-        // ★ 网关为上升沿置位（标准 PLIC）：必须先撤低再拉高，才产生新的 pending
-        @(negedge aclk);
-        src[1] = 1'b0;
-        repeat (2) @(posedge aclk);
-        @(negedge aclk);
-        src[1] = 1'b1;   // 源 1 再次置位（新的上升沿）
-        repeat (3) @(posedge aclk);
-        #1;
+        set_src(8'h02);
         `CK(meip_o === 1'b0, "M enable 清零后 meip_o 应为 0（上下文独立）")
         `CK(seip_o === 1'b1, "S enable 保持 ⇒ seip_o 应为 1（上下文独立）")
+        set_src(8'h00);
+        mmio_read(CLAIM_OFF_1, rd, hit);
+        `CK(rd === SRC_UART, "S 上下文撤电平后仍应能 claim 到源 1（请求未丢）")
+        mmio_write(CLAIM_OFF_1, SRC_UART);   // complete（电平低）⇒ 清 busy，不重投
+        #1;
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd === 32'h0, "S claim + complete 后 pending 应为 0")
 
         //----------------------------------------------------------------------
-        // (9) S 上下文 threshold 独立过滤
+        // (11) S 上下文 threshold 独立过滤（通知）；claim 不受其影响
         //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_S, (32'h1 << SRC_UART));
+        mmio_write(THRESH_OFF_0, 32'd0);
         mmio_write(THRESH_OFF_1, 32'd7);   // S 阈值 = 7 == priority(源1)
-        #1;
-        `CK(seip_o === 1'b0, "S 上下文 threshold=7 应过滤 priority=7 的源 1")
+        set_src(8'h02);
+        `CK(seip_o === 1'b0, "S 上下文 threshold=7 应过滤 priority=7 的源 1 通知")
         `CK(meip_o === 1'b0, "M 侧不受 S threshold 影响")
+        mmio_read(CLAIM_OFF_1, rd, hit);
+        `CK(rd === SRC_UART, "S threshold 不得屏蔽 claim（仍应返回源 1）")
+        mmio_write(CLAIM_OFF_1, SRC_UART);   // complete（电平高）⇒ 重投
+        #1;
+        `CK(seip_o === 1'b0, "重投后 S threshold 仍屏蔽通知（seip_o=0）")
         mmio_write(THRESH_OFF_1, 32'd6);
         #1;
         `CK(seip_o === 1'b1, "S 上下文 threshold=6 < 7 应通过")
+        set_src(8'h00);
+        mmio_read(CLAIM_OFF_1, rd, hit);
+        `CK(rd === SRC_UART, "撤电平后可 claim 到 pending 的源 1")
+        mmio_write(CLAIM_OFF_1, SRC_UART);
+        #1;
 
         //----------------------------------------------------------------------
-        // (10) pending 只读：写 pending 不应改变其值
+        // (12) priority == 0：IP 可置位但不可 claim、不通知
         //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd0);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        mmio_write(THRESH_OFF_0, 32'd0);
+        set_src(8'h02);
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "priority=0 的源 IP 仍应可被 gateway 置位")
+        `CK(meip_o === 1'b0, "priority=0 不得产生通知（meip_o=0）")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === 32'd0, "priority=0 的源不得被 claim（返回 0）")
+        // 恢复优先级 ⇒ 同一 pending 变为可 claim
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        #1;
+        `CK(meip_o === 1'b1, "恢复 priority>0 后同一 pending 应变为可通知")
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(rd === SRC_UART, "恢复 priority>0 后应可 claim 到源 1")
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+
+        //----------------------------------------------------------------------
+        // (13) pending 只读：写 pending 不应改变其值
+        //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        set_src(8'h02);
         mmio_read(PEND_OFF, rd, hit);
         begin : pend_ro_check
             reg [31:0] pend_before, pend_after;
@@ -441,16 +668,82 @@ module tb_plic;
             pend_after = rd;
             `CK(pend_after === pend_before, "写 pending 应被忽略（只读）")
         end
+        set_src(8'h00);
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
 
         //----------------------------------------------------------------------
-        // (11) 命中地址：未实现偏移不应命中
+        // (13b) 非全字 claim **读**被拒绝且无副作用（P1 边界）：
+        //       claim 读是非幂等访问；mask 0/1 时 hit 必须为 0 且 **pending 不动**；
+        //       随后全字（4'hF）claim 仍须成功——保留合法覆盖。
         //----------------------------------------------------------------------
-        mmio_read(32'h0000_0004, rd, hit);  // 源 1 的 priority 地址之外
-        // 注：0x4 = priority[1] 是合法地址 ⇒ 应命中；用真正的空洞测试：
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        mmio_write(THRESH_OFF_0, 32'd0);
+        set_src(8'h02);   // 源 1 投递
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "非法 claim 读前置：源 1 pending 应为 1")
+        // mask = 4'h0
+        mmio_read_strb(CLAIM_OFF_0, 4'h0, rd, hit);
+        `CK(hit === 1'b0, "非全字(mask0) claim 读应命中为 0（拒绝）")
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "非全字(mask0) claim 读不得清 pending（无副作用）")
+        // mask = 4'h1
+        mmio_read_strb(CLAIM_OFF_0, 4'h1, rd, hit);
+        `CK(hit === 1'b0, "非全字(mask1) claim 读应命中为 0（拒绝）")
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b1, "非全字(mask1) claim 读不得清 pending（无副作用）")
+        // 全字 claim 仍成功（合法路径不被破坏）
+        mmio_read(CLAIM_OFF_0, rd, hit);
+        `CK(hit === 1'b1 && rd === SRC_UART, "全字 claim 读仍应成功返回源 1")
+        mmio_read(PEND_OFF, rd, hit);
+        `CK(rd[SRC_UART] === 1'b0, "全字 claim 后该源 pending 应被清 0")
+        set_src(8'h00);
+        mmio_write(CLAIM_OFF_0, SRC_UART);
+        #1;
+
+        //----------------------------------------------------------------------
+        // (14) 命中地址：未实现偏移不应命中
+        //----------------------------------------------------------------------
         mmio_read(32'h0000_0030, rd, hit);
         `CK(hit === 1'b0, "越界 priority 偏移（源 12 > NUM_SOURCES）不应命中")
         mmio_read(32'h0000_3000, rd, hit);
         `CK(hit === 1'b0, "未实现偏移 0x3000 不应命中")
+
+        //----------------------------------------------------------------------
+        // (15) 空/非法字节掩码写无副作用（保留"全字命中 / 非全字拒绝"契约）
+        //----------------------------------------------------------------------
+        quiesce();
+        mmio_write(prio_off(SRC_UART), 32'd7);
+        mmio_write(EN_OFF_M, (32'h1 << SRC_UART));
+        mmio_write(THRESH_OFF_0, 32'd3);
+        #1;
+        // enable：空掩码写 0xFFFFFFFF ⇒ 读回不变
+        mmio_read(EN_OFF_M, v_before, hit);
+        mmio_write_strb(EN_OFF_M, 32'hFFFF_FFFF, 4'h0);
+        mmio_read(EN_OFF_M, v_after, hit);
+        `CK(v_after === v_before,
+            $sformatf("空字节掩码写 enable 不得有副作用（应仍为 0x%08x，实得 0x%08x）",
+                      v_before, v_after))
+        // threshold：空掩码写 0 ⇒ 读回不变
+        mmio_read(THRESH_OFF_0, v_before, hit);
+        mmio_write_strb(THRESH_OFF_0, 32'd0, 4'h0);
+        mmio_read(THRESH_OFF_0, v_after, hit);
+        `CK(v_after === v_before, "空字节掩码写 threshold 不得有副作用")
+        // priority：空掩码写 0 ⇒ 读回不变
+        mmio_read(prio_off(SRC_UART), v_before, hit);
+        mmio_write_strb(prio_off(SRC_UART), 32'd0, 4'h0);
+        mmio_read(prio_off(SRC_UART), v_after, hit);
+        `CK(v_after === v_before, "空字节掩码写 priority 不得有副作用")
+        // 非全字掩码读：resp_hit 必须为 0（既有拒绝契约），且无副作用
+        mmio_read_strb(EN_OFF_M, 4'h1, v_after, hit);
+        `CK(hit === 1'b0, "非全字（4'h1）访问 enable 不应命中（既有拒绝契约）")
+        mmio_read(EN_OFF_M, v_before, hit);
+        `CK(v_before === (32'h1 << SRC_UART), "非全字访问后 enable 应保持原值")
+        mmio_read_strb(EN_OFF_M, 4'hF, v_after, hit);
+        `CK(hit === 1'b1, "全字（4'hF）访问 enable 应命中")
 
         //----------------------------------------------------------------------
         // 汇总（fail-closed）
