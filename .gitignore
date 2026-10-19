@@ -69,6 +69,8 @@ clockInfo.txt
 tight_setup_hold_pins.txt
 sw/**/out/
 sw/**/xsim.dir/
+# 板级诊断生成的混合旧 RTL overlay；不能依赖未入库的局部 .gitignore。
+sw/m5_board/tb/scratch/
 
 # 参考回答（外部 agent 输出，仅本地参考，不追踪）
 answer.md

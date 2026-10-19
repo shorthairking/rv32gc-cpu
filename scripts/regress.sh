@@ -4,19 +4,27 @@
 #==============================================================================
 # 项目 : rv32gc-cpu（阶段二 2A 单发射顺序 5 级基线核）
 # 用法 : ./scripts/regress.sh
-# 范围 : 遍历 sim/unit/tb_*.sv（当前 19 个；清单以实际 `ls` 为准，不硬编码、不白名单）
+# 范围 : 遍历 ${RV32_SIM_UNIT_DIR}/tb_*.sv（当前 33 个；清单以实际 glob 为准，不硬编码、不白名单）
 #        —— 每个 TB 取**文件内第一个 `module` 名**作编译顶层（-s），把 rtl/**/*.v 全量编入
 #           （与综合脚本同一份源码集合，避免手工维护 per-TB 依赖表导致真源分叉），
 #           统一带 `-I rtl/pkg -I <repo>` 编译（RTL 内混用裸名与 rtl/pkg/… 两种 include 写法，
 #           统一 include 路径天然兼容，无需按 TB 排除）。
-#        产物 : sim/unit/<tb>.vvp（*.vvp 已在 .gitignore 第 40 行忽略）
-#        日志 : mktemp 目录；全绿自动清理，失败/跳过时保留并打印路径（不污染仓库）
+#        产物 : **每次运行独占一个目录**（默认 ${RV32_BUILD_DIR}/functional/runner 之下，
+#               build/ 已被 .gitignore 忽略）：
+#                 <RUN_DIR>/obj/<tb>.vvp   编译产物（**不再**写 sim/unit：并发两次不互覆、
+#                                          也不污染只读源目录）
+#                 <RUN_DIR>/logs/<tb>.*.log 编译/运行日志（**成功与失败都保留**，不随 rc0 删除）
+#               可用 RV32_REGRESS_OUT_DIR / RV32_REGRESS_LOG_DIR 显式改落点；二者都是**根**，
+#               每次运行在根下由 mktemp 新建唯一子目录 ⇒ 两个并发运行绝不互覆。
+#               若不设 RV32_REGRESS_LOG_DIR，日志放本次 run 目录的 logs/ 里。
 #
 # 判据（每个 TB，**任一不满足 ⇒ 立即非零退出**；脚本自身**绝不**输出任何含 PASS 字样的
 #       兜底文案——失败路径的诊断文字一律避开该字样）：
-#   ① iverilog 编译成功（rc==0）。仅当编译失败原因**全部**是"待落盘集成件"缺失
-#      （RV32_REGRESS_PENDING_MODULES：core_top / sim_mem_model / uart_ser_decoder，
-#        见 08 §3.2 M1 集成件）时，才允许 `SKIP:` + WARN 显式降级；其余一律判失败。
+#   ① iverilog 编译成功（rc==0）。**编译失败一律判失败，绝不降级为 SKIP**：
+#      早期版本对"待落盘集成件缺失"（Unknown module type 命中 pending 表）做 SKIP 降级，
+#      且不校验日志里是否混有其他真实错误（混合 unknown + syntax 也会被 SKIP 并 rc0），
+#      见 sim/audit/global-2026-10-18/07-test-infrastructure.md §发现1；该降级已删除。
+#      缺依赖只认显式 RV32_REGRESS_EXTRA_DEPS（见 2.3），且默认 strict 下判失败。
 #   ② vvp 运行退出码 == 0（timeout 兜底，超时=非零 ⇒ 失败；08 §8.1 第 5 条）
 #   ③ 输出中**恰好一行**整行命中该 TB 源码里提取到的 PASS 锚点（`grep -cxF`；08 §8.1 第 4 条）
 #   ④ 输出中成功标记出现次数 == 1（唯一）
@@ -32,13 +40,16 @@
 #         （此时 通过数 == 发现总数，即任务要求的 `REGRESS: N/N PASS`）。
 #   ★ 有任何跳过 ⇒ **不打印任何带 PASS 的汇总行**，改为 `REGRESS: 部分完成 p/total（…未覆盖）`
 #     + 每项一条 `SKIP:` 原因 —— 有意设计：杜绝把"部分运行"读成"全绿"（AGENT.md §0.6 教训）。
-#   ★ 跳过只是"依赖尚未落盘"的显式降级（如集成 TB 依赖 rtl/top/core_top.v）：退出码默认 0
-#     （warn 语义）；需要"跳过即失败"时置 RV32_REGRESS_STRICT_SKIP=1（退出码 3）。
-#   ★ 退出码：0 = 全绿或"有跳过但非严格模式"；1 = 任一 TB 判失败（立即退出）；3 = 严格模式有跳过。
-#
+#   ★ 跳过只可能来自 RV32_REGRESS_EXTRA_DEPS 显式声明的"依赖尚未落盘"；**默认
+#     RV32_REGRESS_STRICT_SKIP=1 ⇒ 有跳过即 rc=3（判失败）**（07 §发现2：正式入口默认必须
+#     strict，只看退出码的 CI 不得把"部分运行"读成完成）。显式 RV32_REGRESS_STRICT_SKIP=0
+#     才是 warn 语义（rc=0，日志同样保留）；该变量**只接受 0/1**，其它显式值（true/2/01/
+#     false/空串…）一律拒绝（rc=1），不静默回退放行。
+#   ★ 退出码：0 = 全绿（或显式放宽后"有跳过"）；1 = 任一 TB 判失败（立即退出）；3 = 严格模式有跳过。
 # 依据 : AGENT.md §0.6（未捕获即失败）、§3.2（回归脚本纪律）；docs/design/08-baseline-5stage.md
-#        §8.1（单元测试入口与纪律：起始 fail、兜底文案禁 PASS、显式计数、正则成对、timeout、
-#        可独立审查）、§3.2（scripts/regress.sh = 顶层回归入口）。
+#        §8.1（单元测试入口与纪律：起始 fail、兜底文案禁 PASS、显式计数、正则成对、timeout）、
+#        §3.2（scripts/regress.sh = 顶层回归入口）；
+#        sim/audit/global-2026-10-18/07-test-infrastructure.md §发现1/2/7（本次修复来源）。
 # 依赖 : scripts/env.sh（工具链/路径唯一真源，本脚本必须能 source 到它）
 #==============================================================================
 set -euo pipefail
@@ -71,8 +82,8 @@ TB_TIMEOUT="${TB_TIMEOUT:-300}"                 ;# 单个 TB 运行超时（秒�
 #     +6 687 FF）把 iverilog 的仿真吞吐从 ≈2 185 拍/s 压到 ≈890 拍/s ⇒ 该 TB 在通用
 #     300 s 墙钟下**必然**被 kill（实测为"非功能失败"：0 行 FAIL、进度/计数/结果区
 #     观测全部符合预期，只是没跑完）。
-#     故**按 TB 名**只给这一个 TB 单独的墙钟兜底；其余 22 个 TB 仍守 `TB_TIMEOUT`
-#     （300 s）——保持"多数 TB 挂死能快速暴露"的纪律。
+#     故**按 TB 名**只给这一个 TB 单独的墙钟兜底；其余 TB 仍守 `TB_TIMEOUT`（300 s）
+#     ——保持"多数 TB 挂死能快速暴露"的纪律。
 #     两个值都可用环境变量覆盖（TB_TIMEOUT / TB_TIMEOUT_TB_M3_DDR3）。
 TB_TIMEOUT_TB_M3_DDR3="${TB_TIMEOUT_TB_M3_DDR3:-1800}"
 #   ★ T6（2026-09-21，2B-2）：`tb_back2_lockstep` 是"双核（2A 顺序核 + front4/back2 乱序核）
@@ -92,46 +103,98 @@ tb_timeout_for() {
         *)                  printf '%s' "$TB_TIMEOUT" ;;
     esac
 }
-STRICT_SKIP="${RV32_REGRESS_STRICT_SKIP:-0}"    ;# 1 = 有跳过即判失败
-# 显式依赖表（仅用于"依赖尚未落盘 ⇒ 跳过并 WARN"的显式降级），形如：
-#     RV32_REGRESS_EXTRA_DEPS="tb_core_top:rtl/top/core_top.v tb_x:tests/x.svh"
-# 说明：当前 sim/unit 下全部 TB 均自包含（TB 清单以实际 glob 为准，脚本不硬编码数量：
-#       20:53 时为 19 个，20:57 起随并行交付的 tb_fpu.sv 自动变为 20 个）
-#       ⇒ 本表默认空 ⇒ **默认全跑、零跳过**。它存在只是为了将来集成 TB（如 tb_core_top）
-#       落进 sim/unit 时，能在脚本里"显式跳过并 warn"而不是悄悄红。
+#   ★ 07 §发现2：正式入口默认 strict（有跳过即判失败）。显式置 0 才回到 warn 语义。
+#   ★ 只接受字面 "0" / "1"：true/2/01/false/空串等**显式非法值一律拒绝（rc=1）**，
+#     绝不静默回退到 rc0 放行；变量**完全未设置**时才取默认 1。
+if [ -z "${RV32_REGRESS_STRICT_SKIP+x}" ]; then
+    STRICT_SKIP=1
+else
+    case "${RV32_REGRESS_STRICT_SKIP}" in
+        0|1) STRICT_SKIP="${RV32_REGRESS_STRICT_SKIP}" ;;
+        *)   die "RV32_REGRESS_STRICT_SKIP 只接受 0 或 1（显式非法值 '${RV32_REGRESS_STRICT_SKIP}' 一律拒绝，绝不回退放行）" ;;
+    esac
+fi
+# 显式依赖表（唯一允许"跳过"的来源；形如：
+#     RV32_REGRESS_EXTRA_DEPS="tb_core_top:rtl/top/core_top.v tb_x:tests/x.svh"）
+# 默认空 ⇒ 默认全跑、零跳过。命中且文件缺失 ⇒ 该 TB 记 SKIP；默认 strict 下即判失败（rc3）。
+# 注：编译期缺模块**不再**做任何 SKIP 降级（07 §发现1），缺件即编译失败即判失败。
 TB_EXTRA_DEPS="${RV32_REGRESS_EXTRA_DEPS:-}"
-# 允许"显式跳过"的待落盘集成件（编译期 Unknown module type 命中这些名字才降级为 SKIP）
-PENDING_MODULES="${RV32_REGRESS_PENDING_MODULES:-core_top sim_mem_model uart_ser_decoder}"
+# 历史变量 RV32_REGRESS_PENDING_MODULES 的降级逻辑已删除（死配置）；如仍被显式设置，
+# 只提示一次"已忽略"，绝不据此放行（避免老调用方误以为仍有降级）。
+RV32_REGRESS_PENDING_MODULES="${RV32_REGRESS_PENDING_MODULES:-}"
 
 #------------------------------------------------------------------------------
 # 1. 收集 TB 清单与 RTL 源集合（任一为空 ⇒ 立即失败，不"跑 0 个然后 PASS"）
+#    —— 在分配运行目录**之前**完成：空集失败不产生任何生成物。
 #------------------------------------------------------------------------------
 shopt -s nullglob
 tbs=( "${SIM_UNIT_DIR}"/tb_*.sv )
 shopt -u nullglob
-[ "${#tbs[@]}" -gt 0 ] || die "sim/unit 下没有 tb_*.sv（目录：${SIM_UNIT_DIR}）"
+[ "${#tbs[@]}" -gt 0 ] || die "sim/unit 下没有 tb_*.sv（目录：${SIM_UNIT_DIR}）；空清单不是成功"
 
 mapfile -t rtl_srcs < <(rv32_rtl_sources)
 [ "${#rtl_srcs[@]}" -gt 0 ] || die "rtl/**/*.v 为空（目录：${RV32_RTL_DIR}）；无 DUT 可编"
 
-LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rv32-regress.XXXXXX")"
+#------------------------------------------------------------------------------
+# 1b. 本次运行的独占目录（产物与日志）
+#     · RUN_DIR  : 永远新建；vvp 与（默认）日志都在其内 ⇒ 两次并发运行互不覆盖
+#     · LOG_DIR  : 默认 <RUN_DIR>/logs；显式 RV32_REGRESS_LOG_DIR 时为其下同名唯一子目录
+#     所有删除类操作都不存在：日志与产物**成功/失败都保留**（07 §发现2）。
+#------------------------------------------------------------------------------
+abs_dir_or_die() {   # $1=路径 $2=用途说明 —— 只接受绝对路径（防拼错相对路径误删/误写）
+    case "${1:-}" in
+        /*) : ;;
+        *)  die "$2 必须是绝对路径（当前值：${1:-<空>}）" ;;
+    esac
+}
+
+RUN_ROOT="${RV32_REGRESS_OUT_DIR:-${RV32_BUILD_DIR}/functional/runner}"
+abs_dir_or_die "$RUN_ROOT" "RV32_REGRESS_OUT_DIR"
+mkdir -p -- "$RUN_ROOT" || die "无法创建运行产物根：${RUN_ROOT}"
+RUN_DIR="$(mktemp -d "${RUN_ROOT}/regress-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" \
+    || die "无法在 ${RUN_ROOT} 下分配唯一 run 目录"
+case "$RUN_DIR" in
+    "${RUN_ROOT%/}"/*) : ;;
+    *) die "mktemp 返回的运行目录不在产物根下：${RUN_DIR}（产物根 ${RUN_ROOT}）" ;;
+esac
+OBJ_DIR="${RUN_DIR}/obj"
+mkdir -p -- "$OBJ_DIR" || die "无法创建编译产物目录：${OBJ_DIR}"
+
+if [ -n "${RV32_REGRESS_LOG_DIR:-}" ]; then
+    LOG_ROOT="${RV32_REGRESS_LOG_DIR}"
+    abs_dir_or_die "$LOG_ROOT" "RV32_REGRESS_LOG_DIR"
+    mkdir -p -- "$LOG_ROOT" || die "无法创建日志根：${LOG_ROOT}"
+    LOG_DIR="${LOG_ROOT%/}/$(basename -- "$RUN_DIR")"
+    mkdir -- "$LOG_DIR" || die "无法创建唯一日志目录（可能已存在）：${LOG_DIR}"
+    case "$LOG_DIR" in
+        "${LOG_ROOT%/}"/*) : ;;
+        *) die "日志目录不在日志根下：${LOG_DIR}（日志根 ${LOG_ROOT}）" ;;
+    esac
+else
+    LOG_DIR="${RUN_DIR}/logs"
+    mkdir -p -- "$LOG_DIR" || die "无法创建日志目录：${LOG_DIR}"
+fi
+
+# 成功/失败都保留并打印目录（成功的证据同样是证据，不随 rc0 删除）。
 finalize() {
     local rc=$?
-    if [ "$rc" -eq 0 ]; then
-        rm -rf "$LOG_DIR"
-    else
-        printf 'REGRESS: 日志保留在 %s（失败诊断用）\n' "$LOG_DIR" >&2
-    fi
+    printf 'REGRESS: 本次运行目录=%s（日志目录=%s；成功/失败均保留）\n' \
+           "$RUN_DIR" "$LOG_DIR" >&2
     return 0
 }
 trap finalize EXIT
+
+if [ -n "$RV32_REGRESS_PENDING_MODULES" ]; then
+    printf 'WARN: RV32_REGRESS_PENDING_MODULES 已失效（pending 降级已删除，07 §发现1）；' >&2
+    printf '编译缺失模块一律判失败，本变量被忽略。\n' >&2
+fi
 
 printf '== regress.sh：REPO_ROOT=%s\n' "$REPO_ROOT"
 printf '== regress.sh：TB 目录=%s（发现 %d 个 tb_*.sv）\n' "$SIM_UNIT_DIR" "${#tbs[@]}"
 printf '== regress.sh：RTL 源=%d 个 rtl/**/*.v；iverilog=%s\n' "${#rtl_srcs[@]}" "$IV"
 printf '== regress.sh：iverilog 版本=%s\n' "$( { "$IV" -V 2>&1 || true; } | sed -n '1p' )"
-printf '== regress.sh：单 TB 超时=%ss（★ T5：tb_m3_ddr3 用放宽档 %ss，其余守默认）；日志目录=%s\n' \
-       "$TB_TIMEOUT" "$TB_TIMEOUT_TB_M3_DDR3" "$LOG_DIR"
+printf '== regress.sh：单 TB 超时=%ss（★ T5：tb_m3_ddr3 用放宽档 %ss，其余守默认）；strict_skip=%s\n' \
+       "$TB_TIMEOUT" "$TB_TIMEOUT_TB_M3_DDR3" "$STRICT_SKIP"
 
 #------------------------------------------------------------------------------
 # 2. 逐 TB：取顶层/锚点 → 编译 → 运行 → 判据
@@ -187,7 +250,7 @@ for tb in "${tbs[@]}"; do
     stem_upper="$(printf '%s' "$stem" | tr 'a-z' 'A-Z')"
     clog="${LOG_DIR}/${stem}.compile.log"
     rlog="${LOG_DIR}/${stem}.run.log"
-    vvp_out="${SIM_UNIT_DIR}/${stem}.vvp"
+    vvp_out="${OBJ_DIR}/${stem}.vvp"     ;# ★ 只写本次 run 目录，绝不写 sim/unit
 
     # ---- 2.1 顶层模块名 ----
     top="$(tb_top_module "$tb")"
@@ -207,7 +270,7 @@ for tb in "${tbs[@]}"; do
     anchor_key="${anchor%: PASS}"        ;# 诊断只打锚点主体，失败路径不出现成功标记字样
     anchor_line="${anchor_key}: PASS"    ;# TB 成功路径的**整行**原文（判据③ 用整行精确匹配）
 
-    # ---- 2.3 显式依赖（尚未落盘 ⇒ SKIP + WARN）----
+    # ---- 2.3 显式依赖（尚未落盘 ⇒ SKIP + WARN；唯一允许跳过的来源）----
     miss_dep="$(tb_missing_declared_dep "$stem")"
     if [ -n "$miss_dep" ]; then
         n_skip=$((n_skip + 1))
@@ -218,30 +281,20 @@ for tb in "${tbs[@]}"; do
     fi
 
     # ---- 2.4 编译（-s 顶层；RTL 全量编入；统一 include 路径）----
+    #   ★ 编译失败**一律判失败**，无任何 SKIP 降级（07 §发现1：混合 unknown+syntax 曾被
+    #     pending 表吞成 SKIP 且 rc0）。诊断只打印失败日志，不输出任何成功字样。
     if ! "$IV" "${RV32_IV_FLAGS[@]}" -o "$vvp_out" -s "$top" "${rtl_srcs[@]}" "$tb" >"$clog" 2>&1; then
-        # 编译失败：仅当缺失模块**全部**属"待落盘集成件"时降级为 SKIP，否则判失败
-        missing_mods="$( { grep -oE 'Unknown module type: [A-Za-z_$][A-Za-z0-9_$]*' "$clog" || true; } \
-                         | sed 's/.*: //' | LC_ALL=C sort -u || true)"
-        all_pending=1
-        if [ -z "$missing_mods" ]; then
-            all_pending=0
-        else
-            while IFS= read -r m; do
-                [ -n "$m" ] || continue
-                case " ${PENDING_MODULES} " in
-                    *" ${m} "*) : ;;
-                    *) all_pending=0 ;;
-                esac
-            done <<< "$missing_mods"
-        fi
-        if [ "$all_pending" -eq 1 ]; then
-            n_skip=$((n_skip + 1))
-            skipped_notes+=( "${stem}（待落盘集成件缺失：$(printf '%s' "$missing_mods" | tr '\n' ' ')）" )
-            printf '[%2d/%2d] %-22s SKIP  —— 待落盘集成件缺失：%s（WARN）\n' \
-                   "$n_total" "${#tbs[@]}" "$stem" "$(printf '%s' "$missing_mods" | tr '\n' ' ')"
-            continue
-        fi
         printf -- '--- FAIL: %s（iverilog 编译失败，顶层 %s）---\n' "$stem" "$top"
+        printf '    编译日志尾部（已滤除成功标记字样的行）：\n'
+        { grep -v 'PASS' "$clog" || true; } | tail -n 20 | sed 's/^/      /'
+        printf '    完整日志：%s\n' "$clog"
+        printf 'REGRESS: FAIL at %s\n' "$stem"
+        exit 1
+    fi
+
+    # 编译"成功"但没产出可执行 vvp ⇒ 视为失败（防假编译器/半成品产物被放行）。
+    if [ ! -s "$vvp_out" ]; then
+        printf 'FAIL: %s —— iverilog rc=0 但未产出非空 vvp（%s）\n' "$stem" "$vvp_out"
         printf '    编译日志尾部（已滤除成功标记字样的行）：\n'
         { grep -v 'PASS' "$clog" || true; } | tail -n 20 | sed 's/^/      /'
         printf 'REGRESS: FAIL at %s\n' "$stem"

@@ -1,0 +1,38 @@
+# sim/functional/manifest.tsv —— 正确行为功能回归总入口的**固定非空**包清单
+#
+# 格式（TAB 分隔，三列）：
+#   ① 包脚本：相对 RV32_FUNCTIONAL_DIR 的路径，必须是普通文件；未落盘 ≡ 缺例 ⇒ 入口判失败（绝不 SKIP）
+#   ② 唯一整行锚点：该包**成功**时必须在其 stdout/stderr 中恰好出现一次的整行原文；
+#      约定 = "FUNCTIONAL_" + 脚本基名（去掉 .sh；若以 test_ 开头则去掉该前缀）+ ": PASS"（大写、非字母数字→_）
+#   ③ 说明：本包覆盖的正确行为范围（供人工审阅，入口不据此判定）
+#
+# 判据（sim/functional/run.sh，fail-closed）：
+#   · 清单为空 / 行格式非法 / 锚点与约定不符 / 脚本重名或锚点重复 ⇒ 入口失败
+#   · 脚本路径只接受 FUNC_DIR 下相对路径且不含 `..`；再经 realpath 包含校验，
+#     文件软链接/父目录软链接逃逸或断链 ⇒ 失败（合法目录内脚本正常）
+#   · 每包：脚本缺失（缺例）⇒ 失败；rc != 0 ⇒ 失败（PASS 之后非零同样失败；124=超时）；
+#          锚点整行命中 != 1 次（缺失或重复）⇒ 失败；输出含 FAIL 字样 ⇒ 失败；
+#          输出含 DEFECT_REPRODUCED（旧错误已复现）⇒ **失败**（复现旧缺陷不是修复通过）
+#   · 只有"清单内每包都成功"才打印聚合 PASS 行；失败时聚合行不含 PASS 字样
+#
+# 入口类型（防子集冒充完整阶段）：
+#   · 未覆盖 RV32_FUNCTIONAL_DIR / RV32_FUNCTIONAL_MANIFEST ⇒ DEFAULT，成功汇总 `FUNCTIONAL: N/N 包 PASS`
+#   · 任一被自定义/指向别处 ⇒ CUSTOM，成功汇总 `FUNCTIONAL_CUSTOM: N/N 包 PASS`，
+#     并明确标注"不代表完整阶段通过"；**绝不**输出 `FUNCTIONAL: N/N 包 PASS`
+#
+# 纪律：
+#   · 每包必须自己断言**正确期望值**（修复后的真实行为），不得把旧审计的 DEFECT_REPRODUCED
+#     复现当通过（入口已显式拒绝该标记）；不得放宽/删除断言换取成功。
+#   · 禁止创建"永远 PASS 占位"包；未实现就让它缺例失败，由母 Agent 后续分派补齐。
+#   · 本清单只报告**包数**，不把包内的向量/断言数包装成入口级计数。
+#   · 脚本自身产物写 ${RV32_FUNCTIONAL_PKG_OUT_DIR}（run.sh 提供，位于本次 run 目录下）。
+# 列序：script<TAB>anchor<TAB>description（以 # 开头的行是注释，不参与解析）
+test_decode.sh	FUNCTIONAL_DECODE: PASS	RV32I/C 译码与立即数正确行为（含权限/非法编码的期望 trap）
+test_backend_semantics.sh	FUNCTIONAL_BACKEND_SEMANTICS: PASS	后端乱序执行语义：重命名/唤醒/提交/回滚正确性
+test_privilege.sh	FUNCTIONAL_PRIVILEGE: PASS	特权级/CSR 权限与锁/中断委托/CLINT-PLIC 正确行为
+test_rename.sh	FUNCTIONAL_RENAME: PASS	重命名回滚 mask/快照/ROB 环绕年龄正确性
+test_lsq.sh	FUNCTIONAL_LSQ: PASS	LSQ 转发/落地/释放/跨页与拆笔身份正确性
+test_memory.sh	FUNCTIONAL_MEMORY: PASS	MMU/Cache/总线：D 位、SFENCE、高 PA、CMO 权限、写回与错误回填
+test_devices.sh	FUNCTIONAL_DEVICES: PASS	设备/外设副作用与寄存器读写正确性
+test_top_control.sh	FUNCTIONAL_TOP_CONTROL: PASS	核顶控制：流水控制/重定向/EPC/端口契约正确性
+test_frontend_faults.sh	FUNCTIONAL_FRONTEND_FAULTS: PASS	前端取指 fault/跨页 parcel/预测器异常路径正确性

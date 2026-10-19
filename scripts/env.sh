@@ -51,25 +51,48 @@ export RV32_GCC RV32_OBJCOPY RV32_OBJDUMP RV32_READELF RV32_SPIKE
 
 #------------------------------------------------------------------------------
 # 2. 仿真器（iverilog / vvp / Verilator；AGENT.md §2：已安装可用）
+#    可用环境变量**显式覆盖**（隔离夹具/多工具链/反证用假工具）；未设置时按 PATH 解析。
+#    覆盖只改变取值来源，不改变"唯一真源"语义：调用方仍只从本文件读工具路径。
 #------------------------------------------------------------------------------
-RV32_IVERILOG="$(command -v iverilog || true)"
-RV32_VVP="$(command -v vvp || true)"
-RV32_VERILATOR="$(command -v verilator || true)"
+RV32_IVERILOG="${RV32_IVERILOG:-$(command -v iverilog || true)}"
+RV32_VVP="${RV32_VVP:-$(command -v vvp || true)}"
+RV32_VERILATOR="${RV32_VERILATOR:-$(command -v verilator || true)}"
 export RV32_IVERILOG RV32_VVP RV32_VERILATOR
 
 #------------------------------------------------------------------------------
-# 3. 路径常量（RTL / 仿真 / FPGA 输出；供各脚本复用，避免各自拼路径）
+# 3. 路径常量（RTL / 仿真 / FPGA / 生成物输出；供各脚本复用，避免各自拼路径）
+#    各路径都可用环境变量**显式覆盖**（未设置时按仓库位置推导）：
+#      · 覆盖 RTL/仿真目录用于隔离夹具，避免触碰真实 RTL/源目录；
+#      · 覆盖 RV32_BUILD_DIR / RV32_REGRESS_OUT_DIR 等只改生成物落点。
+#    本文件仍只"设变量/函数"，无副作用；overwrite 语义向后兼容（默认值不变）。
 #------------------------------------------------------------------------------
-RV32_RTL_DIR="${RV32_ROOT}/rtl"
-RV32_PKG_DIR="${RV32_RTL_DIR}/pkg"          # 唯一真源 *.vh（rv32_defs.vh / core_params.vh）
-RV32_SIM_DIR="${RV32_ROOT}/sim"
-RV32_SIM_UNIT_DIR="${RV32_SIM_DIR}/unit"    # L0 单元 TB（tb_*.sv）
-RV32_FPGA_DIR="${RV32_ROOT}/fpga"
-RV32_FPGA_TCL_DIR="${RV32_FPGA_DIR}/tcl"
-RV32_FPGA_IP_DIR="${RV32_FPGA_DIR}/ip"      # create_ip.tcl 产物（*/*.xci）
-RV32_OUT_DIR="${RV32_FPGA_DIR}/out"         # 综合/实现报告与检查点（.gitignore 已忽略）
-export RV32_RTL_DIR RV32_PKG_DIR RV32_SIM_DIR RV32_SIM_UNIT_DIR
+RV32_RTL_DIR="${RV32_RTL_DIR:-${RV32_ROOT}/rtl}"
+RV32_PKG_DIR="${RV32_PKG_DIR:-${RV32_RTL_DIR}/pkg}"   # 唯一真源 *.vh（rv32_defs.vh / core_params.vh）
+RV32_SIM_DIR="${RV32_SIM_DIR:-${RV32_ROOT}/sim}"
+RV32_SIM_UNIT_DIR="${RV32_SIM_UNIT_DIR:-${RV32_SIM_DIR}/unit}"    # L0 单元 TB（tb_*.sv）
+RV32_FUNCTIONAL_DIR="${RV32_FUNCTIONAL_DIR:-${RV32_SIM_DIR}/functional}"  # 功能回归总入口包目录
+RV32_FPGA_DIR="${RV32_FPGA_DIR:-${RV32_ROOT}/fpga}"
+RV32_FPGA_TCL_DIR="${RV32_FPGA_TCL_DIR:-${RV32_FPGA_DIR}/tcl}"
+RV32_FPGA_IP_DIR="${RV32_FPGA_IP_DIR:-${RV32_FPGA_DIR}/ip}"       # create_ip.tcl 产物（*/*.xci）
+RV32_OUT_DIR="${RV32_OUT_DIR:-${RV32_FPGA_DIR}/out}"              # 综合/实现报告与检查点（.gitignore 已忽略）
+export RV32_RTL_DIR RV32_PKG_DIR RV32_SIM_DIR RV32_SIM_UNIT_DIR RV32_FUNCTIONAL_DIR
 export RV32_FPGA_DIR RV32_FPGA_TCL_DIR RV32_FPGA_IP_DIR RV32_OUT_DIR
+
+#------------------------------------------------------------------------------
+# 3b. 生成物/运行目录（全部落在已忽略的 build/ 下；**每个入口每次运行独占子目录**）
+#     · RV32_BUILD_DIR        : 生成物总根（.gitignore 忽略 build/）
+#     · RV32_REGRESS_OUT_DIR  : regress 产物**根**；每次运行为其下新建唯一 run-<UTC>-XXXXXX/
+#     · RV32_REGRESS_LOG_DIR  : regress 日志**根**（可不设；空 = 日志放本次 run 目录内）
+#     · RV32_FUNCTIONAL_OUT_DIR: 功能总入口产物根；每次运行为其下新建唯一 functional-<UTC>-XXXXXX/
+#     显式设置上述"根"不会让两次并发运行互覆：唯一子目录由各入口自己 mktemp 分配。
+#------------------------------------------------------------------------------
+RV32_BUILD_DIR="${RV32_BUILD_DIR:-${RV32_ROOT}/build}"
+RV32_REGRESS_OUT_DIR="${RV32_REGRESS_OUT_DIR:-${RV32_BUILD_DIR}/functional/runner}"
+RV32_REGRESS_LOG_DIR="${RV32_REGRESS_LOG_DIR:-}"
+RV32_FUNCTIONAL_OUT_DIR="${RV32_FUNCTIONAL_OUT_DIR:-${RV32_BUILD_DIR}/functional/runner}"
+RV32_FUNCTIONAL_MANIFEST="${RV32_FUNCTIONAL_MANIFEST:-${RV32_FUNCTIONAL_DIR}/manifest.tsv}"
+export RV32_BUILD_DIR RV32_REGRESS_OUT_DIR RV32_REGRESS_LOG_DIR
+export RV32_FUNCTIONAL_OUT_DIR RV32_FUNCTIONAL_MANIFEST
 
 # 平台器件（AGENT.md §2 / docs/kb/platform-facts.md；综合与实现均用同一 part）
 VIVADO_PART="${VIVADO_PART:-xc7a200tfbg676-2}"
