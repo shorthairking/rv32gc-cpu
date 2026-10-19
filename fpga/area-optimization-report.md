@@ -3,7 +3,12 @@
 > 本文件是**唯一**的"总结性报告"落点（用户约定：每次更新都在此文件修改，不新建 md）。
 > 固定四部分：① 项目当前状况 → ② 主要问题与成因 → ③ 解决方案与优化路径 → ④ 补充信息。
 > 数据均为实测原始值，随综合 tag/commit 可复现，禁止编造或夸大/缩小。
-> 更新日期：2026-10-14
+> 更新日期：2026-10-18
+>
+> **时点声明（先读）**：本文面积/时序数据截止综合基线 **`d00eb03`（2026-10-15，126,699 LUT）**；
+> RTL 最新提交 **`7e2e730`**（D2/D6/D8 功能修复；D1 非对齐 store 修复在 `bd622ee`）**尚未重综合** ⇒
+> 不得把 126,699/WNS≈−52ns 当作 `7e2e730` 的实测。N34B-2（删除 LOCAL）**仅送审 patch、未采纳**，
+> 当前 RTL 仍保留 Gshare+局部+选择器三分量；本文旧句若暗示"已删除 LOCAL"以本声明为准。
 
 ---
 
@@ -11,7 +16,7 @@
 
 ### 1.1 一句话定位
 
-一个面向 **chiplab / xc7a200t** 的 **RV32GC 4-发射乱序（OoO）处理器**（项目内代号 2B），当前处于**后端面积优化**阶段：已从 366,483 LUT（272.28%）压到 **126,699 LUT（94.13%，累计 −65.43%，已低于器件容量）**，目标 ≤80%（107,680 LUT 仍差 −19,019）。
+一个面向 **chiplab / xc7a200t** 的 **RV32GC 4-发射乱序（OoO）处理器**（项目内代号 2B），当前处于**后端面积优化收尾/审计修复**阶段：已从 366,483 LUT（272.28%）压到 **126,699 LUT（94.13%，累计 −65.43%，已低于器件容量；综合基线 `d00eb03`）**，目标 ≤80%（107,680 LUT 仍差 −19,019）。
 
 ### 1.2 架构（微架构框架）
 
@@ -30,7 +35,7 @@ back2 后端（乱序执行）
 2 宽提交（2-wide commit，4-issue ≠ 4-commit）→ 分支训练（trq，单写口 FIFO）
 ```
 
-- 关键结构参数（当前 HEAD `d00eb03`）：整数物理寄存器 **NREG_I=64**（PDW_I=6bit）、浮点 64（6bit）、ROB 64（**窄表 nq 36→16 bit（N35B）**，typed 四表 + ev_mem 已 LUTRAM）、SQ 32、LQ 8、IQ 总容量 50（np_q 2W bank）、checkpoint 16、**commit 2-wide（分配 4-wide）**、free-list FL_DEPTH=64、FMA 共享 53-bit 核（fma_s/d 保留金标）、div/sqrt 收尾舍入并入 u_fma（N33B）、PRF 读口 11/5、**store→load 转发已移除（N29B）**、前端 LHT/ev_mem/rob typed 四表 LUTRAM（N34B-1/3）。
+- 关键结构参数（综合基线 `d00eb03`；RTL 已到 `7e2e730`，仅功能修复、未重综合）：整数物理寄存器 **NREG_I=64**（PDW_I=6bit）、浮点 64（6bit）、ROB 64（**窄表 nq 36→16 bit（N35B）**，typed 四表 + ev_mem 已 LUTRAM）、SQ 32、LQ 8、IQ 总容量 50（np_q 2W bank）、checkpoint 16、**commit 2-wide（分配 4-wide）**、free-list FL_DEPTH=64、FMA 共享 53-bit 核（fma_s/d 保留金标）、div/sqrt 收尾舍入并入 u_fma（N33B）、PRF 读口 11/5、**store→load 转发已移除（N29B）**、前端 LHT/ev_mem/rob typed 四表 LUTRAM（N34B-1/3）。
 - 流水线：前端 4 宽取指 → rename（4 宽分配）→ IQ 唤醒/选择（4-wide issue）→ 发射 → 执行 → 写回（4 写口）→ **2 宽提交**。
 
 ### 1.3 使用技术
@@ -43,7 +48,7 @@ back2 后端（乱序执行）
 | 平台 | chiplab 龙芯实验箱，xc7a200tfbg676-2，DDR3 AXI + XIP + confreg |
 | IP | mult/div（Vivado IP，仿真行为模型双分支）；BRAM 用 XPM/rob_wide_mem 行为模型 |
 
-### 1.4 资源占用率（当前，`synth_2b_n35b_16.667ns_utilization.rpt`）
+### 1.4 资源占用率（综合记录 `d00eb03`；**不是 `7e2e730` 重测**，`synth_2b_n35b_16.667ns_utilization.rpt`）
 
 | 资源 | 占用 | 器件 | 百分比 |
 |---|---:|---:|---:|
@@ -53,7 +58,7 @@ back2 后端（乱序执行）
 | RAMB18 | 6 | 730 | 0.82% |
 | DSP48E1 | 21 | 740 | 2.84% |
 
-**资源特征**：Gate E 的 LUTRAM 化潮把 **FF 68,170→49,597（−27%）**、全核 **首次降破器件容量（94.13%）**（从 272% 一路压下来）；RAMB18 10→6（N34B-2 裁 LPHT+选择器 4 副本，patch 留档送审可复原）。推 AreaOptimized_medium 比例估算 ~90%（须在当前树复测 + WNS 复核）。
+**资源特征**：Gate E 的 LUTRAM 化潮把 **FF 68,170→49,597（−27%）**、全核 **首次降破器件容量（94.13%）**（从 272% 一路压下来）；RAMB18 10→6 是存表实现变化的综合结果（以 `synth_2b_n35b` 报告为准）。**N34B-2 的 LOCAL 删除只是送审 patch、未采纳**：当前 RTL 仍保留 `bpu_local_hist`（LHT 为 LUTRAM，LPHT/选择器存表仍在），不得写成已删除。推 AreaOptimized_medium 比例估算 ~90%（须在当前树复测 + WNS 复核）。
 
 ---
 
@@ -96,7 +101,7 @@ back2 后端（乱序执行）
   - **仍封存**：PRF 单口继续收窄（≈312 LUT/口 × 只剩 4 口，单轮 ≥1.5k 不可达）、iwm 交叉开关（940+605 raw、综合=理论下界）、ROB 减深（64→48 fail-closed：5 档实测顶满 64）、SQ banking 与 eqv-mux 重写类。
 - **教训（写死到流程）**：**"局部锥融不通 ≠ 结构不可动"——是"保持功能的前提下可删除的完整对象"决定收益； 对每个候选必须先问"删掉的物全是为什么存在"，而不是"能不能再分一棵树"**（N29A 的输出侧可删性判据 + N30 表为标准流程）。
 
-**结论（有数据支撑）**：366,483→126,699（−65.43%）来自六类真实结构改动：删完整单元/主通路径（C1/N8/N27B/N33B）、级联减宽（NREG/N1/N3/N4/flist_q/N35B-nq）、互斥路径合并（N15）、**删除整段功能并以时序语义兜底（N29B 转发移除）**、**实现修复（N34B-1/3 把要 LUTRAM 的表脱异步复位 dword）**。剩余 −19,019 缺口待 §③ 三个方向：候选 1（综合配方）、候选 2（K1，on old-tree base）、N34B-2（LOCAL，patch 复原 ≤−915+送审需求冲突），以及"再造一个 N27B/N29B 级的完整功能/重复块"（须重新扫描）。
+**结论（有数据支撑）**：366,483→126,699（−65.43%）来自六类真实结构改动：删完整单元/主通路径（C1/N8/N27B/N33B）、级联减宽（NREG/N1/N3/N4/flist_q/N35B-nq）、互斥路径合并（N15）、**删除整段功能并以时序语义兜底（N29B 转发移除）**、**实现修复（N34B-1/3 把要 LUTRAM 的表脱异步复位 dword）**。剩余 −19,019 缺口待 §③ 三个方向：候选 1（综合配方）、候选 2（K1，on old-tree base）、**候选 3（N34B-2 LOCAL 删除，仅送审 patch、未采纳；当前 RTL 仍保留 LOCAL）**，以及"再造一个 N27B/N29B 级的完整功能/重复块"（须重新扫描）。
 
 ---
 
@@ -150,7 +155,7 @@ back2 后端（乱序执行）
 **架构级取舍候选（进用户评审，不擅自采纳；Gate C/D 实测基于旧基线，搬移到当前树需复测）**：
 - **候选 1｜综合配方切换**：`AreaOptimized_medium` 全核 **−13,959 LUT**（Gate C 时 143,992 基线 → 96.61%；按比例推当前树 ~90.8%），代价 WNS −5.936ns。属项目级配方决策。
 - **候选 2｜K1 读口折叠**（NRD_I 11→7）：**−1,249 LUT**、IPC=2.0、C5 最大降幅 0.151%，代价 = 压力让位 y5 2.81%/3.51% 超界（patch `n21b_k1_rtl.patch` 一键复现）。
-- **候选 3｜N34B-2 LOCAL 删除**（patch 复原）：**−915 LUT** + **BRAM Tile −2** + IPC/C5 无退化（R1/R2/R3 全绿、纯 gshare 预测级 60,001 条记录逐字节一致），需同时裁决需求冲突（AGENT.md §1 与 04-predictor.md 规格含 LOCAL）。合成轨迹精度代价 B3 档 +11.93pp（仍 ≥80%）。
+- **候选 3｜N34B-2 LOCAL 删除**（**仅送审 patch，当前未采纳**；patch 复原口径）：**−915 LUT** + **BRAM Tile −2** + IPC/C5 无退化（R1/R2/R3 全绿、纯 gshare 预测级 60,001 条记录逐字节一致），需同时裁决需求冲突（[`AGENT.md`](../AGENT.md) 原硬性指标/`04-predictor.md` 规格含 LOCAL）。合成轨迹精度代价 B3 档 +11.93pp（仍 ≥80%）。**当前 RTL 仍例化 `bpu_local_hist`，不得写成已删除。**
 - 以上任一采纳 = 性能/配方/功能指标变更，按 2026-10-04/2026-10-15 裁决口径需先经用户审阅。
 
 **下一批候选（Gate E 尾部数据派生）**：
@@ -173,4 +178,4 @@ back2 后端（乱序执行）
    - BTB SDPRAM 写模式漏传（`8439e55`，N25）：补显式 `WRITE_MODE_B=read_first`，综合语义与行为模型对齐（8-5775 全核 17→0、网表碰撞拍读回 X→旧值）；同址冲突承重件 = `dang_hit` 地址守护（实测 963 次同址同拍全靠它正确），**未来任何 ROB/读路径重构不得移除 dang_hit，且必须重跑 N25 探针**。
 2. **验证纪律**：`tb_core_top_2b` 219/219 + `tb_back2_iq` 151/151 + `tb_back2_lockstep` 57/57（提交 821）+ `regress.sh` 33/33；IPC=2.0 + C5 五档；逐拍等价；重综合 tag 命名；动态冲突统计（N21B pairwise 矩阵 48,603 拍 8 档、iss 列逐行一致率 100.000%）；归因探针全部 fail-closed + 反证注入；**Gate D 新增三重位级等价闸**（模块向量对拍 80k/12k + **顶层同树逐拍差分 4×100k 指令**（不过"空闲拍 result 是 don't-care"须只在 done 拍比）+ **64 KiB 存储映像 vs Spike 逐字相等**）；**每个采纳实验都必须用同树基线复跑钉死非随机**（N29B 同会话复现 142,163 逐位相同）；**只认全核官方 Slice LUT，桶级归因因 rebuilt 重划分不可信**（N29B 实测 fpu_div_sqrt −4,167 伪归因）。
 3. **面积演进全史**（commit 级）：366,483 → L1 −74,086 → ROB64 −36,052 → LQ16 −2,597 → flist_q −14,330 → C2 −8,420 → EXP-B −6,807 → C1 −14,340 → C6 −8,879 → D1 −1,434 → C7 −546 → C4+C9 −488 → C8 −425 → D2 −874 → EXP-R1 −3,536 → EXP-R3b −2,479 → LQ16→8 −1,002 → NREG −10,239 → **N1 −16,022 → flist_q(128→64) −2,093 → N4 −3,171 → N3 −2,677 → LSQ age 8→6 −1,875 → N8 FPU 并入 FMA −5,679 → N10 np_q 2W bank −960 → 非对齐/跨字修复 −612 → N15 PRF 读口 −2,868** = **143,992**（Gate A/B/C，Gate C 净 0）。**Gate D = −5,399 = N27B −1,829（`412c2c3`→142,163）+ N29B −3,570（`9203d98`→138,593）**（N26/N28 关闭不计），累计 −62.2%。**Gate E = −11,894 = N33B −1,712（`08a06ad`→136,881）+ N34B-1 −5,627（`1c2e0bd`→131,254）+ N34B-3 −2,085（`8d98117`→129,169）+ N35B −2,470（`d00eb03`→126,699）**（N32/N28/N34B-2 关闭不计），累计 **−65.43%，首破器件容量**。
-4. **已知遗留**：设计文档口径滞后（NREG 96→64、nq 49→37→16、RB 416→225→230、commit 4→2、FPU 6→1 算术单元、PRF 读口 11/5、store→load 转发已移除、**typed 四表+ev_mem+lht 已 LUTRAM** 等未同步）；动态探针 `dyn_probe_r` 需适配 EXP-R1 后的 rename 接口；NREG=64 余量仅 6 个物理号；时序 WNS≈−52ns（94% 下仍深度不收敛，post-route 未做；N35B 后 +2.72ns 是本轮唯一改善）；div/sqrt 参数 `RV32GC_FDIV/FSQRT_CYCLES=32` 是死参数（实际 114 拍）；iverilog 在 STQ/LQ 近满时吞吐崩塌 >100×（仿真限制）；**归因方法学警示**：rebuilt 网表上跨容器 `get_pins -of_objects <net>` 不可信（须 `all_fanin -flat -to <真实负载脚>`），`all_fanout -from <RAMB DO>` 同样不可用，读块边界输出边须用 `get_property DIRECTION`；**n34b1_diff_tb 伪随机"三次左移"变体低 7 位恒定**（低位使能激励退化，夹具统一改规范 xorshift32；n34b1 结论不受影响）；`fwd_all_w`/`pend_sel` 死逻辑保留（综合剪除）；**未跑清单**：arch-test 接入 2B（2~3.5 人日）、N29B 的 `n12_stress_run.sh` 反证段已内建跑过、post-route 签署；**历史 scratch 探针**（rename_audit/tb_ls_ckprobe、n35a_body.inc、expA_*）因宏删除不可编译——已不在任何红线命令内（遗留卫生项）；**LHTRAM 表示纪律**：含同步读口的分布式 RAM 阵列写口必须独立无复位 always，async-reset always 中写 ⇒ dissolved（本轮 6 阵教训）。
+4. **已知遗留**：设计文档口径滞后——**部分已在 2026-10-18 的 [`docs/README.md`](../docs/README.md) 与 design/03/04 等重点文档同步**（NREG 96→64、commit 4→2、store→load 转发已移除、PRF 读口 11/5 等），其余历史章节保留原目标；引用时以 `back2_params.vh` 为准。动态探针 `dyn_probe_r` 需适配 EXP-R1 后的 rename 接口；NREG=64 余量仅 6 个物理号；时序 WNS≈−52ns（94% 下仍深度不收敛，post-route 未做；N35B 后 +2.72ns 是本轮唯一改善）；div/sqrt 参数 `RV32GC_FDIV/FSQRT_CYCLES=32` 是死参数（实际 114 拍）；iverilog 在 STQ/LQ 近满时吞吐崩塌 >100×（仿真限制）；**归因方法学警示**：rebuilt 网表上跨容器 `get_pins -of_objects <net>` 不可信（须 `all_fanin -flat -to <真实负载脚>`），`all_fanout -from <RAMB DO>` 同样不可用，读块边界输出边须用 `get_property DIRECTION`；**n34b1_diff_tb 伪随机"三次左移"变体低 7 位恒定**（低位使能激励退化，夹具统一改规范 xorshift32；n34b1 结论不受影响）；`fwd_all_w`/`pend_sel` 死逻辑保留（综合剪除）；**未跑清单**：arch-test 接入 2B（2~3.5 人日）、N29B 的 `n12_stress_run.sh` 反证段已内建跑过、post-route 签署；**历史 scratch 探针**（rename_audit/tb_ls_ckprobe、n35a_body.inc、expA_*）因宏删除不可编译——已不在任何红线命令内（遗留卫生项）；**LHTRAM 表示纪律**：含同步读口的分布式 RAM 阵列写口必须独立无复位 always，async-reset always 中写 ⇒ dissolved（本轮 6 阵教训）。

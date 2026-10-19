@@ -1,7 +1,9 @@
 # 05 — Cache 与存储层次设计
 
-> 本文属 RV32-GC 新项目（`dev` 分支）阶段一设计文档集。文中所有参数取自 `AGENT.md` §1 硬性指标与 §3 平台事实基线，ISA 语义以常驻知识库（riscv-kb）检索到的手册原文为准并逐条标注 `path:line`。
+> 本文属 RV32-GC 新项目（`dev` 分支）阶段一设计文档集。文中所有参数取自 [`AGENT.md`](../../AGENT.md) 的硬指标表与平台事实基线，ISA 语义以常驻知识库（riscv-kb）检索到的手册原文为准并逐条标注 `path:line`。
 > 本文不复制任何上一代实现或文档的正文/图/参数组织；旧项目仅作为"教训清单"（见 §8）。
+>
+> **现行口径（2026-10-18）**：L1I **16 KB**（2 路/32 B 行/256 组）与 L1D **32 KB**（4 路/32 B 行/256 组）是当前 2A/2B 实作参数（`rtl/pkg/core_params.vh` §7）。**L2 256 KB 未实现**（`RV32GC_L2_IMPLEMENTED=0`，2A 的 M6 可选后置项；2B 也未接 L2）；本文 L2 相关章节是设计目标，不是当前结构。§2 图中的 "乱序 ROB128" 是阶段一目标，当前 2B 为 ROB64（见 [`back2_params.vh`](../../rtl/back2/back2_params.vh)）；CMO 的 clean/flush 64 B、zero 32 B 口径不变。
 
 ---
 
@@ -9,18 +11,18 @@
 
 | 项 | 设计值 | 来源 |
 |---|---|---|
-| L1 I-Cache | 16 KB | `AGENT.md` §1 |
-| L1 D-Cache | 32 KB | `AGENT.md` §1 |
-| L2 Cache | 256 KB | `AGENT.md` §1 |
-| 主频 | ≥60 MHz，目标 100 MHz；上板 33 MHz | `AGENT.md` §1 / §3.1 |
+| L1 I-Cache | 16 KB | [工作契约](../../AGENT.md) 的"硬指标" |
+| L1 D-Cache | 32 KB | [工作契约](../../AGENT.md) 的"硬指标" |
+| L2 Cache | 256 KB | [工作契约](../../AGENT.md) 的"硬指标" |
+| 主频 | ≥60 MHz，目标 100 MHz；上板 33 MHz | [工作契约](../../AGENT.md) 的"硬指标"；[平台事实台账](../kb/platform-facts.md) |
 | 总线 | AXI4，32 bit 数据、4 bit len（≤16 beat）、4 bit ID、3 bit size、2 bit burst | `chiplab/chip/soc_demo/loongson/config.h:57-100` |
-| FPGA | `xc7a200tfbg676-2`（Artix-7，BRAM/DSP 资源紧张） | `AGENT.md` §2 |
+| FPGA | `xc7a200tfbg676-2`（Artix-7，BRAM/DSP 资源紧张） | [工作契约](../../AGENT.md) 的"环境事实" |
 
 三条硬约束决定了本设计的骨架：
 
-1. **BRAM 只能同步读**（`AGENT.md` §3.3）：数据阵列必须用 Vivado **Block Memory Generator** IP，不允许组合读大阵列——否则 Vivado 会把阵列退化成几十万个触发器，时序与面积同时崩溃。
+1. **BRAM 只能同步读**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）：数据阵列必须用 Vivado **Block Memory Generator** IP，不允许组合读大阵列——否则 Vivado 会把阵列退化成几十万个触发器，时序与面积同时崩溃。
 2. **红线 4**：从「Cache → AXI 转换」边界开始向外，一律复用 Vivado 成熟 AXI IP/wrapper 与 chiplab 平台已有模块，**禁止手写 AXI 协议逻辑**。
-3. **XIP 无 Cache 一致性**（`AGENT.md` §3.1）：SPI Flash XIP 窗口的取指必须绕过 I-Cache。
+3. **XIP 无 Cache 一致性**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1）：SPI Flash XIP 窗口的取指必须绕过 I-Cache。
 
 ---
 
@@ -104,7 +106,7 @@ L1 行 32 B 是「取指突发长度」与「填充带宽」的折中：AXI 侧 
 I-Cache 只服务取指。自修改代码（Linux `ftrace` 补丁、模块加载）走 D-Cache 写完 → `fence.i` 刷新 I-Cache；ISA 也要求 `fence.i` 与显式的 cache block 维护指令配合，而不是让 I-Cache 参与一致性协议。
 
 **为何 L2 用物理地址索引？**
-L2 是所有访存的汇聚点，若用虚拟地址索引，不同 ASID 下同一 VA 会互相伪命中（L2 位于 ASID 检查之外时是静默错误）。用物理地址索引把 VA/PA 混用的风险从 L2 移除——这与 `AGENT.md` §3.3「VA/PA 混用是静默错，总线地址寄存器只允许一个赋值点」直接呼应：**L2 的 tag 与总线请求地址寄存器只允许由物理地址这一个来源驱动**。
+L2 是所有访存的汇聚点，若用虚拟地址索引，不同 ASID 下同一 VA 会互相伪命中（L2 位于 ASID 检查之外时是静默错误）。用物理地址索引把 VA/PA 混用的风险从 L2 移除——这与 [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3「VA/PA 混用是静默错，总线地址寄存器只允许一个赋值点」直接呼应：**L2 的 tag 与总线请求地址寄存器只允许由物理地址这一个来源驱动**。
 
 ---
 
@@ -153,7 +155,7 @@ graph LR
 ### 4.3 outstanding 与 MSHR
 
 - L1 每侧 8 个 MSHR 项（I/D 各 8），L2 16 个 MSHR 项。
-- 单笔在途 + 归属寄存器 + `valid && ready` 推进 FSM 的三件套（`AGENT.md` §3.3）用于**每条 AXI ID 通道**：L2 用 AXI ID 区分 I/D/CBO 三类请求（`4'd0` = I-Cache 填充、`4'd1` = D-Cache 填充、`4'd2` = 脏行写回、`4'd3` = CBO 维护），返回时按 ID 回送。
+- 单笔在途 + 归属寄存器 + `valid && ready` 推进 FSM 的三件套（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）用于**每条 AXI ID 通道**：L2 用 AXI ID 区分 I/D/CBO 三类请求（`4'd0` = I-Cache 填充、`4'd1` = D-Cache 填充、`4'd2` = 脏行写回、`4'd3` = CBO 维护），返回时按 ID 回送。
 - 4 发核查账：同一拍最多 2 个 L1D 请求 + 1 个 L1I 请求 + 1 个 CBO 请求，MSHR 满时反压 LSU/IF 队列，不阻塞其它非法请求。
 
 ---
@@ -166,7 +168,7 @@ graph LR
 |---|---|---|---|
 | `0x0000_0000`–`0x07FF_FFFF` | **DDR3 默认从设备**（128 MiB） | 可缓存（Write-Back） | `chiplab/IP/AMBA/axi_mux_syn.v:859-861`（`rd_addr_hit[0] = ~\|rd_addr_hit[4:1]` 默认落 DDR3）、`:949-953` |
 | `0x1C00_0000`–`0x1C0F_FFFF` | **SPI Flash XIP**（1 MiB，读别名 `0x1FE8_0000`） | **必须绕过 I-Cache** | `chiplab/IP/AMBA/axi_mux_syn.v:951`（`axi_s_araddr[31:20]==12'h1c0`）、`chiplab/IP/SPI/godson_sbridge_spi.v:192-194`、`soc_top.v:1227`（`.spi_addr(16'h1fe8)`） |
-| `0x1F00_0000` | **核内 CLINT**（自研） | 不可缓存，核内截获 | 用户拍板口径（`AGENT.md` §3.1）；平台 `axi_mux` **未占用**该区间 |
+| `0x1F00_0000` | **核内 CLINT**（自研） | 不可缓存，核内截获 | 用户拍板口径（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1）；平台 `axi_mux` **未占用**该区间 |
 | `0x1F10_0000` | **核内 PLIC**（自研） | 不可缓存，核内截获 | 同上 |
 | `0x1FAF_0000` | **confreg（仿真）** `confreg_sim`，含 `VIRTUAL_UART`/`IO_SIMU` | 不可缓存 | `chiplab/IP/BRIDGE/bridge_1x2.v:48`（`CONF_ADDR_BASE = 32'h1faf_0000`）、`chiplab/IP/AMBA/axi_mux_sim.v:859/951` |
 | `0x1FD0_0000` | **confreg（上板）** `confreg_syn`（LED/SWITCH/TIMER/FREQ） | 不可缓存 | `chiplab/IP/AMBA/axi_mux_syn.v:857-858`（`axi_s_awaddr[31:16]==16'h1fd0`）、`chiplab/IP/CONFREG/confreg_syn.v:33-42` |
@@ -174,7 +176,7 @@ graph LR
 | `0x1FE7_8000` | NAND 控制器 | 不可缓存 | `chiplab/IP/AMBA/axi_mux_syn.v:856-857`（`[31:16]==16'h1fe7`） |
 | `0x1FF0_0000` | MAC | 不可缓存（不使用） | `chiplab/IP/AMBA/axi_mux_syn.v:858` |
 
-**平台无硬件 boot ROM**（`soc_top.v:664-1885` 中无 boot ROM 例化）⇒ 上板复位取指必须从 SPI XIP 窗口开始（`RESET_PC = 0x1C00_0000`）。引导软件在 SPI 窗口内只用 PC 相对寻址，跨窗口跳转用 `auipc + addi + jalr`，早期不得开 MMU（`AGENT.md` §3.1）。
+**平台无硬件 boot ROM**（`soc_top.v:664-1885` 中无 boot ROM 例化）⇒ 上板复位取指必须从 SPI XIP 窗口开始（`RESET_PC = 0x1C00_0000`）。引导软件在 SPI 窗口内只用 PC 相对寻址，跨窗口跳转用 `auipc + addi + jalr`，早期不得开 MMU（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1）。
 
 ### 5.2 可缓存性译码（PMA 表）
 
@@ -315,7 +317,7 @@ graph TD
 4. **Tag 阵列同理**：L1I/L1D 的 Tag+valid+dirty+ASID 存储也用 Block Memory Generator（简单双口足够），仿真分支用同一套行为模型写法。
 5. **IP 检索记录**：实现评审时须附「Vivado IP 目录中 `Block Memory Generator` 被选中、且不存在更合适的替代 IP（Distributed Memory Generator 面积更大、FIFO Generator 语义不符）」的检索结论，作为红线 1 的证据。
 
-**教训对应**（`AGENT.md` §3.3）：BRAM 只能同步读，组合读大阵列会被 Vivado 退化成约 26 万个触发器——这正是本条规范存在的唯一原因；两条分支的等价性由单元测试（见 `07-verification.md`）守住。
+**教训对应**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）：BRAM 只能同步读，组合读大阵列会被 Vivado 退化成约 26 万个触发器——这正是本条规范存在的唯一原因；两条分支的等价性由单元测试（见 `07-verification.md`）守住。
 
 ---
 
@@ -329,4 +331,4 @@ graph TD
 | C-4 | L2 包容性（inclusive）在 256 KB 下对 L1 的独占反压 | 待测 | 若 L2 失效压力过大，退化为 NINE（non-inclusive non-exclusive）策略；需在 RTL 中预留策略开关 |
 | C-5 | 4 K 边界与 AXI 突发拆分 | **已实现（2026-09-14）** | 4K 边界拆分现由核内在描述符生成与控制器两处落地：`rtl/axi/axi_req_desc.v` 给出拆分判定与信息（`desc_split` / `desc_to_4k` / `desc_beats`，组合输出唯一赋值点），`rtl/axi/axi_master_ctrl.v` 按 `req_split` / `req_beats_1` / `req_beats_2` 执行「首笔在 4 K 边界处截断 + 第二笔自动接续」；单元测试 `tb_axi_master_ctrl`（其中 C5 用例）覆盖「不生成跨 4 K 的单条 `AxLEN`」。原口径保留：64 B 行在 4 KiB 边界上除最后一行外均对齐，但跨 4 K 的首行需拆突发 |
 | C-6 | `AxCACHE`/`AxPROT` 在 chiplab `axi_mux` 上是否被透传 | 待核实 | 平台 `axi_mux_syn.v` 未见对 `cache`/`prot` 的语义依赖（仅转发），但上板前需以仿真波形确认 |
-| C-7 | XIP 窗口旁路判定若被写成「VA 判定」而非「PA 判定」 | **高风险** | 这正是 `AGENT.md` §3.3 点名的 VA/PA 混用静默错；判定必须在物理地址侧、且总线地址寄存器只有一个赋值点 |
+| C-7 | XIP 窗口旁路判定若被写成「VA 判定」而非「PA 判定」 | **高风险** | 这正是 [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3 点名的 VA/PA 混用静默错；判定必须在物理地址侧、且总线地址寄存器只有一个赋值点 |

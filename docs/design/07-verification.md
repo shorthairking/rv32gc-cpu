@@ -1,7 +1,16 @@
 # 07 — 验证与测试设计
 
-> 本文属 RV32-GC 新项目（`dev` 分支）阶段一设计文档集。环境事实取自 `AGENT.md` §2 与实测；ISA/覆盖点出处以常驻知识库（riscv-kb）返回的 `path:line` 标注。
+> 本文属 RV32-GC 新项目（`dev` 分支）阶段一设计文档集。环境事实取自 [`AGENT.md`](../../AGENT.md) 的"环境事实"节与实测；ISA/覆盖点出处以常驻知识库（riscv-kb）返回的 `path:line` 标注。
 > 本文不复制任何上一代实现或文档的正文/图/参数组织；旧项目只作为「教训清单」。
+>
+> **当前执行状态（2026-10-18，先读）**：本文是验证**设计**，不是"所有层都已搭好并全绿"。
+> - 已落地入口：`sim/arch_test/run.sh`（ACT4，DUT=**2A `core_top`**）、`sim/lockstep/run.sh`（2A 整数锁步）、
+>   `scripts/regress.sh`（L0 全量 + 2B 集成 TB，当前记录 33/33）、`sim/unit/tb_back2_lockstep.sv`（2B 锁步，记录 57 项/821 提交）、
+>   `fpga/run_vivado_batch.sh`（Vivado 三坑统一入口）。§9 的"待建/目标形态"已按此更新，历史目标保留。
+> - 2A arch-test 于 2026-09-17 收口全绿；**之后** 2A/2B 共享 RTL（`trap_ctrl`/`csr_file` 等）在 D2/D6 修复中改过，
+>   **未重跑 arch-test/上板** ⇒ 旧全绿不能直接当作 `7e2e730` 的结论。
+> - **2B 尚未接入 arch-test**：`sim/arch_test/run.sh` 与 `sim/tb/tb_arch_test.sv` 仍例化 2A `core_top`；
+>   2B 的功能仿真记录与 arch-test/上板验收是两件事（详见 [`docs 索引`](../README.md) §3）。
 
 ---
 
@@ -24,7 +33,7 @@ graph TD
     class L0,L1 base;
 ```
 
-**自下而上的门槛**：下一层未全绿，不得启动上一层。这条门槛由母 Agent 在阶段验收时用命令复跑确认（`AGENT.md` §0.6）。
+**自下而上的门槛**：下一层未全绿，不得启动上一层。这条门槛由母 Agent 在阶段验收时用命令复跑确认（[工作契约](../../AGENT.md) 的"验收纪律"）。
 
 **层次职责**：
 
@@ -47,8 +56,9 @@ graph TD
 |---|---|---|
 | Icarus Verilog | **12.0** | `iverilog -V`（实测） |
 | Verilator | **5.020** | `verilator --version`（实测） |
-| GCC | 16.1.0 @ `/opt/riscv`（`riscv32-unknown-linux-gnu-`） | `AGENT.md` §2 |
-| Vivado | 2023.2（仅综合/上板，**回归不依赖**） | `AGENT.md` §2 |
+| GCC | 16.1.0 @ `/opt/riscv`（`riscv32-unknown-linux-gnu-`） | 工作区环境台账（`AGENT.md` 环境事实） |
+| Vivado | 2023.2（仅综合/上板，**回归不依赖**） | 工作区环境台账（`AGENT.md` 环境事实） |
+| Spike | 1.1.1-dev @ `/opt/riscv/bin/spike` | 用户沙箱外编译；`sim/arch_test/test_config.yaml` 实查 |
 
 **强制约束**：单元测试与回归必须能在**没有 Vivado** 的机器上跑通。所有 IP 例化必须有仿真行为模型双分支（见 §2.2）。
 
@@ -120,7 +130,7 @@ graph LR
 
 ### 4.2 参考模型：Spike 锁步
 
-**Spike 现状**：本工作区**当前没有可用的 spike 二进制**（实测 `which spike` 无输出，`riscv-arch-test/config/` 下只有 sail / spike / whisper 等**配置目录**而无已编译的参考模型）。⇒ **「Spike 重取并编译」列为阶段二的前置项**（见 §9）。旧项目编译产物不得复制（`AGENT.md` §3.4）。
+**Spike 现状（2026-10-18 更新）**：`/opt/riscv/bin/spike` **已就绪**（1.1.1-dev，2026-09-14 由用户在沙箱外编译安装；`sim/arch_test/test_config.yaml` 的 `ref_model_exe` 指向它）。历史"工作区无 spike"的记录已过期。当前 arch-test 参考模型入口见 [`sim/arch_test/run.sh`](../../sim/arch_test/run.sh) 与 [`sim/arch_test/README.md`](../../sim/arch_test/README.md)；2A/2B 锁步见 [`sim/lockstep/README.md`](../../sim/lockstep/README.md) 与 `sim/unit/tb_back2_lockstep.sv`。旧项目编译产物仍不得复制（现行纪律：只用本机 `/opt/riscv` 的 Spike）。
 
 **Spike 的调用口径（已从 arch-test 官方配置读出，实测）**：
 
@@ -132,8 +142,8 @@ spike --instructions=100000000 {debug:-l --log-commits --log=__TRACEFILE__} \
 
 关键点：
 
-1. **`--log-commits` 的输出走 `stderr`**（`AGENT.md` §3.1 已记录）；重定向时必须是 `2> <logfile>`，不能只写 `>`。
-2. `--log=__TRACEFILE__` 写的是**完整指令轨迹**，与 `--log-commits` 是两份不同产物。
+1. **`--log-commits` 默认走 `stderr`；若同时给 `--log=<file>`，commit 行写入该文件**（与反汇编行交错，见 `sim/lockstep/README.md` §4）——重定向前先确认实际走的是哪一路。
+2. 同时开启时，**反汇编与 commit 行共用 `--log` 文件**；比对器按 commit 格式筛选，**不假定存在另一份 stderr 提交轨迹**。
 3. `--isa` 字符串需按本项目实际实现的扩展调整（`rv32imafdc_zicsr_zifencei_zicntr_zicbom`）；不支持的扩展不得出现在其中，否则 Spike 会拒绝启动。
 4. `--instructions=` 上限用于防止跑飞的测试无限执行。
 
@@ -157,11 +167,11 @@ sequenceDiagram
 
 **比对粒度**：以**指令提交（retire）**为单位，比对 `pc`、指令位、目的寄存器号与写回值、访存地址与数据。CSR 写比对同一周期后状态（Spike commit log 中含 CSR 变更）。
 
-**参考模型自身失败的排除**（`AGENT.md` §3.2）：先用 `grep -l FAILED <日志目录>` 排除「参考模型自己失败」，再判定 DUT。
+**参考模型自身失败的排除**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2）：先用 `grep -l FAILED <日志目录>` 排除「参考模型自己失败」，再判定 DUT。
 
 ### 4.3 内存映射的差异处理
 
-- Spike 惯用 `0x8000_0000` 起的内存（`-m0x80000000:0x10000000,...`，`AGENT.md` §3.1）。
+- Spike 惯用 `0x8000_0000` 起的内存（`-m0x80000000:0x10000000,...`，[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1）。
 - 本平台的 DDR3 在 `0x0000_0000`–`0x07FF_FFFF`（`axi_mux_syn.v:859-861`）。
 - ⇒ **arch-test / 锁步用的链接脚本必须把代码段放在本核可执行且 Spike 也能接受的位置**；两种做法二选一，并在验证环境里**只写一处**：
   1. 给 Spike 传 `-m0x00000000:0x08000000,...` 让两者地址空间一致（推荐，改动最小）；
@@ -172,7 +182,7 @@ sequenceDiagram
 
 ## 5. L3 — 变异测试与反证实验
 
-**核心纪律**（`AGENT.md` §0.6 / §3.2）：**测试必须能失败**。一个从不失败的测试等于零覆盖。
+**核心纪律**（[工作契约](../../AGENT.md) 的"验收纪律"）：**测试必须能失败**。一个从不失败的测试等于零覆盖。
 
 | 实验 | 变异 | 期望 |
 |---|---|---|
@@ -198,7 +208,7 @@ sequenceDiagram
 恢复: git checkout <file>   （由母 Agent 统一执行，子 Agent 不得自行 git 操作）
 ```
 
-**防「假 PASS」的脚本要求**（`AGENT.md` §0.6，硬性）：
+**防「假 PASS」的脚本要求**（[工作契约](../../AGENT.md) 的"验收纪律"，硬性）：
 
 1. 判定失败、输出未捕获、兜底文案**一律不得含 `PASS` 字样**；
 2. 脚本必须显式检查每条测试的运行状态与 signature 比对结果，**不能只 grep 一个正则**；
@@ -236,7 +246,7 @@ graph LR
 
 - 计数器必须是**可加、可清零、可冻结**的，便于在固定基准程序上复现数值。
 - 自定义计数器**不得**占用标准 CSR 地址；使用 `0xBC0`–`0xBFF` 之外的地址需先确认与 arch-test 不冲突（建议用 `0x7C0`–`0x7FF` 自定义区，且必须登记在本文档）。
-- 性能数值的对比必须在**同一时钟频率**下进行（上板 33 MHz，`AGENT.md` §3.1），否则 IPC 之外的指标不可比。
+- 性能数值的对比必须在**同一时钟频率**下进行（上板 33 MHz，[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1），否则 IPC 之外的指标不可比。
 
 ---
 
@@ -246,10 +256,10 @@ graph LR
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| 器件 | `xc7a200tfbg676-2` | `AGENT.md` §2 |
-| 上板时钟 | **33 MHz**（`clk_pll_33.clk_out2` 同时驱动 `cpu_clk` 与 `uncore_clk`，同域无 CDC） | `soc_top.v:1463-1471`（`.clk_out1()` 留空 + `assign cpu_clk = uncore_clk;`），`AGENT.md` §3.1 |
-| `config.h` 的 `FREQ` | 需同步为 33 | `AGENT.md` §3.1 |
-| 复位取指 | `RESET_PC = 0x1C00_0000`（SPI XIP，平台无 boot ROM） | `AGENT.md` §3.1；`soc_top.v:664-1885` 无 boot ROM 例化 |
+| 器件 | `xc7a200tfbg676-2` | [工作契约](../../AGENT.md) 的"环境事实" |
+| 上板时钟 | **33 MHz**（`clk_pll_33.clk_out2` 同时驱动 `cpu_clk` 与 `uncore_clk`，同域无 CDC） | `soc_top.v:1463-1471`（`.clk_out1()` 留空 + `assign cpu_clk = uncore_clk;`），[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 |
+| `config.h` 的 `FREQ` | 需同步为 33 | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 |
+| 复位取指 | `RESET_PC = 0x1C00_0000`（SPI XIP，平台无 boot ROM） | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1；`soc_top.v:664-1885` 无 boot ROM 例化 |
 | confreg（上板） | `0x1FD0_0000`（LED/SWITCH/TIMER/FREQ） | `axi_mux_syn.v:857-858`；`confreg_syn.v:33-42` |
 | confreg（仿真） | `0x1FAF_0000`（含 VIRTUAL_UART/IO_SIMU） | `bridge_1x2.v:48`；`axi_mux_sim.v:859/951` |
 | UART | `0x1FE0_01E0` | `axi_mux_syn.v:856-857` |
@@ -263,7 +273,7 @@ graph LR
 4. **定时器**：读 `TIMER_ADDR`（`0x1FD0_E000`）验证 confreg 内部计时器；与核内 CLINT `mtime` 对照，检查两个时间基准是否一致。
 5. **`FREQ` 回读**：`confreg_sim`/`confreg_syn` 在 `[28:16] == 16'h1fd0` 时返回 `FREQ`（`confreg_sim.v:171-176`）⇒ 用来核对 `config.h` 的 `FREQ` 与板级实际频率一致。
 
-**上板失败的定位纪律**（`AGENT.md` §3.2）：**先假设自己的缺陷**（转发/冒险、总线仲裁三件套），用「关掉新特性后是否恢复」的对照实验判定；「平台/生成器有缺陷」是低概率假设。
+**上板失败的定位纪律**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2）：**先假设自己的缺陷**（转发/冒险、总线仲裁三件套），用「关掉新特性后是否恢复」的对照实验判定；「平台/生成器有缺陷」是低概率假设。
 
 ### 7.3 Vivado 运行入口
 
@@ -276,7 +286,7 @@ export HOME=<工作区>/<项目>/.vivado_home
 #   set_property source_mgmt_mode None
 ```
 
-- **`fpga/run_vivado_batch.sh` 待建**（见 §9 前置项；**用户已定（2026-09-14）：保持待建，阶段二建立**），统一封装上述三条环境设置 + `vivado -mode batch -source <tcl>`。
+- **`fpga/run_vivado_batch.sh` 已落地**（2026-09-18；见 [`docs/kb/tools-and-flow.md`](../kb/tools-and-flow.md) 三坑统一入口），封装上述三条环境设置 + `vivado -mode batch -source <tcl>`。历史"待建"记录保留在 §9.2 的说明中。
 - 综合脚本必须只包含本项目的 `rtl/**`，不修改 chiplab 平台文件。
 - 时序验收：`report_timing_summary` 无负 slack（33 MHz 下）；面积验收：BRAM/DSP 占用在 `xc7a200tfbg676-2` 容量内。
 
@@ -318,53 +328,58 @@ graph TD
 
 ## 9. 验证环境与运行入口
 
-### 9.1 目录规划（本设计建议，实施由后续任务落地）
+### 9.1 目录（**当前已落地**；原设计建议的 `sim/arch`、`sim/regress.sh`、`tools/spike` 未采用）
 
 ```
-sim/            # 仿真 TB 与回归脚本
-  unit/         # L0 单元 TB（iverilog / Verilator）
-  arch/         # arch-test 运行器
-  lockstep/     # Spike 锁步比对
-  regress.sh    # 顶层回归入口（"未捕获即失败"）
-fpga/
-  run_vivado_batch.sh   # 【待建】Vivado 统一入口；**用户已定（2026-09-14）**：保持待建，阶段二建立
-  *.tcl                 # 综合/实现脚本
-tools/
-  spike/                # 【待建】Spike 源码与编译产物（不复制旧项目产物）；**用户已定（2026-09-14）**：由用户编译安装到 `/opt/riscv/bin/spike`
+sim/unit/        # L0 单元 TB + 2B 集成 TB（tb_core_top_2b / tb_back2_iq / tb_back2_lockstep）
+sim/arch_test/   # ACT4 arch-test 运行器（当前 DUT = 2A core_top；run.sh + test_config.yaml + exclude.list）
+sim/lockstep/    # 2A 整数锁步（core_top + Spike）
+sim/tb/          # 总装 TB（tb_arch_test.sv 例化 2A core_top）
+scripts/         # env.sh（工具链真源）+ regress.sh（L0/集成回归，fail-closed）
+fpga/            # run_vivado_batch.sh（三坑统一入口）+ tcl/（synth/impl）
+/opt/riscv/bin/spike   # 参考模型（用户沙箱外安装；不在 tools/spike）
 ```
 
-### 9.2 前置项（**必须先完成，否则 L2 无法启动**）
+> 原设计建议的目录名（`sim/arch/`、`sim/regress.sh`、`tools/spike/`）只作历史；现行入口以上表与 §9.3 为准。
+
+### 9.2 前置项（**均已关闭**；历史要求为"先完成否则 L2 无法启动"）
 
 | 编号 | 前置项 | 状态 | 说明 |
 |---|---|---|---|
-| V-1 | **Spike 重取并编译** | **用户已定（2026-09-14）** | 裁决：**由用户在沙箱外编译并安装到 `/opt/riscv/bin/spike`**；需系统依赖 `device-tree-compiler`、`libboost-regex-dev`、`libboost-system-dev`，编译命令见 `NEXT_SESSION.md` §6.5；编译完成后通知母 Agent 记录版本。旧项目编译产物不得复制（`AGENT.md` §3.4） |
-| V-2 | **`fpga/run_vivado_batch.sh`** | **待建（阶段二建立）** | 用户已定（2026-09-14）：保持待建，阶段二建立。统一 Vivado 入口，封装 `LD_LIBRARY_PATH`、`HOME=.vivado_home`、`source_mgmt_mode None`（`AGENT.md` §2 三个坑） |
-| V-3 | arch-test 编译/运行环境 | 待建 | 需 `riscv32-unknown-linux-gnu-gcc`（`/opt/riscv`）、链接脚本、signature 比对；arch-test 官方配置期望 `riscv64-unknown-elf-gcc`，**本机为 `riscv32-unknown-linux-gnu-`**，需在 `test_config.yaml` 中改写编译器名 |
-| V-4 | RV32/Sv32 测试筛选清单 | 待建 | 只跑 `sv32_*` 变体；sv39/sv48/sv57 与 RV64 测试加入排除清单 |
-| V-5 | signature 比对工具 | 待建 | arch-test 的 `signature` 区需与参考模型比对；这是「未捕获即失败」在 L2 的落点 |
+| V-1 | **Spike 重取并编译** | ✅ **已就绪**（2026-09-14，1.1.1-dev） | 由用户在沙箱外编译安装到 `/opt/riscv/bin/spike`；`sim/arch_test/test_config.yaml` 与锁步 `run.sh` 均指向它。旧项目编译产物不得复制 |
+| V-2 | **`fpga/run_vivado_batch.sh`** | ✅ **已落地**（2026-09-18） | 统一 Vivado 入口，封装 `LD_LIBRARY_PATH`、`HOME=.vivado_home`、`source_mgmt_mode None`（见 `docs/kb/tools-and-flow.md`） |
+| V-3 | arch-test 编译/运行环境 | ✅ **已落地** | `sim/arch_test/run.sh` + `test_config.yaml` + `link.ld` + `exclude.list`；编译器已按本机 `riscv32-unknown-linux-gnu-` 配置，signature 逐行比对 |
+| V-4 | RV32/Sv32 测试筛选清单 | ✅ **已落地** | `exclude.list` 逐条理由 + `run.sh --check-exclude` 防漂移；sv39/sv48/sv57 与 RV64 排除 |
+| V-5 | signature 比对工具 | ✅ **已落地** | `run.sh` 内做 DUT/Spike 签名区逐行比对；`TOTAL/PASS_COUNT/FAIL_COUNT` 与唯一 PASS 文案 |
 
-### 9.3 运行入口（目标形态）
+> 历史状态（2026-09 设计期）为"V-1 用户裁决、V-2/V-3/V-4/V-5 待建"；现已按上表落地。2A arch-test 全绿是 2026-09-17 记录；2B 尚未接入（见文首状态）。
+
+### 9.3 运行入口（**当前可用**）
 
 ```sh
-# L0 单元测试（不定义 RV32GC_USE_VIVADO_IP）
-sim/unit/run.sh                       # 期望：全部 PASS，退出码 0
+cd /home/shorthair/dsh/rv32-cpu/rv32gc-cpu
 
-# L1 定向（Verilator 编译 + 裸机程序）
-sim/arch/run.sh --test <name>
+# L0 + 2B 集成：全量回归（fail-closed；当前记录 33/33，须母 Agent 复跑）
+# 必须显式 strict-skip，否则默认 skip 可 rc=0 但不算验收
+RV32_REGRESS_STRICT_SKIP=1 ./scripts/regress.sh
+# 期望：rc=0 且唯一汇总行为 `REGRESS: 33/33 PASS`（无 SKIP 项）
 
-# L2 arch-test（含 L2 锁步）
-sim/arch/run.sh --suite rv32i --ext zicbom
-sim/arch/run.sh --suite priv --ext sv32_pmp
+# L2 arch-test（ACT4；当前 DUT = 2A core_top）
+./sim/arch_test/run.sh I-nop-00
+./sim/arch_test/run.sh --group rv32i/I --jobs 16
+./sim/arch_test/run.sh --check-exclude
 
-# L3 变异回归（每个变异单独跑；脚本内不得含 git 操作）
-sim/regress.sh --mutation M-4
+# 2A Spike 锁步（整数；默认 lock_hello）
+./sim/lockstep/run.sh
 
-# L4 性能统计
-sim/regress.sh --perf --bench <benchmark>
-
-# L5 上板
-fpga/run_vivado_batch.sh build.tcl    # 【待建】
+# L5 综合/F5 上板：统一 Vivado 入口（2B 需显式 top/宏）
+./fpga/run_vivado_batch.sh fpga/tcl/synth.tcl 16.667
+#   RV32_SYNTH_TOP=core_top_2b RV32_SYNTH_TAG=2b_<x> RV32_SYNTH_DIRECTIVE=RuntimeOptimized 由调用者设置
 ```
+
+- 原设计中的 `sim/unit/run.sh`、`sim/arch/run.sh`、`sim/regress.sh`、`fpga/run_vivado_batch.sh build.tcl` 均为**目标形态**，实际入口以上面为准。
+- 2B 锁步不是 `sim/lockstep/run.sh`（那是 2A `core_top`）；2B 入口是 `sim/unit/tb_back2_lockstep.sv`，由 `scripts/regress.sh` 自动发现。
+- 性能统计（L4）没有独立入口；`tb_back2_ipc`/`tb_back2_lockstep` 随 regress 跑，数值必须标运行频率与程序集。
 
 **每条入口的验收输出格式**必须一致（便于机器判定）：
 
@@ -391,9 +406,9 @@ TOTAL=NN  PASS_COUNT=NN  FAIL_COUNT=NN  RESULT=pass|fail
 
 | 编号 | 项 | 状态 | 说明 |
 |---|---|---|---|
-| V-6 | Spike 编译需系统依赖（`device-tree-compiler`、`libboost-regex-dev`、`libboost-system-dev`，见 `riscv-arch-test/config/spike/ci.yaml`），而本机 `sudo` 不可用 | **用户已定（2026-09-14）** | 裁决：由用户在沙箱外编译并安装到 `/opt/riscv/bin/spike`（命令见 `NEXT_SESSION.md` §6.5）；编译完成后通知母 Agent 记录版本 |
-| V-7 | arch-test 官方配置默认参考模型为 `sail_riscv_sim`（`config/spike/spike-rv32g/test_config.yaml` 的 `ref_model_exe`），而非 Spike 本身 | 待定 | 需确认是「Spike 作为 DUT 的参考」还是「Sail 作参考」；本项目锁步对象是 Spike，故需自建比对器 |
-| V-8 | 编译器名差异：本机 `riscv32-unknown-linux-gnu-gcc` vs arch-test 期望 `riscv64-unknown-elf-gcc` | 待处理 | 需在 `test_config.yaml` 中改写；注意 RV32 的 `-march/-mabi` 组合 |
-| V-9 | 上板 33 MHz 与目标 100 MHz 的性能统计不可直接比较 | 已识别 | L4 数值必须标注运行频率；`AGENT.md` §3.2 要求性能口径明确 |
+| V-6 | Spike 编译需系统依赖，而本机 `sudo` 不可用 | ✅ **已解决** | 用户在沙箱外编译安装到 `/opt/riscv/bin/spike`（1.1.1-dev）；本机直接使用 |
+| V-7 | arch-test 官方配置默认参考模型为 `sail_riscv_sim`，而非 Spike | ✅ **已定口径** | 本项目 `sim/arch_test/run.sh` 以 **Spike** 为参考模型；`sail.json` 仅取 `SAIL_*` 编译宏（sig 版 ELF 需要），不是运行参考 |
+| V-8 | 编译器名差异：本机 `riscv32-unknown-linux-gnu-gcc` vs arch-test 期望 `riscv64-unknown-elf-gcc` | ✅ **已解决** | `sim/arch_test/test_config.yaml` 已按本机 RV32 编译器配置；`run.sh` 实查可通过 |
+| V-9 | 上板 33 MHz 与目标 100 MHz 的性能统计不可直接比较 | 已识别 | L4 数值必须标注运行频率；[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2 要求性能口径明确 |
 | V-10 | Verilator 5.020 与 11 级乱序核的编译时间 | 待测 | 若单次编译超过可接受范围，需分模块编译 + 增量；建议用 `--output-split` |
 | V-11 | 中断取用点（`06-csr-privilege.md` T-6）的验证手段 | 待设计 | 需要能构造「访存副作用已落地但中断尚未取」的竞态用例；建议用定向 TB 而非 arch-test |

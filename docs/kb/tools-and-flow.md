@@ -13,16 +13,16 @@
 | Verilator | **5.020**（`2024-01-01 rev (Debian 5.020-1)`） | 系统包 | [环境实测] |
 | Icarus Verilog | **12.0 (stable)** | 系统包 | [环境实测] |
 | Vivado | **2023.2** | `/home/shorthair/fpga/Vivado/2023.2` | [环境实测] |
-| 参考模型 Spike | **缺失**（需重取编译） | — | [环境实测] |
+| 参考模型 Spike | **1.1.1-dev（已就绪）** | `/opt/riscv/bin/spike` | [环境实测 2026-09-14；2026-10-18 复核存在] |
 
 - 复现命令：
   ```sh
   iverilog -V | head -2
   verilator --version
   /opt/riscv/bin/riscv32-unknown-linux-gnu-gcc --version | head -1
+  /opt/riscv/bin/spike --help | head -2
   ```
-- **Spike 现状**：工作区内无 Spike 源码。旧编译产物在旧项目内，**不复制**。[旧项目转述]
-  → **待办**：重新取上游源码并编译到本项目（见 §6）。
+- **Spike 现状**：`/opt/riscv/bin/spike` 已可用；`sim/arch_test/test_config.yaml` 的 `ref_model_exe` 与 `sim/lockstep/run.sh` 均使用该二进制。历史"工作区无 Spike"记录已过期。旧项目编译产物仍不复制（见 §6）。
 
 ---
 
@@ -217,19 +217,19 @@
 
 ---
 
-## 6. 参考模型 Spike（**待重取编译**）
+## 6. 参考模型 Spike（**已就绪；以下为升级/重装口径**）
 
-- **现状**：工作区**无 Spike 源码**；旧编译产物在旧项目内，**不复制**。[环境实测 + 旧项目转述]
-- **必须重新取源码并编译**（步骤口径供参考）：
+- **现状（2026-10-18）**：`/opt/riscv/bin/spike` = **1.1.1-dev**，由用户在沙箱外编译安装；arch-test 与锁步均直接使用。工作区仍不保存 Spike 源码/旧项目产物。
+- **重装/升级步骤**（仅当版本需要变更时）：
   1. `git clone` 上游 `riscv-isa-sim`；
-  2. `mkdir build && cd build && ../configure --prefix=<项目内 prefix>`；
-  3. `make -j$(nproc)`；
-  4. **验证可执行且版本正确**（打印 `--help` 或版本）。
-- **使用口径** [旧项目转述]：
-  - `--log-commits` 的输出走 **stderr**（不是 stdout）——重定向时别只抓 stdout；
+  2. `mkdir build && cd build && ../configure --prefix=/opt/riscv --enable-commitlog`（若选项不支持则去掉 `--enable-commitlog`）；
+  3. `make -j$(nproc)` → `sudo make install`（需用户在沙箱外执行）；
+  4. 用 `--help` 或实际跑一条锁步验证。
+- **使用口径**（本机实测）：
+  - 不给 `--log=` 时 `--log-commits` 走 **stderr**；给 `--log=<file>` 时 commit 行写入文件（与反汇编行交错），比对器按正则挑 commit 行——见 `sim/lockstep/README.md` §4；
   - 内存映射用 `-m0x80000000:0x10000000,...` 形式；
-  - **RISC-V 习惯的 `0x8000_0000` 仅用于仿真/arch-test 布局**；上板物理地址以平台为准（DDR3 默认从设备 `0x0–0x07FF_FFFF`，SPI XIP `0x1C00_0000`）——见 `docs/kb/platform-facts.md` §2。
-- **门禁** [工程约定]：Spike 编译成功并通过自检前，**锁步验证（difftest）不得开启**——否则"参考模型自身失败"会被误判成被测核的缺陷。
+  - **RISC-V 习惯的 `0x8000_0000` 仅用于仿真/arch-test 布局**；上板物理地址以平台为准（DDR3 默认从设备 `0x0–0x07FF_FFFF`，SPI XIP `0x1C00_0000`）——见 [`platform-facts.md`](platform-facts.md) §2。
+- **门禁** [工程约定]：参考模型自身失败必须先排除（`grep -l FAILED <日志目录>`），再判定 DUT；不得把参考模型失败误判成核缺陷。
 
 ---
 
@@ -245,6 +245,7 @@
 - 平台侧位宽真源：`chiplab/chip/soc_demo/loongson/config.h:46-100`。
 - 本项目侧真源：`rtl/pkg/*defs.vh`。
 - [工程约定] 改位域**先改真源**，再全量同步所有使用处；改完**必须 grep 核对新端口两侧都接上**。
+- **RTL 文件集合口径**：`scripts/env.sh` 的 `rv32_rtl_sources`（回归/仿真用）与 `fpga/tcl/synth.tcl` 自己的枚举是**两处等价约定，不是同一个函数调用**；新增/删除 RTL 文件时必须两处都核对，不能只改一处就认为全量同步。
 
 ### 7.3 每阶段收尾
 
@@ -265,44 +266,48 @@
 
 ## 8. 知识库（riscv-kb）操作
 
-### 8.1 会话内工具
+### 8.1 会话内工具（当前缓存状态）
 
 - `kb_search "<关键词>"` —— 检索（支持 `source:`/`path:`/`kind:` 过滤，引号短语强制相邻）。
 - `kb_get chunkIds=[...]` / `kb_get path=... startLine/endLine` —— 展开引用。
 - `kb_manage action=stats|sources|documents|reindex` —— 体检/重建。
+- **当前会话工具仍缓存旧 LSA 表**（2026-10-18 母验收：`kb_search "mtvec"` 返回无关 PWM，N34B 空命中）⇒ 不能说“实时同排序”或“无需重载即可恢复”。本轮改用 **CLI `search`/`get` + `kb_get` 精确范围**；新会话/用户重载后再另验，**不自行重启用户服务**。`kb_manage reindex` 的 `lsaDims` 参数当前被忽略（`dsh-extension/lib/tools.js:326-327`，不改代码）。
 
-### 8.2 CLI 等价命令
+### 8.2 CLI 命令（当前优先）
 
 ```sh
 node /home/shorthair/dsh/rv32-cpu/dsh-extension/bin/riscv-kb.js search "mtvec MODE"
 node /home/shorthair/dsh/rv32-cpu/dsh-extension/bin/riscv-kb.js get 42
-node /home/shorthair/dsh/rv32-cpu/dsh-extension/bin/riscv-kb.js build     # 全量重建
+node /home/shorthair/dsh/rv32-cpu/dsh-extension/bin/riscv-kb.js build --no-lsa   # 全量重建（推荐；实测 13.3s）
+node /home/shorthair/dsh/rv32-cpu/dsh-extension/bin/riscv-kb.js stats             # 体检用
 ```
 
-### 8.3 重建时机与代价
+- 2026-10-18 实测：`build --no-lsa` 成功 **13.3s**，磁盘 **3716 docs / 15443 chunks / latent disabled**；CLI `search "mtvec MODE"` 正确返回规范，`search N34B-2 path:rv32gc-cpu/docs/README.md` 返回新索引。
 
-- **重建命令**：`kb_manage action=reindex`（会话内）或上面的 `build`（CLI）。
+### 8.3 重建时机、代价与体检
+
+- **推荐重建命令**：`node dsh-extension/bin/riscv-kb.js build --no-lsa`（CLI；当前实测 13.3s，磁盘 3716 docs/15443 chunks/latent disabled）。
+- **会话内 `kb_manage reindex` 的局限**：`lsaDims:0` 当前被忽略（仍按 96 建 LSA），所以默认 LSA 检索需在新会话/重载后重新验证；重建优先用上面的 CLI。
 - **时机**：新增/修改被索引的文档后。
-- **代价**：全量重建**需要数分钟**，**建议放后台跑**。
-- **[工程约定]** 重建后必须用 `kb_manage action=stats` 确认**文档数与索引时间已更新**，否则视为重建未生效。
+- **[工程约定]** 体检不能只看可能缓存的 `kb_manage stats`：同时查 `node dsh-extension/bin/riscv-kb.js stats` 和**实际查询**（如 `search "mtvec MODE"`、按 path 搜新文档），两者一致才算生效。
 
 ### 8.4 检索纪律
 
 - **不要在文档树里 `read`/`grep` 学 ISA 事实**（`riscv-isa-manual`、`riscv-arch-test`、`docs-dev-guide`、`riscv-gnu-toolchain` 是**素材**，不是读物）。
-- 检索空手归时，按序：`stats` → 换更短的标识符 → 去掉过滤器 → `documents filter=` 确认文档在库内。
+- 检索空手归时，按序：CLI `stats` → 换更短的标识符 → 去掉过滤器 → `documents filter=` 确认文档在库内。
 - 引用一律带 `path:line`。
 
 ---
 
 ## 9. 待办清单（本文相关）
 
-| # | 待办 | 验收 |
+| # | 待办 | 验收 / 状态 |
 |---|---|---|
-| B1 | 取 Spike 源码并编译（§6） | 可执行存在 + `--help` 正常 |
-| B2 | 建 `fpga/run_vivado_batch.sh`（§3 三坑封装） | 传入任一 Tcl 能批处理跑通 |
-| B3 | 回归脚本全量体检"未捕获即失败"（§5） | 逐个脚本确认兜底文案不含 PASS + 正则成对 |
-| B4 | 封装配 `-D` 宏值的构建函数（§2） | 全项目无 `-D*=0x` 形式 |
-| B5 | 镜像生成脚本打印 LMA/VMA 对照（§4） | 打包日志含 `readelf -l` 输出 |
+| B1 | 取 Spike 源码并编译（§6） | ✅ **已完成**：`/opt/riscv/bin/spike` 1.1.1-dev 存在 |
+| B2 | 建 `fpga/run_vivado_batch.sh`（§3 三坑封装） | ✅ **已完成**（2026-09-18）：传入 Tcl 可批处理 |
+| B3 | 回归脚本全量体检"未捕获即失败"（§5） | **部分完成**：`scripts/regress.sh` 已 fail-closed；其余脚本未逐一审计 |
+| B4 | 封装配 `-D` 宏值的构建函数（§2） | **未核实**（留待需要时检查） |
+| B5 | 镜像生成脚本打印 LMA/VMA 对照（§4） | **未核实**（留待需要时检查） |
 
 ---
 

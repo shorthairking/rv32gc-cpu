@@ -4,6 +4,12 @@
 > 写入范围：`rtl/back2/**` + `sim/unit/**` 的 back2 相关新增件；**唯一例外**：`scripts/regress.sh`
 > 的 T6 按名放宽墙钟档（只放宽墙钟、不放松判据）
 > **2A/front4 既有文件零修改**；全程未 `git checkout/stash/reset`、未提交；反证用 cp 备份。
+>
+> **★ 历史台账声明（2026-10-18 补注）**：本文是 **2B-2 起（2026-09-21 第 3 轮）**的缺陷/进展台账（B1–B29），
+> 记录当时的参数与判据（早期轮次可能仍是 ROB 128/PRF 96 等，早于后续降档）。**它不是当前状态真源**：
+> 当前参数以 [`back2_params.vh`](../../rtl/back2/back2_params.vh) 为准；当前功能记录为
+> `tb_core_top_2b` 219/219、`tb_back2_iq` 151/151、`tb_back2_lockstep` 57 项/821 提交、`regress` 33/33
+> （既有记录，本次未重跑）。2B 的 arch-test/上板仍未完成，不要据本文声称已验收。
 
 ---
 
@@ -1295,7 +1301,7 @@ TB_BACK2_LOCKSTEP: PASS
 |---|---|
 | 容量 | **LQ 32 + SQ 32**（`BACK2_STQ_N`/`OUT_N` 需扩为 32；索引位宽随之 +1） |
 | load 乱序 | E1 生成地址后入 LQ，可**乱序执行/乱序写回**；写回按 tag 匹配归属（单端口响应 + `ld_tag`） |
-| store 提交排空 | 仅按 ROB 提交序在提交点逐条排空到存储器；**单 AXI 在途 + 归属寄存器**纪律（AGENT.md §3.3 三件套） |
+| store 提交排空 | 仅按 ROB 提交序在提交点逐条排空到存储器；**单 AXI 在途 + 归属寄存器**纪律（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3 三件套） |
 | store→load 转发 | 完整字节掩码语义：部分重叠**逐字节**取"更年轻的更老 store"（现有 §2.2 归约已成雏形，扩到 32 项） |
 | 违序闸门 | 年轻 load 仅在**地址已证不相交**时越过年老 store；存在未定址更老 store ⇒ 保守闸门（**B28 的 `INORD_LOAD` 教训**必须保留） |
 | 口径保持 | B24（`size` = log2 字节数）、B27（窗口算术、禁掩码写法）、B29（提交级 CSR）**均不得回退** |
@@ -5766,7 +5772,7 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
 
 ## B4.49.2 §4 红线口径决策：**选 IP（XPM/BMG + ifdef 双分支）**，并给出由此**必然导出**的架构
 
-* **检索过程与结论（AGENT.md §4.1/§4.2 要求）**：
+* **检索过程与结论（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §4.1/§4.2 要求）**：
   1. Vivado 存储 IP（BMG / XPM `xpm_memory_*`）**只有同步读**，**没有组合读**的存储 IP
      —— 本仓库已有同口径先例与记录：`rtl/front4/bpu_local_hist.v` 头注明确写"**IP 检索结论**：
      无组合读存储 IP ⇒ 该表用可综合 HDL + `ram_style=\"distributed\"`（LUTRAM 推断，非触发器阵列）"；
@@ -5866,7 +5872,7 @@ C3' 不一致：DUT `0x00001808` vs 黄金 `0xffffe7dc`（rd=17）。失败指�
   `re/roff → rdata`（同步读 1 拍）。
 * **同拍写+读口径**：`WRITE_MODE_A="read_first"`（行为模型同口径：读旧值）。本设计满足前提——
   窗口预取读的是"已写入 ≥1 拍"的旧项，新分配项当拍不读。
-* **IP 口径（AGENT.md §4.1/§4.2）**：综合分支 `ifdef RV32GC_USE_VIVADO_IP` 例化 **`xpm_memory_sdpram`**
+* **IP 口径（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §4.1/§4.2）**：综合分支 `ifdef RV32GC_USE_VIVADO_IP` 例化 **`xpm_memory_sdpram`**
   （Vivado 原生 XPM 存储 IP，**无需生成 .xci、无需改 `synth.tcl`**）；仿真分支为**逐拍等价行为模型**
   （与 `rtl/front4/front4_mem.v` 完全同构，宏名同款）。参数/端口名逐字对齐 Vivado 2023.2 XPM 源码。
 * **自检**（`parameter CHK`，默认关 ⇒ 综合零成本；行为分支内）：写后逐位比对，覆盖 bank 边界。

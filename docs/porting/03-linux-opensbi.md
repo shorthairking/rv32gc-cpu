@@ -6,6 +6,8 @@
 > - OpenSBI：本机 `opensbi/`（上游，generic 平台）
 > - **参考**上游：`linux/`（**7.3.0-rc2**）[RTL 实测] `linux/Makefile:2-5`
 > **纪律**：上游源码树**不复制**进本项目；用"新增文件 + 补丁序列 + 构建脚本"管理，版本号记录在 `sw/*/UPSTREAM.md`。
+>
+> **当前基线（2026-10-18，先读）**：实际 Linux 移植基线已切到工作区 [`linux/`](../../../linux/)（**7.3.0-rc4**，见 [`sw/linux/UPSTREAM.md`](../../sw/linux/UPSTREAM.md)），不是 `la32r-Linux/` 5.14；下文 §3 对 `la32r-Linux` 的对照仅作历史参考。OpenSBI 为上游 `opensbi/` 的 generic + FW_JUMP（见 [`sw/opensbi/UPSTREAM.md`](../../sw/opensbi/UPSTREAM.md)）。运行期证据来自 **QEMU chiplab machine**，真板未验。
 
 ---
 

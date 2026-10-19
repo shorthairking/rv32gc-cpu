@@ -3,6 +3,11 @@
 > 一句话：**同一条 ELF** 同时喂给 DUT（iverilog 跑 `core_top`）与本机 Spike，
 > 以"指令提交"为单位**逐条比对 PC 与 rd 写值**，首个分歧点定位并打印上下文；
 > 全部一致 ⇒ 唯一一行 `LOCKSTEP: N/N PASS`，否则非零退出且**无 PASS 兜底**。
+>
+> **范围（2026-10-18，先读）**：本目录是 **2A 整数锁步**（DUT=`rtl/top/core_top.v`，不比对浮点/CSR/访存字段）。
+> **2B 锁步不在本目录**：2B 入口是 `sim/unit/tb_back2_lockstep.sv`（既有记录 57 项/821 提交，随 `scripts/regress.sh` 跑），
+> 它对 2A 顺序核 + front4/back2 双核同映像比对；两者不要混用。2A arch-test 于 2026-09-17 收口，
+> 但 D2/D6 共享 RTL 修复后未重跑本底座，旧 PASS 不自动代表 `7e2e730`。
 
 ---
 
@@ -29,7 +34,7 @@ cd rv32gc-cpu
 
 - `--min-commits N`：比对条数下限（默认 60；`csr_hazard` 自动降到 10）。
 - 失败路径：`LOCKSTEP_RUN: FAIL …` / `CMP_DIVERGENCE: 第 N 条：…` / `CMP_ERROR: …`，
-  一律非零退出，**且输出里不含 `PASS` 字样**（避免 `AGENT.md §0.6` 点名的"假 PASS"）。
+  一律非零退出，**且输出里不含 `PASS` 字样**（避免 [工作契约](../../AGENT.md) 的“验收纪律”点名的“假 PASS”）。
 
 ## 3. 结构：DUT 侧怎么跑起来
 
@@ -87,7 +92,7 @@ spike --instructions=4096 --pc=0x1C000000 -l --log-commits --log=build/spike.tra
 |---|---|
 | 加 `--pc=0x1C000000` | 不给 `--pc` 时 Spike 先跑内置 boot ROM（`0x1000` 起 5 条）再跳 ELF 入口，轨迹前 5 条无法与 DUT 对齐 |
 | `-m` 三个区域（而非只有 `0x80000000`） | ① `0x1C00_0000`：跳转桩（DUT 复位取指处）；② `0x8000_0000`：任务指定的仿真布局；③ `0x1FE0_0000`：UART 结束铃——**不映射它**时 Spike 在结束铃那条 store 上取 access fault 就停了（实测），双方跑不到同一点 |
-| `--log-commits` 配 `--log=<file>` | 本机实测：给了 `--log=` 时 commit 行**落在文件里**（与 `AGENT.md §3.1`"输出在 stderr"的旧口径并存——不给 `--log=` 时确实在 stderr）。`--log` 文件里**反汇编行与 commit 行交错**，比对器按正则挑 commit 行 |
+| `--log-commits` 配 `--log=<file>` | 本机实测：不给 `--log=` 时 commit 行走 **stderr**；给了 `--log=` 时 commit 行**落在文件里**（与反汇编行交错）。比对器按正则挑 commit 行 |
 | `--instructions=4096` | 程序末尾是死循环；DUT 侧由 `TERM_PC` 终止，Spike 侧用上限兜底 |
 | ELF 里多一个 `0x1C00_0000` 段 | 见 §3.1：`RESET_PC` 固定 + 禁止 RTL 别名 ⇒ 必须用 2 条桩跳进仿真布局 |
 | 自写 `link.ld`（不用 `-Ttext=`） | 实测本机 ld 对 `-Ttext=0x80000000` 会把 LOAD 段起点页对齐回退到 `0x7FFF_F000`，Spike 加载报 `Access exception … 0x7ffff000 is invalid` |

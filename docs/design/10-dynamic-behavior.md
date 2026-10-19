@@ -6,6 +6,9 @@
 > （确定性判定，fail-closed）。
 > **原始数据**：`fpga/scratch/dyn/{lockstep,ipc,core_top_2b}.csv`。
 > **服务决策**：6→3 集群 IQ / PRF operand collector / ROB 稀疏更新。
+>
+> **★ 数据快照声明（2026-10-18 补注）**：本报告是 **2026-10-01（C2 IQ 深度 68→50 之后）**的动态数据，20 基准/49,116 拍，**不是 `7e2e730` 的最新测量**；之后 RTL 又有 NREG 96→64、LQ 16→8、commit 4→2、FMA 共享、转发移除等变化。报告数据保留原样，不得改造成"最新"。
+> 当时的服务决策中，**IQ 6→3（EXP-C）与 operand collector（EXP-A）后续均实测为负收益并回退**，不是当前方案；ROB 稀疏更新方向也未按本报告落地。现行状态/待办见 [`NEXT_SESSION.md`](../../NEXT_SESSION.md)，现行参数见 [`back2_params.vh`](../../rtl/back2/back2_params.vh)。
 
 ## 0. 口径
 

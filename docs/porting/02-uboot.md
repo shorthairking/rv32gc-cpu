@@ -375,9 +375,9 @@ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j16
 | §3.1 board 目录 `board/<vendor>/rv32gc/` | 实际落点 **`board/loongson/chiplab/`**；`dram_init` 不自己写，用 `arch/riscv/cpu/generic/dram.c` 从自带 DTS `/memory` 取，板级只做 bank 与平台事实的对账（`chiplab.c:board_init`） |
 | §3.2 defconfig 名 `rv32gc_defconfig` 与其中条目 | 实际 **`chiplab_rv32_defconfig`**；`CONFIG_RISCV_SMODE=y` ✔、`RISCV_M_MODE` 未出现 ✔；**`CONFIG_SYS_NAND_SELF_INIT=y` 写进 defconfig 会被静默丢弃**（隐藏符号），改由板级 `select` |
 | §3.3 DTS 节点清单（cpus/memory/chosen/UART/NAND） | **已落地**（另加 CLINT/PLIC/SPI XIP）；`timebase-frequency` 放在 `/cpus`（CPU 驱动先查 hart 节点、再回退父节点） |
-| §3.4/§3.5 NAND 驱动、`saveenv`、`bootcmd` 自动启动 | **未完成**：defconfig/DTS 只做编译期预留（`MTD`/`MTD_RAW_NAND`/`CMD_NAND`/`ENV_IS_IN_NAND`，NAND 节点 `status="disabled"`，板级提供弱 `board_nand_init()` 空桩）；驱动与寄存器语义见 `docs/porting/04-nand-driver.md` 与 PF §4/§9(U1,U2) |
+| §3.4/§3.5 NAND 驱动、`saveenv`、`bootcmd` 自动启动 | **已更新（2026-10-18）**：B-3/B-4/B-5 + E6–E8 已完成，`mtd`/`saveenv`/`bootcmd`/冷启在 **QEMU chiplab machine** 上通过；真板未验。驱动/寄存器语义见 [`04-nand-driver.md`](04-nand-driver.md) §10–§11 与 `platform-facts` §4/§9 |
 | §4.1 构建命令与 GCC 兼容风险 | 命令更新为 `make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- chiplab_rv32_defconfig && make ...`；GCC16 风险 **无**（8.3） |
-| §4.2 验收 U1–U7 | U1（defconfig 无符号丢失）：**已按"逐条在 `.config` 里回查"完成**（`savedefconfig` 只省默认值，不能当丢符号判据）；U2（无 `RISCV_M_MODE`）：✔（脚本 §4）；U3（产出 `u-boot.bin`）：✔；U4–U7（NAND 识别/`mtdparts` 一致/`saveenv` 掉电保持/自动启动）：**待 NAND 驱动与上板** |
+| §4.2 验收 U1–U7 | U1（defconfig 无符号丢失）：**已按"逐条在 `.config` 里回查"完成**；U2/U3：✔；**U4–U7（NAND 识别/`mtdparts`/`saveenv`/自动启动）已更新：QEMU 全 PASS，真板仍待**（见 §8.7 与 `04-nand-driver.md` §11） |
 | §5 与 `arch/la32r`、`la32rsoc_defconfig` 的边界 | **不再适用**（新树无这些对象）；新边界＝只新增文件 + 2 处挂接改动（8.4），改上游文件须写清理由 |
 | §6 风险 R1–R6 | R4（GCC16 兼容）**关闭**；R2（NAND 控制器寄存器全表）**仍在**（PF §9 U1/U2）；R3（`TEXT_BASE` 取值）按下述约定定：`0x0200_0000`（S 模式运行在 DDR3，由 OpenSBI 装载，**不走 SPI XIP**） |
 
@@ -394,8 +394,7 @@ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j16
 
 ### 8.7 遗留 / 风险（本次新增）
 
-1. **无 qemu 冒烟**：本机 `qemu-system-riscv32` 缺失（`which` 实测），B-1/B-2 只到构建级；
-   且本板 DTS 是真实平台地址，`-M virt` 无法等价验证（详见 `u-boot/board/loongson/chiplab/README` §遗留）。
+1. **QEMU 冒烟已完成（2026-10-18 更新）**：`qemu-system-riscv32 -M chiplab` 已可用，B-3/B-4/B-5 + E6–E8 在 QEMU 上全 PASS（见工作区 `../../../docs/chiplab-qemu/`）；本板 DTS 是真实平台地址，`-M virt` 仍不能等价验证。**真板未验**。
 2. **宿主机缺 `libgnutls28-dev`**：影响 `make tools`（`mkeficapsule`）。本项目**不装系统包、不提权**，
    在 defconfig 中 `# CONFIG_TOOLS_MKEFICAPSULE is not set` 以保持 `defconfig && make` 两条命令可复现。
 3. **CLINT/PLIC 地址无平台 RTL 佐证**（PF §9 U8）：DTS 已按 `0x1F00_0000`/`0x1F10_0000` 登记，
@@ -403,4 +402,6 @@ make ARCH=riscv CROSS_COMPILE=riscv32-unknown-linux-gnu- -j16
 4. **`riscv,isa` 用传统字符串**（`rv32imafdc_zicsr_zifencei_zicntr_zicbom`）；Linux 阶段如需
    `riscv,isa-base` + `riscv,isa-extensions` 再补，须与核实际实现逐条对齐。
 5. **UART 窗口内偏移 `+0x1E0` 含转述成分**（PF §2.5/§9 U3）；上板首轮若串口无声，按 U3 反查 APB 从口译码。
-6. **NAND 路径未通**：`saveenv`/`nand`/`mtdparts` 目前不可用（§3.4/§3.5 待做）。
+6. **NAND 路径（2026-10-18 更新）**：`saveenv`/`nand`/`mtdparts`/冷启在 QEMU chiplab machine 上已可用；**真板未验**（见 §8.5 行与 [`04-nand-driver.md`](04-nand-driver.md) §11）。
+
+> 本节其余条目保留 2026-09-21 的记录时点；已更新项在文中标了日期。QEMU 通过不等于真板验收。

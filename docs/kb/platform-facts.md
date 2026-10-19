@@ -197,27 +197,29 @@
 
 ---
 
-## 8. chiplab 工作树 dirty 状态快照
+## 8. chiplab 工作树 dirty 状态快照（2026-10-18 实测）
 
-采集命令：`git -C chiplab status --porcelain`。[环境实测]
+采集命令：`git -C chiplab status --porcelain`。[环境实测 2026-10-18]
 
-**当前分支**：`chiplab_diff`。[环境实测] `git -C chiplab branch` → `* chiplab_diff`
+**当前分支**：`chiplab_diff`；**HEAD `602c8d2`（2026-09-20 "M5 集成: 33MHz 同域接线 + 核 rtl×38/IP×5 入工程 + 平台构建脚本"）**。[环境实测]
 
-**已跟踪文件的修改（`M`，共 4 项）**：
+**当前已跟踪修改（1 项）**：`fpga/loongson/2023.2/system_run.xpr`（Vivado 工程文件回写）。
+**当前未跟踪（117 项）**：`IP/xilinx_ip/2023.2/axi_2x1_mux/` 下的 IP 产物（`.dcp`/`.xml`/`*_clocks.xdc`/`*_ooc.xdc`/`*_sim_netlist.v[hdl]`/`*_stub.v[hdl]` 等）。
 
-| 文件 | 处置 |
+> 下表是 **2026-09-14 的历史快照**（当时 4 项 modified）；其中 `soc_top.v` 等已随 M5 集成提交/回退变化，**不再代表当前工作树**，保留仅作追溯。
+
+**历史快照（2026-09-14）**：
+
+| 文件 | 当时状态 |
 |---|---|
-| `chip/soc_demo/loongson/soc_top.v` | **modified** —— 含 §5 的 33 MHz 方案改动；**处置：用户已定（2026-09-14），已回退干净基线（见下）** |
+| `chip/soc_demo/loongson/soc_top.v` | modified（33 MHz 方案改动） |
 | `IP/xilinx_ip/2023.2/axi_clock_converter_0/axi_clock_converter_0.xcix` | modified |
 | `IP/xilinx_ip/2023.2/mig_axi_32_loongson/mig_axi_32.xci` | modified |
-| `fpga/loongson/2023.2/system_run.xpr` | modified（Vivado 工程文件，工具回写） |
-
-**未跟踪文件（`??`）**：`IP/xilinx_ip/2023.2/axi_2x1_mux/` 下的一批 IP 产物（`.dcp`/`.veo`/`.vho`/`.xml`/`*_clocks.xdc`/`*_ooc.xdc`/`*_sim_netlist.v[hdl]`/`*_stub.v[hdl]`/`doc/`/`hdl/`/`sim/`/`simulation/`/`synth/`）。
+| `fpga/loongson/2023.2/system_run.xpr` | modified（工具回写） |
 
 **处置口径**：
 
-1. **用户已定（2026-09-14）：chiplab 工作树已回退干净基线** —— HEAD `a2e11b3`，`git status --porcelain` 为 **0 dirty**；原接线 `clk_out1=cpu_clk`(50 MHz)/`clk_out2=uncore_clk`(33 MHz) 已恢复。不采用旧项目任何修改。
-   - **沿用提示**：上述「§8 快照」按其采集时点记录，回退后**已不反映当前状态**；当前状态以本条为准。
+1. **2026-10-18 实测**：工作树仍 dirty（1 modified + 117 untracked）；处置待用户裁决，不擅自清理。历史 2026-09-14 的"已回退到 a2e11b3、0 dirty"记录**已被后续 M5 集成覆盖**，不再当作当前状态。
 2. **用户许可**：**本项目可不受限制地按需修改 chiplab**（含 `soc_top.v` 与 `intrpt` 扩展）——原先「不动 chiplab 任何文件」的红线**已由用户裁决解除**。
 3. `soc_top.v` 的 33 MHz 改动若后续仍需要，按第 2 条就地修改即可并记录为"平台补丁"。
 4. **本节只做快照与登记，不做任何写操作。**
@@ -233,8 +235,8 @@
 | U3 | **UART 基址偏移** `0x1FE0_01E0` 的平台侧常量出处 | mux 只译到高 16 位；偏移无 RTL 显式常量 | 查 APB 顶层与 UART 模块的 `PADDR` 截取（`apb_dev_top_with_nand.v:364` 用了 `apb_uart0_addr[7:0]`） |
 | U4 | **NAND 基址偏移** `0x1FE7_8000` 的平台侧常量出处 | 同上；`nand.v` 只看 `ADDR[10:0]` | 查 APB 顶层的从口译码逻辑 |
 | U5 | `intrpt` **仅 [4:0] 有效**时，外部中断如何映射到 mip | 平台 `{3'b0, int_out[4:0]}`（`soc_top.v:726`） | 核内 mip/PLIC 设计时确定映射表 |
-| U6 | **Spike 参考模型缺失** | 工作区内无 Spike 源码/二进制 | 重新取源码并编译（见 `docs/kb/tools-and-flow.md`） |
-| U7 | `fpga/run_vivado_batch.sh` **尚未创建** | `rv32gc-cpu/fpga/` 目录不存在 | 建统一 Vivado 批处理入口（三坑封装） |
+| U6 | **Spike 参考模型** | **已关闭（2026-10-18）**：`/opt/riscv/bin/spike` 1.1.1-dev 可用；arch-test/锁步均指向它 | 使用口径见 [`tools-and-flow.md`](tools-and-flow.md) §6 |
+| U7 | **`fpga/run_vivado_batch.sh`** | **已关闭**：统一入口已落地（2026-09-18），封装三坑 | 见 [`tools-and-flow.md`](tools-and-flow.md) §3"三坑统一入口" |
 | U8 | CLINT/PLIC 基址（`0x1F00_0000`/`0x1F10_0000`）无平台 RTL 佐证 | 仅有旧项目口径 | 核内译码实现时拍板并写入 `rtl/pkg/*defs.vh` |
 | U9 | 33 MHz 派生时钟是否需额外 `create_generated_clock` | `soc_up.xdc` 只有板级 10 ns 约束 | 跑实现后看时序报告/时钟交互报告 |
 
@@ -243,6 +245,6 @@
 ## 10. 使用本清单的纪律
 
 1. 本文任何一条**在写进设计文档前**，若为 [旧项目转述]，必须先尝试升级为 [RTL 实测]；无法升级的，在引用处**保留 [旧项目转述] 标注**。
-2. 平台源码**只读**：不得修改 `chiplab/` 下任何文件（含本节提到的 dirty 文件）。
+2. 平台源码**默认只读**；但用户已裁决本项目可按需修改 chiplab（见 §8 处置口径第 2 条）——任何修改必须作为"平台补丁"记录并同步本台账，不得悄悄改。
 3. 位域/端口契约的唯一真源是 `config.h:46-100`（平台侧）与本项目 `rtl/pkg/*defs.vh`（本项目侧）；两侧改动必须同步。
 4. 新增事实一律追加到本文对应小节，**不新建平行清单**，避免口径分叉。

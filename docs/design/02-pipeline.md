@@ -2,6 +2,8 @@
 
 > 本文属 RV32-GC 新项目（`rv32gc-cpu/`，`dev` 分支）阶段一微架构设计文档集（01–04）第 2 篇。顶层端口契约与地址/时钟口径见 `docs/design/01-overview-datapath.md`；乱序后端细节见 `docs/design/03-out-of-order.md`；预测器结构见 `docs/design/04-predictor.md`。
 > 本文不复制上一代（`master` 分支冻结历史）实现的任何文字、图或参数组织。
+>
+> **现行口径（2026-10-18）**：本文是**流水线设计目标**。4 路取指/译码/重命名/派发/发射与 11 级框架仍是当前 2B 的主干；但 **提交宽度原目标 4 条/拍 → 当前 2 条/拍**（`BACK2_ALLOC_W=4`、`BACK2_COMMIT_W=2`），ROB 原目标 128 → 当前 **64**。实际参数以 [`rtl/back2/back2_params.vh`](../../rtl/back2/back2_params.vh) 为准；下文凡写"提交 4/ROB 128"处均按**原设计目标**阅读。
 
 ---
 
@@ -9,12 +11,12 @@
 
 | 项 | 设计值 | 来源 |
 |---|---|---|
-| 流水级数 | **11 级**（硬性下限 ≥5 级） | `AGENT.md` §1 |
-| 发射宽度 | **4 发射超标量** | `AGENT.md` §1 |
-| 执行部件 | **6 个**：ALU×2、BRU、MDU、LSU、FPU | `AGENT.md` §1 |
+| 流水级数 | **11 级**（硬性下限 ≥5 级） | [工作契约](../../AGENT.md) 的"硬指标" |
+| 发射宽度 | **4 发射超标量** | [工作契约](../../AGENT.md) 的"硬指标" |
+| 执行部件 | **6 个**：ALU×2、BRU、MDU、LSU、FPU | [工作契约](../../AGENT.md) 的"硬指标" |
 | 前端 | **顺序、4 路**（F1–D3） | 本文 §2 |
 | 后端 | **乱序、分布式发射**（I1–W1） | `docs/design/03-out-of-order.md` |
-| 提交 | **顺序、每拍 ≤4 条**，ROB 128 项 | `AGENT.md` §1 |
+| 提交 | **顺序、每拍 ≤4 条**（原目标），ROB 128 项（原目标） | `AGENT.md` 原硬指标表；**当前 2B：2 条/拍、ROB 64**，见 `back2_params.vh` |
 | 主频 | 上板 33 MHz（单时钟域，无 CDC） | `docs/design/01-overview-datapath.md` §7.1 |
 
 **为什么选 11 级而不是 5 级**：乱序后端要求「重命名 → 发射队列 → 读寄存器堆 → 执行 → 写回」每步都有独立流水站，否则唤醒-选择-读寄存器的组合链会直接压在关键路径上；同时 4 路取指要求 I-Cache 命中路径至少两级（索引 + 读出/Tag 比较）才能容纳 32 B/拍的指令带宽与跨行拼接。两者相加给出 11 级。代价是分支误判惩罚变长（F1 重定向时最多丢弃 10 级），因此**预测器准确率是本文性能口径的核心依赖**（`docs/design/04-predictor.md`）。
@@ -48,7 +50,7 @@ flowchart LR
     style W1 fill:#ffe9e9,stroke:#aa3333
 ```
 
-**分级归属**：F1–F4 属 `rtl/ifu/` + `rtl/bpu/` + `rtl/cache/l1i`；D1–D2 属 `rtl/idu/`；D3 属 `rtl/dispatch/`；I1–I2 + E1 + W1 属 `rtl/exu/`、`rtl/lsu/`、`rtl/rob/`。跨级信号位宽全部在 `rtl/pkg/rv32gc_defs.vh` 定义一次（`AGENT.md` §3.2）。
+**分级归属**：F1–F4 属 `rtl/ifu/` + `rtl/bpu/` + `rtl/cache/l1i`；D1–D2 属 `rtl/idu/`；D3 属 `rtl/dispatch/`；I1–I2 + E1 + W1 属 `rtl/exu/`、`rtl/lsu/`、`rtl/rob/`。跨级信号位宽全部在 `rtl/pkg/rv32gc_defs.vh` 定义一次（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2）。
 
 ---
 
@@ -72,7 +74,7 @@ flowchart LR
 | 功能 | 用 `fetch_pc` 查询 BTB（预测目标 + 预测器索引）与 RAS（返回地址栈顶）；锦标赛预测器的 Gshare/局部历史/选择器查表在此级发起 |
 | 输入 | `fetch_pc` |
 | 输出 | `btb_hit`、`btb_target`、`bht_dir`（三表投票结果，见 `04-predictor.md` §3）、`ras_top`/`ras_hit` |
-| 冒险点 | BTB/RAS 存储用 **Vivado Block Memory Generator IP + `ifdef` 仿真行为模型双分支**（`AGENT.md` §4 红线 1/2）；同步读 ⇒ 预测结果在 F2 末可用，F1 使用上一拍的结果（见 §4.2） |
+| 冒险点 | BTB/RAS 存储用 **Vivado Block Memory Generator IP + `ifdef` 仿真行为模型双分支**（[工作契约](../../AGENT.md) 的"编码红线"）；同步读 ⇒ 预测结果在 F2 末可用，F1 使用上一拍的结果（见 §4.2） |
 
 ### 3.3 F3 — L1I 索引
 
@@ -135,7 +137,7 @@ flowchart LR
 | 功能 | 读物理寄存器堆获取源操作数；对同拍/前拍写回结果做**旁路选择**；对尚无数据的源保持等待标记 |
 | 输入 | I1 的 `uop` 的物理寄存器号、写回端口、旁路网络 |
 | 输出 | 源操作数 A/B、ready 标志 |
-| 冒险点 | **旁路/转发网络是最常见缺陷源**，本设计强制覆盖三处（`AGENT.md` §3.3）：<br/>① **写优先寄存器堆**：物理寄存器堆写口与读口同址时，**写数据直通读口**（同拍旁路），不依赖「先写后读」的时序假设；<br/>② **MEM 级转发**：load 的结果在 E1/W1 之间生成，必须在下一拍 I2 被旁路，否则依赖它的指令会读到旧值；<br/>③ **CSR/MPRV/SUM/MXR 同拍旁路**：CSR 写与随后访问该 CSR 的指令之间不做流水线互锁，靠同拍旁路；`mstatus.MPRV`/`SUM`/`MXR` 的更新必须在**同一拍**对 LSU 的权限判定可见。<br/>另：**`xRET` 只有回到 M 以外的更低特权级时才清 `MPRV`**（`riscv-isa-manual/src/priv/machine.adoc:599-600` `norm:mstatus_mprv_clr_mret_sret_less_priv`；`MPRV=1` 时按 **`MPP`** 语义翻译与保护，`:588-597` `norm:mstatus_mprv_ldst_op`——规范**未写**"MPRV only takes effect if MPP≠M"；coverpoint `mstatus_mprv_clr_mret_sret_less_priv`，`riscv-arch-test/coverpoints/norm/Sm.yaml:393-412`） |
+| 冒险点 | **旁路/转发网络是最常见缺陷源**，本设计强制覆盖三处（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）：<br/>① **写优先寄存器堆**：物理寄存器堆写口与读口同址时，**写数据直通读口**（同拍旁路），不依赖「先写后读」的时序假设；<br/>② **MEM 级转发**：load 的结果在 E1/W1 之间生成，必须在下一拍 I2 被旁路，否则依赖它的指令会读到旧值；<br/>③ **CSR/MPRV/SUM/MXR 同拍旁路**：CSR 写与随后访问该 CSR 的指令之间不做流水线互锁，靠同拍旁路；`mstatus.MPRV`/`SUM`/`MXR` 的更新必须在**同一拍**对 LSU 的权限判定可见。<br/>另：**`xRET` 只有回到 M 以外的更低特权级时才清 `MPRV`**（`riscv-isa-manual/src/priv/machine.adoc:599-600` `norm:mstatus_mprv_clr_mret_sret_less_priv`；`MPRV=1` 时按 **`MPP`** 语义翻译与保护，`:588-597` `norm:mstatus_mprv_ldst_op`——规范**未写**"MPRV only takes effect if MPP≠M"；coverpoint `mstatus_mprv_clr_mret_sret_less_priv`，`riscv-arch-test/coverpoints/norm/Sm.yaml:393-412`） |
 
 ### 3.10 E1 — 执行
 
@@ -144,14 +146,14 @@ flowchart LR
 | 功能 | 按部件执行：**ALU0/ALU1** 整数算术逻辑；**BRU** 分支条件判定 + 目标计算（并在此产生分支误判重定向信号）；**MDU** 乘除（用 Vivado Multiplier / Divider Generator IP）；**FPU** 浮点（用 Vivado Floating-Point IP，含 FMA）；**LSU** 地址生成 + MMU 翻译 + PMP 检查 + D-Cache 访问发起 |
 | 输入 | I2 的源操作数、`uop` 控制 |
 | 输出 | 结果值、分支判定与目标、异常类型、访存请求（物理地址） |
-| 冒险点 | **BRU 在 E1 判定 ⇒ 这是分支误判惩罚的起点**（见 §5）；LSU 的**总线地址寄存器唯一赋值点、统一物理地址**（VA/PA 混用是静默错，`AGENT.md` §3.3）；非对齐检测**优先于** PMP 检查——**本设计选择**（规范**实现可选**：`norm:mcause_exccodepri2`，`riscv-isa-manual/src/priv/machine.adoc:1937-1938`）；AMO/`sc`/`cbo.zero` 通过 PMP 检查需写权限，否则恒 **cause 7**（`norm:pmp_store_fault`，`:3422-3425`；对照 `norm:pmp_load_fault`，`:3419-3422`） |
+| 冒险点 | **BRU 在 E1 判定 ⇒ 这是分支误判惩罚的起点**（见 §5）；LSU 的**总线地址寄存器唯一赋值点、统一物理地址**（VA/PA 混用是静默错，[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）；非对齐检测**优先于** PMP 检查——**本设计选择**（规范**实现可选**：`norm:mcause_exccodepri2`，`riscv-isa-manual/src/priv/machine.adoc:1937-1938`）；AMO/`sc`/`cbo.zero` 通过 PMP 检查需写权限，否则恒 **cause 7**（`norm:pmp_store_fault`，`:3422-3425`；对照 `norm:pmp_load_fault`，`:3419-3422`） |
 
 ### 3.11 W1 — 写回 / 访存 / 提交
 
 | 项 | 内容 |
 |---|---|
-| 功能 | ① 物理寄存器堆写回并广播旁路标签；② D-Cache 完成读写（含 miss 处理与访存序检查出队）；③ **ROB 顺序提交**：从 ROB 头部按程序序提交最多 4 条，写架构寄存器提交态、更新 CSR、处理精确异常与中断 |
-| 输入 | 各部件结果、ROB 头 4 项状态、LSU 完成信号、CSR 现行值 |
+| 功能 | ① 物理寄存器堆写回并广播旁路标签；② D-Cache 完成读写（含 miss 处理与访存序检查出队）；③ **ROB 顺序提交**：原设计目标为从 ROB 头部按程序序提交最多 4 条，**当前 2B 为最多 2 条**（`BACK2_COMMIT_W=2`），写架构寄存器提交态、更新 CSR、处理精确异常与中断 |
+| 输入 | 各部件结果、ROB 头待提交项状态（原目标 4 项，当前 2 项）、LSU 完成信号、CSR 现行值 |
 | 输出 | 架构寄存器提交（供 `debug0_wb_*` 探针）、CSR 更新、异常/中断触发、`ws_valid` |
 | 冒险点 | **精确异常与顺序提交**（`03-out-of-order.md` §8）；**中断只在"副作用已落地"指令之后取**——**本设计纪律**，规范**未明说**"指令边界/副作用之后"这一取点时机（最接近条文为**有界时间**评估要求 `norm:intr_mip_mie_bounded_time`、`riscv-isa-manual/src/priv/machine.adoc:1346-1358`，及 `xRET`/CSR 写后立即评估 `norm:intr_mip_mie_xret_csrwr`；WFI 侧 `:2697-2698`）；**陷阱不从高特权级委托到低特权级**（`norm:trap_never_trans_lower`，`:1281-1288`；`medeleg` 为 64-bit 寄存器 `:1234`，XLEN=32 时高 32 位经 `medelegh` 别名访问 `:1305-1309`）；`debug0_wb_rf_wen` 为 **4 bit**（每提交槽位 1 bit，`docs/design/01-overview-datapath.md` §5.7） |
 
@@ -187,7 +189,7 @@ flowchart LR
 | 发射队列写口 | 各部件队列独立写口 | 同部件多指令同拍 | 允许同拍入多条（队列深度 ≥4 的写口），仅受余量限制 |
 | ROB 写口 | 4 项 / 拍 | — | S5 |
 | LSQ 写口 | ≤4 项 / 拍 | — | S6 |
-| 提交 | 4 条 / 拍 | — | 严格顺序，遇未完成项即停（`03-out-of-order.md` §8） |
+| 提交 | 4 条 / 拍（原目标；**当前 2B 为 2 条/拍**） | — | 严格顺序，遇未完成项即停（`03-out-of-order.md` §8） |
 
 **BTB/RAS 查询与取指的一拍错位**：F2 查表（同步读）⇒ 结果在 F2 末有效；F1 在**下一拍**使用它。因此一次新取指块的预测依赖来自**上一拍同 PC 的查表**。实现上 F1 维护一个小型「预测结果随取指块携带」的管道，不做同拍组合穿透（否则 F1 的组合路径会变成长路径）。预测错误在 F4/D 级被 BTB 重查纠正（`04-predictor.md` §5）。
 
@@ -212,6 +214,7 @@ flowchart TD
     style R fill:#f3e8ff,stroke:#663399
     style CM fill:#ffe9e9,stroke:#aa3333
 ```
+> 上图是**原设计目标**（ROB128/4 提交）；当前 2B 的对应实现为 ROB64/2 提交，4 宽分配/发射不变。读图时以本文头部"现行口径"为准。
 
 **衔接的三条硬规则**：
 
@@ -245,7 +248,7 @@ flowchart TD
 **规则**：
 
 - 冲刷信号必须在**同一拍**同时送达 F1–D3 与 ROB：任何一级被漏掉都会造成"已冲刷的指令仍被提交"的静默错。
-- 重定向 PC 必须是虚拟地址（取指走 MMU）；而 **LSU 的总线地址寄存器只存物理地址**（`AGENT.md` §3.3）。
+- 重定向 PC 必须是虚拟地址（取指走 MMU）；而 **LSU 的总线地址寄存器只存物理地址**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）。
 - 冲刷期间：F1 只接受重定向 PC，不推进顺序 PC；D1–D3 的载荷全部置无效；已入 RIQ 的项不立即删除（靠 ROB 索引比较在发射时过滤），避免分布式删除逻辑。
 
 ---
@@ -283,7 +286,7 @@ flowchart TD
 | 停顿粒度 | 整块 4 路 | 保持块内顺序信息与 ROB 连续索引，简化检查点与异常恢复 | 部分派发：块内顺序被拆散，恢复逻辑复杂化 |
 | 分支判定级 | E1（BRU） | 需要操作数；提前到 D 级需投机读寄存器 | 预测级判定：无法覆盖数据相关分支 |
 | 提交宽度 | ≤4 条/拍、顺序 | 与 4 发射指标对齐；顺序提交是精确异常的前提 | 乱序提交：无法满足精确异常语义 |
-| 旁路级 | I2 读口 + 写优先 + MEM 级转发 + CSR 同拍 | 覆盖三类最容易出错的转发点（`AGENT.md` §3.3） | 只做写回旁路：MEM 级 load→ALU 转发缺失是最经典缺陷 |
+| 旁路级 | I2 读口 + 写优先 + MEM 级转发 + CSR 同拍 | 覆盖三类最容易出错的转发点（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3） | 只做写回旁路：MEM 级 load→ALU 转发缺失是最经典缺陷 |
 | RAS 修复位置 | D2 | 需要译码确认 `jalr`/`ret`（RVC 展开后） | F 级修复：无法区分 `jalr` 与普通寄存器跳转 |
 
 ---

@@ -12,6 +12,7 @@ build/
 *.fst
 *.jou
 *.log
+*.log.compile
 obj_dir/
 *.Xil/
 .vivado/
@@ -43,14 +44,19 @@ sim/tests/out/
 
 # arch-test 生成产物（参考签名/结果/ELF 均由脚本重建）
 sim/arch_test/out/
-sim/tests/out/
-sim/log/
+
+# 审计定向验证产物：run_all.sh 逐例捕获 all_*.out，negative 夹具输出 log_*.out
+# （log_*.log / ref_*.log 已由上方 *.log 忽略；vvp 已由 *.vvp 忽略）
+# 可复现源码与证据仍追踪：run_*.sh、run_one.sh、ref_calc.py、*.sv、
+# negative/ 反证夹具、README/results 与审计报告均不在忽略范围。
+sim/audit/**/validation/**/*.out
 
 # Vivado 工程/综合/实现产物（可由 fpga/tcl/*.tcl 重新生成）
 fpga/out/
 
-# 注（2026-09-14 重定位）：上一代实现文件已从磁盘移除（历史见 master 分支），
-# 本仓库 dev 分支即新项目；docs/ rtl/ sim/ sw/ fpga/ scripts/ 等目录后续按阶段重新建立并正常追踪。
+# 项目源码与测试目录正常追踪；上一代实现仅作历史追溯，不能把 master 等同旧代冻结。
+# 分支/快照身份以 AGENT.md、NEXT_SESSION.md 与 git 实际记录为准。
+# 本文件只忽略可由脚本/工具重建的生成物，不隐藏源码或测试夹具。
 
 # 散落产物（子 Agent 工作区/编译测试）
 a.out

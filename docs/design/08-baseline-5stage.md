@@ -1,9 +1,11 @@
 # 08 — 阶段二 2A：单发射顺序 5 级基线核实施规格
 
 > **本文性质**：阶段二**子阶段 2A** 的**唯一实施依据**。后续每一个 RTL 模块的派活提示词都必须引用本文对应小节；本文与代码冲突时，**以本文为准**，修改本文须先说明理由并同步受影响模块。
-> **上游依据**：`AGENT.md` §1（硬性指标）/§3（前序精简记忆）/§4（红线）；`docs/design/01-overview-datapath.md`（§5 48 端口契约、§6.2 核内截获、§6.3 XIP 旁路）；`docs/design/02-pipeline.md`（流水线与冲刷口径）；`docs/design/05-cache-memory.md`（§3 参数、§5.2 PMA 表、§7 Zicbom、§8 BRAM 双分支）；`docs/design/06-csr-privilege.md`（§2 CSR 全集、§3 位域、§6 PMP、§7 envcfg、§8 CLINT/PLIC）；`docs/design/07-verification.md`（验证金字塔、arch-test、Spike 锁步、未捕获即失败）；`docs/kb/platform-facts.md`（地址映射/AXI/时钟）；`docs/kb/isa-notes.md`（T1–T8 定版口径）；`docs/kb/tools-and-flow.md`（工具链与三坑）。
+> **上游依据**：[`AGENT.md`](../../AGENT.md)（硬指标、流程/验收、编码红线，按名称定位）；`docs/design/01-overview-datapath.md`（§5 48 端口契约、§6.2 核内截获、§6.3 XIP 旁路）；`docs/design/02-pipeline.md`（流水线与冲刷口径）；`docs/design/05-cache-memory.md`（§3 参数、§5.2 PMA 表、§7 Zicbom、§8 BRAM 双分支）；`docs/design/06-csr-privilege.md`（§2 CSR 全集、§3 位域、§6 PMP、§7 envcfg、§8 CLINT/PLIC）；`docs/design/07-verification.md`（验证金字塔、arch-test、Spike 锁步、未捕获即失败）；`docs/kb/platform-facts.md`（地址映射/AXI/时钟）；`docs/kb/isa-notes.md`（T1–T8 定版口径）；`docs/kb/tools-and-flow.md`（工具链与三坑）。
 > **不复制旧项目**：本文为重新撰写，不含旧项目（`master` 分支冻结历史）任何实现正文。
-> **事实基线（引用强度）**：本文所有平台事实均引用 `docs/kb/platform-facts.md` 的 `[RTL 实测]`/`[旧项目转述]`/`[环境实测]` 标注；ISA 语义引用 `docs/kb/isa-notes.md` 的 `path:line`。**本会话内 kb_search 对 `source:isa-manual` 检索返回异常（详见 §11 遗留）**，因此 ISA 条文一律经 `docs/kb/isa-notes.md` 二次引用，不另行编造。
+> **事实基线（引用强度）**：本文所有平台事实均引用 `docs/kb/platform-facts.md` 的 `[RTL 实测]`/`[旧项目转述]`/`[环境实测]` 标注；ISA 语义引用 `docs/kb/isa-notes.md` 的 `path:line`。**历史设计期曾出现 `kb_search` 对 `source:isa-manual` 排序异常；2026-10-18 实测已可用（见 §11 R2）**。ISA 条文仍优先经 `docs/kb/isa-notes.md` 二次引用，不另行编造。
+>
+> **状态与口径（2026-10-18）**：2A 的 M1–M5 已验收（arch-test 2026-09-17 收口 + 上板 `RV32GC-M5-OK`），本文 2A 实施口径仍是现行 2A 依据。**时点边界**：D2/D6 在 2026-10-18 改过 2A/2B 共享的 `trap_ctrl`/`csr_file`，此后**未重跑 arch-test/上板** ⇒ 旧验收不能自动当作 `7e2e730` 的 2A 结论。但 §1.2 表中 "2B = ROB 128 项" 是**原目标**：用户 2026-10-04 裁决后，2B 实作为 4 取指 + **ROB 64 + 2 宽提交**，FU/频率可调需审阅；不要再把 128/4-commit 当作 2B 硬指标。L2 256 KB 至今**未实现**（2A M6 可选、2B 未接），本文 L2 段落是后置目标。当前参数以 [`back2_params.vh`](../../rtl/back2/back2_params.vh) 为准。
 
 ---
 
@@ -33,7 +35,7 @@
 | 不做 | 归属 |
 |---|---|
 | 4 发射超标量前端（4 路取指/译码/派发） | **2B**（`01`–`04` 篇的目标架构） |
-| 乱序执行（ROB 128 项、物理寄存器重命名、分布式发射队列、LSQ） | **2B** |
+| 乱序执行（原目标 ROB 128 项、物理寄存器重命名、分布式发射队列、LSQ；**当前 2B 为 ROB64/2 宽提交**） | **2B** |
 | 锦标赛分支预测器（Gshare + 局部历史 + 选择器）、11 级流水 | **2B** |
 | L2 256 KB Cache | **2A 后置里程碑**（本文件 §2 的 M6 可选） |
 | 多 hart / SMT | 不做 |
@@ -43,13 +45,13 @@
 
 ### 1.3 2A 与 2B 的关系
 
-2A 的产物是 **2B 的黄金参考（golden reference）**：2B 的乱序后端必须与 2A 顺序核做**同激励锁步比对**（`AGENT.md` §6 阶段二验收）。因此 2A 的取指/译码/CSR/PMP/Sv32/Cache 语义必须**精确、可测、无捷径**——任何"为了先跑通而简化"的语义都必须在本文登记为**偏差**，否则 2B 会继承错误基线。
+2A 的产物是 **2B 的黄金参考（golden reference）**：2B 的乱序后端必须与 2A 顺序核做**同激励锁步比对**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §6（阶段二验收））。因此 2A 的取指/译码/CSR/PMP/Sv32/Cache 语义必须**精确、可测、无捷径**——任何"为了先跑通而简化"的语义都必须在本文登记为**偏差**，否则 2B 会继承错误基线。
 
 ---
 
 ## 2. 里程碑与验收判据
 
-五个里程碑串行推进；**每个里程碑的验收判据必须全部达成才可进入下一个**（`AGENT.md` §0.6）。
+五个里程碑串行推进；**每个里程碑的验收判据必须全部达成才可进入下一个**（[工作契约](../../AGENT.md) 的"验收纪律"）。
 
 ```mermaid
 flowchart LR
@@ -80,9 +82,9 @@ flowchart LR
 |---|---|
 | 目标 | 指令集全覆盖；M/S/U 特权、CSR、PMP 16 项、Sv32 页表全部实现并通过 arch-test 子集；与 Spike 锁步一致 |
 | 结构范围 | 完整 D（全译码表）/E（ALU/BRU/MDU/FPU）/M（访存、PMP、PTW、AMO/LRSC、`cbo.*`）/W（写回、CSR 提交、异常入口）；仍无 Cache（访问直达 AXI，DDR3 走仿真内存模型） |
-| 验收判据 | ① arch-test **非特权** rv32i/m/f/d/c + Zicsr/Zifencei/Zicntr/Zicbom 子集**全绿**（signature 比对通过，见 §8.2）；② arch-test **特权** SvPMP 的 `sv32_*` 4 个 + SvPMPZicbo/SvZicbo 的 `sv32_*` 变体全绿；③ **Spike 锁步**：`sim/lockstep/` 逐条 commit 比对到程序结束无分歧（比对字段见 §8.3）；④ 单元测试 `sim/unit/run.sh` 全绿 |
-| 测试入口 | `sim/arch_test/run.sh --suite rv32i --ext <ext>`；`sim/arch_test/run.sh --suite priv --ext sv32_pmp`；`sim/lockstep/run.sh --elf <elf>`；`sim/unit/run.sh` |
-| 前置门禁 | **Spike 必须已由用户编译安装到 `/opt/riscv/bin/spike`**（`NEXT_SESSION.md` §5.6）；未就绪则 ②③ 判据标记为 BLOCKED，不得用"跳过"充作通过 |
+| 验收判据 | ① arch-test **非特权** rv32i/m/f/d/c + Zicsr/Zifencei/Zicntr/Zicbom 子集**全绿**（signature 比对通过，见 §8.2）；② arch-test **特权** SvPMP 的 `sv32_*` 4 个 + SvPMPZicbo/SvZicbo 的 `sv32_*` 变体全绿；③ **Spike 锁步**：`sim/lockstep/` 逐条 commit 比对到程序结束无分歧（比对字段见 §8.3）；④ `scripts/regress.sh`（L0 单元 + 2B 集成，strict-skip）全绿 |
+| 测试入口 | `./sim/arch_test/run.sh --group rv32i/I --jobs 16`；`./sim/arch_test/run.sh <用例名>`；`./sim/lockstep/run.sh`；`RV32_REGRESS_STRICT_SKIP=1 ./scripts/regress.sh`（当前入口见 `docs/design/07-verification.md` §9.3） |
+| 前置门禁 | **Spike 必须已由用户编译安装到 `/opt/riscv/bin/spike`**（安装/使用见 [tools-and-flow](../kb/tools-and-flow.md) §6；历史裁决见 [历史 NEXT](../../archive/next-session-pre-workflow-2026-10-18.md) §5.6）；未就绪则 ②③ 判据标记为 BLOCKED，不得用"跳过"充作通过 |
 
 ### M3 — 加 L1I/L1D + 裸机 DDR3 内存测试
 
@@ -91,7 +93,7 @@ flowchart LR
 | 目标 | 接入 L1I 16 KB（2 路/32 B 行）与 L1D 32 KB（4 路/32 B 行），写回 + 写分配；XIP 取指绕过 L1I；裸机 DDR3 全地址读写比对通过 |
 | 结构范围 | `rtl/cache/` 落地；数据阵列 Block Memory Generator + `ifdef` 双分支（§7.3）；L1 miss path 驱动 AXI 控制器；MSHR 简化（2A 允许每侧 1 项在途，见 §5.5） |
 | 验收判据 | ① 裸机内存测试：DDR3 `0x0000_0000`–`0x07FF_FFFF` 位模式遍历（`0x00`/`0xFF`/`0x55`/`0xAA` + 每 4 KB 页首/页尾）无错，脚本显式计数判定；② XIP 旁路反证实验（§8.5）：改 Flash 内容后取指看到新内容；③ 核内 MMIO 截获反证实验：写 CLINT 前后 DDR3 对应区域**内容不变**；④ M1/M2 的全部判据在接入 Cache 后**仍然全绿**（回归不退化） |
-| 测试入口 | `sim/arch_test/run.sh --test ddr3_memtest`；`sim/unit/run.sh`（新增 cache 单元组）；`sim/arch_test/run.sh --mutate xip_bypass` |
+| 测试入口 | 当前实际入口见 `docs/design/07-verification.md` §9.3（`sim/arch_test/run.sh` + `RV32_REGRESS_STRICT_SKIP=1 ./scripts/regress.sh`）；原设计的 `--test`/`--mutate` 形态未落地 |
 
 ### M4 — Vivado 综合 / 时序
 
@@ -209,7 +211,7 @@ scripts/          # 回归入口、镜像打包、环境封装
 | | `rvmodel_macros.h` | DUT 宏（启动/结束/签名区），按 2A TB 定制 |
 | | `exclude.list` | 排除清单（sv39/sv48/sv57、RV64、未实现扩展） |
 | `sim/lockstep/` | `run.sh` | Spike 锁步入口 |
-| | `cmp_commit.py` | commit log 逐条比对器（DUT trace vs Spike stderr） |
+| | `cmp_commit.py` | commit log 逐条比对器（DUT trace vs Spike commit log：默认 stderr，给 `--log` 时为文件） |
 | `fpga/tcl/` | `synth.tcl` | 非工程模式综合（`read_verilog` + `synth_design`），定义 `RV32GC_USE_VIVADO_IP` |
 | | `impl.tcl` | 实现与报告（`report_timing_summary`/`report_utilization`） |
 | | `create_ip.tcl` | Block Memory Generator 等 IP 生成（红线 1 证据留档） |
@@ -221,7 +223,7 @@ scripts/          # 回归入口、镜像打包、环境封装
 
 ### 3.3 命名与真源纪律
 
-1. **位宽/参数只写一次**：AWSIZE/ID 位宽、地址窗口、L1 参数、PMP 项数、`RESET_PC`、cause 编码全部在 `rtl/pkg/{rv32_defs.vh, core_params.vh}` 定义；**改动先改真源再全量同步**，改完用 `grep` 核对新端口两侧都接上（`AGENT.md` §3.2）。
+1. **位宽/参数只写一次**：AWSIZE/ID 位宽、地址窗口、L1 参数、PMP 项数、`RESET_PC`、cause 编码全部在 `rtl/pkg/{rv32_defs.vh, core_params.vh}` 定义；**改动先改真源再全量同步**，改完用 `grep` 核对新端口两侧都接上（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2）。
 2. **平台侧真源**是 `chiplab/chip/soc_demo/loongson/config.h:46-100`（`docs/kb/platform-facts.md` §1.3）；本项目侧真源是 `rtl/pkg/*.vh`，两侧必须一致。
 3. **宏名固定**：`RV32GC_USE_VIVADO_IP`（综合定义、仿真**从不**定义）；`iverilog -D` 的宏值**必须写 Verilog 字面量**（`-DRESET_PC=32'h1C000000`），禁止 `0x` 形式（`docs/kb/tools-and-flow.md` §2）。
 
@@ -286,7 +288,7 @@ scripts/          # 回归入口、镜像打包、环境封装
 
 ### 4.2 端口规则
 
-1. **逐字对齐**：工程只加本项目 `rtl/**`，2A 期间**不修改 chiplab 平台文件**（`soc_top.v`/`config.h` 只读）。若后续确需扩展 `intrpt` 位宽或接线，必须先按 §6.6 的口径走用户裁决流程；用户已确认「chiplab 可改」（`NEXT_SESSION.md` §5.2），但任何改动**必须记录在案**。
+1. **逐字对齐**：工程只加本项目 `rtl/**`，2A 期间**不修改 chiplab 平台文件**（`soc_top.v`/`config.h` 只读）。若后续确需扩展 `intrpt` 位宽或接线，必须先按 §6.6 的口径走用户裁决流程；用户已确认「chiplab 可改」（[历史 NEXT](../../archive/next-session-pre-workflow-2026-10-18.md) §5.2），但任何改动**必须记录在案**。
 2. **`awlock`/`arlock` 高位显式置 0**：平台侧只接 `[0:0]`（`soc_top.v:1514/1534`），核必须自己把 `[1]` 驱动为 0。
 3. **`intrpt` 高 3 位不假设功能**：`intrpt[7:5]` 恒 0；核内**不得**对高位做"预留"设计。RISC-V 外部中断经**核内 PLIC**（§6.6），`intrpt[4:0]` 只是 PLIC 的源线输入。
 4. **`debug0_wb_rf_wen` 为 4 bit**：即使平台当前不消费它，位宽不符仍会产生端口宽度不匹配告警。2A 单发射只驱动 `[0]`，`[3:1]` 恒 0。
@@ -298,8 +300,8 @@ scripts/          # 回归入口、镜像打包、环境封装
 |---|---|---|
 | `RESET_PC` | **`0x1C00_0000`**（SPI Flash XIP 窗口） | 平台无 boot ROM（`soc_top.v:664-1885` 无例化）；`convert.c:88` 的 `@1c000000`；`common.h:9` 的 `FIRST_INST_ADDRESS 0x1c000000` |
 | XIP 取指 | **绕过 L1I**：取指物理地址命中 `PA[31:20]==12'h1C0` 或 `PA[31:16]==16'h1FE8` ⇒ uncached fetch，**不写** I-Cache Tag/Data | `01-overview-datapath.md` §6.3；XIP 无 cache 维护信号 |
-| 早期寻址 | SPI 窗口内**只用 PC 相对寻址**；跨窗口跳转用 `auipc + addi + jalr` | `AGENT.md` §3.1 |
-| 早期 MMU | **开 MMU 前禁止跨窗口跳转**；`satp.MODE=Bare` 直到引导软件备好页表 | `AGENT.md` §3.1 |
+| 早期寻址 | SPI 窗口内**只用 PC 相对寻址**；跨窗口跳转用 `auipc + addi + jalr` | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 |
+| 早期 MMU | **开 MMU 前禁止跨窗口跳转**；`satp.MODE=Bare` 直到引导软件备好页表 | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 |
 | 取指粒度 | 每次取指以 **16-bit parcel** 为单位处理；M2 后支持 C 扩展跨 parcel 拼接 | ISA 最小指令 2 B（`ialign=16`，`misa` 不置 `C` 的核则 32） |
 | 取指 PMP | 按 **16-bit parcel 逐 parcel** 检查——**本设计选择**（规范**未明说**按 2 B；规范强制的是「取指无执行权限 ⇒ instruction access-fault」与「每笔访存独立检查」） | `docs/kb/isa-notes.md` T2 |
 
@@ -418,7 +420,7 @@ flowchart LR
 | 2 | **取指 PMP 检查粒度** | **按 16-bit parcel 逐个检查** | `docs/kb/isa-notes.md` T2：规范未明说；规范强制的是「无执行权限 ⇒ instruction access fault」与「每笔独立检查」 |
 | 3 | **PMP 匹配的「整笔」边界** | 匹配项必须**覆盖该笔操作的全部字节**，否则失败；非对齐访问拆成多笔时**每笔独立**检查（允许部分副作用落地） | `norm:pmpfullmatch_required`、`norm:pmpmisalignedaccess_behavior`（`docs/kb/isa-notes.md` §3.2/§3.3） |
 | 4 | **AMO 被 PMP 拒** | **恒 cause 7**（store/AMO access fault），无论内部实现为读+写 | `docs/kb/isa-notes.md` T4 |
-| 5 | **PMP 粒度 G** | **G=0**（4 B 粒度，**NA4 可用**；`pmpaddr` 读写不做低位掩码） | 用户裁决（`NEXT_SESSION.md` §5.7）；`docs/design/06-csr-privilege.md` §6.3 |
+| 5 | **PMP 粒度 G** | **G=0**（4 B 粒度，**NA4 可用**；`pmpaddr` 读写不做低位掩码） | 用户裁决（[历史 NEXT](../../archive/next-session-pre-workflow-2026-10-18.md) §5.7）；`docs/design/06-csr-privilege.md` §6.3 |
 | 6 | **无 PMP 项匹配时** | M 模式 ⇒ 成功；S/U 模式 ⇒ **失败**（因已实现 16 项） | `norm:pmpnoentry_match` |
 | 7 | **`mtval` 取值** | 写 faulting instruction bits（**本设计选择实现**，右对齐、高位清零）；**恒写虚拟地址**（即使物理内存 access fault）；取指 PMP 失败时写**故障 parcel 的 VA** | T1、`norm:mtvalvaddrnot_paddr` |
 | 8 | **`mepc`** | 取指 PMP 违例时指向**故障指令起始地址** | `docs/kb/isa-notes.md` §3.2 末 |
@@ -588,7 +590,7 @@ flowchart TD
 
 - PLIC **源 0 保留为「无中断」**；源 1–5 对应上表。
 - **映射实现时定稿**：上表为 2A 的**默认接线口径**；最终取值**在实现 `plic.v` 时定稿**并写入设备树与 OpenSBI 平台代码（**只写一处**，不得 RTL 与软件各写一份）。
-- **允许修改 `soc_top.v`**：用户已确认 chiplab 可改（`NEXT_SESSION.md` §5.2）。若需 >5 个源，可扩展 `intrpt` 位宽，但**必须**：① 记录改动；② 同步 `config.h` 与核侧 `core_top` 端口表（§4）；③ 不得破坏 §4 的 48 端口契约基线（扩展需**显式**登记为契约变更）。
+- **允许修改 `soc_top.v`**：用户已确认 chiplab 可改（[历史 NEXT](../../archive/next-session-pre-workflow-2026-10-18.md) §5.2）。若需 >5 个源，可扩展 `intrpt` 位宽，但**必须**：① 记录改动；② 同步 `config.h` 与核侧 `core_top` 端口表（§4）；③ 不得破坏 §4 的 48 端口契约基线（扩展需**显式**登记为契约变更）。
 
 ---
 
@@ -602,14 +604,14 @@ flowchart TD
 |---|---|---|---|
 | Cache 内部的 Tag/替换/MSHR/FSM | CPU 核心内部 | **允许手写** | 属体系结构语义 |
 | **核内 AXI 主端口控制器**（五通道握手 FSM、单笔在途、突发拆分、4 K 边界） | **核内端口控制器** | **允许手写** | 它是"核与平台之间的端口控制器"，不是通用互连；2A **不引入 Vivado 互连 IP**，核直连平台（§1.1） |
-| AXI 互连、协议转换（4→1 IC）、位宽转换、DMA、FIFO、外设控制器 | 核外 | **必须复用** Vivado IP/wrapper 或平台已有模块 | `AGENT.md` §4 红线 4 |
+| AXI 互连、协议转换（4→1 IC）、位宽转换、DMA、FIFO、外设控制器 | 核外 | **必须复用** Vivado IP/wrapper 或平台已有模块 | [工作契约](../../AGENT.md) 的"编码红线" |
 
 > **红线 4 的边界声明（本设计的正式判断）**：红线 4 点名的是「从 **Cache→AXI 转换**边界开始向外」——即**互连、协议转换、DMA、FIFO、外设控制器**必须复用 IP。2A 的 AXI 主端口控制器位于**边界向内**（它是核的端口控制器，2A 核直连平台、无互连层），因此**允许手写**。**一旦 M6/L2 引入互连或协议转换，那部分必须走 Vivado IP**，并附「Vivado IP 目录检索记录 + 结论」作为红线 1/4 的证据。
 
 **控制器实现要点**：
 
 1. **五通道状态机**：AR/R、AW/W/B 各一状态机；读通道与写通道可**交替**在途（2A 允许简化：**同一时刻只允许一笔读或一笔写在途**）。
-2. **单笔在途三件套**（`AGENT.md` §3.3）：① **busy** 单笔在途标志；② **owner** 归属寄存器（记录本笔请求属于取指/D 填充/写回/CMO）；③ FSM 推进**只用 `valid && ready`**。
+2. **单笔在途三件套**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）：① **busy** 单笔在途标志；② **owner** 归属寄存器（记录本笔请求属于取指/D 填充/写回/CMO）；③ FSM 推进**只用 `valid && ready`**。
 3. **地址寄存器唯一赋值点**：总线地址寄存器只允许**一个**赋值点，且**统一使用物理地址**（VA/PA 混用是静默错）。
 4. **突发口径**：`AxSIZE=3'b010`（4 B）；`AxLEN ≤ 4'd15`（≤16 beat = 64 B）；`AxBURST` = `INCR`（`2'b01`）或 `WRAP`（`2'b10`，仅用于行填充对齐）；`AxLOCK=1'b0`（平台只接 `[0:0]`）；填充用 `AxCACHE=4'b1111`，非缓存 MMIO 用 `4'b0000`；`AxPROT=3'b010`。
 5. **4 K 边界**：一次突发**不得跨越 4 KB 边界**（AXI 强制）；控制器必须在描述符生成时拆分。
@@ -663,7 +665,7 @@ flowchart TD
 4. **BRAM 只同步读**：读延迟固定 1 拍（IP 配置**不勾** `Output Register`）；若勾了，行为模型必须补一级流水。
 5. **等价性验收**：行为模型自身必须有单元测试（`tb_cm_array.sv`），且"逐拍等价"在有 Vivado 的环境跑一次 IP 仿真对照（`07-verification.md` §2.2）。
 6. **Tag 阵列同理**（L1I/L1D 的 Tag + valid + dirty + ASID）。
-7. **禁止组合逻辑大阵列**：任何"组合读 16 KB 阵列"的写法会被退化成 ~26 万触发器（`AGENT.md` §3.3 教训）。
+7. **禁止组合逻辑大阵列**：任何"组合读 16 KB 阵列"的写法会被退化成 ~26 万触发器（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3 教训）。
 
 ### 7.4 组合逻辑风格（红线 3）
 
@@ -678,8 +680,8 @@ flowchart TD
 
 ### 8.1 单元测试入口与纪律
 
-- **入口**：`sim/unit/run.sh`（2A 的 L0 总入口）；每个模块一个 TB（§3.2 清单）。
-- **"未捕获即失败"（fail-closed）**（`AGENT.md` §0.6，旧项目假 PASS 事故的教训，**最高纪律**）：
+- **入口**：当前为 `RV32_REGRESS_STRICT_SKIP=1 ./scripts/regress.sh`（L0 + 集成）；原设计目标写 `sim/unit/run.sh`，实际未采用独立 L0 入口。每个模块一个 TB（§3.2 清单）。
+- **"未捕获即失败"（fail-closed）**（[工作契约](../../AGENT.md) 的"验收纪律"，旧项目假 PASS 事故的教训，**最高纪律**）：
   1. 脚本起始 `RESULT=fail`；**只有走完所有检查才置 pass**。
   2. **兜底/默认分支输出禁止含 `PASS` 字样**（只能 `FAIL`/`UNKNOWN`）。
   3. 退出码由**显式计数器**决定：必须 `捕获数 > 0` 且 `失败数 == 0`。
@@ -724,7 +726,7 @@ include_priv_tests: True                     # 特权子集是 M2 判据
 ```
 
 - **编译器名差异是硬事实**：本机工具链前缀是 `/opt/riscv/bin/riscv32-unknown-linux-gnu-`（GCC 16.1.0，`docs/kb/tools-and-flow.md` §1），官方配置期望 `riscv64-unknown-elf-*` ⇒ **必须改写**，否则编译阶段直接失败。
-- **`ref_model_exe`**：官方默认 `sail_riscv_sim`；本项目用 **Spike**，需改指向 `/opt/riscv/bin/spike`（用户编译安装，`NEXT_SESSION.md` §5.6/§6.5）。
+- **`ref_model_exe`**：官方默认 `sail_riscv_sim`；本项目用 **Spike**，需改指向 `/opt/riscv/bin/spike`（用户编译安装；安装/使用口径见 [tools-and-flow](../kb/tools-and-flow.md) §6，历史裁决见 [历史 NEXT](../../archive/next-session-pre-workflow-2026-10-18.md) §5.6/§6.5）。
 - **`link.ld`**：源配置的 `RAM_ORIGIN = 0x80000000`（实测）—— 这是 **sail/Spike 习惯布局**，**不是本平台布局**。arch-test 专用 `link.ld` 必须与本核可执行位置一致：**仿真环境**允许用 `0x8000_0000` 的仿真内存模型（`07-verification.md` §4.3 方案 2），或给 Spike 传 `-m0x00000000:0x08000000,...` 统一到平台 DDR3 布局（**推荐，方案 1**）。**禁止**在生产 RTL 里放 `0x8000_0000` 别名逻辑。
 - **MARCH 精确性**：Zicbom 用例的 `MARCH` 是 `rv32i_zicbom_zicsr_zifencei`，**必须写全**（含 `_zicsr_zifencei`），否则 CSRRW/FENCE.I 侧缺扩展。
 
@@ -776,18 +778,18 @@ riscv-arch-test/tests/env/encoding.h:32             #define MSTATUS_FS 0x0000600
 
 ### 8.3 Spike 锁步
 
-- **前置门禁**：**Spike 必须已由用户在沙箱外编译安装到 `/opt/riscv/bin/spike`**（`NEXT_SESSION.md` §5.6；编译步骤见 `§6.5`）。未就绪 ⇒ M2 判据 ③ 标记 **BLOCKED**，**不得**用"跳过/稍后补"充作通过（`07-verification.md` §9.2 的门禁纪律）。
+- **前置门禁**：**Spike 必须已由用户在沙箱外编译安装到 `/opt/riscv/bin/spike`**（安装/使用见 [tools-and-flow](../kb/tools-and-flow.md) §6；历史裁决见 [历史 NEXT](../../archive/next-session-pre-workflow-2026-10-18.md) §5.6/§6.5）。未就绪 ⇒ M2 判据 ③ 标记 **BLOCKED**，**不得**用"跳过/稍后补"充作通过（`07-verification.md` §9.2 的门禁纪律）。
 - **调用口径**：
   ```
   spike --instructions=100000000 -l --log-commits --log=<tracefile> \
         --isa=rv32imafdc_zicsr_zifencei_zicntr_zicbom -m0x00000000:0x08000000,...
   ```
-  - **`--log-commits` 输出在 stderr**（`AGENT.md` §3.1）⇒ 重定向必须 `2> <logfile>`，不能只写 `>`。
-  - `--log=<file>` 是**完整指令轨迹**，与 `--log-commits` 是两份不同产物，**不要混用**。
-  - `--isa` 字符串**必须按本项目实际实现的扩展**写（`rv32imafdc_zicsr_zifencei_zicntr_zicbom`）；不在其中的扩展不得出现（否则 Spike 拒绝启动）。注意官方 arch-test 配置用的是 `rv32imafd_zicclsm_zicsr_zifencei_zicntr_zaamo_zalrsc`（`zaamo`/`zalrsc`/`zicclsm` + `_zicbom` 的写法；见 `NEXT_SESSION.md` §6.5），**实现时以 Spike 实际接受的字符串为准并记录**。
+  - **`--log-commits` 默认走 `stderr`；同时给 `--log=<file>` 时 commit 行写入该文件**（与反汇编行交错）⇒ 重定向前先确认实际走的是哪一路，不能一概写 `2>`。
+  - 同时开启时，**反汇编与 commit 行共用 `--log` 文件**；比对器按 commit 格式筛选，**不假定存在另一份 stderr 提交轨迹**。
+  - `--isa` 字符串**必须按本项目实际实现的扩展**写（`rv32imafdc_zicsr_zifencei_zicntr_zicbom`）；不在其中的扩展不得出现（否则 Spike 拒绝启动）。注意官方 arch-test 配置用的是 `rv32imafd_zicclsm_zicsr_zifencei_zicntr_zaamo_zalrsc`（`zaamo`/`zalrsc`/`zicclsm` + `_zicbom` 的写法；见 [07-verification](07-verification.md) §4.1），**实现时以 Spike 实际接受的字符串为准并记录**。
   - 内存映射：给 Spike 传与 DUT 一致的物理布局（推荐 `-m0x00000000:0x08000000,...` 对齐平台 DDR3），避免"Spike 用 `0x8000_0000`、DUT 用 `0x0`"的伪分歧。
 - **比对器 `cmp_commit.py`**：以**指令提交（retire）**为单位，逐条比对 `pc`、指令位、目的寄存器号与写回值、访存地址与数据、CSR 变更（Spike commit log 中含 CSR 变更）。首个分歧点必须打印**前后 20 条上下文**，并以非零退出码结束。
-- **参考模型自身失败的排除**：先用 `grep -l FAILED <日志目录>` 排除"参考模型自己失败"，再判定 DUT（`AGENT.md` §3.2）。
+- **参考模型自身失败的排除**：先用 `grep -l FAILED <日志目录>` 排除"参考模型自己失败"，再判定 DUT（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2）。
 - **锁步范围**：M2 起对所有通过 arch-test 的 ELF 与定向测试程序做锁步；**2A 的锁步结果同时是 2B 的对照基线**。
 
 ### 8.4 裸机内存测试（M3）
@@ -850,10 +852,10 @@ riscv-arch-test/tests/env/encoding.h:32             #define MSTATUS_FS 0x0000600
 | # | 项 | 状态 | 说明 / 处置 |
 |---|---|---|---|
 | R1 | **`cbo.zero` 属 Zicboz，2A 指令集清单只列 Zicbom** | **待用户/母 Agent 确认** | 2A 指令集为 "RV32IMAFDC + Zicsr/Zifencei/Zicntr/**Zicbom**"，而 `cbo.zero` 属 **Zicboz**。`05-cache-memory.md` §7 与用户裁决（`cbo.zero` block = 32 B）都涉及 `cbo.zero`。**2A 口径**：按任务书只实现 **Zicbom（clean/flush/inval）**；`cbo.zero` 与 Zicboz 归 **2C/后续**，但 `CBZE` 字段与 `cmo_unit` 的 32 B 参数**预留位域不预留逻辑**。若用户要求 2A 含 Zicboz，需追加 Zicboz 用例测试。 |
-| R2 | **kb_search 对 `source:isa-manual` 检索返回异常** | 已记录 | 本会话 `kb_search` 对 ISA 手册内容的检索返回无关文档（命中的是 u-boot/la32r-linux 等），尽管 `kb_manage stats` 显示 `isa-manual` 源已配置（3711 文档）。**处置**：本文 ISA 条文一律经 `docs/kb/isa-notes.md`（已核实、带 `path:line`）二次引用；如需补充检索，建议 `kb_manage action=reindex` 后复核。 |
+| R2 | **kb_search 检索排序** | **已恢复（2026-10-18 实测可用）** | 历史记录：设计期曾出现 `source:isa-manual` 命中无关文档；当前会话 `kb_search` 可用。若复现，按 `docs/kb/tools-and-flow.md` §8 先 `stats` 再换短标识符，仍异常走 CLI/`kb_get`。 |
 | R3 | **PLIC 源号映射** | 实现时定稿 | §6.6 给出默认映射（`intrpt[1]`→源 1 等）；**最终值在实现 `plic.v` 时定稿**并写设备树/OpenSBI（只写一处）。 |
 | R4 | **`intrpt[7:5]` 恒 0，平台无法传 >5 源** | 用户已确认 chiplab 可改 | 若需扩展须改 `soc_top.v` 并**显式登记契约变更**（§6.6）。 |
-| R5 | **Spike 未安装** | 前置门禁 | M2 判据 ③ 与 arch-test 的 `ref_model_exe` 依赖 `/opt/riscv/bin/spike`；未就绪前 **BLOCKED**，不得绕过。 |
+| R5 | **Spike 未就绪**（历史风险） | **已关闭（2026-10-18）**：`/opt/riscv/bin/spike` 1.1.1-dev 可用；安装/使用见 `docs/kb/tools-and-flow.md` §6。 |
 | R6 | **FPU 面积/时序** | M4 评估 | 2A 允许 FPU 多拍非流水；若 M4 时序不收敛，改为流水化（不得改变语义与 `fflags` 精确性）。 |
 | R7 | **16 项 PMP 的组合比较器是热点** | M4 评估 | 若时序不收敛，加流水寄存器而不是改成大 `always @(*)`。 |
 | R8 | **arch-test 排除清单需逐条清单化** | 实现时定稿 | §8.2 给出类别；落到 `exclude.list` 时**逐目录可复核**，禁止放水。 |

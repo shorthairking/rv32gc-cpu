@@ -2,6 +2,18 @@
 
 > 本文属 RV32-GC 新项目（`rv32gc-cpu/`，`dev` 分支）阶段一微架构设计文档集（01–04）第 3 篇。流水线分级与停顿-冲刷矩阵见 `docs/design/02-pipeline.md`；顶层端口/地址/时钟口径见 `docs/design/01-overview-datapath.md`；预测器见 `docs/design/04-predictor.md`；Cache 与 AXI 见 `docs/design/05-cache-memory.md`。
 > 本文不复制上一代（`master` 分支冻结历史）实现的任何文字、图或参数组织。
+>
+> **现行口径（2026-10-18，先读）**：本文是**乱序后端设计目标**，不是 2B as-built。下表保留原设计目标，右侧给出当前 2B 实作；实际参数以 [`rtl/back2/back2_params.vh`](../../rtl/back2/back2_params.vh) 与 RTL 连接为准。
+
+| 项 | 原设计目标（本文） | 当前 2B 实作（2026-10-18） |
+|---|---|---|
+| 发射/派发 | 4 发射、4 宽派发 | 4 取指、`ALLOC_W=4`、4 宽发射（不变） |
+| 提交 | 顺序、≤4 条/拍 | **顺序、2 条/拍**（`COMMIT_W=2`） |
+| ROB | 128 项 | **64 项**（`ROB_N=64`，指数 6） |
+| 物理寄存器 | 整数 96 / 浮点 64 | **整数 64 / 浮点 64**（`PRF_I_N=64`） |
+| 发射队列 | 16/16/8/8/12/8 = 68 | **12/12/6/6/8/6 = 50** |
+| LSQ | LQ 32 / SQ 32 | **LQ 8 / SQ 32** |
+| store→load 转发 | 设计为 LSQ 内转发 | **已移除（N29B）**：依赖 load 等 older store 排空后访存 |
 
 ---
 
@@ -9,13 +21,13 @@
 
 | 指标 | 设计值 | 来源 |
 |---|---|---|
-| 发射宽度 | **4 发射** | `AGENT.md` §1 |
-| ROB | **128 项** | `AGENT.md` §1 |
-| 重命名 | **物理寄存器重命名**（RAT + free list） | `AGENT.md` §1 |
-| 发射队列 | **分布式**（每执行部件一个 RIQ） | `AGENT.md` §1 |
-| 执行部件 | **6 个**：ALU0、ALU1、BRU、MDU、LSU、FPU | `AGENT.md` §1 |
-| LSQ | Load Queue / Store Queue，含访存序检查 | `AGENT.md` §1 |
-| 提交 | **顺序、精确异常**，≤4 条/拍 | `AGENT.md` §1 |
+| 发射宽度 | **4 发射** | [工作契约](../../AGENT.md) 的"硬指标" |
+| ROB | **128 项**（原目标；当前 2B 64） | 原硬指标表（后按 2026-10-04 裁决降档） |
+| 重命名 | **物理寄存器重命名**（RAT + free list） | [工作契约](../../AGENT.md) 的"硬指标" |
+| 发射队列 | **分布式**（每执行部件一个 RIQ） | [工作契约](../../AGENT.md) 的"硬指标" |
+| 执行部件 | **6 个**：ALU0、ALU1、BRU、MDU、LSU、FPU | [工作契约](../../AGENT.md) 的"硬指标" |
+| LSQ | Load Queue / Store Queue，含访存序检查 | [工作契约](../../AGENT.md) 的"硬指标" |
+| 提交 | **顺序、精确异常**，≤4 条/拍（原目标；当前 2 条/拍） | 原硬指标表（后按 2026-10-04 裁决降档） |
 
 ```mermaid
 flowchart TD
@@ -62,7 +74,7 @@ flowchart TD
 
 ---
 
-## 2. ROB（128 项）
+## 2. ROB（原设计目标 128 项 → 当前 2B 为 64 项）
 
 ### 2.1 组织
 
@@ -83,11 +95,11 @@ flowchart TD
 | `fp_dst` | 1 | 是否写浮点寄存器堆 |
 | `epoch` | 2 | 冲刷纪元（用于识别过期项） |
 
-**深度 128 = 32 × 4**：与 4 发射 × 32 条指令窗口对齐，便于 free list 定深。ROB 是环形缓冲：`head` = 提交点、`tail` = 派发点；`tail - head` 即占用项数。
+**深度（原目标 128 = 32 × 4；当前 64）**：原设计与 4 发射 × 32 条指令窗口对齐，便于 free list 定深；2B 按用户 2026-10-04 裁决降为 64，只降"在飞指令数上限"，不改指令语义。ROB 是环形缓冲：`head` = 提交点、`tail` = 派发点；`tail - head` 即占用项数。
 
 ### 2.2 顺序提交（关键路径）
 
-每拍从 ROB 头开始，**按程序序**最多提交 4 条：
+每拍从 ROB 头开始，**按程序序**最多提交 4 条（原设计目标；**当前 2B 为 2 条**，下表循环上界读作 `COMMIT_W`）：
 
 ```
 commit_count = 0
@@ -145,6 +157,8 @@ flowchart LR
 | RAT 项 | 整数 32 项 + 浮点 32 项 | 每架构寄存器一项 |
 | Free List | 整数 64 项 + 浮点 32 项（**不含架构基线**） | 基线 32（整数）/32（浮点）在复位时预置给 RAT |
 
+> **当前 2B 实作（2026-10-18）**：整数物理寄存器 **64**（`PRF_I_N=64`、`PREG_I_W=6`、`FREE_I_N=32`），浮点 **64**；上表的 96 / 7 bit / 64 项 free list 是**原设计目标**。EXP-R2 的实测依据与余量见 [`docs/design/11-dynamic-behavior-r.md`](11-dynamic-behavior-r.md) §1.1；参数真源见 [`back2_params.vh`](../../rtl/back2/back2_params.vh)。
+
 **为什么不是"每个 ROB 项都配一个物理寄存器"**：那会要求 ROB 项数 = 物理寄存器数（128+32），free list 几乎永不空转但面积失控。96 个整数物理寄存器的口径是「能覆盖 4 发射窗口的在途写目的 + 一定余量」；free list 真正耗尽时由前端停顿（`02-pipeline.md` §4.1 的 S3）承担，属于可接受的、可统计的性能损失。
 
 **为什么浮点与整数分离重命名**：FPU 是 8 拍以上的长延迟部件，混在同一个 free list 里会让整数指令因浮点长延迟而耗尽自由项。分离后两侧独立停顿。
@@ -174,7 +188,7 @@ flowchart LR
 
 ### 4.1 部件分工
 
-| 部件 | 数量 | 承担的 `uop` | 延迟 | IP 复用（`AGENT.md` §4 红线 1/4） |
+| 部件 | 数量 | 承担的 `uop` | 延迟 | IP 复用（[工作契约](../../AGENT.md) 的"编码红线"） |
 |---|---|---|---|---|
 | **ALU0** | 1 | 整数算术/逻辑/移位/比较、`lui`/`auipc`、CSR 读写、`cbo.*` 控制 | 1 拍 | 全自研组合逻辑（`assign` 为主） |
 | **ALU1** | 1 | 同 ALU0（**不含 CSR**，避免两处 CSR 副作用） | 1 拍 | 同上 |
@@ -197,6 +211,8 @@ flowchart LR
 | RIQ-MDU | 8 | ≤4/拍 | 1/拍 | 乘除占用时间长，队列深反而放大阻塞，故浅 |
 | RIQ-LSU | 12 | ≤4/拍 | 1/拍 | 与 LSQ 容量联动 |
 | RIQ-FPU | 8 | ≤4/拍 | 1/拍 | 浮点指令密度低 |
+
+> **当前 2B 深度为 12/12/6/6/8/6 = 50**（C2：原总容量 68 > ROB_N=64 的死容量裁剪，ALU 12、BRU/MDU/FPU 6、LSU 8），见 [`back2_params.vh`](../../rtl/back2/back2_params.vh)。上表 16/16/8/8/12/8 保留为原设计目标。
 
 **分布式 vs 集中式**：选择分布式（每部件独立队列）的理由是**唤醒-选择可局部化**——只需在部件自己的队列里做优先级选择，而不必在 60+ 项的集中队列里每拍做全局仲裁。代价是需要按部件做队列满停顿（`02-pipeline.md` §4.1 的 S4）。
 
@@ -234,7 +250,7 @@ sequenceDiagram
 
 ## 5. 旁路 / 转发网络（吸收教训，重点设计）
 
-> `AGENT.md` §3.3：**旁路/转发网络漏洞是最常见缺陷源**。本节把三处必须覆盖的转发点显式写成规范，并要求每一条都有对应的反向实验（关掉该路径后回归必须 FAIL）。
+> [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3：**旁路/转发网络漏洞是最常见缺陷源**。本节把三处必须覆盖的转发点显式写成规范，并要求每一条都有对应的反向实验（关掉该路径后回归必须 FAIL）。
 
 ### 5.1 转发点全景
 
@@ -263,8 +279,8 @@ flowchart LR
 
 | # | 转发点 | 为什么必须显式做 | 实现口径 |
 |---|---|---|---|
-| **T1** | **写优先寄存器堆** | 同拍写口与读口命中同一物理寄存器时，若依赖「写先于读」的时序假设，综合/仿真会给出不同的结果（典型静默错） | 物理寄存器堆推断成 **Vivado Block Memory Generator 的简单双端口（Simple Dual Port）** 配置（写优先模式），或在其外层包一层**显式比较旁路**：`rd_wen && (waddr == raddr) ? wdata : mem_rdata`。二者都在 `ifdef` 双分支中实现 |
-| **T2** | **MEM 级转发访存结果** | load 数据在 E1/W1 之间（MEM 级）从 D-Cache 返回，晚于同拍 ALU 结果。依赖它的后续指令若只等 W1 写回，会读到旧值或错误等一整拍 | load 命中时在 **MEM 级**就驱动旁路总线（物理号 + 数据），不等 W1；此外 **load→store 转发**在 LSQ 内完成（§7） |
+| **T1** | **写优先寄存器堆** | 同拍写口与读口命中同一物理寄存器时，若依赖「写先于读」的时序假设，综合/仿真会给出不同的结果（典型静默错） | 物理寄存器堆推断成 **Vivado Block Memory Generator 的简单双端口（Simple Dual Port）** 配置（写优先模式），或在其外层包一层**显式比较旁路**：`rd_wen && (waddr == raddr) ? wdata : mem_rdata`。二者都在 `ifdef` 双分支中实现。**当前 2B 的 PRF 写路径直连 FF、读侧为 mux（见面积报告"PRF 阵列 we/waddr/wdata 直连 FF"）**，本行是原设计选项 |
+| **T2** | **MEM 级转发访存结果** | load 数据在 E1/W1 之间（MEM 级）从 D-Cache 返回，晚于同拍 ALU 结果。依赖它的后续指令若只等 W1 写回，会读到旧值或错误等一整拍 | load 命中时在 **MEM 级**就驱动旁路总线（物理号 + 数据），不等 W1；此外 **load 从更老 store 取数（store→load 转发）**在 LSQ 内完成（§6）——**该转发在 2B 已整体移除（N29B），当前改为等 older store 排空后再访存**，本节保留原设计目标 |
 | **T3** | **CSR/MPRV/SUM/MXR 同拍旁路** | `csrw mstatus, x` 之后紧接着一条访存，若依赖流水线互锁会引入不必要停顿；若不做旁路则会用到旧 `MPRV`/`SUM`/`MXR` 判定权限 —— **静默的权限错判** | CSR 写值在 ALU0 的 **E1 同拍**广播给 LSU 的权限判定单元（有效特权级、`SUM`、`MXR`、`MPRV` 的组合逻辑）。**不引入 CSR 流水线互锁**（`fence`/`sfence` 等显式同步指令由软件负责） |
 
 ### 5.3 `xRET` 与 `MPRV` 的特殊口径
@@ -276,7 +292,7 @@ flowchart LR
 
 ### 5.4 旁路网络的验证口径
 
-每一条转发路径都必须配 **反向实验**：在 RTL 里用 `ifdef` 关闭该路径，回归必须 **FAIL**；若关闭后仍 PASS，说明该路径未被测试真正覆盖（对应 `AGENT.md` §3.2 的"变异测试/反证实验"）。
+每一条转发路径都必须配 **反向实验**：在 RTL 里用 `ifdef` 关闭该路径，回归必须 **FAIL**；若关闭后仍 PASS，说明该路径未被测试真正覆盖（对应 [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2 的"变异测试/反证实验"）。
 
 | 路径 | 关闭方式 | 期望 |
 |---|---|---|
@@ -293,8 +309,8 @@ flowchart LR
 
 | 项 | 设计值 | 说明 |
 |---|---|---|
-| Load Queue | **32 项** | 与 4 发射 × 8 条在途 load 的量级匹配 |
-| Store Queue | **32 项** | 同上 |
+| Load Queue | **32 项**（原目标）；**当前 2B 为 8 项**（`LQ_N=8`） | 与 4 发射 × 8 条在途 load 的量级匹配；LQ 16→8 依据实测高水位 6（EXP-R3） |
+| Store Queue | **32 项**（当前同） | 同上；SQ 高水位 20，不可砍到 16（EXP-R4） |
 | 每项字段 | `valid`、`addr_valid`（地址已生成）、`addr`（**物理地址**）、`size`、`is_signed`、`data`（store）、`done`、`rob_idx`、`pdest` | |
 | 索引 | 环形，按程序序分配 | 分配在 D3，按 ROB 顺序 |
 
@@ -302,10 +318,10 @@ flowchart LR
 
 | 机制 | 口径 |
 |---|---|
-| **load → store 转发** | load 在 LSQ 中向**更老**的 store 项按程序序做地址匹配（同地址、且访问范围重叠）；命中且数据已就绪 ⇒ 直接转发，不访问 D-Cache。**地址未生成的更老 store 必须阻塞该 load**（保守但正确） |
+| **store→load 转发（原写"load → store"）** | **原设计目标**：load 在 LSQ 中向**更老**的 store 项按程序序做地址匹配（同地址、且访问范围重叠）；命中且数据已就绪 ⇒ 直接转发，不访问 D-Cache。**地址未生成的更老 store 必须阻塞该 load**（保守但正确）。**当前 2B 已整体移除该转发（N29B）**：依赖 load 等 older store 排空、L1D 写完成后再访存；RISC-V 不要求转发，功能契约无损，性能代价已有实测记录 |
 | **store → load 顺序** | load 不得越过**地址已确认不重叠**的更老 store；地址未知的更老 store 一律阻塞（典型的保守策略，是正确性优先的取舍） |
 | **store → store 顺序** | 同地址 store 必须按程序序进入 L1D（否则写序错乱）；不同地址允许乱序推进到 D-Cache |
-| **地址来源唯一** | store 项里的地址字段**只写一次**、且**只写物理地址**（VA/PA 混用是静默错，`AGENT.md` §3.3）。虚拟地址在 E1 由 MMU 翻译后立即被物理地址替换，不保留两份 |
+| **地址来源唯一** | store 项里的地址字段**只写一次**、且**只写物理地址**（VA/PA 混用是静默错，[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）。虚拟地址在 E1 由 MMU 翻译后立即被物理地址替换，不保留两份 |
 | **AMO / LR-SC** | AMO 在 LSU 内按「读-改-写」序列化（一次 AXI 侧不做原子锁，平台 `awlock`/`arlock` 高位显式置 0，见 `01-overview-datapath.md` §5.8 规则 2）；`sc` 的成功判定依赖独占监视器，失败时按 `sc` 语义写 `rd = 0` 且**不产生 store 副作用**。AMO/`sc` 通过 PMP 检查需**写**权限，否则恒 **cause 7**（`norm:pmp_store_fault`，`riscv-isa-manual/src/priv/machine.adoc:3422-3425`；对照 `norm:pmp_load_fault`，`:3419-3422`） |
 | **提交时释放** | store 项在 ROB 提交时方可写入 D-Cache（保持精确异常语义：异常导致不提交时 store 绝不落地） |
 
@@ -313,7 +329,7 @@ flowchart LR
 
 | 情形 | 处理 | 依据 |
 |---|---|---|
-| 非对齐 | **非对齐优先于 PMP（本设计选择；规范为可选项）**：先判非对齐（cause 4/6），再判 PMP。规范 `norm:mcause_exccodepri2` 明确 misaligned 与 page/access fault 优先级**由实现任选（either higher or lower）**——`riscv-isa-manual/src/priv/machine.adoc:1937-1938` | `AGENT.md` §3.3 + 规范可选条 |
+| 非对齐 | **非对齐优先于 PMP（本设计选择；规范为可选项）**：先判非对齐（cause 4/6），再判 PMP。规范 `norm:mcause_exccodepri2` 明确 misaligned 与 page/access fault 优先级**由实现任选（either higher or lower）**——`riscv-isa-manual/src/priv/machine.adoc:1937-1938` | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3 + 规范可选条 |
 | 页表 PTE 访问违反 PMA/PMP | 抛**对应原访问类型**的 access-fault（不是 page-fault） | `riscv-isa-manual/src/priv/supervisor.adoc` Virtual Address Translation Process，kb chunk 10790（步骤 2） |
 | `mtval` | 写**故障有效地址**（load/store 为访问地址；指令为取指地址）；非法指令写**原始指令位**——后者是**可选特性**（**本设计选择实现**，`norm:mtval_instr_bits_lead-in`，`riscv-isa-manual/src/priv/machine.adoc:2039-2050`；未实现时读 0 合法，`:2071-2074`） | `riscv-isa-manual/src/priv/machine.adoc` `mtval` Register，`norm:mtvalvaddrwr2`，kb chunk 10565 |
 | 一次访存拆成多笔 | **每笔独立做 PMP 检查**；部分可能先成功并可见 | `riscv-isa-manual/src/priv/machine.adoc` `norm:pmpmisalignedaccess_behavior`，`:3564-3569` |
@@ -380,10 +396,10 @@ flowchart TD
 | 无匹配 | M 模式无匹配 ⇒ 成功；S/U 模式无匹配 ⇒ **只要有至少一项 PMP 实现就失败** | `norm:pmpnoentry_match`，kb chunk 10615 |
 | L 位 | `L=1` 锁定该配置与地址寄存器直到复位；且 L 位使 RWX 权限**对 M 模式也生效**；`L=0` 时 M 模式访问恒成功 | `norm:pmplbit_function`、`norm:pmplbitwriteprotection`、`norm:pmplbitmmode_enforcement`，kb chunk 10613 |
 | 失败异常 | 抛 instruction / load / store **access-fault** | `norm:pmpaccessfault_exception`，kb chunk 10615 |
-| 取指粒度 | 取指按 **16-bit parcel** 检查——**本设计选择**："按 2 B parcel"**规范未明说**（规范强制：取指无 X 权限 ⇒ instruction access-fault `norm:pmp_exec_fault`，`riscv-isa-manual/src/priv/machine.adoc:3418-3419`；粒度由平台定义 `norm:pmp_granularity`，`:3315`） | `AGENT.md` §3.3 + 规范强制条 |
+| 取指粒度 | 取指按 **16-bit parcel** 检查——**本设计选择**："按 2 B parcel"**规范未明说**（规范强制：取指无 X 权限 ⇒ instruction access-fault `norm:pmp_exec_fault`，`riscv-isa-manual/src/priv/machine.adoc:3418-3419`；粒度由平台定义 `norm:pmp_granularity`，`:3315`） | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3 + 规范强制条 |
 | AMO/`sc`/`cbo.zero` | 需**写**权限，否则恒 store access-fault（**cause 7**） | `norm:pmp_store_fault`，`riscv-isa-manual/src/priv/machine.adoc:3422-3425`（对照 `norm:pmp_load_fault`，`:3419-3422`） |
 
-**注意**：`config.h` 等平台参数与 PMP 无关；PMP 条目数 16 是本项目需求（`AGENT.md` §1），不来自平台 RTL。
+**注意**：`config.h` 等平台参数与 PMP 无关；PMP 条目数 16 是本项目需求（[工作契约](../../AGENT.md) 的"硬指标"），不来自平台 RTL。
 
 ---
 
@@ -424,14 +440,16 @@ flowchart TD
 
 | 取舍 | 选择 | 理由 | 被否方案 |
 |---|---|---|---|
-| ROB 深度 | 128 项 | `AGENT.md` §1 硬性指标；等于 4 发射 × 32 条窗口，free list 定深方便 | 更浅（64）：4 发射下窗口太短，乱序收益不足 |
-| 物理寄存器数 | 整数 96 / 浮点 64（分离 free list） | 覆盖在途写目的 + 余量；浮点长延迟不拖累整数 | 统一 128 项池：FPU 长延迟导致整数侧饥饿；ROB 等深池：面积过大 |
+| ROB 深度 | 128 项（原目标；**当前 2B 64**） | 原硬性指标；等于 4 发射 × 32 条窗口，free list 定深方便。2026-10-04 用户裁决放宽条目数硬指标，按面积/容量实测降为 64 | 更浅（64）：原评估认为 4 发射下窗口太短；**后续已采纳 64**（2026-10-04 裁决） |
+| 物理寄存器数 | 整数 96 / 浮点 64（原目标；**当前整数 64**） | 覆盖在途写目的 + 余量；浮点长延迟不拖累整数。EXP-R2 实测整数 max live 58 ⇒ 64 可行（余量薄） | 统一 128 项池：FPU 长延迟导致整数侧饥饿；ROB 等深池：面积过大 |
 | 发射队列 | **分布式**（6 个 RIQ） | 选择局部化，避免每拍 60+ 项全局仲裁 | 集中式统一队列：面积与时序压力大 |
 | 选择策略 | 最老优先 | 无饥饿、异常/分支尽早暴露 | 随机/轮转：饥饿风险 + 异常发现晚 |
 | A/D 位 | **Svade**（抛 page-fault） | 避免"隐式内存写"给乱序核加额外顺序约束 | Svadu（硬件隐式更新 A/D）：需额外的不可推测写通路 |
 | 检查点 | 16 个 + 变更日志 | 面积远小于全量快照 | 全量 RAT 快照：每个检查点 32×(5+7) bit × 16，面积大 |
 | 旁路 | I2 读口 + 写优先 + MEM 级 + CSR 同拍 | 覆盖三类高风险转发（§5.2） | 只做写回旁路：缺 T1/T2/T3 中任一条都会静默错 |
 | store 发射 | 提交时才写 D-Cache | 精确异常的必要条件 | 发射时即写：异常回滚不可能 |
+
+> **本表是阶段一设计取舍记录**。ROB 128/PRF 96 已按 2026-10-04 用户裁决在 2B 降档（64/64）；4 发射与 4 取指仍是底线，提交 2 宽。历史理由保留，但不要再把 128/96 当作当前参数。
 
 ---
 
@@ -441,7 +459,7 @@ flowchart TD
 |---|---|---|
 | ROB `pdest_old` 释放时机 | 释放错 ⇒ 静默错值或泄漏 | 断言：free list 项数 + 活跃映射数 ≡ 物理寄存器总数 |
 | 检查点耗尽 | 分支密集时额外停顿 | 统计检查点满停顿（`07-verification` 接口） |
-| load→store 转发地址未知阻塞 | 过度保守 ⇒ 性能损失 | 统计因未知地址阻塞的 load 比例 |
+| load→store 转发地址未知阻塞 | 原设计风险；**当前 2B 已移除转发（N29B）**，改为等 older store 排空，性能代价另计 | 原：统计因未知地址阻塞的 load 比例；现行：N29B 等待档案与 C5 记录 |
 | `epoch` 过滤 | 漏一处 ⇒ 冲刷后陈旧请求仍发出 | 断言：所有 RIQ/LSQ 发射项的 `epoch == 当前 epoch` |
 | 旁路网络 | 三处转发遗漏 | 反向实验（§5.4，关闭后必须 FAIL） |
 | PMP 优先级逻辑 | 实现成"最高编号优先"或"部分匹配即通过" | 定向测试 + 反向实验 |

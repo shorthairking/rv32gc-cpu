@@ -3,6 +3,8 @@
 > 依据 `rv32gc-cpu/docs/porting/03-linux-opensbi.md` §7.2 交付要求。落档时间：2026-09-21。
 > 相关运行期证据：`docs/linux-port/logs/linux-boot-final.log`（`Boot HART Domain: root`、
 > `Next Mode: S-mode`、`SBI specification v3.0 detected`）、`docs/linux-port/README.md` §5。
+>
+> **状态边界（2026-10-18）**：上游树当前 `3593a5f`，工作树干净、零改动；运行期证据来自 **QEMU chiplab machine**，**真板未验**。本文件是基线与 FW_JUMP 口径，不是上板验收报告。
 
 ## 1. 基线
 

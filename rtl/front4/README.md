@@ -3,7 +3,14 @@
 > 归属：阶段二 **2B-1**（`docs/design/02-pipeline.md` F1–F4 前端 + `docs/design/04-predictor.md`
 > 锦标赛预测器）。**本里程碑不含乱序后端**（ROB/重命名/发射队列属 2B-2）。
 > 设计输入：`docs/design/02-pipeline.md`、`docs/design/04-predictor.md`、
-> `docs/design/08-baseline-5stage.md`（2A 取指/L1I 契约）；硬性约束：`AGENT.md` §4 红线。
+> `docs/design/08-baseline-5stage.md`（2A 取指/L1I 契约）；硬性约束：[`AGENT.md`](../../AGENT.md) 的 IP/原语/复用红线。
+>
+> **状态（2026-10-18，先读）**：本文是 **2B-1 交付说明**，结构/端口/预测器参数大多仍适用；文中
+> "26 个 TB / 248 条黄金轨迹 / 90.85%"等是**当时记录**，当前回归以 `scripts/regress.sh`（既有 33/33）为准。
+> 当前后端参数（ROB 64 / 2 宽提交 / NREG 64 / SQ32 / LQ8 / IQ 50 / 转发已移除）见
+> [`back2_params.vh`](../back2/back2_params.vh)；前端参数见 [`front4_params.vh`](front4_params.vh)。
+> **N34B-2 "删除 LOCAL"仅是送审 patch，未采纳**：当前仍例化 `bpu_local_hist`（Gshare+局部+选择器三分量）。
+> 2B 尚未接入 arch-test/上板，本文不是 2B 验收结论。
 
 ---
 
@@ -179,7 +186,7 @@ C6 取指 PMP（第二 parcel 无 X ⇒ fault，`cause=1`、`tval` = 故障 parc
 
 ---
 
-## 6. IP / 原语合规（`AGENT.md` §4 红线 1/2）
+## 6. IP / 原语合规（[工作契约](../../AGENT.md) 的"编码红线"）
 
 | 表 | 综合分支 | 仿真分支 | 依据 |
 |---|---|---|---|

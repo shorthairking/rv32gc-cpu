@@ -2,6 +2,8 @@
 
 > 本文属 RV32-GC 新项目（`rv32gc-cpu/`，`dev` 分支）阶段一微架构设计文档集（01–04）第 4 篇。流水线分级与重定向机制见 `docs/design/02-pipeline.md`；检查点/ROB 恢复见 `docs/design/03-out-of-order.md`；顶层口径见 `docs/design/01-overview-datapath.md`。
 > 本文不复制上一代（`master` 分支冻结历史）实现的任何文字、图或参数组织；准确率统计接口为 `docs/design/07-verification` 预留。
+>
+> **实现口径（2026-10-18）**：本文是**设计目标**。当前 RTL `rtl/front4/` 实现 Gshare 4096×2/GHR16、LHT 1024×10、LPHT 1024×2、选择器 1024×2、BTB 2048 项 2 路、RAS 16、检查点 16；存储综合走 **XPM**（GPHT/LPHT/选择器/BTB）+ **LUTRAM**（LHT），不是本文 §7 旧表述的"Block Memory Generator + `ifdef`"。BTB 组索引在本文 §3.1/§4.1 同时写 `PC[12:2]`（11 bit）与"1024 组"，二者不自洽；RTL 按项数/相联度优先取 **`PC[11:2]`（10 bit）**，详见 [`rtl/front4/README.md`](../../rtl/front4/README.md) §3 偏差 1。**N34B-2 "删除 LOCAL"仅是送审 patch，未采纳**：当前 RTL 仍例化 `bpu_local_hist`，不得写成已删除。
 
 ---
 
@@ -9,7 +11,7 @@
 
 | 项 | 设计值 | 来源 |
 |---|---|---|
-| 预测器类型 | **锦标赛预测器**（全局 Gshare + 局部历史 + 选择器） | `AGENT.md` §1 |
+| 预测器类型 | **锦标赛预测器**（全局 Gshare + 局部历史 + 选择器） | 原硬指标表 |
 | BTB | 分支目标缓冲 | 本文 §4 |
 | RAS | 返回地址栈 | 本文 §4.2 |
 | 预测发生级 | F2 查表，F1 下一拍使用 | `docs/design/02-pipeline.md` §4.2 |
@@ -56,7 +58,7 @@ flowchart TD
     class GPHT,LPHT,SEL,LHT,BTBQ ip;
 ```
 
-**存储实现约束**：所有表（GPHT/LPHT/选择器/LHT/BTB/RAS）都用 **Vivado Block Memory Generator IP**，并配 `ifdef` **仿真行为模型双分支**（综合走 IP、仿真走逐拍等价模型），保证 iverilog/Verilator 回归不依赖 Vivado（`AGENT.md` §4 红线 1/2）。禁止用寄存器阵列实现大表——Vivado 会把组合读的大阵列退化成几十万个触发器，时序与面积同时崩溃（`AGENT.md` §3.3）。
+**存储实现约束**：所有表（GPHT/LPHT/选择器/LHT/BTB/RAS）原目标用 **Vivado Block Memory Generator IP**，并配 `ifdef` **仿真行为模型双分支**；**当前实现改为 XPM（GPHT/LPHT/选择器/BTB）+ LHT LUTRAM**（见 [`rtl/front4/README.md`](../../rtl/front4/README.md) §6），仍保证 iverilog/Verilator 回归不依赖 Vivado。禁止用寄存器阵列实现大表——Vivado 会把组合读的大阵列退化成几十万个触发器，时序与面积同时崩溃。
 
 ---
 
@@ -71,7 +73,7 @@ flowchart TD
 | 局部历史 | 局部历史表 LHT | **1024 项** | **10 bit**（每 PC 的近 10 次方向） | `PC[11:2]`（10 bit） |
 | 局部历史 | 局部 PHT | **1024 项** | **2 bit** | `LHT[PC] XOR PC[11:2]`（10 bit） |
 | 选择器 | 选择器表 | **1024 项** | **2 bit**（偏向计数） | `PC[11:2]`（10 bit） |
-| 目标缓冲 | BTB | **2048 项** | tag 20 bit + target 32 bit + 属性 | `PC[12:2]`（11 bit，2 路组相联 ⇒ 30 bit tag） |
+| 目标缓冲 | BTB | **2048 项** | tag 30 bit + target 32 bit + 属性 | `PC[11:2]`（10 bit，1024 组×2 路；原写 `PC[12:2]` 与组数不自洽，见头部说明） |
 
 **为什么 PHT 用 2 bit 饱和计数器**：1 bit 在分支偏离后需要两次相同结果才恢复预测方向，对短循环不友好；3 bit 相对 2 bit 的准确率提升在常见基准上不足 1%，而面积翻 1.5 倍。取 2 bit。
 
@@ -131,7 +133,7 @@ stateDiagram-v2
 
 | 项 | 设计值 | 说明 |
 |---|---|---|
-| 项数 | **2048 项，2 路组相联**（1024 组） | 组索引 `PC[12:2]`；每路 tag 30 bit |
+| 项数 | **2048 项，2 路组相联**（1024 组） | 组索引 `PC[11:2]`（10 bit）；每路 tag 30 bit。原写 `PC[12:2]`（11 bit）会推出 2048 组/4096 项，与"2048 项"矛盾；RTL 按项数优先，见 `rtl/front4/README.md` §3 偏差 1 |
 | 项字段 | `tag`（30 bit）、`target`（32 bit）、`is_call`（1）、`is_return`（1）、`is_cond`（1）、`valid`（1） | |
 | 命中用途 | ① 提供跳转目标（F1 下一拍直接取目标）；② 标记该取指块含分支/调用/返回 |
 | 未命中 | 顺序推进取指（预测"不跳"）；首次遇到分支时预测失败，由 BRU 在 E1 纠正并分配/替换 BTB 项 |
@@ -271,7 +273,7 @@ GHR 是**推测态**：F2 预测时按预测方向推进，但**只在提交点�
 | 准确率回归 | 记录基准程序（coremark/dhrystone 等）的 `bpu_br_mispred / bpu_br_total`，作为回归基线 |
 | 性能归因 | `bpu_flush_penalty_cycles / 总周期` 是误判对 IPC 的贡献上限 |
 
-**验收口径**：`docs/design/07-verification` 中必须包含「预测器准确率统计」一节，并要求**未捕获即失败**——统计脚本在未能读到计数器时必须报 FAIL，兜底文案不得含 PASS（`AGENT.md` §0.6 / §3.2）。
+**验收口径**：`docs/design/07-verification` 中必须包含「预测器准确率统计」一节，并要求**未捕获即失败**——统计脚本在未能读到计数器时必须报 FAIL，兜底文案不得含 PASS（[工作契约](../../AGENT.md) 的"验收纪律"）。
 
 ---
 
@@ -279,7 +281,7 @@ GHR 是**推测态**：F2 预测时按预测方向推进，但**只在提交点�
 
 | 取舍 | 选择 | 理由 | 被否方案 |
 |---|---|---|---|
-| 预测器类型 | 锦标赛（Gshare + 局部 + 选择器） | `AGENT.md` §1 硬性指标；两类负载互补 | 单一 Gshare：在分支独立的行为上弱 |
+| 预测器类型 | 锦标赛（Gshare + 局部 + 选择器） | [工作契约](../../AGENT.md) 的"硬指标" 硬性指标；两类负载互补 | 单一 Gshare：在分支独立的行为上弱 |
 | PHT 位宽 | 2 bit 饱和 | 面积/收益比最佳 | 3 bit：面积 ×1.5，收益 <1% |
 | GHR 宽度 | 16 bit | 覆盖 11 级流水的在途分支窗口 | 更长：噪声大于收益 |
 | 选择器训练 | 只在提交点 | 避免错误路径污染 | 执行级训练：错误路径分支污染选择器 |
@@ -287,7 +289,7 @@ GHR 是**推测态**：F2 预测时按预测方向推进，但**只在提交点�
 | RAS 更新 | 推测推进 + 检查点恢复 | `ret` 必须提前预测目标 | 只在提交点：无法预测 `ret` |
 | RAS 溢出 | 不压入（保持栈顶） | 保守但正确，避免错误返回目标 | 覆盖最老项：栈顶变成错误值 |
 | BTB 更新 | 提交点 | 避免错误路径分配 | 执行级分配：错误路径项挤占 |
-| 表实现 | Block Memory Generator IP + `ifdef` 双分支 | `AGENT.md` §4 红线 1/2 | 寄存器阵列：Vivado 退化成几十万触发器 |
+| 表实现 | 原目标：Block Memory Generator IP + `ifdef` 双分支；**当前实现：XPM + LUTRAM（LHT）** | 红线 1/2（不用原语、仿真双分支）；当前实现见 `rtl/front4/README.md` §6 | 寄存器阵列：Vivado 退化成几十万触发器 |
 | 统计端口 | 核内 MMIO，不新增 core_top 端口 | 端口契约 48 项不可改（`01-overview-datapath.md` §5） | 新增端口：平台例化不匹配 |
 
 ---

@@ -9,13 +9,15 @@
 > **交叉验证**：`fpga/scratch/dyn_crosscheck_r.py`（探针 vs TB 独立计数）。
 > **原始数据**：`fpga/scratch/dyn_r/{lockstep,ipc,core_top_2b}.csv`。
 > **服务决策**：NREG 96→64 / 检查点压缩到 ≤4 / SQ 32→16 / FPU iterative div-sqrt。
+>
+> **★ 数据快照声明（2026-10-18 补注）**：本报告基于**冻结树 `cfc0af9`（2026-10-04）**，49,087 拍，**不是 `7e2e730` 的最新测量**。四条结论中的 NREG 96→64 已落地；SQ 32→16 被高水位否决；检查点压缩被池满否决；FPU iterative div/sqrt 被判断不值。数据保留原样，不重造成"最新测量"；现行参数见 [`back2_params.vh`](../../rtl/back2/back2_params.vh)，现行状态见 [`NEXT_SESSION.md`](../../NEXT_SESSION.md)。
 
 ## 0. 口径（每个信号的真源行号 + 是「需求」还是「物理端口」）
 
 | 信号（CSV 列） | 口径 | 真源 | 性质 |
 |---|---|---|---|
 | `freei`/`freef` | rename 两域 free list **剩余空位** `free_cnt_w = ftail−fhead`（8 bit） | `rename.v:320`，端口 `rename.v:90/322` | 物理状态 |
-| `livei`/`livef` | **已占用物理寄存器数** = `NREG − free`（整数 96 / 浮点 64） | 由 `rename.v:320` 导出；`NREG` 见 `back2_params.vh:33/35` | 需求（含 ARCH_N=32 架构基线） |
+| `livei`/`livef` | **已占用物理寄存器数** = `NREG − free`（冻结树 cfc0af9 时点整数 96 / 浮点 64；**当前 NREG 整数 64**） | 由 `rename.v:320` 导出；`NREG` 见 `back2_params.vh:33/35` | 需求（含 ARCH_N=32 架构基线） |
 | `cki`/`ckf` | `popcount(ck_val)`（rename 两域检查点有效位） | `rename.v:161` | **上界**（见 §3 缺陷 D3） |
 | `ckbusy` | 后端 `ck_busy_q` 原值 | `backend_top.v:630` | 物理端口（**只 4 bit，越界缺陷 D2**） |
 | `ckpend` | `popcount(ck_pend_q)` 待释放检查点 | `backend_top.v:632/2356` | 物理状态 |

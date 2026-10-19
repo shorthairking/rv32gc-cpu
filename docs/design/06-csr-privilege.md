@@ -1,13 +1,15 @@
 # 06 — CSR 与特权级设计
 
-> 本文属 RV32-GC 新项目（`dev` 分支）阶段一设计文档集。CSR 语义以常驻知识库（riscv-kb）检索到的 ISA 手册原文为准并逐条标注 `path:line`；平台事实以 `AGENT.md` §3 与 chiplab 源码为准。
+> 本文属 RV32-GC 新项目（`dev` 分支）阶段一设计文档集。CSR 语义以常驻知识库（riscv-kb）检索到的 ISA 手册原文为准并逐条标注 `path:line`；平台事实以 [`AGENT.md`](../../AGENT.md) 的"平台事实"节与 chiplab 源码为准。
 > 本文不复制任何上一代实现或文档的正文/图/参数组织。
+>
+> **实现差异提示（2026-10-18，先读）**：本文是 CSR/特权**设计规格**，不等于全部已实现。截至 RTL `7e2e730`，审计仍有未关闭/待裁决项：**D3** `pmpcfg.L=1` 时 `pmpaddr` 仍可写；**D4** `mcounteren/scounteren` 门控缺失；**D5** `mstatus.TVM` 未强制；**D7** 2B `misa.A=1` 但 AMO/LR/SC/WFI 判非法（需按核分档或登记 2B 不含 A/WFI，属架构裁决）；**D9** `mideleg=0` 时 S 级中断在 M/S/U 均不可见的委托门控疑似偏差（待裁决）。D1 已修（`bd622ee`），D2/D6/D8 已修（`7e2e730`）。详见 [`sim/audit/audit2_report.md`](../../sim/audit/audit2_report.md) 与 [`NEXT_SESSION.md`](../../NEXT_SESSION.md) 当前状态/待办；**不要据本文声称上述项已实现**。
 
 ---
 
 ## 1. 特权级模型与总体结构
 
-**设计目标**：M / S / U 三级 + Sv32 分页 + PMP 16 项（`AGENT.md` §1）。
+**设计目标**：M / S / U 三级 + Sv32 分页 + PMP 16 项（[工作契约](../../AGENT.md) 的"硬指标"）。
 
 ```mermaid
 graph TD
@@ -32,7 +34,7 @@ graph TD
 **关键口径**（ISA 强制）：
 
 - **默认全部由 M 处理**：「By default, all traps at any privilege level are handled in machine mode」；`medeleg`/`mideleg` 置位后才把 **S/U 模式下发生**的对应陷阱委托给 S。——`riscv-isa-manual/src/priv/machine.adoc` Machine Trap Delegation (`medeleg` and `mideleg`) Registers，`norm:trapdefM_mode` / `norm:medelegmidelegop2`（`kb` chunk 10545）。
-- **陷阱不从高特权级委托到低特权级**（本项目口径，`AGENT.md` §3.3）：M 模式下发生的陷阱**永不**被委托；只有源特权级为 S 或 U 的陷阱才可能被委托到 S。这与手册「delegate the corresponding trap, **when occurring in S-mode or U-mode**」一致。
+- **陷阱不从高特权级委托到低特权级**（本项目口径，[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）：M 模式下发生的陷阱**永不**被委托；只有源特权级为 S 或 U 的陷阱才可能被委托到 S。这与手册「delegate the corresponding trap, **when occurring in S-mode or U-mode**」一致。
 - **委托后不写 M 侧 CSR**：「The `mcause`, `mepc`, and `mtval` registers and the `mpp` and `mpie` fields of `mstatus` are **not written**」；改为写 `scause`/`sepc`/`stval`/`sstatus.SPP`/`sstatus.SPIE`，并清 `sstatus.SIE`。——同节 `norm:trapdelS-mode` / `norm:trapdelSmodenoMmode`（`kb` chunk 10545）。**陷阱不从高特权级委托到低特权级**的规范依据为 `norm:trap_never_trans_lower`（`riscv-isa-manual/src/priv/machine.adoc:1281-1288`）；`medeleg` 为 **64-bit** 寄存器（`:1234`），XLEN=32 时高 32 位经 `medelegh` **别名**访问（`:1305-1309`）。
 
 ---
@@ -206,7 +208,7 @@ U 模式访问其它任何 CSR ⇒ 非法指令异常。S 模式访问 M 模式 
 
 ## 4. MPRV / SUM / MXR 同拍旁路
 
-**为什么必须同拍旁路**：本核为 11 级乱序流水。若 CSR 写指令在 WB 之后才更新特权级判定输入，那么紧随其后的访存指令会用**旧的** `MPRV`/`MPP`/`SUM`/`MXR` 做翻译与检查，产生静默错误。`AGENT.md` §3.3 把「CSR/MPRV/SUM/MXR 同拍旁路」列为点名教训。
+**为什么必须同拍旁路**：本核为 11 级乱序流水。若 CSR 写指令在 WB 之后才更新特权级判定输入，那么紧随其后的访存指令会用**旧的** `MPRV`/`MPP`/`SUM`/`MXR` 做翻译与检查，产生静默错误。[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3 把「CSR/MPRV/SUM/MXR 同拍旁路」列为点名教训。
 
 ```mermaid
 graph LR
@@ -351,7 +353,7 @@ graph TD
 
 ### 6.4 陷阱口径（本项目强制清单）
 
-逐条来自 `AGENT.md` §3.3，此处给出**可实现的判定顺序与取值**：
+逐条来自 [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3，此处给出**可实现的判定顺序与取值**：
 
 | 编号 | 口径 | 实现要点 |
 |---|---|---|
@@ -462,7 +464,7 @@ assign rd_addr_hit[0] = ~|rd_addr_hit[4:1];                  // DDR3
 | `0x4000` | `mtimecmp` | 64（RV32 拆两个 32 位字） | R/W |
 | `0xBFF8` | `mtime` | 64（RV32 拆两个 32 位字） | R/W（或只读） |
 
-标准 CLINT 的 `mtimecmp`/`mtime` 为 64 位，RV32 下按「低字在低地址、高字在高地址」拆成两组 32 位寄存器。`mtime` 由板级时钟驱动；33 MHz 上板频率下 1 tick ≈ 30.3 ns（`AGENT.md` §3.1 时钟口径）。
+标准 CLINT 的 `mtimecmp`/`mtime` 为 64 位，RV32 下按「低字在低地址、高字在高地址」拆成两组 32 位寄存器。`mtime` 由板级时钟驱动；33 MHz 上板频率下 1 tick ≈ 30.3 ns（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 时钟口径）。
 
 ### 8.3 PLIC 与「232 only 5bit」中断号收敛方案
 

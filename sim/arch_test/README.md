@@ -2,6 +2,11 @@
 
 > 项目：rv32gc-cpu（阶段二 2A）；规格依据：`docs/design/08-baseline-5stage.md` §8.2/§8.2.1、
 > `docs/design/07-verification.md` V-3/V-4/V-5。
+>
+> **DUT 边界（2026-10-18，先读）**：本目录 `run.sh` 与 `sim/tb/tb_arch_test.sv` 仍例化 **2A `core_top`**，
+> **2B 尚未接入 arch-test**。2A arch-test 于 2026-09-17 收口全绿（分组记录见历史台账），但之后
+> 2A/2B 共享的 `trap_ctrl`/`csr_file` 等在 D2/D6 修复中改过、**未重跑本套件** ⇒ 旧"全绿"不能直接当作
+> `7e2e730` 的复查结论；更不能把 2A 全绿/上板等同于 2B 验收。
 
 ## 1. 用法
 
@@ -16,7 +21,7 @@
 ./sim/arch_test/run.sh --group rv32i/I --jobs 16 # 组模式多进程并行（默认 jobs=nproc；本机 16 核）
 ```
 
-判定纪律（AGENT.md §0.6「未捕获即失败」）：
+判定纪律（[工作契约](../../AGENT.md) 的“验收纪律”「未捕获即失败」）：
 - 唯一成功文案 = `RV32_ARCH_TEST: <用例> PASS (compared=<n> lines, first_diff=none)` 与
   `RV32_ARCH_TEST_RUN: PASS (<n>/<n>)`；兜底/失败路径**不含 PASS 字样**；
 - 任一步失败（编译/参考/DUT 仿真/签名行数/逐行比对/超时）⇒ 该用例 FAIL 且脚本 rc≠0。
@@ -59,7 +64,13 @@
 | `dm_smoke.S` / `dm_csr_raw.S` / `dm_htif.S` | 定向程序：底座 PASS 通道自证 / CSR 写后读回归 / HTIF 控制台写最小复现 |
 | `../tb/tb_arch_test.sv` | DUT TB：core_top + 自洽 AXI 从设备 + hex 预载 + HTIF(tohost) 终止 + 签名导出 + 超时守卫 |
 
-## 3. 当前状态（2026-09-15）
+## 3. 状态（2026-10-18）
+
+- **2A**：本底座在 2026-09-15 自证可用后，随 2A M2 收口于 **2026-09-17 全绿**（PMP/Sv32/Sv*/Zicbom/Zicntr 等分组；历史台账见 `AGENT` 存档与 `NEXT` 记录）。此后 D2/D6 共享 RTL 修复**未重跑**本套件，故该"全绿"只对应 2026-09-17 的树。
+- **2B**：`run.sh`/`tb_arch_test.sv` 仍用 2A `core_top`，**2B 未接入**；不得把 2A 的 arch-test 结果当作 2B 验收。
+- 历史排查（2026-09-15，I-nop/I-add 曾 FAIL）保留在 §3.1，仅作追溯；其中阻塞项已随 2A 收口解决，不再按该表判断当前状态。
+
+### 3.1 历史排查记录（2026-09-15；已收口，仅追溯）
 
 **底座本身已自证可用**（三条定向程序在 DUT 与 Spike 上跑出逐行一致的签名）：
 ```bash
@@ -68,7 +79,7 @@
 ./sim/arch_test/run.sh --directed dm_htif      # PASS（HTIF 控制台写 tohost 窗口无副作用）
 ```
 
-**arch-test 用例（I-nop-00 / I-add-00）当前仍 FAIL，阻塞在 DUT（非底座）**，已定位/已排除的链条：
+**arch-test 用例（I-nop-00 / I-add-00）当时仍 FAIL，阻塞在 DUT（非底座）**，已定位/已排除的链条：
 | # | 现象 | 结论 |
 |---|---|---|
 | 1 | ACT 启动码 mtvec 自检失败（`csrw mtvec; csrr 读回旧值`） | **RTL 缺陷**：CSR 写后读距离 1 缺旁路 ⇒ 已由 `96207a9` 修复，`dm_csr_raw` 复验 PASS |
@@ -83,7 +94,9 @@
 证据文件：`work/I-nop-00/I-nop-00.dut.log`（DUT 侧末态 + 摘要）、`work/I-nop-00/I-nop-00.spike.sig`
 （参考签名）、`work/evidence/*.log`（历史定位过程：CSR RAW / 提交分歧比对 / 停摆态）。
 
-## 4. 修复后的验收动作（无需改底座）
+## 4. 收口后的回归动作（仅 2A；2B 不适用）
+
+> 下面期望值对应 **2026-09-17 的 2A 树**；D2/D6 之后未重跑，若要当前结论须重新执行并记录日期。
 
 ```bash
 ./sim/arch_test/run.sh I-nop-00            # 期望：RV32_ARCH_TEST: I-nop-00 PASS (compared=15020 lines, first_diff=none)

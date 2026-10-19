@@ -3,6 +3,9 @@
 > 依据 `rv32gc-cpu/docs/porting/03-linux-opensbi.md` §7.2 交付要求（基线版本 + 补丁清单 +
 > 构建命令）。落档时间：2026-09-21（L-m1/L-m2 完成后）。
 > 详细报告与运行期证据：`docs/linux-port/README.md`、`docs/linux-port/logs/`。
+>
+> **状态边界（2026-10-18）**：当前 `dev` HEAD 为 `a73502e`（L-m3 子页读修复）；L-m1…L-m3 + UBIFS 冷启的
+> 运行期证据均在 **QEMU chiplab machine**，**真板未验**。本文件是基线与构建口径，不是上板验收报告。
 
 ## 1. 基线
 

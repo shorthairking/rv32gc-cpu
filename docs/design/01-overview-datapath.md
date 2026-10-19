@@ -1,19 +1,21 @@
 # 01 — 项目定位、顶层契约与数据通路总览
 
-> 本文属 RV32-GC 新项目（`rv32gc-cpu/`，`dev` 分支）阶段一微架构设计文档集（01–04）。所有参数取自 `AGENT.md` §1 硬性指标与 §3 平台事实基线；ISA 语义以常驻知识库（riscv-kb）检索到的手册原文为准，逐条标注 `path:line`；平台电气口径以只读的 `chiplab/chip/soc_demo/loongson/{soc_top.v,config.h}`、`chiplab/IP/AMBA/axi_mux_syn.v` 为准。
+> 本文属 RV32-GC 新项目（`rv32gc-cpu/`，`dev` 分支）阶段一微架构设计文档集（01–04）。所有参数取自 [`AGENT.md`](../../AGENT.md) 的硬指标表与平台事实基线；ISA 语义以常驻知识库（riscv-kb）检索到的手册原文为准，逐条标注 `path:line`；平台电气口径以只读的 `chiplab/chip/soc_demo/loongson/{soc_top.v,config.h}`、`chiplab/IP/AMBA/axi_mux_syn.v` 为准。
 > 本文不复制上一代（`master` 分支冻结历史）实现的任何文字、图或参数组织；旧项目只作为"教训清单"出现在 §8。
+>
+> **现行口径（2026-10-18，先读）**：本文是**阶段一设计目标**，不是 2B as-built。§2/§4 的 "ROB 128 项 / 每拍提交 4 条" 是原设计目标；用户 2026-10-04 裁决后，当前 2B 实作为 **4 取指 + ROB 64 + 分配/发射 4 宽 + 提交 2 宽**，整数/浮点物理寄存器各 **64**，SQ **32** / LQ **8**，IQ **12/12/6/6/8/6**，PRF 读口 **11/5**，**store→load 转发已移除（N29B）**。实际参数一律以 [`rtl/back2/back2_params.vh`](../../rtl/back2/back2_params.vh) 与 RTL 连接为准；本文不再把 128/4 当作当前参数。§5 的 48 端口契约仍是现行顶层契约；**L2 256 KB 未实现**（当前只有 L1I/L1D）。
 
 ---
 
 ## 1. 项目定位
 
-在 **chiplab 龙芯 FPGA 实验箱**（`xc7a200tfbg676-2`，Artix-7）上实现一颗 **RV32-GC 4 发射乱序处理器**，并完成 **OpenSBI(M) + U-Boot(S) + Linux(S, Sv32) + 根文件系统** 移植，最终**从 NAND 自动启动 Linux**（`AGENT.md` §1）。
+在 **chiplab 龙芯 FPGA 实验箱**（`xc7a200tfbg676-2`，Artix-7）上实现一颗 **RV32-GC 4 发射乱序处理器**，并完成 **OpenSBI(M) + U-Boot(S) + Linux(S, Sv32) + 根文件系统** 移植，最终**从 NAND 自动启动 Linux**（[工作契约](../../AGENT.md) 的"硬指标"）。
 
 项目的三条定位边界：
 
 1. **事实基线不可改**：DDR3 位于物理地址 `0x0` 是平台硬事实（`chiplab/IP/AMBA/axi_mux_syn.v:860` 的 `wr_addr_hit[0] = ~|wr_addr_hit[4:1]`），ISA 并不规定物理地址映射。本项目**不改平台 AXI 编址**；RISC-V 习惯的 `0x8000_0000` 只用于仿真/arch-test 布局。
-2. **核内外分工**：CPU 核心内部（取指、译码、Cache 控制、执行流水）自研；从「Cache→AXI 转换」边界**向外**（协议转换、互连、DMA、FIFO、外设控制器）一律复用 Vivado 成熟 AXI IP/wrapper 与 chiplab 平台已有模块（`AGENT.md` §4 红线 4）。
-3. **不用原语**：任何功能先检索 Vivado 是否有可用 IP（Clocking Wizard、Block Memory Generator、FIFO Generator、Multiplier、Divider Generator、DSP Macro、AXI 系列），用 IP 实现；确无 IP 才允许写可综合 HDL，并附检索过程与结论（`AGENT.md` §4 红线 1）。
+2. **核内外分工**：CPU 核心内部（取指、译码、Cache 控制、执行流水）自研；从「Cache→AXI 转换」边界**向外**（协议转换、互连、DMA、FIFO、外设控制器）一律复用 Vivado 成熟 AXI IP/wrapper 与 chiplab 平台已有模块（[工作契约](../../AGENT.md) 的"编码红线"）。
+3. **不用原语**：任何功能先检索 Vivado 是否有可用 IP（Clocking Wizard、Block Memory Generator、FIFO Generator、Multiplier、Divider Generator、DSP Macro、AXI 系列），用 IP 实现；确无 IP 才允许写可综合 HDL，并附检索过程与结论（[工作契约](../../AGENT.md) 的"编码红线"）。
 
 ---
 
@@ -27,12 +29,12 @@
 | 执行部件 | **6 个**：ALU×2、BRU、MDU、LSU、FPU | §4 数据通路图 | RTL 结构 |
 | 分支预测 | **锦标赛预测器**（全局 Gshare + 局部历史 + 选择器） | `docs/design/04-predictor.md` | 结构 + 准确率统计 |
 | 流水级 | **11 级**（≥5 级的下限之上） | `docs/design/02-pipeline.md` | 结构 |
-| 乱序执行 | **ROB 128 项 + 物理寄存器重命名 + 分布式发射队列 + LSQ** | `docs/design/03-out-of-order.md` | 结构 + 锁步验证 |
+| 乱序执行 | **ROB 128 项（原目标；当前 2B 为 64）+ 物理寄存器重命名 + 分布式发射队列 + LSQ** | `docs/design/03-out-of-order.md` | 结构 + 锁步验证 |
 | Cache | **L1I 16 KB / L1D 32 KB / L2 256 KB** | `docs/design/05-cache-memory.md` | 结构 + 命中率 |
 | 主频 | **≥60 MHz，目标 100 MHz；上板 33 MHz** | §7 时钟域 | Vivado 时序报告 |
 | 软件栈 | OpenSBI(M) + U-Boot(S) + Linux(S, Sv32) | `docs/porting/` | 上板实测 |
 
-> 4 发核查账：ISA 只要求「single hart 按程序序提交」，多发射/乱序是**微架构**选择，因此 4 发射的正确性判据是「提交（retire）流的顺序与宽度」——每拍最多提交 4 条、且严格按程序序；由 `docs/design/03-out-of-order.md` 的 ROB 顺序提交队列保证。
+> 4 发核查账：ISA 只要求「single hart 按程序序提交」，多发射/乱序是**微架构**选择，因此 4 发射的正确性判据是「提交（retire）流的顺序与宽度」——原设计目标为每拍最多提交 4 条、且严格按程序序；**当前 2B 已按 2026-10-04 裁决降为 2 宽提交**（分配/发射仍 4 宽），由 `docs/design/03-out-of-order.md` 的 ROB 顺序提交队列保证。表中「验收方式=提交宽度 4」应读作**原设计目标**，现行验收底线是 4 取指 + ≥2 提交/拍。
 
 ---
 
@@ -76,9 +78,9 @@ graph TD
 
 **层级规则**（写入 `rtl/pkg/rv32gc_defs.vh` 作为唯一真源）：
 
-- 所有跨模块信号位宽只在 `rtl/pkg/rv32gc_defs.vh` 定义一次；**位域/接口改动先改唯一真源再全量同步**，改完用 `grep` 核对新端口两侧都接上（`AGENT.md` §3.2）。
-- `cache/` 与 `bus/` 属"可复用 IP 区"：数据阵列用 Vivado **Block Memory Generator** IP，AXI 转换用 Vivado AXI IP/wrapper，二者都必须配 **`ifdef` 双分支仿真行为模型**（综合走 IP、仿真走逐拍等价模型），保证 iverilog/Verilator 回归不依赖 Vivado（`AGENT.md` §4 红线 2）。
-- 大量组合逻辑用 `assign`/连续赋值（或 `function`）表达；`always @(*)` 不得用于给多个 `reg` 赋值，`always` 块只用于确有必要的少量场合并注释理由（`AGENT.md` §4 红线 3）。
+- 所有跨模块信号位宽只在 `rtl/pkg/rv32gc_defs.vh` 定义一次；**位域/接口改动先改唯一真源再全量同步**，改完用 `grep` 核对新端口两侧都接上（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.2）。
+- `cache/` 与 `bus/` 属"可复用 IP 区"：数据阵列用 Vivado **Block Memory Generator** IP，AXI 转换用 Vivado AXI IP/wrapper，二者都必须配 **`ifdef` 双分支仿真行为模型**（综合走 IP、仿真走逐拍等价模型），保证 iverilog/Verilator 回归不依赖 Vivado（[工作契约](../../AGENT.md) 的"编码红线"）。
+- 大量组合逻辑用 `assign`/连续赋值（或 `function`）表达；`always @(*)` 不得用于给多个 `reg` 赋值，`always` 块只用于确有必要的少量场合并注释理由（[工作契约](../../AGENT.md) 的"编码红线"）。
 
 ---
 
@@ -210,11 +212,11 @@ flowchart LR
 
 ### 5.8 顶层端口规则（实现必须遵守）
 
-1. **端口名/位宽逐字对齐**：工程只加我们自己的 `rtl/**`，不修改平台源码（`AGENT.md` §3.1）。
+1. **端口名/位宽逐字对齐**：工程只加我们自己的 `rtl/**`，不修改平台源码（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1）。
 2. **`awlock`/`arlock` 高位显式置 0**：平台侧只接 `[0:0]`（`soc_top.v:1514` 写 `s0_awlock[0:0]`、`soc_top.v:1534` 写 `s0_arlock[0:0]`），本核必须自己把 `[1]` 驱动为 0，不得依赖平台忽略高位。
 3. **`intrpt` 未用高位视为 0**：`int_out` 声明为 `wire [5:0]`（`soc_top.v:595`），`:725` 的 `{3'b0, int_out[4:0]}` 补齐 8 bit 端口宽度，核内不得对高位做"预留功能"假设。
-4. **单笔在途三件套**：总线口仲裁必须同时具备「单笔在途 busy」+「归属 owner 寄存器」+「FSM 用 `valid && ready` 推进」（`AGENT.md` §3.3）。
-5. **地址寄存器唯一赋值点**：总线地址寄存器只允许一个赋值点，且统一使用**物理地址**（`AGENT.md` §3.3，VA/PA 混用是静默错）。
+4. **单笔在途三件套**：总线口仲裁必须同时具备「单笔在途 busy」+「归属 owner 寄存器」+「FSM 用 `valid && ready` 推进」（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）。
+5. **地址寄存器唯一赋值点**：总线地址寄存器只允许一个赋值点，且统一使用**物理地址**（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3，VA/PA 混用是静默错）。
 
 ---
 
@@ -236,7 +238,7 @@ flowchart LR
 
 ### 6.2 设计约束：CLINT / PLIC 必须核内截获
 
-用户拍板口径（`AGENT.md` §3.1）：**不改 SoC 顶层**，核内自建 **CLINT `0x1F00_0000`** 与 **PLIC `0x1F10_0000**。
+用户拍板口径（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1）：**不改 SoC 顶层**，核内自建 **CLINT `0x1F00_0000`** 与 **PLIC `0x1F10_0000**。
 
 ```mermaid
 flowchart TD
@@ -278,7 +280,7 @@ SPI XIP 是**只读直执行**窗口：Flash 内容可被外部编程器改写�
 
 **口径**：上板时 `cpu_clk` 与 un-core（AXI/DDR3/外设）**同为 33 MHz 且同源**，`aclk` 域内**无跨时钟域（no CDC）**、无需异步 FIFO / 同步器。`intrpt` 与 AXI 返回都在同一时钟域内采样。仿真环境按目标频率独立给时钟（不改变同域性质）。
 
-> 主频指标 ≥60 MHz / 目标 100 MHz 是**时序收敛目标**（`AGENT.md` §1），与"上板跑 33 MHz"不矛盾：约束文件复用平台 `soc_up.xdc`，100 MHz 只作为综合/实现的目标频率用于评估关键路径余量。
+> 主频指标 ≥60 MHz / 目标 100 MHz 是**时序收敛目标**（[工作契约](../../AGENT.md) 的"硬指标"），与"上板跑 33 MHz"不矛盾：约束文件复用平台 `soc_up.xdc`，100 MHz 只作为综合/实现的目标频率用于评估关键路径余量。
 
 ### 7.2 复位
 
@@ -290,12 +292,12 @@ SPI XIP 是**只读直执行**窗口：Flash 内容可被外部编程器改写�
 | 项 | 口径 | 依据 |
 |---|---|---|
 | `RESET_PC` | **`0x1C00_0000`** | 平台无 boot ROM（`soc_top.v:664-1885`），程序镜像被烧到 SPI Flash 的 `0x1C00_0000`：`chiplab/software/bsp/env/convert.c:88`（`fprintf(out,"@1c000000\n")`）等全部 convert 脚本，以及 `chiplab/sims/verilator/testbench/include/common.h:9`（`#define FIRST_INST_ADDRESS 0x1c000000`），difftest 用它在 `difftest.cpp:255` 判定首条提交指令 |
-| 早期寻址 | SPI 窗口内**只用 PC 相对寻址**；跨窗口跳转用 `auipc + addi + jalr` | `AGENT.md` §3.1 |
-| 早期 MMU | **开 MMU 前禁止跨窗口跳转**；`satp.MODE=Bare` 直到引导软件准备好页表 | `AGENT.md` §3.1 |
+| 早期寻址 | SPI 窗口内**只用 PC 相对寻址**；跨窗口跳转用 `auipc + addi + jalr` | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 |
+| 早期 MMU | **开 MMU 前禁止跨窗口跳转**；`satp.MODE=Bare` 直到引导软件准备好页表 | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.1 |
 | XIP 取指 | 命中 XIP 窗口**绕过 I-Cache** | §6.3 |
-| 取指粒度 | 每条 16 bit parcel，一次最多提交 4 条（4 发射） | 11 级流水线定义见 `docs/design/02-pipeline.md` |
-| 取指 PMP | 取指的 PMP 检查按 **16-bit parcel** 进行——**本设计选择**："按 2 B parcel"**规范未明说**；规范强制的是「取指无执行权限 ⇒ instruction access-fault」`norm:pmp_exec_fault`（`riscv-isa-manual/src/priv/machine.adoc:3418-3419`）与「每笔访存独立检查」`norm:pmpmisalignedaccess_behavior`（`:3564-3569`），粒度由平台定义 `norm:pmp_granularity`（`:3315`） | `AGENT.md` §3.3；ISA 依据见 §7.4 |
-| 非对齐 | 非对齐的优先级**高于** PMP——**本设计选择**（规范为**实现可选**：misaligned 与 page/access fault 优先级**由实现任选 either higher or lower**，`norm:mcause_exccodepri2`，`riscv-isa-manual/src/priv/machine.adoc:1937-1938`） | `AGENT.md` §3.3；ISA 依据见 §7.4 |
+| 取指粒度 | 每条 16 bit parcel，一次最多**取** 4 条（4 发射；原设计目标为提交 4 条/拍，**当前 2B 提交 2 条/拍**） | 11 级流水线定义见 `docs/design/02-pipeline.md`；当前提交宽度见 `back2_params.vh` |
+| 取指 PMP | 取指的 PMP 检查按 **16-bit parcel** 进行——**本设计选择**："按 2 B parcel"**规范未明说**；规范强制的是「取指无执行权限 ⇒ instruction access-fault」`norm:pmp_exec_fault`（`riscv-isa-manual/src/priv/machine.adoc:3418-3419`）与「每笔访存独立检查」`norm:pmpmisalignedaccess_behavior`（`:3564-3569`），粒度由平台定义 `norm:pmp_granularity`（`:3315`） | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3；ISA 依据见 §7.4 |
+| 非对齐 | 非对齐的优先级**高于** PMP——**本设计选择**（规范为**实现可选**：misaligned 与 page/access fault 优先级**由实现任选 either higher or lower**，`norm:mcause_exccodepri2`，`riscv-isa-manual/src/priv/machine.adoc:1937-1938`） | [历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3；ISA 依据见 §7.4 |
 
 ### 7.4 ISA 强制项（写实现时必须遵守，逐条带出处）
 
@@ -369,8 +371,8 @@ flowchart TD
 
 **数据通路三条关键定理**（后续文档反复引用）：
 
-1. **虚拟地址只在两处出现**：取指（F3/F4）与 LSU 地址生成（E1）。**总线地址寄存器唯一赋值点、统一物理地址**——VA/PA 混用是静默错（`AGENT.md` §3.3）。
-2. **旁路/转发网络覆盖三个必须点**：写优先寄存器堆（WB→读口显式旁路）、MEM 级转发访存结果、CSR/MPRV/SUM/MXR 同拍旁路；且 `xRET` 只有回到 **M 以外的更低调特权级**时才清 `MPRV`（`AGENT.md` §3.3；ISA 依据：`MPRV=1` 时按 **`MPP`** 语义做翻译与保护 `norm:mstatus_mprv_ldst_op`——`riscv-isa-manual/src/priv/machine.adoc:588-597`；`mret`/`sret` 转到低于 M 的模式时清零 `MPRV` `norm:mstatus_mprv_clr_mret_sret_less_priv`——`:599-600`、`:413`；arch-test coverpoint `mstatus_mprv_clr_mret_sret_less_priv`，`riscv-arch-test/coverpoints/norm/Sm.yaml:393-412`）。
+1. **虚拟地址只在两处出现**：取指（F3/F4）与 LSU 地址生成（E1）。**总线地址寄存器唯一赋值点、统一物理地址**——VA/PA 混用是静默错（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3）。
+2. **旁路/转发网络覆盖三个必须点**：写优先寄存器堆（WB→读口显式旁路）、MEM 级转发访存结果、CSR/MPRV/SUM/MXR 同拍旁路；且 `xRET` 只有回到 **M 以外的更低调特权级**时才清 `MPRV`（[历史工作契约](../../archive/agent-pre-workflow-2026-10-18.md) §3.3；ISA 依据：`MPRV=1` 时按 **`MPP`** 语义做翻译与保护 `norm:mstatus_mprv_ldst_op`——`riscv-isa-manual/src/priv/machine.adoc:588-597`；`mret`/`sret` 转到低于 M 的模式时清零 `MPRV` `norm:mstatus_mprv_clr_mret_sret_less_priv`——`:599-600`、`:413`；arch-test coverpoint `mstatus_mprv_clr_mret_sret_less_priv`，`riscv-arch-test/coverpoints/norm/Sm.yaml:393-412`）。
 3. **核内 MMIO 与 Cache 通路互斥**：CLINT/PLIC 访问经 LSU 直通核内 MMIO，不经 Cache、不发 AXI（§6.2）；XIP 取指绕过 I-Cache（§6.3）。两者共同保证"绝不因地址译码错误静默访问 DDR3 默认通路"。
 
 ---
