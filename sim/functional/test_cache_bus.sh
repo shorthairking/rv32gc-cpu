@@ -8,31 +8,32 @@
 #
 # 做什么 :
 #   1) 用 iverilog 编译**本包固定 TB**（sim/functional/tb_cache_bus_semantics.sv）
-#      + DUT_ROOT 下 `rtl/cache/{l1d,l1i,cache_tag_array,cache_array_bram}.v`
-#      + `rtl/axi/axi_master_ctrl.v`（头文件按 DUT_ROOT 解析）；
+#      + DUT_ROOT 下 5 个 RTL（l1d/l1i/cache_tag_array/cache_array_bram/axi_master_ctrl）；
+#      ★ 编译前 `cd "$DUT_ROOT"` 且只用 `-I "$DUT_ROOT"` ⇒ `rtl/pkg/*.vh` 只能来自
+#        DUT 根，**不会**从调用者 cwd 或活树 fallback 借头文件（毒化 cwd 反证见 driver）。
 #   2) 跑 vvp，把编译/运行输出捕获到**本次独占**的 run 目录；
-#   3) 逐向量严格校验摘要/格式/冻结规格/逐向量检查数；缺一即失败；
+#   3) 逐向量**逐项核对**（编号/名称/checks/fails/defect 全固定，见 §2 的规格表）；
+#      多一条、少一条、重名、错名、错数、0 检查凑数，一律失败；
 #   4) 默认 DUT_ROOT = 本仓库根（当前树）；置 DUT_ROOT=<只读源根> 可对旧源码复跑
 #      同一 TB 做反证。
 #
-# 两种判定模式（同一 TB、同一脚本，只换期望）：
-#   · 默认 CACHE_BUS_EXPECT=fixed：fails=0 且 defect=0 且冻结规格精确匹配
+# 两种判定模式（同一 TB、同一脚本、同一 env，只换期望规格）：
+#   · 默认 CACHE_BUS_EXPECT=fixed：逐向量 fails=0 / defect=0，checks 等于 fixed 表
 #     ⇒ stdout 只有摘要行 + `FUNCTIONAL_CACHE_BUS: PASS`，rc=0。
-#   · CACHE_BUS_EXPECT=old（旧树反证口径）：要求**每个**登记根因向量都给出 defect=1
-#     且 fails>0，逐根因打印 `FUNCTIONAL_CACHE_BUS: DEFECT_REPRODUCED root=<04-xx> ...`；
-#     **绝不**打印 PASS 锚点，rc=1。旧树上"缺陷被复现"不是修复通过。
+#   · CACHE_BUS_EXPECT=old（旧树反证口径）：逐向量 checks/fails/defect 等于 old 表
+#     （旧树真实死锁会让部分向量提前中止，故**旧/新检查数不同**，各自独立规格，
+#      不强行压成同一个数），逐根因打印 DEFECT_REPRODUCED；**绝不**打印 PASS，rc=1。
 #
 # 产物纪律（每次运行互不覆盖、**不删除任何历史文件**）:
-#   · 产物根 = RV32_FUNCTIONAL_PKG_OUT_DIR（功能总入口传入，若设置）
-#              > OUT_DIR（显式指定）
-#              > $REPO_ROOT/build/functional/cache-bus（默认）
+#   · 产物根 = RV32_FUNCTIONAL_PKG_OUT_DIR > OUT_DIR > $REPO_ROOT/build/functional/cache-bus
 #   · 根先 readlink -m 规范化并校验位于 $REPO_ROOT/build/functional 之下，再 mkdir；
 #     随后 `mktemp -d <根>/run-XXXXXXXX` 建**独占 run 目录**，本次全部产物都在其中。
-#   · 因目录独占，脚本**不做任何 rm**；固定文件名也不会覆盖历史。
+#   · 因目录独占，脚本**不做任何 rm**。
 #
-# 工具真源 : 只从 scripts/env.sh 取 RV32_IVERILOG / RV32_VVP（env.sh 只读）；
-#            二者仍可被调用方以同名环境变量覆盖 ⇒ 保留"假工具"反证能力。
-# 源冻结  : DUT 源 + 头 + TB 的 sha256 **运行前后各算一次并要求逐字节一致**。
+# 工具真源 : 只从 scripts/env.sh 取 RV32_IVERILOG / RV32_VVP（env.sh 只读）。
+# 源冻结  : 集合 A（8 依赖）= 5 RTL + 2 头 + TB，**恰好 8 行全为 64 位 hex**；
+#           集合 B（包/env）= 本包脚本 + env.sh，**恰好 2 行全为 hex**。
+#           两组都运行前后各算一次并要求逐字节一致（不容忍额外坏行）。
 #
 # 用法 : bash sim/functional/test_cache_bus.sh
 #        DUT_ROOT=<只读源根> bash sim/functional/test_cache_bus.sh
@@ -49,7 +50,7 @@ if [ "$#" -ne 0 ]; then
 fi
 
 TIMEOUT_COMPILE_S="${TIMEOUT_COMPILE_S:-300}"
-TIMEOUT_RUN_S="${TIMEOUT_RUN_S:-600}"
+TIMEOUT_RUN_S="${TIMEOUT_RUN_S:-900}"
 CACHE_BUS_EXPECT="${CACHE_BUS_EXPECT:-fixed}"
 
 #------------------------------------------------------------------------------
@@ -63,20 +64,37 @@ REPO_ROOT="$(cd -- "$SELF_DIR/../.." && pwd -P)" || {
 TB_SRC="$SELF_DIR/tb_cache_bus_semantics.sv"
 ENV_SH="$REPO_ROOT/scripts/env.sh"
 
-# ---- 本包冻结规格（与 tb_cache_bus_semantics.sv 同步；改 TB 必须同步改这里）----
-SPEC_TOTAL=14
-SPEC_NONZERO=14
-SPEC_CHECKS=249
-SPEC_DEFECT_VECTORS=11
-SPEC_CONTROL_VECTORS="ctrl_wb_clean_no_req ctrl_axi_nonsplit_single_done ctrl_l1d_fill_hit"
+#------------------------------------------------------------------------------
+# 2. 冻结规格（与 tb_cache_bus_semantics.sv **逐向量逐字段**同步；改 TB 必须同步改这里）
+#    ★ 顺序即 VEC 行顺序；编号必须 1..SPEC_TOTAL；每项 checks 必须 > 0。
+#    ★ fixed 与 old 是**两套独立规格**：旧树在真实死锁处提前中止，检查数必然更少，
+#      这不是"少跑"，而是缺陷证据；两套都精确匹配才判通过。
+#------------------------------------------------------------------------------
+SPEC_NAMES="wb_first_valid_zero_delay wb_two_victims_distinct wb_accept_delay3 \
+ctrl_wb_clean_no_req axi_split_read_single_done axi_split_write_single_done \
+ctrl_axi_nonsplit_single_done l1i_fill_err_early l1i_fill_err_last \
+l1i_two_err_lines_alternate l1d_fill_err_mid l1d_wb_b_fail_keeps_dirty \
+l1d_maint_clean_b_fail ctrl_l1d_fill_hit axi_r_err_early axi_r_err_mid \
+axi_r_err_last axi_b_err_write axi_split_first_err_last_ok axi_err_clear_next_req \
+axi_r_resp_x_fail_closed axi_b_resp_x_fail_closed ctrl_axi_error_free_chain \
+l1i_fill_err_x_early l1i_fill_err_x_last l1d_fill_err_x_mid \
+l1d_wb_err_x_keeps_dirty l1d_maint_flush_b_fail_two_ways"
+SPEC_TOTAL=28
+
+SPEC_CHECKS_FIXED="36 53 37 6 12 11 8 15 6 10 12 35 49 7 11 9 8 9 10 10 9 6 10 9 8 7 24 21"
+SPEC_CHECKS_OLD="35 49 37 6 12 11 8 6 1 1 5 21 11 7 11 9 8 9 10 10 9 6 10 1 1 5 21 11"
+SPEC_FAILS_OLD="13 26 10 0 2 1 0 1 1 1 1 1 1 0 3 2 2 1 3 3 3 1 0 1 1 1 1 1"
+SPEC_DEFECT_OLD="1 1 1 0 1 1 0 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 0 1 1 1 1 1"
+
+SPEC_CONTROL_VECTORS="ctrl_wb_clean_no_req ctrl_axi_nonsplit_single_done ctrl_l1d_fill_hit ctrl_axi_error_free_chain"
 
 #   登记根因 → 期望在旧树上给出 defect=1 的向量名（与审计 04-04/04-05/04-07 对应）
 R0404_VECS="wb_first_valid_zero_delay wb_two_victims_distinct wb_accept_delay3"
 R0405_VECS="axi_split_read_single_done axi_split_write_single_done"
-R0407_VECS="l1i_fill_err_early l1i_fill_err_last l1i_two_err_lines_alternate l1d_fill_err_mid l1d_wb_b_fail_keeps_dirty l1d_maint_clean_b_fail"
+R0407_VECS="l1i_fill_err_early l1i_fill_err_last l1i_two_err_lines_alternate l1d_fill_err_mid l1d_wb_b_fail_keeps_dirty l1d_maint_clean_b_fail axi_r_err_early axi_r_err_mid axi_r_err_last axi_b_err_write axi_split_first_err_last_ok axi_err_clear_next_req axi_r_resp_x_fail_closed axi_b_resp_x_fail_closed l1i_fill_err_x_early l1i_fill_err_x_last l1d_fill_err_x_mid l1d_wb_err_x_keeps_dirty l1d_maint_flush_b_fail_two_ways"
 
 #------------------------------------------------------------------------------
-# 2. 判定状态与输出助手（stdout 只放摘要 + 唯一锚点；细节在 run 目录日志）
+# 3. 判定状态与输出助手（stdout 只放摘要 + 唯一锚点；细节在 run 目录日志）
 #------------------------------------------------------------------------------
 RUN_LOG=""
 SUM_TOTAL="-"; SUM_NONZERO="-"; SUM_CHECKS="-"; SUM_FAILS="-"; SUM_DEFECT="-"
@@ -103,7 +121,7 @@ parse_summary_besteffort() {
 }
 
 #------------------------------------------------------------------------------
-# 3. 产物根：规范化 → 授权树校验 → mkdir → mktemp 独占 run 目录（绝不 rm）
+# 4. 产物根：规范化 → 授权树校验 → mkdir → mktemp 独占 run 目录（绝不 rm）
 #------------------------------------------------------------------------------
 AUTH_ROOT="$(readlink -m -- "$REPO_ROOT/build/functional")" || emit_fail "auth_root_readlink_failed"
 ROOT_RAW="${RV32_FUNCTIONAL_PKG_OUT_DIR:-${OUT_DIR:-$AUTH_ROOT/cache-bus}}"
@@ -139,7 +157,7 @@ VVP_OUT="$RUN_DIR/tb_cache_bus_semantics.vvp"
     echo "AUTH_ROOT       = $AUTH_ROOT"
     echo "TB_SRC          = $TB_SRC"
     echo "CACHE_BUS_EXPECT= $CACHE_BUS_EXPECT"
-    echo "SPEC            = total=$SPEC_TOTAL nonzero=$SPEC_NONZERO checks=$SPEC_CHECKS defect=$SPEC_DEFECT_VECTORS"
+    echo "SPEC_TOTAL      = $SPEC_TOTAL"
     if git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
         echo "GIT_HEAD        = $(git -C "$REPO_ROOT" rev-parse HEAD)"
     else
@@ -149,7 +167,7 @@ VVP_OUT="$RUN_DIR/tb_cache_bus_semantics.vvp"
 } >> "$RUN_LOG" || emit_fail "run_log_header_failed"
 
 #------------------------------------------------------------------------------
-# 4. 工具真源：scripts/env.sh（只读）；工具缺失/不可执行即失败
+# 5. 工具真源：scripts/env.sh（只读）；工具缺失/不可执行即失败
 #------------------------------------------------------------------------------
 if [ ! -r "$ENV_SH" ]; then
     emit_fail "env_sh_unreadable path=$ENV_SH"
@@ -167,7 +185,7 @@ echo "RV32_IVERILOG   = $IV" >> "$RUN_LOG"
 echo "RV32_VVP        = $VV" >> "$RUN_LOG"
 
 #------------------------------------------------------------------------------
-# 5. DUT 源根校验 + 源冻结（前后 SHA 一致；任一步失败即失败）
+# 6. DUT 源根校验 + 源冻结（**恰好 10 行、全为 hex**；前后一致）
 #------------------------------------------------------------------------------
 if [ ! -f "$TB_SRC" ]; then
     emit_fail "tb_missing tb=$TB_SRC"
@@ -190,36 +208,76 @@ done
 
 #   旧树快照（201acf61 同代）**没有**错误端口 ⇒ 用宏切到旧端口表例化。
 #   判定依据不是调用方口述，而是 DUT 源里是否真的存在 `fill_err` 端口。
-if grep -q '^\s*input\s*\+wire\s\+fill_err' "$DUT_L1D" 2>/dev/null; then
+if grep -q '^[[:space:]]*input[[:space:]]\+wire[[:space:]]\+fill_err' "$DUT_L1D" 2>/dev/null; then
     DUT_HAS_ERR=1
 else
     DUT_HAS_ERR=0
 fi
 echo "DUT_HAS_ERR_IF  = $DUT_HAS_ERR" >> "$RUN_LOG"
+#   新增输出 `cs_err_paddr` 只在当前树存在；旧/HEAD 树不连（端口可悬空）
+if grep -q 'cs_err_paddr' "$DUT_L1I" 2>/dev/null; then
+    DUT_HAS_ERR_PA=1
+else
+    DUT_HAS_ERR_PA=0
+fi
+echo "DUT_HAS_ERR_PA  = $DUT_HAS_ERR_PA" >> "$RUN_LOG"
 
+#   ★ 冻结集合 A（"8 依赖"）= 5 RTL + 2 头 + TB ⇒ **恰好 8 行**
+FREEZE_LIST=("$DUT_L1D" "$DUT_L1I" "$DUT_TAG" "$DUT_DAT" "$DUT_AXI" \
+             "$DUT_DEFS" "$DUT_PARAMS" "$TB_SRC")
+FREEZE_N=8
+#   ★ 冻结集合 B（包/env）= 本包脚本 + env.sh ⇒ **恰好 2 行**
+FREEZE_AUX=("$SELF_PATH" "$ENV_SH")
+FREEZE_AUX_N=2
+
+#   ★ 注意 rc 传播：直接把 sha256sum 的 rc 作为函数返回值（不吞进管道）。
 freeze_sha() {
-    sha256sum -- "$DUT_L1D" "$DUT_L1I" "$DUT_TAG" "$DUT_DAT" "$DUT_AXI" \
-                 "$DUT_DEFS" "$DUT_PARAMS" "$TB_SRC" 2>>"$RUN_LOG"
+    sha256sum -- "${FREEZE_LIST[@]}" 2>>"$RUN_LOG"
 }
-SHA_PRE="$(freeze_sha)" || emit_fail "sha256_pre_failed"
-N_SHA_LINES="$(printf '%s\n' "$SHA_PRE" | grep -c '^[0-9a-f]\{64\} ' || true)"
-[ "$N_SHA_LINES" = "8" ] || emit_fail "sha256_pre_lines=$N_SHA_LINES"
+freeze_aux_sha() {
+    sha256sum -- "${FREEZE_AUX[@]}" 2>>"$RUN_LOG"
+}
+
+check_freeze_lines() {  # check_freeze_lines <block> <tag> <expect_n>
+    local block="$1" tag="$2" want="$3" n_total n_hex
+    n_total="$(printf '%s\n' "$block" | wc -l)"
+    n_hex="$(printf '%s\n' "$block" | grep -c '^[0-9a-f]\{64\}  ' || true)"
+    # ★ 必须"总行数 == 期望 且 每行全为 hex"：只数合法行会让额外坏行蒙混过关。
+    [ "$n_total" = "$want" ] || emit_fail "${tag}_lines=$n_total expect=$want"
+    [ "$n_hex"   = "$want" ] || emit_fail "${tag}_hex=$n_hex expect=$want"
+}
+
+SHA_PRE="$(freeze_sha)"
+SHA_RC=$?
+[ "$SHA_RC" -eq 0 ] || emit_fail "sha256_pre_rc=$SHA_RC"
+check_freeze_lines "$SHA_PRE" "sha256_pre" "$FREEZE_N"
+AUX_PRE="$(freeze_aux_sha)"
+AUX_RC=$?
+[ "$AUX_RC" -eq 0 ] || emit_fail "sha256_aux_pre_rc=$AUX_RC"
+check_freeze_lines "$AUX_PRE" "sha256_aux_pre" "$FREEZE_AUX_N"
 {
-    echo "-- pre-run source sha256 (5 RTL + 2 header + TB) --"
+    echo "-- run phase start (both phases must match; driver checks ENV/TB/PKG) --"
+    echo "-- pre-run source sha256 (8 deps = 5 RTL + 2 header + TB) --"
     printf '%s\n' "$SHA_PRE"
+    echo "-- pre-run package/env sha256 (2 files) --"
+    printf '%s\n' "$AUX_PRE"
 } >> "$RUN_LOG" || emit_fail "run_log_sha_pre_append_failed"
 
 #------------------------------------------------------------------------------
-# 6. 编译（DUT 取 DUT_ROOT，TB 恒取本包；rc=0 零产物亦失败）
+# 7. 编译（**cd "$DUT_ROOT"** + 只用 `-I "$DUT_ROOT"`；rc=0 零产物亦失败）
 #------------------------------------------------------------------------------
 COMPILE_DEFS=()
 if [ "$DUT_HAS_ERR" = "0" ]; then
     COMPILE_DEFS+=( -DCACHE_BUS_OLD_DUT )
 fi
+if [ "$DUT_HAS_ERR_PA" = "1" ]; then
+    COMPILE_DEFS+=( -DCACHE_BUS_HAS_ERR_PA )
+fi
 
-timeout "$TIMEOUT_COMPILE_S" "$IV" -g2012 -Wall -I "$DUT_ROOT" "${COMPILE_DEFS[@]}" \
+( cd -- "$DUT_ROOT" && \
+  timeout "$TIMEOUT_COMPILE_S" "$IV" -g2012 -Wall -I "$DUT_ROOT" "${COMPILE_DEFS[@]}" \
         -s tb_cache_bus_semantics_top -o "$VVP_OUT" \
-        "$TB_SRC" "$DUT_L1D" "$DUT_L1I" "$DUT_TAG" "$DUT_DAT" "$DUT_AXI" \
+        "$TB_SRC" "$DUT_L1D" "$DUT_L1I" "$DUT_TAG" "$DUT_DAT" "$DUT_AXI" ) \
         > "$COMPILE_LOG" 2>&1
 RC=$?
 cat -- "$COMPILE_LOG" >> "$RUN_LOG" || emit_fail "run_log_compile_append_failed"
@@ -231,9 +289,9 @@ fi
 [ -s "$VVP_OUT" ] || emit_fail "compile_no_vvp_output"
 
 #------------------------------------------------------------------------------
-# 7. 运行（超时/非零退出即失败）
+# 8. 运行（超时/非零退出即失败）
 #------------------------------------------------------------------------------
-timeout "$TIMEOUT_RUN_S" "$VV" "$VVP_OUT" >> "$RUN_LOG" 2>&1
+( cd -- "$RUN_DIR" && timeout "$TIMEOUT_RUN_S" "$VV" "$VVP_OUT" ) >> "$RUN_LOG" 2>&1
 RC=$?
 parse_summary_besteffort
 if [ "$RC" -eq 124 ]; then
@@ -244,17 +302,27 @@ fi
 [ -s "$RUN_LOG" ] || emit_fail "run_zero_output"
 
 #------------------------------------------------------------------------------
-# 8. 源冻结复核（编译/运行前后逐字节一致）
+# 9. 源冻结复核（编译/运行前后逐字节一致）
 #------------------------------------------------------------------------------
-SHA_POST="$(freeze_sha)" || emit_fail "sha256_post_failed"
+SHA_POST="$(freeze_sha)"
+SHA_RC=$?
+[ "$SHA_RC" -eq 0 ] || emit_fail "sha256_post_rc=$SHA_RC"
+check_freeze_lines "$SHA_POST" "sha256_post" "$FREEZE_N"
+AUX_POST="$(freeze_aux_sha)"
+AUX_RC=$?
+[ "$AUX_RC" -eq 0 ] || emit_fail "sha256_aux_post_rc=$AUX_RC"
+check_freeze_lines "$AUX_POST" "sha256_aux_post" "$FREEZE_AUX_N"
 if [ "$SHA_PRE" != "$SHA_POST" ]; then
     emit_fail "source_changed_during_run"
 fi
+if [ "$AUX_PRE" != "$AUX_POST" ]; then
+    emit_fail "package_or_env_changed_during_run"
+fi
 
 #------------------------------------------------------------------------------
-# 9. 判定（严格格式 + 冻结规格 + 逐向量一致性）
+# 10. 判定
 #------------------------------------------------------------------------------
-# 9.1 摘要整行唯一且严格匹配（缺/多/坏字段一律失败）
+# 10.1 摘要整行唯一且严格匹配
 N_SUMMARY="$(grep -c '^CACHE_BUS_VECTORS ' "$RUN_LOG" || true)"
 [ "$N_SUMMARY" = "1" ] || emit_fail "summary_count=$N_SUMMARY"
 SUM_LINE="$(grep -m1 '^CACHE_BUS_VECTORS ' "$RUN_LOG" || true)"
@@ -266,67 +334,81 @@ else
     emit_fail "summary_format"
 fi
 
-# 9.2 冻结规格（防"少向量/少跑"冒充完整包）
-#   · total/nonzero 在**两种模式**都必须精确等于规格（向量数与"每向量至少 1 检查"）
-#   · checks 总数只在 fixed 模式要求精确：旧树反证时部分向量会在真实死锁处提前中止，
-#     其检查数必然少于新树（这正是缺陷证据），若强求相等就永远无法反证。
-#     旧模式仍由 9.3/9.4 保证"逐向量 checks 之和 == 摘要 checks"且 controls 精确。
-[ "$SUM_TOTAL"   -eq "$SPEC_TOTAL"    ] || emit_fail "summary_total=$SUM_TOTAL expect=$SPEC_TOTAL"
-[ "$SUM_NONZERO" -eq "$SPEC_NONZERO"  ] || emit_fail "summary_nonzero=$SUM_NONZERO expect=$SPEC_NONZERO"
+# 10.2 摘要与规格
+[ "$SUM_TOTAL"   -eq "$SPEC_TOTAL" ] || emit_fail "summary_total=$SUM_TOTAL expect=$SPEC_TOTAL"
+[ "$SUM_NONZERO" -eq "$SPEC_TOTAL" ] || emit_fail "summary_nonzero=$SUM_NONZERO expect=$SPEC_TOTAL"
+
+# 10.3 选模式规格表
 if [ "$CACHE_BUS_EXPECT" = "fixed" ]; then
-    [ "$SUM_CHECKS" -eq "$SPEC_CHECKS" ] || emit_fail "summary_checks=$SUM_CHECKS expect=$SPEC_CHECKS"
+    SPEC_CHECKS="$SPEC_CHECKS_FIXED"
+    SPEC_FAILS="$(for ((q=0;q<SPEC_TOTAL;q++)); do printf '0 '; done)"
+    SPEC_DEFECT="$(for ((q=0;q<SPEC_TOTAL;q++)); do printf '0 '; done)"
+elif [ "$CACHE_BUS_EXPECT" = "old" ]; then
+    SPEC_CHECKS="$SPEC_CHECKS_OLD"
+    SPEC_FAILS="$SPEC_FAILS_OLD"
+    SPEC_DEFECT="$SPEC_DEFECT_OLD"
 else
-    [ "$SUM_CHECKS" -gt 0 ] || emit_fail "summary_checks_zero"
+    emit_fail "unknown_expect=$CACHE_BUS_EXPECT"
 fi
 
-# 9.3 逐向量：行数、严格格式、checks 之和、汇总一致
+# 10.4 **逐向量逐字段**核对：编号 1..N、名称、checks、fails、defect 全等于规格
+#      ⇒ 多一条/少一条/重复名/错名/错数/0 检查凑数 一律失败。
+IFS=' ' read -r -a E_NAMES <<< "$SPEC_NAMES"
+IFS=' ' read -r -a E_CHECKS <<< "$SPEC_CHECKS"
+IFS=' ' read -r -a E_FAILS  <<< "$SPEC_FAILS"
+IFS=' ' read -r -a E_DEFECT <<< "$SPEC_DEFECT"
+[ "${#E_NAMES[@]}" -eq "$SPEC_TOTAL" ] || emit_fail "spec_names_len=${#E_NAMES[@]}"
+[ "${#E_CHECKS[@]}" -eq "$SPEC_TOTAL" ] || emit_fail "spec_checks_len=${#E_CHECKS[@]}"
+
 N_VEC="$(grep -c '^VEC ' "$RUN_LOG" || true)"
-[ "$N_VEC" -eq "$SUM_TOTAL" ] || emit_fail "vec_line_count=$N_VEC total=$SUM_TOTAL"
-VEC_STAT="$(awk '
-    /^VEC / {
-        if ($0 ~ /^VEC [0-9]+ [^ ]+ checks=[0-9]+ fails=[0-9]+ defect=[0-1]$/) {
-            n++
-            for (i = 1; i <= NF; i++) if ($i ~ /^checks=/) { split($i, a, "="); s += a[2] }
-        } else { b++ }
-    }
-    END { printf "%d %d %d\n", n + 0, s + 0, b + 0 }
-' "$RUN_LOG")" || emit_fail "vec_awk_failed"
-read -r V_OK V_SUM V_BAD <<<"$VEC_STAT"
-[ "$V_BAD" = "0" ] || emit_fail "vec_format_bad=$V_BAD"
-[ "$V_OK" -eq "$SUM_TOTAL" ] || emit_fail "vec_ok=$V_OK total=$SUM_TOTAL"
-[ "$V_SUM" -eq "$SUM_CHECKS" ] || emit_fail "vec_checks_sum=$V_SUM checks=$SUM_CHECKS"
+[ "$N_VEC" -eq "$SPEC_TOTAL" ] || emit_fail "vec_line_count=$N_VEC expect=$SPEC_TOTAL"
 
-# 9.4 逐向量摘要与汇总一致（fails/defect 之和）
-V_SUMS="$(awk '/^VEC /{ for (i=1;i<=NF;i++){ if ($i ~ /^fails=/){split($i,a,"="); f+=a[2]} if ($i ~ /^defect=/){split($i,a,"="); d+=a[2]} } } END{printf "%d %d\n", f+0, d+0}' "$RUN_LOG")"
-read -r VF_SUM VD_SUM <<<"$V_SUMS"
-[ "$VF_SUM" = "$SUM_FAILS" ]  || emit_fail "vec_fails_sum=$VF_SUM fails=$SUM_FAILS"
-[ "$VD_SUM" = "$SUM_DEFECT" ] || emit_fail "vec_defect_sum=$VD_SUM defect=$SUM_DEFECT"
+VEC_IDX=0
+SUM_C=0; SUM_F=0; SUM_D=0
+while IFS= read -r vline; do
+    VEC_IDX=$((VEC_IDX + 1))
+    if [[ ! "$vline" =~ ^VEC\ ([0-9]+)\ ([A-Za-z0-9_]+)\ checks=([0-9]+)\ fails=([0-9]+)\ defect=([0-9]+)$ ]]; then
+        emit_fail "vec_format line=$VEC_IDX"
+    fi
+    v_id="${BASH_REMATCH[1]}"; v_nm="${BASH_REMATCH[2]}"
+    v_c="${BASH_REMATCH[3]}"; v_f="${BASH_REMATCH[4]}"; v_d="${BASH_REMATCH[5]}"
+    e_i=$((VEC_IDX - 1))
+    # 编号必须等于序号（拒绝乱序/跳号/重复）
+    [ "$v_id" = "$VEC_IDX" ] || emit_fail "vec_id=$v_id expect=$VEC_IDX"
+    # 名称必须逐位一致（拒绝重名/错名/额外名）
+    [ "$v_nm" = "${E_NAMES[$e_i]}" ] || emit_fail "vec_name=$v_nm expect=${E_NAMES[$e_i]} at=$VEC_IDX"
+    # 每例至少 1 个检查（拒绝 0 检查凑数）
+    [ "$v_c" -gt 0 ] || emit_fail "vec_zero_checks name=$v_nm"
+    [ "$v_c" = "${E_CHECKS[$e_i]}" ] || emit_fail "vec_checks name=$v_nm got=$v_c expect=${E_CHECKS[$e_i]}"
+    [ "$v_f" = "${E_FAILS[$e_i]}" ]  || emit_fail "vec_fails name=$v_nm got=$v_f expect=${E_FAILS[$e_i]}"
+    [ "$v_d" = "${E_DEFECT[$e_i]}" ] || emit_fail "vec_defect name=$v_nm got=$v_d expect=${E_DEFECT[$e_i]}"
+    SUM_C=$((SUM_C + v_c)); SUM_F=$((SUM_F + v_f)); SUM_D=$((SUM_D + v_d))
+done < <(grep '^VEC ' "$RUN_LOG")
 
-vec_line() {  # vec_line <name> -> 该向量整行（唯一）
-    grep -m1 -- "^VEC [0-9]\+ $1 checks=" "$RUN_LOG" || true
-}
+[ "$VEC_IDX" -eq "$SPEC_TOTAL" ] || emit_fail "vec_parsed=$VEC_IDX expect=$SPEC_TOTAL"
+# 汇总必须等于逐向量之和（拒绝"摘要自报"与逐向量不一致）
+[ "$SUM_C" = "$SUM_CHECKS" ] || emit_fail "vec_checks_sum=$SUM_C expect=$SUM_CHECKS"
+[ "$SUM_F" = "$SUM_FAILS" ]  || emit_fail "vec_fails_sum=$SUM_F expect=$SUM_FAILS"
+[ "$SUM_D" = "$SUM_DEFECT" ] || emit_fail "vec_defect_sum=$SUM_D expect=$SUM_DEFECT"
+
+# 10.5 控制向量：两棵树都必须 fails=0 defect=0（否则"修复"是靠放宽判据）
 vec_field() { # vec_field <name> <field>
-    local ln; ln="$(vec_line "$1")"
+    local ln
+    ln="$(grep -m1 -- "^VEC [0-9]\+ $1 checks=" "$RUN_LOG" || true)"
     printf '%s\n' "$ln" | sed -n "s/.*[[:space:]]$2=\([0-9]\+\).*/\1/p"
 }
-
-#   控制向量：两棵树都必须 fails=0 defect=0（否则"修复"是靠放宽判据）。
 for cv in $SPEC_CONTROL_VECTORS; do
-    cl="$(vec_line "$cv")"
-    [ -n "$cl" ] || emit_fail "control_vec_missing name=$cv"
-    cf="$(vec_field "$cv" fails)"; cd="$(vec_field "$cv" defect)"
-    [ "$cf" = "0" ] || emit_fail "control_vec_fails name=$cv fails=$cf"
-    [ "$cd" = "0" ] || emit_fail "control_vec_defect name=$cv defect=$cd"
+    [ "$(vec_field "$cv" fails)"  = "0" ] || emit_fail "control_vec_fails name=$cv"
+    [ "$(vec_field "$cv" defect)" = "0" ] || emit_fail "control_vec_defect name=$cv"
 done
 
 if [ "$CACHE_BUS_EXPECT" = "fixed" ]; then
-    # 9.5a 修复口径：零失败、零缺陷签名、唯一 PASS 锚点、无旧错误复现标记
-    [ "$SUM_FAILS"  -eq 0 ] || emit_fail "summary_fails=$SUM_FAILS"
+    [ "$SUM_FAILS" -eq 0 ] || emit_fail "summary_fails=$SUM_FAILS"
     [ "$SUM_DEFECT" -eq 0 ] || emit_fail "summary_defect=$SUM_DEFECT"
     N_ANYFAIL="$(grep -c 'FAIL' "$RUN_LOG" || true)"
     [ "$N_ANYFAIL" = "0" ] || emit_fail "log_has_FAIL=$N_ANYFAIL"
-    N_DEFECT="$(grep -c 'DEFECT_REPRODUCED' "$RUN_LOG" || true)"
-    [ "$N_DEFECT" = "0" ] || emit_fail "log_has_defect_reproduced=$N_DEFECT"
+    N_DEFECT="$(grep -c 'DEFECT_REPRODUCED\|DEFECT_SIG' "$RUN_LOG" || true)"
+    [ "$N_DEFECT" = "0" ] || emit_fail "log_has_defect_marker=$N_DEFECT"
     N_TIMEOUT="$(grep -c 'CACHE_BUS_TIMEOUT' "$RUN_LOG" || true)"
     [ "$N_TIMEOUT" = "0" ] || emit_fail "log_has_timeout=$N_TIMEOUT"
     N_PASS="$(grep -cxF 'FUNCTIONAL_CACHE_BUS: PASS' "$RUN_LOG" || true)"
@@ -334,9 +416,8 @@ if [ "$CACHE_BUS_EXPECT" = "fixed" ]; then
     emit_summary_line
     printf 'FUNCTIONAL_CACHE_BUS: PASS\n'
     exit 0
-elif [ "$CACHE_BUS_EXPECT" = "old" ]; then
-    # 9.5b 旧树反证口径：每个登记根因向量都必须给出 defect=1；fails 必须非零。
-    [ "$SUM_DEFECT" -eq "$SPEC_DEFECT_VECTORS" ] || emit_fail "old_defect=$SUM_DEFECT expect=$SPEC_DEFECT_VECTORS"
+else
+    [ "$SUM_DEFECT" -gt 0 ] || emit_fail "old_no_defect_observed"
     [ "$SUM_FAILS" -gt 0 ] || emit_fail "old_no_failure_observed"
     N_PASS="$(grep -cxF 'FUNCTIONAL_CACHE_BUS: PASS' "$RUN_LOG" || true)"
     [ "$N_PASS" = "0" ] || emit_fail "old_mode_printed_pass"
@@ -355,6 +436,4 @@ elif [ "$CACHE_BUS_EXPECT" = "old" ]; then
     printf 'FUNCTIONAL_CACHE_BUS: DEFECT_REPRODUCED root=04-07 vectors=%s\n' "$R0407_VECS"
     printf 'FUNCTIONAL_CACHE_BUS: FAIL reason=old_tree_defects_confirmed run_dir=%s\n' "$RUN_DIR"
     exit 1
-else
-    emit_fail "unknown_expect=$CACHE_BUS_EXPECT"
 fi

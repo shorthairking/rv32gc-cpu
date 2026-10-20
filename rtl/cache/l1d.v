@@ -305,7 +305,22 @@ module l1d #(
     //   fill_err 与 fill_valid 同拍（由 axi_master_ctrl.rdata_error 逐 beat 对齐给出）
     //   ⇒ 早/中/末 beat 的错误都在同一笔事务里累计；fill_take 清累计器（重试是
     //   新事务，重试成功必须能正常装行）。fill_done 拍连同当拍 fill_err 一起结算。
-    wire fill_err_beat = fill_active_q & fill_valid & fill_err;
+    //   ★★ 04-07 复审修复（P1-2）：**有效握手拍上的 X/Z 不得被当"无错"**。
+    //   原写法 `fill_valid & fill_err` 在 fill_err=X 时得到 X，`if (fill_err_beat)`
+    //   把 X 当假 ⇒ 错误被静默吞掉；末 beat 若为 0 时该行仍装 valid（垃圾行可命中）。
+    //   改为"**已知 OK 才算 OK**"（case + default 覆盖 1/X/Z，可综合，不依赖 ===）。
+    //   只在 fill_valid 有效拍采样 ⇒ 无效 payload 非 0 不影响判定。
+    function automatic err_flag;                    // 0 = 已知 OK，1 = 非已知 OK
+        input e;                                    // Verilog-2001 函数入参（不带 wire）
+        begin
+            case (e)
+                1'b0:    err_flag = 1'b0;
+                default: err_flag = 1'b1;           // 1 / X / Z
+            endcase
+        end
+    endfunction
+
+    wire fill_err_beat = fill_active_q & fill_valid & err_flag(fill_err);
     wire fill_any_err  = fill_err_acc_q | fill_err_beat;
     //   失败完成：与 fill_done 同拍（事务结束拍）给出，供调用方终结挂起的访问。
     wire fill_fail_w   = fill_finish & fill_any_err;
@@ -337,8 +352,11 @@ module l1d #(
     wire wb_finish   = wb_ready & wb_done;
     // ★★ 04-07：B 响应失败 ⇒ 写回**失败**（不得清 dirty / 腾路 / 进填充）。
     //   wb_err 与 wb_done 同拍（同一 B 握手）⇒ 与 wb_finish 严格同拍。
-    wire wb_fail_w   = wb_finish & wb_err;
-    wire wb_ok_w     = wb_finish & ~wb_err;
+    //   ★★ 04-07 复审修复（P1-2）：wb_err 为 X/Z 时同样不得被当"B 成功"。
+    //   用同一个 err_flag 函数（已知 0 才算 OK），失败优先于成功。
+    wire wb_err_b    = err_flag(wb_err);
+    wire wb_fail_w   = wb_finish &  wb_err_b;
+    wire wb_ok_w     = wb_finish & ~wb_err_b;
 
     //--------------------------------------------------------------------------
     // 8. 阵列例化
@@ -395,8 +413,15 @@ module l1d #(
             // clean 走"只清 dirty"专用口（保留 tag/valid）；inval 走整项写（清 valid）
             //   inval：破坏性失效；flush：在"该组脏行已全部写回"那一拍再失效（数据已落内存）
             wire way_maint    = (maint_q & ~maint_clean_q) | (maint_adv_w & maint_flush_q);
-            //   ★ 维护写回完成 ⇒ 只清**这一路**的 dirty（保留 tag/valid；读口数据仍是本组读回的）
-            wire way_clr      = maint_wb_fin_w & (maint_way_w == gw[WAY_W-1:0]);
+            //   ★★ 复审修复（P1-1）：维护写回**成功**时清的必须是**本次真正写回的那一路**。
+            //   缺陷：原实现 `maint_wb_fin_w & (maint_way_w == gw)` 用的是扫描的**即时**
+            //   组合值；而发起写回时已把该路记进 `maint_done_q`（见 §11），完成拍
+            //   `maint_dvec` 已不含它 ⇒ `maint_way_w` 指向**下一路**脏行（无脏路时默认
+            //   3）⇒ 真正写回的那路 dirty 没清（残留脏），甚至对一个 invalid 的 way3
+            //   写了 valid=1（把无效路"造"成有效路，静默错）。
+            //   修法：用写回时**锁存**的 `wb_way_q` + `wb_line_q`（地址/tag 同源）来清，
+            //   与扫描即时值彻底解耦；valid 保持 1（该路本就 valid+dirty）。
+            wire way_clr      = maint_wb_fin_w & (wb_way_q == gw[WAY_W-1:0]);
             // 抓行只读受害者路的数据（tag 不动）
             wire way_cap      = (ms_state_q == MS_WB_CAP) & (wb_way_q == gw[WAY_W-1:0]);
 
@@ -410,11 +435,18 @@ module l1d #(
                 // ★ 维护（clean/inval）只允许改写"被寻址那一项"且必须保留其 tag；
                 //   若在无访问的拍上对全部路写 tag/valid，会破坏其它组的项（静默错）。
                 .wr_en      (way_fill_tag | way_st | way_maint | way_clr),
-                .wr_addr    ((way_maint | way_clr) ? maint_idx_q
-                                          : (way_fill_tag ? fill_line_q[OFF_BITS +: INDEX_BITS]
-                                                          : acc_index_q)),
+                //   ★ 地址优先级：inval 扫描用 maint_idx_q；clean 写回完成用**锁存**的
+                //     写回行索引（wb_line_q），不再借用 maint_idx_q —— 后者在完成拍可能
+                //     已前进到下一组。填充/store 仍用各自索引。
+                .wr_addr    (way_maint ? maint_idx_q
+                          : way_clr   ? wb_line_q[OFF_BITS +: INDEX_BITS]
+                          : (way_fill_tag ? fill_line_q[OFF_BITS +: INDEX_BITS]
+                                          : acc_index_q)),
+                //   ★ tag：clean 写回完成必须保留**该行自己的** tag（锁存值），不能取
+                //     tag_rdata[gw]（完成拍读口可能已换到别的组/路）。
                 .wr_tag     (way_fill_tag ? fill_line_q[31 -: TAG_W]
-                                          : (way_clr ? tag_rdata[gw] : acc_tag_q)),
+                          : way_clr      ? wb_line_q[31 -: TAG_W]
+                          : acc_tag_q),
                 // valid：inval 扫描清 0；**填充失败**清 0（不装垃圾行）；其余保持 1
                 .wr_valid   (way_fill_tag ? ~fill_any_err
                                           : (way_maint ? 1'b0 : 1'b1)),
@@ -728,8 +760,23 @@ module l1d #(
                         wb_active_q <= 1'b0;
                         wb_taken_q  <= 1'b0;
                         wb_want_q   <= 1'b0;
-                        // 维护扫描：中止（maint_err 已由组合输出给调用方），脏行保留
-                        if (maint_wb_q) maint_wb_q <= 1'b0;
+                        // ★★ 04-07 复审修复（P1-1）：维护扫描必须**真正中止**。
+                        //   缺陷：原实现只清 maint_wb_q，maint_q 仍为 1 ⇒ 扫描继续；
+                        //   而发起写回时已把该路记进 `maint_done_q`（见 §11 维护分支），
+                        //   于是 `maint_dvec` 不再包含它 ⇒ 扫描把该组当作"已无脏路"
+                        //   前进；若是 flush（clean_all&inval_all），末拍的
+                        //   `maint_adv_w & maint_flush_q` 会**失效整组**，把那条
+                        //   写回失败、仍为脏的行数据一起作废（静默丢脏）。
+                        //   修法：失败即清 maint_q / maint_rd_q / maint_done_q /
+                        //   maint_wb_q（不回扫描、不前进、不失效），保留该路
+                        //   valid+dirty 与行数据；`maint_err` 同拍告知调用方。
+                        if (maint_wb_q) begin
+                            maint_q      <= 1'b0;
+                            maint_wb_q   <= 1'b0;
+                            maint_rd_q   <= 1'b0;
+                            maint_done_q <= {WAYS{1'b0}};
+                            maint_idx_q  <= {INDEX_BITS{1'b0}};
+                        end
                         // 普通 miss 路径：该笔访问以 cs_err 终结（不回填充），
                         // 受害者行 valid/dirty 原样保留 ⇒ 之后重试仍会再次写回。
                         ms_state_q  <= MS_IDLE;

@@ -93,12 +93,27 @@ module tb_cache_bus_semantics_top;
         end
     endtask
 
+    // ★★ 复审修复（P1-2）：chk **四态安全** —— 只有"已知 1"才算通过。
+    //   原写法 `if (!ok)` 在 ok=X/Z 时得 X，`if (X)` 被当假 ⇒ **未知被静默当通过**。
+    //   改为 `ok !== 1'b1`：0/X/Z 一律计失败（fail-closed）。
     task chk(input ok, input [8*64-1:0] what);
         begin
             v_checks = v_checks + 1;
-            if (!ok) begin
+            if (ok !== 1'b1) begin
                 v_fails = v_fails + 1;
                 $display("CHK_BAD vec=%0d name=%0s what=%0s", g_total, v_name, what);
+            end
+        end
+    endtask
+
+    // ★ 逐字比较（带 word 下标与 got/exp，便于定位"只核了 3/8 字"这类漏洞）
+    task chk_word(input [31:0] got, input [31:0] exp, input [8*24-1:0] tag, input integer w);
+        begin
+            v_checks = v_checks + 1;
+            if (got !== exp) begin
+                v_fails = v_fails + 1;
+                $display("CHK_BAD vec=%0d name=%0s what=%0s word=%0d got=%h exp=%h",
+                         g_total, v_name, tag, w, got, exp);
             end
         end
     endtask
@@ -199,6 +214,11 @@ module tb_cache_bus_semantics_top;
 
     reg         i_inval_all;
     wire        i_idle, i_err_sticky;
+`ifdef CACHE_BUS_HAS_ERR_PA
+    wire [31:0] i_cs_err_paddr;      // 新增输出（仅当前树有；旧/HEAD 树不连）
+`else
+    wire [31:0] i_cs_err_paddr = 32'h0;
+`endif
 
 `ifdef CACHE_BUS_OLD_DUT
     l1i dut_i (
@@ -224,6 +244,9 @@ module tb_cache_bus_semantics_top;
         .fill_data (i_fill_data), .fill_word_idx (i_fill_word_idx),
         .fill_done (i_fill_done), .fill_err (i_fill_err), .fill_fail (i_fill_fail),
         .inval_all (i_inval_all), .idle (i_idle), .err_sticky (i_err_sticky)
+`ifdef CACHE_BUS_HAS_ERR_PA
+        , .cs_err_paddr (i_cs_err_paddr)
+`endif
     );
 `endif
 
@@ -344,8 +367,13 @@ module tb_cache_bus_semantics_top;
     integer sl_r_gap_1 = 100;    // 第 2 笔（拆分后半）AR→首 beat 间隔（故意 100 拍）
     integer sl_b_gap_0 = 2;
     integer sl_b_gap_1 = 100;
-    reg [1:0] sl_r_resp_0 = 2'b00, sl_r_resp_1 = 2'b00;
-    reg [1:0] sl_b_resp_0 = 2'b00, sl_b_resp_1 = 2'b00;
+    reg [1:0] sl_r_resp_0 = 2'b00, sl_r_resp_1 = 2'b00;   // 整笔基准响应（可设 X）
+    reg [1:0] sl_b_resp_0 = 2'b00, sl_b_resp_1 = 2'b00;   // B 响应（可设 X）
+    // ★ 逐 beat 注入（-1 = 不注入）：beat_idx 为**本笔事务内**的 0 起下标。
+    //   err_beat ⇒ 该 beat 的 rresp = SLVERR(2'b10)；x_beat ⇒ 该 beat 的 rresp = 2'bxx。
+    //   X 优先于 SLVERR（用于证明"有效拍上的 X 不得被当 OK"）。
+    integer sl_r_err_beat_0 = -1, sl_r_err_beat_1 = -1;
+    integer sl_r_x_beat_0   = -1, sl_r_x_beat_1   = -1;
 
     integer ar_seen, aw_seen;
     reg [31:0] ar_addr_seen [0:7];
@@ -390,24 +418,27 @@ module tb_cache_bus_semantics_top;
         end
     end
 
-    // ---- R 引擎 ----
-    integer   r_rem;  integer r_gap;
-    reg [31:0] r_addr; reg r_busy; reg [1:0] r_resp_cur;
-    integer   r_txn_idx;
+    // ---- R 引擎（支持逐 beat 响应注入；X/Z 用于证明 fail-closed）----
+    integer   r_rem;  integer r_gap; integer r_idx;
+    reg [31:0] r_addr; reg r_busy; reg [1:0] r_resp_base;
+    integer   r_err_beat, r_x_beat;
     always @(posedge clk) begin
         if (!rst_n) begin
             m_rvalid <= 1'b0; m_rdata <= 32'h0; m_rresp <= 2'b00;
             m_rlast <= 1'b0;  m_rid <= 4'h0;
             r_rem <= 0; r_gap <= 0; r_busy <= 1'b0; r_addr <= 32'h0;
-            r_resp_cur <= 2'b00; r_txn_idx <= 0;
+            r_resp_base <= 2'b00; r_idx <= 0;
+            r_err_beat <= -1; r_x_beat <= -1;
         end else if (m_arvalid && m_arready) begin
-            r_rem      <= {1'b0, m_arlen} + 1;
-            r_gap      <= (ar_seen == 0) ? sl_r_gap_0 : sl_r_gap_1;
-            r_addr     <= m_araddr;
-            r_resp_cur <= (ar_seen == 0) ? sl_r_resp_0 : sl_r_resp_1;
-            r_busy     <= 1'b1;
-            m_rvalid   <= 1'b0;
-            r_txn_idx  <= ar_seen;
+            r_rem       <= {1'b0, m_arlen} + 1;
+            r_gap       <= (ar_seen == 0) ? sl_r_gap_0 : sl_r_gap_1;
+            r_addr      <= m_araddr;
+            r_resp_base <= (ar_seen == 0) ? sl_r_resp_0 : sl_r_resp_1;
+            r_err_beat  <= (ar_seen == 0) ? sl_r_err_beat_0 : sl_r_err_beat_1;
+            r_x_beat    <= (ar_seen == 0) ? sl_r_x_beat_0   : sl_r_x_beat_1;
+            r_idx       <= 0;
+            r_busy      <= 1'b1;
+            m_rvalid    <= 1'b0;
         end else if (r_busy) begin
             if (r_gap > 0) begin
                 r_gap <= r_gap - 1;
@@ -415,10 +446,14 @@ module tb_cache_bus_semantics_top;
             end else if (!m_rvalid) begin
                 m_rvalid <= 1'b1;
                 m_rdata  <= r_addr;
-                m_rresp  <= r_resp_cur;
                 m_rid    <= a_req_id;
                 m_rlast  <= (r_rem == 1);
+                // 逐 beat 响应：X 优先 > SLVERR > 本笔基准
+                if (r_x_beat == r_idx)        m_rresp <= 2'bxx;
+                else if (r_err_beat == r_idx) m_rresp <= 2'b10;
+                else                          m_rresp <= r_resp_base;
             end else if (m_rvalid && m_rready) begin
+                r_idx <= r_idx + 1;
                 if (r_rem <= 1) begin
                     m_rvalid <= 1'b0; r_busy <= 1'b0; r_rem <= 0;
                 end else begin
@@ -426,6 +461,12 @@ module tb_cache_bus_semantics_top;
                     r_addr <= r_addr + 32'd4;
                     m_rdata<= r_addr + 32'd4;
                     m_rlast<= (r_rem == 2);
+                    // ★ 连续 beat 期间 m_rvalid 保持为 1（不回到 !m_rvalid 分支），
+                    //   因此**下一 beat 的响应必须在这里一起更新**；否则整笔都会
+                    //   沿用首 beat 的 rresp（逐 beat 注入会全部失效/错位）。
+                    if (r_x_beat == (r_idx + 1))        m_rresp <= 2'bxx;
+                    else if (r_err_beat == (r_idx + 1)) m_rresp <= 2'b10;
+                    else                                m_rresp <= r_resp_base;
                 end
             end
         end else begin
@@ -469,32 +510,114 @@ module tb_cache_bus_semantics_top;
     reg [1:0]  done_owner_cap;
     reg        req_acc_seen;      // 本逻辑请求已被接受
     reg        done_seen_cur;     // 本逻辑请求已看到 done
-    integer    busy_holes;        // 接受后、done 前 busy=0 的拍数
+    integer    busy_holes;        // 接受后、done 前 busy 非已知 1 的拍数
+    integer    x_ctrl;            // active 控制信号上出现 X/Z 的**sticky** 计数
     integer    done_before_busy_end; // 首笔后 done 的违规计数（由 busy_holes 覆盖）
 
     always @(posedge clk) begin
         if (!rst_n) begin
             n_done <= 0; n_done_err <= 0; done_addr_cap <= 32'h0;
             done_owner_cap <= 2'h0; req_acc_seen <= 1'b0; done_seen_cur <= 1'b0;
-            busy_holes <= 0;
+            busy_holes <= 0; x_ctrl <= 0;
         end else begin
-            if (a_req_valid && a_req_ready) begin
+            if ((a_req_valid === 1'b1) && (a_req_ready === 1'b1)) begin
                 req_acc_seen <= 1'b1;
                 done_seen_cur <= 1'b0;
                 busy_holes <= 0;
             end
-            if (a_done) begin
+            if (a_done === 1'b1) begin
                 n_done <= n_done + 1;
                 done_addr_cap <= a_done_addr;
                 done_owner_cap <= a_done_owner;
                 done_seen_cur <= 1'b1;
 `ifndef CACHE_BUS_OLD_DUT
-                if (a_done_error) n_done_err <= n_done_err + 1;
+                //   done_error 同拍采样（只有已知 1 才算"该 done 报错"）
+                if (a_done_error === 1'b1) n_done_err <= n_done_err + 1;
 `endif
             end
-            // 逻辑请求在途（已接受、未见 done）⇒ busy 必须恒 1
-            if (req_acc_seen && !done_seen_cur && !a_busy && !a_done)
-                busy_holes <= busy_holes + 1;
+            // ★★ 复审修复（P1-2）：busy 为 X/Z 时**不得**被当"不忙"而吞掉空洞。
+            //   判据改为"busy 不是已知 1"⇒ 记一次 hole + 记一次控制未知（sticky）。
+            if ((req_acc_seen === 1'b1) && (done_seen_cur === 1'b0) && (a_done !== 1'b1)) begin
+                if (a_busy !== 1'b1) busy_holes <= busy_holes + 1;
+            end
+            //   active 控制信号上的 X/Z：**sticky** 结算（每个 AXI 向量末尾断言为 0）。
+            //   只看"在途窗口"内的控制（req/done/busy/valid/ready/rlast），不看 payload。
+            if (a_busy   !== 1'b0 && a_busy   !== 1'b1) x_ctrl <= x_ctrl + 1;
+            if (a_done   !== 1'b0 && a_done   !== 1'b1) x_ctrl <= x_ctrl + 1;
+            if (a_req_ready !== 1'b0 && a_req_ready !== 1'b1) x_ctrl <= x_ctrl + 1;
+            if (a_rdata_valid !== 1'b0 && a_rdata_valid !== 1'b1) x_ctrl <= x_ctrl + 1;
+            if (a_rdata_last  !== 1'b0 && a_rdata_last  !== 1'b1) x_ctrl <= x_ctrl + 1;
+            if (a_wdata_ready !== 1'b0 && a_wdata_ready !== 1'b1) x_ctrl <= x_ctrl + 1;
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // 5.2b resp_error / resp_code 观测（用于断言"错误码来源正确"）
+    //   `resp_code` 在错误拍 = 原始 resp；错误脉冲过后 = 锁存的 err_code_q。
+    //   两者都断言：前者证明码源选对（读错不得锁 bresp），后者证明锁存没串源。
+    //--------------------------------------------------------------------------
+    integer    n_resp_err;
+    reg [1:0]  resp_code_at_err;      // 错误当拍的 resp_code（原始码）
+    reg [1:0]  resp_code_latched;     // 错误后 2 拍仍有效的 resp_code（= err_code_q）
+    reg        resp_code_latched_ok;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            n_resp_err <= 0; resp_code_at_err <= 2'b00;
+            resp_code_latched <= 2'b00; resp_code_latched_ok <= 1'b0;
+        end else begin
+            if (a_resp_error === 1'b1) begin
+                if (n_resp_err == 0) resp_code_at_err <= a_resp_code;
+                n_resp_err <= n_resp_err + 1;
+                resp_code_latched_ok <= 1'b0;
+            end else if ((n_resp_err > 0) && (resp_code_latched_ok === 1'b0) &&
+                         (a_resp_error === 1'b0)) begin
+                // 错误脉冲后的稳定拍：resp_code 现在来自 err_code_q（锁存码）
+                resp_code_latched    <= a_resp_code;
+                resp_code_latched_ok <= 1'b1;
+            end
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // 5.2c ★★ 复审修复（P1-3）：**逐 beat 独立 oracle**
+    //   原实现只数"错误 beat 总数/是否落在某个有效 R beat 上" ⇒ 把**早 beat 的错误
+    //   拖到本事务最后一个有效 beat** 仍然全绿（总数没变、也仍在某个 valid beat 上）。
+    //   这里改为：在**每一个** slave 侧 `m_rvalid && m_rready` 握手上，用 TB 自己驱动
+    //   的 `m_rresp/m_rdata/m_rlast` 独立解码期望值（known OKAY=0，其余含 X/Z=1），
+    //   与 DUT **同一拍**的 `rdata_valid/rdata_error/rdata_data/rdata_last` 逐项比较；
+    //   错误拍还要求 `resp_code` 等于原始 m_rresp（已知非 OKAY 时）。
+    //   任何一项不符 ⇒ beat_mismatch 累加（逐向量断言为 0）。
+    //--------------------------------------------------------------------------
+    integer n_beat_seen;          // slave 侧已完成的 R beat 数（真实握手，不是拍数）
+    integer n_beat_err_exp;       // 其中期望为错误的 beat 数
+    integer beat_mismatch;        // 逐 beat 期望 vs DUT 输出的不符数
+    integer beat_code_mismatch;   // 错误拍上 resp_code 与原始 m_rresp 不符数
+    integer bt_mm;                // 本拍不符计数（仅该 always 使用）
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            n_beat_seen <= 0; n_beat_err_exp <= 0;
+            beat_mismatch <= 0; beat_code_mismatch <= 0;
+        end else if ((m_rvalid === 1'b1) && (m_rready === 1'b1)) begin
+            n_beat_seen <= n_beat_seen + 1;
+            if (m_rresp !== 2'b00) n_beat_err_exp <= n_beat_err_exp + 1;
+`ifndef CACHE_BUS_OLD_DUT
+            //   独立解码：known OKAY ⇒ 期望无错；1/X/Z ⇒ 期望有错
+            //   （旧树没有 rdata_error 端口 ⇒ 无可比对象，整段不启用，保证控制向量仍绿）
+            bt_mm = 0;
+            if (a_rdata_valid !== 1'b1) bt_mm = bt_mm + 1;
+            if (m_rresp === 2'b00) begin
+                if (a_rdata_error !== 1'b0) bt_mm = bt_mm + 1;
+            end else begin
+                if (a_rdata_error !== 1'b1) bt_mm = bt_mm + 1;
+                // 码源：仅当原始 resp 已知（非 X）时要求 resp_code 等于它
+                if ((m_rresp !== 2'bxx) && (a_resp_code !== m_rresp))
+                    beat_code_mismatch <= beat_code_mismatch + 1;
+            end
+            if (a_rdata_last !== m_rlast) bt_mm = bt_mm + 1;
+            if (a_rdata_data !== m_rdata) bt_mm = bt_mm + 1;
+            if (bt_mm != 0) beat_mismatch <= beat_mismatch + bt_mm;
+`endif
         end
     end
 
@@ -823,6 +946,49 @@ module tb_cache_bus_semantics_top;
         end
     endtask
 
+    // 写回服务（X 注入版）：与 d_wb_serve 同流程，但末 beat 的 wb_err 取 **1'bx**
+    //   用于证明"有效 B 拍上的未知响应不得被当写回成功"。
+    task d_wb_serve_x(input integer acc_delay, input [8*40-1:0] tag);
+        integer k, g;
+        begin : d_wb_serve_x_guard
+            g = 0;
+            while (d_wb_req !== 1'b1) begin
+                @(negedge clk); g = g + 1;
+                if (g > 400) begin
+                    d_recover({tag, " wb_req timeout"});
+                    disable d_wb_serve_x_guard;
+                end
+            end
+            wb_paddr_cap = d_wb_paddr;
+            wb_way_cap   = d_wb_way;
+            if (acc_delay != 0) for (k = 0; k < acc_delay; k = k + 1) @(negedge clk);
+            d_wb_accepted = 1'b1;
+            @(posedge clk); #1;
+            d_wb_accepted = 1'b0;
+            g = 0;
+            while (d_wb_ready !== 1'b1) begin
+                @(negedge clk); g = g + 1;
+                if (g > 200) begin
+                    d_recover({tag, " wb_ready timeout"});
+                    disable d_wb_serve_x_guard;
+                end
+            end
+            for (k = 0; k < WORDS; k = k + 1) begin
+                @(negedge clk);
+                d_wb_word_idx = k[4:0];
+                d_wb_done     = (k == WORDS-1);
+                // ★ 末 beat 的 B 响应取未知（有效握手拍上的 X）
+                d_wb_err      = (k == WORDS-1) ? 1'bx : 1'b0;
+                @(posedge clk); #1;
+                wb_words[k] = d_wb_data;
+            end
+            @(negedge clk);
+            d_wb_done = 1'b0; d_wb_err = 1'b0;
+            @(posedge clk); #1;
+            repeat (2) @(posedge clk);
+        end
+    endtask
+
     // 维护扫描期间服务写回（clean/flush 复用写回通路）
     task d_maint_clean(input inject_err, input [8*40-1:0] tag);
         integer g, k, nwb;
@@ -924,6 +1090,249 @@ module tb_cache_bus_semantics_top;
             i_fill_valid = 1'b0; i_fill_done = 1'b0; i_fill_err = 1'b0;
             repeat (3) @(posedge clk); #1;
         end
+        end
+    endtask
+
+    //--------------------------------------------------------------------------
+    // 8b. 复审新增驱动任务（P1-2/P1-3 用）
+    //   · X/Z 注入版填充：fill_err 在指定 beat 上取 1'bx（**有效握手拍**上的未知）
+    //   · 维护 flush（clean_all+inval_all 同拍）：失败须真正中止扫描且不失效
+    //   · AXI 请求/等待助手：把"发请求 + 等到 done"收敛成一处，减少各向量重复
+    //--------------------------------------------------------------------------
+    task i_fill_x(input [31:0] base, input integer x_beat, input [8*40-1:0] tag);
+        integer k;
+        begin
+            if (abort_vec) begin end else begin
+                i_wait_fill(base, tag);
+                @(negedge clk); i_fill_accepted = 1'b1;
+                @(posedge clk); @(negedge clk); i_fill_accepted = 1'b0;
+                i_drop;
+                for (k = 0; k < WORDS; k = k + 1) begin
+                    i_fill_valid    = 1'b1;
+                    i_fill_data     = line_word(base, k);
+                    i_fill_word_idx = k[4:0];
+                    i_fill_done     = (k == WORDS-1);
+                    // 指定 beat 的 fill_err 取未知；其余拍显式 0（"无效 payload 非 0"不参与）
+                    i_fill_err      = (k == x_beat) ? 1'bx : 1'b0;
+                    @(posedge clk); @(negedge clk);
+                end
+                i_fill_valid = 1'b0; i_fill_done = 1'b0; i_fill_err = 1'b0;
+                repeat (3) @(posedge clk); #1;
+            end
+        end
+    endtask
+
+    task d_fill_body_x(input [31:0] base, input integer x_beat);
+        integer k;
+        begin
+            if (abort_vec) begin end else begin
+                @(negedge clk); d_fill_accepted = 1'b1;
+                @(posedge clk); @(negedge clk); d_fill_accepted = 1'b0;
+                for (k = 0; k < WORDS; k = k + 1) begin
+                    d_fill_valid    = 1'b1;
+                    d_fill_data     = line_word(base, k);
+                    d_fill_word_idx = k[4:0];
+                    d_fill_done     = (k == WORDS-1);
+                    d_fill_err      = (k == x_beat) ? 1'bx : 1'b0;
+                    @(posedge clk); @(negedge clk);
+                end
+                d_fill_valid = 1'b0; d_fill_done = 1'b0; d_fill_err = 1'b0;
+                @(posedge clk); #1;
+            end
+        end
+    endtask
+
+    // 维护 **flush**（clean_all + inval_all 同拍）：失败时不得继续扫描/不得失效
+    task d_maint_flush(input inject_err, input [8*40-1:0] tag);
+        integer g, k, nwb;
+        reg inj;
+        begin
+            nwb = 0; inj = 1'b0;
+            g = 0;
+            @(negedge clk); d_clean_all = 1'b1; d_inval_all = 1'b1;
+            @(posedge clk); @(negedge clk); d_clean_all = 1'b0; d_inval_all = 1'b0;
+            while (d_idle !== 1'b1) begin
+                if (d_wb_req === 1'b1) begin
+                    nwb = nwb + 1;
+                    inj = inject_err && (nwb == 1);
+                    @(negedge clk); d_wb_accepted = 1'b1;
+                    @(posedge clk); #1; d_wb_accepted = 1'b0;
+                    while (d_wb_ready !== 1'b1) @(negedge clk);
+                    for (k = 0; k < WORDS; k = k + 1) begin
+                        @(negedge clk);
+                        d_wb_word_idx = k[4:0];
+                        d_wb_done     = (k == WORDS-1);
+                        d_wb_err      = (k == WORDS-1) && inj;
+                        @(posedge clk); #1;
+                    end
+                    @(negedge clk); d_wb_done = 1'b0; d_wb_err = 1'b0;
+                    @(posedge clk); #1;
+                end else begin
+                    @(posedge clk);
+                end
+                g = g + 1;
+                if (g > 20000) begin
+                    chk(0, {tag, " flush scan timeout"});
+                    $display("CACHE_BUS_TIMEOUT"); $finish;
+                end
+            end
+            #1;
+        end
+    endtask
+
+    // ★★ 复审修复（P1-3）：每个 AXI 向量末尾统一断言"逐 beat oracle + 控制未知"
+    task axi_beat_checks(input integer nbeats, input [8*24-1:0] tag);
+        begin
+            chk(beat_mismatch == 0, {tag, " per-beat rdata_valid/error/data/last == independent oracle"});
+            chk(beat_code_mismatch == 0, {tag, " error beats report resp_code == raw R resp"});
+            chk(n_beat_seen == nbeats, {tag, " R beats forwarded == expected count"});
+            chk(x_ctrl == 0, {tag, " no X/Z on active AXI control signals"});
+            if ((beat_mismatch != 0) || (beat_code_mismatch != 0)) mark_defect;
+        end
+    endtask
+
+    //--------------------------------------------------------------------------
+    // 8c. ★★ 复审修复（P1-1）：维护 clean 的**事务化**记录器
+    //   旧写法用"wb_req 高电平拍数 >= 2"推断发生了两笔事务 ⇒ 高电平跨拍会重复计数，
+    //   也没有把"地址/8 字数据"绑定到**真实握手与真实完成**上。
+    //   本任务：
+    //     · 以 `wb_req & wb_accepted`（valid&&ready）作为**事务起点**记录地址；
+    //     · 逐 beat 只在 `wb_ready` 有效拍采样 `wb_data`（真实数据拍）；
+    //     · 以 B 事务结束（成功/失败）作为**事务终点**：成功才把地址+8 字写入账本，
+    //       失败只计 mtx_fail（脏行保留）。
+    //   输出走全局：mtx_n / mtx_fail / mtx_addr[] / mtx_words[][]
+    //--------------------------------------------------------------------------
+    integer    v13_w;
+    reg [7:0]  v13_set;
+    integer    mtx_n;
+    integer    mtx_fail;
+    reg [31:0] mtx_addr  [0:7];
+    reg [31:0] mtx_words [0:7][0:7];
+
+    task mt_clear;
+        integer q, r;
+        begin
+            mtx_n = 0; mtx_fail = 0;
+            for (q = 0; q < 8; q = q + 1) begin
+                mtx_addr[q] = 32'h0;
+                for (r = 0; r < WORDS; r = r + 1) mtx_words[q][r] = 32'h0;
+            end
+        end
+    endtask
+
+    task d_maint_run(input inject_first, input [8*40-1:0] tag);
+        integer g, k, nfail0;
+        reg inj;
+        reg [31:0] pa;
+        reg [31:0] w [0:7];
+        begin
+            mt_clear;
+            g = 0;
+            @(negedge clk); d_clean_all = 1'b1;
+            @(posedge clk); @(negedge clk); d_clean_all = 1'b0;
+            while (d_idle !== 1'b1) begin
+                if ((d_wb_req === 1'b1) && (d_wb_accepted !== 1'b1)) begin
+                    // 事务起点：地址在握手拍前采样（组合稳定），随后做 valid&&ready 握手
+                    pa = d_wb_paddr;
+                    nfail0 = n_wb_fail;
+                    inj = inject_first && ((mtx_n + mtx_fail) == 0);
+                    @(negedge clk); d_wb_accepted = 1'b1;
+                    @(posedge clk); #1;
+                    d_wb_accepted = 1'b0;
+                    while (d_wb_ready !== 1'b1) @(negedge clk);
+                    for (k = 0; k < WORDS; k = k + 1) begin
+                        @(negedge clk);
+                        d_wb_word_idx = k[4:0];
+                        d_wb_done     = (k == WORDS-1);
+                        d_wb_err      = (k == WORDS-1) && inj;
+                        @(posedge clk); #1;
+                        // 只有真实 ready 拍的数据才算"实际完成的数据 beat"
+                        w[k] = d_wb_data;
+                    end
+                    @(negedge clk); d_wb_done = 1'b0; d_wb_err = 1'b0;
+                    @(posedge clk); #1;
+                    repeat (2) @(posedge clk);
+                    if (n_wb_fail != nfail0) begin
+                        mtx_fail = mtx_fail + 1;       // 失败：脏行保留，不记账为完成
+                    end else begin
+                        mtx_addr[mtx_n] = pa;
+                        for (k = 0; k < WORDS; k = k + 1) mtx_words[mtx_n][k] = w[k];
+                        mtx_n = mtx_n + 1;
+                    end
+                end else begin
+                    @(posedge clk);
+                end
+                g = g + 1;
+                if (g > 40000) begin
+                    chk(0, {tag, " maint transaction timeout"});
+                    $display("CACHE_BUS_TIMEOUT"); $finish;
+                end
+            end
+            #1;
+        end
+    endtask
+
+    // ★ cs_err_paddr 必须在 cs_err **脉冲拍**采样（脉冲只有一拍，事后读会得 0）
+`ifndef CACHE_BUS_OLD_DUT
+    reg [31:0] cs_err_pa_cap;
+    reg        cs_err_pa_seen;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            cs_err_pa_cap <= 32'h0; cs_err_pa_seen <= 1'b0;
+        end else if (dut_i.cs_err === 1'b1) begin
+            cs_err_pa_cap  <= i_cs_err_paddr;
+            cs_err_pa_seen <= 1'b1;
+        end
+    end
+`else
+    //   旧树无 cs_err/paddr 端口（04-07 结构缺陷）；此路径恒 0，供 v24/v25 判"无此能力"。
+    reg [31:0] cs_err_pa_cap = 32'h0;
+    reg        cs_err_pa_seen = 1'b0;
+`endif
+
+    // 账本里是否记录了某地址
+    function mtx_has_addr(input [31:0] a);
+        integer q;
+        begin
+            mtx_has_addr = 1'b0;
+            for (q = 0; q < 8; q = q + 1)
+                if ((mtx_n > q) && (mtx_addr[q] === a)) mtx_has_addr = 1'b1;
+        end
+    endfunction
+
+    function [31:0] mtx_word_of(input [31:0] a, input integer w);   // ★ 必须带 32 位返回宽度
+        integer q;
+        begin
+            mtx_word_of = 32'h0;
+            for (q = 0; q < 8; q = q + 1)
+                if ((mtx_n > q) && (mtx_addr[q] === a)) mtx_word_of = mtx_words[q][w];
+        end
+    endfunction
+
+    // AXI：发一笔请求（读/写），保持 valid 到被接受
+    task axi_req(input wr, input [31:0] addr, input [4:0] beats,
+                 input split, input [4:0] b1, input [4:0] b2, input [1:0] own);
+        begin
+            a_req_is_write = wr; a_req_addr = addr; a_req_beats = beats;
+            a_req_len = beats[3:0] - 4'd1; a_req_split = split;
+            a_req_beats_1 = b1; a_req_beats_2 = b2;
+            a_req_owner = own; a_req_id = 4'h0;
+            a_req_valid = 1'b1;
+            @(posedge clk);
+            while (a_req_ready !== 1'b1) @(posedge clk);
+            @(negedge clk); a_req_valid = 1'b0;
+        end
+    endtask
+
+    // AXI：等到第 nin 次 done 且总线释放，再留观察余量
+    task axi_wait_done(input integer nin, input integer maxc);
+        integer gg;
+        begin
+            gg = 0;
+            while (gg < maxc && !((n_done >= nin) && (a_busy === 1'b0) && (a_done === 1'b0))) begin
+                @(posedge clk); gg = gg + 1;
+            end
+            repeat (16) @(posedge clk);
         end
     endtask
 
@@ -1140,6 +1549,7 @@ module tb_cache_bus_semantics_top;
         if (n_done != 1) mark_defect;
         if (busy_holes != 0) mark_defect;
         repeat (4) @(posedge clk);
+        axi_beat_checks(8, "v5");
         vec_end;
 
         //======================================================================
@@ -1179,6 +1589,7 @@ module tb_cache_bus_semantics_top;
         if (n_done != 1) mark_defect;
         if (busy_holes != 0) mark_defect;
         repeat (4) @(posedge clk);
+        axi_beat_checks(0, "v6");
         vec_end;
 
         //======================================================================
@@ -1207,6 +1618,7 @@ module tb_cache_bus_semantics_top;
         chk(ar_seen == 1, "v7 exactly one AR");
         chk(ar_len_seen[0] === 4'd3, "v7 AR LEN == 3 (4 beats)");
         if (n_done != 1) mark_defect;
+        axi_beat_checks(4, "v7");
         vec_end;
 
         //======================================================================
@@ -1399,31 +1811,89 @@ module tb_cache_bus_semantics_top;
         //======================================================================
         vec_begin("l1d_maint_clean_b_fail");
         d_reset;
-        n_maint_err = 0;
+        n_maint_err = 0; n_wb_fail = 0; n_wb_req_seen = 0;
+        // 同组两路脏（DA0/DA1），其余两路保持 invalid（供"未用 way 始终 invalid"判据）
         d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
         chk(d_cs_miss === 1'b1, "v13 DA0 misses"); d_fill(DA0, -1, "v13");
+        d_access(1'b0, DA1 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v13 DA1 misses"); d_fill(DA1, -1, "v13");
         d_access(1'b1, DA0 + 32'h4, 32'hF0F0_0001, 4'hF);
         chk(d_cs_wr_done === 1'b1, "v13 store DA0"); dirty_add(DA0, 32'd1, 32'hF0F0_0001);
+        d_drop; repeat (2) @(posedge clk);
+        d_access(1'b1, DA1 + 32'h8, 32'hF1F1_0002, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v13 store DA1"); dirty_add(DA1, 32'd2, 32'hF1F1_0002);
         d_drop; repeat (2) @(posedge clk);
         if (!HAS_ERR) begin
             chk(0, "v13 old DUT has no wb_err/maint_err (04-07 structural defect)");
             mark_defect;
         end else begin
-            d_maint_clean(1'b1, "v13");         // 注入 B 失败
+            // ---- 第一次 clean：首路 B 失败 ⇒ 中止、脏保留、无事务完成 ----
+            d_maint_run(1'b1, "v13");
             repeat (2) @(posedge clk);
             chk(n_maint_err == 1, "v13 maint_err pulses (failure is NOT reported as success)");
-            chk(d_idle === 1'b1, "v13 scan aborts and idle returns (no livelock)");
+            chk(d_idle === 1'b1, "v13 scan really aborts (idle returns)");
+            chk(mtx_fail == 1, "v13 failed writeback counted as ONE failed transaction");
+            chk(mtx_n == 0, "v13 no transaction committed on failure");
             // 脏数据保留：仍命中且值正确
             d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
-            chk(d_cs_ready === 1'b1, "v13 dirty line still cached after failed clean");
-            chk(d_cs_rdata === 32'hF0F0_0001, "v13 dirty data preserved");
+            chk(d_cs_ready === 1'b1, "v13 DA0 still cached after failed clean");
+            chk(d_cs_rdata === 32'hF0F0_0001, "v13 DA0 dirty data preserved");
             if (d_cs_rdata !== 32'hF0F0_0001) mark_defect;
             d_drop; repeat (2) @(posedge clk);
-            // 第二次 clean（成功）⇒ 不再有 maint_err，且之后无脏行可写
+            d_access(1'b0, DA1 + 32'h8, 32'h0, 4'h0);
+            chk(d_cs_ready === 1'b1, "v13 DA1 still cached after failed clean");
+            chk(d_cs_rdata === 32'hF1F1_0002, "v13 DA1 dirty data preserved");
+            d_drop; repeat (2) @(posedge clk);
+            // ---- 重试 clean：两笔事务都成功，按**握手+实际完成**记账 ----
+            n_maint_err = 0; n_wb_fail = 0;
+            d_maint_run(1'b0, "v13b");
+            repeat (2) @(posedge clk);
+            chk(n_maint_err == 0, "v13 retry clean: no maint_err");
+            chk(mtx_fail == 0, "v13 retry clean: no failed transaction");
+            chk(mtx_n == 2, "v13 retry clean commits exactly TWO transactions (by handshake)");
+            chk(mtx_has_addr(DA0), "v13 retry wrote back DA0 (address from handshake)");
+            chk(mtx_has_addr(DA1), "v13 retry wrote back DA1 (address from handshake)");
+            //   ★★ 每路**逐 8 字**与独立期望比较（exp_line_word 走 TB 自己的脏账本，
+            //      不读 DUT 任何内部）；原实现只比了 3/8 字，漏核 10 字。
+            for (v13_w = 0; v13_w < WORDS; v13_w = v13_w + 1) begin
+                chk_word(mtx_word_of(DA0, v13_w), exp_line_word(DA0, v13_w),
+                         "v13 DA0 writeback word", v13_w);
+                chk_word(mtx_word_of(DA1, v13_w), exp_line_word(DA1, v13_w),
+                         "v13 DA1 writeback word", v13_w);
+            end
+            if (mtx_n != 2) mark_defect;
+            //   ★ 清理的必须是**本次写回的那一路**：成功 clean 后该路 dirty 必须已清。
+            //     未用的 way2/way3 必须始终 invalid（旧实现会把 way3 造 valid）。
+            //   ★★ 原判据读的是**读口输出** `tag_dirty/tag_vld`，此刻 rd_addr 停在维护
+            //      扫描终点（set 255），根本不是 DA0/DA1 的目标 set ⇒ 等于没证目标组。
+            //      改为**只读**真实目标阵列（层次引用 tagv_q/dirty_q，不驱动任何输入），
+            //      在目标 set 上逐 way 核对：way0/1 已 clean 且仍 valid；way2/3 绝无 valid。
+            v13_set = DA0[12:5];
+            chk(dut_d.g_way[0].u_tag.dirty_q[v13_set] === 1'b0,
+                "v13 real target-set way0 dirty cleared by clean");
+            chk(dut_d.g_way[1].u_tag.dirty_q[v13_set] === 1'b0,
+                "v13 real target-set way1 dirty cleared by clean");
+            chk(dut_d.g_way[0].u_tag.tagv_q[v13_set][0] === 1'b1,
+                "v13 real target-set way0 still valid (clean keeps line)");
+            chk(dut_d.g_way[1].u_tag.tagv_q[v13_set][0] === 1'b1,
+                "v13 real target-set way1 still valid (clean keeps line)");
+            chk(dut_d.g_way[2].u_tag.tagv_q[v13_set][0] === 1'b0,
+                "v13 real target-set way2 has NO valid (no clean ghost)");
+            chk(dut_d.g_way[3].u_tag.tagv_q[v13_set][0] === 1'b0,
+                "v13 real target-set way3 has NO valid (no clean ghost)");
+            if ((dut_d.g_way[0].u_tag.dirty_q[v13_set] !== 1'b0) ||
+                (dut_d.g_way[1].u_tag.dirty_q[v13_set] !== 1'b0) ||
+                (dut_d.g_way[2].u_tag.tagv_q[v13_set][0] !== 1'b0) ||
+                (dut_d.g_way[3].u_tag.tagv_q[v13_set][0] !== 1'b0)) mark_defect;
+            // ---- 再 clean（已全干净）⇒ 零事务、零写回 ----
             n_wb_req_seen = 0;
-            d_maint_clean(1'b0, "v13b");
-            chk(n_maint_err == 1, "v13 successful clean adds no maint_err");
+            d_maint_run(1'b0, "v13c");
+            repeat (2) @(posedge clk);
+            chk(mtx_n == 0, "v13 third clean issues ZERO writeback transactions");
+            chk(n_wb_req_seen == 0, "v13 third clean sees no wb_req at all");
+            chk(d_idle === 1'b1, "v13 third clean completes");
             chk(d_err_sticky === 1'b1, "v13 err_sticky still latched (diagnostic)");
+            if (mtx_n != 0) mark_defect;
         end
         vec_end;
 
@@ -1441,6 +1911,417 @@ module tb_cache_bus_semantics_top;
         chk(d_cs_rdata === line_word(32'h0009_0100, 3), "v14 data correct");
         if (d_cs_rdata !== line_word(32'h0009_0100, 3)) mark_defect;
         d_drop; repeat (2) @(posedge clk);
+        vec_end;
+
+        //======================================================================
+        // v15（04-07/P1-3）：AXI 读 **首 beat** 错误 —— rdata_error 与 rdata_valid
+        //   同拍同 beat；done_error 在唯一 done 拍为 1；错误码来源必须是 R 的 resp。
+        //======================================================================
+        vec_begin("axi_r_err_early");
+        d_reset;
+        sl_r_gap_0 = 2; sl_r_gap_1 = 2;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_r_err_beat_0 = 0; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0; resp_code_latched_ok = 1'b0;
+        n_rdata_err_beats = 0; n_rdata_err_mismatch = 0;
+        axi_req(1'b0, 32'h0000_6000, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(1, 400);
+        chk(n_done == 1, "v15 exactly one done");
+        chk(n_done_err == 1, "v15 done_error == 1 at the final done (R error)");
+        chk(n_rdata_err_beats == 1, "v15 exactly one rdata_error beat");
+        chk(n_rdata_err_mismatch == 0, "v15 rdata_error only on rdata_valid beats (same beat)");
+        chk(resp_code_at_err === 2'b10, "v15 resp_code at error == R SLVERR (not B)");
+        chk(a_resp_code === 2'b10, "v15 latched err_code source == R resp (not bresp)");
+        chk(ar_seen == 1, "v15 exactly one AR");
+        if ((n_done_err != 1) || (n_rdata_err_beats != 1) || (n_rdata_err_mismatch != 0)) mark_defect;
+        axi_beat_checks(4, "v15");
+        vec_end;
+
+        //======================================================================
+        // v16：AXI 读 **中间 beat** 错误（第 2 拍，共 4 拍）
+        //======================================================================
+        vec_begin("axi_r_err_mid");
+        d_reset;
+        sl_r_gap_0 = 2; sl_r_gap_1 = 2;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_r_err_beat_0 = 2; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0; resp_code_latched_ok = 1'b0;
+        n_rdata_err_beats = 0; n_rdata_err_mismatch = 0;
+        axi_req(1'b0, 32'h0000_6400, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(1, 400);
+        chk(n_done == 1, "v16 exactly one done");
+        chk(n_done_err == 1, "v16 done_error == 1 (mid-beat R error must not be lost)");
+        chk(n_rdata_err_beats == 1, "v16 exactly one rdata_error beat");
+        chk(n_rdata_err_mismatch == 0, "v16 rdata_error same-beat aligned");
+        chk(resp_code_at_err === 2'b10, "v16 error code from R resp");
+        if ((n_done_err != 1) || (n_rdata_err_beats != 1)) mark_defect;
+        axi_beat_checks(4, "v16");
+        vec_end;
+
+        //======================================================================
+        // v17：AXI 读 **末 beat** 错误（第 3 拍，共 4 拍）
+        //======================================================================
+        vec_begin("axi_r_err_last");
+        d_reset;
+        sl_r_gap_0 = 2; sl_r_gap_1 = 2;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_r_err_beat_0 = 3; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0; resp_code_latched_ok = 1'b0;
+        n_rdata_err_beats = 0; n_rdata_err_mismatch = 0;
+        axi_req(1'b0, 32'h0000_6800, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(1, 400);
+        chk(n_done == 1, "v17 exactly one done");
+        chk(n_done_err == 1, "v17 done_error == 1 at done (last-beat R error)");
+        chk(n_rdata_err_beats == 1, "v17 exactly one rdata_error beat");
+        chk(n_rdata_err_mismatch == 0, "v17 rdata_error same-beat aligned");
+        if (n_done_err != 1) mark_defect;
+        axi_beat_checks(4, "v17");
+        vec_end;
+
+        //======================================================================
+        // v18：AXI **B 错误**（写响应非 OKAY）—— done_error 可见、码源来自 bresp
+        //======================================================================
+        vec_begin("axi_b_err_write");
+        d_reset;
+        sl_b_gap_0 = 2; sl_b_gap_1 = 2;
+        sl_b_resp_0 = 2'b11; sl_b_resp_1 = 2'b00;   // DECERR
+        sl_r_err_beat_0 = -1; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0; resp_code_latched_ok = 1'b0;
+        // 写数据恒有效（控制器只在 ST_W 取）
+        @(negedge clk); a_wdata_valid = 1'b1; a_wdata_data = 32'hD000_0000;
+        axi_req(1'b1, 32'h0000_6C00, 5'd4, 1'b0, 5'd4, 5'd0, 2'd2);
+        axi_wait_done(1, 400);
+        @(negedge clk); a_wdata_valid = 1'b0;
+        chk(n_done == 1, "v18 exactly one done");
+        chk(n_done_err == 1, "v18 done_error == 1 at done (B error)");
+        chk(aw_seen == 1, "v18 exactly one AW");
+        chk(resp_code_at_err === 2'b11, "v18 resp_code at error == B DECERR");
+        chk(a_resp_code === 2'b11, "v18 latched err_code source == B resp");
+        if ((n_done_err != 1) || (a_resp_code !== 2'b11)) mark_defect;
+        axi_beat_checks(0, "v18");
+        vec_end;
+
+        //======================================================================
+        // v19：AXI 4 K 拆分：**首笔错、末笔好** ⇒ 唯一 done 拍仍报错（跨笔累计）
+        //======================================================================
+        vec_begin("axi_split_first_err_last_ok");
+        d_reset;
+        sl_r_gap_0 = 2; sl_r_gap_1 = 2;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_r_err_beat_0 = 0;  sl_r_err_beat_1 = -1;   // 只在第一笔的首 beat 出错
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0; resp_code_latched_ok = 1'b0;
+        n_rdata_err_beats = 0; n_rdata_err_mismatch = 0;
+        axi_req(1'b0, 32'h0000_7FF8, 5'd8, 1'b1, 5'd2, 5'd6, 2'd1);
+        axi_wait_done(1, 900);
+        chk(n_done == 1, "v19 exactly ONE done for the split request");
+        chk(n_done_err == 1, "v19 done_error reports the FIRST-half error at the single done");
+        chk(ar_seen == 2, "v19 two AR (split)");
+        chk(n_rdata_err_beats == 1, "v19 exactly one errored R beat");
+        chk(n_rdata_err_mismatch == 0, "v19 rdata_error aligned only on valid beats");
+        chk(busy_holes == 0, "v19 busy covers whole logical request");
+        if ((n_done != 1) || (n_done_err != 1)) mark_defect;
+        axi_beat_checks(8, "v19");
+        vec_end;
+
+        //======================================================================
+        // v20：AXI 错误累计**在新请求被接受时清零**（第二笔干净请求不得继承旧错）
+        //======================================================================
+        vec_begin("axi_err_clear_next_req");
+        d_reset;
+        sl_r_gap_0 = 2; sl_r_gap_1 = 2;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_r_err_beat_0 = 1; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0;
+        // 第一笔：带错
+        axi_req(1'b0, 32'h0000_7000, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(1, 400);
+        chk(n_done == 1, "v20 first request done");
+        chk(n_done_err == 1, "v20 first request reports error");
+        // 第二笔：干净（把逐 beat 注入清掉）
+        sl_r_err_beat_0 = -1;
+        axi_req(1'b0, 32'h0000_7400, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(2, 400);
+        chk(n_done == 2, "v20 second request done");
+        chk(n_done_err == 1, "v20 second (clean) request must NOT report an error");
+        chk(a_done_error === 1'b0, "v20 done_error == 0 on the clean request's done");
+        chk(a_resp_error === 1'b0, "v20 no lingering resp_error on clean request");
+        if ((n_done_err != 1) || (a_done_error !== 1'b0)) mark_defect;
+        axi_beat_checks(8, "v20");
+        vec_end;
+
+        //======================================================================
+        // v21（P1-2）：AXI 有效 R beat 上 **rresp = X** ⇒ 必须按错误处理（fail-closed）
+        //======================================================================
+        vec_begin("axi_r_resp_x_fail_closed");
+        d_reset;
+        sl_r_gap_0 = 2; sl_r_gap_1 = 2;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_r_err_beat_0 = -1; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = 1;  sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0; resp_code_latched_ok = 1'b0;
+        n_rdata_err_beats = 0; n_rdata_err_mismatch = 0;
+        axi_req(1'b0, 32'h0000_7800, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(1, 400);
+        chk(n_done == 1, "v21 exactly one done");
+        chk(n_resp_err >= 1, "v21 X resp must raise resp_error (not swallowed)");
+        // ★ done_error 是**与 done 同拍**的脉冲：必须在 done 拍由监视器锁存后断言，
+        //   不能在 done 过去之后再组合采样（那时它本就应为 0）。
+        chk(n_done_err == 1, "v21 done_error == 1 at the done beat for X resp (fail-closed)");
+        chk(n_rdata_err_beats == 1, "v21 X beat flagged by rdata_error");
+        chk(n_rdata_err_mismatch == 0, "v21 rdata_error aligned with rdata_valid");
+        if (n_done_err != 1) mark_defect;
+        axi_beat_checks(4, "v21");
+        vec_end;
+
+        //======================================================================
+        // v22（P1-2）：AXI 有效 **B 响应 = X** ⇒ 不得当作写成功
+        //======================================================================
+        vec_begin("axi_b_resp_x_fail_closed");
+        d_reset;
+        sl_b_gap_0 = 2; sl_b_gap_1 = 2;
+        sl_b_resp_0 = 2'bxx; sl_b_resp_1 = 2'b00;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0;
+        @(negedge clk); a_wdata_valid = 1'b1; a_wdata_data = 32'hD100_0000;
+        axi_req(1'b1, 32'h0000_7C00, 5'd4, 1'b0, 5'd4, 5'd0, 2'd2);
+        axi_wait_done(1, 400);
+        @(negedge clk); a_wdata_valid = 1'b0;
+        chk(n_done == 1, "v22 exactly one done");
+        chk(n_done_err == 1, "v22 X B resp must be treated as failure (fail-closed)");
+        if (n_done_err != 1) mark_defect;
+        axi_beat_checks(0, "v22");
+        vec_end;
+
+        //======================================================================
+        // v23（正控）：AXI 全干净读写链 —— 无 resp_error / done_error、码保持 OKAY
+        //======================================================================
+        vec_begin("ctrl_axi_error_free_chain");
+        d_reset;
+        sl_r_gap_0 = 1; sl_r_gap_1 = 1; sl_b_gap_0 = 1; sl_b_gap_1 = 1;
+        sl_r_resp_0 = 2'b00; sl_r_resp_1 = 2'b00;
+        sl_b_resp_0 = 2'b00; sl_b_resp_1 = 2'b00;
+        sl_r_err_beat_0 = -1; sl_r_err_beat_1 = -1;
+        sl_r_x_beat_0   = -1; sl_r_x_beat_1   = -1;
+        n_done = 0; n_done_err = 0; busy_holes = 0;
+        req_acc_seen = 0; done_seen_cur = 0;
+        ar_seen = 0; aw_seen = 0; n_resp_err = 0;
+        n_rdata_err_beats = 0; n_rdata_err_mismatch = 0;
+        axi_req(1'b0, 32'h0000_2000, 5'd4, 1'b0, 5'd4, 5'd0, 2'd0);
+        axi_wait_done(1, 400);
+        axi_wait_done(1, 10);
+        chk(n_done == 1, "v23 clean read: one done");
+        chk(n_done_err == 0, "v23 clean read: done_error == 0");
+        chk(a_resp_error === 1'b0, "v23 clean read: no resp_error");
+        @(negedge clk); a_wdata_valid = 1'b1; a_wdata_data = 32'hD200_0000;
+        axi_req(1'b1, 32'h0000_2400, 5'd4, 1'b0, 5'd4, 5'd0, 2'd2);
+        axi_wait_done(2, 400);
+        @(negedge clk); a_wdata_valid = 1'b0;
+        chk(n_done == 2, "v23 clean write: second done");
+        chk(n_done_err == 0, "v23 clean write: still zero errored done");
+        chk(a_resp_error === 1'b0, "v23 clean write: no resp_error");
+        if (n_done_err != 0) mark_defect;
+        axi_beat_checks(4, "v23");
+        vec_end;
+
+        //======================================================================
+        // v24（P1-2）：L1I 有效拍 **fill_err = X**（早 beat）⇒ 不得装 valid
+        //======================================================================
+        vec_begin("l1i_fill_err_x_early");
+        d_reset;
+        n_fill_fail_i = 0; n_cs_err_i = 0;
+        if (!HAS_ERR) begin
+            chk(0, "v24 old DUT has no fill_err input (04-07 structural defect)");
+            mark_defect;
+        end else begin
+            i_issue(IA + 32'h4);
+            chk(i_cs_miss === 1'b1, "v24 IA misses");
+            i_fill_x(IA, 0, "v24");                 // beat 0 的 fill_err = X
+            repeat (2) @(posedge clk);
+            chk(n_fill_fail_i == 1, "v24 X on an early valid beat is treated as a transaction error");
+            chk(n_cs_err_i == 1, "v24 cs_err reports the failed access");
+            // ★ 新增输出 cs_err_paddr 必须与 cs_err **同拍**给出**原填充行基址**
+            chk(cs_err_pa_seen === 1'b1, "v24 cs_err pulse occurred (paddr captured on it)");
+            chk(cs_err_pa_cap === IA, "v24 cs_err_paddr == original fill line base");
+            if (cs_err_pa_cap !== IA) mark_defect;
+            i_issue(IA + 32'h4);
+            chk(i_cs_miss === 1'b1, "v24 X-errored line must NOT install valid");
+            if (i_cs_ready === 1'b1) mark_defect;
+            i_drop; repeat (2) @(posedge clk);
+        end
+        vec_end;
+
+        //======================================================================
+        // v25（P1-2）：L1I 有效拍 **fill_err = X**（末 beat）⇒ 不得装 valid
+        //======================================================================
+        vec_begin("l1i_fill_err_x_last");
+        d_reset;
+        n_fill_fail_i = 0;
+        if (!HAS_ERR) begin
+            chk(0, "v25 old DUT has no fill_err input (04-07 structural defect)");
+            mark_defect;
+        end else begin
+            i_issue(IC + 32'h8);
+            chk(i_cs_miss === 1'b1, "v25 IC misses");
+            i_fill_x(IC, 7, "v25");                 // 末 beat 的 fill_err = X
+            repeat (2) @(posedge clk);
+            chk(n_fill_fail_i == 1, "v25 X on the last valid beat is accumulated (not swallowed)");
+            chk(cs_err_pa_seen === 1'b1, "v25 cs_err pulse occurred (paddr captured on it)");
+            chk(cs_err_pa_cap === IC, "v25 cs_err_paddr == original fill line base");
+            if ((n_fill_fail_i != 1) || (cs_err_pa_cap !== IC)) mark_defect;
+            i_issue(IC + 32'h8);
+            chk(i_cs_miss === 1'b1, "v25 last-beat X-errored line must NOT hit");
+            if ((i_cs_ready === 1'b1) || (i_cs_miss !== 1'b1)) mark_defect;
+            i_drop; repeat (2) @(posedge clk);
+        end
+        vec_end;
+
+        //======================================================================
+        // v26（P1-2）：L1D 有效拍 **fill_err = X**（中 beat）⇒ 不得装 valid
+        //======================================================================
+        vec_begin("l1d_fill_err_x_mid");
+        d_reset;
+        n_fill_fail = 0; n_cs_err_d = 0;
+        if (!HAS_ERR) begin
+            d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_miss === 1'b1, "v26 DA0 misses");
+            d_fill(DA0, -1, "v26");
+            chk(0, "v26 old DUT has no fill_err input (04-07 structural defect)");
+            mark_defect;
+        end else begin
+            d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_miss === 1'b1, "v26 DA0 misses");
+            d_wait_fill(DA0, "v26");
+            d_drop;
+            d_fill_body_x(DA0, 3);                  // 中 beat 的 fill_err = X
+            repeat (2) @(posedge clk);
+            chk(n_fill_fail == 1, "v26 X on a mid valid beat is treated as an error");
+            chk(n_cs_err_d >= 1, "v26 cs_err terminates the pending access");
+            d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_miss === 1'b1, "v26 X-errored D line must NOT hit");
+            if (d_cs_ready === 1'b1) mark_defect;
+            d_drop; repeat (2) @(posedge clk);
+        end
+        vec_end;
+
+        //======================================================================
+        // v27（P1-2）：L1D **wb_err = X** ⇒ 不得当作写回成功（dirty 必须保留）
+        //======================================================================
+        vec_begin("l1d_wb_err_x_keeps_dirty");
+        d_reset;
+        n_wb_fail = 0; n_cs_err_d = 0;
+        // 填满一组 4 路并全部写脏 ⇒ 替换必有写回
+        d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v27 DA0 misses"); d_fill(DA0, -1, "v27");
+        d_access(1'b0, DA1 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v27 DA1 misses"); d_fill(DA1, -1, "v27");
+        d_access(1'b0, DA2 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v27 DA2 misses"); d_fill(DA2, -1, "v27");
+        d_access(1'b0, DA3 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v27 DA3 misses"); d_fill(DA3, -1, "v27");
+        d_access(1'b1, DA0 + 32'h4, 32'hA1A1_0000, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v27 store DA0"); dirty_add(DA0, 32'd1, 32'hA1A1_0000);
+        d_drop; repeat (2) @(posedge clk);
+        d_access(1'b1, DA1 + 32'h4, 32'hA1A1_0001, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v27 store DA1"); dirty_add(DA1, 32'd1, 32'hA1A1_0001);
+        d_drop; repeat (2) @(posedge clk);
+        d_access(1'b1, DA2 + 32'h4, 32'hA1A1_0002, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v27 store DA2"); dirty_add(DA2, 32'd1, 32'hA1A1_0002);
+        d_drop; repeat (2) @(posedge clk);
+        d_access(1'b1, DA3 + 32'h4, 32'hA1A1_0003, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v27 store DA3"); dirty_add(DA3, 32'd1, 32'hA1A1_0003);
+        d_drop; repeat (2) @(posedge clk);
+        if (!HAS_ERR) begin
+            chk(0, "v27 old DUT has no wb_err input (04-07 structural defect)");
+            mark_defect;
+        end else begin
+            d_access(1'b0, DA4 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_miss === 1'b1, "v27 DA4 misses (set full)");
+            d_wb_serve_x(0, "v27");                 // B 拍 wb_err = X
+            repeat (2) @(posedge clk);
+            chk(n_wb_fail == 1, "v27 X B response treated as writeback failure (fail-closed)");
+            if (n_wb_fail != 1) mark_defect;
+            d_drop; repeat (3) @(posedge clk);
+            d_access(1'b0, wb_paddr_cap + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_ready === 1'b1, "v27 failed victim still cached (dirty kept on X B)");
+            chk(d_cs_rdata === exp_line_word(wb_paddr_cap, 1),
+                "v27 victim data intact after X B failure");
+            if (d_cs_ready !== 1'b1) mark_defect;
+            d_drop; repeat (2) @(posedge clk);
+        end
+        vec_end;
+
+        //======================================================================
+        // v28（P1-1）：flush（clean+inval）**首路写回 B 失败** ⇒ 真正中止扫描：
+        //   不得继续写回、不得失效该组；两路脏数据仍可读；重试 flush 后全部落盘。
+        //======================================================================
+        vec_begin("l1d_maint_flush_b_fail_two_ways");
+        d_reset;
+        n_maint_err = 0; n_wb_fail = 0;
+        // 同一组 0x08 的 2 路写脏（DA0/DA1 都已 fill）
+        d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v28 DA0 misses"); d_fill(DA0, -1, "v28");
+        d_access(1'b0, DA1 + 32'h4, 32'h0, 4'h0);
+        chk(d_cs_miss === 1'b1, "v28 DA1 misses"); d_fill(DA1, -1, "v28");
+        d_access(1'b1, DA0 + 32'h4, 32'hBEEF_0000, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v28 store DA0"); dirty_add(DA0, 32'd1, 32'hBEEF_0000);
+        d_drop; repeat (2) @(posedge clk);
+        d_access(1'b1, DA1 + 32'h4, 32'hBEEF_0001, 4'hF);
+        chk(d_cs_wr_done === 1'b1, "v28 store DA1"); dirty_add(DA1, 32'd1, 32'hBEEF_0001);
+        d_drop; repeat (2) @(posedge clk);
+        if (!HAS_ERR) begin
+            chk(0, "v28 old DUT has no wb_err/maint_err (04-07 structural defect)");
+            mark_defect;
+        end else begin
+            // 第一次 flush：首个写回 B 失败 ⇒ 必须中止，不得再写第二路、不得失效
+            d_maint_flush(1'b1, "v28");
+            repeat (2) @(posedge clk);
+            chk(n_maint_err == 1, "v28 maint_err pulses on flush writeback failure");
+            chk(d_idle === 1'b1, "v28 scan really aborts (idle returns)");
+            chk(d_wb_req === 1'b0, "v28 no subsequent writeback after abort");
+            chk(n_wb_fail == 1, "v28 exactly one failed writeback");
+            // 两路脏数据都必须仍可读且内容正确（**没有被 flush 失效**）
+            d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_ready === 1'b1, "v28 DA0 still cached after aborted flush (not invalidated)");
+            chk(d_cs_rdata === 32'hBEEF_0000, "v28 DA0 dirty data preserved");
+            if (d_cs_ready !== 1'b1) mark_defect;
+            d_drop; repeat (2) @(posedge clk);
+            d_access(1'b0, DA1 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_ready === 1'b1, "v28 DA1 still cached after aborted flush");
+            chk(d_cs_rdata === 32'hBEEF_0001, "v28 DA1 dirty data preserved");
+            if (d_cs_ready !== 1'b1) mark_defect;
+            d_drop; repeat (2) @(posedge clk);
+            // 重试 flush（不注入错）⇒ 两路都写回并失效
+            n_wb_req_seen = 0;
+            d_maint_flush(1'b0, "v28b");
+            repeat (2) @(posedge clk);
+            chk(n_maint_err == 1, "v28 successful retry adds no maint_err");
+            chk(n_wb_req_seen >= 2, "v28 retry writes back both dirty ways");
+            d_access(1'b0, DA0 + 32'h4, 32'h0, 4'h0);
+            chk(d_cs_miss === 1'b1, "v28 DA0 invalidated after successful flush");
+            if (d_cs_ready === 1'b1) mark_defect;
+            d_drop; repeat (2) @(posedge clk);
+        end
         vec_end;
 
         //======================================================================

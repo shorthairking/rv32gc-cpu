@@ -71,6 +71,12 @@ module l1i #(
     // ★★ 04-07：本笔挂起取指**失败**（单拍，与失败完成同拍）。失败时 cs_rdata 不可
     //   采信：调用方必须以 instruction access fault 终结该笔，不得用该数据。
     output wire                 cs_err,
+    // ★★ 复审批准新增（仅 L1I；纯组合、**不新增状态/不新增输入**）：
+    //   与 `cs_err` 脉冲**同拍有效**的"**原填充物理行地址**"（= `fill_line_q`）。
+    //   供 Top71 → 前端 f2 的新信号 `l1i_rsp_err_pa` 匹配"旧返错行 + 当前 word"。
+    //   注意：`fill_paddr` 由 `cs_paddr_q` 派生、每拍随当前访问变化，**不能**当作
+    //   原错误响应的行地址；故单独引出本输出。其他 named caller 可不连（输出悬空无害）。
+    output wire [31:0]          cs_err_paddr,
 
     //------------------------------------------------------------------
     // MSHR / AXI 控制器 <-> L1I
@@ -158,7 +164,24 @@ module l1i #(
     //   ⇒ 早/中/末 beat 的错误都在同一笔事务里累计；`fill_take` 清累计器（重试是
     //   新事务）。因此"两个不同错误行交替"不会留下可命中的垃圾行。
     //--------------------------------------------------------------------------
-    wire fill_err_beat = fill_active_q & fill_valid & fill_err;
+    //   ★★ 04-07 复审修复（P1-2）：**有效握手拍上的 X/Z 不得被当"无错"**。
+    //   原写法 `fill_valid & fill_err` 在 fill_err=X 时得到 X，后面 `if (fill_err_beat)`
+    //   把 X 当假 ⇒ 错误被静默吞掉，末 beat 若为 0 该行仍然装 valid（垃圾行可命中）。
+    //   改为"**已知 OK 才算 OK**"的显式判定（case + default 覆盖 X/Z）：
+    //     1'b0 ⇒ 0（已知无错）；1'b1/X/Z ⇒ 1（一律按错误处理，fail-closed）。
+    //   只在 fill_valid 的有效拍上采样，故"无效 payload 不为 0"不影响判定。
+    //   用 function + case 是为可综合（X 检测不依赖 `===`/仿真专用语义）。
+    function automatic err_flag;                    // 0 = 已知 OK，1 = 非已知 OK
+        input e;                                    // Verilog-2001 函数入参（不带 wire）
+        begin
+            case (e)
+                1'b0:    err_flag = 1'b0;
+                default: err_flag = 1'b1;           // 1 / X / Z
+            endcase
+        end
+    endfunction
+
+    wire fill_err_beat = fill_active_q & fill_valid & err_flag(fill_err);
     wire fill_any_err  = fill_err_acc_q | fill_err_beat;
     wire fill_finish   = fill_active_q & fill_valid & fill_done;
     wire fill_fail_w   = fill_finish & fill_any_err;
@@ -166,6 +189,8 @@ module l1i #(
     assign fill_fail  = fill_fail_w;
     assign cs_err     = fill_fail_w;     // I 侧：该笔挂起取指以 access fault 终结
     assign err_sticky = err_sticky_q;
+    // ★ 与 cs_err 同拍：本次失败填充的**行基址**（fill_take 时锁存，事务期间稳定）。
+    assign cs_err_paddr = fill_line_q;
 
     //--------------------------------------------------------------------------
     // 5. Tag 阵列（每路）与数据阵列（每路）

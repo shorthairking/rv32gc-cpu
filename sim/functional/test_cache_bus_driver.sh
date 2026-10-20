@@ -8,23 +8,26 @@
 # 做什么（默认全跑；`--self-test` 只跑包装器杀伤路径自检）：
 #   1) **私有不可变基线快照**：用 `git show <BASE>:` 取出 201acf61 的**最小依赖集**
 #      （l1d.v / l1i.v / axi_master_ctrl.v / cache_tag_array.v / cache_array_bram.v /
-#        rv32_defs.vh / core_params.vh）到本次独占 run 目录（不递归复制 build、
-#      不碰工作树），chmod 444 并记录/复核 sha256（运行前后一致）。
-#       —— 快照含**完整实际头文件**，编译用 `-I <快照根>`，不借调用 cwd、
-#          也不 fallback 到活树头文件。
-#   2) **正控（新树）**：DUT_ROOT=<当前工作树> 跑 test_cache_bus.sh（默认 fixed 口径）
-#      ⇒ 必须 rc=0、唯一 PASS 锚点、fails=0 defect=0、冻结规格精确。
+#        rv32_defs.vh / core_params.vh = 7 个）+ TB 恒取本包。快照落本次独占 run 目录
+#      （不递归复制 build、不碰工作树），chmod 444 并记录/复核 sha256（运行前后一致）。
+#      ★ `snapshot_sha` 的 rc **原样传播**（不经管道吞掉）；哈希块必须"恰好 7 行且全为
+#        64 位 hex"，多一行坏行也必须拒。
+#   2) **正控（新树）**：DUT_ROOT=<当前树私有快照> 跑 test_cache_bus.sh（fixed 口径）
+#      ⇒ 必须 rc=0、唯一 PASS 锚点、逐向量规格精确。
 #   3) **反证（旧树）**：DUT_ROOT=<基线快照>、CACHE_BUS_EXPECT=old 跑**同一 TB**
 #      ⇒ 必须 rc=1、**不得**出现 PASS 锚点、3 个根因的 DEFECT_REPRODUCED 行齐全、
 #      逐向量 defect 签名齐全、fails>0。
-#   4) **控制两边正确**：对两棵树都校验控制向量的 fails=0 defect=0
-#      （否则"修复"可能只是放宽判据）。
-#   5) **包装器自检**：注入 编译失败 / 空 vvp / 运行非零 / 缺摘要 / 日志含 FAIL /
-#      日志含 DEFECT_REPRODUCED / 少向量 七类反例，逐一要求**精确 reason + rc≠0 + 无 PASS**。
+#   4) **输入一致性**：两次运行必须使用**同一 TB / 同一包脚本 / 同一 env**，且包日志里
+#      记录的 TB SHA 必须等于仓库当前 TB 的 SHA（防止旧新用了不同 TB 而不自知）。
+#   5) **控制向量两边正确**：两棵树都校验 fails=0 defect=0。
+#   6) **包装器自检**（精确 reason + rc≠0 + 无 PASS）：
+#        · 既有 7 类：编译失败 / 空 vvp / 运行非零 / 缺摘要 / 日志含 FAIL /
+#          日志含 DEFECT_REPRODUCED / 少向量
+#        · 严格逐向量 6 类：重复名 / 错名 / 多向量 / 0 检查凑数 / 错检查数 / 摘要自报不一致
+#        · 环境 4 类：毒化 cwd 不影响结果（正控）/ 共享依赖运行中被改 / 哈希多坏行 / 哈希 exit9
 #
 # 产物纪律：产物根固定在本仓库 build/functional/ 授权树内（或父入口传入的 PKGOUT），
 #          每次 mktemp -d 独占 run 目录，**不做任何 rm**。
-# 工具真源：scripts/env.sh（只读）；本驱动只经 test_cache_bus.sh 间接使用 iverilog/vvp。
 #
 # 用法 : bash sim/functional/test_cache_bus_driver.sh
 #        bash sim/functional/test_cache_bus_driver.sh --self-test
@@ -73,6 +76,56 @@ fail() {
     exit 1
 }
 
+HASH_ERR=""     # 失败原因（**全局**：绝不放在 command substitution 子壳里，否则会丢）
+HASH_OUT=""     # 成功时的 64 hex（同样走全局，避免 `$(...)` 吞 rc/丢状态）
+
+#   ★ 用法约定：**不要**写 `h=$(hash_one f)` —— 那会开子壳，既丢 rc 又丢 HASH_ERR。
+#     一律 `hash_one f || fail "..."`，随后读 $HASH_OUT。
+hash_one() {  # hash_one <file> -> 成功: HASH_OUT=64hex, rc=0；失败: HASH_ERR, rc=1
+    local f="$1" out rc one nlines
+    HASH_ERR=""; HASH_OUT=""
+    out="$(sha256sum -- "$f" 2>>"$DRV_LOG")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then HASH_ERR="hash_rc=$rc file=$f"; return 1; fi
+    if [ -z "$out" ]; then HASH_ERR="hash_empty file=$f"; return 1; fi
+    nlines="$(printf '%s\n' "$out" | wc -l)"
+    if [ "$nlines" -ne 1 ]; then HASH_ERR="hash_lines=$nlines file=$f"; return 1; fi
+    one="${out%%[[:space:]]*}"
+    if [ "${#one}" -ne 64 ]; then HASH_ERR="hash_len=${#one} file=$f"; return 1; fi
+    case "$one" in
+        *[!0-9a-f]*) HASH_ERR="hash_badhex file=$f"; return 1 ;;
+    esac
+    HASH_OUT="$one"
+    return 0
+}
+
+#   逐文件 copy 一致性：**两侧分别校验**（rc/非空/hex）后再比较
+verify_copy_equal() {  # verify_copy_equal <src> <dst> <tag>
+    local src="$1" dst="$2" tag="$3" hs hd
+    hash_one "$src" || { HASH_ERR="src_${HASH_ERR}"; return 1; }
+    hs="$HASH_OUT"
+    hash_one "$dst" || { HASH_ERR="dst_${HASH_ERR}"; return 1; }
+    hd="$HASH_OUT"
+    #   双保险：空值绝不参与相等判定（防"两失败 ⇒ 空==空 ⇒ 通过"）
+    if [ -z "$hs" ] || [ -z "$hd" ]; then HASH_ERR="empty_hash tag=$tag"; return 1; fi
+    [ "$hs" = "$hd" ] || { HASH_ERR="mismatch src=$hs dst=$hd tag=$tag"; return 1; }
+    return 0
+}
+
+is_hex64() {
+    case "$1" in
+        *[!0-9a-f]*|"") return 1 ;;
+    esac
+    [ "${#1}" -eq 64 ] || return 1
+    return 0
+}
+
+# ★ rc 传播：sha256sum 的 rc 由函数返回，调用方用 `rc=$?` 取；不经管道吞掉。
+snapshot_sha() {  # snapshot_sha <root>  -> 7 行 sha256sum 输出，rc=sha256sum 的 rc
+    local r="$1"
+    ( cd -- "$r" && sha256sum -- $BASE_FILES 2>>"$DRV_LOG" )
+}
+
 note "==== test_cache_bus_driver.sh ===="
 note "date       = $(date -Is 2>/dev/null || date)"
 note "REPO_ROOT  = $REPO_ROOT"
@@ -81,29 +134,56 @@ note "MODE       = $MODE"
 if git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
     note "GIT_HEAD   = $(git -C "$REPO_ROOT" rev-parse HEAD)"
 fi
-note "L1D_SHA    = $(sha256sum -- "$REPO_ROOT/rtl/cache/l1d.v" | awk '{print $1}')"
-note "L1I_SHA    = $(sha256sum -- "$REPO_ROOT/rtl/cache/l1i.v" | awk '{print $1}')"
-note "AXI_SHA    = $(sha256sum -- "$REPO_ROOT/rtl/axi/axi_master_ctrl.v" | awk '{print $1}')"
-note "TB_SHA     = $(sha256sum -- "$SELF_DIR/tb_cache_bus_semantics.sv" | awk '{print $1}')"
-note "PKG_SHA    = $(sha256sum -- "$PKG_SH" | awk '{print $1}')"
+hash_one "$SELF_DIR/tb_cache_bus_semantics.sv" || fail "repo_tb_hash ${HASH_ERR}"
+TB_SHA_REPO="$HASH_OUT"
+hash_one "$PKG_SH" || fail "repo_pkg_hash ${HASH_ERR}"
+PKG_SHA_REPO="$HASH_OUT"
+hash_one "$REPO_ROOT/rtl/cache/l1d.v" || fail "repo_l1d_hash ${HASH_ERR}"
+L1D_SHA_REPO="$HASH_OUT"
+hash_one "$REPO_ROOT/rtl/cache/l1i.v" || fail "repo_l1i_hash ${HASH_ERR}"
+L1I_SHA_REPO="$HASH_OUT"
+hash_one "$REPO_ROOT/rtl/axi/axi_master_ctrl.v" || fail "repo_axi_hash ${HASH_ERR}"
+AXI_SHA_REPO="$HASH_OUT"
+#   ★ 跨相冻结还要管 env.sh：起始值在这里固定，两相都必须等于它
+hash_one "$REPO_ROOT/scripts/env.sh" || fail "repo_env_hash ${HASH_ERR}"
+ENV_SHA_START="$HASH_OUT"
+is_hex64 "$TB_SHA_REPO"  || fail "repo_tb_hash_not_hex64"
+is_hex64 "$PKG_SHA_REPO" || fail "repo_pkg_hash_not_hex64"
+is_hex64 "$L1D_SHA_REPO" || fail "repo_l1d_hash_not_hex64"
+is_hex64 "$L1I_SHA_REPO" || fail "repo_l1i_hash_not_hex64"
+is_hex64 "$AXI_SHA_REPO" || fail "repo_axi_hash_not_hex64"
+is_hex64 "$ENV_SHA_START" || fail "repo_env_hash_not_hex64"
+note "L1D_SHA    = $L1D_SHA_REPO"
+note "L1I_SHA    = $L1I_SHA_REPO"
+note "AXI_SHA    = $AXI_SHA_REPO"
+note "TB_SHA     = $TB_SHA_REPO"
+note "PKG_SHA    = $PKG_SHA_REPO"
+note "ENV_SHA    = $ENV_SHA_START"
+note "TB_SHA_REPO= $TB_SHA_REPO"
 
-# 基线依赖清单（最小集；含完整实际头）
+# 基线依赖清单（最小集；含完整实际头）= 7 个
 BASE_FILES="rtl/cache/l1d.v rtl/cache/l1i.v rtl/cache/cache_tag_array.v \
 rtl/cache/cache_array_bram.v rtl/axi/axi_master_ctrl.v rtl/pkg/rv32_defs.vh rtl/pkg/core_params.vh"
+SNAP_N=7
 
 #==============================================================================
-# A. 基线快照（不可变；git show 提取，不递归 build）
+# A. 快照（不可变；git show 提取，不递归 build）
 #==============================================================================
 BASE_COMMIT="${CACHE_BUS_BASELINE_COMMIT:-201acf61}"
 SNAP="$DRV/deps_base"
 CUR="$DRV/deps_cur"
 
-snapshot_sha() {  # snapshot_sha <root>
-    local r="$1" f out=""
-    for f in $BASE_FILES; do
-        out="$out$(sha256sum -- "$r/$f" | awk '{print $1}') "
-    done
-    printf '%s' "$out"
+# ★★ P1-SHA 加固：所有哈希**捕获点**都必须
+#     (a) 显式取 rc（`var="$(f)" || fail`，不靠管道/note 内替换吞掉）；
+#     (b) 拒绝空输出与非法 hex；
+#     (c) 比较前先各自校验非空 —— 否则"两边都失败 ⇒ 空==空 ⇒ 通过"是最隐蔽的假绿。
+# ★ 块校验：恰好 SNAP_N 行、且 SNAP_N 行全为 64 位 hex（不允许额外坏行）
+snapshot_sha_check() {  # snapshot_sha_check <block> <tag>
+    local block="$1" tag="$2" n_total n_hex
+    n_total="$(printf '%s\n' "$block" | wc -l)"
+    n_hex="$(printf '%s\n' "$block" | grep -c '^[0-9a-f]\{64\}  ' || true)"
+    [ "$n_total" = "$SNAP_N" ] || fail "${tag}_lines=$n_total expect=$SNAP_N"
+    [ "$n_hex"   = "$SNAP_N" ] || fail "${tag}_hex=$n_hex expect=$SNAP_N"
 }
 
 if [ "$MODE" = "full" ]; then
@@ -114,10 +194,13 @@ if [ "$MODE" = "full" ]; then
         mkdir -p -- "$CUR/$(dirname -- "$f")" || fail "cur_snapshot_mkdir_failed"
         cp -- "$REPO_ROOT/$f" "$CUR/$f" || fail "cur_snapshot_copy f=$f"
         chmod 444 -- "$CUR/$f" || fail "cur_snapshot_chmod f=$f"
-        [ "$(sha256sum -- "$REPO_ROOT/$f" | awk '{print $1}')" = \
-          "$(sha256sum -- "$CUR/$f" | awk '{print $1}')" ] || fail "cur_snapshot_mismatch f=$f"
+        verify_copy_equal "$REPO_ROOT/$f" "$CUR/$f" "cur f=$f" \
+            || fail "cur_snapshot_copy_check f=$f ${HASH_ERR}"
     done
     CUR_SHA_PRE="$(snapshot_sha "$CUR")"
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "cur_snapshot_sha_rc=$rc"
+    snapshot_sha_check "$CUR_SHA_PRE" "cur_snapshot_sha"
     note "CUR        = $CUR"
     note "CUR_SHA    = $CUR_SHA_PRE"
     #   ---- 旧树基线快照（git show 提取；不递归 build、不碰工作树）----
@@ -129,6 +212,9 @@ if [ "$MODE" = "full" ]; then
         chmod 444 -- "$SNAP/$f" || fail "snapshot_chmod_failed f=$f"
     done
     SNAP_SHA_PRE="$(snapshot_sha "$SNAP")"
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "snapshot_sha_rc=$rc"
+    snapshot_sha_check "$SNAP_SHA_PRE" "snapshot_sha"
     note "SNAP       = $SNAP"
     note "SNAP_COMMIT= $BASE_COMMIT"
     note "SNAP_SHA   = $SNAP_SHA_PRE"
@@ -153,8 +239,48 @@ pkg_run_log() {  # pkg_run_log <pkgout_root>
     [ -n "$f" ] && [ -f "$f" ] && printf '%s\n' "$f"
 }
 
+#------------------------------------------------------------------------------
+# 跨相冻结：TB / 包 / env 三者都必须"单一、起始值、两相相同"
+#   ★ 只比 TB/pkg 不够：env.sh 在两相之间被改会让"同一 TB"实际跑在不同工具/环境下。
+#   ★ 每次取 SHA 都要 rc=0 + 非空 + 64 hex（不允许空==空）。
+#------------------------------------------------------------------------------
+ENV_ERR=""
+sha_from_log() {  # sha_from_log <log> <regex-path-suffix>
+    sed -n "s|^\([0-9a-f]\{64\}\)  /.*$2\$|\1|p" "$1" | head -1
+}
+
+check_cross_phase_env() {  # check_cross_phase_env <pos_log> <neg_log> <start_sha>
+    local pl="$1" nl="$2" start="$3" ps ns
+    ENV_ERR=""
+    ps="$(sha_from_log "$pl" 'scripts/env\.sh')"
+    ns="$(sha_from_log "$nl" 'scripts/env\.sh')"
+    is_hex64 "$ps" || { ENV_ERR="pos_env_sha_invalid=${ps:-empty}"; return 1; }
+    is_hex64 "$ns" || { ENV_ERR="neg_env_sha_invalid=${ns:-empty}"; return 1; }
+    is_hex64 "$start" || { ENV_ERR="start_env_sha_invalid=${start:-empty}"; return 1; }
+    [ "$ps" = "$start" ] || { ENV_ERR="pos_env_sha_differs pos=$ps start=$start"; return 1; }
+    [ "$ns" = "$start" ] || { ENV_ERR="neg_env_sha_differs neg=$ns start=$start"; return 1; }
+    return 0
+}
+
+check_cross_phase_inputs() {  # <pos_log> <neg_log> <start_tb> <start_pkg>
+    local pl="$1" nl="$2" stb="$3" spkg="$4" a b c d
+    a="$(sha_from_log "$pl" 'tb_cache_bus_semantics\.sv')"
+    b="$(sha_from_log "$nl" 'tb_cache_bus_semantics\.sv')"
+    c="$(sha_from_log "$pl" 'test_cache_bus\.sh')"
+    d="$(sha_from_log "$nl" 'test_cache_bus\.sh')"
+    is_hex64 "$a" || { INPUT_ERR="pos_tb_sha_invalid=${a:-empty}"; return 1; }
+    is_hex64 "$b" || { INPUT_ERR="neg_tb_sha_invalid=${b:-empty}"; return 1; }
+    is_hex64 "$c" || { INPUT_ERR="pos_pkg_sha_invalid=${c:-empty}"; return 1; }
+    is_hex64 "$d" || { INPUT_ERR="neg_pkg_sha_invalid=${d:-empty}"; return 1; }
+    [ "$a" = "$b" ] || { INPUT_ERR="tb_sha_differs"; return 1; }
+    [ "$c" = "$d" ] || { INPUT_ERR="pkg_sha_differs"; return 1; }
+    [ "$a" = "$stb" ] || { INPUT_ERR="tb_sha_not_start"; return 1; }
+    [ "$c" = "$spkg" ] || { INPUT_ERR="pkg_sha_not_start"; return 1; }
+    return 0
+}
+
 #==============================================================================
-# B. 正控（新树 fixed）+ 反证（旧树 old）
+# B. 正控（新树 fixed）+ 反证（旧树 old）+ 输入一致性
 #==============================================================================
 if [ "$MODE" = "full" ]; then
     POS_LOG="$DRV/pos_fixed.log"
@@ -167,7 +293,6 @@ if [ "$MODE" = "full" ]; then
     [ "$(pkg_field "$POS_LOG" fails)" = "0" ] || fail "pos_fails=$(pkg_field "$POS_LOG" fails)"
     [ "$(pkg_field "$POS_LOG" defect)" = "0" ] || fail "pos_defect=$(pkg_field "$POS_LOG" defect)"
 
-    #   ---- 反证（旧树 old）----
     NEG_LOG="$DRV/neg_old.log"
     run_pkg "$NEG_LOG" "CACHE_BUS_EXPECT=old" "DUT_ROOT=$SNAP" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_old"
     NEG_RC=$?
@@ -180,9 +305,8 @@ if [ "$MODE" = "full" ]; then
             || fail "neg_missing_root=$r"
     done
     grep -q 'reason=old_tree_defects_confirmed' "$NEG_LOG" || fail "neg_missing_reason"
-    [ "$(pkg_field "$NEG_LOG" defect)" = "11" ] || fail "neg_defect=$(pkg_field "$NEG_LOG" defect)"
+    [ "$(pkg_field "$NEG_LOG" defect)" = "24" ] || fail "neg_defect=$(pkg_field "$NEG_LOG" defect)"
 
-    #   ---- 控制向量两边正确（逐向量证据取包内 run 日志）----
     POS_RUNLOG="$(pkg_run_log "$DRV/pkg_pos")"
     NEG_RUNLOG="$(pkg_run_log "$DRV/pkg_old")"
     [ -n "$POS_RUNLOG" ] || fail "pos_runlog_missing"
@@ -191,31 +315,50 @@ if [ "$MODE" = "full" ]; then
     note "NEG_RUNLOG = $NEG_RUNLOG"
     [ "$(grep -cxF 'FUNCTIONAL_CACHE_BUS: PASS' "$POS_RUNLOG" || true)" = "1" ] || fail "pos_runlog_pass_anchor"
     [ "$(grep -cxF 'FUNCTIONAL_CACHE_BUS: PASS' "$NEG_RUNLOG" || true)" = "0" ] || fail "neg_runlog_pass_anchor"
+
+    #   ---- 输入一致性：两次运行必须用同一 TB/包/env；且等于仓库当前 TB ----
+    check_cross_phase_inputs "$POS_RUNLOG" "$NEG_RUNLOG" "$TB_SHA_REPO" "$PKG_SHA_REPO" \
+        || fail "cross_phase_inputs $INPUT_ERR"
+    check_cross_phase_env "$POS_RUNLOG" "$NEG_RUNLOG" "$ENV_SHA_START" \
+        || fail "cross_phase_env $ENV_ERR"
+
+    #   ---- 逐向量 defect 签名 / 控制向量两边正确 ----
     for dv in wb_first_valid_zero_delay wb_two_victims_distinct wb_accept_delay3 \
               axi_split_read_single_done axi_split_write_single_done \
               l1i_fill_err_early l1i_fill_err_last l1i_two_err_lines_alternate \
-              l1d_fill_err_mid l1d_wb_b_fail_keeps_dirty l1d_maint_clean_b_fail; do
+              l1d_fill_err_mid l1d_wb_b_fail_keeps_dirty l1d_maint_clean_b_fail \
+              axi_r_err_early axi_r_err_mid axi_r_err_last axi_b_err_write \
+              axi_split_first_err_last_ok axi_err_clear_next_req \
+              axi_r_resp_x_fail_closed axi_b_resp_x_fail_closed \
+              l1i_fill_err_x_early l1i_fill_err_x_last l1d_fill_err_x_mid \
+              l1d_wb_err_x_keeps_dirty l1d_maint_flush_b_fail_two_ways; do
         grep -q "^VEC [0-9]\+ $dv checks=[0-9]\+ fails=[1-9][0-9]* defect=1$" "$NEG_RUNLOG" \
             || fail "neg_defect_sig_missing vec=$dv"
     done
-    for cv in ctrl_wb_clean_no_req ctrl_axi_nonsplit_single_done ctrl_l1d_fill_hit; do
+    for cv in ctrl_wb_clean_no_req ctrl_axi_nonsplit_single_done \
+              ctrl_l1d_fill_hit ctrl_axi_error_free_chain; do
         grep -q "^VEC [0-9]\+ $cv checks=[0-9]\+ fails=0 defect=0$" "$POS_RUNLOG" \
             || fail "pos_control_mismatch vec=$cv"
         grep -q "^VEC [0-9]\+ $cv checks=[0-9]\+ fails=0 defect=0$" "$NEG_RUNLOG" \
             || fail "neg_control_mismatch vec=$cv"
     done
 
-    #   ---- 快照不可变复核 ----
-    SNAP_SHA_POST="$(snapshot_sha "$SNAP")"
+    #   ---- 快照不可变复核（rc 原样检查）----
+    SNAP_SHA_POST="$(snapshot_sha "$SNAP")"; rc=$?
+    [ "$rc" -eq 0 ] || fail "snapshot_post_sha_rc=$rc"
+    snapshot_sha_check "$SNAP_SHA_POST" "snapshot_post_sha"
     [ "$SNAP_SHA_PRE" = "$SNAP_SHA_POST" ] || fail "snapshot_modified"
-    CUR_SHA_POST="$(snapshot_sha "$CUR")"
+    CUR_SHA_POST="$(snapshot_sha "$CUR")"; rc=$?
+    [ "$rc" -eq 0 ] || fail "cur_post_sha_rc=$rc"
+    snapshot_sha_check "$CUR_SHA_POST" "cur_post_sha"
     [ "$CUR_SHA_PRE" = "$CUR_SHA_POST" ] || fail "cur_snapshot_modified"
 fi
 
 #==============================================================================
-# C. 包装器自检（注入七类反例；要求精确 reason + rc≠0 + 无 PASS）
+# C. 包装器自检（精确 reason + rc≠0 + 无 PASS）
 #==============================================================================
 ST_FAIL=0
+ST_N=0
 selftest_start() { ST_NAME="$1"; ST_WANT="$2"; ST_LOG="$DRV/st_$1.log"; }
 selftest_check() {  # selftest_check <rc>
     local rc="$1"
@@ -232,19 +375,17 @@ selftest_check() {  # selftest_check <rc>
 FAKE="$DRV/fake"
 mkdir -p -- "$FAKE" || fail "fake_mkdir_failed"
 REAL_VVP="$(command -v vvp || true)"
+REAL_SHA="$(command -v sha256sum || true)"
 [ -n "$REAL_VVP" ] && [ -x "$REAL_VVP" ] || fail "real_vvp_missing"
+[ -n "$REAL_SHA" ] && [ -x "$REAL_SHA" ] || fail "real_sha256sum_missing"
 
-#   1) 编译失败：DUT 根本身语法错误（同时保留头，确保失败原因是 rc 而非缺文件）
+#   1) 编译失败：DUT 根本身语法错误（头/其它源齐备，确保失败原因是 rc 而非缺文件）
 BAD_DUT="$DRV/bad_dut"
+for f in $BASE_FILES; do mkdir -p -- "$BAD_DUT/$(dirname -- "$f")"; done
 for f in $BASE_FILES; do
-    mkdir -p -- "$BAD_DUT/$(dirname -- "$f")"
+    [ "$f" = "rtl/cache/l1d.v" ] && continue
+    cp -- "$REPO_ROOT/$f" "$BAD_DUT/$f"
 done
-cp -- "$REPO_ROOT/rtl/pkg/rv32_defs.vh"   "$BAD_DUT/rtl/pkg/rv32_defs.vh"
-cp -- "$REPO_ROOT/rtl/pkg/core_params.vh" "$BAD_DUT/rtl/pkg/core_params.vh"
-cp -- "$REPO_ROOT/rtl/cache/l1i.v"              "$BAD_DUT/rtl/cache/l1i.v"
-cp -- "$REPO_ROOT/rtl/cache/cache_tag_array.v"  "$BAD_DUT/rtl/cache/cache_tag_array.v"
-cp -- "$REPO_ROOT/rtl/cache/cache_array_bram.v" "$BAD_DUT/rtl/cache/cache_array_bram.v"
-cp -- "$REPO_ROOT/rtl/axi/axi_master_ctrl.v"    "$BAD_DUT/rtl/axi/axi_master_ctrl.v"
 printf 'module l1d; this is not verilog ; endmodule\n' > "$BAD_DUT/rtl/cache/l1d.v"
 selftest_start compile_rc compile_rc
 run_pkg "$ST_LOG" "DUT_ROOT=$BAD_DUT" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st1"
@@ -303,23 +444,428 @@ echo "injected DEFECT_REPRODUCED marker"
 exit \$rc
 EOF
 chmod 755 "$FAKE/vvp_defect.sh"
-selftest_start log_defect log_has_defect_reproduced
+selftest_start log_defect log_has_defect_marker
 run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_defect.sh" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st6"
 selftest_check $?
 
-#   7) 少向量（摘要 total=14 但只有 13 条 VEC 行 ⇒ 必须被拒）
-cat > "$FAKE/vvp_short.sh" <<'EOF'
+#   ---- 严格逐向量自检的公共素材：以**真实正控输出**为模板，只改一处 ----
+#   先跑一次干净树拿到 VEC + 摘要行（模板），再逐类注入。
+BASE_TMPL="$DRV/vec_template.txt"
+run_pkg "$DRV/tmpl.log" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_tmpl" || true
+#   ★ VEC/摘要行在**包内 run 日志**里（包 stdout 只放摘要+锚点），不是 stdout。
+TMPL_RUNLOG="$(pkg_run_log "$DRV/pkg_tmpl")"
+[ -n "$TMPL_RUNLOG" ] || fail "template_runlog_missing"
+grep '^VEC ' "$TMPL_RUNLOG" > "$BASE_TMPL" || true
+grep '^CACHE_BUS_VECTORS ' "$TMPL_RUNLOG" >> "$BASE_TMPL" || true
+TMPL_VEC_N="$(grep -c '^VEC ' "$BASE_TMPL" || true)"
+[ "$TMPL_VEC_N" = "28" ] || fail "template_vec_count=$TMPL_VEC_N"
+
+mk_vvp_cat() {  # mk_vvp_cat <script> <file>
+    local scr="$1" f="$2"
+    cat > "$scr" <<EOF
 #!/usr/bin/env bash
-echo "CACHE_BUS_VECTORS total=14 nonzero=14 checks=249 fails=0 defect=0"
-i=1
-while [ $i -le 12 ]; do echo "VEC $i short_vec$i checks=2 fails=0 defect=0"; i=$((i+1)); done
-echo "VEC 13 short_vec13 checks=225 fails=0 defect=0"
+cat "$f"
 exit 0
 EOF
-chmod 755 "$FAKE/vvp_short.sh"
-selftest_start short_vecs vec_line_count=13
-run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_short.sh" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st7"
+    chmod 755 "$scr"
+}
+
+#   7) 少向量（摘要 total=28 但只有 27 条 VEC 行）
+grep -v '^CACHE_BUS_VECTORS ' "$BASE_TMPL" | head -n -1 > "$DRV/m_short.txt"
+grep '^CACHE_BUS_VECTORS ' "$BASE_TMPL" >> "$DRV/m_short.txt"
+mk_vvp_cat "$FAKE/vvp_cat_short.sh" "$DRV/m_short.txt"
+selftest_start short_vecs vec_line_count=27
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_short.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st7"
 selftest_check $?
+
+#   8) 多向量（摘要仍 28，但多一条 VEC ⇒ vec_line_count=29）
+cp -- "$BASE_TMPL" "$DRV/m_extra.txt"
+printf 'VEC 29 bogus_extra_vec checks=1 fails=0 defect=0\n' >> "$DRV/m_extra.txt"
+# 摘要必须仍在最后一行：把摘要行移回末尾
+grep -v '^CACHE_BUS_VECTORS ' "$DRV/m_extra.txt" > "$DRV/m_extra2.txt"
+grep '^CACHE_BUS_VECTORS ' "$BASE_TMPL" >> "$DRV/m_extra2.txt"
+mk_vvp_cat "$FAKE/vvp_cat_extra.sh" "$DRV/m_extra2.txt"
+selftest_start extra_vec vec_line_count=29
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_extra.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st8"
+selftest_check $?
+
+#   9) 重复名（第 2 条改成第 1 条的名字 ⇒ 名称逐位不一致）
+awk 'BEGIN{n=0} /^VEC /{n++; if(n==2){sub(/VEC 2 [A-Za-z0-9_]+/, "VEC 2 wb_first_valid_zero_delay")}} {print}' \
+    "$BASE_TMPL" > "$DRV/m_dup.txt"
+mk_vvp_cat "$FAKE/vvp_cat_dup.sh" "$DRV/m_dup.txt"
+selftest_start dup_name vec_name=wb_first_valid_zero_delay
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_dup.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st9"
+selftest_check $?
+
+#   10) 错名（第 5 条改名）
+awk 'BEGIN{n=0} /^VEC /{n++; if(n==5){sub(/VEC 5 [A-Za-z0-9_]+/, "VEC 5 bogus_wrong_name")}} {print}' \
+    "$BASE_TMPL" > "$DRV/m_name.txt"
+mk_vvp_cat "$FAKE/vvp_cat_name.sh" "$DRV/m_name.txt"
+selftest_start wrong_name vec_name=bogus_wrong_name
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_name.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st10"
+selftest_check $?
+
+#   11) 0 检查凑数（把第 3 条 checks 改 0，并同步摘要 checks 减去原值 37）
+awk 'BEGIN{n=0} /^VEC /{n++; if(n==3){sub(/checks=[0-9]+/, "checks=0")}} {print}' \
+    "$BASE_TMPL" > "$DRV/m_zero.txt"
+mk_vvp_cat "$FAKE/vvp_cat_zero.sh" "$DRV/m_zero.txt"
+selftest_start zero_checks 'vec_zero_checks name=wb_accept_delay3'
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_zero.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st11"
+selftest_check $?
+
+#   12) 错检查数（第 4 条 checks 6→7，摘要同步 +1 ⇒ 逐向量不匹配）
+awk 'BEGIN{n=0} /^VEC /{n++; if(n==4){sub(/checks=[0-9]+/, "checks=7")}} {print}' \
+    "$BASE_TMPL" > "$DRV/m_cnt.txt"
+mk_vvp_cat "$FAKE/vvp_cat_cnt.sh" "$DRV/m_cnt.txt"
+selftest_start wrong_count 'vec_checks name=ctrl_wb_clean_no_req'
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_cnt.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st12"
+selftest_check $?
+
+#   13) 摘要自报不一致（行不变、摘要 checks +1 ⇒ 逐向量之和 != 摘要）
+sed -E 's/^(CACHE_BUS_VECTORS total=28 nonzero=28) checks=448 /\1 checks=449 /' \
+    "$BASE_TMPL" > "$DRV/m_sum.txt"
+mk_vvp_cat "$FAKE/vvp_cat_sum.sh" "$DRV/m_sum.txt"
+selftest_start bad_sum vec_checks_sum=448
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_cat_sum.sh" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st13"
+selftest_check $?
+
+#   14) 毒化 cwd（正控）：cwd 里放**错误**的 rtl/pkg 头，包必须仍用 DUT_ROOT 的头而 PASS
+POISON="$DRV/poison_cwd"
+mkdir -p -- "$POISON/rtl/pkg" "$POISON/rtl/cache" "$POISON/rtl/axi" || fail "poison_mkdir"
+cat > "$POISON/rtl/pkg/rv32_defs.vh" <<'EOF'
+// poisoned header: must never be used
+`define RV32GC_AXI_RESP_OKAY 2'bzz
+this is not verilog
+EOF
+cat > "$POISON/rtl/pkg/core_params.vh" <<'EOF'
+// poisoned header: wrong geometry must never be used
+`define RV32GC_L1D_WAYS 8
+this is not verilog
+EOF
+POISON_LOG="$DRV/poison_cwd.log"
+( cd -- "$POISON" && env DUT_ROOT="$CUR" RV32_FUNCTIONAL_PKG_OUT_DIR="$DRV/pkg_poison" \
+      bash "$PKG_SH" > "$POISON_LOG" 2>&1 )
+POISON_RC=$?
+note "POISON_CWD rc=$POISON_RC"
+cat -- "$POISON_LOG" >&3
+[ "$POISON_RC" -eq 0 ] || fail "poison_cwd_rc=$POISON_RC"
+[ "$(grep -cxF 'FUNCTIONAL_CACHE_BUS: PASS' "$POISON_LOG" || true)" = "1" ] || fail "poison_cwd_pass_anchor"
+
+#   15) 共享依赖运行中被改（写回失败源文件必须被冻结检查抓到）
+MUT_DUT="$DRV/mut_dut"
+for f in $BASE_FILES; do
+    mkdir -p -- "$MUT_DUT/$(dirname -- "$f")"
+    cp -- "$REPO_ROOT/$f" "$MUT_DUT/$f"
+done
+cat > "$FAKE/vvp_mutate.sh" <<EOF
+#!/usr/bin/env bash
+cat "$BASE_TMPL"
+echo "// injected mutation during run" >> "$MUT_DUT/rtl/cache/l1i.v"
+exit 0
+EOF
+chmod 755 "$FAKE/vvp_mutate.sh"
+selftest_start shared_mutation source_changed_during_run
+run_pkg "$ST_LOG" "RV32_VVP=$FAKE/vvp_mutate.sh" "DUT_ROOT=$MUT_DUT" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st15"
+selftest_check $?
+
+#   16) 哈希块多一条坏行（必须按"总行数"拒，而不是只数合法行）
+FAKEBIN="$DRV/fakebin"
+mkdir -p -- "$FAKEBIN" || fail "fakebin_mkdir"
+cat > "$FAKEBIN/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@"
+echo "this-is-not-a-hash-line"
+exit 0
+EOF
+chmod 755 "$FAKEBIN/sha256sum"
+selftest_start hash_extra_line sha256_pre_lines=9
+run_pkg "$ST_LOG" "PATH=$FAKEBIN:$PATH" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st16"
+selftest_check $?
+
+#   17) 哈希输出完整 7 行后 exit 9（必须保原 rc 拒绝，不能被"行数够"蒙混）
+cat > "$FAKEBIN/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@"
+exit 9
+EOF
+chmod 755 "$FAKEBIN/sha256sum"
+selftest_start hash_exit9 sha256_pre_rc=9
+run_pkg "$ST_LOG" "PATH=$FAKEBIN:$PATH" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st17"
+selftest_check $?
+#   还原 fakebin（后续不再使用）
+rm -f "$FAKEBIN/sha256sum"
+
+#   18) **单文件**哈希：真实完整输出后 exit 9（多文件/共享调用仍正常）⇒
+#       copy 一致性检查必须按 rc 拒绝，绝不能"两边都失败 ⇒ 空==空 ⇒ 通过"。
+cat > "$FAKEBIN/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@"
+rc=\$?
+# 单文件调用（忽略分隔符 --）：先给出**真实完整**哈希行，再 exit 9
+n=\$#
+if [ "\${1:-}" = "--" ]; then n=\$((n - 1)); fi
+if [ "\$n" -eq 1 ]; then exit 9; fi
+exit \$rc
+EOF
+chmod 755 "$FAKEBIN/sha256sum"
+HS_A="$DRV/hash_self_a.txt"; HS_B="$DRV/hash_self_b.txt"
+printf 'identical content for hash self-test\n' > "$HS_A"
+cp -- "$HS_A" "$HS_B"
+OLD_PATH="$PATH"; PATH="$FAKEBIN:$PATH"
+verify_copy_equal "$HS_A" "$HS_B" "selftest-copy"; VCE_RC=$?; VCE_ERR="$HASH_ERR"
+PATH="$OLD_PATH"
+ST_N=$((ST_N + 1))
+if [ "$VCE_RC" -eq 0 ] || [[ "$VCE_ERR" != *"hash_rc=9"* ]]; then
+    printf 'CACHE_BUS_SELFTEST case=copy_hash_exit9 rc=%s err=%s ok=0\n' "$VCE_RC" "$VCE_ERR"
+    ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=copy_hash_exit9 rc=%s err=%s ok=1\n' "$VCE_RC" "$VCE_ERR"
+fi
+note "SELFTEST copy_hash_exit9 rc=$VCE_RC err=$VCE_ERR"
+
+#   19) 单文件哈希：输出为空且 exit 0 ⇒ 必须按"空输出"拒绝
+cat > "$FAKEBIN/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 755 "$FAKEBIN/sha256sum"
+PATH="$FAKEBIN:$PATH"
+hash_one "$HS_A"; HO_RC=$?; HO_ERR="$HASH_ERR"; HO_EMPTY="$HASH_OUT"
+PATH="$OLD_PATH"
+ST_N=$((ST_N + 1))
+if [ "$HO_RC" -eq 0 ] || [ -n "$HO_EMPTY" ] || [[ "$HO_ERR" != *"hash_empty"* ]]; then
+    printf 'CACHE_BUS_SELFTEST case=hash_empty rc=%s out=%s err=%s ok=0\n' "$HO_RC" "$HO_EMPTY" "$HO_ERR"
+    ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=hash_empty rc=%s err=%s ok=1\n' "$HO_RC" "$HO_ERR"
+fi
+
+#   20) 单文件哈希：非 hex 的"完整输出" ⇒ 必须按 badhex 拒绝
+cat > "$FAKEBIN/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+echo "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  fake"
+exit 0
+EOF
+chmod 755 "$FAKEBIN/sha256sum"
+PATH="$FAKEBIN:$PATH"
+hash_one "$HS_A"; HO_RC=$?; HO_ERR="$HASH_ERR"; HO_BAD="$HASH_OUT"
+PATH="$OLD_PATH"
+ST_N=$((ST_N + 1))
+if [ "$HO_RC" -eq 0 ] || [ -n "$HO_BAD" ] || [[ "$HO_ERR" != *"hash_badhex"* ]]; then
+    printf 'CACHE_BUS_SELFTEST case=hash_badhex rc=%s out=%s err=%s ok=0\n' "$HO_RC" "$HO_BAD" "$HO_ERR"
+    ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=hash_badhex rc=%s err=%s ok=1\n' "$HO_RC" "$HO_ERR"
+fi
+rm -f "$FAKEBIN/sha256sum"
+
+#   21) **多文件/共享**哈希：输出完整 7 行后 exit 9 ⇒ snapshot_sha 的 rc 必须原样为 9
+#       （覆盖"初始快照"这条调用路径；证明不是只有单文件 helper 保 rc）。
+SNAP_SELF="$DRV/snap_self"
+for f in $BASE_FILES; do
+    mkdir -p -- "$SNAP_SELF/$(dirname -- "$f")"
+    cp -- "$REPO_ROOT/$f" "$SNAP_SELF/$f"
+done
+cat > "$FAKEBIN/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@"
+exit 9
+EOF
+chmod 755 "$FAKEBIN/sha256sum"
+PATH="$FAKEBIN:$PATH"
+SNAP_SELF_OUT="$(snapshot_sha "$SNAP_SELF")"; SNAP_SELF_RC=$?
+PATH="$OLD_PATH"
+SNAP_SELF_LINES="$(printf '%s\n' "$SNAP_SELF_OUT" | wc -l)"
+ST_N=$((ST_N + 1))
+if [ "$SNAP_SELF_RC" -ne 9 ] || [ "$SNAP_SELF_LINES" -ne "$SNAP_N" ]; then
+    printf 'CACHE_BUS_SELFTEST case=snapshot_hash_exit9 rc=%s lines=%s ok=0\n' "$SNAP_SELF_RC" "$SNAP_SELF_LINES"
+    ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=snapshot_hash_exit9 rc=%s lines=%s ok=1\n' "$SNAP_SELF_RC" "$SNAP_SELF_LINES"
+fi
+note "SELFTEST snapshot_hash_exit9 rc=$SNAP_SELF_RC lines=$SNAP_SELF_LINES"
+rm -f "$FAKEBIN/sha256sum"
+
+#   22) **跨相 env 敏感反证**：两相 env SHA 与起始值不同 ⇒ 必须按精确原因拒绝
+#       （先证明"相同则通过"，再改一个字节证明会被抓）
+EP_A="$DRV/env_mock_pos.log"; EP_B="$DRV/env_mock_neg.log"; EP_C="$DRV/env_mock_bad.log"
+ZH="$(printf '0%.0s' $(seq 1 64))"
+ONE="$(printf '1%.0s' $(seq 1 64))"
+{
+  printf '%s  /x/scripts/env.sh\n' "$ZH"
+  printf '%s  /x/tb_cache_bus_semantics.sv\n' "$ZH"
+  printf '%s  /x/test_cache_bus.sh\n' "$ZH"
+} > "$EP_A"
+cp -- "$EP_A" "$EP_B"
+{
+  printf '%s  /x/scripts/env.sh\n' "$ONE"
+  printf '%s  /x/tb_cache_bus_semantics.sv\n' "$ZH"
+  printf '%s  /x/test_cache_bus.sh\n' "$ZH"
+} > "$EP_C"
+ST_N=$((ST_N + 1))
+if check_cross_phase_env "$EP_A" "$EP_B" "$ZH"; then
+    printf 'CACHE_BUS_SELFTEST case=env_same_ok ok=1\n'
+else
+    printf 'CACHE_BUS_SELFTEST case=env_same_ok ok=0 err=%s\n' "$ENV_ERR"; ST_FAIL=1
+fi
+ST_N=$((ST_N + 1))
+if check_cross_phase_env "$EP_A" "$EP_C" "$ZH"; then
+    printf 'CACHE_BUS_SELFTEST case=stage_env_mismatch ok=0 (not detected)\n'; ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=stage_env_mismatch ok=1 err=%s\n' "$ENV_ERR"
+fi
+note "SELFTEST stage_env_mismatch err=$ENV_ERR"
+
+#   23) **DUT 变异自证 A**：把 rdata_error 从"真实错误 beat"拖到"逻辑末有效 beat"
+#       ⇒ 逐 beat oracle 必须红（旧 TB 只数总数/是否在某 valid beat 上是绿的）。
+MUT_ERR="$DRV/mut_dut_errdelay"
+for f in $BASE_FILES; do
+    mkdir -p -- "$MUT_ERR/$(dirname -- "$f")"
+    cp -- "$REPO_ROOT/$f" "$MUT_ERR/$f"
+done
+python3 - "$MUT_ERR/rtl/axi/axi_master_ctrl.v" <<'PYEOF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+old="    assign rdata_error = r_err;"
+new="    assign rdata_error = r_fire & m_rlast & err_acc_q;  // MUTATION: delay to last beat"
+assert old in s
+open(p,'w').write(s.replace(old,new))
+PYEOF
+MUT_ERR_LOG="$DRV/mut_errdelay.log"
+run_pkg "$MUT_ERR_LOG" "DUT_ROOT=$MUT_ERR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_mut_err"
+MUT_ERR_RC=$?
+ST_N=$((ST_N + 1))
+if [ "$MUT_ERR_RC" -eq 0 ]; then
+    printf 'CACHE_BUS_SELFTEST case=mut_early_err_delayed ok=0 (mutation survived)\n'; ST_FAIL=1
+elif ! grep -q 'reason=vec_fails name=axi_r_err' "$MUT_ERR_LOG"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_early_err_delayed ok=0 (wrong reason)\n'; ST_FAIL=1
+elif ! grep -q 'per-beat rdata_valid/error/data/last == independent oracle' \
+        "$(pkg_run_log "$DRV/pkg_mut_err")"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_early_err_delayed ok=0 (oracle did not fire)\n'; ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=mut_early_err_delayed rc=%s reason=vec_fails(oracle) ok=1\n' "$MUT_ERR_RC"
+fi
+note "SELFTEST mut_early_err_delayed rc=$MUT_ERR_RC"
+cat -- "$MUT_ERR_LOG" >&3
+
+#   24) **DUT 变异自证 B**：在在途窗口把 busy 变成 X ⇒ 控制未知 sticky 计数必须红
+#       （去掉/弱化 X 监视器会让它变绿，故这条同时是监视器的"载荷证明"）。
+MUT_X="$DRV/mut_dut_busyx"
+for f in $BASE_FILES; do
+    mkdir -p -- "$MUT_X/$(dirname -- "$f")"
+    cp -- "$REPO_ROOT/$f" "$MUT_X/$f"
+done
+python3 - "$MUT_X/rtl/axi/axi_master_ctrl.v" <<'PYEOF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+old="    assign busy  = busy_q;"
+new=("    reg x_poison_q;\n"
+     "    always @(posedge clk) if (!rst_n) x_poison_q <= 1'b0;\n"
+     "        else x_poison_q <= (req_valid && req_ready);\n"
+     "    assign busy  = x_poison_q ? 1'bx : busy_q;  // MUTATION: X on active control")
+assert old in s
+open(p,'w').write(s.replace(old,new))
+PYEOF
+MUT_X_LOG="$DRV/mut_busyx.log"
+run_pkg "$MUT_X_LOG" "DUT_ROOT=$MUT_X" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_mut_x"
+MUT_X_RC=$?
+ST_N=$((ST_N + 1))
+if [ "$MUT_X_RC" -eq 0 ]; then
+    printf 'CACHE_BUS_SELFTEST case=mut_busy_x ok=0 (mutation survived)\n'; ST_FAIL=1
+elif ! grep -q 'reason=vec_fails' "$MUT_X_LOG"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_busy_x ok=0 (wrong reason)\n'; ST_FAIL=1
+elif ! grep -q 'no X/Z on active AXI control signals' \
+        "$(pkg_run_log "$DRV/pkg_mut_x")"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_busy_x ok=0 (X monitor did not fire)\n'; ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=mut_busy_x rc=%s reason=vec_fails(x_ctrl) ok=1\n' "$MUT_X_RC"
+fi
+note "SELFTEST mut_busy_x rc=$MUT_X_RC"
+cat -- "$MUT_X_LOG" >&3
+
+#   25) **维护专用 word3 损坏变异必红**：只在维护写回时污染 word3，
+#       普通写回（v1/v2/v3）不受影响 ⇒ 必须由 v13 的逐字核对抓到。
+mk_mut_dut() {  # mk_mut_dut <dir>
+    local d="$1" f
+    for f in $BASE_FILES; do
+        mkdir -p -- "$d/$(dirname -- "$f")"
+        cp -- "$REPO_ROOT/$f" "$d/$f"
+    done
+}
+
+MUT_W3="$DRV/mut_dut_w3"
+mk_mut_dut "$MUT_W3"
+python3 - "$MUT_W3/rtl/cache/l1d.v" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "    wire [31:0] wb_data_sel = wb_buf_q[wb_word_idx[WIDX_BITS-1:0]*32 +: 32];"
+lines = [
+    "    // MUTATION: corrupt maintenance-only writeback word3",
+    "    wire [31:0] wb_data_sel = wb_buf_q[wb_word_idx[WIDX_BITS-1:0]*32 +: 32]",
+    "                             ^ ((maint_wb_q && (wb_word_idx == 5'd3)) ? 32'h0000_0001 : 32'h0);",
+]
+assert old in s, "mutation anchor not found"
+open(p, "w").write(s.replace(old, "\n".join(lines)))
+PYEOF
+MUT_W3_LOG="$DRV/mut_w3.log"
+run_pkg "$MUT_W3_LOG" "DUT_ROOT=$MUT_W3" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_mut_w3"
+MUT_W3_RC=$?
+ST_N=$((ST_N + 1))
+if [ "$MUT_W3_RC" -eq 0 ]; then
+    printf 'CACHE_BUS_SELFTEST case=mut_maint_word3 ok=0 (mutation survived)\n'; ST_FAIL=1
+elif ! grep -q 'reason=vec_fails name=l1d_maint_clean_b_fail' "$MUT_W3_LOG"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_maint_word3 ok=0 (wrong reason)\n'; ST_FAIL=1
+elif ! grep -q 'v13 DA0 writeback word word=3' "$(pkg_run_log "$DRV/pkg_mut_w3")"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_maint_word3 ok=0 (word3 not the hit)\n'; ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=mut_maint_word3 rc=%s reason=vec_fails(word3) ok=1\n' "$MUT_W3_RC"
+fi
+note "SELFTEST mut_maint_word3 rc=$MUT_W3_RC"
+cat -- "$MUT_W3_LOG" >&3
+
+#   26) **目标组凭空 valid 变异必红**：clean 完成拍对所有 way 都写 valid=1
+#       ⇒ 目标 set 的 way2/3 变 valid；真实目标阵列探针必须抓到。
+MUT_PV="$DRV/mut_dut_phantom"
+mk_mut_dut "$MUT_PV"
+python3 - "$MUT_PV/rtl/cache/l1d.v" <<'PYEOF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+old="            wire way_clr      = maint_wb_fin_w & (wb_way_q == gw[WAY_W-1:0]);"
+new="            wire way_clr      = maint_wb_fin_w;  // MUTATION: all ways (phantom valid)"
+assert old in s
+open(p,'w').write(s.replace(old,new))
+PYEOF
+MUT_PV_LOG="$DRV/mut_phantom.log"
+run_pkg "$MUT_PV_LOG" "DUT_ROOT=$MUT_PV" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_mut_pv"
+MUT_PV_RC=$?
+ST_N=$((ST_N + 1))
+if [ "$MUT_PV_RC" -eq 0 ]; then
+    printf 'CACHE_BUS_SELFTEST case=mut_target_phantom_valid ok=0 (mutation survived)\n'; ST_FAIL=1
+elif ! grep -q 'reason=vec_fails name=l1d_maint_clean_b_fail' "$MUT_PV_LOG"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_target_phantom_valid ok=0 (wrong reason)\n'; ST_FAIL=1
+elif ! grep -q 'has NO valid (no clean ghost)' "$(pkg_run_log "$DRV/pkg_mut_pv")"; then
+    printf 'CACHE_BUS_SELFTEST case=mut_target_phantom_valid ok=0 (probe did not fire)\n'; ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=mut_target_phantom_valid rc=%s reason=vec_fails(ghost) ok=1\n' "$MUT_PV_RC"
+fi
+note "SELFTEST mut_target_phantom_valid rc=$MUT_PV_RC"
+cat -- "$MUT_PV_LOG" >&3
+
+#   27) **合法相同工具控绿**：同一 mk_mut_dut 管线、**不做任何改动** ⇒ 必须 rc=0 且 PASS
+#       （证明变异工装本身不会引入失败，上两条红是变异导致而非工装导致）。
+MUT_NOOP="$DRV/mut_dut_noop"
+mk_mut_dut "$MUT_NOOP"
+MUT_NOOP_LOG="$DRV/mut_noop.log"
+run_pkg "$MUT_NOOP_LOG" "DUT_ROOT=$MUT_NOOP" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_mut_noop"
+MUT_NOOP_RC=$?
+ST_N=$((ST_N + 1))
+if [ "$MUT_NOOP_RC" -ne 0 ] || [ "$(grep -cxF 'FUNCTIONAL_CACHE_BUS: PASS' "$MUT_NOOP_LOG" || true)" != "1" ]; then
+    printf 'CACHE_BUS_SELFTEST case=mut_noop_control rc=%s ok=0\n' "$MUT_NOOP_RC"; ST_FAIL=1
+else
+    printf 'CACHE_BUS_SELFTEST case=mut_noop_control rc=0 pass=1 ok=1\n'
+fi
+note "SELFTEST mut_noop_control rc=$MUT_NOOP_RC"
 
 [ "$ST_FAIL" = "0" ] || fail "selftest_failed"
 
@@ -327,7 +873,7 @@ selftest_check $?
 # D. 结论
 #==============================================================================
 if [ "$MODE" = "full" ]; then
-    printf 'CACHE_BUS_DRIVER: positive=ok negative=ok control=ok snapshot=immutable selftest=ok\n'
+    printf 'CACHE_BUS_DRIVER: positive=ok negative=ok control=ok inputs=consistent snapshot=immutable selftest=ok\n'
 else
     printf 'CACHE_BUS_DRIVER: selftest=ok\n'
 fi

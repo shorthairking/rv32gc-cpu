@@ -275,8 +275,22 @@ module axi_master_ctrl #(
     // 第二笔 beat 数 = 请求总 beat 数 - 首笔 beat 数（仅 req_split=1 时有效）
 
     // 写响应非 OKAY ⇒ 错误可见
-    wire b_err = b_fire & (m_bresp != `RV32GC_AXI_RESP_OKAY);
-    wire r_err = r_fire & (m_rresp != `RV32GC_AXI_RESP_OKAY);
+    // ★★ 04-07 复审修复（P1-2）：**有效握手拍上的 X/Z 不得被当 OKAY**
+    //   原写法 `m_bresp != OKAY` 在 resp 为 X 时得 X，随后 `if (b_err | r_err)` 把
+    //   X 当假 ⇒ 总线错误被静默吞掉（消费者按成功提交）。改为"**已知 OKAY 才算
+    //   OKAY**"：case 的 default 覆盖 1/X/Z（可综合，不依赖 ===/#）。
+    function automatic resp_bad;                   // 1 = 非已知 OKAY
+        input [1:0] r;                              // Verilog-2001 函数入参（不带 wire）
+        begin
+            case (r)
+                `RV32GC_AXI_RESP_OKAY: resp_bad = 1'b0;
+                default:               resp_bad = 1'b1;   // 1 / X / Z
+            endcase
+        end
+    endfunction
+
+    wire b_err = b_fire & resp_bad(m_bresp);
+    wire r_err = r_fire & resp_bad(m_rresp);
 
     reg  err_pending_q;
     reg [1:0] err_code_q;
