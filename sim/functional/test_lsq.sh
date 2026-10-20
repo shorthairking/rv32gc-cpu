@@ -32,7 +32,11 @@
 #
 # 工具真源 : 只从 scripts/env.sh 取 RV32_IVERILOG / RV32_VVP（env.sh 只读）；
 #            二者仍可被调用方以同名环境变量覆盖 ⇒ 保留"假工具"反证能力。
-# 源冻结  : DUT 源 + 头 + TB 的 sha256 **运行前后各算一次并要求逐字节一致**。
+# 源冻结  : DUT 源 + 头 + TB 的 sha256 **运行前后各算一次并要求逐字节一致**；
+#            哈希清单直接捕 `sha256sum` 原始 rc，并校验**恰好 3 行 / 每行 64hex / 路径逐条匹配**
+#            （3 条合法行后 exit 9 或少数一行都必须拒）。
+# X/Z 探针 : `vvp ... +LSQ_XZ_PROBE` 时 TB 以私有观测替身注入 X/Z（不 force DUT），
+#            正式 gate 对 `XZ_PROBE_TRIPPED/MISS` 精确拒绝（reason=xz_probe_tripped/miss）。
 #
 # 用法 : bash sim/functional/test_lsq.sh
 #        DUT_ROOT=<只读源根> bash sim/functional/test_lsq.sh
@@ -209,12 +213,37 @@ DUT_HDR="$DUT_ROOT/rtl/back2/back2_params.vh"
 [ -f "$DUT_LSQ" ] || emit_fail "dut_src_missing file=$DUT_LSQ"
 [ -f "$DUT_HDR" ] || emit_fail "dut_header_missing file=$DUT_HDR"
 
-freeze_sha() {
-    sha256sum -- "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" 2>>"$RUN_LOG"
+#   ★ 窄复审 P1：哈希清单**直接捕原始 rc + 固定 3 条/每行 64hex/路径逐条匹配**。
+#     旧实现只数“3 条合法行”⇒ 额外坏行被放过；且 `sha256sum | awk` 会吞掉工具 rc。
+FREEZE_ERR=""
+freeze_sha() {  # 成功：stdout = 3 行完整清单；失败：FREEZE_ERR 给精确原因
+    local out rc total line h p i
+    FREEZE_ERR=""
+    out="$(sha256sum -- "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" 2>>"$RUN_LOG")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then FREEZE_ERR="sha256sum_rc=$rc"; return 1; fi
+    total="$(printf '%s\n' "$out" | wc -l)"
+    if [ "$total" -ne 3 ]; then FREEZE_ERR="sha256_lines=$total"; return 1; fi
+    i=0
+    for p in "$DUT_LSQ" "$DUT_HDR" "$TB_SRC"; do
+        i=$((i + 1))
+        line="$(printf '%s\n' "$out" | sed -n "${i}p")"
+        if ! printf '%s\n' "$line" | grep -qE '^[0-9a-f]{64}  '; then
+            FREEZE_ERR="sha256_format line=$i"; return 1
+        fi
+        h="$(printf '%s\n' "$line" | cut -c1-64)"
+        if [ "${#h}" -ne 64 ]; then FREEZE_ERR="sha256_hexlen line=$i"; return 1; fi
+        if [ "$(printf '%s\n' "$line" | cut -c67-)" != "$p" ]; then
+            FREEZE_ERR="sha256_path line=$i"; return 1
+        fi
+    done
+    printf '%s\n' "$out"
 }
-SHA_PRE="$(freeze_sha)" || emit_fail "sha256_pre_failed"
-N_SHA_LINES="$(printf '%s\n' "$SHA_PRE" | grep -c '^[0-9a-f]\{64\} ' || true)"
-[ "$N_SHA_LINES" = "3" ] || emit_fail "sha256_pre_lines=$N_SHA_LINES"
+FREEZE_PRE_OUT="$RUN_DIR/sha_pre.txt"
+if freeze_sha > "$FREEZE_PRE_OUT"; then :; else
+    emit_fail "${FREEZE_ERR:-sha256_pre_failed}"
+fi
+SHA_PRE="$(cat -- "$FREEZE_PRE_OUT")" || emit_fail "sha256_pre_read_failed"
 {
     echo "-- pre-run source sha256 (DUT / header / TB) --"
     printf '%s\n' "$SHA_PRE"
@@ -253,10 +282,24 @@ elif [ "$RC" -ne 0 ]; then
 fi
 [ -s "$RUN_LOG" ] || emit_fail "run_zero_output"
 
+#   ★ 窄复审 P2：+LSQ_XZ_PROBE 独立探针的正式 gate —— 解析摘要前先判标记。
+#     TRIPPED（真实 chk/monitor 都能捕获注入的 X/Z）与 MISS（checker/monitor/口径被
+#     弱化）都必须被**精确拒绝**；正常（无探针）日志里不会出现这两个标记。
+if grep -q 'XZ_PROBE_TRIPPED' "$RUN_LOG"; then
+    emit_fail "xz_probe_tripped"
+fi
+if grep -q 'XZ_PROBE_MISS' "$RUN_LOG"; then
+    emit_fail "xz_probe_miss"
+fi
+
 #------------------------------------------------------------------------------
 # 8. 源冻结复核（编译/运行前后逐字节一致）
 #------------------------------------------------------------------------------
-SHA_POST="$(freeze_sha)" || emit_fail "sha256_post_failed"
+FREEZE_POST_OUT="$RUN_DIR/sha_post.txt"
+if freeze_sha > "$FREEZE_POST_OUT"; then :; else
+    emit_fail "${FREEZE_ERR:-sha256_post_failed}"
+fi
+SHA_POST="$(cat -- "$FREEZE_POST_OUT")" || emit_fail "sha256_post_read_failed"
 if [ "$SHA_PRE" != "$SHA_POST" ]; then
     emit_fail "source_changed_during_run"
 fi

@@ -18,9 +18,14 @@
 #   3) **反证（旧树）**：用**同一份 frozen 副本**对 `deps_base` 跑 `LSQ_EXPECT=old`
 #      ⇒ rc=1、不得出现 PASS、5 个根因 `DEFECT_REPRODUCED` 齐全、10 个缺陷向量 defect=1。
 #   4) **控制两边正确**：两相都校验控制向量 `fails=0 defect=0`。
-#   5) **包装器自检**（私有 fixture，不改正式源）：编译失败 / 零 vvp / 运行非零 / 缺摘要 /
-#      日志含 FAIL / 日志含 DEFECT_REPRODUCED / 少向量 / **毒 cwd 但 DUT_ROOT 正确（必须 PASS）**
-#      / **重复 ID** / **错名** / **零检查+别例补偿 checksum** / **阶段间共享 TB 被改必须拒**。
+#   5) **包装器自检**（私有 fixture，不改正式源，共 20 例）：编译失败 / 零 vvp / 运行非零 /
+#      缺摘要 / 日志含 FAIL / 日志含 DEFECT_REPRODUCED / 少向量 / 毒 cwd 但 DUT_ROOT 正确
+#      （必须 PASS）/ 重复 ID / 错名 / 零检查+别例补偿 checksum / 共享 TB 被改必须拒 /
+#      共享+单文件 sha 清单 rc9 与少数行必须拒 / **+LSQ_XZ_PROBE 正控**（真实 chk 收 X/Z、
+#      私有替身注 X/Z ⇒ gate 精确拒）/ **弱 chk、删 monitor、坏有效字段口径三种变异必须
+#      判 MISS** / REAL 相活源前后变动必须拒。
+#   6) **SHA 收口**：所有哈希先 capture 原始 rc、校验非空 64hex（共享清单 3 行逐路径），
+#      `||fail` 后才比较/打印；REAL 相虽用正式活入口，但前后对照冻结集合，变化即拒。
 #
 # 产物纪律：产物根固定在本仓库 `build/functional/` 授权树内（或父入口传入的 PKGOUT），
 #          每次 `mktemp -d` 独占 run 目录，**不做任何 rm**。
@@ -70,6 +75,46 @@ fail() {
     exit 1
 }
 
+#==============================================================================
+# S. SHA 收口（窄复审 P1）：单文件哈希直接捕原始 rc，校验恰好 1 行 / 64 位小写 hex /
+#    路径逐字匹配；调用端一律“先 capture 并 ||fail、非空 64hex 再比较/打印”，
+#    绝不在 `[ "$(hash a)" = "$(hash b)" ]` / `note "$(hash)"` 里直接调用。
+#==============================================================================
+file_sha() {  # 成功：stdout = 64hex；失败：返回非零
+    local out rc total h
+    out="$(sha256sum -- "$1")"
+    rc=$?
+    [ "$rc" -eq 0 ] || { printf 'sha256_failed path=%s rc=%s\n' "$1" "$rc" >&2; return 1; }
+    total="$(printf '%s\n' "$out" | wc -l)"
+    [ "$total" -eq 1 ] || { printf 'sha256_lines path=%s lines=%s\n' "$1" "$total" >&2; return 1; }
+    printf '%s\n' "$out" | grep -qE '^[0-9a-f]{64}  ' \
+        || { printf 'sha256_format path=%s\n' "$1" >&2; return 1; }
+    h="$(printf '%s\n' "$out" | cut -c1-64)"
+    [ "${#h}" -eq 64 ] || { printf 'sha256_hexlen path=%s\n' "$1" >&2; return 1; }
+    [ "$(printf '%s\n' "$out" | cut -c67-)" = "$1" ] \
+        || { printf 'sha256_path path=%s\n' "$1" >&2; return 1; }
+    printf '%s' "$h"
+}
+
+sha_of() {  # 取哈希并传播失败（绝不让空值参与比较）
+    local h
+    h="$(file_sha "$1")" || fail "sha256_failed path=$1"
+    [ -n "$h" ] || fail "sha256_empty path=$1"
+    printf '%s' "$h"
+}
+
+need_hash() {  # need_hash <value> <path>
+    case "$1" in
+        ""|*[!0-9a-f]*) fail "sha256_bad_value path=$2" ;;
+    esac
+    [ "${#1}" -eq 64 ] || fail "sha256_bad_value path=$2"
+}
+
+need_shared_hash() {  # need_shared_hash <value> <root>
+    printf '%s' "$1" | grep -qE '^[0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{64} $' \
+        || fail "shared_sha_bad_value root=$2"
+}
+
 note "==== test_lsq_driver.sh ===="
 note "date       = $(date -Is 2>/dev/null || date)"
 note "REPO_ROOT  = $REPO_ROOT"
@@ -78,10 +123,19 @@ note "MODE       = $MODE"
 if git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
     note "GIT_HEAD   = $(git -C "$REPO_ROOT" rev-parse HEAD)"
 fi
-note "LSQ_SHA    = $(sha256sum -- "$REPO_ROOT/rtl/back2/lsq_simple.v" | awk '{print $1}')"
-note "HDR_SHA    = $(sha256sum -- "$REPO_ROOT/rtl/back2/back2_params.vh" | awk '{print $1}')"
-note "TB_SHA     = $(sha256sum -- "$SELF_DIR/tb_lsq_semantics.sv" | awk '{print $1}')"
-note "PKG_SHA    = $(sha256sum -- "$PKG_SH" | awk '{print $1}')"
+
+IDENT_LSQ_SHA="$(sha_of "$REPO_ROOT/rtl/back2/lsq_simple.v")" || fail "sha256_failed identity_lsq"
+need_hash "$IDENT_LSQ_SHA" "$REPO_ROOT/rtl/back2/lsq_simple.v"
+IDENT_HDR_SHA="$(sha_of "$REPO_ROOT/rtl/back2/back2_params.vh")" || fail "sha256_failed identity_hdr"
+need_hash "$IDENT_HDR_SHA" "$REPO_ROOT/rtl/back2/back2_params.vh"
+IDENT_TB_SHA="$(sha_of "$SELF_DIR/tb_lsq_semantics.sv")" || fail "sha256_failed identity_tb"
+need_hash "$IDENT_TB_SHA" "$SELF_DIR/tb_lsq_semantics.sv"
+IDENT_PKG_SHA="$(sha_of "$PKG_SH")" || fail "sha256_failed identity_pkg"
+need_hash "$IDENT_PKG_SHA" "$PKG_SH"
+note "LSQ_SHA    = $IDENT_LSQ_SHA"
+note "HDR_SHA    = $IDENT_HDR_SHA"
+note "TB_SHA     = $IDENT_TB_SHA"
+note "PKG_SHA    = $IDENT_PKG_SHA"
 
 #==============================================================================
 # A. 私有不可变输入冻结
@@ -91,20 +145,20 @@ SNAP="$DRV/deps_base"
 FRZ="$DRV/frozen"
 BASE_COMMIT="${LSQ_BASELINE_COMMIT:-201acf61}"
 
-file_sha() { sha256sum -- "$1" | awk '{print $1}'; }
-
 #   `deps_cur`：当前工作树两文件的私有拷贝（两相/自检共用；与并发改动隔离）
 mkdir -p -- "$CUR/rtl/back2" || fail "cur_snapshot_mkdir_failed"
 cp -- "$REPO_ROOT/rtl/back2/lsq_simple.v" "$CUR/rtl/back2/lsq_simple.v" || fail "cur_snapshot_lsq_copy"
 cp -- "$REPO_ROOT/rtl/back2/back2_params.vh" "$CUR/rtl/back2/back2_params.vh" || fail "cur_snapshot_hdr_copy"
 chmod 444 -- "$CUR/rtl/back2/lsq_simple.v" "$CUR/rtl/back2/back2_params.vh" || fail "cur_snapshot_chmod"
-[ "$(file_sha "$REPO_ROOT/rtl/back2/lsq_simple.v")" = "$(file_sha "$CUR/rtl/back2/lsq_simple.v")" ] \
-    || fail "cur_snapshot_lsq_mismatch"
-[ "$(file_sha "$REPO_ROOT/rtl/back2/back2_params.vh")" = "$(file_sha "$CUR/rtl/back2/back2_params.vh")" ] \
-    || fail "cur_snapshot_hdr_mismatch"
+CUR_LSQ_SHA="$(sha_of "$CUR/rtl/back2/lsq_simple.v")" || fail "sha256_failed cur_lsq"
+need_hash "$CUR_LSQ_SHA" "$CUR/rtl/back2/lsq_simple.v"
+CUR_HDR_SHA="$(sha_of "$CUR/rtl/back2/back2_params.vh")" || fail "sha256_failed cur_hdr"
+need_hash "$CUR_HDR_SHA" "$CUR/rtl/back2/back2_params.vh"
+[ "$IDENT_LSQ_SHA" = "$CUR_LSQ_SHA" ] || fail "cur_snapshot_lsq_mismatch"
+[ "$IDENT_HDR_SHA" = "$CUR_HDR_SHA" ] || fail "cur_snapshot_hdr_mismatch"
 note "CUR        = $CUR"
-note "CUR_LSQ_SHA= $(file_sha "$CUR/rtl/back2/lsq_simple.v")"
-note "CUR_HDR_SHA= $(file_sha "$CUR/rtl/back2/back2_params.vh")"
+note "CUR_LSQ_SHA= $CUR_LSQ_SHA"
+note "CUR_HDR_SHA= $CUR_HDR_SHA"
 
 #   `frozen/`：两相共用的包脚本 + TB + env.sh（阶段间共享输入的真身）
 mkdir -p -- "$FRZ/sim/functional" "$FRZ/scripts" || fail "frozen_mkdir_failed"
@@ -117,18 +171,51 @@ cmp -s -- "$PKG_SH" "$FRZ/sim/functional/test_lsq.sh" || fail "frozen_pkg_mismat
 cmp -s -- "$SELF_DIR/tb_lsq_semantics.sv" "$FRZ/sim/functional/tb_lsq_semantics.sv" || fail "frozen_tb_mismatch"
 cmp -s -- "$REPO_ROOT/scripts/env.sh" "$FRZ/scripts/env.sh" || fail "frozen_env_mismatch"
 
-#   共享输入集合的 sha（用于阶段间不变性判定；自检也复用同一函数）
+#   共享输入清单（3 条固定路径）—— 同样直接捕 rc、固定 3 行、每行 64hex、路径逐条匹配；
+#   任何一项不符都返回非零（“少一条共享 hash”不得被当成正常）。
 shared_sha_of() {
-    sha256sum -- "$1/sim/functional/test_lsq.sh" \
-                 "$1/sim/functional/tb_lsq_semantics.sv" \
-                 "$1/scripts/env.sh" 2>/dev/null | awk '{print $1}' | tr '\n' ' '
+    local root="$1" out rc total line h i p
+    out="$(sha256sum -- "$root/sim/functional/test_lsq.sh" \
+                       "$root/sim/functional/tb_lsq_semantics.sv" \
+                       "$root/scripts/env.sh" 2>/dev/null)"
+    rc=$?
+    [ "$rc" -eq 0 ] || { printf 'shared_sha_rc=%s\n' "$rc" >&3; return 1; }
+    total="$(printf '%s\n' "$out" | wc -l)"
+    [ "$total" -eq 3 ] || { printf 'shared_sha_lines=%s\n' "$total" >&3; return 1; }
+    i=0
+    for p in "$root/sim/functional/test_lsq.sh" \
+             "$root/sim/functional/tb_lsq_semantics.sv" \
+             "$root/scripts/env.sh"; do
+        i=$((i + 1))
+        line="$(printf '%s\n' "$out" | sed -n "${i}p")"
+        printf '%s\n' "$line" | grep -qE '^[0-9a-f]{64}  ' \
+            || { printf 'shared_sha_format line=%s\n' "$i" >&3; return 1; }
+        h="$(printf '%s\n' "$line" | cut -c1-64)"
+        [ "${#h}" -eq 64 ] || { printf 'shared_sha_hexlen line=%s\n' "$i" >&3; return 1; }
+        [ "$(printf '%s\n' "$line" | cut -c67-)" = "$p" ] \
+            || { printf 'shared_sha_path line=%s\n' "$i" >&3; return 1; }
+    done
+    printf '%s' "$(printf '%s\n' "$out" | cut -c1-64 | tr '\n' ' ')"
+}
+
+#   ★ REAL 相用活源：其前后必须与冻结时的同一集合逐字一致（否则结果与日志 SHA 错配）。
+check_live_unchanged() {  # check_live_unchanged <live_root> <expected_sha>
+    local now rc
+    now="$(shared_sha_of "$1")"
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "live_sha_failed root=$1"
+    need_shared_hash "$now" "$1"
+    [ "$now" = "$2" ] || return 1
+    return 0
 }
 
 #   ★ 若共享输入在阶段间变化 ⇒ 反证结果无效：**必须拒**。
 check_shared_unchanged() {  # check_shared_unchanged <frozen_root> <expected_sha>
-    local now
+    local now rc
     now="$(shared_sha_of "$1")"
-    [ -n "$now" ] || return 1
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "shared_sha_failed root=$1"
+    need_shared_hash "$now" "$1"
     [ "$now" = "$2" ] || return 1
     return 0
 }
@@ -145,11 +232,16 @@ if [ "$MODE" = "full" ]; then
         || fail "snapshot_chmod_failed"
     note "SNAP       = $SNAP"
     note "SNAP_COMMIT= $BASE_COMMIT"
-    note "SNAP_LSQ_SHA= $(file_sha "$SNAP/rtl/back2/lsq_simple.v")"
-    note "SNAP_HDR_SHA= $(file_sha "$SNAP/rtl/back2/back2_params.vh")"
+    SNAP_LSQ_SHA="$(sha_of "$SNAP/rtl/back2/lsq_simple.v")" || fail "sha256_failed snap_lsq"
+    need_hash "$SNAP_LSQ_SHA" "$SNAP/rtl/back2/lsq_simple.v"
+    SNAP_HDR_SHA="$(sha_of "$SNAP/rtl/back2/back2_params.vh")" || fail "sha256_failed snap_hdr"
+    need_hash "$SNAP_HDR_SHA" "$SNAP/rtl/back2/back2_params.vh"
+    note "SNAP_LSQ_SHA= $SNAP_LSQ_SHA"
+    note "SNAP_HDR_SHA= $SNAP_HDR_SHA"
 fi
 
-SHARED_SHA_PRE="$(shared_sha_of "$FRZ")"
+SHARED_SHA_PRE="$(shared_sha_of "$FRZ")" || fail "shared_sha_failed"
+need_shared_hash "$SHARED_SHA_PRE" "$FRZ"
 note "FRZ        = $FRZ"
 note "SHARED_SHA = $SHARED_SHA_PRE"
 
@@ -176,9 +268,16 @@ pkg_run_log() {  # pkg_run_log <pkgout_root>
 #==============================================================================
 if [ "$MODE" = "full" ]; then
     #   ---- B0：正式注册入口自证（manifest 里的那个脚本本身）----
+    #   ★ 窄复审补充：REAL 相跑的是**活**包脚本/活 TB/活 env.sh ⇒ 必须在它前后对照
+    #     冻结时的同一输入集合；否则“结果”与日志里记录（frozen）的 SHA 会错配。
+    LIVE_SHA_PRE="$(shared_sha_of "$REPO_ROOT")" || fail "live_sha_failed_before_real"
+    need_shared_hash "$LIVE_SHA_PRE" "$REPO_ROOT"
+    note "LIVE_SHA_PRE = $LIVE_SHA_PRE"
+    [ "$LIVE_SHA_PRE" = "$SHARED_SHA_PRE" ] || fail "live_source_changed_before_real"
     REAL_LOG="$DRV/real_fixed.log"
     run_pkg "$PKG_SH" "$REAL_LOG" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_real"
     REAL_RC=$?
+    check_live_unchanged "$REPO_ROOT" "$LIVE_SHA_PRE" || fail "live_source_changed_during_real"
     note "REAL rc=$REAL_RC"
     [ "$REAL_RC" -eq 0 ] || fail "real_entry_rc=$REAL_RC"
     [ "$(grep -cxF 'FUNCTIONAL_LSQ: PASS' "$REAL_LOG" || true)" = "1" ] || fail "real_entry_pass_anchor"
@@ -240,8 +339,11 @@ if [ "$MODE" = "full" ]; then
     done
 
     #   ---- B4：私有快照/冻结输入不可变复核 ----
-    [ "$(file_sha "$CUR/rtl/back2/lsq_simple.v")" = "$(file_sha "$REPO_ROOT/rtl/back2/lsq_simple.v")" ] \
-        || fail "deps_cur_lsq_changed"
+    B4_CUR_SHA="$(sha_of "$CUR/rtl/back2/lsq_simple.v")" || fail "sha256_failed b4_cur"
+    need_hash "$B4_CUR_SHA" "$CUR/rtl/back2/lsq_simple.v"
+    B4_LIVE_SHA="$(sha_of "$REPO_ROOT/rtl/back2/lsq_simple.v")" || fail "sha256_failed b4_live"
+    need_hash "$B4_LIVE_SHA" "$REPO_ROOT/rtl/back2/lsq_simple.v"
+    [ "$B4_CUR_SHA" = "$B4_LIVE_SHA" ] || fail "deps_cur_lsq_changed"
     check_shared_unchanged "$FRZ" "$SHARED_SHA_PRE" || fail "shared_inputs_changed_final"
 fi
 
@@ -403,7 +505,8 @@ cp -- "$FRZ/sim/functional/test_lsq.sh" "$FIX/sim/functional/test_lsq.sh" || fai
 cp -- "$FRZ/sim/functional/tb_lsq_semantics.sv" "$FIX/sim/functional/tb_lsq_semantics.sv" || fail "fixture_tb_copy"
 cp -- "$FRZ/scripts/env.sh" "$FIX/scripts/env.sh" || fail "fixture_env_copy"
 chmod u+w -- "$FIX/sim/functional/tb_lsq_semantics.sv" || fail "fixture_tb_chmod"
-FIX_SHA_PRE="$(shared_sha_of "$FIX")"
+FIX_SHA_PRE="$(shared_sha_of "$FIX")" || fail "fixture_shared_sha_failed"
+need_shared_hash "$FIX_SHA_PRE" "$FIX"
 printf '\n// fixture mutation (must be rejected)\n' >> "$FIX/sim/functional/tb_lsq_semantics.sv"
 if check_shared_unchanged "$FIX" "$FIX_SHA_PRE"; then
     note "SELFTEST shared_tb_change detector failed to notice mutation"
@@ -412,6 +515,126 @@ if check_shared_unchanged "$FIX" "$FIX_SHA_PRE"; then
 else
     note "SELFTEST shared_tb_change detector rejected mutation"
     printf 'LSQ_SELFTEST case=shared_tb_change rc=1 want_reason=shared_tb_changed ok=1\n'
+fi
+
+#   13) 哈希清单：3 条**合法**行后工具 rc=9 ⇒ 必须按原始 rc 拒（旧管道会吞 rc）
+REAL_SHA="$(command -v sha256sum || true)"
+[ -n "$REAL_SHA" ] && [ -x "$REAL_SHA" ] || fail "real_sha256sum_missing"
+SHA_RC9_DIR="$DRV/fake_sha_rc9"
+mkdir -p -- "$SHA_RC9_DIR" || fail "fake_sha_rc9_mkdir"
+cat > "$SHA_RC9_DIR/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@"
+exit 9
+EOF
+chmod 755 -- "$SHA_RC9_DIR/sha256sum"
+selftest_start sha_rc9 sha256sum_rc=9
+run_pkg "$PKG_SH" "$ST_LOG" "PATH=$SHA_RC9_DIR:$PATH" \
+    "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st13"
+selftest_check $? "$ST_WANT"
+
+#   14) 少一条共享哈希（3 条固定路径只回 2 行）⇒ 必须拒
+SHA_SHORT_DIR="$DRV/fake_sha_short"
+mkdir -p -- "$SHA_SHORT_DIR" || fail "fake_sha_short_mkdir"
+cat > "$SHA_SHORT_DIR/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@" | head -2
+exit 0
+EOF
+chmod 755 -- "$SHA_SHORT_DIR/sha256sum"
+selftest_start sha_short sha256_lines=2
+run_pkg "$PKG_SH" "$ST_LOG" "PATH=$SHA_SHORT_DIR:$PATH" \
+    "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st14"
+selftest_check $? "$ST_WANT"
+
+#   15) +LSQ_XZ_PROBE 正控（未变异）：真实 chk 收 X/Z + 私有观测替身注 X/Z ⇒ gate 必须
+#       以精确 reason 拒绝（证明 checker/monitor/有效字段口径真的会拦）。
+cat > "$FAKE/vvp_probe.sh" <<EOF
+#!/usr/bin/env bash
+"$REAL_VVP" "\$@" +LSQ_XZ_PROBE
+EOF
+chmod 755 -- "$FAKE/vvp_probe.sh"
+selftest_start xz_probe xz_probe_tripped
+run_pkg "$FRZ/sim/functional/test_lsq.sh" "$ST_LOG" \
+    "RV32_VVP=$FAKE/vvp_probe.sh" "DUT_ROOT=$CUR" \
+    "RV32_FUNCTIONAL_PKG_OUT_DIR=$FRZ/build/functional/xzprobe"
+selftest_check $? "$ST_WANT"
+
+#   16-18) 变异杀伤：只改**私有 fixture**（弱化 chk / 删除 monitor / 破坏有效字段口径），
+#       探针必须给出 `XZ_PROBE_MISS` 且对应字段为 0 ⇒ gate 以 `xz_probe_miss` 拒。
+xz_mut_case() {  # xz_mut_case <name> <sed-expr> <expected-miss-field>
+    local nm="$1" sx="$2" field="$3" fix rc runlog
+    fix="$DRV/xzfix_$nm"
+    mkdir -p -- "$fix/sim/functional" "$fix/scripts" || fail "xzfix_${nm}_mkdir"
+    cp -- "$FRZ/sim/functional/test_lsq.sh" "$fix/sim/functional/test_lsq.sh" || fail "xzfix_${nm}_pkg"
+    cp -- "$FRZ/sim/functional/tb_lsq_semantics.sv" "$fix/sim/functional/tb_lsq_semantics.sv" || fail "xzfix_${nm}_tb"
+    cp -- "$FRZ/scripts/env.sh" "$fix/scripts/env.sh" || fail "xzfix_${nm}_env"
+    chmod u+w -- "$fix/sim/functional/tb_lsq_semantics.sv" || fail "xzfix_${nm}_chmod"
+    sed -i "$sx" "$fix/sim/functional/tb_lsq_semantics.sv" || fail "xzfix_${nm}_sed"
+    if cmp -s -- "$FRZ/sim/functional/tb_lsq_semantics.sv" "$fix/sim/functional/tb_lsq_semantics.sv"; then
+        note "SELFTEST $nm mutation_not_applied"
+        printf 'LSQ_SELFTEST case=%s rc=- want_reason=xz_probe_miss ok=0\n' "$nm"
+        ST_FAIL=1
+        return
+    fi
+    selftest_start "$nm" xz_probe_miss
+    run_pkg "$fix/sim/functional/test_lsq.sh" "$ST_LOG" \
+        "RV32_VVP=$FAKE/vvp_probe.sh" "DUT_ROOT=$CUR" \
+        "RV32_FUNCTIONAL_PKG_OUT_DIR=$fix/build/functional/xzprobe"
+    rc=$?
+    selftest_check "$rc" "$ST_WANT"
+    runlog="$(pkg_run_log "$fix/build/functional/xzprobe")"
+    if [ -n "$runlog" ] && grep -q "XZ_PROBE_MISS .*$field" "$runlog"; then
+        note "SELFTEST $nm field=$field observed"
+    else
+        note "SELFTEST $nm missing_field=$field runlog=${runlog:-none}"
+        printf 'LSQ_SELFTEST case=%s rc=%s want_reason=xz_probe_miss field=%s ok=0\n' "$nm" "$rc" "$field"
+        ST_FAIL=1
+    fi
+}
+xz_mut_case weak_chk "s|if (ok !== 1'b1) begin|if (!ok) begin|" "chk=0"
+xz_mut_case no_monitor "s|always @(posedge clk) if (xz_hit === 1'b1) g_xz <= g_xz + 1;|always @(posedge clk) begin end|" "mon=0"
+xz_mut_case bad_gate "s|((wen !== 1'b1) \\|\\| (is_known(w32) && is_known(s32)))|(is_known(w32) \\&\\& is_known(s32))|" "dc=0"
+
+#   20) 单文件哈希：真实正常 1 行输出后工具 rc=9 ⇒ `sha_of` 必须失败（不是空值通过）
+SHA1_RC9_DIR="$DRV/fake_sha1_rc9"
+mkdir -p -- "$SHA1_RC9_DIR" || fail "fake_sha1_rc9_mkdir"
+cat > "$SHA1_RC9_DIR/sha256sum" <<EOF
+#!/usr/bin/env bash
+"$REAL_SHA" "\$@"
+exit 9
+EOF
+chmod 755 -- "$SHA1_RC9_DIR/sha256sum"
+( PATH="$SHA1_RC9_DIR:$PATH"; sha_of "$CUR/rtl/back2/lsq_simple.v" ) \
+    > "$DRV/st_sha_file_rc9.log" 2>&1
+SHA1_RC=$?
+if [ "$SHA1_RC" -ne 0 ] && grep -q 'reason=sha256_failed' "$DRV/st_sha_file_rc9.log"; then
+    note "SELFTEST sha_file_rc9 rejected rc=$SHA1_RC"
+    printf 'LSQ_SELFTEST case=sha_file_rc9 rc=%s want_reason=sha256_failed ok=1\n' "$SHA1_RC"
+else
+    note "SELFTEST sha_file_rc9 NOT rejected rc=$SHA1_RC"
+    printf 'LSQ_SELFTEST case=sha_file_rc9 rc=%s want_reason=sha256_failed ok=0\n' "$SHA1_RC"
+    ST_FAIL=1
+fi
+
+#   19) REAL 相活源变动必须拒（私有 fixture：同一检测器两次调用之间改 TB）
+LIVEFIX="$DRV/fixture_live"
+mkdir -p -- "$LIVEFIX/sim/functional" "$LIVEFIX/scripts" || fail "livefix_mkdir"
+cp -- "$FRZ/sim/functional/test_lsq.sh" "$LIVEFIX/sim/functional/test_lsq.sh" || fail "livefix_pkg"
+cp -- "$FRZ/sim/functional/tb_lsq_semantics.sv" "$LIVEFIX/sim/functional/tb_lsq_semantics.sv" || fail "livefix_tb"
+cp -- "$FRZ/scripts/env.sh" "$LIVEFIX/scripts/env.sh" || fail "livefix_env"
+chmod u+w -- "$LIVEFIX/sim/functional/tb_lsq_semantics.sv" || fail "livefix_chmod"
+LIVEFIX_SHA="$(shared_sha_of "$LIVEFIX")" || fail "livefix_sha_failed"
+need_shared_hash "$LIVEFIX_SHA" "$LIVEFIX"
+check_live_unchanged "$LIVEFIX" "$LIVEFIX_SHA" || { note "SELFTEST live_source_change baseline mismatch"; ST_FAIL=1; }
+printf '\n// live-source mutation (must be rejected)\n' >> "$LIVEFIX/sim/functional/tb_lsq_semantics.sv"
+if check_live_unchanged "$LIVEFIX" "$LIVEFIX_SHA"; then
+    note "SELFTEST live_source_change detector failed to notice mutation"
+    printf 'LSQ_SELFTEST case=live_source_change rc=0 want_reason=live_source_changed ok=0\n'
+    ST_FAIL=1
+else
+    note "SELFTEST live_source_change detector rejected mutation"
+    printf 'LSQ_SELFTEST case=live_source_change rc=1 want_reason=live_source_changed ok=1\n'
 fi
 
 [ "$ST_FAIL" = "0" ] || fail "selftest_failed"

@@ -393,43 +393,87 @@ module tb_lsq_semantics_top;
         end
     endfunction
 
-    //   全局 X/Z 监视（初审 #2）：**控制输出**不得为 X/Z；**有效窗口内**的 payload 不得含
-    //   X/Z（无效窗口的 payload 不作要求，不强制清零）。命中即 `g_xz` 非零：摘要 `xz=` 字段
-    //   非零 ⇒ 包装器拒（见 test_lsq.sh 的 xz 判据）。
+    //   全局 X/Z 监视（窄复审 P2）：
+    //     · **控制线**必须为 0/1；未知即 `xz_hit`；
+    //     · **只在有效窗口内**要求 payload 已知（不要求无效 payload 清零）：
+    //         - 读请求（`wen=0`）的 `wdata/wstrb` 是 don't-care，**不再强求 known**；
+    //         - `wb_dst_i=0` 时 `pdest_i`、`wb_dst_f=0` 时 `pdest_f`、无目的寄存器时 `data`
+    //           均为 don't-care；只有对应 dst 有效才检查；
+    //         - 真正有效的控制（wen/dst/f64/valid）若未知一定抓住。
+    //     · `obs_*` 是 TB 侧**私有观测替身**（`xz_inj` 注入，不 force DUT）：
+    //       供 +LSQ_XZ_PROBE 探针证明“控制未知会被正式 gate 拒”，并证明 don't-care 容忍。
     integer g_xz;
-    reg     xz_hit;
+    reg     xz_hit = 1'b0, xz_inj = 1'b0, xz_probe = 1'b0;
+    wire    obs_mem_rsp_valid = xz_inj ? 1'bx : mem_rsp_valid;
+    wire    obs_wb_valid      = xz_inj ? 1'bx : wb_valid;
+
+    //   有效字段口径（monitor 与探针共用；改口径必须同时过 dc 自检）：
+    function req_payload_ok(input wen, input [31:0] addr, input [31:0] wdata,
+                            input [3:0] wstrb, input [TAG_W-1:0] tag);
+        reg [31:0] a32, t32, w32, s32;
+        begin
+            a32 = addr; t32 = tag; w32 = wdata; s32 = wstrb;
+            req_payload_ok = is_known(a32) && is_known(t32) &&
+                             ((wen !== 1'b1) || (is_known(w32) && is_known(s32)));
+        end
+    endfunction
+
+    function wb_payload_ok(input dst_i, input dst_f, input f64,
+                           input [PDW_I-1:0] pdi, input [PDW_F-1:0] pdf,
+                           input [31:0] d, input [31:0] dhi);
+        reg [31:0] pi32, pf32;
+        begin
+            pi32 = pdi; pf32 = pdf;
+            wb_payload_ok = 1'b1;
+            if (dst_i === 1'b1) wb_payload_ok = wb_payload_ok && is_known(pi32);
+            if (dst_f === 1'b1) wb_payload_ok = wb_payload_ok && is_known(pf32);
+            if ((dst_i === 1'b1) || (dst_f === 1'b1)) begin
+                wb_payload_ok = wb_payload_ok && is_known(d);
+                if (f64 === 1'b1) wb_payload_ok = wb_payload_ok && is_known(dhi);
+            end
+        end
+    endfunction
+
     always @(*) begin
         xz_hit = 1'b0;
         if (rst_n === 1'b1) begin
+            // ---- 控制线：0/1 之外一律命中 ----
             if ((mem_req_valid !== 1'b0) && (mem_req_valid !== 1'b1)) xz_hit = 1'b1;
             if ((mem_req_wen   !== 1'b0) && (mem_req_wen   !== 1'b1)) xz_hit = 1'b1;
-            if ((mem_rsp_valid !== 1'b0) && (mem_rsp_valid !== 1'b1)) xz_hit = 1'b1;
-            if ((wb_valid      !== 1'b0) && (wb_valid      !== 1'b1)) xz_hit = 1'b1;
+            if ((obs_mem_rsp_valid !== 1'b0) && (obs_mem_rsp_valid !== 1'b1)) xz_hit = 1'b1;
+            if ((obs_wb_valid  !== 1'b0) && (obs_wb_valid  !== 1'b1)) xz_hit = 1'b1;
             if ((st_xlate_valid!== 1'b0) && (st_xlate_valid!== 1'b1)) xz_hit = 1'b1;
             if ((exc_valid_o   !== 1'b0) && (exc_valid_o   !== 1'b1)) xz_hit = 1'b1;
             if ((dr_empty_o    !== 1'b0) && (dr_empty_o    !== 1'b1)) xz_hit = 1'b1;
+            // ---- 请求窗口（读 wdata/wstrb = don't-care）----
             if ((mem_req_valid === 1'b1) &&
-                (!is_known(mem_req_addr) || !is_known(mem_req_wdata) ||
-                 !is_known({28'h0, mem_req_wstrb}) || !is_known({28'h0, mem_req_tag})))
+                !req_payload_ok(mem_req_wen, mem_req_addr, mem_req_wdata,
+                                mem_req_wstrb, mem_req_tag))
                 xz_hit = 1'b1;
-            if ((mem_rsp_valid === 1'b1) &&
+            // ---- 响应窗口 ----
+            if ((obs_mem_rsp_valid === 1'b1) &&
                 (!is_known(mem_rsp_rdata) || !is_known({28'h0, mem_rsp_tag}) ||
                  !is_known({31'h0, mem_rsp_err})))
                 xz_hit = 1'b1;
-            if ((wb_valid === 1'b1) &&
-                (!is_known(wb_data) || !is_known(wb_data_hi) ||
-                 !is_known({26'h0, wb_rob}) || !is_known({30'h0, wb_epoch}) ||
-                 !is_known({30'h0, wb_pdest_i}) || !is_known({30'h0, wb_pdest_f}) ||
-                 !is_known({31'h0, wb_dst_i}) || !is_known({31'h0, wb_dst_f}) ||
-                 !is_known({31'h0, wb_f64})))
+            // ---- 写回窗口（dst 位决定 pdest/data 是否有效）----
+            if (obs_wb_valid === 1'b1) begin
+                if (!is_known({26'h0, wb_rob}) || !is_known({30'h0, wb_epoch}))
+                    xz_hit = 1'b1;
+                if ((wb_dst_i !== 1'b0) && (wb_dst_i !== 1'b1)) xz_hit = 1'b1;
+                if ((wb_dst_f !== 1'b0) && (wb_dst_f !== 1'b1)) xz_hit = 1'b1;
+                if ((wb_f64   !== 1'b0) && (wb_f64   !== 1'b1)) xz_hit = 1'b1;
+                if (!wb_payload_ok(wb_dst_i, wb_dst_f, wb_f64,
+                                   wb_pdest_i, wb_pdest_f, wb_data, wb_data_hi))
+                    xz_hit = 1'b1;
+            end
+            // ---- 翻译/异常窗口 ----
+            if ((st_xlate_valid === 1'b1) &&
+                (!is_known(st_xlate_va) || !is_known({27'h0, st_xlate_idx}) ||
+                 !is_known({28'h0, st_xlate_ctx_o})))
                 xz_hit = 1'b1;
             if ((exc_valid_o === 1'b1) &&
                 (!is_known({26'h0, exc_rob_o}) || !is_known({28'h0, exc_cause_o}) ||
                  !is_known(exc_tval_o)))
-                xz_hit = 1'b1;
-            if ((st_xlate_valid === 1'b1) &&
-                (!is_known(st_xlate_va) || !is_known({27'h0, st_xlate_idx}) ||
-                 !is_known({28'h0, st_xlate_ctx_o})))
                 xz_hit = 1'b1;
         end
     end
@@ -537,7 +581,46 @@ module tb_lsq_semantics_top;
     reg [31:0] v_addr;
     reg [STQ_IW-1:0] probe;
 
+    //   ★★ 窄复审 P2：**独立显式 X/Z 探针**（+LSQ_XZ_PROBE；默认关闭，正常运行零影响）。
+    //     1) 真实 `chk` 直接收到 X 与 Z 实参 ⇒ 正式 checker 必须判失败；
+    //     2) 被监控的控制/有效载荷经 **TB 侧私有观测替身** `xz_inj` 注入 X/Z
+    //        （不 force DUT 内部）⇒ 正式 monitor 必须命中 `g_xz`。
+    //     两者都命中才打印 `XZ_PROBE_TRIPPED`；否则打印 `XZ_PROBE_MISS chk=.. mon=..`。
+    //     由 test_lsq.sh 在解析前以精确 reason 拒绝 ⇒ 移除 checker/monitor 的变异无法蒙混。
+    integer p_chk, p_mon, p_dc;
     initial begin
+        if ($test$plusargs("LSQ_XZ_PROBE")) begin
+            xz_probe = 1'b1; xz_inj = 1'b0;
+            g_total = 0; g_nonzero = 0; g_checks = 0; g_fails = 0; g_defect = 0; g_xz = 0;
+            v_checks = 0; v_fails = 0; v_defect = 0; v_name = 0;
+            do_reset;
+            //   (a) 真实 checker：X 与 Z 实参都必须判失败
+            chk(1'bx, "xz_probe_chk_x");
+            chk(1'bz, "xz_probe_chk_z");
+            p_chk = (v_fails >= 2) ? 1 : 0;
+            //   (b) 私有观测替身注入：控制 + 有效窗口 payload 经 shim 变 X
+            xz_inj = 1'b1;
+            repeat (2) @(posedge clk);
+            xz_inj = 1'b0;
+            @(posedge clk);
+            p_mon = (g_xz > 0) ? 1 : 0;
+            //   (c) 有效字段口径自证：don't-care 的 X 必须**放行**，有效字段的 X 必须**拒绝**。
+            p_dc = ((req_payload_ok(1'b0, 32'h0, 32'hx, 4'hx, 4'h0) === 1'b1) &&
+                    (wb_payload_ok(1'b0, 1'b0, 1'b0, 32'hx, 32'hx,
+                                   32'hx, 32'hx) === 1'b1) &&
+                    (req_payload_ok(1'b1, 32'h0, 32'hx, 4'h0, 4'h0) === 1'b0) &&
+                    (wb_payload_ok(1'b1, 1'b0, 1'b0, 32'hx, 32'h0,
+                                   32'h0, 32'h0) === 1'b0)) ? 1 : 0;
+            if ((p_chk === 1) && (p_mon === 1) && (p_dc === 1))
+                $display("XZ_PROBE_TRIPPED chk=%0d mon=%0d dc=%0d", p_chk, p_mon, p_dc);
+            else
+                $display("XZ_PROBE_MISS chk=%0d mon=%0d dc=%0d", p_chk, p_mon, p_dc);
+            $finish;
+        end
+    end
+
+    initial begin
+        xz_inj = 1'b0; xz_probe = 1'b0;
         g_total = 0; g_nonzero = 0; g_checks = 0; g_fails = 0; g_defect = 0; g_xz = 0;
 
         //----------------------------------------------------------------------
