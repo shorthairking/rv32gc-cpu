@@ -616,7 +616,12 @@ module rename #(
                                     lane_valid[1] ? (lane_ridx[1] + 1'b1) :
                                                     (lane_ridx[0] + 1'b1);
     //   本次回滚的杀伤弧长度：LANE 落在 (restore_rob_idx, tail_q) 内即"比回滚点年轻"。
-    wire [LOG_AW-1:0] tail_dlt = tail_q - restore_rob_idx[LOG_AW-1:0];
+    //   ★★ 审阅 P1-1：6 bit 模运算在"空弧 0"与"整环 64"上同值（满 ROB 回滚到 head 时
+    //     tail==restore），会把"应杀 63 条"误判成"什么都不杀"⇒ 掩码漏清。改用 7 bit 显式：
+    //     合法 squash 目标必为**活项**，而 target==tail 只可能发生在 ROB 满 64
+    //     （head==tail 且目标仍活）⇒ d7==0 一律按**满弧 64**处理。
+    wire [LOG_AW-1:0] tail_dlt6 = tail_q - restore_rob_idx[LOG_AW-1:0];  // 模 64 环距
+    wire [6:0]        tail_arc  = (tail_dlt6 == {LOG_AW{1'b0}}) ? 7'd64 : {1'b0, tail_dlt6};
     genvar gsh;
     wire [LOG_AW-1:0] sh_lidx [0:3];
     wire [LOG_AW-1:0] sh_dlt  [0:3];
@@ -625,10 +630,16 @@ module rename #(
     for (gsh = 0; gsh < 4; gsh = gsh + 1) begin : g_shk
         assign sh_lidx[gsh] = {sh_grp, 2'b00} + gsh[LOG_AW-1:0];
         assign sh_dlt [gsh] = sh_lidx[gsh] - restore_rob_idx[LOG_AW-1:0];
-        assign sh_kill[gsh] = (sh_dlt[gsh] != {LOG_AW{1'b0}}) & (sh_dlt[gsh] < tail_dlt);
+        assign sh_kill[gsh] = (sh_dlt[gsh] != {LOG_AW{1'b0}})
+                            & ({1'b0, sh_dlt[gsh]} < tail_arc);
     end
     endgenerate
     wire [3:0] sh_killm = {sh_kill[3], sh_kill[2], sh_kill[1], sh_kill[0]};
+    //   ★★ 审阅 P1-2：只清"影子组**旧代**里真正被杀"的 lane。新段 lane（≤ sh_t）的同号
+    //     物理槽已被新代占据 ⇒ 旧代该 lane 必已退休，其 mask 位是组基重建的**前缀**，
+    //     不能因为"同号槽被新代杀过"就被清掉（否则 RAT 少映射一次、free head 少 1）。
+    wire [3:0] sh_newseg = 4'b1111 >> (2'd3 - sh_t);    // lanes 0..sh_t
+    wire [3:0] sh_clear  = sh_killm & ~sh_newseg;
 
     // ---- 1.6c EXP-R1：RAT 快照写侧（组基宽快照候选 + 每 bank 增量写口）----
     //   `blk_pre[j]` = 本块**前 j 条 lane 已应用后**的整份 RAT（j = 0..3；j=0 即当前
@@ -1101,7 +1112,7 @@ module rename #(
                 if (sh_val & ~((sh_grp == urst_grp) & (urst_lane <= sh_t))) begin
                     rb_g_fhead[sh_grp] <= sh_fhead;
                     rb_g_log  [sh_grp] <= sh_log;
-                    rb_g_ndst [sh_grp] <= sh_mask & ~sh_killm;
+                    rb_g_ndst [sh_grp] <= sh_mask & ~sh_clear;
                     rb_arn_b0 [sh_grp] <= sh_arn[0];
                     rb_arn_b1 [sh_grp] <= sh_arn[1];
                     rb_arn_b2 [sh_grp] <= sh_arn[2];

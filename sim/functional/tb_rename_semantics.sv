@@ -54,7 +54,7 @@ module tb_rename_semantics;
     localparam integer ROBW     = 7;   // 年龄运算零扩展位宽
     localparam integer RN_SRC   = 2;   // 整数域源口数（NSRC）
 
-    localparam integer TOTAL_CASES  = 20;
+    localparam integer TOTAL_CASES  = 25;
     // 触发例（旧源码必须 DEFECT_SIG）。控制例（新旧都必须 OK）。
     // 用常量表在本文件与脚本之间保持一致（脚本另有一份冻结清单，两边必须一致）。
     function integer is_trigger(input integer c);
@@ -64,8 +64,10 @@ module tb_rename_semantics;
             //   15   = 随机混合（含环绕分裂路径；固定种子 ⇒ 可复现）
             //   16/17/18 = 审阅 P1：**死组重入抢走仍活旧组的共享影子**
             //              （最短反证 / 同组二次 split 覆盖 / 死组重入后继续分配）
+            //   22/23 = 审阅 P1-1（满 ROB 回滚 head：杀伤弧 0 vs 64）与 P1-2
+            //           （旧代已退休前缀不得因新代同号槽被杀而清掉）
             is_trigger = (c==8)||(c==9)||(c==10)||(c==11)||(c==12)||(c==13)||(c==15)
-                      || (c==16)||(c==17)||(c==18);
+                      || (c==16)||(c==17)||(c==18)||(c==22);
         end
     endfunction
 
@@ -303,6 +305,36 @@ module tb_rename_semantics;
         begin
             if (chk_en) begin
                 nchk = nchk + 1;
+                if ((^{busy, free_ok}) === 1'bx) begin
+                    errs = errs + 1;
+                    if (errs <= 6) $display("CHK X/Z: busy=%b free_ok=%b (t=%0t)",
+                                            busy, free_ok, $time);
+                end
+                if (busy !== 1'b0 && busy !== 1'b1) begin
+                    errs = errs + 1;
+                    if (errs <= 6) $display("CHK busy 非 0/1: %b (t=%0t)", busy, $time);
+                end
+                //   ★ 独立占用数一致性：popcount(r_v) == r_cnt，且 [head, tail) 内恰为
+                //     r_cnt 条有效、窗外全无效（防止任何手写路径漏更新生命周期）。
+                begin : chk_occ
+                    integer pu, pcnt;
+                    reg [ROBW-1:0] pw;
+                    pcnt = 0;
+                    for (pu = 0; pu < 64; pu = pu + 1) if (r_v[pu]) pcnt = pcnt + 1;
+                    if (pcnt !== r_cnt) begin
+                        errs = errs + 1;
+                        if (errs <= 6) $display("CHK popcount(r_v)=%0d != r_cnt=%0d (t=%0t)",
+                                                pcnt, r_cnt, $time);
+                    end
+                    for (pu = 0; pu < 64; pu = pu + 1) begin
+                        pw = (r_head + pu[ROBW-1:0]) & 7'h3f;
+                        if (r_v[pw] !== (pu < r_cnt)) begin
+                            errs = errs + 1;
+                            if (errs <= 6) $display("CHK ROB 窗口不一致 idx=%0d v=%b 期望=%b (t=%0t)",
+                                                    pw, r_v[pw], (pu < r_cnt), $time);
+                        end
+                    end
+                end
                 if ((errs > 0) && !errs_dumped) errs_dumped = 1'b1;
                 // (0) 逐项状态比对
                 for (fa = 0; fa < ARCH_N; fa = fa + 1) begin
@@ -389,6 +421,9 @@ module tb_rename_semantics;
     // 6. ROB 模型（真实冲刷语义：保留 head..squash_idx 的**环弧**）
     //--------------------------------------------------------------------------
     reg [ROBW-1:0]      r_head, r_tail;
+    //   ★ 独立占用计数（0..64）。**禁止**用 (tail-head) mod 64 辨满/空：满 64 与空 0 同值。
+    //     所有"是否有空间"判据只看 r_cnt；目标槽是否可写只看 r_v[]（派发前断言其为 0）。
+    integer             r_cnt;
     reg                 r_v   [0:63];
     reg [ARN_W-1:0]     r_arn [0:63];
     reg                 r_nd  [0:63];
@@ -449,7 +484,7 @@ module tb_rename_semantics;
             wait_commit_en = 1'b0;
             inputs_idle;
             repeat (4) @(posedge clk);
-            r_head = {ROBW{1'b0}}; r_tail = {ROBW{1'b0}};
+            r_head = {ROBW{1'b0}}; r_tail = {ROBW{1'b0}}; r_cnt = 0;
             for (bi = 0; bi < 64; bi = bi + 1) begin
                 r_v[bi] = 1'b0; r_arn[bi] = 5'd0; r_nd[bi] = 1'b0;
                 r_pdd[bi] = 6'd0; r_pdo[bi] = 6'd0;
@@ -503,8 +538,8 @@ module tb_rename_semantics;
             //     重新求值再判资源，否则会读到上一拍的 stale 值 ⇒ 在空闲表不足时误派发
             //     （TB 侧假缺陷，与 DUT 无关）。
             #1;
-            room = 64 - ((r_tail - r_head) & 7'h3f);
-            while (busy || (room < n) || !free_ok) begin
+            room = 64 - r_cnt;
+            while ((busy !== 1'b0) || (room < n) || (free_ok !== 1'b1)) begin
                 if (verbose)
                     $display("DBG t=%0t WAIT n=%0d nd=%b free_ok=%b free_cnt=%0d dutF/M=%0d/%0d dutT/M=%0d/%0d room=%0d busy=%b whe=%b rH=%0d rT=%0d rnd=%b rv=%b",
                              $time, n, lane_need_dst, free_ok, free_cnt_o,
@@ -513,14 +548,20 @@ module tb_rename_semantics;
                 lane_fire = 1'b0; rob_snap_valid = 1'b0;
                 //   派发停顿期间让 ROB 继续退休（真实后端里提交与派发互相独立）⇒ 空闲表
                 //   能重新长出。定向向量里由 `wait_commit_en` 关闭，以免改变 head 位置。
-                if (wait_commit_en && !busy && (((r_tail - r_head) & 7'h3f) > 0))
+                if (wait_commit_en && (busy === 1'b0) && (r_cnt > 0))
                     commit_n(1);
                 else begin
                     @(posedge clk); #1;
                     chk_now();
                 end
                 #1;
-                room = 64 - ((r_tail - r_head) & 7'h3f);
+                room = 64 - r_cnt;
+            end
+            //   ★ X/Z 硬拒：busy/free_ok 若为 X/Z，一律判失败（不得当作"可以派发"）。
+            if ((busy !== 1'b0) || (free_ok !== 1'b1)) begin
+                errs = errs + 1;
+                $display("CHK busy/free_ok 出现 X/Z 或非法值 busy=%b free_ok=%b (t=%0t)",
+                         busy, free_ok, $time);
             end
             if (verbose)
                 $display("DBG t=%0t FIRE n=%0d v=%b nd=%b free_ok=%b free_cnt=%0d dutF=%0d dutT=%0d allocn=%0d",
@@ -546,6 +587,18 @@ module tb_rename_semantics;
             end
             lane_fire = 1'b0; rob_snap_valid = 1'b0; lane_valid = {W{1'b0}};
             // ROB 模型登记（用沿前采样值）
+            //   ★ 派发前断言：目标 ROB 槽此前必须无效（否则就是"覆写在飞项"的非法窗口）
+            if ((r_cnt + n) > 64) begin
+                errs = errs + 1;
+                $display("CHK ROB 溢出：cnt=%0d + n=%0d > 64 (t=%0t)", r_cnt, n, $time);
+            end
+            for (bi = 0; bi < n; bi = bi + 1) begin
+                if (r_v[(r_tail + bi) & 7'h3f]) begin
+                    errs = errs + 1;
+                    $display("CHK 目标 ROB 槽 idx=%0d 此前仍有效（TB 模型非法）",
+                             (r_tail + bi) & 7'h3f);
+                end
+            end
             for (bi = 0; bi < n; bi = bi + 1) begin
                 r_v[(r_tail + bi) & 7'h3f]   = 1'b1;
                 r_arn[(r_tail + bi) & 7'h3f] = b_arn[bi];
@@ -554,6 +607,7 @@ module tb_rename_semantics;
                 r_pdo[(r_tail + bi) & 7'h3f] = s_pdo[bi];
             end
             r_tail = (r_tail + n) & 7'h3f;
+            r_cnt  = r_cnt + n;
             chk_now();
         end
     endtask
@@ -573,8 +627,8 @@ module tb_rename_semantics;
         integer u, idx, nc;
         begin
             cmt_we = {CMW{1'b0}}; rel_we = {CMW{1'b0}};
-            nc = (r_tail - r_head) & 7'h3f;
-            if (nc > n) nc = n;
+            nc = (n < r_cnt) ? n : r_cnt;     // ★ 只用独立占用计数
+            if (nc < 0) nc = 0;
             for (u = 0; u < CMW; u = u + 1) begin
                 if (u < nc) begin
                     idx = (r_head + u) & 7'h3f;
@@ -595,6 +649,7 @@ module tb_rename_semantics;
                 r_v[idx] = 1'b0;
             end
             r_head = (r_head + nc) & 7'h3f;
+            r_cnt  = r_cnt - nc;
             if (verbose)
                 $display("DBG t=%0t CMT nc=%0d head=%0d fhead(dut/mdl)=%0d/%0d ftail=%0d/%0d",
                          $time, nc, r_head, dut.fhead_q, m_fhead, dut.ftail_q, m_ftail);
@@ -611,6 +666,12 @@ module tb_rename_semantics;
             restore_valid     =  use_ck;
             restore_rob_idx   = idx;
             restore_id        = ckid;
+            //   ★ squash 只能指向**活**项（ROB 环弧 [head, tail) 内）；否则 TB 向量非法。
+            if (age_of({ROBW{1'b0}} + idx, r_head) >= r_cnt) begin
+                errs = errs + 1;
+                $display("CHK TB 非法回滚目标 idx=%0d 不在活窗 [head=%0d cnt=%0d] (t=%0t)",
+                         idx, r_head, r_cnt, $time);
+            end
             @(posedge clk); #1;
             restore_rob_valid = 1'b0;
             restore_valid     = 1'b0;
@@ -623,6 +684,7 @@ module tb_rename_semantics;
                 if (age_of(cur[ROBW-1:0], r_head) > keep) r_v[cur[5:0]] = 1'b0;
             end
             r_tail = (idx + 1'b1) & 7'h3f;
+            r_cnt  = age_of({1'b0, idx}, r_head) + 1;   // 保留环弧 [head..idx]
             chk_now();
         end
     endtask
@@ -636,6 +698,7 @@ module tb_rename_semantics;
             for (bi = 0; bi < 64; bi = bi + 1) r_v[bi] = 1'b0;
             r_head = (trap_idx + 1'b1) & 7'h3f;
             r_tail = r_head;
+            r_cnt  = 0;
             // 等 free list 重建结束
             while (busy) begin
                 @(posedge clk); #1;
@@ -651,6 +714,34 @@ module tb_rename_semantics;
                 @(posedge clk); #1;
                 chk_now();
             end
+        end
+    endtask
+
+    //   满 ROB（r_cnt=64）时"第 65 条"必须不 fire：呈现一块、保持 lane_fire=0 数拍，
+    //   断言 DUT 与 ROB 模型都无任何副作用（fhead/log_wr/RAT/尾指针/占用数全不变）。
+    task chk_full_no_fire;
+        reg [PDW-1:0] r0; reg [FL_PTR_W-1:0] fh, ft; reg [15:0] lw;
+        reg [ROBW-1:0] th; integer oc;
+        begin
+            r0 = dut.rat_q[0]; fh = dut.fhead_q; ft = dut.ftail_q; lw = dut.log_wr_q;
+            th = r_tail; oc = r_cnt;
+            if (r_cnt !== 64) begin
+                errs = errs + 1;
+                $display("CHK 满 ROB 用例前提不成立 r_cnt=%0d", r_cnt);
+            end
+            build_block(1, 1'b1, 5'd5, 5'd0, 5'd0, 5'd0);
+            drive_block;                       // lane_valid=1，lane_fire=0（资源不足）
+            repeat (3) begin
+                @(posedge clk); #1;
+                chk_now();
+            end
+            if ((dut.fhead_q !== fh) || (dut.ftail_q !== ft) || (dut.log_wr_q !== lw) ||
+                (dut.rat_q[0] !== r0) || (r_tail !== th) || (r_cnt !== oc)) begin
+                errs = errs + 1;
+                $display("CHK 满 ROB 时仍出现派发副作用（第 65 条被 fire）");
+            end
+            lane_valid = {W{1'b0}};
+            lane_need_dst = {W{1'b0}};
         end
     endtask
 
@@ -782,6 +873,7 @@ module tb_rename_semantics;
             flush_all = 1'b0; cmt_we = {CMW{1'b0}};
             for (bi = 0; bi < 64; bi = bi + 1) r_v[bi] = 1'b0;
             r_head = (r_head + 2) & 7'h3f; r_tail = r_head;
+            r_cnt  = 0;                       // ★ 手写路径同样要维护独立占用数（冲刷 ⇒ 空）
             chk_now();
             while (busy) begin @(posedge clk); #1; chk_now(); end
             chk_now();
@@ -813,6 +905,7 @@ module tb_rename_semantics;
             for (bi = 0; bi < 64; bi = bi + 1)
                 if (age_of(bi[ROBW-1:0], r_head) > age_of({1'b0, 6'd5}, r_head)) r_v[bi] = 1'b0;
             r_tail = (6'd5 + 1'b1) & 7'h3f;
+            r_cnt  = age_of({1'b0, 6'd5}, r_head) + 1;   // ★ 提交+回滚同拍后保留弧长（=4）
             chk_now();
             build_block(2, 2'b11, 5'd30, 5'd31, 5'd0, 5'd0);
             fire_block(2);
@@ -977,20 +1070,20 @@ module tb_rename_semantics;
             bmp = 64'h0;
             for (rr = 3; rr <= 20; rr = rr + 1) bmp[rr] = 1'b1;
             for (rr = 40; rr <= 48; rr = rr + 1) bmp[rr] = 1'b1;
-            fill_rob_bmp(0, 64, bmp, 1);
-            commit_n(1);                          // head=1（组 0 旧段 1..3 活）
-            fill_rob_bmp(0, 2, 64'h0, 1);         // 环绕回组 0 lane0 → 分裂
-            rollback_to(6'd3, 1'b0, 4'd0);        // 进旧段 → 影子整段搬回
-            fill_rob_bmp(4, 3, 64'h0, 1);         // 继续从 4 派发
-            rollback_to(6'd5, 1'b0, 4'd0);        // 再进旧段
+            fill_rob_bmp(0, 64, bmp, 1);          // cnt = 64（合法上限，不得再多 1 条）
+            commit_n(1);                          // cnt=63，head=1（组 0 旧段 1..3 活）
+            fill_rob_bmp(0, 1, 64'h0, 1);         // cnt=64；环绕回组 0 lane0 → 分裂
+            rollback_to(6'd3, 1'b0, 4'd0);        // cnt=3；进旧段 → 影子整段折回
+            fill_rob_bmp(4, 2, 64'h0, 1);         // cnt=5
+            rollback_to(6'd5, 1'b0, 4'd0);        // cnt=5；再进旧段
             for (t = 0; t < 5; t = t + 1) begin
-                fill_rob_bmp(4 + t, 2, 64'h0, 1);
-                if (((r_tail - r_head) & 7'h3f) > 4) begin
-                    rk = (r_head + ((r_tail - r_head) & 7'h3f) - 1) & 7'h3f;
-                    rollback_to(rk, 1'b0, 4'd0);
-                end
-                build_block(1, 1'b1, (14+t), 5'd0, 5'd0, 5'd0);
+                fill_rob_bmp(6 + t, 1, 64'h0, 1);
+                //   回滚到"当前最年轻活项"（tail-1），保证目标合法
+                rk = (r_tail - 1'b1) & 7'h3f;
+                if (r_cnt > 2) rollback_to(rk, 1'b0, 4'd0);
+                build_block(1, 1'b1, (14 + t), 5'd0, 5'd0, 5'd0);
                 fire_block(1);
+                commit_n(1);
             end
         end
     endtask
@@ -1154,9 +1247,121 @@ module tb_rename_semantics;
                 fire_block(2);
                 commit_n(1);
             end
-            rollback_to(6'd7, 1'b0, 4'd0);
+            rollback_to((r_tail - 1'b1) & 7'h3f, 1'b0, 4'd0);   // 最年轻活项（合法）
             build_block(3, 3'b111, 5'd11, 5'd12, 5'd13, 5'd0);
             fire_block(3);
+            commit_n(2);
+            check_high_pregs_active;
+        end
+    endtask
+
+    // ---- 20: 控制 —— tail_q 生命周期边界（reset 后首派发 / 回滚 / 冲刷后首派发）----
+    //   影子折叠依赖 `tail_q`（跟随 rob_snap_idx 的 ROB tail）来算"本次回滚杀伤弧"。
+    //   本向量在**合法**序列上覆盖三条边界：①reset 后首次派发跟随；②回滚后 tail=idx+1；
+    //   ③flush 清空 ROB 后由下一次派发**重新跟随**（不得沿用冲刷前的陈旧 tail）。
+    task c_ctrl_tailq_boundary;
+        begin
+            build_block(2, 2'b11, 5'd1, 5'd2, 5'd0, 5'd0);
+            fire_block(2);
+            commit_n(1);
+            rollback_to(6'd1, 1'b0, 4'd0);          // ② 回滚到唯一活项 idx1；tail_q ← 2
+            build_block(2, 2'b11, 5'd3, 5'd4, 5'd0, 5'd0);
+            fire_block(2);
+            commit_n(2);
+            do_flush(6'd1);                          // ③ ROB 清空，head=tail=2
+            build_block(2, 2'b11, 5'd5, 5'd6, 5'd0, 5'd0);
+            fire_block(2);                           // 冲刷后首派发：index 2,3
+            rollback_to(6'd3, 1'b0, 4'd0);           // 紧接回滚（目标仍活）
+            build_block(2, 2'b11, 5'd7, 5'd8, 5'd0, 5'd0);
+            fire_block(2);
+            commit_n(2);
+            check_high_pregs_active;
+        end
+    endtask
+
+    // ---- 21: 控制 —— 满 64 项时"第 65 条"必须不 fire ----
+    task c_ctrl_full_no_fire;
+        reg [63:0] bmp;
+        begin
+            bmp = 64'h0;
+            bmp[3] = 1'b1; bmp[10] = 1'b1; bmp[20] = 1'b1;
+            bmp[33] = 1'b1; bmp[50] = 1'b1;
+            fill_rob_bmp(0, 64, bmp, 1);             // cnt = 64（合法上限）
+            chk_full_no_fire;                         // 第 65 条不得产生任何副作用
+            commit_n(1);                              // cnt = 63
+            fill_rob_bmp(0, 1, 64'h0, 1);             // cnt = 64（恰满）
+            chk_full_no_fire;
+            commit_n(2);                              // cnt = 62
+            build_block(2, 2'b11, 5'd7, 5'd8, 5'd0, 5'd0);
+            fire_block(2);                            // 有空位才允许 fire
+            commit_n(2);
+            check_high_pregs_active;
+        end
+    endtask
+
+    // ---- 22: 满 ROB 回滚到 head —— 杀伤弧必须按"整环 64"而非"空弧 0" ----
+    //   0..63 满（仅 lane2/3 写目的），提交 nop idx0 → head=1；
+    //   新 idx0 nop ⇒ 仍满 64 / tail=1 / group0 分裂（sh_t=0）；
+    //   rollback 到老 idx1：应杀其余 63 条（含旧 lane2/3 的掩码位）；
+    //   新路 idx2 nop（可代表"不写目的的分支"）；再 rollback 到 idx2。
+    //   缺陷版：tail−idx = 0 被当空弧 ⇒ 旧 2/3 掩码漏清 ⇒ 再回滚时 free head/RAT 错。
+    task c_t_full_arc_restore;
+        reg [63:0] bmp;
+        begin
+            bmp = 64'h0; bmp[2] = 1'b1; bmp[3] = 1'b1;
+            fill_rob_bmp(0, 64, bmp, 1);
+            commit_n(1);                              // nop idx0 退休 → head=1（满 63）
+            fill_rob_bmp(0, 1, 64'h0, 1);             // 新 idx0 nop → 满 64, tail=1, 分裂
+            rollback_to(6'd1, 1'b0, 4'd0);            // 满弧：只留 idx1
+            fill_rob_bmp(2, 1, 64'h0, 1);             // 新路 idx2
+            rollback_to(6'd2, 1'b0, 4'd0);
+            build_block(2, 2'b00, 5'd0, 5'd0, 5'd0, 5'd0);
+            fire_block(2);
+        end
+    endtask
+
+    // ---- 23: 旧代已退休前缀（同号物理槽）不得被新代掩码清理误清 ----
+    //   原 idx0 写 x5 并提交 → head=1，1..63 仍活；
+    //   新 idx0 nop ⇒ split（旧段 1..3 活）；rollback 31 杀掉新 idx0；
+    //   rollback 3 回旧段：旧 lane0 的掩码位是"组基重建前缀"，必须保留
+    //   （否则 x5 退回 preg5 而非 32，free head 少 1）。
+    task c_t_retired_prefix_mask;
+        reg [63:0] bmp;
+        begin
+            bmp = 64'h0; bmp[0] = 1'b1;               // 原 idx0 写目的
+            fill_rob_bmp(0, 64, bmp, 1);
+            commit_n(1);                              // 老 idx0 退休 → head=1
+            fill_rob_bmp(0, 1, 64'h0, 1);             // 新 idx0 nop → 分裂（sh_t=0）
+            rollback_to(6'd31, 1'b0, 4'd0);           // 杀 new idx0（旧 1..31 活）
+            rollback_to(6'd3, 1'b0, 4'd0);            // 回旧段
+            build_block(2, 2'b11, 5'd5, 5'd6, 5'd0, 5'd0);
+            fire_block(2);
+        end
+    endtask
+
+    // ---- 24: 可重建压力 —— 环绕/满 ROB/退休前缀的有限随机序列（固定种子）----
+    //   只允许合法动作：满时先提交再派发；回滚目标取"活窗内随机项"；每步后 chk_now
+    //   校验（含 popcount(r_v)==r_cnt、窗口一致、ROB 槽不覆写）。
+    task c_t_stress_legal;
+        integer t, nl, tgt;
+        reg [63:0] bmp;
+        begin
+            bmp = 64'h0;
+            for (rr = 0; rr < 64; rr = rr + 5) bmp[rr] = 1'b1;   // 稀疏写目的
+            fill_rob_bmp(0, 64, bmp, 1);
+            commit_n(2);
+            for (t = 0; t < 6; t = t + 1) begin
+                nl = 1 + ({$random(seed)} % 3);
+                if (r_cnt >= 62) commit_n(2);
+                fill_rob_bmp(r_tail, nl, 64'h0, 1);       // nop 块（可能触发 lane0 重入）
+                commit_n(1 + ({$random(seed)} % 2));
+                if (r_cnt > 2) begin
+                    tgt = (r_head + (1 + ({$random(seed)} % (r_cnt - 1)))) & 7'h3f;
+                    rollback_to(tgt[ROB_IDX_W-1:0], 1'b0, 4'd0);
+                end
+                build_block(2, 2'b11, 5'd1, 5'd2, 5'd0, 5'd0);
+                fire_block(2);
+            end
             commit_n(2);
             check_high_pregs_active;
         end
@@ -1290,6 +1495,11 @@ module tb_rename_semantics;
                 17: begin cname="t_same_group_2nd";      c_t_same_group_2nd;   end
                 18: begin cname="t_dead_reentry_alloc";  c_t_dead_reentry_alloc; end
                 19: begin cname="ctrl_post_rb_alloc";    c_ctrl_post_rb_alloc; end
+                20: begin cname="ctrl_tailq_boundary";   c_ctrl_tailq_boundary; end
+                21: begin cname="ctrl_full_no_fire";     c_ctrl_full_no_fire; end
+                22: begin cname="t_full_arc_restore";    c_t_full_arc_restore; end
+                23: begin cname="t_retired_prefix_mask"; c_t_retired_prefix_mask; end
+                24: begin cname="t_stress_legal";        c_t_stress_legal; end
                 default: begin cname="unknown"; end
             endcase
             post_activity;
