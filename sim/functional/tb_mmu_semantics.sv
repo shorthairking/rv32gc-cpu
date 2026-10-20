@@ -41,15 +41,17 @@
 //   · 缺陷标签（旧基线必须触发，两树区分）:
 //       MMU_SVADE_D_TLB_HIT / MMU_SFENCE_GLOBAL_VA /
 //       MMU_PA34_ROOT / MMU_PA34_L0 / MMU_PA34_LEAF4K / MMU_PA34_LEAF4M /
-//       MMU_CBM_RO_PTW / MMU_CBM_RO_TLB / MMU_CBM_D_CHECK /
-//       MMU_LSU_CBM_RO / MMU_LSU_NEED_PERM；
+//       MMU_PA34_AF_LEGAL / MMU_CBM_RO_PTW / MMU_CBM_RO_TLB / MMU_CBM_D_CHECK /
+//       MMU_LSU_CBM_RO / MMU_LSU_NEED_PERM / MMU_LOOKUP2_D0；
 //   · 合法控制标签（两实现都必须通过，前缀 `CTRL_`）:
 //       CTRL_PTW_TLB_HIT / CTRL_PTW_TLB_PA / CTRL_BASE_TR / CTRL_BIGPAGE /
 //       CTRL_SVADE_D1 / CTRL_SVADE_A0 / CTRL_SFENCE_ASID_KEEP_G /
 //       CTRL_SFENCE_VA_ASID_KEEP_G / CTRL_SFENCE_ALL / CTRL_PA_LOW /
 //       CTRL_SFENCE_OTHER_VA / CTRL_SFENCE_GLOBAL_HIT / CTRL_CBM_FILL /
 //       CTRL_CBM_A0 / CTRL_CBM_RESERVED / CTRL_STORE_RO /
-//       CTRL_LSU_CBM_WO / CTRL_LSU_CBM_DENY / CTRL_LSU_STORE_RO / CTRL_LSU_LOAD_WO。
+//       CTRL_LSU_CBM_WO / CTRL_LSU_CBM_DENY / CTRL_LSU_STORE_RO / CTRL_LSU_LOAD_WO /
+//       CTRL_XZ_DETECT / CTRL_PA34_PRIO_PERM / CTRL_PA34_SVADE /
+//       CTRL_LOOKUP2_FETCH。
 //
 // 判定 : 每个向量至少 1 条 `!==`（四态安全）实断言；任一失败 ⇒ 末尾 $fatal(1)，
 //        **绝不**打印 PASS；全部通过才打印机读摘要与唯一 PASS 锚点。
@@ -65,7 +67,7 @@ module tb_mmu_semantics;
     //--------------------------------------------------------------------------
     // 冻结规格：向量总数（改动 TB 必须同步 test_mmu.sh 的 SPEC_VECTORS）
     //--------------------------------------------------------------------------
-    localparam integer SPEC_VECTORS = 26;
+    localparam integer SPEC_VECTORS = 32;
 
     //--------------------------------------------------------------------------
     // 常量
@@ -121,11 +123,36 @@ module tb_mmu_semantics;
     integer vec_fail_base = 0;
     integer vec_sum_checks = 0;
     reg     sim_ok = 1'b0;
+    //   ★ 2026-10（独审 P1③）：每个向量必须绑定**固定 ID/name**，
+    //     `VEC` 行带 name，脚本按冻结表逐 ID 校验 name 与 checks。
+    reg [8*32-1:0] cur_vec_name = 32'h0;
+    //   ★ 2026-10（独审 P1②）：四态安全 —— 活跃控制线出现 X/Z 必须**被观测到**，
+    //     不能被 `if (valid)` 吞掉（X 走 false 分支会伪装成"无请求"）。
+    integer xz_cnt = 0;
+    reg     saw_pte_strict = 1'b0;   // pte_req_valid === 1（与 ready 无关）
+    reg     saw_pmp_strict = 1'b0;
+    reg     saw_tlb_strict = 1'b0;
+
+    function xz_detect;
+        input b;
+        begin
+            xz_detect = (b === 1'bx) || (b === 1'bz);
+        end
+    endfunction
 
     task settle_vec;
         integer c;
         integer f;
         begin
+            //   ★ 四态观测：本向量执行期间活跃控制线出现 X/Z ⇒ 记一条失败
+            //     （先结算 XZ，再结算"至少一项检查"，保证 checks 含 XZ 检查）。
+            if (xz_cnt != 0) begin
+                n_fail = n_fail + 1;
+                $display("MMU FAIL [XZ_CONTROL]: vector %0d name=%0s xz=%0d",
+                         n_vec, cur_vec_name, xz_cnt);
+            end else begin
+                n_pass = n_pass + 1;
+            end
             c = (n_pass + n_fail) - vec_chk_base;
             f = n_fail - vec_fail_base;
             if (c <= 0) begin
@@ -134,14 +161,16 @@ module tb_mmu_semantics;
                 $display("MMU FAIL [VEC_EMPTY]: vector %0d checks=0", n_vec);
             end
             vec_sum_checks = vec_sum_checks + c;
-            $display("VEC %0d checks=%0d fails=%0d", n_vec, c, f);
+            $display("VEC %0d name=%0s checks=%0d fails=%0d", n_vec, cur_vec_name, c, f);
         end
     endtask
 
     task vec_begin;
+        input [8*32-1:0] nm;
         begin
             if (n_vec > 0) settle_vec;
             n_vec = n_vec + 1;
+            cur_vec_name  = nm;
             vec_chk_base  = n_pass + n_fail;
             vec_fail_base = n_fail;
         end
@@ -256,6 +285,13 @@ module tb_mmu_semantics;
     wire [31:0] tlb_pa;
     wire        tlb_hit2, tlb_pf2;
     wire [31:0] tlb_pa2;
+    //   第二查询口（取指侧）驱动：本包也要动态覆盖（独审 P2 边界项）
+    reg         lk2_valid = 1'b0;
+    reg  [31:0] lk2_va = 32'h0;
+    reg  [1:0]  lk2_acc = ACC_FETCH;
+    reg  [1:0]  lk2_priv = PRIV_S;
+    reg         lk2_sum = 1'b0;
+    reg         lk2_mxr = 1'b0;
 
     reg         sf_valid = 0;
     reg  [31:0] sf_va = 0;
@@ -276,13 +312,13 @@ module tb_mmu_semantics;
         .hit_o            (tlb_hit),
         .perm_fault_o     (tlb_pf),
         .pa_o             (tlb_pa),
-        .lookup2_valid    (1'b0),
-        .lookup2_va       (32'h0),
-        .lookup2_asid     (9'h0),
-        .lookup2_acc      (ACC_FETCH),
-        .lookup2_priv     (PRIV_S),
-        .lookup2_sum      (1'b0),
-        .lookup2_mxr      (1'b0),
+        .lookup2_valid    (lk2_valid),
+        .lookup2_va       (lk2_va),
+        .lookup2_asid     (asid_v),
+        .lookup2_acc      (lk2_acc),
+        .lookup2_priv     (lk2_priv),
+        .lookup2_sum      (lk2_sum),
+        .lookup2_mxr      (lk2_mxr),
         .hit2_o           (tlb_hit2),
         .perm_fault2_o    (tlb_pf2),
         .pa2_o            (tlb_pa2),
@@ -343,7 +379,8 @@ module tb_mmu_semantics;
             case (pm_st)
                 PM_IDLE: begin
                     pte_resp_valid_r <= 1'b0;
-                    if (pte_req_valid && pte_req_ready) begin
+                    if ((pte_req_valid === 1'b1) && (pte_req_ready === 1'b1)) begin
+                        //   ★ 只在 valid===1 时采信 payload（X/Z 拍不得被当成地址）
                         pm_addr <= pte_req_pa;
                         pm_cnt  <= 0;
                         pm_st   <= PM_WAIT;
@@ -385,12 +422,29 @@ module tb_mmu_semantics;
                            (pmp_req_addr >= pmp_deny_lo) &&
                            (pmp_req_addr <= pmp_deny_hi));
 
-    // ---- 计数器（在向量开始时清零；此处只累计）----
+    // ---- 计数器（向量内累计）----
+    //   ★ 2026-10（独审 P1②）：必须用**严格相等**判定 valid，否则 valid=X 时
+    //     `if (valid)` 走 false 分支 ⇒ 计数保持 0 ⇒ "无请求"断言被误判为通过。
+    //     另设严格粘滞标志（与 ready 无关），供"本条遍历一条物理读都没发"的断言。
     always @(posedge clk) begin
         if (rst_n) begin
-            if (pte_req_valid && pte_req_ready) n_pte_req <= n_pte_req + 1;
-            if (pmp_req_valid)                  n_pmp_req <= n_pmp_req + 1;
+            if ((pte_req_valid === 1'b1) && (pte_req_ready === 1'b1))
+                n_pte_req <= n_pte_req + 1;
+            if (pmp_req_valid === 1'b1) n_pmp_req <= n_pmp_req + 1;
+            if (pte_req_valid === 1'b1) saw_pte_strict <= 1'b1;
+            if (pmp_req_valid === 1'b1) saw_pmp_strict <= 1'b1;
+            if ((tlb_hit === 1'b1) || (tlb_pf === 1'b1)) saw_tlb_strict <= 1'b1;
         end
+    end
+
+    // ---- 活跃控制线的四态监测（X/Z 计数；只观测，不 force DUT）----
+    wire xz_active = xz_detect(pte_req_valid) | xz_detect(pte_req_ready) |
+                     xz_detect(pte_resp_valid) | xz_detect(pmp_req_valid) |
+                     xz_detect(req_done) | xz_detect(fault_o) |
+                     xz_detect(tlb_hit) | xz_detect(tlb_pf) |
+                     xz_detect(sf_valid) | xz_detect(lk_valid);
+    always @(posedge clk) begin
+        if (rst_n && (xz_active === 1'b1)) xz_cnt <= xz_cnt + 1;
     end
 
     // ---- PTW 完成粘滞（req_done 只维持 1 拍）----
@@ -614,6 +668,36 @@ module tb_mmu_semantics;
     endtask
 
     //--------------------------------------------------------------------------
+    // 辅助：TLB **第二查询口** 组合查询（取指侧；不推进状态）
+    //--------------------------------------------------------------------------
+    task tlb_probe2;
+        input  [31:0] va;
+        input  [1:0]  acc;
+        input  [1:0]  pv;
+        input         sm;
+        input         mx;
+        output        hit;
+        output        pf;
+        output [31:0] pa;
+        begin
+            @(negedge clk);
+            lk2_valid = 1'b1;
+            lk2_va    = va;
+            lk2_acc   = acc;
+            lk2_priv  = pv;
+            lk2_sum   = sm;
+            lk2_mxr   = mx;
+            #1;
+            hit = tlb_hit2;
+            pf  = tlb_pf2;
+            pa  = tlb_pa2;
+            @(negedge clk);
+            lk2_valid = 1'b0;
+            #1;
+        end
+    endtask
+
+    //--------------------------------------------------------------------------
     // 辅助：跑一次真实页表遍历（PTW），成功时再回查 TLB 证明"填充→命中"
     //--------------------------------------------------------------------------
     task walk;
@@ -702,6 +786,10 @@ module tb_mmu_semantics;
             n_data_req = 0;
             n_data_wr = 0;
             last_data_pa = 32'h0;
+            saw_pte_strict = 1'b0;
+            saw_pmp_strict = 1'b0;
+            saw_tlb_strict = 1'b0;
+            xz_cnt = 0;
         end
     endtask
 
@@ -797,9 +885,42 @@ module tb_mmu_semantics;
         #1;
 
         //======================================================================
-        // V1 CTRL_BASE_TR：两级页表 + PTW 填充 + TLB 命中（基线正控）
+        // V1 CTRL_XZ_DETECT：四态观测器自证（**私有观测替身**，不 force DUT）
+        //   独审 P1②：valid=X 被 `if` 吞掉会让"无请求"断言假绿 ⇒ 观测器必须真能
+        //   分辨 X/Z 与 0/1；本向量只验证观测器本身，不驱动 DUT。
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_XZ_DETECT");
+        clr_counters;
+        chk1("CTRL_XZ_DETECT", xz_detect(1'bx), 1'b1);
+        chk1("CTRL_XZ_DETECT", xz_detect(1'bz), 1'b1);
+        chk1("CTRL_XZ_DETECT", xz_detect(1'b0), 1'b0);
+        chk1("CTRL_XZ_DETECT", xz_detect(1'b1), 1'b0);
+
+`ifdef MMU_XZ_NEG
+        //======================================================================
+        // ★ 负向刺激（只在 -DMMU_XZ_NEG 的私有不入库构建里编译）：
+        //   把 **TB 驱动的活跃控制线** `lk_valid` 打成 X —— 不 force DUT 任何内部，
+        //   走的是真实端口/真实 monitor：xz_cnt 必须 +1，本向量在 vecend 报
+        //   `MMU FAIL [XZ_CONTROL]`，正式 gate 必须以 reason=xz_control 精确拒。
+        //   删除 monitor 的变异体（见 test_mmu.sh --self-test）不会再出现该标签。
+        //   注：pmp_req_valid 是 DUT **输出**，驱动它只能靠 force（本包禁止），
+        //       故用同属 monitor 观测集的 TB 输入控制线做刺激。
+        //======================================================================
+        vec_begin("XZ_NEG_STIM");
+        clr_counters;
+        @(negedge clk);
+        lk_valid = 1'bx;
+        @(posedge clk);
+        #1;
+        @(negedge clk);
+        lk_valid = 1'b0;
+        chk1("XZ_NEG_STIM", xz_cnt > 0, 1'b1);
+`endif
+
+        //======================================================================
+        // V2 CTRL_BASE_TR：两级页表 + PTW 填充 + TLB 命中（基线正控）
+        //======================================================================
+        vec_begin("CTRL_BASE_TR");
         clr_counters;
         setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);   // RW, A=1, D=1
         satp_v = 32'h8000_0000 | ROOT_PPN;
@@ -820,7 +941,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V2 CTRL_BIGPAGE：4 MiB 大页（一级叶，PPN[0]=0）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_BIGPAGE");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         set_big_leaf(VA_A, 22'h000400, 1'b1, 1'b1, 1'b0, 1'b1, 1'b1, 1'b0);
@@ -834,7 +955,7 @@ module tb_mmu_semantics;
         //   load 填表（A=1,D=0）后，同 VA 的 **store 命中 TLB** ⇒ 必须 page fault
         //   且**不得写**；旧实现在 TLB 里丢 D ⇒ 直接写成功（漏检）。
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_SVADE_D_TLB_HIT");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b0, 1'b1, 1'b1, 1'b0, 1'b1);   // RW, A=1, D=0
@@ -854,7 +975,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V4 CTRL_SVADE_D1：同一序列但 D=1 ⇒ store 命中必须成功
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_SVADE_D1");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);   // RW, A=1, D=1
@@ -871,7 +992,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V5 CTRL_SVADE_A0：A=0 ⇒ Svade 直接 page fault（13/15），不填充
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_SVADE_A0");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b0, 1'b1, 1'b1, 1'b0, 1'b0);   // RW, A=0
@@ -889,7 +1010,7 @@ module tb_mmu_semantics;
         //   `sfence.vma rs1!=x0, rs2=x0`（按 VA、**全 ASID**）必须失效该 VA 的
         //   **global** 项；旧实现无条件先排除 G ⇒ 旧翻译残留。
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_SFENCE_GLOBAL_VA");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);               // 先全刷
         fill_entry(VA_A, 9'd2, 1'b0, 22'h000050);         // 非 global，ASID=2
@@ -921,7 +1042,7 @@ module tb_mmu_semantics;
         //   ⇒ 只失效该 ASID 的非 global 项；**global 保留**（两实现都必须对）。
         //   同时证明"rs2 值 0 但寄存器非 x0"≠"rs2=x0"。
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_SFENCE_ASID_KEEP_G");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         fill_entry(VA_A, 9'd0, 1'b1, 22'h000050);         // global
@@ -936,7 +1057,7 @@ module tb_mmu_semantics;
         // V8 CTRL_SFENCE_VA_ASID_KEEP_G：`rs1!=x0, rs2!=x0`（值 0）
         //   ⇒ VA∩ASID；global 保留。
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_SFENCE_VA_ASID_KEEP_G");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         fill_entry(VA_A, 9'd0, 1'b1, 22'h000050);         // global
@@ -950,7 +1071,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V9 CTRL_SFENCE_ALL：`rs1=x0, rs2=x0` ⇒ 全失效（含 global）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_SFENCE_ALL");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         fill_entry(VA_A, 9'd0, 1'b1, 22'h000050);
@@ -969,7 +1090,7 @@ module tb_mmu_semantics;
         //   截断后恰为真实根表 0x0002_0000 ⇒ 旧实现会"成功"并返回翻译。
         //   要求：原访问类型 access fault，且**一条 PTE 物理读都不发**。
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_PA34_ROOT");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);
@@ -977,8 +1098,10 @@ module tb_mmu_semantics;
         walk(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, f, c, p);
         chk1("MMU_PA34_ROOT", f, 1'b1);
         chk32("MMU_PA34_ROOT", {27'b0, c}, {27'b0, C_LOAD_AF});
-        chk32("MMU_PA34_ROOT", n_pte_req, 32'd0);         // 不得读别名根表
-        chk32("MMU_PA34_ROOT", n_pmp_req, 32'd0);         // 也不发 PMP 请求
+        //   ★ 独审 P1②：用**严格粘滞**标志（valid===1 即锁），不用会被 X 吞掉的计数
+        chk1("MMU_PA34_ROOT", saw_pte_strict, 1'b0);     // 不得读别名根表
+        chk1("MMU_PA34_ROOT", saw_pmp_strict, 1'b0);     // 也不发 PMP 请求
+        chk32("MMU_PA34_ROOT", n_pte_req, 32'd0);
         walk(VA_A, ACC_FETCH, PRIV_S, 1'b0, 1'b0, f, c, p);
         chk1("MMU_PA34_ROOT", f, 1'b1);
         chk32("MMU_PA34_ROOT", {27'b0, c}, {27'b0, C_INSN_AF});
@@ -993,7 +1116,7 @@ module tb_mmu_semantics;
         //   一级指针 PPN = 22'h100030 ⇒ 二级表 PA = 0x1_0003_0000（截断后=真实二级表）
         //   要求：store ⇒ cause 7，且只发**一级**那一次 PTE 读。
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_PA34_L0");
         clr_counters;
         //   ★ 先全刷：本向量只观测"本级高地址 ⇒ 不发下级 PTE 读"，
         //     不让先前向量可能残留的**同 VA** 表项参与（TLB 的唯一性假设见 L2）。
@@ -1005,7 +1128,8 @@ module tb_mmu_semantics;
         walk(VA_A, ACC_STORE, PRIV_S, 1'b0, 1'b0, f, c, p);
         chk1("MMU_PA34_L0", f, 1'b1);
         chk32("MMU_PA34_L0", {27'b0, c}, {27'b0, C_STORE_AF});
-        chk32("MMU_PA34_L0", n_pte_req, 32'd1);           // 只读一级，二级不发
+        chk32("MMU_PA34_L0", n_pte_req, 32'd1);          // 只读一级，二级不发
+        chk1("MMU_PA34_L0", saw_pte_strict, 1'b1);
         tlb_probe(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, h, pf, p2);
         chk1("MMU_PA34_L0", h, 1'b0);
 
@@ -1014,7 +1138,7 @@ module tb_mmu_semantics;
         //   叶 PPN = 22'h100005 ⇒ PA = 0x1_0000_5000（截断后 0x0000_5000）
         //   要求：load ⇒ cause 5，且**不发数据请求**、不填充别名翻译。
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_PA34_LEAF4K");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);
@@ -1031,7 +1155,7 @@ module tb_mmu_semantics;
         // V13 ★ MMU_PA34_LEAF4M：4 MiB 大页 PPN[1] 高位非零
         //   PPN = 22'h200000（PPN[1]=0x800）⇒ PA = 0x2_0000_0000
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_PA34_LEAF4M");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         set_big_leaf(VA_A, 22'h200000, 1'b1, 1'b1, 1'b0, 1'b1, 1'b1, 1'b0);
@@ -1043,10 +1167,71 @@ module tb_mmu_semantics;
         chk1("MMU_PA34_LEAF4M", h, 1'b0);
 
         //======================================================================
-        // V14 CTRL_PA_LOW：对照 —— 同样的 VA，只有 PPN 高位不同 ⇒ 正常成功
+        // V14a MMU_PA34_PRIO_PERM（独审 P1①）：高 PA 与**权限**叠加时，
+        //   page-fault 判据（权限/U 位）必须先于高 PA 的 access fault。
+        //======================================================================
+        vec_begin("CTRL_PA34_PRIO_PERM");
+        clr_counters;
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        satp_v = 32'h8000_0000 | ROOT_PPN;
+        asid_v = 9'h0;
+        //   U 模式 load 到 U=0 的高 PPN 页 ⇒ PF13（不是 AF5）
+        set_root_ptr(L0_PPN, 1'b0);
+        set_l0_leaf(VA_A, L0_PPN, 22'h100005, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1);
+        walk(VA_A, ACC_LOAD, PRIV_U, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_PA34_PRIO_PERM", f, 1'b1);
+        chk32("CTRL_PA34_PRIO_PERM", {27'b0, c}, {27'b0, C_LOAD_PF});
+        //   S 模式 store 到只读（W=0）高 PPN 页 ⇒ PF15（不是 AF7）
+        set_l0_leaf(VA_A, L0_PPN, 22'h100005, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1);
+        walk(VA_A, ACC_STORE, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_PA34_PRIO_PERM", f, 1'b1);
+        chk32("CTRL_PA34_PRIO_PERM", {27'b0, c}, {27'b0, C_STORE_PF});
+        //   S 模式取指到 X=0 的高 PPN 页 ⇒ PF12（不是 AF1）
+        walk(VA_A, ACC_FETCH, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_PA34_PRIO_PERM", f, 1'b1);
+        chk32("CTRL_PA34_PRIO_PERM", {27'b0, c}, {27'b0, C_INSN_PF});
+
+        //======================================================================
+        // V14b CTRL_PA34_AF_LEGAL：**权限合法**时高 PA 才报原访问类型 AF（1/5/7）
+        //======================================================================
+        vec_begin("MMU_PA34_AF_LEGAL");
+        clr_counters;
+        set_l0_leaf(VA_A, L0_PPN, 22'h100005, 1'b1, 1'b1, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1); // RWX
+        walk(VA_A, ACC_FETCH, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("MMU_PA34_AF_LEGAL", f, 1'b1);
+        chk32("MMU_PA34_AF_LEGAL", {27'b0, c}, {27'b0, C_INSN_AF});
+        walk(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("MMU_PA34_AF_LEGAL", f, 1'b1);
+        chk32("MMU_PA34_AF_LEGAL", {27'b0, c}, {27'b0, C_LOAD_AF});
+        walk(VA_A, ACC_STORE, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("MMU_PA34_AF_LEGAL", f, 1'b1);
+        chk32("MMU_PA34_AF_LEGAL", {27'b0, c}, {27'b0, C_STORE_AF});
+        chk32("MMU_PA34_AF_LEGAL", n_data_req, 32'd0);   // 任何 AF 都不得产生数据访问
+
+        //======================================================================
+        // V14c MMU_PA34_SVADE（独审 P1①）：高 PA 叠加 Svade 的 A/D 缺失
+        //   ⇒ 仍是 page-fault（A=0 ⇒ PF13；写且 D=0 ⇒ PF15），不是 AF。
+        //======================================================================
+        vec_begin("CTRL_PA34_SVADE");
+        clr_counters;
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        //   A=0 + 高 PPN ⇒ PF13（load）
+        set_l0_leaf(VA_A, L0_PPN, 22'h100005, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1);
+        walk(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_PA34_SVADE", f, 1'b1);
+        chk32("CTRL_PA34_SVADE", {27'b0, c}, {27'b0, C_LOAD_PF});
+        //   A=1,D=0 + 高 PPN ⇒ store PF15（Svade 的 D 检查先于 AF）
+        set_l0_leaf(VA_A, L0_PPN, 22'h100005, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1);
+        walk(VA_A, ACC_STORE, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_PA34_SVADE", f, 1'b1);
+        chk32("CTRL_PA34_SVADE", {27'b0, c}, {27'b0, C_STORE_PF});
+        chk32("CTRL_PA34_SVADE", n_data_req, 32'd0);
+
+        //======================================================================
+        // V17 CTRL_PA_LOW：对照 —— 同样的 VA，只有 PPN 高位不同 ⇒ 正常成功
         //   （证明 V10–V13 的差异只来自"34 bit 高位"，不是把大 PPN 一律拒掉）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_PA_LOW");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);
@@ -1062,7 +1247,7 @@ module tb_mmu_semantics;
         //   [norm:cbm_access]：load **或** store 允许即可 ⇒ 必须成功；
         //   [NOTE]：不检查 D。旧实现按 store 判 ⇒ page fault。
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_CBM_RO_PTW");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b0, 1'b1, 1'b0, 1'b0, 1'b1);   // RO, A=1, D=0
@@ -1073,7 +1258,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V16 ★ MMU_CBM_RO_TLB：同一只读项经 **TLB 命中** 执行 CBM
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_CBM_RO_TLB");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b0, 1'b1, 1'b0, 1'b0, 1'b1);   // RO, A=1, D=0
@@ -1089,7 +1274,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V17 ★ MMU_CBM_D_CHECK：可写页但 D=0 上的 CBM ⇒ 必须成功（不查 D）
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_CBM_D_CHECK");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b0, 1'b1, 1'b1, 1'b0, 1'b1);   // RW, A=1, D=0
@@ -1102,7 +1287,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V18 CTRL_CBM_A0：A=0 页上的 CBM ⇒ page fault（查 A），cause 15
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_CBM_A0");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b0, 1'b1, 1'b0, 1'b0, 1'b0);   // RO, A=0
@@ -1116,7 +1301,7 @@ module tb_mmu_semantics;
         // V19 CTRL_CBM_RESERVED：R=0,W=1 是 Sv32 **非法编码**，CBM 也不得放行
         //   （"R0W1 不可当合法可写页"）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_CBM_RESERVED");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         set_root_ptr(L0_PPN, 1'b0);
@@ -1131,7 +1316,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V20 CTRL_STORE_RO：对照 —— 同一只读页上的 store 必须 page fault（15）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_STORE_RO");
         clr_counters;
         do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
         setup_std(VA_A, 1'b1, 1'b1, 1'b0, 1'b0, 1'b1);   // RO, A=1, D=1
@@ -1145,7 +1330,7 @@ module tb_mmu_semantics;
         // V21 ★ MMU_LSU_CBM_RO：lsu 的 CBM PMP 权限 = load OR store
         //   PMP 只读区（L=1,R=1,W=0）上的 cbo.clean ⇒ **必须放行**（旧实现按 W 判 ⇒ 拒）
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_LSU_CBM_RO");
         lsu_pmp_clear;
         lsu_pmp_na4(0, 32'h0000_E000, 1'b1, 1'b0, 1'b0);  // 只读
         lsu_eval(LK_CBO, 32'h0000_E000, PRIV_S, `RV32GC_CBO_CLEAN);
@@ -1159,7 +1344,7 @@ module tb_mmu_semantics;
         // V22 CTRL_LSU_CBM_WO：PMP 只写区（L=1,R=0,W=1）上的 CBM 也必须放行
         //   （store 侧允许即够；旧实现在此处**恰好**也放行 ⇒ 属合法控制标签）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_LSU_CBM_WO");
         lsu_pmp_clear;
         lsu_pmp_na4(0, 32'h0000_E000, 1'b0, 1'b1, 1'b0);  // 只写
         lsu_eval(LK_CBO, 32'h0000_E000, PRIV_S, `RV32GC_CBO_FLUSH);
@@ -1171,7 +1356,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V23 ★ MMU_LSU_NEED_PERM：CBM 的 need_perm 必须是 R（load 口径）
         //======================================================================
-        vec_begin;
+        vec_begin("MMU_LSU_NEED_PERM");
         lsu_pmp_clear;
         lsu_pmp_na4(0, 32'h0000_E000, 1'b1, 1'b1, 1'b0);
         lsu_eval(LK_CBO, 32'h0000_E000, PRIV_S, `RV32GC_CBO_INVAL);
@@ -1182,7 +1367,7 @@ module tb_mmu_semantics;
         //======================================================================
         // V24 CTRL_LSU_CBM_DENY：R/W 全拒（只给 X）⇒ CBM 拒且 cause **恒 7**
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_LSU_CBM_DENY");
         lsu_pmp_clear;
         lsu_pmp_na4(0, 32'h0000_E000, 1'b0, 1'b0, 1'b1);  // 只给 X
         lsu_eval(LK_CBO, 32'h0000_E000, PRIV_S, `RV32GC_CBO_CLEAN);
@@ -1195,7 +1380,7 @@ module tb_mmu_semantics;
         // V25 CTRL_LSU_STORE_RO：对照 —— 同一只读区上的 store 仍必须拒（cause 7）
         //   （证明 V21 的放行是 CBM 专属，不是把 PMP 放宽了）
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_LSU_STORE_RO");
         lsu_pmp_clear;
         lsu_pmp_na4(0, 32'h0000_E000, 1'b1, 1'b0, 1'b0);  // 只读
         lsu_eval(LK_STORE, 32'h0000_E000, PRIV_S, 5'd0);
@@ -1205,9 +1390,51 @@ module tb_mmu_semantics;
         #1;
 
         //======================================================================
-        // V26 CTRL_LSU_LOAD_WO：对照 —— 同一只写区上的 load 仍必须拒（cause 5）
+        // V27 CTRL_LOOKUP2_FETCH（独审 P2 边界）：TLB **第二查询口**（取指侧）
+        //   最小正控：PTW 填充后取指查询必须命中且 PA 相同。
         //======================================================================
-        vec_begin;
+        vec_begin("CTRL_LOOKUP2_FETCH");
+        clr_counters;
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        //   取指要求 X=1（S 模式不得在 U=1 页执行）⇒ 用 RWX、A=1、D=0 的页
+        setup_std(VA_A, 1'b0, 1'b1, 1'b1, 1'b1, 1'b1);   // R=1,W=1,X=1, A=1, D=0
+        asid_v = 9'h0;
+        walk(VA_A, ACC_FETCH, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_LOOKUP2_FETCH", f, 1'b0);
+        tlb_probe2(VA_A, ACC_FETCH, PRIV_S, 1'b0, 1'b0, h, pf, p2);
+        chk1("CTRL_LOOKUP2_FETCH", h, 1'b1);
+        chk1("CTRL_LOOKUP2_FETCH", pf, 1'b0);
+        chk32("CTRL_LOOKUP2_FETCH", p2, 32'h0005_0000);
+        //   取指口同样做 A/D 复核：A=1、D=0 的项对取指**允许**（不查 D）
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        setup_std(VA_A, 1'b0, 1'b1, 1'b1, 1'b1, 1'b1);
+        walk(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("CTRL_LOOKUP2_FETCH", f, 1'b0);
+        tlb_probe2(VA_A, ACC_FETCH, PRIV_S, 1'b0, 1'b0, h, pf, p2);
+        chk1("CTRL_LOOKUP2_FETCH", h, 1'b1);             // fetch 不查 D
+
+        //======================================================================
+        // V28 CTRL_LOOKUP2_D0（独审 P2 边界）：第二查询口的 D/A 口径
+        //   同一 A=1,D=0 表项：store 查询 ⇒ perm_fault；CBM 查询 ⇒ 命中
+        //   （即 TLB 两端口共用同一套 A/D 复核逻辑）。
+        //======================================================================
+        vec_begin("MMU_LOOKUP2_D0");
+        clr_counters;
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        setup_std(VA_A, 1'b0, 1'b1, 1'b1, 1'b0, 1'b1);   // RW, A=1, D=0
+        walk(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, f, c, p);
+        chk1("MMU_LOOKUP2_D0", f, 1'b0);
+        tlb_probe2(VA_A, ACC_STORE, PRIV_S, 1'b0, 1'b0, h, pf, p2);
+        chk1("MMU_LOOKUP2_D0", pf, 1'b1);               // store 且 D=0 ⇒ page fault
+        chk1("MMU_LOOKUP2_D0", h, 1'b0);
+        tlb_probe2(VA_A, ACC_CBM, PRIV_S, 1'b0, 1'b0, h, pf, p2);
+        chk1("MMU_LOOKUP2_D0", h, 1'b1);                // CBM 不查 D
+        chk1("MMU_LOOKUP2_D0", pf, 1'b0);
+
+        //======================================================================
+        // V29 CTRL_LSU_LOAD_WO：对照 —— 同一只写区上的 load 仍必须拒（cause 5）
+        //======================================================================
+        vec_begin("CTRL_LSU_LOAD_WO");
         lsu_pmp_clear;
         lsu_pmp_na4(0, 32'h0000_E000, 1'b0, 1'b1, 1'b0);  // 只写
         lsu_eval(LK_LOAD, 32'h0000_E000, PRIV_S, 5'd0);

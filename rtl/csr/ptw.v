@@ -560,24 +560,28 @@ module ptw #(
             //   架构可见行为，只决定内部走哪一支。
             //------------------------------------------------------------------
             S_AD: begin
-                if (pa_leaf_hi) begin
-                    // ★ 04-03：叶子算出的 PA 超出平台 32 bit ⇒ **原访问类型 access fault**，
-                    //   绝不截断成低地址后"成功"（截断会访问无关对象且不报错）。
-                    //   判定放在权限之后、A/D 之前：权限不足仍是 page-fault（ISA 步骤 8
-                    //   先于步骤 9），而物理不可达属于物理侧 ⇒ access fault。
-                    //   注：此处只可能出现在叶子级（PTE 地址本身已在前置拦截里挡住）。
-                    fault_r       <= 1'b1;
-                    fault_cause_r <= af_cause(acc_r);
-                    st            <= S_DONE;
-                end else if (!perm_granted) begin
+                if (!perm_granted) begin
+                    // ★ 页故障优先（ISA Sv32 算法步骤 6/8）：权限不足/保留编码/U 位
+                    //   等一律 page-fault —— **即使**叶子 PPN 的高位不可达。
+                    //   例：U 模式 load 到 U=0 的高 PPN 页必须是 PF13，不是 AF5。
                     fault_r       <= 1'b1;
                     fault_cause_r <= pf_cause(acc_r);
                     st            <= S_DONE;
                 end else if (ad_missing & (SVADE != 0)) begin
                     // ★ Svade 口径（默认）：A=0（或写访问 D=0）⇒ **page-fault**，
                     //   由软件置位后重试；不发起任何 PTE 写。
+                    //   同样优先于高 PA 的 access fault（D=0 + 高 PPN ⇒ PF15）。
                     fault_r       <= 1'b1;
                     fault_cause_r <= pf_cause(acc_r);
+                    st            <= S_DONE;
+                end else if (pa_leaf_hi) begin
+                    // ★ 04-03：叶子算出的 PA 超出平台 32 bit ⇒ **原访问类型 access fault**。
+                    //   位置：**全部 page-fault 判据之后**（权限 → A/D），
+                    //         **任何 fill/最终访问之前**（本分支不写 pa_r/perm_r）。
+                    //   依据：页表遍历的 page-fault 判据（步骤 6/8/9）先于"物理可达性"；
+                    //   物理不可达属实现/平台侧 ⇒ access fault。
+                    fault_r       <= 1'b1;
+                    fault_cause_r <= af_cause(acc_r);
                     st            <= S_DONE;
                 end else if (ad_missing) begin
                     // ---- SVADE=0：硬件原子更新通路（外层写回后回 pte_ad_done）----
@@ -641,7 +645,11 @@ module ptw #(
     // ---- A/D 更新请求（仅 SVADE=0 的硬件更新通路会拉高；默认口径恒 0）----
     //   ★ engine 侧口径注释：SVADE=1 时本端口恒 0 ⇒ core_top 的 M_S_PADW/M_S_PADX
     //     状态不可达（保留状态机结构不动，避免接口/状态编号漂移）。
-    assign pte_ad_update = (SVADE == 0) & (st == S_AD) & ad_missing;
+    //   ★ 2026-10（F3 独审 P1①）：必须在**所有会 fault 的判据之后**才发更新请求。
+    //     否则"权限不足/高 PA 不可达"的那一拍仍会拉高 pte_ad_update（组合输出），
+    //     SVADE=0 路径下会先写 PTE 再报 access fault（不该发生的副作用）。
+    assign pte_ad_update = (SVADE == 0) & (st == S_AD) & ad_missing &
+                           perm_granted & ~pa_leaf_hi;
     //   pte_ad_pa = 需要更新的那个 PTE 的物理地址（二级叶子 ⇒ l0_pte_pa；
     //   一级叶子（4 MiB 大页）⇒ l1_pte_pa，由 cur_is_l1 选择）
     assign pte_ad_pa     = (st == S_AD) ? (cur_is_l1 ? l1_pte_pa[31:0]

@@ -84,10 +84,15 @@ fail() {
 #------------------------------------------------------------------------------
 # 本包冻结规格（必须与 test_mmu.sh / tb_mmu_semantics.sv 一致）
 #------------------------------------------------------------------------------
-readonly SPEC_VECTORS=26
+readonly SPEC_VECTORS=32
 readonly N_HASH_EXPECTED=10
 readonly BASE_COMMIT_FULL="201acf61e118a3fb533e1a96768687a35efa1751"
-readonly DEFECT_TAGS="MMU_SVADE_D_TLB_HIT MMU_SFENCE_GLOBAL_VA MMU_PA34_ROOT MMU_PA34_L0 MMU_PA34_LEAF4K MMU_PA34_LEAF4M MMU_CBM_RO_PTW MMU_CBM_RO_TLB MMU_CBM_D_CHECK MMU_LSU_CBM_RO MMU_LSU_NEED_PERM"
+readonly DEFECT_TAGS="MMU_SVADE_D_TLB_HIT MMU_SFENCE_GLOBAL_VA MMU_PA34_ROOT MMU_PA34_L0 MMU_PA34_LEAF4K MMU_PA34_LEAF4M MMU_PA34_AF_LEGAL MMU_CBM_RO_PTW MMU_CBM_RO_TLB MMU_CBM_D_CHECK MMU_LSU_CBM_RO MMU_LSU_NEED_PERM MMU_LOOKUP2_D0"
+# ---- 冻结的逐向量规格（与 test_mmu.sh / tb_mmu_semantics.sv 同步）----
+readonly CHECKS_TOTAL_NEW=225
+readonly CHECKS_TOTAL_OLD=243
+readonly VEC_NAMES="CTRL_XZ_DETECT CTRL_BASE_TR CTRL_BIGPAGE MMU_SVADE_D_TLB_HIT CTRL_SVADE_D1 CTRL_SVADE_A0 MMU_SFENCE_GLOBAL_VA CTRL_SFENCE_ASID_KEEP_G CTRL_SFENCE_VA_ASID_KEEP_G CTRL_SFENCE_ALL MMU_PA34_ROOT MMU_PA34_L0 MMU_PA34_LEAF4K MMU_PA34_LEAF4M CTRL_PA34_PRIO_PERM MMU_PA34_AF_LEGAL CTRL_PA34_SVADE CTRL_PA_LOW MMU_CBM_RO_PTW MMU_CBM_RO_TLB MMU_CBM_D_CHECK CTRL_CBM_A0 CTRL_CBM_RESERVED CTRL_STORE_RO MMU_LSU_CBM_RO CTRL_LSU_CBM_WO MMU_LSU_NEED_PERM CTRL_LSU_CBM_DENY CTRL_LSU_STORE_RO CTRL_LOOKUP2_FETCH MMU_LOOKUP2_D0 CTRL_LSU_LOAD_WO"
+readonly NEW_CHECKS="5 11 7 9 9 6 16 9 9 9 11 6 6 5 7 8 6 8 6 9 7 4 5 7 4 3 2 3 3 13 9 3"
 
 RTL_REL_LIST=(
     rtl/csr/ptw.v
@@ -110,7 +115,47 @@ if git -C "$REPO_ROOT" rev-parse HEAD >/dev/null 2>&1; then
     note "GIT_HEAD   = $(git -C "$REPO_ROOT" rev-parse HEAD)"
 fi
 
-file_sha() { sha256sum -- "$1" | awk '{print $1}'; }
+#------------------------------------------------------------------------------
+# ★ 2026-10（独审 P1④）：原来的 `sha256sum | awk` 管道**吞掉** sha 的原始 rc，
+#   且无 pipefail ⇒ 假 sha（rc≠0 但仍打印合法行）会被当成成功。
+#   这里改为：先落盘、检查 rc、逐行判 64-hex，再取哈希；任何一步失败即返回非 0。
+#------------------------------------------------------------------------------
+SHA_BIN="${SHA_BIN:-sha256sum}"
+
+sha_one() {   # sha_one <file> -> stdout 64-hex；失败返回非 0
+    local f="$1" out rc=0 line
+    out="$(mktemp "$DRV/h.XXXXXX")" || return 1
+    "$SHA_BIN" -- "$f" >"$out" 2>/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then rm -f -- "$out"; return 1; fi
+    if [ "$(wc -l < "$out")" -ne 1 ]; then rm -f -- "$out"; return 1; fi
+    line="$(cat -- "$out")"
+    case "$line" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'  '*) ;;
+        *) rm -f -- "$out"; return 1 ;;
+    esac
+    printf '%s\n' "${line%% *}"
+    rm -f -- "$out"
+    return 0
+}
+
+file_sha() { sha_one "$1"; }
+
+#   非空 + 恰 64 个 hex（调用方**必须先赋值并检查返回值**，不能直接嵌进 $( ) 比较：
+#   两次 file_sha 都失败时两侧都是空串，"空==空"会假通过 —— 独审 P1）
+sha64_ok() {
+    [[ "${1:-}" =~ ^[0-9a-f]{64}$ ]]
+}
+
+#   取一个文件的可信 SHA：失败时**返回非 0 且不打印**（绝不在 $( ) 里调 fail ——
+#   fail 只会退出那个子 shell，父层拿到的是它打印的文本，比较就变成"文本 vs 文本"）。
+#   调用方必须：`sha="$(need_sha f)" || fail reason`，再确认 sha64_ok。
+need_sha() {   # need_sha <file>
+    local h
+    h="$(file_sha "$1")" || return 1
+    sha64_ok "$h" || return 1
+    printf '%s' "$h"
+    return 0
+}
 
 #==============================================================================
 # A. 私有不可变快照
@@ -125,16 +170,21 @@ for f in "${RTL_REL_LIST[@]}"; do
     mkdir -p -- "$CUR/$(dirname -- "$f")" || fail "cur_snapshot_subdir"
     cp -- "$REPO_ROOT/$f" "$CUR/$f" || fail "cur_snapshot_copy_$f"
     chmod 444 -- "$CUR/$f" || fail "cur_snapshot_chmod_$f"
-    [ "$(file_sha "$REPO_ROOT/$f")" = "$(file_sha "$CUR/$f")" ] || fail "cur_snapshot_mismatch_$f"
+    src_sha="$(need_sha "$REPO_ROOT/$f")" || fail "cur_src_sha_fail_$f"
+    cp_sha="$(need_sha "$CUR/$f")"        || fail "cur_copy_sha_fail_$f"
+    [ "$src_sha" = "$cp_sha" ] || fail "cur_snapshot_mismatch_$f"
+    note "CUR_SHA $f = $cp_sha"
 done
 for f in "${HDR_REL_LIST[@]}"; do
     mkdir -p -- "$CUR/$(dirname -- "$f")" || fail "cur_snapshot_subdir"
     cp -- "$REPO_ROOT/$f" "$CUR/$f" || fail "cur_snapshot_copy_$f"
     chmod 444 -- "$CUR/$f" || fail "cur_snapshot_chmod_$f"
-    [ "$(file_sha "$REPO_ROOT/$f")" = "$(file_sha "$CUR/$f")" ] || fail "cur_snapshot_mismatch_$f"
+    src_sha="$(need_sha "$REPO_ROOT/$f")" || fail "cur_src_sha_fail_$f"
+    cp_sha="$(need_sha "$CUR/$f")"        || fail "cur_copy_sha_fail_$f"
+    [ "$src_sha" = "$cp_sha" ] || fail "cur_snapshot_mismatch_$f"
+    note "CUR_SHA $f = $cp_sha"
 done
 note "CUR        = $CUR"
-for f in "${RTL_REL_LIST[@]}"; do note "CUR_SHA $f = $(file_sha "$CUR/$f")"; done
 
 #   frozen/：两相共用的包脚本 + TB + env.sh（阶段间共享输入的真身）
 mkdir -p -- "$FRZ/sim/functional" "$FRZ/scripts" || fail "frozen_mkdir_failed"
@@ -147,14 +197,28 @@ cmp -s -- "$PKG_SH" "$FRZ/sim/functional/test_mmu.sh" || fail "frozen_pkg_mismat
 cmp -s -- "$REPO_ROOT/$TB_REL" "$FRZ/$TB_REL" || fail "frozen_tb_mismatch"
 cmp -s -- "$REPO_ROOT/scripts/env.sh" "$FRZ/scripts/env.sh" || fail "frozen_env_mismatch"
 
+#   共享输入 = 包脚本 + TB + env.sh（**恰好 3 个**）。
+#   返回：成功时打印 3 个 64-hex（空格分隔）；任一文件缺失 / sha rc≠0 /
+#   行数≠3 / 任一行非 64-hex ⇒ 返回 1 且不打印任何东西。
 shared_sha_of() {
-    sha256sum -- "$1/sim/functional/test_mmu.sh" \
-                 "$1/$TB_REL" \
-                 "$1/scripts/env.sh" 2>/dev/null | awk '{print $1}' | tr '\n' ' '
+    local root="$1" out rc=0 n bad f out_s=""
+    out="$(mktemp "$DRV/s.XXXXXX")" || return 1
+    "$SHA_BIN" -- "$root/sim/functional/test_mmu.sh" \
+                 "$root/$TB_REL" \
+                 "$root/scripts/env.sh" >"$out" 2>/dev/null || rc=$?
+    if [ "$rc" -ne 0 ]; then rm -f -- "$out"; return 1; fi
+    n="$(wc -l < "$out")"
+    if [ "$n" -ne 3 ]; then rm -f -- "$out"; return 1; fi
+    bad="$(grep -cvE '^[0-9a-f]{64}  ' "$out" || true)"; bad="${bad:-0}"
+    if [ "$bad" -ne 0 ]; then rm -f -- "$out"; return 1; fi
+    while IFS= read -r f; do out_s="${out_s}${f%% *} "; done < "$out"
+    rm -f -- "$out"
+    printf '%s' "${out_s% }"
+    return 0
 }
 check_shared_unchanged() {
     local now
-    now="$(shared_sha_of "$1")"
+    now="$(shared_sha_of "$1")" || return 1
     [ -n "$now" ] || return 1
     [ "$now" = "$2" ] || return 1
     return 0
@@ -170,10 +234,14 @@ if [ "$MODE" = "full" ]; then
     done
     note "SNAP       = $SNAP"
     note "SNAP_COMMIT= $BASE_COMMIT"
-    for f in "${RTL_REL_LIST[@]}"; do note "SNAP_SHA $f = $(file_sha "$SNAP/$f")"; done
+    for f in "${RTL_REL_LIST[@]}"; do
+        snap_sha="$(need_sha "$SNAP/$f")" || fail "snap_sha_fail_$f"
+        note "SNAP_SHA $f = $snap_sha"
+    done
 fi
 
-SHARED_SHA_PRE="$(shared_sha_of "$FRZ")"
+SHARED_SHA_PRE="$(shared_sha_of "$FRZ")" || fail "shared_sha_fail"
+[ -n "$SHARED_SHA_PRE" ] || fail "shared_sha_empty"
 note "FRZ        = $FRZ"
 note "SHARED_SHA = $SHARED_SHA_PRE"
 
@@ -200,122 +268,237 @@ if [ "$MODE" = "selftest" ]; then
     st="$DRV/selftest"; mkdir -p "$st" || fail "selftest_mkdir_failed"
     pass=0; total=0
 
-    #   ---- 夹具：合法包脚本（打印完整摘要 + 唯一锚点）----
+    #   ---- 冻结表（与包脚本一致）：name / NEW checks ----
+    VN=(); VC=()
+    read -r -a VN <<<"$VEC_NAMES"
+    read -r -a VC <<<"$NEW_CHECKS"
+
     mk_good() {
         local out="$1" i
         : > "$out"
-        for ((i = 1; i <= SPEC_VECTORS; i++)); do printf 'VEC %d checks=1 fails=0\n' "$i" >> "$out"; done
-        printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$SPEC_VECTORS" >> "$out"
+        for ((i = 1; i <= SPEC_VECTORS; i++)); do
+            printf 'VEC %d name=%s checks=%d fails=0\n' "$i" "${VN[$((i-1))]}" "${VC[$((i-1))]}" >> "$out"
+        done
+        printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW" >> "$out"
         printf 'mmu: compile_rc=0 vvp_ok=1 hash_lines=10 hash_badhex=0 run_rc=0 total=%d checks=%d fails=0 vec_lines=%d anchor_lines=1 pass_substr=1\n' \
-               "$SPEC_VECTORS" "$SPEC_VECTORS" "$SPEC_VECTORS" >> "$out"
+               "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW" "$SPEC_VECTORS" >> "$out"
         printf 'FUNCTIONAL_MMU: PASS\n' >> "$out"
     }
 
-    #   ---- 复用包入口的**真实门控**（不复制判据）：把夹具当运行日志喂给它 ----
-    #   做法：源出包脚本的 gate_positive_log 会因 `case "$MODE"` 直接执行 main，
-    #   故这里改为调用**包脚本自身的默认模式**跑假 vvp 造出真日志，再用
-    #   本驱动的独立判据校验 rc/锚点/摘要 —— 判据不复制，只看端到端结果。
-    killer_case() {   # <名称> <期望> <假 vvp> <检查函数名>
-        local name="$1" expect="$2" vvp="$3" chk="$4" got log rc=0
+    killer_case() {   # <名称> <期望 pass|kill> <假 vvp> <期望 reason 片段>
+        local name="$1" expect="$2" vvp="$3" exp_reason="$4"
+        local got log rc=0
         log="$st/${name}.log"
+        rm -f -- "$st/${name}.marker"
         #   ★ DUT_ROOT 必须显式给：冻结副本的 REPO_ROOT 是 $FRZ（只有 TB/env.sh），
         #     不给就会在"缺 DUT 源"上提前 die ⇒ 反例被误判成"杀伤成功"。
-        #   冻结副本的 REPO_ROOT = $FRZ ⇒ 其授权产物根是 $FRZ/build/functional
+        #   冻结副本的授权产物根是 $FRZ/build/functional。
         env RV32_VVP="$vvp" DUT_ROOT="$CUR" \
             RV32_FUNCTIONAL_PKG_OUT_DIR="$FRZ/build/functional/mmu_${name}" \
+            MMU_FIXTURE_MARKER="$st/${name}.marker" \
             bash "$FRZ/sim/functional/test_mmu.sh" > "$log" 2>&1 || rc=$?
         total=$((total + 1))
-        case "$chk" in
-            pass)    if [ "$rc" -eq 0 ] && [ "$(anchor_count "$log" 'FUNCTIONAL_MMU: PASS')" = "1" ]; then got=pass; else got=reject; fi ;;
-            #   ★ 反例必须"真的被门控拒"：rc≠0 **且** 无正式锚点 **且** 包入口打印了
-            #     它自己的 POSITIVE_CHECK_FAILED 诊断（排除"提前 die 也算杀伤"的假绿）
-            kill)    if [ "$rc" -ne 0 ] && [ "$(anchor_count "$log" 'FUNCTIONAL_MMU: PASS')" = "0" ] \
-                        && [ "$(grep -c 'POSITIVE_CHECK_FAILED' "$log" 2>/dev/null || true)" = "1" ]; then got=kill; else got=leak; fi ;;
-            *)       got=reject ;;
+        #   ★ 独审 P2：杀伤必须"精确 rc=1 + 对应 reason + 证明 VVP 真被调用 +
+        #     编译成功（无关的编译失败不得计杀伤）"。
+        local compile_ok=0 vvp_ran=0 reason_ok=0 anchor_n
+        grep -q 'compile_rc=0' "$log" && compile_ok=1
+        [ -f "$st/${name}.marker" ] && vvp_ran=1
+        [ -n "$exp_reason" ] && grep -q "reason=${exp_reason}" "$log" && reason_ok=1
+        anchor_n="$(anchor_count "$log" 'FUNCTIONAL_MMU: PASS')"
+        case "$expect" in
+            pass) if [ "$rc" -eq 0 ] && [ "$anchor_n" = "1" ] && [ "$compile_ok" = 1 ]; then got=pass; else got=reject; fi ;;
+            kill) if [ "$rc" -eq 1 ] && [ "$anchor_n" = "0" ] && [ "$compile_ok" = 1 ] \
+                      && [ "$reason_ok" = 1 ] && [ "$vvp_ran" = 1 ]; then got=kill; else got=leak; fi ;;
+            *)    got=reject ;;
         esac
         if [ "$got" = "$expect" ]; then
-            pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK rc=%s\n' "$name" "$expect" "$got" "$rc"
+            pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK rc=%s reason=%s vvp=%s\n' \
+                "$name" "$expect" "$got" "$rc" "$exp_reason" "$vvp_ran"
         else
-            printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH rc=%s\n' "$name" "$expect" "$got" "$rc"
+            printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH rc=%s compile_ok=%s reason_ok=%s vvp_ran=%s\n' \
+                "$name" "$expect" "$got" "$rc" "$compile_ok" "$reason_ok" "$vvp_ran"
         fi
-        note "SELFTEST $name expect=$expect got=$got rc=$rc log=$log"
+        note "SELFTEST $name expect=$expect got=$got rc=$rc compile_ok=$compile_ok reason_ok=$reason_ok vvp_ran=$vvp_ran log=$log"
     }
 
-    #   ---- 夹具：各种"坏"假 vvp ----
+    #   ---- 假 vvp 夹具：都先 touch marker（证明 VVP 真被调用）----
+    emit_vecs() {   # emit_vecs <count>
+        local n="$1" i
+        for ((i = 1; i <= n; i++)); do
+            printf 'VEC %d name=%s checks=%d fails=0\n' "$i" "${VN[$((i-1))]}" "${VC[$((i-1))]}"
+        done
+    }
+    mk_fake() {   # mk_fake <name> <payload_file> <rc>
+        local nm="$1" pay="$2" rc="$3"
+        {
+            printf '#!/bin/sh\n'
+            printf '%s\n' '[ -n "${MMU_FIXTURE_MARKER:-}" ] && : > "$MMU_FIXTURE_MARKER"'
+            printf 'cat <<'"'"'EOP'"'"'\n'
+            cat -- "$pay"
+            printf 'EOP\n'
+            printf 'exit %s\n' "$rc"
+        } > "$st/$nm"
+        chmod +x "$st/$nm"
+    }
     cat > "$st/vvp_fail" <<'EOS'
 #!/bin/sh
+[ -n "${MMU_FIXTURE_MARKER:-}" ] && : > "$MMU_FIXTURE_MARKER"
 exit 1
 EOS
     cat > "$st/vvp_quiet" <<'EOS'
 #!/bin/sh
+[ -n "${MMU_FIXTURE_MARKER:-}" ] && : > "$MMU_FIXTURE_MARKER"
 exit 0
 EOS
-    cat > "$st/vvp_badsum" <<'EOS'
-#!/bin/sh
-printf 'FUNCTIONAL_MMU_VECTORS total=25 checks=25 fails=0\n'
-exit 0
-EOS
-    cat > "$st/vvp_fails" <<'EOS'
-#!/bin/sh
-printf 'FUNCTIONAL_MMU_VECTORS total=26 checks=26 fails=1\n'
-exit 1
-EOS
-    cat > "$st/vvp_failline" <<'EOS'
-#!/bin/sh
-i=1
-while [ "$i" -le 26 ]; do printf 'VEC %d checks=1 fails=0\n' "$i"; i=$((i+1)); done
-printf 'MMU FAIL [MMU_PA34_ROOT]: x\n'
-printf 'FUNCTIONAL_MMU_VECTORS total=26 checks=26 fails=0\n'
-printf 'FUNCTIONAL_MMU: PASS\n'
-exit 0
-EOS
-    cat > "$st/vvp_defect" <<'EOS'
-#!/bin/sh
-i=1
-while [ "$i" -le 26 ]; do printf 'VEC %d checks=1 fails=0\n' "$i"; i=$((i+1)); done
-printf 'DEFECT_REPRODUCED: X\n'
-printf 'FUNCTIONAL_MMU_VECTORS total=26 checks=26 fails=0\n'
-printf 'FUNCTIONAL_MMU: PASS\n'
-exit 0
-EOS
-    cat > "$st/vvp_shortvec" <<'EOS'
-#!/bin/sh
-i=1
-while [ "$i" -le 25 ]; do printf 'VEC %d checks=1 fails=0\n' "$i"; i=$((i+1)); done
-printf 'FUNCTIONAL_MMU_VECTORS total=26 checks=26 fails=0\n'
-printf 'FUNCTIONAL_MMU: PASS\n'
-exit 0
-EOS
-    cat > "$st/vvp_noanchor" <<'EOS'
-#!/bin/sh
-i=1
-while [ "$i" -le 26 ]; do printf 'VEC %d checks=1 fails=0\n' "$i"; i=$((i+1)); done
-printf 'FUNCTIONAL_MMU_VECTORS total=26 checks=26 fails=0\n'
-exit 0
-EOS
+    : > "$st/p_badsum"; printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$((SPEC_VECTORS + 1))" "$CHECKS_TOTAL_NEW" > "$st/p_badsum"
+    printf 'FUNCTIONAL_MMU: PASS\n' >> "$st/p_badsum"
+    #   ★ 独审 P2：summary_fails 夹具必须**底层 rc=0**，否则测的是"运行非零"而不是摘要门控
+    printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=1\n' "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW" > "$st/p_fails"
+    printf 'FUNCTIONAL_MMU: PASS\n' >> "$st/p_fails"
+    { emit_vecs "$SPEC_VECTORS"; printf 'MMU FAIL [MMU_PA34_ROOT]: x\n'; \
+      printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW"; \
+      printf 'FUNCTIONAL_MMU: PASS\n'; } > "$st/p_failline"
+    { emit_vecs "$SPEC_VECTORS"; printf 'DEFECT_REPRODUCED: X\n'; \
+      printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW"; \
+      printf 'FUNCTIONAL_MMU: PASS\n'; } > "$st/p_defect"
+    { emit_vecs $((SPEC_VECTORS - 1)); \
+      printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" \
+             "$((CHECKS_TOTAL_NEW - ${VC[$((SPEC_VECTORS-1))]}))"; \
+      printf 'FUNCTIONAL_MMU: PASS\n'; } > "$st/p_shortvec"
+    { emit_vecs "$SPEC_VECTORS"; \
+      printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW"; } > "$st/p_noanchor"
+    #   32 行但每行 checks=1（"凑数自证"）⇒ 必须被逐向量规格拒
+    { for ((i = 1; i <= SPEC_VECTORS; i++)); do
+          printf 'VEC %d name=%s checks=1 fails=0\n' "$i" "${VN[$((i-1))]}"
+      done
+      printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$SPEC_VECTORS"
+      printf 'FUNCTIONAL_MMU: PASS\n'; } > "$st/p_fakechecks"
+
+    mk_fake vvp_badsum   "$st/p_badsum"     0
+    mk_fake vvp_fails    "$st/p_fails"      0
+    mk_fake vvp_failline "$st/p_failline"   0
+    mk_fake vvp_defect   "$st/p_defect"     0
+    mk_fake vvp_shortvec "$st/p_shortvec"   0
+    mk_fake vvp_noanchor "$st/p_noanchor"   0
+    mk_fake vvp_fakechecks "$st/p_fakechecks" 0
     chmod +x "$st"/vvp_*
 
     # 正控：真实工具 + 真实快照 ⇒ 必须绿
-    killer_case real_tool_ok      pass   "$VVP_BIN" pass
-    # 八类反例：全部必须 rc≠0 且**无**正式锚点
-    killer_case vvp_fail          kill   "$st/vvp_fail"      kill
-    killer_case vvp_quiet         kill   "$st/vvp_quiet"     kill
-    killer_case bad_summary_total kill   "$st/vvp_badsum"    kill
-    killer_case summary_fails     kill   "$st/vvp_fails"     kill
-    killer_case log_has_fail      kill   "$st/vvp_failline"  kill
-    killer_case log_has_defect    kill   "$st/vvp_defect"    kill
-    killer_case vec_short         kill   "$st/vvp_shortvec"  kill
-    killer_case no_anchor         kill   "$st/vvp_noanchor"  kill
+    killer_case real_tool_ok      pass   "$VVP_BIN" ""
+    # 反例：全部必须 rc=1 + 对应 reason + 编译成功 + VVP 真被调用
+    killer_case vvp_fail          kill   "$st/vvp_fail"      "no_capture"
+    killer_case vvp_quiet         kill   "$st/vvp_quiet"     "no_capture"
+    killer_case bad_summary_total kill   "$st/vvp_badsum"    "summary_total="
+    killer_case summary_fails     kill   "$st/vvp_fails"     "summary_fails=1"
+    killer_case log_has_fail      kill   "$st/vvp_failline"  "log_has_FAIL=1"
+    killer_case log_has_defect    kill   "$st/vvp_defect"    "log_has_DEFECT=1"
+    killer_case vec_short         kill   "$st/vvp_shortvec"  "vec_line_count=31"
+    killer_case no_anchor         kill   "$st/vvp_noanchor"  "pass_anchor_count=0"
+    killer_case fake_checks       kill   "$st/vvp_fakechecks" "vec_checks_mismatch="
+
+    #   ★ 独审 P1④：共享哈希的"假 sha"反证（不经过包脚本，直接测驱动自己的判据）
+    sha_case() {   # <名称> <期望 ok|reject> <sha 工具> <root>
+        local name="$1" expect="$2" bin="$3" root="$4" got
+        total=$((total + 1))
+        if SHA_BIN="$bin" shared_sha_of "$root" >/dev/null 2>&1; then got=ok; else got=reject; fi
+        if [ "$got" = "$expect" ]; then
+            pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK\n' "$name" "$expect" "$got"
+        else
+            printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH\n' "$name" "$expect" "$got"
+        fi
+        note "SELFTEST $name expect=$expect got=$got"
+    }
+    real_sha="$SHA_BIN"
+    sha_case good_sha              ok     "$real_sha"            "$FRZ"
+    #   假 sha：打印 3 行完整合法哈希后 exit 9 ⇒ 必须拒（原来管道会吞 rc）
+    cat > "$st/sha_rc9" <<EOS
+#!/bin/sh
+i=0
+while [ "\$i" -lt 3 ]; do
+  printf '%064d  f\$i\n' 0
+  i=\$((i+1))
+done
+exit 9
+EOS
+    #   假 sha：只打印 2 行合法哈希、exit 0 ⇒ 必须拒（行数≠3）
+    cat > "$st/sha_2lines" <<EOS
+#!/bin/sh
+printf '%064d  f0\n' 0
+printf '%064d  f1\n' 0
+exit 0
+EOS
+    #   假 sha：3 行但其中一行非 64-hex ⇒ 必须拒
+    cat > "$st/sha_nonhex" <<EOS
+#!/bin/sh
+printf '%064d  f0\n' 0
+printf 'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ  f1\n'
+printf '%064d  f2\n' 0
+exit 0
+EOS
+    chmod +x "$st"/sha_rc9 "$st"/sha_2lines "$st"/sha_nonhex
+    sha_case sha_rc9_reject        reject "$st/sha_rc9"     "$FRZ"
+    sha_case sha_2lines_reject     reject "$st/sha_2lines"  "$FRZ"
+    sha_case sha_nonhex_reject     reject "$st/sha_nonhex"  "$FRZ"
+    #   共享输入被改动（阶段间改包/env）⇒ check_shared_unchanged 必须拒
+    fz2="$st/frozen_changed"
+    cp -a "$FRZ" "$fz2"
+    chmod u+w "$fz2/sim/functional/test_mmu.sh"
+    printf '\n# tampered\n' >> "$fz2/sim/functional/test_mmu.sh"
+    total=$((total + 1))
+    if check_shared_unchanged "$fz2" "$SHARED_SHA_PRE"; then
+        printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH\n' shared_changed reject ok
+    else
+        pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK\n' shared_changed reject reject
+    fi
+    SHA_BIN="$real_sha"
 
     # ---- 冻结快照 sha 自检：deps_cur 与工作树一致；frozen 与源一致 ----
     total=$((total + 1))
     ok=1
     for f in "${RTL_REL_LIST[@]}" "${HDR_REL_LIST[@]}"; do
-        [ "$(file_sha "$CUR/$f")" = "$(file_sha "$REPO_ROOT/$f")" ] || ok=0
+        h1="$(file_sha "$CUR/$f")" || { ok=0; break; }
+        h2="$(file_sha "$REPO_ROOT/$f")" || { ok=0; break; }
+        sha64_ok "$h1" && sha64_ok "$h2" || { ok=0; break; }
+        [ "$h1" = "$h2" ] || ok=0
     done
-    [ "$ok" = "1" ] && [ "$(shared_sha_of "$FRZ")" = "$SHARED_SHA_PRE" ] || ok=0
+    if [ "$ok" = "1" ]; then
+        h3="$(shared_sha_of "$FRZ")" || ok=0
+    fi
+    [ "$ok" = "1" ] || true
     if [ "$ok" = "1" ]; then pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK\n' snapshots_frozen yes yes
     else printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH\n' snapshots_frozen yes no; fi
+
+    #   ★ 独审 P1：**单文件**身份校验的杀伤链。假 sha 对"单文件"调用（$#=2：-- + file）
+    #     委托真 sha 打印**合法一行**后 exit 9；对共享三文件调用（$#=4）正常委托。
+    #     ⇒ 驱动必须在 deps_cur 身份校验处 rc=1 且**不**打印任何 PASS。
+    cat > "$st/sha_single_bad" <<EOS
+#!/bin/sh
+if [ "\$#" -eq 2 ]; then
+    "$real_sha" "\$@"
+    exit 9
+fi
+exec "$real_sha" "\$@"
+EOS
+    chmod +x "$st/sha_single_bad"
+    #   先自证：该假 sha 的三文件调用确实正常（否则下面的"正式 rc1"可能是别的原因）
+    total=$((total + 1))
+    if SHA_BIN="$st/sha_single_bad" shared_sha_of "$FRZ" >/dev/null 2>&1; then
+        pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK\n' sha_single_shared_ok ok ok
+    else
+        printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH\n' sha_single_shared_ok ok reject
+    fi
+    #   正式 run：驱动完整跑一遍（full 模式），必须在单文件身份校验处 rc=1、无 PASS
+    formal_log="$st/formal_badsha.log"
+    formal_rc=0
+    env SHA_BIN="$st/sha_single_bad" bash "$SELF_PATH" > "$formal_log" 2>&1 || formal_rc=$?
+    total=$((total + 1))
+    if [ "$formal_rc" -eq 1 ] && [ "$(anchor_count "$formal_log" 'MMU_DRIVER_PASS')" = "0" ] \
+       && grep -q 'MMU_DRIVER: FAIL reason=cur_src_sha_fail' "$formal_log"; then
+        pass=$((pass + 1)); printf 'SELFTEST %-24s expected=%-6s got=%-6s OK rc=%s\n' formal_badsha_rc1 kill kill "$formal_rc"
+    else
+        printf 'SELFTEST %-24s expected=%-6s got=%-6s MISMATCH rc=%s\n' formal_badsha_rc1 kill "rc=$formal_rc"
+    fi
+    note "SELFTEST formal_badsha rc=$formal_rc log=$formal_log"
 
     printf 'SELFTEST_FIXTURES: %s\n' "$st"
     printf 'SELFTEST_TOTAL: %d/%d\n' "$pass" "$total"
@@ -366,6 +549,15 @@ done
 [ "$(grep -c 'MMU FAIL \[CTRL_' "$NEG_RUN_LOG" 2>/dev/null || true)" = "0" ] || fail "neg_ctrl_fails"
 #   旧树也不得出现正式锚点（双重保险）
 [ "$(anchor_count "$NEG_RUN_LOG" 'FUNCTIONAL_MMU: PASS')" = "0" ] || fail "neg_runlog_pass_anchor"
+#   ★ 独审 P1③：旧树必须**完整跑完** 32 个向量（唯一 ID、name 冻结），
+#     不能"凑满 11 个标签 + 半跑"就算反证通过。
+[ "$(grep -c '^VEC ' "$NEG_RUN_LOG" 2>/dev/null || true)" = "$SPEC_VECTORS" ] || fail "neg_vec_line_count"
+neg_ids="$(sed -n 's/^VEC \([0-9]\+\) name=.*/\1/p' "$NEG_RUN_LOG" | sort -n | uniq | tr '\n' ' ')"
+exp_ids="$(seq -s ' ' 1 "$SPEC_VECTORS") "
+[ "$neg_ids" = "$exp_ids" ] || fail "neg_vec_ids"
+neg_names="$(sed -n 's/^VEC [0-9]\+ name=\([A-Za-z0-9_]\+\).*/\1/p' "$NEG_RUN_LOG" | tr '\n' ' ')"
+[ "${neg_names% }" = "$VEC_NAMES" ] || fail "neg_vec_names"
+[ "$(grep -c '^FUNCTIONAL_MMU_VECTORS ' "$NEG_RUN_LOG" 2>/dev/null || true)" = "1" ] || fail "neg_summary_count"
 check_shared_unchanged "$FRZ" "$SHARED_SHA_PRE" || fail "shared_inputs_changed_after_neg"
 
 # ---- C3：控制两边正确（两棵树 CTRL_ 失败均为 0）----

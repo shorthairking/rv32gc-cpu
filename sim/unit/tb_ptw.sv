@@ -195,7 +195,7 @@ module tb_ptw_top;
     reg     sim_ok = 1'b0;   // 仅在全部检查通过后置 1
 
     task expect_eq32;
-        input [8*40-1:0] name; input [31:0] got; input [31:0] exp;
+        input [8*96-1:0] name; input [31:0] got; input [31:0] exp;
         begin
             if (got !== exp) begin
                 $display("TB_PTW FAIL: %0s got=0x%08x exp=0x%08x", name, got, exp);
@@ -205,7 +205,7 @@ module tb_ptw_top;
     endtask
 
     task expect_eq1;
-        input [8*40-1:0] name; input got; input exp;
+        input [8*96-1:0] name; input got; input exp;
         begin
             if (got !== exp) begin
                 $display("TB_PTW FAIL: %0s got=%0b exp=%0b", name, got, exp);
@@ -596,13 +596,51 @@ module tb_ptw_top;
                     {27'b0, fault_cause_o}, 32'h0000_0005);
         expect_eq1("H1: ★ 失败时不得产生 fill（不得把别名 PA 灌进 TLB）",
                    fill_latch, 1'b0);
-        //   H2：同页取指 / store / CBM 的 cause 跟随原访问类型（1 / 7 / 7）
+        //   H2：**权限合法**时 cause 跟随原访问类型（1 / 5 / 7 / 7）
+        //     取指要求 X=1、store/CBM 要求 R=1（W⇒R）——原 H2 在 X=0 页上取指却期望
+        //     AF1 是**错误 oracle**（X=0 应先 PF12，见 H2b）。
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h100001, 1'b1, 1'b1, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1, 1'b1);  // RWX
         do_translate(32'h8040_2123, 2'b00, `RV32GC_PRIV_S, 1'b0, 1'b0);
-        expect_eq32("H2: 高 PA + 取指 ⇒ cause 1", {27'b0, fault_cause_o}, 32'h0000_0001);
+        expect_eq32("H2: highPA + legal-fetch => AF1",
+                    {27'b0, fault_cause_o}, 32'h0000_0001);
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("H2: highPA + legal-load => AF5",
+                    {27'b0, fault_cause_o}, 32'h0000_0005);
         do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
-        expect_eq32("H2: 高 PA + store ⇒ cause 7", {27'b0, fault_cause_o}, 32'h0000_0007);
+        expect_eq32("H2: highPA + legal-store => AF7",
+                    {27'b0, fault_cause_o}, 32'h0000_0007);
         do_translate(32'h8040_2123, 2'b11, `RV32GC_PRIV_S, 1'b0, 1'b0);
-        expect_eq32("H2: 高 PA + CBM ⇒ cause 7", {27'b0, fault_cause_o}, 32'h0000_0007);
+        expect_eq32("H2: highPA + legal-CBM => AF7",
+                    {27'b0, fault_cause_o}, 32'h0000_0007);
+        //   H2b：**权限不合法**时必须是 page-fault（先于高 PA 的 access fault）
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h100001, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);  // RW（X=0）
+        do_translate(32'h8040_2123, 2'b00, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H2b: X0 highPA fetch => fault", fault_o, 1'b1);
+        expect_eq32("H2b: X0 fetch => PF12 not AF1",
+                    {27'b0, fault_cause_o}, 32'h0000_000C);
+        //        U 模式 load 到 U=0 的高 PPN 页 ⇒ PF13（不是 AF5）
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_U, 1'b0, 1'b0);
+        expect_eq1("H2b: U-load U0 highPPN => fault", fault_o, 1'b1);
+        expect_eq32("H2b: U-load U0 => PF13 not AF5",
+                    {27'b0, fault_cause_o}, 32'h0000_000D);
+        //        S 模式 store 到只读高 PPN 页 ⇒ PF15（不是 AF7）
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h100001, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1);  // RO, D=1
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H2b: S-store RO highPPN => fault", fault_o, 1'b1);
+        expect_eq32("H2b: S-store RO => PF15 not AF7",
+                    {27'b0, fault_cause_o}, 32'h0000_000F);
+        //   H2c：**SVADE=0 路径也不漏高 PA**：A=0 的高 PPN 叶 ⇒ 不触发 A/D 更新，
+        //        仍报 AF（Svadu 的 A/D 缺失不是 page fault，物理不可达仍是 AF）。
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))]   =
+            mk_pte(22'h100001, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);  // RW, A=0
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("H2c: SVADE0 A0 highPPN => fault", fault_o, 1'b1);
+        expect_eq32("H2c: SVADE0 A0 highPPN => AF7",
+                    {27'b0, fault_cause_o}, 32'h0000_0007);
+        expect_eq1("H2c: SVADE0 highPPN => no ad_update", saw_ad_update, 1'b0);
         //   H3：4 MiB 大页 PPN[1] = 0x800（bit11=1 ⇒ PA[33:32]=10）⇒ access fault
         pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] =
             mk_pte(22'h200_000, 1'b1, 1'b1, 1'b0, 1'b0, 1'b0, 1'b1, 1'b1, 1'b1);  // PPN[0]=0
