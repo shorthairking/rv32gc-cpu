@@ -135,6 +135,20 @@ module rob #(
     output wire [31:0]             trap_tval,
 
     //==================================================================
+    // ★★ P1（ROB 窗口语义根修）：**头部 PC 本拍可安全用于 trap/interrupt**
+    //==================================================================
+    //   1 = 「当前 `trap_pc`（= `win_q[0]` 的 PC 段）就是当前 ROB 头项、且该载荷
+    //       不可能是旧世代/预取旧数据」⇒ 架构状态（中断 mepc / 异常 EPC / 提交 PC）
+    //       本拍可以安全采样它。
+    //   0 = 不得采样 `trap_pc`：可能是"ROB 空/未分配"、窗口标签失配、或载荷读取
+    //       与该项分配存在跨拍竞争（本拍重填尚未完成）。此时中断应保持 pending
+    //       （`cnt==0` 时本核 `trap_ctrl` 也不会取中断），下一拍再看。
+    //   ★ 判据 = 真活性（`cnt_q != 0`，不是"窗口非空"）× 窗口全索引标签命中
+    //     （`win_lane_ok[0]`，其 `win_val` 已在 §5.35 由 `e_ok` / `e_bad
+    //     (= flush_all | squash_valid)` 守卫）。
+    output wire                    head_pc_valid_o,
+
+    //==================================================================
     // 冲刷：squash_idx 及其**之后（更年轻）**的项全部作废（含该项保留）
     //        flush_all = 全清（异常/中断；head 不动）
     //==================================================================
@@ -190,7 +204,26 @@ module rob #(
     reg  [ROB_IDX_W-1:0] win_idx [0:WIN_N-1]; // 每槽全索引标签（命中校验 ⇒ 绝不交付 stale 载荷）
     reg                  win_val [0:WIN_N-1]; // 每槽有效（复位/冲刷清零；read_first 危险拍丢弃）
     reg  [ROB_IDX_W-1:0] e_of_r_q[0:PF_W-1];  // 预取读地址的**打拍版**（读数据下一拍到达时用它定标签）
-    //   ★★ 危险修正（p11 实测）：BRAM 为 `read_first` ⇒ "同拍被写的项，当拍读到旧值"。
+    //   ★★ P1 根修：预取读命令**发出那一拍**的"该目标索引是否已在 ROB 内分配"与
+    //     "该拍是否 flush_all"必须随 `e_of_r_q` 一起打拍，作为窗口填充的采信条件。
+    //     理由（确定性证据见 build/functional/c8-review：p8 的 0x8000802c）：
+    //       · BRAM 同步读在 T 拍发命令、T+1 拍数据到达、T+1→T+2 沿填窗；读回值是
+    //         **T 拍沿之前**的存储内容（read_first）；
+    //       · 若目标索引在 T 拍**尚未分配**（ROB 空/尾后/已 flush），T+1 读回的只是
+    //         上一程序/旧世代的残留载荷；旧实现只比 `win_idx == 目标`（`fhit`）就把
+    //         `win_val` 置 1 ⇒ 下一拍该槽再被 alloc 命中时，提交/中断直接吃旧 PC；
+    //       · `e_ok_q[k]` = 读命令拍 K 的 `live(e_rd_idx[k])`（`0 <= age < cnt`）
+    //         ⇒ 只有"K 拍前已分配 ≥1 拍"的项，读回才一定是**本次分配之后**写入的
+    //         载荷（write 在 K-1 沿或更早完成，K 沿读可见）；
+    //       · `e_bad_q` = T 拍为 `flush_all | squash_valid` ⇒ 该拍发出的读命令
+    //         穿越了**杀伤/世代边界**（flush 会复位/前移 head；squash 会杀
+    //         `squash_idx` 之后的项，且下一拍可能同时 commit/复用被杀索引）
+    //         ⇒ T+1 读回值不得给新 head 重新贴标签（尤其"读 idx1 时 idx1 仍 live，
+    //         同沿 squash 杀 idx1，次拍 commit 旧 head 并 alloc 复用 idx1"的交错）。
+    //     两者都只走 1 拍寄存器，不进入提交组合链。
+    reg  [PF_W-1:0]      e_ok_q;              // 读命令拍：目标索引已分配（live）
+    reg                  e_bad_q;             // 读命令拍：处于 flush_all（世代边界）
+    //   危险修正（p11 实测）：BRAM 为 `read_first` ⇒ "同拍被写的项，当拍读到旧值"。
     //     若预取地址正好是本拍刚分配的项（ROB 近空：清洗后 head≈tail），窗口会被填入**旧载荷**
     //     但标签恰好命中 ⇒ 会交付错误 PC。修法：记下**上一拍的分配索引**，填充时若命中则
     //     **丢弃本次填充并把该槽置为无效**（下一拍重读即可）；冲刷时也全部置无效。
@@ -366,6 +399,34 @@ module rob #(
     end
     endgenerate
 
+    //==========================================================================
+    // 1.2 ★★ P1 根修：预取读命令拍的"已分配（live）"判定
+    //==========================================================================
+    //   ★ 时序对齐（最容易写错的一格，必须与 `e_of_r_q` **同沿同源**）：
+    //     · 读命令在拍 K 的组合 `e_rd_idx[k]` 上发出、在 K 沿被 BRAM 采样；
+    //       读回数据在 K+1 拍可见，K+1 沿填窗（用 K+1 拍沿前的 `e_of_r_q/
+    //       e_ok_q` —— 两者都在 K 沿与 `e_rd_idx` 一起锁存）。
+    //     · 因此 live 判定必须用**同一个 K 拍 `e_rd_idx`** + **K 拍沿前**的
+    //       `head_q/cnt_q`（也就是"发出读命令那一刻"的 ROB 活性），不能拿
+    //       `e_of_r_q`（K 拍沿后才变成 `e_rd_idx[K]`，早一拍）或 K+1 拍的
+    //       指针去判（会把"读后才 alloc"误判成 live）。
+    //   口径与全核 `(idx - head) mod ROB_N < cnt` **逐位同源**（C8 年龄的唯一实现）：
+    //     · 先按 ROB_IDX_W 位做模 N 减法（截断即取模），再**零扩展**到 cnt_q 的
+    //       ROB_IDX_W+1 位比较（cnt=N 时窄位比较会把满窗误判成空窗，见 §1.1）。
+    //   ★ 该判定**只在填窗时**使用（§5.35），不进提交关键路径。
+    wire [PF_W*ROB_IDX_W-1:0] e_rd_idx_flat;   // 本拍读命令的 4 个目标索引（与 bw_roff 同源）
+    wire [PF_W-1:0]           e_live_w;
+    genvar gl;
+    generate
+    for (gl = 0; gl < PF_W; gl = gl + 1) begin : g_live
+        assign e_rd_idx_flat[gl*ROB_IDX_W +: ROB_IDX_W] =
+            idx_add(hpred_w, {{5{1'b0}}, rsel[gl]});
+        wire [ROB_IDX_W-1:0] e_age_w =
+            e_rd_idx_flat[gl*ROB_IDX_W +: ROB_IDX_W] - head_q;   // mod ROB_N
+        assign e_live_w[gl] = ({1'b0, e_age_w} < cnt_q);
+    end
+    endgenerate
+
     //   窗口读（**零 mux**：槽号 = lane 号）+ 命中判定
     //   ★★ EXP-N3：窗口槽号 = 组内 lane 号 ⇒ `win_rd[gi] = win_q[gi]` **直连**，
     //     原 2 lane × 8:1 × RB_W 的窗口读 mux 与按 `idx[2:0]` 的动态索引整体消失。
@@ -391,7 +452,7 @@ module rob #(
     for (gw = 0; gw < PF_W; gw = gw + 1) begin : g_bw
         //   （函数返回值不能直接做位选（iverilog）⇒ 先存临时线）
         wire [ROB_IDX_W-1:0] wt = idx_add(tail_w,  {{5{1'b0}}, wsel[gw]});
-        wire [ROB_IDX_W-1:0] rt = idx_add(hpred_w, {{5{1'b0}}, rsel[gw]});
+        wire [ROB_IDX_W-1:0] rt = e_rd_idx_flat[gw*ROB_IDX_W +: ROB_IDX_W];
         //   `wsel[gw]` 是 2 bit（bank = idx[1:0]）⇒ 恒 < 4 = ALLOC_W，索引天然合法
         assign bw_we[gw]   = alloc_fire & alloc_lane_valid[wsel[gw]] & (wsel[gw] < alloc_n);
         assign bw_woff[gw*5 +: 5] = wt[ROB_IDX_W-1:2];
@@ -561,6 +622,17 @@ module rob #(
                                   : win_q[0][`BACK2_RB_TVAL_MSB:`BACK2_RB_TVAL_LSB];
 
     //==========================================================================
+    // 3b. ★★ P1 根修：头部 PC 安全指示（组合，供中断/trap EPC 采样门控）
+    //==========================================================================
+    //   语义（唯一口径，勿简化成 `win_val[0]`）：
+    //     · `cnt_q != 0`：头项真的在 ROB 内（未分配/已 flush/被 kill 的 index 不算）；
+    //     · `win_lane_ok[0]`：窗口槽 0 有效 + **全索引标签等于当前 head**，且它的
+    //       `win_val` 已在 §5.35 通过 `e_ok_q/e_bad_q`（读命令拍已分配/未跨 flush）筛过；
+    //   ⇒ 为 1 时 `trap_pc` 一定是当前头项分配之后写入的 PC；为 0 时中断必须保持
+    //     pending（不得用 `trap_pc` 写 mepc），异常侧 `trap_valid` 本身已含同一窗口门。
+    assign head_pc_valid_o = (cnt_q != {(ROB_IDX_W+1){1'b0}}) & win_lane_ok[0];
+
+    //==========================================================================
     // 4. 观测输出
     //==========================================================================
     //   ★ ② CSR 提交合成**单 lane 动态读口**：只读被选中的那一项（而非 4 lane 全读）
@@ -611,6 +683,10 @@ module rob #(
                 win_val[k] <= 1'b0;
             end
             for (k = 0; k < PF_W; k = k + 1) e_of_r_q[k] <= {ROB_IDX_W{1'b0}};
+            //   ★★ P1 根修：read-command 采信条件（live / flush|squash 世代）复位后
+            //     一律不采信（复位后的第一次读命令也必须等"目标已分配 ≥1 拍"才允许填窗）。
+            e_ok_q  <= {PF_W{1'b0}};
+            e_bad_q <= 1'b0;
             for (k = 0; k < ROB_N; k = k + 1) begin
                 nq[k]     <= {NQ_W{1'b0}};
                 //   ★★ EXP-B：三张 typed 表只复位 {valid, epoch}（数据数组在 valid=0 时被
@@ -694,13 +770,41 @@ module rob #(
             if (!flush_all && !squash_valid) begin
                 win_q  [0] <= fdat0_w;
                 win_idx[0] <= hpred_w;
-                win_val[0] <= fhit0_w & ~fdang0_w;
+                //   ★★ P1 根修：除"标签命中（fhit）+ 同址危险（fdang）"外，还必须
+                //     **读命令发出那拍目标已分配（e_ok_q）且未穿越 flush/squash 杀伤
+                //     世代（e_bad_q = flush_all | squash_valid）**。
+                //     · e_ok_q=0 的反例：ROB 空/尾后索引的读回值只是旧程序残留；旧实现
+                //       会把它当有效窗口，随后 alloc 命中同 index 时提交/中断吃旧 PC；
+                //     · e_bad_q=1 的反例①：flush 拍发出的读命令，T+1 读回的是旧 head 世代
+                //       的载荷；若只清窗口而不拦这一拍填充，新 head=0（或 head+1）可能
+                //       被旧数据重新贴上"匹配"标签。
+                //     · e_bad_q=1 的反例②（独审 P1）：读 idx1 拍 idx1 仍 live（e_ok=1），
+                //       同沿 squash 保 head0、杀 idx1；T+1 撤 squash 并 commit head0 +
+                //       alloc 复用 idx1=PC B。T 拍旧 idx1=A 的读回在 T+1 沿仍会
+                //       fhit/ e_ok=1/ fdang=0（prevalloc 在 T 拍为 0）⇒ 旧 e_bad（只记
+                //       flush）会把 win0=idx1/A 标成有效；T+2 新 head=idx1 即
+                //       head_pc_valid=1/trap_pc=A，次沿才清已晚。
+                //   ⇒ 未分配项最多多等 1~2 拍重读（插气泡，不串行化提交），**绝不交付
+                //     旧载荷**；fdang 保留为同拍读写的第二道保险。
+                win_val[0] <= fhit0_w & ~fdang0_w & e_ok_q[fsel0_w] & ~e_bad_q;
                 win_q  [1] <= fdat1_w;
                 win_idx[1] <= fidx1_w;
-                win_val[1] <= fhit1_w & ~fdang1_w;
+                win_val[1] <= fhit1_w & ~fdang1_w & e_ok_q[fsel1_w] & ~e_bad_q;
             end
             //   预取地址打拍（下一拍用它给读回的数据定标签）
-            for (k = 0; k < PF_W; k = k + 1) e_of_r_q[k] <= idx_add(hpred_w, {{5{1'b0}}, rsel[k]});
+            //   ★ 与 §1.2 的 `e_rd_idx_flat` 同源（同拍、同一组地址），e_ok_q 与它
+            //     同沿锁存 ⇒ 填窗时"标签 + live 判定"严格指向同一个读命令。
+            for (k = 0; k < PF_W; k = k + 1)
+                e_of_r_q[k] <= e_rd_idx_flat[k*ROB_IDX_W +: ROB_IDX_W];
+            //   ★★ P1 根修：与 `e_of_r_q` **同拍同沿**锁存"读命令拍的 live / flush 世代"；
+            //     下一沿填窗时使用的正是这一组（非阻塞赋值 ⇒ 填窗读旧值，标签/条件严格对齐）。
+            e_ok_q  <= e_live_w;
+            //   ★★ P1 补洞（独审定案）：squash 与 flush 同属"杀伤世代" —— 读命令拍
+            //     目标还 live、同沿 squash 却把它杀掉时，T+1 的旧读回值仍带
+            //     e_ok=1/fhit=1/fdang=0；若 e_bad 只记 flush，它会被标成下一拍新 head 的
+            //     有效窗口（随后 commit/alloc 复用该索引即交付旧 PC）。保守禁止跨杀伤
+            //     响应：squash 拍发出的读命令在下一沿一律不得填窗（只多 1 拍重读）。
+            e_bad_q <= flush_all | squash_valid;
             //   记下本拍分配的索引（下一拍用于上面的危险判定）
             //   ★★ EXP-N1：分配槽数 = ALLOC_W（派发宽度，未变）。
             for (k = 0; k < ALLOC_W; k = k + 1) begin
