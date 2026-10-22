@@ -43,15 +43,15 @@
 #   · 运行：rc=0（超时 ⇒ 失败）；运行日志存在且非空；
 #   · 捕获：不得出现 `FAIL` 字样、不得出现 `DEFECT` 字样（正向模式）；
 #   · 摘要：整行 `FUNCTIONAL_PRIVILEGE_VECTORS total=<d> checks=<d> fails=<d>` **同前缀
-#           恰 1 行**且严格匹配；total 必须 == 本包冻结规格 41、checks>0、fails==0；
+#           恰 1 行**且严格匹配；total 必须 == 本包冻结规格 42、checks>0、fails==0；
 #   · 逐向量：`^VEC <i> checks=<d> fails=<d>$` 行数 == total；编号必须恰为 1..total
 #           （缺号/重号/越界 ⇒ 失败）；每行 fails==0 且 checks>=1（**逐向量 >0，不允许
 #           少跑**）；各行 checks 之和必须 == 摘要 checks；
 #   · 锚点：整行 `FUNCTIONAL_PRIVILEGE: PASS` 恰好 1 行，且整份日志 `PASS` 子串恰 1 次。
 #   失败分支：只打印诊断计数与日志/运行目录路径，**绝不** tail 底层日志（避免把底层
 #            `FUNCTIONAL_PRIVILEGE: PASS` 泄漏到失败 stdout）；rc 精确为 1。
-#   反证模式：当前源须全绿（同上）；冻结基线须 rc!=0、锚点 0、total==41、fails>0、
-#           逐向量行数==41，且 26 个定向缺陷标签全部出现、`CTRL_` 合法控制标签 0 失败。
+#   反证模式：当前源须全绿（同上）；冻结基线须 rc!=0、锚点 0、total==42、fails>0、
+#           逐向量行数==42，且 27 个定向缺陷标签全部出现、`CTRL_` 合法控制标签 0 失败。
 #
 # 用法 : bash sim/functional/test_privilege.sh
 #        DUT_ROOT=<只读源根> bash sim/functional/test_privilege.sh
@@ -71,12 +71,12 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 #------------------------------------------------------------------------------
 # 本包冻结规格（与 tb_privilege_semantics.sv 同步；改 TB 必须同步改这里）
 #------------------------------------------------------------------------------
-readonly SPEC_VECTORS=41
+readonly SPEC_VECTORS=42
 readonly N_HASH_EXPECTED=6        # 3 RTL + 2 vh + TB = 实际编译输入
 readonly BASE_COMMIT_SHORT="201acf61"
 readonly BASE_COMMIT_FULL="201acf61e118a3fb533e1a96768687a35efa1751"
 # 旧基线必须触发的定向缺陷标签（与 TB 头注一致）；`CTRL_` 前缀为合法控制标签
-readonly DEFECT_TAGS="PMP_OWN_L PMP_MID_OWN_L PMP_I15_OWN_L CNTR_S_DISABLED CNTR_U_SCNT_DIS CNTR_HALF_SHADOW TVM_S_ILL SIE_ALIAS_READ SIE_ALIAS_WRITE SIE_PARTIAL_DELEG SIP_ALIAS_READ SIP_UNDELEG_WRITE SIP_PARTIAL_DELEG IRQ_UNDELEG_M IRQ_SRC_S_TO_M IRQ_SSI_U_TO_M BYP_MPRV_1TO0 BYP_SSTATUS_MASK BYP_MPP_S_TO_U BYP_MIE_1TO0 IRQ_MFIRST_U IRQ_MFIRST_S SIE_PREVIEW_DELEG SIE_PREVIEW_PARTIAL SIP_PREVIEW_DELEG SIE_PREVIEW_MIDELEG_SAME"
+readonly DEFECT_TAGS="PMP_OWN_L PMP_MID_OWN_L PMP_I15_OWN_L CNTR_S_DISABLED CNTR_U_SCNT_DIS CNTR_HALF_SHADOW TVM_S_ILL SIE_ALIAS_READ SIE_ALIAS_WRITE SIE_PARTIAL_DELEG SIP_ALIAS_READ SIP_UNDELEG_WRITE SIP_PARTIAL_DELEG IRQ_UNDELEG_M IRQ_SRC_S_TO_M IRQ_SSI_U_TO_M BYP_MPRV_1TO0 BYP_SSTATUS_MASK BYP_MPP_S_TO_U BYP_MIE_1TO0 IRQ_MFIRST_U IRQ_MFIRST_S SIE_PREVIEW_DELEG SIE_PREVIEW_PARTIAL SIP_PREVIEW_DELEG SIE_PREVIEW_MIDELEG_SAME MSTATUS_SD_DIRTY"
 
 usage() {
     cat <<'EOF'
@@ -398,7 +398,7 @@ selftest_main() {
     st_dir="$(mktemp -d "${AUTH_ROOT}/privilege/selftest.XXXXXXXX")"
     local pass=0 total=0
 
-    # ---- 生成一份"合法"运行日志夹具：摘要 + 41 条逐向量（checks=1，fails=0）+ 锚点 ----
+    # ---- 生成一份"合法"运行日志夹具：摘要 + SPEC_VECTORS 条逐向量（checks=1，fails=0）+ 锚点 ----
     mk_good_log() {
         local out="$1" i
         : > "$out"
@@ -439,14 +439,14 @@ selftest_main() {
     grep -v '^FUNCTIONAL_PRIVILEGE: PASS$' "${st_dir}/good.log" > "${st_dir}/no_anchor.log" || true
     cp "${st_dir}/good.log" "${st_dir}/dup_anchor.log"; printf 'FUNCTIONAL_PRIVILEGE: PASS\n' >> "${st_dir}/dup_anchor.log"
     grep -v '^FUNCTIONAL_PRIVILEGE_VECTORS ' "${st_dir}/good.log" > "${st_dir}/no_summary.log" || true
-    cp "${st_dir}/good.log" "${st_dir}/dup_summary.log"; printf 'FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=41 fails=0\n' >> "${st_dir}/dup_summary.log"
-    sed 's/^FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=41 fails=0$/FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=41/' \
+    cp "${st_dir}/good.log" "${st_dir}/dup_summary.log"; printf 'FUNCTIONAL_PRIVILEGE_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$SPEC_VECTORS" >> "${st_dir}/dup_summary.log"
+    sed "s/^FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} checks=${SPEC_VECTORS} fails=0$/FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} checks=${SPEC_VECTORS}/" \
         "${st_dir}/good.log" > "${st_dir}/bad_summary_fmt.log"
-    sed 's/^FUNCTIONAL_PRIVILEGE_VECTORS total=41 /FUNCTIONAL_PRIVILEGE_VECTORS total=40 /' \
+    sed "s/^FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} /FUNCTIONAL_PRIVILEGE_VECTORS total=$((SPEC_VECTORS - 1)) /" \
         "${st_dir}/good.log" > "${st_dir}/bad_total.log"
-    sed "s/^FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=41 fails=0$/FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=0 fails=0/" \
+    sed "s/^FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} checks=${SPEC_VECTORS} fails=0$/FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} checks=0 fails=0/" \
         "${st_dir}/good.log" > "${st_dir}/zero_checks.log"
-    sed 's/^FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=41 fails=0$/FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=41 fails=1/' \
+    sed "s/^FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} checks=${SPEC_VECTORS} fails=0$/FUNCTIONAL_PRIVILEGE_VECTORS total=${SPEC_VECTORS} checks=${SPEC_VECTORS} fails=1/" \
         "${st_dir}/good.log" > "${st_dir}/summary_fails.log"
     grep -v "^VEC ${SPEC_VECTORS} " "${st_dir}/good.log" > "${st_dir}/vec_missing_line.log" || true
     sed "s/^VEC ${SPEC_VECTORS} /VEC $((SPEC_VECTORS - 1)) /" "${st_dir}/good.log" > "${st_dir}/vec_dup_idx.log"

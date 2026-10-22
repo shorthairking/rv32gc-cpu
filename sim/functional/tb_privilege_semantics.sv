@@ -4,7 +4,7 @@
 //==============================================================================
 // 目的 : 用**同一份** TB 对两个源码根（DUT_ROOT）编译运行做对照：
 //          · 当前（已修）源码 ⇒ 全部向量通过，打印机读摘要
-//            `FUNCTIONAL_PRIVILEGE_VECTORS total=41 checks=<C> fails=0`、41 行
+//            `FUNCTIONAL_PRIVILEGE_VECTORS total=42 checks=<C> fails=0`、42 行
 //            `VEC <i> checks=<d> fails=0` 与唯一整行 `FUNCTIONAL_PRIVILEGE: PASS`；
 //          · 冻结基线 201acf61 ⇒ 定向缺陷标签必须触发 `PRIV FAIL [TAG]`（反向 oracle），
 //            摘要 fails>0，退出码非 0，且**不**打印 PASS。
@@ -13,7 +13,7 @@
 // 机读输出契约（test_privilege.sh 严格解析；同前缀必须唯一）:
 //   · `VEC <i> checks=<d> fails=<d>`：第 i 个向量结算行（i = 1..SPEC_VECTORS，恰各一次）；
 //   · `FUNCTIONAL_PRIVILEGE_VECTORS total=<d> checks=<d> fails=<d>`：总摘要
-//     （total 必须 == 41；checks == 各向量 checks 之和；fails == 0 才 PASS）；
+//     （total 必须 == 42；checks == 各向量 checks 之和；fails == 0 才 PASS）；
 //   · `FUNCTIONAL_PRIVILEGE: PASS`：仅当 total/逐向量/全局检查全过时打印（唯一 PASS 子串）。
 //   失败行统一为 `PRIV FAIL [TAG]: ...`；每个向量在 TB 内自判"至少 1 项检查"
 //   （缺检查 ⇒ `PRIV FAIL [VEC_EMPTY]` 且该向量行 fails=1）。
@@ -35,7 +35,7 @@
 //     SIP_UNDELEG_WRITE / SIP_PARTIAL_DELEG / IRQ_UNDELEG_M / IRQ_SRC_S_TO_M /
 //     IRQ_SSI_U_TO_M / BYP_MPRV_1TO0 / BYP_SSTATUS_MASK / BYP_MPP_S_TO_U / BYP_MIE_1TO0 /
 //     IRQ_MFIRST_U / IRQ_MFIRST_S / SIE_PREVIEW_DELEG / SIE_PREVIEW_PARTIAL /
-//     SIP_PREVIEW_DELEG / SIE_PREVIEW_MIDELEG_SAME；
+//     SIP_PREVIEW_DELEG / SIE_PREVIEW_MIDELEG_SAME / MSTATUS_SD_DIRTY；
 //   · 合法控制标签（两实现都必须通过，前缀 `CTRL_`）：PMP_SUCC_TOR / PMP_SUCC_NONTOR /
 //     PMP_I15_PRED_FREE / CNTR_M_FREE / CNTR_S_ENABLED / CNTR_U_BOTH_EN / TVM_M_OK /
 //     TVM_CLEARED_OK / SIP_DELEG_WRITE / IRQ_M_GATED / IRQ_DELEG_S / IRQ_DELEG_M_MASK /
@@ -56,7 +56,7 @@ module tb_privilege_semantics;
     //--------------------------------------------------------------------------
     // 冻结规格：向量总数（改动 TB 必须同步 test_privilege.sh 的 SPEC_VECTORS）
     //--------------------------------------------------------------------------
-    localparam integer SPEC_VECTORS = 41;
+    localparam integer SPEC_VECTORS = 42;
 
     //--------------------------------------------------------------------------
     // 时钟 / 复位
@@ -767,6 +767,40 @@ module tb_privilege_semantics;
         @(posedge clk); #1;
         csr_read_val(`RV32GC_CSR_SIP, rdv);
         chk32("CTRL_SIP_PREVIEW_FULL_LAND", rdv, 32'h0000_0220);
+
+        // ---- V42：【SD 派生】FS=Off/Initial/Clean ⇒ SD=0；FS=Dirty ⇒ SD=1 ----
+        //   machine.adoc:883-887（SD 汇总 dirty；编码 824-843：只有 FS=3 是 Dirty）；
+        //   本核 VS/XS=0 ⇒ SD=(FS==3)。旧树 FS!=Off ⇒ FS=1 读回 0x8000_2000
+        //   （Spike 0x2000）。★ 旧树红的新检查一律不用 CTRL_ 前缀（基线门禁要求 0 条
+        //   CTRL fail），只有两树都应为真的才用 CTRL_。
+        vec_begin;
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0000_0000);
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("CTRL_SD_FS_OFF", rdv, 32'h0000_0000);
+        csr_write(`RV32GC_CSR_MSTATUS, (2'b01 << `RV32GC_MSTATUS_FS_LSB));
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("MSTATUS_SD_DIRTY", rdv, 32'h0000_2000);          // ★ 旧树红（defect tag）
+        chk32("SD_FS_INITIAL_MO", mstatus_o, 32'h0000_2000);    // ★ 旧树红（非 CTRL）
+        csr_write(`RV32GC_CSR_MSTATUS, (2'b10 << `RV32GC_MSTATUS_FS_LSB));
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("SD_FS_CLEAN", rdv, 32'h0000_4000);               // ★ 旧树红（非 CTRL）
+        csr_write(`RV32GC_CSR_MSTATUS, (2'b11 << `RV32GC_MSTATUS_FS_LSB));
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("CTRL_SD_FS_DIRTY", rdv, 32'h8000_6000);          // 两树皆真
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h8000_0000);
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("CTRL_SD_RO", rdv, 32'h0000_0000);                // 只读 SD 不可置脏
+        csr_write(`RV32GC_CSR_SSTATUS, 32'h0000_6000);
+        csr_read_val(`RV32GC_CSR_SSTATUS, rdv);
+        chk32("CTRL_SD_SSTATUS", rdv, 32'h8000_6000);
+        @(negedge clk);
+        raddr = `RV32GC_CSR_MSTATUS; waddr = `RV32GC_CSR_MSTATUS;
+        wdata = 32'h0000_2000; byp_wdata = 32'h0000_2000; wen = 1'b1; #1;
+        chk32("SD_PREVIEW_CLEAR", rdata_w, 32'h0000_2000);      // ★ 旧树红（非 CTRL）
+        chk32("SD_PREVIEW_CLEAR_BYP", byp_rdata, 32'h0000_2000);
+        @(posedge clk); #1;
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        @(posedge clk); #1;
 
         //======================================================================
         // 汇总（fail-closed）

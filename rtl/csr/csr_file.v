@@ -483,6 +483,8 @@ module csr_file (
         reg [1:0]  mode_new;
         reg [1:0]  cbie_new;
         reg [1:0]  mpp_new;
+        reg [31:0] res;
+        reg [1:0]  fs_new;
         reg        sip_ssip_new;
         begin
             m = wr_mask(a);
@@ -524,14 +526,26 @@ module csr_file (
                         csr_landing = (d & m & ~32'h0000_0030) | ({30'b0, cbie_new} << 4);
                     end
                     // ---- ② mstatus：MPP 在落地处 WARL 合法化（F1-B）----
-                    //   写 2'b10 ⇒ 落盘/读回 = S；其余字段仍走通用掩码替换（SD 只读位
-                    //   由 cur 保留）。这样 mstatus 读回、rdata_w/byp_rdata 预览与
-                    //   priv_ctrl 的旁路口径三者一致。
+                    //   写 2'b10 ⇒ 落盘/读回 = S；其余字段走掩码替换。
+                    //   ★ SD 是只读派生位（bit31）：落盘/读回/写口/M 级预览都必须由
+                    //     **落盘后的 FS** 重新派生（FS==Dirty ⇒ 1），不能从 cur 保留旧 SD，
+                    //     否则同拍写 FS（如 Clean→Dirty 或 Dirty→Initial）预览的 SD 会滞后。
                     `RV32GC_CSR_MSTATUS: begin
                         mpp_new = mpp_warl(d[`RV32GC_MSTATUS_MPP_LSB +: 2]);
-                        csr_landing = (d & m & ~(32'h3 << `RV32GC_MSTATUS_MPP_LSB)) |
-                                      ({30'b0, mpp_new} << `RV32GC_MSTATUS_MPP_LSB) |
-                                      (cur & ~m);
+                        res = (d & m & ~(32'h3 << `RV32GC_MSTATUS_MPP_LSB)) |
+                              ({30'b0, mpp_new} << `RV32GC_MSTATUS_MPP_LSB) |
+                              (cur & ~m);
+                        fs_new = (res >> `RV32GC_MSTATUS_FS_LSB) & `RV32GC_MSTATUS_FS_MSK;
+                        csr_landing = (res & ~(32'h1 << `RV32GC_MSTATUS_SD_BIT)) |
+                                      ({31'b0, (fs_new == `RV32GC_FS_DIRTY)}
+                                        << `RV32GC_MSTATUS_SD_BIT);
+                    end
+                    `RV32GC_CSR_SSTATUS: begin
+                        res = (d & m) | (cur & ~m);
+                        fs_new = (res >> `RV32GC_MSTATUS_FS_LSB) & `RV32GC_MSTATUS_FS_MSK;
+                        csr_landing = (res & ~(32'h1 << `RV32GC_MSTATUS_SD_BIT)) |
+                                      ({31'b0, (fs_new == `RV32GC_FS_DIRTY)}
+                                        << `RV32GC_MSTATUS_SD_BIT);
                     end
                     // ---- ② SIE/SIP：**delegation-aware 别名落地**（P1-05 旁路一致性修复）----
                     //   规范（machine.adoc，KB chunk 10554）：只有 mideleg 置位的位在
@@ -570,8 +584,8 @@ module csr_file (
                     `RV32GC_CSR_PMPADDR14, `RV32GC_CSR_PMPADDR15:
                         csr_landing = pmp_addr_locked(a, pmp_cfg_cur) ? cur : (d & m);
                     // ---- 通用：可写位取写数据，其余位保持当前读回值 ----
-                    //   （mstatus/sstatus 的 SD 等派生位即使略旧也会被 core_top 的
-                    //    FS/SD 覆盖逻辑重新派生；mip 的只读设备位由此保持）
+                    //   （mstatus/sstatus 已在上面的显式分支里派生 SD；mip 的只读设备位
+                    //    由此保持）
                     default: csr_landing = (d & m) | (cur & ~m);
                 endcase
             end
@@ -773,9 +787,12 @@ module csr_file (
     //==========================================================================
     // 5. 组合只读视图（全部 assign，红线 3）
     //==========================================================================
-    // ---- mstatus：存储位 | 常量位；SD 由 FS!=Off 派生（只读汇总） ----
+    // ---- mstatus：存储位 | 常量位；SD 由 **FS==Dirty** 派生（只读汇总） ----
+    //   machine.adoc:883-887：SD 汇总 FS/VS/XS 的 **dirty** 状态；编码 824-843 中
+    //   FS=3(Dirty) 才 dirty（0=Off/1=Initial/2=Clean 均非 dirty）。本核 VS/XS=0
+    //   ⇒ SD = (FS == FS_DIRTY)，不是"FS != Off"（后者会把 Initial/Clean 误置 SD）。
     wire [31:0] mstat_fs  = (mstat_sw >> `RV32GC_MSTATUS_FS_LSB) & `RV32GC_MSTATUS_FS_MSK;
-    wire        mstat_sd  = (mstat_fs != `RV32GC_FS_OFF);
+    wire        mstat_sd  = (mstat_fs == `RV32GC_FS_DIRTY);
     wire [31:0] mstatus_view =
         (mstat_sw & wr_mask(`RV32GC_CSR_MSTATUS)) |
         (mstat_sd << `RV32GC_MSTATUS_SD_BIT);

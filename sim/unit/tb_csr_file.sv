@@ -601,6 +601,54 @@ module tb_csr_file_top;
         csr_write(`RV32GC_CSR_MSTATUS, 32'h0);
 
         //======================================================================
+        // M5. 【SD 派生】FS dirty 汇总：Off/Initial/Clean⇒SD=0，Dirty⇒SD=1
+        //   machine.adoc:883-887（SD 汇总 dirty；编码 824-843：只有 FS=3 是 Dirty）。
+        //   本核 VS/XS=0 ⇒ SD=(FS==3)。★ 反证：旧"FS!=Off"会把 Initial/Clean 误置 SD
+        //   （写 FS=1 读回 0x8000_2000，Spike 为 0x2000）。
+        //======================================================================
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0000_0000); #1;
+        csr_read_chk("M5 FS=Off ⇒ SD=0", `RV32GC_CSR_MSTATUS, 32'h0000_0000);
+        expect_eq32("M5 FS=Off mstatus_o SD=0", mstatus_o, 32'h0000_0000);
+        csr_write(`RV32GC_CSR_MSTATUS, (2'b01 << `RV32GC_MSTATUS_FS_LSB)); #1;
+        csr_read_chk("★ M5 FS=Initial ⇒ SD=0（Spike 0x2000）",
+                     `RV32GC_CSR_MSTATUS, 32'h0000_2000);
+        expect_eq32("★ M5 FS=Initial mstatus_o == 0x2000", mstatus_o, 32'h0000_2000);
+        csr_write(`RV32GC_CSR_MSTATUS, (2'b10 << `RV32GC_MSTATUS_FS_LSB)); #1;
+        csr_read_chk("★ M5 FS=Clean ⇒ SD=0（Spike 0x4000）",
+                     `RV32GC_CSR_MSTATUS, 32'h0000_4000);
+        csr_write(`RV32GC_CSR_MSTATUS, (2'b11 << `RV32GC_MSTATUS_FS_LSB)); #1;
+        csr_read_chk("M5 FS=Dirty ⇒ SD=1（0x8000_6000）",
+                     `RV32GC_CSR_MSTATUS, 32'h8000_6000);
+        expect_eq32("M5 FS=Dirty mstatus_o == 0x8000_6000", mstatus_o, 32'h8000_6000);
+        //   ---- 只读 SD 不能由软件置脏（FS=Off 时写 bit31 仍读 0）----
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h8000_0000); #1;
+        csr_read_chk("★ M5 软件写 SD=1（FS=Off）⇒ 读回 SD=0",
+                     `RV32GC_CSR_MSTATUS, 32'h0000_0000);
+        //   ---- sstatus 别名同口径 ----
+        csr_write(`RV32GC_CSR_SSTATUS, 32'h0000_2000); #1;
+        csr_read_chk("★ M5 sstatus FS=Initial ⇒ SD=0", `RV32GC_CSR_SSTATUS, 32'h0000_2000);
+        csr_write(`RV32GC_CSR_SSTATUS, 32'h0000_6000); #1;
+        csr_read_chk("M5 sstatus FS=Dirty ⇒ SD=1", `RV32GC_CSR_SSTATUS, 32'h8000_6000);
+        //   ---- 同拍写预览：SD 必须由落盘后 FS 派生（Dirty→Initial 清 SD）----
+        @(negedge clk);
+        raddr = `RV32GC_CSR_MSTATUS; waddr = `RV32GC_CSR_MSTATUS;
+        wdata = 32'h0000_2000; byp_wdata = 32'h0000_2000; wen = 1'b1; #1;
+        expect_eq32("★ M5 W rdata_w：Dirty→Initial 同拍预览 SD=0",
+                    rdata_w, 32'h0000_2000);
+        expect_eq32("★ M5 M byp_rdata：同拍预览 SD=0", byp_rdata, 32'h0000_2000);
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        //   ---- 反向：Initial→Dirty 同拍预览 SD=1 ----
+        @(negedge clk);
+        raddr = `RV32GC_CSR_MSTATUS; waddr = `RV32GC_CSR_MSTATUS;
+        wdata = 32'h0000_6000; byp_wdata = 32'h0000_6000; wen = 1'b1; #1;
+        expect_eq32("★ M5 W rdata_w：Initial→Dirty 同拍预览 SD=1",
+                    rdata_w, 32'h8000_6000);
+        expect_eq32("★ M5 M byp_rdata：同拍预览 SD=1", byp_rdata, 32'h8000_6000);
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        //   ---- 收尾 ----
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0);
+
+        //======================================================================
         // N. mie / mip 与中断请求
         //======================================================================
         csr_write(`RV32GC_CSR_MIE, 32'h0000_0AAA);   // bit1|3|5|7|9|11 = 0xAAA
