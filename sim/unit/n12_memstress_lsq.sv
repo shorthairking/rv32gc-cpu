@@ -161,6 +161,11 @@ module n12_memstress_lsq_top;
         .mem_req_ready(mem_req_ready), .mem_rsp_valid(mem_rsp_valid),
         .mem_rsp_rdata(mem_rsp_rdata), .mem_rsp_tag(mem_rsp_tag),
         .mem_rsp_err(mem_rsp_err),
+`ifndef LSQ_LEGACY_IF
+        //   ★★ F4：旧直驱夹具显式建模新 active 输入 known 0（禁止 Z 兼容逃生）。
+        .mem_rsp_cause(4'd0), .mem_rsp_defer(1'b0), .mem_rsp_side(1'b0),
+        .st_xlate_fault_cause(4'd0),
+`endif
         .exc_valid_o(exc_valid_o), .exc_rob_o(exc_rob_o),
         .exc_cause_o(exc_cause_o), .exc_tval_o(exc_tval_o),
         .wb_valid(wb_valid), .wb_rob(wb_rob), .wb_epoch(wb_epoch),

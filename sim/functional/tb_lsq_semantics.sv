@@ -86,6 +86,27 @@ module tb_lsq_semantics_top;
     wire [31:0]      mem_rsp_rdata;
     wire [TAG_W-1:0] mem_rsp_tag;
     wire             mem_rsp_err;
+    //   ★★ F4：本 TB 是“旧接口”用例。`LSQ_NEW_PORTS_TIE` 由包脚本在**检测到新 DUT**
+    //     时定义 ⇒ 新增 active 输入**显式驱 known 0**（不用产品 RTL 的 Z 兼容逃生口）；
+    //     对旧树（无新口）不定义，同一 TB 源码仍可编译复跑旧 18/285。
+`ifdef LSQ_NEW_PORTS_TIE
+    reg  [3:0]       mem_rsp_cause = 0;
+    reg              mem_rsp_defer = 0;
+    reg              mem_rsp_side  = 0;
+    reg  [3:0]       st_xlate_fault_cause = 0;
+    wire [3:0]       mem_req_bytes;
+    wire [3:0]       mem_req_bmask;
+    wire [ROBW-1:0]  mem_req_rob;
+    wire             mem_req_is_head;
+    wire [7:0]       st_xlate_bmask8;
+    wire [3:0]       st_xlate_bytes;
+    wire             st_xlate_xpg;
+    wire             side_issue_valid;
+    wire [ROBW-1:0]  side_issue_rob;
+    wire             side_pending;
+    wire [ROBW-1:0]  side_pending_rob;
+    wire [OUT_N-1:0] ld_kill_tags;
+`endif
 
     wire             exc_valid_o;
     wire [ROBW-1:0]  exc_rob_o;
@@ -141,6 +162,17 @@ module tb_lsq_semantics_top;
         .mem_req_ready(mem_req_ready), .mem_rsp_valid(mem_rsp_valid),
         .mem_rsp_rdata(mem_rsp_rdata), .mem_rsp_tag(mem_rsp_tag),
         .mem_rsp_err(mem_rsp_err),
+`ifdef LSQ_NEW_PORTS_TIE
+        .mem_rsp_cause(mem_rsp_cause), .mem_rsp_defer(mem_rsp_defer),
+        .mem_rsp_side(mem_rsp_side),
+        .mem_req_bytes(mem_req_bytes), .mem_req_bmask(mem_req_bmask),
+        .mem_req_rob(mem_req_rob), .mem_req_is_head(mem_req_is_head),
+        .st_xlate_bmask8(st_xlate_bmask8), .st_xlate_bytes(st_xlate_bytes),
+        .st_xlate_xpg(st_xlate_xpg), .st_xlate_fault_cause(st_xlate_fault_cause),
+        .side_issue_valid(side_issue_valid), .side_issue_rob(side_issue_rob),
+        .side_pending(side_pending), .side_pending_rob(side_pending_rob),
+        .ld_kill_tags(ld_kill_tags),
+`endif
         .exc_valid_o(exc_valid_o), .exc_rob_o(exc_rob_o),
         .exc_cause_o(exc_cause_o), .exc_tval_o(exc_tval_o),
         .wb_valid(wb_valid), .wb_rob(wb_rob), .wb_epoch(wb_epoch),
@@ -489,6 +521,10 @@ module tb_lsq_semantics_top;
             alloc_valid = 0; lalloc_valid = 0; dr_valid = 0;
             exe_valid = 0; exe_is_store = 0; exe_is_fp = 0;
             mem_req_ready = 0; st_xlate_en = 0; st_xlate_ctx = 0;
+`ifdef LSQ_NEW_PORTS_TIE
+            mem_rsp_cause = 0; mem_rsp_defer = 0; mem_rsp_side = 0;
+            st_xlate_fault_cause = 0;
+`endif
             stx_adapt_en = 1; pg1_fault = 0; stx_adapt_delay = 0; rsp_force = 0;
             rsp_force_err = 0; rob_head = 0; squash_idx = 0; cmt_n = 0;
             exe_wdata_hi = 0; iss_rob = 0;

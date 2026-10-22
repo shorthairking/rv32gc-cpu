@@ -112,6 +112,13 @@ module tb_back2_lsq_fwd_top;
         .mem_req_wdata(mem_req_wdata), .mem_req_wstrb(mem_req_wstrb), .mem_req_tag(mem_req_tag),
         .mem_req_ready(mem_req_ready), .mem_rsp_valid(mem_rsp_valid), .mem_rsp_rdata(mem_rsp_rdata),
         .mem_rsp_tag(mem_rsp_tag),
+`ifndef LSQ_LEGACY_IF
+        //   ★★ F4：旧直驱夹具显式建模新 active 输入 known 0（禁止 Z 兼容逃生）；
+        //     本夹具不做设备/带错/翻译语义，故全部为 0。新输出口悬空即可。
+        .mem_rsp_err(1'b0),
+        .mem_rsp_cause(4'd0), .mem_rsp_defer(1'b0), .mem_rsp_side(1'b0),
+        .st_xlate_fault_cause(4'd0),
+`endif
         .wb_valid(wb_valid), .wb_rob(wb_rob), .wb_epoch(wb_epoch), .wb_dst_i(wb_dst_i),
         .wb_dst_f(wb_dst_f), .wb_pdest_i(wb_pdest_i), .wb_pdest_f(wb_pdest_f), .wb_data(wb_data),
         .st_done_valid(st_done_valid), .st_done_rob(st_done_rob), .st_done_epoch(st_done_epoch),

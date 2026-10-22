@@ -254,9 +254,17 @@ SHA_PRE="$(cat -- "$FREEZE_PRE_OUT")" || emit_fail "sha256_pre_read_failed"
 #------------------------------------------------------------------------------
 #   ★ 初审 #3：编译在 **DUT_ROOT 子 shell** 内进行（并显式 `-I "$DUT_ROOT"`）——
 #   头文件只允许来自被冻结的 DUT_ROOT，禁止借调用者 cwd 里同路径的 `back2_params.vh`。
+#   ★★ F4：旧 18/285 TB 用**纯宏**适配新口 —— 仅当 DUT 源码含新 active 口
+#     （`mem_rsp_cause`）时定义 `LSQ_NEW_PORTS_TIE`，把新输入显式驱 known 0；
+#     旧树（无新口）不定义 ⇒ 同一 TB 仍可编译复跑旧 18/285。
+EXTRA_DEFS=()
+if grep -q 'mem_rsp_cause' "$DUT_LSQ"; then
+    EXTRA_DEFS=(-D LSQ_NEW_PORTS_TIE)
+fi
 (
     cd -- "$DUT_ROOT" || exit 91
     exec timeout "$TIMEOUT_COMPILE_S" "$IV" -g2012 -Wall -I "$DUT_ROOT" \
+        "${EXTRA_DEFS[@]}" \
         -s tb_lsq_semantics_top -o "$VVP_OUT" \
         "$TB_SRC" "$DUT_LSQ"
 ) > "$COMPILE_LOG" 2>&1
