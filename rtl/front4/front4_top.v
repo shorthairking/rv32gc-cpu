@@ -145,6 +145,8 @@ module front4_top #(
     input  wire        sv32_translate_en,
     input  wire        sv32_translate_done,
     input  wire        sv32_translate_fault,
+    //   ★ F05-02（方案 A）：只在 fault=1 时有效的 cause 分类（1=access fault / 0=page fault）。
+    input  wire        sv32_translate_fault_af,
     input  wire [31:0] sv32_translate_paddr,
     output wire        tr_req_valid,
     output wire [31:0] tr_req_va,
@@ -158,11 +160,16 @@ module front4_top #(
     input  wire [31:0] l1i_rdata,
     input  wire        l1i_miss,
     input  wire        l1i_uncached,
+    //   ★ 响应错误包B（默认 0 ⇒ 未接线 caller 行为不变）：错误是该活动挂起 word 的终态，
+    //     可独立于 ready；`l1i_rsp_err_pa` 仅 err 有效时携带原填充物理行（PA[31:5]）。
+    input  wire        l1i_rsp_err = 1'b0,
+    input  wire [31:0] l1i_rsp_err_pa = 32'h0,
     output wire        unc_req_valid,
     output wire [31:0] unc_req_pa,
     input  wire        unc_rsp_valid,
     input  wire [31:0] unc_rsp_pa,
     input  wire [31:0] unc_rsp_data,
+    input  wire        unc_rsp_err = 1'b0,
 
     //==================================================================
     // 输出：观测/统计
@@ -213,6 +220,11 @@ module front4_top #(
 
     wire        ckpt_alloc_valid, ckpt_full;
     wire [3:0]  ckpt_alloc_id;
+    //   ★ 稳定 ID：前端取消保持块时归还预留 id。**不再与后端释放口 mux 合并**（旧实现
+    //     外部优先，两者同拍会丢一个 ⇒ 池项泄漏）；两路分别直连 predictor_top 的两个
+    //     独立释放口，同拍事件都兑现（见 predictor_top 端口注释）。
+    wire        fe_ckpt_hold_free_valid;
+    wire [3:0]  fe_ckpt_hold_free_id;
 
     wire        ckpt_restore_used = redirect_valid & redirect_use_ckpt;
     wire [31:0] ras_repair_addr_w;
@@ -280,6 +292,8 @@ module front4_top #(
         //   ★ K1'：整机冲刷 ⇒ 清空检查点池（见 predictor_top 的 ckpt_clear_all 说明）
         .ckpt_clear_all(ckpt_clear_all),
         .ckpt_free_valid(ckpt_free_valid), .ckpt_free_id(ckpt_free_id),
+        .ckpt_hold_free_valid(fe_ckpt_hold_free_valid),
+        .ckpt_hold_free_id(fe_ckpt_hold_free_id),
         .ckpt_restore_valid(ckpt_restore_used), .ckpt_restore_id(redirect_ckpt),
         .bpu_br_total(bpu_br_total), .bpu_br_mispred(bpu_br_mispred),
         .bpu_dir_mispred(bpu_dir_mispred), .bpu_target_mispred(bpu_target_mispred),
@@ -311,18 +325,23 @@ module front4_top #(
         .lu_en(lu_en), .lu_pc0(lu_pc0), .lu_pc1(lu_pc1), .lu_pack(lu_pack),
         .ras_top(ras_top), .ras_empty(ras_empty),
         .ckpt_alloc_valid(ckpt_alloc_valid), .ckpt_alloc_id(ckpt_alloc_id),
+        .ckpt_hold_free_valid(fe_ckpt_hold_free_valid),
+        .ckpt_hold_free_id(fe_ckpt_hold_free_id),
         .ckpt_full(ckpt_full),
         .sv32_translate_en(sv32_translate_en),
         .sv32_translate_done(sv32_translate_done),
         .sv32_translate_fault(sv32_translate_fault),
+        .sv32_translate_fault_af(sv32_translate_fault_af),
         .sv32_translate_paddr(sv32_translate_paddr),
         .tr_req_valid(tr_req_valid), .tr_req_va(tr_req_va),
         .l1i_req_valid(l1i_req_valid), .l1i_req_addr(l1i_req_addr),
         .l1i_req_line(l1i_req_line),
         .l1i_ready(l1i_ready), .l1i_rdata(l1i_rdata),
         .l1i_miss(l1i_miss), .l1i_uncached(l1i_uncached),
+        .l1i_rsp_err(l1i_rsp_err), .l1i_rsp_err_pa(l1i_rsp_err_pa),
         .unc_req_valid(unc_req_valid), .unc_req_pa(unc_req_pa),
         .unc_rsp_valid(unc_rsp_valid), .unc_rsp_pa(unc_rsp_pa), .unc_rsp_data(unc_rsp_data),
+        .unc_rsp_err(unc_rsp_err),
         .priv(priv), .pmpcfg_i(pmpcfg_i), .pmpaddr_i(pmpaddr_i),
         .blk_valid(blk_valid), .blk_ready(blk_ready), .blk_mask(blk_mask),
         .blk_next_pc(blk_next_pc), .blk_taken(blk_taken),
@@ -341,8 +360,19 @@ module front4_top #(
         .cnt_restart(cnt_restart), .cnt_stall(cnt_stall), .cnt_req(cnt_req)
     );
 
-    assign fe_fetch_fault = blk_valid & (|lane_fault);
+    //   ★ 2026-10-22（F2）：对外故障只能由**本块 mask 内**的 lane 归约。
+    //     `lane_fault` 是 4 个槽位的组合值：块在较早的 taken/页尾/故障 lane 终止时，
+    //     更年轻的 marker（下一页翻译故障）或更年轻 lane 的 PMP 故障可以已在缓冲里、
+    //     落在 mask 之外。冻结后首次呈现/older-taken 场景下这些槽位不属于本块，
+    //     未 mask 的 `|lane_fault` 会让 `fe_fetch_fault` 伪高（后端据此误报异常）。
+    wire [3:0] lane_fault_masked = lane_fault & blk_mask;
+    assign fe_fetch_fault = blk_valid & (|lane_fault_masked);
     assign fe_frozen      = fe_fetch_fault | break_point | fe_stall;
+
+    //   ★ F05-09（2026-10-20）：`ras_repair_addr` 原为未驱动输出（内部只用了
+    //     `ras_repair_addr_w` 接 predictor 并参与 `redir_all_pc`）。此处直接把内部
+    //     值引出——不改任何内部重定向口径，只补齐对外端口契约（最小 assign）。
+    assign ras_repair_addr = ras_repair_addr_w;
 
     assign fetch_pc_o = f_pc;
     assign head_pc_o  = f_head_pc;

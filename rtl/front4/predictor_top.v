@@ -21,7 +21,9 @@
 //      ——理由见 04 §3.2/§3.3：计数器与选择器只能用**当时**的预测来训练，
 //      否则学的是被后续训练改过的表。
 //   ③ 检查点段 `ckpt_*`：分支推测点分配（16 项，03 §3.4），误判重定向按 id 恢复
-//      RAS 深度（+ 方案 B 时的 GHR）；后端提交时释放。
+//      RAS 深度（+ 方案 B 时的 GHR）；后端提交时释放。**两个独立释放口**：
+//      `ckpt_free_*`（后端提交/丢弃）与 `ckpt_hold_free_*`（前端取消 held 块），
+//      同拍事件都兑现（旧单口 mux 会丢一个 ⇒ 池泄漏）。
 //
 // 【GHR 方案选择】`SPEC_GHR=0`（默认）= 04 §5.3 **方案 A**：GHR 只在提交点更新，
 //   误判无需回滚（消除一整类恢复静默错）。`SPEC_GHR=1` = 方案 B：GHR 亦为推测态，
@@ -127,6 +129,16 @@ module predictor_top #(
     //     它把 ROB 清空 ⇒ 所有在飞检查点都失效 ⇒ 一次性归还全部池项（正确且无副作用）。
     input  wire         ckpt_clear_all,
     input  wire [3:0]   ckpt_free_id,
+    //   ★★ 前端内部第二释放口（母 2026-10-20 批准的最小内部端口增量）：
+    //     来源 = ifetch4 取消**已预留的 held 块**（redirect/维护冲刷时把首次呈现拍
+    //     分配的 id 归还）。与 `ckpt_free_valid`（后端提交/丢弃释放）**相互独立**：
+    //       · 两端口同拍时**都兑现**（旧实现在 front4_top 用单口 mux 合并，外部优先
+    //         ⇒ 同拍必丢一个 ⇒ 池项泄漏/ckpt_full 卡死）；
+    //       · 两端口同 id（重复 free）或 free 未分配项 ⇒ 幂等 no-op（不产生第二个 owner）；
+    //       · 同拍 free→alloc：本拍释放出来的槽位可以给同拍新分配（最低编号优先），
+    //         `clear_all` 与 alloc 同拍时 clear 先清、alloc 再写其 id（新 owner 胜）。
+    input  wire         ckpt_hold_free_valid,
+    input  wire [3:0]   ckpt_hold_free_id,
     input  wire         ckpt_restore_valid,
     input  wire [3:0]   ckpt_restore_id,
 
@@ -186,14 +198,26 @@ module predictor_top #(
     //   ★ 不用"function 内部读存储器"的写法：iverilog 12.0 对该形态有组合求值缺陷
     //     （实测：16 项全空却返回"无空闲"），改用静态索引读 + 纯向量编码，
     //     语义相同（最低编号优先、同拍释放的项可被同拍复用），且可控可查。
+    //   ★ 两个释放口 + 整机冲刷都参与"本拍可分配"判定：
+    //     旧式 `~valid & ~(free_valid & id)` 会把"本拍释放"的项排除在候选外；这里改为
+    //     `可分配 = 当前空闲 | 本拍外部释放 | 本拍 held 释放 | 整机冲刷`，于是
+    //     **同拍 free→alloc 可以复用最低编号的释放槽**（释放先写、分配后写，最终 valid=1
+    //     ⇒ 新 owner 胜，不存在"分配到的槽在同一拍又被清"的覆盖错误）。free 未分配/重复
+    //     free 只是把同一槽再写一次 0，幂等。`ckpt_clear_all` 拍全部槽可分配，但 alloc
+    //     只写它选中的 id（其余仍被清 0）⇒ 不会留下"无 owner 的 valid 项"。
     wire [CKPT_NUM-1:0] ck_valid_v;      // 打包视图
-    wire [CKPT_NUM-1:0] ck_free_v;       // 逐项"空闲"标志
+    wire [CKPT_NUM-1:0] ck_free_v;       // 逐项"本拍可作为分配候选"标志
+    wire [CKPT_NUM-1:0] ck_ext_free_v;   // 后端释放（逐项）
+    wire [CKPT_NUM-1:0] ck_hld_free_v;   // 前端 held 释放（逐项）
     genvar cg;
     generate
         for (cg = 0; cg < CKPT_NUM; cg = cg + 1) begin : g_ckv
-            assign ck_valid_v[cg] = ck_valid_q[cg];
-            assign ck_free_v[cg]  = ~ck_valid_q[cg] &
-                                    ~(ckpt_free_valid & (ckpt_free_id == cg[3:0]));
+            assign ck_valid_v[cg]   = ck_valid_q[cg];
+            assign ck_ext_free_v[cg] = ckpt_free_valid & (ckpt_free_id == cg[3:0]);
+            assign ck_hld_free_v[cg] = ckpt_hold_free_valid &
+                                       (ckpt_hold_free_id == cg[3:0]);
+            assign ck_free_v[cg]    = ckpt_clear_all | ~ck_valid_q[cg] |
+                                      ck_ext_free_v[cg] | ck_hld_free_v[cg];
         end
     endgenerate
 
@@ -240,9 +264,11 @@ module predictor_top #(
                 ck_ghr_q[ck_i]   <= 16'h0;
             end
         end else begin
-            // ---- 释放 ----
+            // ---- 释放（两个独立释放口；同 id/未分配项重复写 0 属幂等 no-op）----
             if (ckpt_free_valid && (ckpt_free_id < CKPT_NUM))
                 ck_valid_q[ckpt_free_id] <= 1'b0;
+            if (ckpt_hold_free_valid && (ckpt_hold_free_id < CKPT_NUM))
+                ck_valid_q[ckpt_hold_free_id] <= 1'b0;
             //   ★ K1'：整机冲刷 ⇒ 一次清空全部检查点（否则池项永久泄漏 ⇒ ckpt_full 卡死）
             //   （iverilog 不支持整数组赋值 ⇒ 用 for 逐项清零）
             if (ckpt_clear_all)
@@ -250,6 +276,8 @@ module predictor_top #(
                     ck_valid_q[ck_i] <= 1'b0;
 
             // ---- 分配（快照：RAS 深度 + GHR）----
+            //   写在释放/clear 之后 ⇒ 同拍 free→alloc 或 clear+alloc 时 **alloc 的新 owner
+            //   胜**（该槽 valid=1，其余被清 0）；绝不会把"本拍释放的槽"分配后又清掉。
             if (ckpt_alloc_valid) begin
                 if (free_found_w) begin
                     ck_valid_q[free_id_w] <= 1'b1;

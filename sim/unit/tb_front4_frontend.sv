@@ -332,14 +332,16 @@ module tb_front4_frontend_top;
         .d2_pop_valid(d2_pop_valid), .d2_pop_addr(d2_pop_addr),
         .ras_repair_valid(ras_repair_valid), .ras_repair_addr(ras_repair_addr),
         .sv32_translate_en(1'b0), .sv32_translate_done(1'b0),
-        .sv32_translate_fault(1'b0), .sv32_translate_paddr(32'h0),
+        .sv32_translate_fault(1'b0), .sv32_translate_fault_af(1'b0),
+        .sv32_translate_paddr(32'h0),
         .tr_req_valid(tr_req_valid), .tr_req_va(tr_req_va),
         .priv(priv), .pmpcfg_i(pmpcfg_i), .pmpaddr_i(pmpaddr_i),
         .l1i_req_valid(l1i_req_valid), .l1i_req_addr(l1i_req_addr),
         .l1i_req_line(l1i_req_line), .l1i_ready(l1i_cs_ready),
         .l1i_rdata(l1i_cs_rdata), .l1i_miss(l1i_cs_miss), .l1i_uncached(l1i_cs_uncached),
+        .l1i_rsp_err(1'b0), .l1i_rsp_err_pa(32'h0),
         .unc_req_valid(unc_req_valid), .unc_req_pa(unc_req_pa),
-        .unc_rsp_valid(unc_rsp_valid), .unc_rsp_pa(unc_rsp_pa), .unc_rsp_data(unc_rsp_data),
+        .unc_rsp_valid(unc_rsp_valid), .unc_rsp_pa(unc_rsp_pa), .unc_rsp_data(unc_rsp_data), .unc_rsp_err(1'b0),
         .fetch_pc_o(fetch_pc_o), .head_pc_o(head_pc_o), .epoch_o(epoch_o), .ghr_o(ghr_o),
         .bpu_br_total(bpu_br_total), .bpu_br_mispred(bpu_br_mispred),
         .bpu_dir_mispred(bpu_dir_mispred), .bpu_target_mispred(bpu_target_mispred),
@@ -616,12 +618,19 @@ module tb_front4_frontend_top;
             exp_add(32'h8000_0028, enc_jal(5'd1, 21'd8), 1'b1);
             exp_add(32'h8000_0030, {16'h0, enc_c_addi(5'd10, 6'd1)}, 1'b0);
             exp_add(32'h8000_0032, enc_addi(5'd0, 5'd0, 12'd0), 1'b1);
-            // 程序之后的填充（TB 存储体默认值 = 32 bit nop 0x0000_0013 组成的字），
-            //   按 **parcel 流** 推期望：每个 nop 字拆成 0x0013 / 0x0000 两个 16 bit parcel
+            // 程序之后的填充：存储体默认值 = 32 bit nop 字 0x0000_0013。
+            //   ★ 2026-10-20 修正（F05-07 定型块把填充也纳入 4 路块后暴露）：
+            //     `0x0013` 的低 2 位 = 11 ⇒ 它是 **32 bit** 指令 `addi x0,x0,0`，不能
+            //     当两个 16 bit parcel。parcel 流从 0x36 起为：
+            //       0x36: 0x0000（16 bit，上一个字的残余高半）
+            //       0x38: 0x0000_0013（32 bit，占 0x38/0x3A）
+            //       0x3C: 0x0000_0013（32 bit，占 0x3C/0x3E）…
             exp_add(32'h8000_0036, 32'h0000_0000, 1'b0);
-            exp_add(32'h8000_0038, 32'h0000_0013, 1'b0);
-            exp_add(32'h8000_003A, 32'h0000_0000, 1'b0);
-            exp_add(32'h8000_003C, 32'h0000_0013, 1'b0);
+            exp_add(32'h8000_0038, 32'h0000_0013, 1'b1);
+            exp_add(32'h8000_003C, 32'h0000_0013, 1'b1);
+            exp_add(32'h8000_0040, 32'h0000_0013, 1'b1);
+            exp_add(32'h8000_0044, 32'h0000_0013, 1'b1);
+            exp_add(32'h8000_0048, 32'h0000_0013, 1'b1);
         end
     endtask
 

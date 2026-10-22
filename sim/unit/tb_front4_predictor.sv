@@ -18,6 +18,9 @@
 //     A5 RAS：压满 16 项后**溢出不压入**、D2 修复（实际返回地址 ≠ 栈顶 ⇒ repair）、
 //             检查点深度恢复、全冲刷回"已提交深度"
 //     A6 检查点：16 项分配满 ⇒ ckpt_full；释放后可再分配；无效 id 恢复不改状态
+//     A6b（2026-10-20）：**两个独立释放口**同拍兑现/幂等；同拍 free→alloc 复用最低槽；
+//         clear_all+alloc 定义（新 owner 保留、其余清 0）；真实 ck_valid_q 位与
+//         restore 快照 id/深度（不只查输出非 X）
 //     A7 GHR 恢复：SPEC_GHR=1 ⇒ 检查点回滚恢复 GHR；SPEC_GHR=0（默认方案 A）⇒ 不回滚
 //   B 准确率统计（4 类自造轨迹，全部**逐条**由本 TB 参照模型计分）：
 //     B1 loop（嵌套循环：内层行程 4/8/16/32 变化）
@@ -98,10 +101,13 @@ module tb_front4_predictor;
 
     reg         ckpt_alloc_valid;
     reg  [31:0] ckpt_alloc_pc;
+    reg         ckpt_clear_all;         // 显式接 0/测试值（不得悬空 Z）
     wire [3:0]  ckpt_alloc_id;
     wire        ckpt_full;
     reg         ckpt_free_valid;
     reg  [3:0]  ckpt_free_id;
+    reg         ckpt_hold_free_valid;   // 2026-10-20：第二（held 块）释放口
+    reg  [3:0]  ckpt_hold_free_id;
     reg         ckpt_restore_valid;
     reg  [3:0]  ckpt_restore_id;
 
@@ -142,7 +148,9 @@ module tb_front4_predictor;
         .train_ready(train_ready), .upd_busy(upd_busy),
         .ckpt_alloc_valid(ckpt_alloc_valid), .ckpt_alloc_pc(ckpt_alloc_pc),
         .ckpt_alloc_id(ckpt_alloc_id), .ckpt_full(ckpt_full),
+        .ckpt_clear_all(ckpt_clear_all),
         .ckpt_free_valid(ckpt_free_valid), .ckpt_free_id(ckpt_free_id),
+        .ckpt_hold_free_valid(ckpt_hold_free_valid), .ckpt_hold_free_id(ckpt_hold_free_id),
         .ckpt_restore_valid(ckpt_restore_valid), .ckpt_restore_id(ckpt_restore_id),
         .bpu_br_total(bpu_br_total), .bpu_br_mispred(bpu_br_mispred),
         .bpu_dir_mispred(bpu_dir_mispred), .bpu_target_mispred(bpu_target_mispred),
@@ -547,7 +555,9 @@ module tb_front4_predictor;
             train_pred_target = 32'h0; train_pred_valid = 1'b0;
             train_btb_hit = 1'b0; train_btb_way = 1'b0;
             ckpt_alloc_valid = 1'b0; ckpt_alloc_pc = 32'h0;
+            ckpt_clear_all = 1'b0;
             ckpt_free_valid = 1'b0; ckpt_free_id = 4'h0;
+            ckpt_hold_free_valid = 1'b0; ckpt_hold_free_id = 4'h0;
             ckpt_restore_valid = 1'b0; ckpt_restore_id = 4'h0;
             repeat (4) @(posedge clk);
             rst_n = 1'b1;
@@ -803,6 +813,120 @@ module tb_front4_predictor;
         #1;
         chk(ckpt_full === 1'b0, "A6 释放 1 项后不再 full");
         chk(ckpt_alloc_id === 4'd5, "A6 空闲项按最低编号优先（应为 5）");
+
+        //======================================================================
+        // A6b（2026-10-20）：两个独立释放口（同拍兑现）/ 幂等 / 同拍 free→alloc /
+        //   clear_all+alloc 定义 / 真实池位与 restore 快照 id（不只查"输出非 X"）。
+        //======================================================================
+        $display("== A6b 双释放口 / 池位 / 快照 ==");
+        begin : a6b
+            dut_reset();
+            // ---- 1) 真实池位：分配 16 项 ----
+            for (i = 0; i < CKPT_NUM; i = i + 1) begin
+                @(negedge clk);
+                ckpt_alloc_valid = 1'b1; ckpt_alloc_pc = PC_CALL + i*4;
+                chk(ckpt_alloc_id === i[3:0], "A6b: 分配必须最低编号优先");
+                @(posedge clk);
+                @(negedge clk); ckpt_alloc_valid = 1'b0;
+                chk(dut.ck_valid_q[i] === 1'b1, "A6b: 真实池位在分配后必须为 1");
+            end
+            #1;
+            chk(ckpt_full === 1'b1, "A6b: 16 项全分配后 ckpt_full=1");
+            // ---- 2) 同拍两个不同 id：外部口 + held 口都必须兑现 ----
+            @(negedge clk);
+            ckpt_free_valid = 1'b1;      ckpt_free_id      = 4'd3;
+            ckpt_hold_free_valid = 1'b1; ckpt_hold_free_id = 4'd7;
+            @(posedge clk);
+            @(negedge clk);
+            ckpt_free_valid = 1'b0; ckpt_hold_free_valid = 1'b0;
+            #1;
+            chk(dut.ck_valid_q[3] === 1'b0 && dut.ck_valid_q[7] === 1'b0,
+                "A6b: 两个独立 free 口同拍必须都清零");
+            chk(dut.ck_valid_q[2] === 1'b1 && dut.ck_valid_q[6] === 1'b1 &&
+                dut.ck_valid_q[8] === 1'b1,
+                "A6b: 两个 free 不得误清相邻/其他项");
+            chk(ckpt_alloc_id === 4'd3, "A6b: 释放后最低空闲应为 3");
+            // ---- 3) 幂等：同 id 双端口重复 free；已释放 id 再 free 不得误清别人 ----
+            @(negedge clk);
+            ckpt_free_valid = 1'b1; ckpt_free_id = 4'd8;
+            ckpt_hold_free_valid = 1'b1; ckpt_hold_free_id = 4'd8;
+            @(posedge clk);
+            @(negedge clk);
+            ckpt_free_valid = 1'b0; ckpt_hold_free_valid = 1'b0;
+            @(negedge clk); ckpt_free_valid = 1'b1; ckpt_free_id = 4'd3;
+            @(posedge clk);
+            @(negedge clk); ckpt_free_valid = 1'b0;
+            @(negedge clk); ckpt_hold_free_valid = 1'b1; ckpt_hold_free_id = 4'd7;
+            @(posedge clk);
+            @(negedge clk); ckpt_hold_free_valid = 1'b0;
+            #1;
+            chk(dut.ck_valid_q[8] === 1'b0, "A6b: 同 id 双端口重复 free 幂等");
+            chk(dut.ck_valid_q[9] === 1'b1 && dut.ck_valid_q[15] === 1'b1,
+                "A6b: 对已 free 的 id 再 free 不得误清其他项");
+            // ---- 4) 满池真实占用槽的同拍 free→alloc：复用该槽并换**新**快照 ----
+            //   审计 P2：旧稿先 free 过 id3 再"同拍 free→alloc"，且 d_before=0，
+            //   新旧深度都为 0，既不是满池占用槽也没证明快照被重写。
+            //   这里重置后重新分配满 16 项：id3 是**真实 valid 占用槽**，其旧快照深度=0；
+            //   再把 RAS 推到 A=3，同拍 free(id3)+alloc ⇒ 必须复用 id3 且快照=A；
+            //   再推到 B=5，restore(id3) 必须回到 A（不是旧 0、也不是当前 5）。
+            dut_reset();
+            for (i = 0; i < CKPT_NUM; i = i + 1) begin
+                @(negedge clk); ckpt_alloc_valid = 1'b1; ckpt_alloc_pc = PC_CALL + i*4;
+                @(posedge clk);
+                @(negedge clk); ckpt_alloc_valid = 1'b0;
+            end
+            #1;
+            chk(dut.ck_valid_q[3] === 1'b1 && ckpt_full === 1'b1,
+                "A6b: 构造：id3 必须是满池中的真实占用槽");
+            chk(dut.ck_ras_q[3] === 5'd0, "A6b: 构造：id3 旧快照深度=0");
+            ras_push(32'h0000_4100);   // A = 3
+            ras_push(32'h0000_4200);
+            ras_push(32'h0000_4300);
+            chk(dut.u_ras.depth_o === 5'd3, "A6b: 构造：当前 RAS 深度 A=3");
+            @(negedge clk);
+            ckpt_free_valid = 1'b1; ckpt_free_id = 4'd3;
+            ckpt_alloc_valid = 1'b1; ckpt_alloc_pc = PC_CALL;
+            #1;
+            chk(ckpt_alloc_id === 4'd3,
+                "A6b: 满池同拍 free→alloc 必须复用本拍释放的占用槽 id3");
+            @(posedge clk);
+            @(negedge clk);
+            ckpt_free_valid = 1'b0; ckpt_alloc_valid = 1'b0;
+            #1;
+            chk(dut.ck_valid_q[3] === 1'b1,
+                "A6b: 同拍 free→alloc 后新 owner 必须胜出（valid=1）");
+            chk(dut.ck_ras_q[3] === 5'd3,
+                "A6b: 复用槽必须重写为当拍新快照 A=3（不是旧 0）");
+            chk(ckpt_full === 1'b1, "A6b: free+alloc 后仍为满池（16 项）");
+            ras_push(32'h0000_4400);   // B = 5
+            ras_push(32'h0000_4500);
+            chk(dut.u_ras.depth_o === 5'd5, "A6b: 构造：当前 RAS 深度 B=5");
+            @(negedge clk); ckpt_restore_valid = 1'b1; ckpt_restore_id = 4'd3;
+            @(posedge clk);
+            @(negedge clk); ckpt_restore_valid = 1'b0;
+            #1;
+            chk(dut.u_ras.depth_o === 5'd3,
+                "A6b: restore 必须恢复新快照 A=3（不是旧 0、也不是当前 5）");
+            // ---- 5) clear_all + alloc 同拍：定义 = 清全部，alloc 的 id 作为新 owner 保留 ----
+            @(negedge clk);
+            ckpt_clear_all = 1'b1;
+            ckpt_alloc_valid = 1'b1; ckpt_alloc_pc = PC_CALL;
+            #1;
+            chk(ckpt_alloc_id === 4'd0, "A6b: clear 拍全部候选 ⇒ alloc 取 id0");
+            @(posedge clk);
+            @(negedge clk); ckpt_clear_all = 1'b0; ckpt_alloc_valid = 1'b0;
+            #1;
+            chk(dut.ck_valid_q[0] === 1'b1, "A6b: clear+alloc 拍的新 owner 必须保留");
+            for (i = 1; i < CKPT_NUM; i = i + 1)
+                chk(dut.ck_valid_q[i] === 1'b0,
+                    "A6b: clear+alloc 拍其余 15 项必须清 0（不得留无 owner 的 valid）");
+            chk(ckpt_full === 1'b0, "A6b: clear 后不得为 full");
+            // ---- 6) 收尾清空（不影响后续 A7）----
+            @(negedge clk); ckpt_clear_all = 1'b1;
+            @(posedge clk);
+            @(negedge clk); ckpt_clear_all = 1'b0;
+            @(posedge clk);
+        end
 
         //======================================================================
         // A7 GHR 恢复（方案 B）/ 不回滚（方案 A）

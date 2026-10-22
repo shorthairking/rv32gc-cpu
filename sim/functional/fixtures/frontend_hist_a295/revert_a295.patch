@@ -1,0 +1,40 @@
+--- rtl/front4/ifetch4.v
++++ rtl/front4/ifetch4.v
+@@ -301,18 +301,9 @@
+                                default: br_cls = C_NONE;
+                            endcase
+                     2'b10: begin
+-                               //   ★ Q2 只有 **funct3==100** 这一组才可能是 c.jr/c.jalr
+-                               //     （bit12 区分 jalr；rs2==0 区分 jr；rd!=0 才是合法 jr）。
+-                               //     旧式漏掉 funct3 限定 ⇒ c.lwsp(0x4082)/c.swsp/FP 栈
+-                               //     load/store 等 Q2 非控制流被误判成 RET/INDIR：RAS 非空或
+-                               //     BTB 命中时伪 taken/重启，跳过顺序指令（真 0x4082 四轮）。
+-                               //     其余 funct3：非 CF（c.mv/c.add 也在 100 组，但 rs2!=0 ⇒
+-                               //     不满足 jr/jalr 条件）；reserved(c.jr x0)/c.ebreak 同样非 CF。
+-                               if ((lo[15:13] == 3'b100) && lo[12] &&
+-                                   (lo[11:7] != 5'd0) && (lo[6:2] == 5'd0))
++                               if (lo[12] && (lo[11:7] != 5'd0) && (lo[6:2] == 5'd0))
+                                    br_cls = C_ICALL;           // c.jalr
+-                               else if ((lo[15:13] == 3'b100) && !lo[12] &&
+-                                        (lo[11:7] != 5'd0) && (lo[6:2] == 5'd0))
++                               else if (!lo[12] && (lo[11:7] != 5'd0) && (lo[6:2] == 5'd0))
+                                    br_cls = ((lo[11:7] == 5'd1) || (lo[11:7] == 5'd5))
+                                             ? C_RET : C_INDIR; // c.jr
+                                else br_cls = C_NONE;
+--- rtl/front4/front4_top.v
++++ rtl/front4/front4_top.v
+@@ -360,13 +360,7 @@
+         .cnt_restart(cnt_restart), .cnt_stall(cnt_stall), .cnt_req(cnt_req)
+     );
+ 
+-    //   ★ 2026-10-22（F2）：对外故障只能由**本块 mask 内**的 lane 归约。
+-    //     `lane_fault` 是 4 个槽位的组合值：块在较早的 taken/页尾/故障 lane 终止时，
+-    //     更年轻的 marker（下一页翻译故障）或更年轻 lane 的 PMP 故障可以已在缓冲里、
+-    //     落在 mask 之外。冻结后首次呈现/older-taken 场景下这些槽位不属于本块，
+-    //     未 mask 的 `|lane_fault` 会让 `fe_fetch_fault` 伪高（后端据此误报异常）。
+-    wire [3:0] lane_fault_masked = lane_fault & blk_mask;
+-    assign fe_fetch_fault = blk_valid & (|lane_fault_masked);
++    assign fe_fetch_fault = blk_valid & (|lane_fault);
+     assign fe_frozen      = fe_fetch_fault | break_point | fe_stall;
+ 
+     //   ★ F05-09（2026-10-20）：`ras_repair_addr` 原为未驱动输出（内部只用了
