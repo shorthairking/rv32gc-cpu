@@ -143,6 +143,7 @@ resolve_root() {
 #------------------------------------------------------------------------------
 CASE_COMPILE_TIMEOUT="${CASE_COMPILE_TIMEOUT:-300}"
 CASE_RUN_TIMEOUT="${CASE_RUN_TIMEOUT:-300}"
+CASE_DEFS=""          # 额外 iverilog -D（仅基线端口兼容用；默认空）
 IV="${RV32_IVERILOG:-}"
 VVP="${RV32_VVP:-}"
 
@@ -223,8 +224,10 @@ case_compile() {
     #        · 源/TB/产物一律绝对路径；工具先解析为绝对路径（cd 后仍可执行）。
     local iv_abs vv_abs
     iv_abs="$(abs_cmd "$iv")"; vv_abs="$(abs_cmd "$vv")"
+    #   ★ CASE_DEFS：基线（旧 csr_file 无 F1-B 计数器端口）时由调用方置
+    #     -DRV32_CSR_NO_CNT_PORTS，保持"同一 TB 复跑旧树"的对照能力。
     ( cd "$root" && timeout "$CASE_COMPILE_TIMEOUT" "$iv_abs" -g2012 \
-        -I "$root" -I "$root/rtl/pkg" \
+        -I "$root" -I "$root/rtl/pkg" $CASE_DEFS \
         -o "$CASE_VVP" -s tb_privilege_semantics \
         "${CASE_INPUTS[@]}" ) >"$CASE_CLOG" 2>&1 || CASE_COMPILE_RC=$?
     if [ "$CASE_COMPILE_RC" -eq 0 ]; then
@@ -809,7 +812,9 @@ baseline_main() {
     git -C "$REPO_ROOT" archive "$full" rtl | tar -x -C "$priv" || die "git archive ${full} rtl 失败"
     printf 'privilege(baseline): baseline_src=%s commit=%s\n' "$priv" "$full"
 
+    CASE_DEFS="-DRV32_CSR_NO_CNT_PORTS"   # 旧树无 F1-B 计数器端口（仅端口兼容）
     case_compile baseline "$priv"
+    CASE_DEFS=""
     local b_err=0
     if ! gate_baseline_log "$CASE_RLOG" "$CASE_RUN_RC"; then b_err=1; fi
 

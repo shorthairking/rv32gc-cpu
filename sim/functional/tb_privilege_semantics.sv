@@ -169,6 +169,14 @@ module tb_privilege_semantics;
         .irq_msip(irq_msip_t), .irq_mtip(irq_mtip_t), .irq_meip(irq_meip_t),
         .irq_stip(1'b0), .irq_seip(1'b0),
         .cycle_i(64'h0000_0001_CAFE_0000), .instret_i(64'h0000_0002_1234_0000),
+        // ★ F1-B 新计数器端口：仅当前树连接；冻结基线 201acf61 的 csr_file 无这些端口，
+        //   --check-baseline 以 -DRV32_CSR_NO_CNT_PORTS 编译本 TB（只为端口兼容，
+        //   本包各向量不读 time 数据，语义不变）。
+`ifndef RV32_CSR_NO_CNT_PORTS
+        .mtime_i(64'h0000_00AA_BBCC_DDEE),
+        .mcycle_we_o(), .mcycleh_we_o(), .minstret_we_o(), .minstreth_we_o(),
+        .cnt_wdata_o(),
+`endif
         .pmp_cfg_o(pmp_cfg_o), .pmp_addr_o(pmp_addr_o),
         .satp_o(satp_o), .menvcfg_o(menvcfg_o), .senvcfg_o(senvcfg_o),
         .mcounteren_o(mcounteren_o), .scounteren_o(scounteren_o),

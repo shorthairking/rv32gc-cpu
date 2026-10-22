@@ -52,6 +52,9 @@ module tb_csr_file_top;
     reg  [31:0] trap_tval_i = 32'h0, trap_data_i = 32'h0;
     reg         irq_msip = 0, irq_mtip = 0, irq_meip = 0, irq_stip = 0, irq_seip = 0;
     reg  [63:0] cycle_i = 64'h0, instret_i = 64'h0;
+    reg  [63:0] mtime_i = 64'h0000_00AA_BBCC_DDEE;
+    wire        mcycle_we, mcycleh_we, minstret_we, minstreth_we;
+    wire [31:0] cnt_wdata;
     wire [127:0] pmp_cfg_o;
     wire [511:0] pmp_addr_o;
     wire [31:0] satp_o, menvcfg_o, senvcfg_o, mcounteren_o, scounteren_o;
@@ -87,7 +90,10 @@ module tb_csr_file_top;
         .trap_tval_i(trap_tval_i), .trap_data_i(trap_data_i),
         .irq_msip(irq_msip), .irq_mtip(irq_mtip), .irq_meip(irq_meip),
         .irq_stip(irq_stip), .irq_seip(irq_seip),
-        .cycle_i(cycle_i), .instret_i(instret_i),
+        .cycle_i(cycle_i), .instret_i(instret_i), .mtime_i(mtime_i),
+        .mcycle_we_o(mcycle_we), .mcycleh_we_o(mcycleh_we),
+        .minstret_we_o(minstret_we), .minstreth_we_o(minstreth_we),
+        .cnt_wdata_o(cnt_wdata),
         .pmp_cfg_o(pmp_cfg_o), .pmp_addr_o(pmp_addr_o),
         .satp_o(satp_o), .menvcfg_o(menvcfg_o), .senvcfg_o(senvcfg_o),
         .mcounteren_o(mcounteren_o), .scounteren_o(scounteren_o),
@@ -570,6 +576,31 @@ module tb_csr_file_top;
         expect_eq1("M3 收尾：TVM 已清 ⇒ S 访问 satp 恢复合法", chk_illegal, 1'b0);
 
         //======================================================================
+        // M4. 【F1-B】mstatus.MPP 的 WARL 落地：非法编码写后读回必须合法
+        //   norm:mstatusxppwarl：MPP 只能持有 M 及以下已实现模式；本核实现 U/S/M
+        //   ⇒ 合法 {00,01,11}，保留 2'b10 ⇒ 落地/读回 S。★ 反证：只在 priv_ctrl
+        //   使用点合法化（csr_file 原样存 2'b10）时，本节读回/预览断言必 FAIL。
+        //======================================================================
+        priv = `RV32GC_PRIV_M;
+        csr_write(`RV32GC_CSR_MSTATUS, (32'h2 << `RV32GC_MSTATUS_MPP_LSB)); #1;
+        csr_read_chk("★ M4 写 MPP=2'b10 ⇒ 读回合法化 S（bits12:11=01）",
+                     `RV32GC_CSR_MSTATUS, 32'h0000_0800);
+        csr_write(`RV32GC_CSR_MSTATUS, (32'h3 << `RV32GC_MSTATUS_MPP_LSB)); #1;
+        csr_read_chk("M4 合法 MPP=M 原样保留", `RV32GC_CSR_MSTATUS, 32'h0000_1800);
+        //   ---- 写口预览（RMW 读改写路径）：W 级 rdata_w 与 M 级 byp_rdata 同口径 ----
+        @(negedge clk);
+        raddr = `RV32GC_CSR_MSTATUS; waddr = `RV32GC_CSR_MSTATUS;
+        wdata = (32'h2 << `RV32GC_MSTATUS_MPP_LSB) | 32'h0000_0008;  // MPP=10 + MIE
+        wen = 1'b1; byp_wdata = (32'h2 << `RV32GC_MSTATUS_MPP_LSB); #1;
+        expect_eq32("★ M4 W 级 rdata_w：MPP=2'b10 预览已合法化且含 MIE",
+                    rdata_w, 32'h0000_0808);
+        expect_eq32("★ M4 M 级 byp_rdata：MPP=2'b10 预览已合法化",
+                    byp_rdata, 32'h0000_0800);
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        //   ---- 收尾：清 mstatus ----
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0);
+
+        //======================================================================
         // N. mie / mip 与中断请求
         //======================================================================
         csr_write(`RV32GC_CSR_MIE, 32'h0000_0AAA);   // bit1|3|5|7|9|11 = 0xAAA
@@ -752,19 +783,68 @@ module tb_csr_file_top;
         csr_write(`RV32GC_CSR_MIP, 32'h0000_0222);
 
         //======================================================================
-        // P. 计数器：mcycle/minstret 高半与 cycle/instret 只读视图
+        // P. 计数器（★ F1-B 新语义）：单一 64 位本体在顶层，本模块只做视图/写请求
+        //   · mcycle/cycle 读同一 cycle_i；minstret/instret 读同一 instret_i；
+        //   · time/timeh 读 mtime_i（不再等于 cycle）；
+        //   · 写地址产生对应半字 we + cnt_wdata；写后同拍预览（rdata_w/byp_rdata）
+        //     对"同计数器同半"的别名（mcycle↔cycle 等）给出写后值。
         //======================================================================
-        cycle_i = 64'h0000_0001_CAFE_0000; instret_i = 64'h0000_0002_1234_0000; #1;
-        csr_read_chk("cycle 低半",    `RV32GC_CSR_CYCLE,    32'hCAFE_0000);
-        csr_read_chk("cycleh 高半",   `RV32GC_CSR_CYCLEH,   32'h0000_0001);
-        csr_read_chk("instret 低半",  `RV32GC_CSR_INSTRET,  32'h1234_0000);
-        csr_read_chk("instreth 高半", `RV32GC_CSR_INSTRETH, 32'h0000_0002);
-        csr_write(`RV32GC_CSR_MCYCLE, 32'h0000_0011);
-        csr_read_chk("mcycle 低半可写",  `RV32GC_CSR_MCYCLE,  32'h0000_0011);
-        csr_write(`RV32GC_CSR_MCYCLEH, 32'h0000_0005);
-        csr_read_chk("mcycleh 高半可写", `RV32GC_CSR_MCYCLEH, 32'h0000_0005);
-        csr_write(`RV32GC_CSR_MINSTRETH, 32'h0000_0009);
-        csr_read_chk("minstreth 高半可写", `RV32GC_CSR_MINSTRETH, 32'h0000_0009);
+        cycle_i  = 64'h0000_0001_CAFE_0000;
+        instret_i= 64'h0000_0002_1234_0000;
+        mtime_i  = 64'h0000_00AA_BBCC_DDEE; #1;
+        csr_read_chk("P cycle 低半 = 本体",    `RV32GC_CSR_CYCLE,    32'hCAFE_0000);
+        csr_read_chk("P cycleh 高半 = 本体",   `RV32GC_CSR_CYCLEH,   32'h0000_0001);
+        csr_read_chk("P mcycle 低半 = 同一本体", `RV32GC_CSR_MCYCLE, 32'hCAFE_0000);
+        csr_read_chk("P mcycleh 高半 = 同一本体",`RV32GC_CSR_MCYCLEH,32'h0000_0001);
+        csr_read_chk("P instret 低半 = 本体",  `RV32GC_CSR_INSTRET,  32'h1234_0000);
+        csr_read_chk("P instreth 高半 = 本体", `RV32GC_CSR_INSTRETH, 32'h0000_0002);
+        csr_read_chk("P minstret 低半 = 同一本体", `RV32GC_CSR_MINSTRET, 32'h1234_0000);
+        csr_read_chk("★ P time 低半 = mtime 低 32", `RV32GC_CSR_TIME,  32'hBBCC_DDEE);
+        csr_read_chk("★ P timeh 高半 = mtime 高 32",`RV32GC_CSR_TIMEH, 32'h0000_00AA);
+        //   ---- 写请求：we/cnt_wdata 只在对应地址断言，同拍至多一个 ----
+        @(negedge clk);
+        waddr = `RV32GC_CSR_MCYCLE; wdata = 32'h1111_2222; wen = 1'b1;
+        raddr = `RV32GC_CSR_MCYCLE; #1;
+        expect_eq1("★ P 写 mcycle ⇒ mcycle_we=1", mcycle_we, 1'b1);
+        expect_eq1("P 写 mcycle 不影响其它 we",
+                   mcycleh_we | minstret_we | minstreth_we, 1'b0);
+        expect_eq32("P cnt_wdata = 写数据", cnt_wdata, 32'h1111_2222);
+        expect_eq32("★ P 写后 rdata_w（raddr=mcycle）= 写值", rdata_w, 32'h1111_2222);
+        raddr = `RV32GC_CSR_CYCLE; byp_wdata = 32'h3333_4444; #1;
+        expect_eq32("★ P 别名预览：读 cycle 同拍写 mcycle ⇒ rdata_w = 写值",
+                    rdata_w, 32'h1111_2222);
+        expect_eq32("★★ P 别名 M 级预览：读 cycle + byp(mcycle 写) = byp_wdata",
+                    byp_rdata, 32'h3333_4444);
+        @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
+        //   ---- 高半写：只产生 mcycleh we ----
+        @(negedge clk);
+        waddr = `RV32GC_CSR_MCYCLEH; wdata = 32'h5555_6666; wen = 1'b1;
+        raddr = `RV32GC_CSR_MCYCLEH; #1;
+        expect_eq1("P 写 mcycleh ⇒ mcycleh_we=1", mcycleh_we, 1'b1);
+        expect_eq1("P 写 mcycleh 不动低半 we", mcycle_we, 1'b0);
+        expect_eq32("P 写后 rdata_w（mcycleh）= 写值", rdata_w, 32'h5555_6666);
+        @(negedge clk); wen = 1'b0;
+        //   ---- minstret 半写：对应 we ----
+        @(negedge clk);
+        waddr = `RV32GC_CSR_MINSTRET; wdata = 32'h7777_8888; wen = 1'b1; #1;
+        expect_eq1("P 写 minstret ⇒ minstret_we=1", minstret_we, 1'b1);
+        expect_eq1("P 写 minstret 不动高半 we", minstreth_we, 1'b0);
+        @(negedge clk); wen = 1'b0;
+        @(negedge clk);
+        waddr = `RV32GC_CSR_MINSTRETH; wdata = 32'h9999_AAAA; wen = 1'b1; #1;
+        expect_eq1("P 写 minstreth ⇒ minstreth_we=1", minstreth_we, 1'b1);
+        @(negedge clk); wen = 1'b0;
+        //   ---- 只读影子（cycle/time/instret）不得产生写请求 ----
+        @(negedge clk);
+        waddr = `RV32GC_CSR_CYCLE; wdata = 32'hFFFF_FFFF; wen = 1'b1; #1;
+        expect_eq1("★ P 写 cycle（只读影子）不得产生任何计数器 we",
+                   mcycle_we | mcycleh_we | minstret_we | minstreth_we, 1'b0);
+        @(negedge clk); wen = 1'b0;
+        //   ---- 本体更新后视图随之变化（本体由顶层维护，TB 直接改输入模拟）----
+        cycle_i  = 64'hFFFF_FFFF_FFFF_FFFF;
+        instret_i= 64'h0000_0000_FFFF_FFFF; #1;
+        csr_read_chk("P 本体更新后 cycle 低",  `RV32GC_CSR_CYCLE,   32'hFFFF_FFFF);
+        csr_read_chk("P 本体更新后 cycleh 高", `RV32GC_CSR_CYCLEH,  32'hFFFF_FFFF);
 
         //======================================================================
         // Q. trap 端口写（trap_ctrl 的入口：**一次原子写 epc/cause/tval 三个**）

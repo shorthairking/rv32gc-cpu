@@ -67,7 +67,11 @@ module clint (
 
     // ---- 中断输出（汇入 mip） ----
     output wire        msip_o,                 // ⇒ mip.MSIP（cause 3 MSI）
-    output wire        mtip_o                  // ⇒ mip.MTIP（cause 7 MTI）
+    output wire        mtip_o,                 // ⇒ mip.MTIP（cause 7 MTI）
+
+    // ---- ★ F1-B：mtime 的 64 位实时值（供 csr_file.time/timeh 只读影子）----
+    //   纯组合直出 mtime_r；不影响原有 MMIO 读写/递增行为。
+    output wire [63:0] mtime_o
 );
 
     //--------------------------------------------------------------------------
@@ -125,6 +129,8 @@ module clint (
     // 4. 组合输出（只出核内总线侧信号；**无 AXI 端口 ⇒ 绝不产生 AXI 请求**）
     //--------------------------------------------------------------------------
     assign msip_o = msip_r;
+    //   ★ F1-B：time/timeh 的影子源（与时序 mtime_r 同拍一致，读 MMIO mtime 亦见同值）
+    assign mtime_o = mtime_r;
     // MTIP = (mtime >= mtimecmp)，无符号大于等于（ISA `#norm:mtimeintrpending`）。
     // 纯组合 ⇒ 软件写 mtimecmp 抬高比较值（使 mtime < mtimecmp）后 MTIP 立刻
     // 自清（08 §6.6 / 验收判据 ③）；mtime == mtimecmp 时**必须**保持挂起。

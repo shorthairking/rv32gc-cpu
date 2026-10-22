@@ -109,10 +109,27 @@ module csr_file (
     input  wire        irq_seip,      // PLIC ctx1       ⇒ mip[9]
 
     //--------------------------------------------------------------------------
-    // 计数器（Zicntr）
+    // 计数器（Zicntr）—— ★ F1-B：单一 64 位本体在顶层，本模块只做 CSR 视图/写请求
     //--------------------------------------------------------------------------
+    //   · cycle_i / instret_i = mcycle / minstret 的**本体当前值**（已含此前已生效的
+    //     软件写）。cycle/instret 是它们的只读影子，读同一本体（不再各算一套）。
+    //   · mtime_i = CLINT 的真实 mtime（64 位）；time/timeh 是其只读影子（低/高 32 位）。
+    //   · 半字写请求（组合、W 提交拍、同拍至多 1 个 we）：顶层须在**同一时钟沿**生效：
+    //       mcycle（clock 计数，非指令副效应）：先做整 64 位 +1（tick），再只覆盖被写
+    //         半字；另一半保留本拍增量/进位（RV32 "writes change only bits 31-0/63-32"，
+    //         未被写的半必须与"本拍无此写"的演化一致）。写低半⇒高半含低位进位；
+    //         写高半⇒低半本拍照常 +1。
+    //       minstret（指令退休副效应）：写代替**本条**的隐式 +1（zicsr.adoc:173-180 /
+    //         norm:csrw_order）；按 older → 半字覆盖 → younger 的顺序
+    //         （norm:csraccessorder；younger 在写值之后累加，由顶层按提交组位次处理）。
     input  wire [63:0] cycle_i,
     input  wire [63:0] instret_i,
+    input  wire [63:0] mtime_i,
+    output wire        mcycle_we_o,    // 写 mcycle[31:0]（CSR 0xB00）
+    output wire        mcycleh_we_o,   // 写 mcycle[63:32]（0xB80）
+    output wire        minstret_we_o,  // 写 minstret[31:0]（0xB02）
+    output wire        minstreth_we_o, // 写 minstret[63:32]（0xB82）
+    output wire [31:0] cnt_wdata_o,    // 写入值（上述 4 个 we 共用；同拍至多一个）
 
     //--------------------------------------------------------------------------
     // PMP（给 pmp_check 用）
@@ -439,6 +456,18 @@ module csr_file (
     //   ★ satp：RV32 的 satp.MODE 只有 1 bit，{0,1} 全合法（无保留编码），故本引擎
     //     无需"保持现值"入参；将来扩到 RV64/Sv39（多 bit MODE）时，在下面加 satp 分支
     //     并把 satp 现值作为入参传入即可（06 §9 的占位就落在这里）。
+    // ---- MPP 的 WARL 合法映射（与 priv_ctrl.mpp_legal 同一口径）----
+    //   ISA norm:mstatusxppwarl（machine.adoc:353-445）：xPP 只能持有 x 及**已实现**
+    //   的低特权模式。本核实现 U/S/M ⇒ 合法 {00,01,11}；保留编码 2'b10 ⇒ 映到 S
+    //   （06 §9 既定口径）。★ F1-B：在**落地**处就合法化（读回恒合法），不再只在
+    //   priv_ctrl 的使用点合法化。
+    function [1:0] mpp_warl;
+        input [1:0] v;
+        begin
+            mpp_warl = ((v == PRIV_M) || (v == PRIV_S) || (v == PRIV_U)) ? v : PRIV_S;
+        end
+    endfunction
+
     //==========================================================================
     function [31:0] csr_landing;
         input [11:0] a;                 // 目标 CSR 地址
@@ -453,6 +482,7 @@ module csr_file (
         reg [31:0] m;
         reg [1:0]  mode_new;
         reg [1:0]  cbie_new;
+        reg [1:0]  mpp_new;
         reg        sip_ssip_new;
         begin
             m = wr_mask(a);
@@ -492,6 +522,16 @@ module csr_file (
                     `RV32GC_CSR_SENVCFG: begin
                         cbie_new    = (d[5:4] == 2'b10) ? senvcfg_cur[5:4] : d[5:4];
                         csr_landing = (d & m & ~32'h0000_0030) | ({30'b0, cbie_new} << 4);
+                    end
+                    // ---- ② mstatus：MPP 在落地处 WARL 合法化（F1-B）----
+                    //   写 2'b10 ⇒ 落盘/读回 = S；其余字段仍走通用掩码替换（SD 只读位
+                    //   由 cur 保留）。这样 mstatus 读回、rdata_w/byp_rdata 预览与
+                    //   priv_ctrl 的旁路口径三者一致。
+                    `RV32GC_CSR_MSTATUS: begin
+                        mpp_new = mpp_warl(d[`RV32GC_MSTATUS_MPP_LSB +: 2]);
+                        csr_landing = (d & m & ~(32'h3 << `RV32GC_MSTATUS_MPP_LSB)) |
+                                      ({30'b0, mpp_new} << `RV32GC_MSTATUS_MPP_LSB) |
+                                      (cur & ~m);
                     end
                     // ---- ② SIE/SIP：**delegation-aware 别名落地**（P1-05 旁路一致性修复）----
                     //   规范（machine.adoc，KB chunk 10554）：只有 mideleg 置位的位在
@@ -600,16 +640,10 @@ module csr_file (
     reg [31:0] menvcfg_r, senvcfg_r;
     reg [31:0] satp_r;
     reg [31:0] sscratch_r, sepc_r, scause_r, stval_r;
-    // ---- 计数器：mcycle/minstret 为 64 位；RV32 下低半走 0xB00/0xB02、
-    //      高半走 0xB80/0xB82，**四个都是软件可写寄存器**（Zicntr 要求 mcycle/
-    //      minstret 对 M 模式读写；高半亦然）。硬件计数输入只驱动"低半的硬件增量"：
-    //      2A 口径：低半 = cycle_i[31:0]（硬件计数）+ 软件写入偏移共同决定；
-    //      为保持语义简单且可测，本设计取 **"软件写即直接置值"**（低半由软件可写，
-    //      高半独立软件可写），硬件计数只反映在 cycle_i/instret_i 的 *只读视图*
-    //      （0xC00/0xC02）上——这也是 2A 未做计数抑制/事件选择（mcountinhibit
-    //      与 mhpmevent 吞写）时的自洽口径。
-    reg [31:0] mcycle_l, mcycle_h;     // mcycle  低/高半（软件可写）
-    reg [31:0] minstret_l, minstret_h; // minstret 低/高半（软件可写）
+    // ---- 计数器：★ F1-B 起**本模块不持有计数器本体** ----
+    //     64 位本体（mcycle/minstret）留在顶层；本模块只做 CSR 视图、半字写请求
+    //     与同拍旁路预览。cycle/instret 与 mcycle/minstret 读同一本体（只读影子），
+    //     time/timeh 读 CLINT 的真实 mtime。软件写的"落盘"由顶层在同一沿执行。
     reg [31:0] mstat_sw;               // mstatus 的**软件可写**字段存储
     //   ★ 位宽必须是 3：{SEIP, STIP, SSIP} ↔ {[2],[1],[0]}。
     //     实测踩到：写成 [1:0] 而索引 [2] ⇒ 读回出现 X（iverilog 报 0xX22）。
@@ -710,10 +744,14 @@ module csr_file (
     wire wr_sepc    = wen & (waddr == `RV32GC_CSR_SEPC);
     wire wr_scause  = wen & (waddr == `RV32GC_CSR_SCAUSE);
     wire wr_stval   = wen & (waddr == `RV32GC_CSR_STVAL);
-    wire wr_mcycle   = wen & (waddr == `RV32GC_CSR_MCYCLE);
-    wire wr_mcycleh  = wen & (waddr == `RV32GC_CSR_MCYCLEH);
-    wire wr_minstret = wen & (waddr == `RV32GC_CSR_MINSTRET);
-    wire wr_minstreth= wen & (waddr == `RV32GC_CSR_MINSTRETH);
+    // ---- 计数器半字写请求（Zicntr）：组合、W 提交拍；顶层同一沿生效 ----
+    //   ★ 同拍至多一个 we（一条指令只写一个 CSR 地址）；cnt_wdata_o 与 csr_file 的
+    //     post-WARL 落地引擎同源（计数器地址的 wr_mask 为全 1 ⇒ 即写数据）。
+    assign mcycle_we_o    = sw_en & (waddr == `RV32GC_CSR_MCYCLE);
+    assign mcycleh_we_o   = sw_en & (waddr == `RV32GC_CSR_MCYCLEH);
+    assign minstret_we_o  = sw_en & (waddr == `RV32GC_CSR_MINSTRET);
+    assign minstreth_we_o = sw_en & (waddr == `RV32GC_CSR_MINSTRETH);
+    assign cnt_wdata_o    = wval_final;
     // ---- PMP：16 项地址寄存器 + 4 个 cfg ----
     wire [3:0] wr_pmpcfg =
         { (wen & (waddr == `RV32GC_CSR_PMPCFG3)),
@@ -815,11 +853,12 @@ module csr_file (
     //      mcycle/minstret 为 64 位；RV32 低半走 CSR，高半走 *H 别名。
     //      Zicntr 的 cycle/time/instret 是"只读视图"，mcounteren/scounteren 门控在
     //      访问权限判定里由 dec_csr 处理（本模块只给值）。
-    //   注：这里用 mcycle_l/mcycle_h 直接组合成 64 位视图；硬件计数视图另有
-    //   cycle/instret（0xC00/0xC02）走 cycle_i/instret_i，两者不混用（08 §6.2
-    //   列 mcycle/minstret 为 MRW、cycle/instret 为 URO 视图）。
-    wire [63:0] mcycle_v   = {mcycle_h, mcycle_l};
-    wire [63:0] minstret_v = {minstret_h, minstret_l};
+    //   ★ F1-B：mcycle_v/minstret_v = 顶层 64 位本体当前值（已含此前软件写）；
+    //   cycle/instret（0xC00/0xC02）与 mcycle/minstret 同源（只读影子），
+    //   time/timeh 读 mtime_v（CLINT mtime_o）。
+    wire [63:0] mcycle_v   = cycle_i;
+    wire [63:0] minstret_v = instret_i;
+    wire [63:0] mtime_v    = mtime_i;
 
     // ---- satp 视图 ----
     assign satp_o = satp_r;
@@ -892,8 +931,8 @@ module csr_file (
             `RV32GC_CSR_MINSTRETH:  rdata_r = minstret_v[63:32];
             `RV32GC_CSR_CYCLE:      rdata_r = cycle_i[31:0];
             `RV32GC_CSR_CYCLEH:     rdata_r = cycle_i[63:32];
-            `RV32GC_CSR_TIME:       rdata_r = cycle_i[31:0];   // time 接 mtime（CLINT 提供）
-            `RV32GC_CSR_TIMEH:      rdata_r = cycle_i[63:32];
+            `RV32GC_CSR_TIME:       rdata_r = mtime_v[31:0];   // ★ F1-B：time 读 CLINT mtime
+            `RV32GC_CSR_TIMEH:      rdata_r = mtime_v[63:32];
             `RV32GC_CSR_INSTRET:    rdata_r = instret_i[31:0];
             `RV32GC_CSR_INSTRETH:   rdata_r = instret_i[63:32];
             `RV32GC_CSR_FFLAGS:     rdata_r = 32'h0;   // FP 状态由 fpu/fcsr 落地（本模块不持有）
@@ -1017,8 +1056,43 @@ module csr_file (
     //     byp_wdata 写进 raddr 之后的读回值；core_top 只在 em 槽地址 == de_csr_addr
     //     （csr_em_hit）时采用 ⇒ 与 rdata_w 一起实现"距离 0/1 两级旁路"。
     //   ⇒ 二者与 §6.3 的写通道落地值共用同一个 csr_landing() 引擎（单一真源）。
+    //   ★ F1-B：计数器/CYCLE 别名的同拍视图 —— 把 W 级半写应用到本体上，
+    //     使"写 mcycle 后紧邻读 cycle（或反之）"在下一级拿到写后值。
+    //     （更年轻 M 级写的同类可见性由 byp_rdata 侧处理；其选中门控在消费者。）
+    //   ★ scope（明确边界，勿当 post-edge）：rdata_w/byp_rdata 只预览**显式半字写**
+    //     作用在当前本体输入上的结果，**不含**顶层在同一沿才执行的 tick/退休隐式更新。
+    //     例：cycle_i={2,FFFF_FFFF}、写 MCYCLE lo=0、raddr=CYCLEH ⇒ rdata_w=2，
+    //     而同沿后 top 本体={3,0}（低溢出进位）。消费者不得把该预览当作
+    //     "下一拍完整状态"；跨半进位/下一条跨半 CSR 读的程序序冒险由 top 侧
+    //     （2A owner 验证）负责，不能靠改 preview 定义掩盖。
+    wire [63:0] mcycle_wv = (sw_en && (waddr == `RV32GC_CSR_MCYCLE))  ? {cycle_i[63:32], wval_final} :
+                            (sw_en && (waddr == `RV32GC_CSR_MCYCLEH)) ? {wval_final, cycle_i[31:0]} :
+                                                                       cycle_i;
+    wire [63:0] minstret_wv = (sw_en && (waddr == `RV32GC_CSR_MINSTRET))  ? {instret_i[63:32], wval_final} :
+                              (sw_en && (waddr == `RV32GC_CSR_MINSTRETH)) ? {wval_final, instret_i[31:0]} :
+                                                                            instret_i;
+    //   计数器地址（含只读影子）⇒ 写后视图；time/timeh 不受写影响。
+    wire [31:0] cnt_view_w =
+        (raddr == `RV32GC_CSR_MCYCLE)    ? mcycle_wv[31:0] :
+        (raddr == `RV32GC_CSR_MCYCLEH)   ? mcycle_wv[63:32] :
+        (raddr == `RV32GC_CSR_CYCLE)     ? mcycle_wv[31:0] :
+        (raddr == `RV32GC_CSR_CYCLEH)    ? mcycle_wv[63:32] :
+        (raddr == `RV32GC_CSR_MINSTRET)  ? minstret_wv[31:0] :
+        (raddr == `RV32GC_CSR_MINSTRETH) ? minstret_wv[63:32] :
+        (raddr == `RV32GC_CSR_INSTRET)   ? minstret_wv[31:0] :
+        (raddr == `RV32GC_CSR_INSTRETH)  ? minstret_wv[63:32] :
+        (raddr == `RV32GC_CSR_TIME)      ? mtime_v[31:0] :
+        (raddr == `RV32GC_CSR_TIMEH)     ? mtime_v[63:32] : 32'h0;
+    wire        is_cnt_rd =
+        (raddr == `RV32GC_CSR_MCYCLE)    | (raddr == `RV32GC_CSR_MCYCLEH)   |
+        (raddr == `RV32GC_CSR_CYCLE)     | (raddr == `RV32GC_CSR_CYCLEH)    |
+        (raddr == `RV32GC_CSR_MINSTRET)  | (raddr == `RV32GC_CSR_MINSTRETH) |
+        (raddr == `RV32GC_CSR_INSTRET)   | (raddr == `RV32GC_CSR_INSTRETH)  |
+        (raddr == `RV32GC_CSR_TIME)      | (raddr == `RV32GC_CSR_TIMEH);
+
     wire [31:0] rd_view_w = (raddr == `RV32GC_CSR_SIE) ? (mie_o & mideleg_w) :
-                            (raddr == `RV32GC_CSR_SIP) ? (mip_o & mideleg_w) : rdata;
+                            (raddr == `RV32GC_CSR_SIP) ? (mip_o & mideleg_w) :
+                            is_cnt_rd ? cnt_view_w : rdata;
     assign rdata_w  = (raddr == waddr) ? wval_final : rd_view_w;
 
     //   M 级预览的"既有状态"必须取**本拍末 W 级写落地之后**的值（M 槽比 W 槽年轻，
@@ -1035,7 +1109,17 @@ module csr_file (
         (wr_pmpcfg[2] & sw_en) ? wval_final : pmp_cfg_r[ 95: 64],
         (wr_pmpcfg[1] & sw_en) ? wval_final : pmp_cfg_r[ 63: 32],
         (wr_pmpcfg[0] & sw_en) ? wval_final : pmp_cfg_r[ 31:  0] };
-    assign byp_rdata = csr_landing(raddr, byp_wdata, byp_cur,
+    //   ★ F1-B：8 个可写计数器地址（mcycle/minstret 及 cycle/instret 只读影子）的
+    //     M 级预览 = 更年轻写的半字值。消费者须仅在"同计数器同半"命中时选用
+    //     （写低半而读高半的情况不适用，须走本体视图）；time/timeh 无写入口。
+    wire        is_cnt_wr_rd =
+        (raddr == `RV32GC_CSR_MCYCLE)    | (raddr == `RV32GC_CSR_MCYCLEH)   |
+        (raddr == `RV32GC_CSR_CYCLE)     | (raddr == `RV32GC_CSR_CYCLEH)    |
+        (raddr == `RV32GC_CSR_MINSTRET)  | (raddr == `RV32GC_CSR_MINSTRETH) |
+        (raddr == `RV32GC_CSR_INSTRET)   | (raddr == `RV32GC_CSR_INSTRETH);
+
+    assign byp_rdata = is_cnt_wr_rd ? byp_wdata :
+                       csr_landing(raddr, byp_wdata, byp_cur,
                                    mtvec_r, stvec_r, menvcfg_r, senvcfg_r, pmp_cfg_byp,
                                    mideleg_w);
 
@@ -1100,10 +1184,6 @@ module csr_file (
             sepc_r       <= 32'h0;
             scause_r     <= 32'h0;
             stval_r      <= 32'h0;
-            mcycle_l     <= 32'h0;
-            mcycle_h     <= 32'h0;
-            minstret_l   <= 32'h0;
-            minstret_h   <= 32'h0;
             mstat_sw     <= 32'h0;
             mip_sw       <= 2'b00;
             pmp_cfg_r    <= {`RV32GC_PMP_ENTRIES*8{1'b0}};
@@ -1181,12 +1261,6 @@ module csr_file (
 
             if (tw_stval)  stval_r <= trap_tval_i;
             else if (wr_stval & sw_en) stval_r <= wval_final;
-
-            // ---- 7.6 计数器高半（软件可写；低半由硬件计数器驱动） ----
-            if (wr_mcycle    & sw_en) mcycle_l   <= wval_final;
-            if (wr_mcycleh   & sw_en) mcycle_h   <= wval_final;
-            if (wr_minstret  & sw_en) minstret_l <= wval_final;
-            if (wr_minstreth & sw_en) minstret_h <= wval_final;
 
             // ---- 7.7 PMP cfg（逐项 L 位锁定） ----
             // ---- 7.7 PMP cfg（逐项 L 位锁定已收口在 csr_landing 内；写点只做分组选择）----

@@ -80,6 +80,7 @@ module tb_clint;
     //    机器化断言。若 clint.v 被加上 AXI 端口，本 TB 的例化会编译失败。
     //--------------------------------------------------------------------------
     wire axi_like_activity = 1'b0;   // 模块无 AXI 端口 ⇒ 不可能存在 AXI 请求
+    wire [63:0] mtime_o;             // ★ F1-B：mtime 实时值输出
 
     //--------------------------------------------------------------------------
     // 3. 例化 DUT（端口逐条对应 clint.v 的 port list；**无任何 AXI 端口**）
@@ -95,7 +96,8 @@ module tb_clint;
         .resp_rdata(resp_rdata),
         .resp_hit  (resp_hit),
         .msip_o    (msip_o),
-        .mtip_o    (mtip_o)
+        .mtip_o    (mtip_o),
+        .mtime_o   (mtime_o)          // ★ F1-B：64 位 mtime 实时输出（csr_file.time 影子源）
     );
 
     //--------------------------------------------------------------------------
@@ -238,6 +240,7 @@ module tb_clint;
         mmio_write(MSIP_OFF, 32'hFFFF_FFF1);
         #1;
         `CK(msip_o === 1'b1, "写 msip bit0=1 时 msip_o 应置位")
+        `CK(mtime_o === 64'h0 || mtime_o[63:32] === 32'h0, "mtime_o 复位后高半为 0")
         mmio_write(MSIP_OFF, 32'h0000_0000);
 
         //----------------------------------------------------------------------
@@ -282,6 +285,16 @@ module tb_clint;
         mmio_read(MTIMEH_OFF, rd, hit);
         `CK(hit === 1'b1,        "读 mtime 高字应命中")
         `CK(rd  === 32'h0000_0001, "mtime 高字应为 1（64 位拆分读写）")
+        //   ---- ★ F1-B：mtime_o 与 MMIO 读 mtime 同拍一致（time 影子的源）----
+        //     这里用"原始读序列"在同一仿真时刻采样 resp_rdata 与 mtime_o，
+        //     避免 mmio_read 任务在返回前多等一个 posedge 造成 +1 假差异。
+        @(negedge aclk);
+        req_addr = MTIME_OFF; req_write = 1'b0; req_valid = 1'b1; #1;
+        `CK(resp_hit === 1'b1, "读 mtime 低字应命中（mtime_o 对照）")
+        `CK(mtime_o[31:0] === resp_rdata, "★ mtime_o 低 32 位 == MMIO 读 mtime 低字（同拍）")
+        `CK(mtime_o[63:32] === 32'h0000_0001, "★ mtime_o 高 32 位 == 已写高字")
+        @(posedge aclk); #1;
+        req_valid = 1'b0; req_write = 1'b0;
 
         //----------------------------------------------------------------------
         // (3) mtimecmp 溢出 ⇒ MTIP 置位；软件写 mtimecmp 清 MTIP

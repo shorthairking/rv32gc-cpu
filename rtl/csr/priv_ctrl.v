@@ -72,6 +72,28 @@ module priv_ctrl (
     output wire [1:0]  priv_next_o      // 下一特权级（供调试/断言）
 );
 
+    // ---- 特权级常量 + MPP WARL 合法映射（§1 旁路与 §2 状态机共用同一口径）----
+    localparam [1:0] PRIV_U = `RV32GC_PRIV_U;
+    localparam [1:0] PRIV_S = `RV32GC_PRIV_S;
+    localparam [1:0] PRIV_M = `RV32GC_PRIV_M;
+
+    //   norm:mstatusxppwarl：xPP 可持有 x 与任何已实现且低于 x 的模式。
+    //   本设计实现 U/S/M ⇒ MPP ∈ {U, S, M}，编码 2'b10(H) 为保留 ⇒ 归为 S
+    //   （保证读回**合法值**，绝不解出 H）。06 §9「WARL 写入非法值须保留合法值」。
+    //   ★ F1-B：csr_file 已在**落地**处做同一 mpp_warl；本模块的旁路也必须对
+    //     csr_wdata 的 MPP 先合法化再替换，三者（落盘读回/rdata_w/byp_rdata）同口径。
+    function [1:0] mpp_legal;
+        input [1:0] v;
+        begin
+            case (v)
+                PRIV_U:  mpp_legal = PRIV_U;
+                PRIV_S:  mpp_legal = PRIV_S;
+                PRIV_M:  mpp_legal = PRIV_M;
+                default: mpp_legal = PRIV_S;   // 2'b10(保留/H) ⇒ 合法化为 S
+            endcase
+        end
+    endfunction
+
     //==========================================================================
     // 1. mstatus 字段抽取（组合；含同拍旁路）
     //==========================================================================
@@ -117,7 +139,15 @@ module priv_ctrl (
                                 (csr_waddr == `RV32GC_CSR_MSTATUS) ? MSTATUS_WR_MSK :
                                                                      SSTATUS_WR_MSK;
     //   ★ 替换语义（先清掩码内旧值，再置入写数据）；mstat_hit=0 时掩码为 0 ⇒ = 架构值。
-    wire [31:0] mstat_eff = (mstatus_i & ~mstat_byp_msk) | (csr_wdata & mstat_byp_msk);
+    //   ★ F1-B：写 mstatus 时先把 MPP 字段合法化（与 csr_file 落地同一映射），
+    //     使旁路值 == 落盘读回值；sstatus 无 MPP 字段，原样使用。
+    wire [31:0] mstat_wdata_eff =
+        (csr_waddr == `RV32GC_CSR_MSTATUS)
+        ? ((csr_wdata & ~(32'h3 << `RV32GC_MSTATUS_MPP_LSB)) |
+           ({30'b0, mpp_legal(csr_wdata[`RV32GC_MSTATUS_MPP_LSB +: 2])}
+             << `RV32GC_MSTATUS_MPP_LSB))
+        : csr_wdata;
+    wire [31:0] mstat_eff = (mstatus_i & ~mstat_byp_msk) | (mstat_wdata_eff & mstat_byp_msk);
 
     // ---- 字段抽取（显式位选，便于 lint） ----
     wire       f_mie   = mstat_eff[`RV32GC_MSTATUS_MIE_BIT];
@@ -137,27 +167,7 @@ module priv_ctrl (
     // 2. 特权级状态机（唯一的架构状态；复位 = M）
     //==========================================================================
     //   理由：特权级是架构寄存器，必须时钟沿保持 ⇒ always 块不可省（AGENT.md §4.3）。
-    localparam [1:0] PRIV_U = `RV32GC_PRIV_U;
-    localparam [1:0] PRIV_S = `RV32GC_PRIV_S;
-    localparam [1:0] PRIV_M = `RV32GC_PRIV_M;
-
     reg [1:0] priv_r;
-
-    // ---- MPP 的 WARL 语义：MPP 只能持有 M 及更低已实现特权级 ----
-    //   norm:mstatusxppwarl：xPP 可持有 x 与任何已实现且低于 x 的模式。
-    //   本设计实现 U/S/M ⇒ MPP ∈ {U, S, M}，编码 2'b10(H) 为保留 ⇒ 归为 S
-    //   （保证读回**合法值**，绝不解出 H）。06 §9「WARL 写入非法值须保留合法值」。
-    function [1:0] mpp_legal;
-        input [1:0] v;
-        begin
-            case (v)
-                PRIV_U:  mpp_legal = PRIV_U;
-                PRIV_S:  mpp_legal = PRIV_S;
-                PRIV_M:  mpp_legal = PRIV_M;
-                default: mpp_legal = PRIV_S;   // 2'b10(保留/H) ⇒ 合法化为 S
-            endcase
-        end
-    endfunction
 
     wire [1:0] mpp_l = mpp_legal(f_mpp);
 
