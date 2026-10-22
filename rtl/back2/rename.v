@@ -912,7 +912,15 @@ module rename #(
                                      lane_pd_old[cj*PDW +: PDW]);
                     end
                 end
-                if (lane_valid[cj] & lane_need_dst[cj]) begin
+                //   ★★ 诊断接受条件修正（仅 checker，无功能改动）：自环只在"本拍真的发生了
+                //     寄存器重命名分配"时才有意义 —— 与 §3 写分支优先级同口径：
+                //     `lvf`（= lane_valid & lane_fire）且不在 flush_all / 重建(rb_act) /
+                //     回滚(restore_valid|restore_rob_valid) 分支内。原判据用 lane_valid，
+                //     会在重建/冲刷窗口按"半更新的 flist_q / rat_q"采样（实测 13/13 条旧
+                //     FAIL 均 lvf=0 且 rb_act=1），把未分配误报成自环。真自环（真派发）仍会打印。
+                if (lvf[cj] & lane_need_dst[cj] &
+                    ~flush_all & ~rb_act & ~busy &
+                    ~(restore_valid | restore_rob_valid)) begin
                     for (ck = 0; ck < NSRC; ck = ck + 1) begin
                         if (lane_need_s[cj*NSRC + ck] &
                             (lane_s_arn[(cj*NSRC+ck)*ARN_W +: ARN_W] ==

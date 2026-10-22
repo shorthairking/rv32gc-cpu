@@ -314,6 +314,46 @@ module tb_rename_semantics;
                     errs = errs + 1;
                     if (errs <= 6) $display("CHK busy 非 0/1: %b (t=%0t)", busy, $time);
                 end
+                //   ★★ 稳定接受窗口不变式（本 cohort 已证：重建/冲刷期内部态不是最终一致态）：
+                //     ① DUT 空闲表 [fhead,ftail) 内 preg 两两唯一（真实重复分配的直接前兆）
+                //     ② 同拍**真正 fire** 且 need_dst 的 lane，其 pd_dst 两两唯一
+                //     ③ 本拍释放的 preg 在释放前不得已在空闲表内（双重释放）
+                //     仅当 `!busy && !flush_all && !restore*` 时判（rb_act 半重建态豁免）。
+                begin : chk_stable_pool
+                    integer qa, qb;
+                    reg [7:0] qarc;          // ★ 显式 8 bit 模差：避免 (ftail-fhead) 被 32 位扩宽
+                    reg [7:0] qpos;
+                    reg [PDW-1:0] qv;
+                    reg [PDW-1:0] qdst [0:3];
+                    reg [PDW-1:0] qrel [0:1];
+                    if (!busy && !flush_all && !restore_rob_valid && !restore_valid) begin
+                        //   ★ 指针 wrap：250→10 必须得 16，不能得 -240
+                        qarc = (dut.ftail_q - dut.fhead_q) & 8'hff;
+                        if (qarc > 8'd64) begin
+                            errs = errs + 1;
+                            if (errs <= 6) $display("CHK 空闲表弧长 %0d > 64 (t=%0t)", qarc, $time);
+                        end
+                        for (qa = 0; qa < 64; qa = qa + 1) begin
+                            if (qa >= qarc) qa = 64;
+                            else begin
+                                qpos = (dut.fhead_q + qa) & 8'hff;
+                                qv = dut.flist_q[qpos[5:0]];
+                                for (qb = qa + 1; qb < 64; qb = qb + 1) begin
+                                    if (qb >= qarc) qb = 64;
+                                    else begin
+                                      qpos = (dut.fhead_q + qb) & 8'hff;
+                                      if (dut.flist_q[qpos[5:0]] == qv) begin
+                                        errs = errs + 1;
+                                        if (errs <= 6) $display("CHK 空闲表重复 preg=%0d pos=%0d/%0d (t=%0t)",
+                                                                qv, qa, qb, $time);
+                                        qb = 64; qa = 64;
+                                      end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
                 //   ★ 独立占用数一致性：popcount(r_v) == r_cnt，且 [head, tail) 内恰为
                 //     r_cnt 条有效、窗外全无效（防止任何手写路径漏更新生命周期）。
                 begin : chk_occ
@@ -478,6 +518,51 @@ module tb_rename_semantics;
         end
     endtask
 
+    //   ★★ 事件侧不变式（**posedge 之前**调用，即 pre-NBA 真实接受/释放事件）：
+    //     `fire_block`/`commit_n` 都会在 edge 后清掉 lane_fire/rel_we，若只在 chk_now 里查
+    //     这两类，主路径根本不会被执行（本组缺陷）。故改为由驱动任务在"驱动后、edge 前"调用。
+    reg [PDW-1:0] ev_dst [0:3];
+    task chk_fire_events;      // 对本拍 actual fire（lvf & need_dst）的 pd_dst 两两唯一
+        integer ea, eb;
+        begin
+            for (ea = 0; ea < 4; ea = ea + 1) ev_dst[ea] = dut.lane_pd_dst[ea*PDW +: PDW];
+            for (ea = 0; ea < 4; ea = ea + 1) begin
+                if (dut.lvf[ea] && dut.lane_need_dst[ea]) begin
+                    for (eb = ea + 1; eb < 4; eb = eb + 1) begin
+                        if (dut.lvf[eb] && dut.lane_need_dst[eb] && (ev_dst[eb] == ev_dst[ea])) begin
+                            errs = errs + 1;
+                            if (errs <= 6) $display("CHK(实际fire) 两条 lane 同 pd=%0d lane=%0d/%0d (t=%0t)",
+                                                    ev_dst[ea], ea, eb, $time);
+                        end
+                    end
+                end
+            end
+        end
+    endtask
+
+    task chk_rel_events;       // 本拍释放的 preg 在**释放前**不得已在空闲表内
+        integer ea, eb; reg [7:0] pos; reg [7:0] arc;
+        begin
+            arc = (dut.ftail_q - dut.fhead_q) & 8'hff;
+            for (ea = 0; ea < CMW; ea = ea + 1) begin
+                if (rel_we[ea]) begin
+                    for (eb = 0; eb < 64; eb = eb + 1) begin
+                        if (eb >= arc) eb = 64;
+                        else begin
+                            pos = (dut.fhead_q + eb) & 8'hff;
+                            if (dut.flist_q[pos[5:0]] == rel_preg[ea*PDW +: PDW]) begin
+                                errs = errs + 1;
+                                if (errs <= 6) $display("CHK(释放前) preg=%0d 已在空闲表内 pos=%0d (t=%0t)",
+                                                        rel_preg[ea*PDW +: PDW], eb, $time);
+                                eb = 64;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    endtask
+
     task do_reset;
         begin
             rst_n = 1'b0;
@@ -570,6 +655,8 @@ module tb_rename_semantics;
             #0;
             lane_fire = 1'b1;
             rob_snap_valid = 1'b1;
+            //   ★ 本拍"真实接受"事件检查（edge 之前；见 chk_fire_events 注释）
+            #1; chk_fire_events; #0;
             rob_snap_idx = {(W*ROB_IDX_W){1'b0}};
             for (bi = 0; bi < W; bi = bi + 1)
                 rob_snap_idx[bi*ROB_IDX_W +: ROB_IDX_W] = (r_tail + bi[ROB_IDX_W-1:0]);
@@ -643,6 +730,7 @@ module tb_rename_semantics;
                     end
                 end
             end
+            chk_rel_events;          // ★ 释放前不得已在空闲表内（edge 前、rel_we 仍有效）
             @(posedge clk); #1;
             for (u = 0; u < nc; u = u + 1) begin
                 idx = (r_head + u) & 7'h3f;
@@ -869,6 +957,7 @@ module tb_rename_semantics;
             cmt_pd [1*PDW   +: PDW]   = r_pdd[(r_head+1) & 7'h3f];
             rel_we = {CMW{1'b0}};
             flush_all = 1'b1;
+            chk_rel_events;          // 手写同拍路径同样覆盖（本拍无释放则空转）
             @(posedge clk); #1;
             flush_all = 1'b0; cmt_we = {CMW{1'b0}};
             for (bi = 0; bi < 64; bi = bi + 1) r_v[bi] = 1'b0;
@@ -898,6 +987,9 @@ module tb_rename_semantics;
             rel_we = 2'b01;
             rel_preg[0*PDW +: PDW]    = r_pdo[(r_head) & 7'h3f];
             restore_rob_valid = 1'b1; restore_rob_idx = 6'd5;
+            //   ★ 手写"提交释放 + 回滚"同拍路径：必须在**沿前**检查本拍释放事件
+            //     （chk_rel_events 内不得因 restore 并行而 blanket 跳过；释放与回滚合法并行）
+            chk_rel_events;
             @(posedge clk); #1;
             restore_rob_valid = 1'b0; cmt_we = {CMW{1'b0}}; rel_we = {CMW{1'b0}};
             r_v[(r_head) & 7'h3f] = 1'b0;
