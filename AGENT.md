@@ -36,12 +36,14 @@
 
 | 角色 | provider | model | reasoning_effort | 用途 |
 |---|---|---|---|---|
-| coding | `opencode-go` | `deepseek-v4.1-flash` | `high` | 写/改 RTL、TB、脚本、移植与文档正文 |
-| testing | `opencode-go` | `deepseek-v4.1-flash` | `high` | 测试、回归、锁步、缺陷定位 |
-| info | `opencode-go` | `deepseek-v4.1-flash` | `high` | 只读检索、知识库/上游/联网、带引用结论 |
+| coding | `openai-codex` | `gpt-6-luna` | `high` | 写/改 RTL、TB、脚本、移植与文档正文 |
+| testing | `openai-codex` | `gpt-6-luna` | `high` | 测试、回归、锁步、缺陷定位 |
+| info | `openai-codex` | `gpt-6-luna` | `high` | 只读检索、知识库/上游/联网、带引用结论 |
 | audit | `openai-codex` | `gpt-6.1-sol` | `low` | 独立审计/复核；低档是刻意选择 |
 
-- 2026-10-19 按用户裁决切换 coding/testing/info，并用 `list_subagent_models` 确认 `opencode-go/deepseek-v4.1-flash` 支持 `high`；audit 沿用此前确认支持 low 的 `openai-codex/gpt-6.1-sol`。此处为路由目录/能力确认，不冒称已运行新路由任务。**不得静默替代**其他 provider/model/档位；无法按表派发时停止并报告用户。
+- 按用户最新裁决，除 audit 外所有子 Agent（包括 coding/testing/info）统一使用 `openai-codex/gpt-6-luna/high`；已用 `list_subagent_models` 确认该精确路由支持 `high`。audit 仍为表中原路由；最多一名活动审计的约束不包含非审计 Luna。此处仅为目录/能力确认，不冒称已运行新路由任务。**不得静默替代**其他 provider/model/档位；无法按表派发时停止并报告用户。
+- **额度护栏（母 Agent 调度规则）**：使用 codex-proxy 的 `/codex-quota` 查询共享的 ChatGPT Plus 额度；首次使用或没有本次任务后的有效被动读数时，`/codex-quota fresh` 只做一次最小探测，不轮询。每个子 Agent 任务回报后检查一次（同一交付与 finished 通知去重），检查完成前不追加派发。默认任一 5 小时/7 天窗口剩余 **≤10%**（usedPercent ≥90%）或明确限额耗尽即暂停所有任务：停止新派发、中断活动子 Agent、停止可安全终止的后台作业，保留已写源与证据，不回滚/删除，不启用 goal，也不因购买 credits 可用而继续花费。阈值可由用户调整；恢复须用户指令并重新核额。
+- **额度查询前提**：仅使用可正常认证的插件接口，不读取/展示登录令牌或绕过本地 API 认证。查询不可用或结果不完整时不猜剩余额度、不宣称自动检查已部署，停止新派发并报告；查询通道可用后才执行上述逐回报检查。当前是否就绪只记在 NEXT。修改路由/额度规则本身不解除用户先前的任务暂停。
 - 默认用 `subagent`，显式传 `provider`/`model`/`reasoning_effort` 三个字段。`subagent_fork` **没有路由字段**（设计如此），不能用于要求精确模型的本项目任务；原实例路由仍符合当前表时，延续用 `send_message`。**改模板或发送消息不会迁移已有实例的模型路由**；路由不符的旧实例不得继续执行新任务，应按当前三字段新建对应角色。
 - 现行 `subagent` **没有 `run_in_background` 参数**；调用本身立即返回 id、在后台运行。不要轮询状态、不要发催促消息，靠宿主完成通知交接。
 - 只在怀疑宿主路由/档位时用 `list_subagent_models` 复验，不必每次派发重查；模型排障往事见归档，不写入各入口文档。**路由定义只在本表**；变更须用户裁决/实测后，同步 `prompts/subagent-*.md` 路由行与 USAGE 示例，避免多方漂移，不再复制第二张表。

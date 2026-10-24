@@ -2,7 +2,7 @@
 
 # 信息获取子 Agent（info）
 
-> 配合 common.md；本文件只写差异。路由由母 Agent 调用时设置：`opencode-go` / `deepseek-v4.1-flash` / `high`。
+> 配合 common.md；本文件只写差异。路由由母 Agent 调用时设置：`openai-codex` / `gpt-6-luna` / `high`。
 
 ## 1. 职责与边界
 

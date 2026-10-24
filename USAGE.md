@@ -33,13 +33,14 @@
 
 ## 3. 派发子 Agent（现行契约）
 
-- **路由只认 [AGENT.md §2](AGENT.md) 的唯一表**：coding / testing / info 用 `opencode-go` / `deepseek-v4.1-flash` / `high`；audit 用 `openai-codex` / `gpt-6.1-sol` / `low`。本文件不另立第二张表，也不得静默替代；路由变更时从该表派生，并同步角色模板与本文件示例。
+- **路由只认 [AGENT.md §2](AGENT.md) 的唯一表**：coding / testing / info 用 `openai-codex` / `gpt-6-luna` / `high`；audit 用 `openai-codex` / `gpt-6.1-sol` / `low`。本文件不另立第二张表，也不得静默替代；路由变更时从该表派生，并同步角色模板与本文件示例。
 - **prompt 只要求路径加载**：子 Agent 实际 `read prompts/common.md` + 选定角色文件；同一子 Agent 后续消息若已完整读过且确认文件未变，可复用不重读；文件变更只补读受影响文件。**不要粘贴模板正文**，也不要要求子 Agent 总重读 AGENT/NEXT。
 - **角色标签可见**：选定角色模板第一行的 `[xxx子agent]` 同时放在任务 `description` 和派发 prompt 首行；子 Agent 首次响应、关键进度、最终交付也保留该前缀。标签从角色模板读取，不用另抄一张映射表；已有任务的旧显示名不会因改模板自动变更。
 - 标签与路径加载指令之后，任务块只附 **【目标】【范围】【验收】**，可选 **【约束】【参考】**。【范围】必须写可写白名单和产物/日志目录，未列默认只读。
 - `subagent` 调用**没有 `run_in_background` 参数**：调用本身立即返回 id、在后台运行。等宿主完成通知，**不要轮询、不要催促**。
 - `subagent_fork` **没有 `provider`/`model`/`reasoning_effort` 字段**（设计如此），不能用于本项目要求精确模型的任务；延续同一子 Agent 用 `send_message`。
 - audit 默认只读、不代修；执行测试或把报告落盘必须在【范围】明确授权。
+- 每次子 Agent 任务回报后按 [AGENT.md §2](AGENT.md#2-子-agent-模型路由唯一表) 执行额度护栏；插件命令为 `/codex-quota` / `/codex-quota fresh`。查询通道未就绪时不得宣称自动检查可用，停止新派发；当前就绪/暂停状态只看 [NEXT_SESSION.md](NEXT_SESSION.md)。
 
 ## 4. 调用例（真实工具 schema）
 
@@ -58,8 +59,8 @@ subagent(
 【验收】bash 运行定向 TB 输出 D3_PMP_LOCK: PASS；并给出修复前同等命令 FAIL 的反证输出。
 【约束】不改 PMP 粒度 G=0 裁决；不跑全量回归。
 【参考】sim/audit/audit2_report.md D3 条目。",
-  provider: "opencode-go",
-  model: "deepseek-v4.1-flash",
+  provider: "openai-codex",
+  model: "gpt-6-luna",
   reasoning_effort: "high",
   cwd: "/home/shorthair/dsh/rv32-cpu/rv32gc-cpu"
 )
@@ -86,7 +87,7 @@ subagent(
 
 ### 4.3 testing / info
 
-- testing：同 `subagent` 三字段（OpenCode Go 的 `deepseek-v4.1-flash` / `high`），角色文件换 `prompts/subagent-testing.md`，description/prompt/响应用其首行 `[测试子agent]`；默认产品只读，TB/日志只写【范围】列出的目录。
+- testing：同 `subagent` 三字段（`openai-codex` / `gpt-6-luna` / `high`），角色文件换 `prompts/subagent-testing.md`，description/prompt/响应用其首行 `[测试子agent]`；默认产品只读，TB/日志只写【范围】列出的目录。
 - info：同 `subagent` 三字段，角色文件换 `prompts/subagent-info.md`，description/prompt/响应用其首行 `[信息子agent]`；纯只读，结论必须带 `文件:行号` 或 URL。
 
 ### 4.4 延续同一子 Agent
