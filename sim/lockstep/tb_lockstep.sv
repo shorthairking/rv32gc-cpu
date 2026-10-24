@@ -47,18 +47,45 @@
 //                 提交 PC == TERM_PC（= prog 里 lockstep_spin 的地址）⇒ 停止记录
 //
 //------------------------------------------------------------------------------
-// 三、DUT trace 格式（cmp_commit.py 的输入契约；一行 = 一条提交）
+// 三、DUT trace 格式 v3（cmp_commit.py 的输入契约；一行 = 一条提交）
 //------------------------------------------------------------------------------
-//   `#` 开头为注释行（含末行 `# end ...` 结束证据）；数据行：
-//     <idx> pc=0x%08x wen=%0d rd=%0d wdata=0x%08x
-//     · idx   : 0 起的提交序号
-//     · pc    : debug0_wb_pc（提交指令 PC）
-//     · wen   : debug0_wb_rf_wen[0]（1 = 该指令写架构寄存器；2A 只驱动 bit0）
-//     · rd    : wen=1 时为 debug0_wb_rf_wnum（0..31），wen=0 时记 -1
-//     · wdata : debug0_wb_rf_wdata（wen=0 时无意义，仍记录便于定位）
-//   ★ 口径限制（写清以免误判覆盖率）：2A 的提交探针**不含**访存地址/数据、不含 CSR
-//     变更、且 FP 写回也用 rf_wen[0] + 浮点寄存器号上报（core_top.v:2755）⇒ 本任务
-//     只比对 **PC 与整数 rd 写值**（任务口径），锁步程序里不出现 F/D 指令（见 .S 头注）。
+//   `#` 仅前三行是固定元数据；trace 版本为 `DUT commit trace v3`（旧 v1/v2 无 SD 域，
+//   比对器明确拒绝，不静默降级）。数据行**固定字段顺序**（全部字段每行必在）：
+//
+//     <idx> pc=0x%08x xw=%0d xrd=%0d xval=0x%08x fw=%0d frd=%0d fval=0x%016x
+//           st=%0d ssz=%0d s0a=0x%08x s0p=0x%08x s0d=0x%08x s0b=0x%x
+//           s1a=0x%08x s1p=0x%08x s1d=0x%08x s1b=0x%x
+//           cw=%0d cad=0x%03x cva=0x%08x cvo=0x%08x fl=%0d ff=0x%05x fs=%0d sd=%0d obs=%0d
+//
+//   · idx/pc : 0 起提交序号 + debug0_wb_pc（真实提交 PC）
+//   · xw/xrd/xval : w_rf_we 整数写回（x0 不写；xw=0 时 xrd=-1、xval 无意义）
+//   · fw/frd/fval : mw_fp_we 浮点写回，fval 为 **64 bit**（S 结果高 32 位 NaN-box）
+//   · st/ssz/...  : **DUT 真实 store 请求**（M_S_ISS 的 m_store_w32/m_store_strb/
+//                   m_va/m_pa_eff）。st=0 无 store；st=1 一个 4 B 车道；st=2 两个
+//                   4 B 车道（仅 fsd）。ssz：0=sb,1=sh,2=sw/fsw,3=fsd。
+//                   s0a/s1a = 虚拟地址（Spike mem 口径），s0p/s1p = DUT 实际物理
+//                   地址；Bare 程序由比对器逐相比 PA==VA，翻译模式显式 UNSUPPORTED。
+//   · cw/cad/cva/cvo : 显式 CSR 写（csr_wen_w；cad 为 CSR 号，FCSR 由比对器展开）；
+//                   cva = 提交后实际状态（mstatus/sstatus 实际读视图；fflags/frm/
+//                   fcsr 实际更新后寄存器；其余 post-WARL landing，不是原始 operand），
+//                   cvo = 写前 waddr 视角当前值。**仅 PMP addr（0x3B0..0x3BF）**有
+//                   csr_file 专用 one-hot 现值路径，故只有该区间非零并可用于识别
+//                   "锁写 no-op"；其他 CSR 的产品读视图是 raddr 视角，不伪造成 0
+//                   参与 no-op 判定（比对器对其缺失记录仍按失败处理）。
+//   · fl/ff      : 隐式浮点 flags 副作用。push 在 E 更新后一拍，ff 取**实际
+//                   fflags_r poststate**（不重算 OR）；与 W 级 CSR flags 写同拍
+//                   时标 taint，提交时明确失败（无法独立归属）。
+//   · fs         : 延迟一拍写出该提交后的**实际 mstatus.FS**（不复制 DUT 规则）
+//   · sd         : 同一时刻直接采样 CoreTop csr_mstatus_view[31] 真实读视图，非 fs 推算
+//   · obs        : 本行被声明字段无 X/Z 且可采样（0 ⇒ 比对器/本 TB 必须失败）
+//
+//   末行 `# end ...` 另含 **DUT 侧 AXI 观测**（AW 地址与 W 数据/strb 配对）：
+//   magic_aw/magic_w/magic_addr/magic_data/magic_strb、doorbell_aw/doorbell_w/
+//   doorbell_addr/doorbell_data/doorbell_strb、obs_err、bus_err。它们是"程序真的
+//   在 DUT 上跑到结尾"的独立证据；Spike 单方停机不能替代。
+//   ★ 限制：store 的逐笔总线落地不逐条比较（提交 store trace ≠ 总线恰一次）；
+//     只有 magic/doorbell 两个锚点要求 DUT 总线恰一次。fsd 需要两相都捕到，
+//     否则比对器拒绝（不拿单相冒充 64 位落盘）。
 //
 //------------------------------------------------------------------------------
 // 四、判据（fail-closed：任一不满足 ⇒ TB_LOCKSTEP: FAIL + $fatal，rc≠0）
@@ -69,6 +96,11 @@
 //   C4 在 TIMEOUT_CYCLES 内提交到 TERM_PC（= lockstep_spin）而停止（非超时）
 //   C5 提交条数 >= MIN_COMMITS（默认 60）
 //   C6 UART 结束铃：u_mem.uart_write_count >= 1（程序确实跑到 0x1FE0_01E0 的写）
+//   C7 所有提交已声明观测域无 X/Z；fflags 事件无残留/无 taint（obs_err=0）
+//   C8 DUT 侧 AXI magic 写恰一次：AW 地址 == MAGIC_ADDR、对应 W 数据 == MAGIC_VAL、
+//      strb == 4'hF（AW/W 配对，不是只看数据）
+//   C9 DUT 侧 AXI UART 结束铃恰一次：AW 地址 == DOORBELL_ADDR、W 数据 == 0x5A、
+//      strb == 4'hF；且无 W 无 AW 的协议错
 //   ★ 本 TB **不打印任何含 PASS 字样的兜底文案**；成功只打印唯一证据行
 //     "TB_LOCKSTEP: DUT_TRACE_OK ..."（"LOCKSTEP: N/N PASS" 由 cmp_commit.py 输出）。
 //
@@ -106,10 +138,13 @@ module tb_lockstep #(
     parameter [31:0]      MAP_FROM       = 32'h8000_0000,  // DUT 侧窗口基址
     parameter [31:0]      MAP_TO         = 32'h0010_0000,  // 模型 DDR3 窗口内的落点
     parameter [31:0]      MAP_MASK       = 32'hFFF0_0000,  // 1 MiB 窗口判定掩码
-    // ---- 程序结束标记地址（与 prog/lock_hello.S 一致；仅作诊断记录，不作判据）----
+    // ---- 程序结束标记地址（与 prog/lock_hello.S 一致；C8/C9 判据）----
     parameter [31:0]      MAGIC_ADDR     = 32'h8000_2000,  // 魔数落点
     parameter [31:0]      MAGIC_VAL      = 32'h600D_5EED,  // 魔数
-    parameter [31:0]      DOORBELL_ADDR  = `RV32GC_UART_BASE // 0x1FE0_01E0 结束铃
+    parameter [3:0]       MAGIC_STRB     = 4'hF,           // sw 的字节使能
+    parameter [31:0]      DOORBELL_ADDR  = `RV32GC_UART_BASE, // 0x1FE0_01E0 结束铃
+    parameter [31:0]      DOORBELL_VAL   = 32'h0000_005A,
+    parameter [3:0]       DOORBELL_STRB  = 4'hF
 ) ();
 
     //==========================================================================
@@ -511,21 +546,6 @@ module tb_lockstep #(
     integer ar_dbg_n;
     wire    ar_fire = arvalid & arready;
 
-    // ---- 诊断：DUT 侧"魔数写 / 结束铃写"的 AXI 观测（**仅诊断，不作判据**）----
-    //   理由：2A 的 PMA 判据下 0x8000_xxxx 属"非 DDR 默认通路 ⇒ AxCACHE=0 直写 AXI"
-    //   （本会话实测：AW 0x0010_2000 + UART AW 均可见），故能观测；但若后续 RTL 把该
-    //   区域改为写回缓存，本项会变 0 而 DUT 仍可能正确 ⇒ 不作为判据，只记录进 trace
-    //   末行供人工/比对器佐证（魔数写的正确性由 Spike 侧 mem 字段锚定）。
-    integer magic_aw_n;
-    integer magic_w_n;
-    wire    aw_fire = awvalid & awready;
-    wire    w_fire  = wvalid & wready;
-
-    always @(posedge clk) begin
-        if (aresetn && aw_fire && (awaddr == MAGIC_ADDR)) magic_aw_n = magic_aw_n + 1;
-        if (aresetn && w_fire  && (wdata  == MAGIC_VAL))  magic_w_n  = magic_w_n  + 1;
-    end
-
     always @(posedge clk) begin
         if (aresetn && ar_fire && (ar_dbg_n < 12)) begin
             $display("TB_LOCKSTEP_DIAG: AR[%0d]=0x%08h len=%0d size=%0d cache=%b 核内 fetch_pc=0x%08h",
@@ -534,20 +554,270 @@ module tb_lockstep #(
         end
     end
 
+    // ---- 观测域 X/Z 检测（已声明字段必须可采样；有 X/Z ⇒ obs=0 ⇒ TB/比对器失败）----
+    function integer unk64;
+        input [63:0] v;
+        begin unk64 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk32;
+        input [31:0] v;
+        begin unk32 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk16;
+        input [15:0] v;
+        begin unk16 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk12;
+        input [11:0] v;
+        begin unk12 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk5;
+        input [4:0] v;
+        begin unk5 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk4;
+        input [3:0] v;
+        begin unk4 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk3;
+        input [2:0] v;
+        begin unk3 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk2;
+        input [1:0] v;
+        begin unk2 = ((^v) === 1'bx); end
+    endfunction
+    function integer unk1;
+        input v;
+        begin unk1 = ((v === 1'bx) || (v === 1'bz)); end
+    endfunction
+
+    //==========================================================================
+    // 6.5 DUT 侧副作用观测（store / CSR / FP / fflags / 总线锚点）
+    //==========================================================================
+    // ---- 6.5.1 DUT 侧 AXI 写观测：AW 地址与 W 数据/strb 配对，只给两个锚点记账 ----
+    integer magic_aw_n, magic_w_n, doorbell_aw_n, doorbell_w_n, bus_err;
+    reg [31:0] magic_data_q, doorbell_data_q;
+    reg [3:0]  magic_strb_q, doorbell_strb_q;
+    reg        bus_aw_pend;
+    reg [31:0] bus_aw_addr;
+    wire aw_fire = awvalid & awready;
+    wire w_fire  = wvalid & wready;
+
+    always @(posedge clk) begin
+        if (!aresetn) begin
+            magic_aw_n = 0; magic_w_n = 0; doorbell_aw_n = 0; doorbell_w_n = 0;
+            bus_err = 0; bus_aw_pend = 1'b0; bus_aw_addr = 32'h0;
+            magic_data_q = 32'h0; magic_strb_q = 4'h0;
+            doorbell_data_q = 32'h0; doorbell_strb_q = 4'h0;
+        end else begin
+            if (w_fire) begin
+                if (!(bus_aw_pend || aw_fire)) begin
+                    bus_err = bus_err + 1;
+                end else begin
+                    if ((aw_fire ? awaddr : bus_aw_addr) == MAGIC_ADDR) begin
+                        magic_w_n = magic_w_n + 1;
+                        magic_data_q = wdata; magic_strb_q = wstrb;
+                    end
+                    if ((aw_fire ? awaddr : bus_aw_addr) == DOORBELL_ADDR) begin
+                        doorbell_w_n = doorbell_w_n + 1;
+                        doorbell_data_q = wdata; doorbell_strb_q = wstrb;
+                    end
+                end
+            end
+            if (aw_fire) begin
+                bus_aw_pend = 1'b1; bus_aw_addr = awaddr;
+                if (awaddr == MAGIC_ADDR)    magic_aw_n    = magic_aw_n + 1;
+                if (awaddr == DOORBELL_ADDR) doorbell_aw_n = doorbell_aw_n + 1;
+            end
+            if (w_fire && wlast) bus_aw_pend = 1'b0;
+        end
+    end
+
+    // ---- 6.5.2 store 观测：M_S_ISS 实际 LSU 请求 + 与提交 PC 对齐 ----
+    //   s0* 是低 4 B 车道，s1* 仅 fsd 的高 4 B 车道（两相都由 M 级真实请求捕获）。
+    //   s0a/s1a 用虚拟地址（Spike mem 口径），s0p/s1p 是 DUT 实际物理地址；
+    //   Bare 下两者必须相等，比较器默认 --pa-mode bare 逐相比对。
+    reg         stg_v, stg_hi_v;
+    localparam [3:0] TB_M_S_ISS    = 4'd7;
+    localparam [3:0] TB_MEM_STORE  = 4'd2;
+    localparam [3:0] TB_MEM_FSTORE = 4'd8;
+    reg  [31:0] stg_pc, stg_a0, stg_p0, stg_d0, stg_a1, stg_p1, stg_d1;
+    reg  [3:0]  stg_b0, stg_b1;
+    reg  [2:0]  stg_ssz;
+    wire        m_iss_store = (u_dut.m_state_q == TB_M_S_ISS) && ~u_dut.m_kill_fsm &&
+                              ((u_dut.em_mem_op == TB_MEM_STORE) ||
+                               (u_dut.em_mem_op == TB_MEM_FSTORE)) &&
+                              ~u_dut.lsu_exc && ~u_dut.m_page_fault_q &&
+                              ~u_dut.m_fp8_misalign;
+
+    always @(posedge clk) begin
+        if (!aresetn) begin
+            stg_v <= 1'b0; stg_hi_v <= 1'b0;
+            stg_pc <= 32'h0; stg_a0 <= 32'h0; stg_p0 <= 32'h0; stg_d0 <= 32'h0;
+            stg_b0 <= 4'h0; stg_a1 <= 32'h0; stg_p1 <= 32'h0; stg_d1 <= 32'h0;
+            stg_b1 <= 4'h0; stg_ssz <= 3'd0;
+        end else begin
+            if (ws_valid || u_dut.trap_exc || u_dut.mw_exc_valid) begin
+                stg_v <= 1'b0; stg_hi_v <= 1'b0;
+            end
+            if (m_iss_store) begin
+                if (u_dut.m_size8) begin
+                    if (!u_dut.m_hi_q) begin
+                        stg_v   <= 1'b1; stg_hi_v <= 1'b0;
+                        stg_pc  <= u_dut.em_pc;
+                        stg_a0  <= u_dut.m_va;
+                        stg_p0  <= u_dut.m_pa_eff;
+                        stg_d0  <= u_dut.m_store_w32;
+                        stg_b0  <= u_dut.m_store_strb;
+                        stg_ssz <= 3'd3;
+                    end else begin
+                        stg_hi_v <= 1'b1;
+                        stg_a1   <= stg_a0 + 32'd4;
+                        stg_p1   <= u_dut.m_pa_eff;
+                        stg_d1   <= u_dut.m_store_w32;
+                        stg_b1   <= u_dut.m_store_strb;
+                    end
+                end else begin
+                    stg_v   <= 1'b1; stg_hi_v <= 1'b0;
+                    stg_pc  <= u_dut.em_pc;
+                    stg_a0  <= u_dut.m_va;
+                    stg_p0  <= u_dut.m_pa_eff;
+                    stg_d0  <= u_dut.m_store_w32;
+                    stg_b0  <= u_dut.m_store_strb;
+                    stg_ssz <= u_dut.em_mem_size;
+                end
+            end
+        end
+    end
+
+    // ---- 6.5.3 隐式 fflags：真实 poststate 事件 FIFO ----
+    //   push 在 E 级更新后一拍，val 取**实际 fflags_r**（不重算 fflags_r|fpu_flags）；
+    //   若同拍还有 W 级 CSR flags 写，则 poststate 混入 merge 值 ⇒ taint，
+    //   提交时明确失败（E/W 多 owner 无法独立归属，不把年轻污染归老）。
+    reg        fl_ev_d;
+    reg [31:0] fl_ev_pc;
+    reg        fl_ev_taint;
+    wire       fl_push = fl_ev_d;
+    wire [31:0] fl_push_pc = fl_ev_pc;
+    wire [4:0]  fl_push_val = u_dut.fflags_r;
+    wire       fl_push_taint = fl_ev_taint;
+    wire [31:0] fl_head_pc;
+    wire [4:0]  fl_head_val;
+    wire        fl_head_taint, fl_head_valid;
+    wire [2:0]  fl_cnt;
+    wire        fl_ovf, fl_unf;
+
+    // 待写出的提交快照（延迟一拍：flush 时读实际 post-commit mstatus.FS）
+    reg        pend_v;
+    reg [31:0] p_pc, p_xval, p_s0a, p_s0p, p_s0d, p_s1a, p_s1p, p_s1d;
+    reg [31:0] p_cva, p_cvo;
+    reg [63:0] p_fval;
+    reg [4:0]  p_ff;
+    reg [11:0] p_cad;
+    reg [3:0]  p_s0b, p_s1b;
+    reg [2:0]  p_ssz;
+    reg [1:0]  p_stn;
+    reg        p_xw, p_fw, p_cw, p_st, p_obs;
+    integer    p_xrd, p_frd;
+
+    wire fl_pop = pend_v && fl_head_valid && (fl_head_pc == p_pc);
+
+    lockstep_fflags_fifo #(.DEPTH(4)) u_flq (
+        .clk(clk), .rst_n(aresetn),
+        .push(fl_push), .push_pc(fl_push_pc), .push_val(fl_push_val),
+        .push_taint(fl_push_taint), .pop(fl_pop),
+        .head_pc(fl_head_pc), .head_val(fl_head_val), .head_taint(fl_head_taint),
+        .head_valid(fl_head_valid), .count(fl_cnt),
+        .overflow(fl_ovf), .underflow(fl_unf)
+    );
+
+    always @(posedge clk) begin
+        if (!aresetn) begin
+            fl_ev_d <= 1'b0; fl_ev_pc <= 32'h0; fl_ev_taint <= 1'b0;
+        end else begin
+            fl_ev_d <= u_dut.e_fflags_we && (u_dut.fpu_fflags != 5'd0);
+            fl_ev_pc <= u_dut.de_pc;
+            fl_ev_taint <= u_dut.csr_wen_w &&
+                           ((u_dut.mw_csr_addr == 12'h001) ||
+                            (u_dut.mw_csr_addr == 12'h002) ||
+                            (u_dut.mw_csr_addr == 12'h003));
+        end
+    end
+
     integer trace_fd;
-    // 路径参数先落到 reg 再交给 $fopen：iverilog 12.0 实测对"直接传 vpiParameter"
-    // 会报 "$fopen's file name argument (vpiParameter) is not a valid string"
-    // （参数向量右侧的 NUL 填充被视为非法字符串），经 reg/任务端口转换后正常。
     reg [8*512-1:0] trace_path_q;
-    integer rd_dbg;            // trace 里的 rd 字段（-1 = 不写架构寄存器）
-    integer commit_n;          // 已记录提交条数
-    integer cyc;               // 复位释放后的拍数
+    integer commit_n;
+    integer cyc;
     integer drain;
-    reg     stopped;           // 已见到 TERM_PC（停止记录）
+    reg     stopped;
     reg     first_pc_chk_done;
     reg     first_pc_ok;
     reg [31:0] first_pc;
-    reg     c1_ok, c2_ok, c3_ok, c4_ok, c5_ok, c6_ok;
+    reg     c1_ok, c2_ok, c3_ok, c4_ok, c5_ok, c6_ok, c7_ok, c8_ok, c9_ok;
+    integer obs_err;
+    integer store_n, csr_n, fp_n, fl_n;
+    integer cap_obs;
+
+    // 写出一拍前的提交快照：fs 取实际 post-commit mstatus_fs（不重算规则）
+    task automatic flush_pending;
+        reg fm;
+        reg sd_now;
+        reg [31:0] cva_now;
+        integer o;
+        begin
+            fm = fl_head_valid && (fl_head_pc == p_pc);
+            o  = p_obs;
+            // 两者同一 flush 时刻采样：FS 是 Top 持有的实际状态；SD 直接取
+            // CoreTop 现有软件 CSR 读视图，不从 FS 在 TB 里推导。
+            sd_now = u_dut.csr_mstatus_view[31];
+            // 显式 CSR 的 poststate 取值：优先读提交后实际状态/视图，而不是
+            // 重算写规则。mstatus/sstatus 取实际读视图（含派生 SD）；fflags/frm/
+            // fcsr 取实际更新后的寄存器；其余取 post-WARL landing（cva）。
+            cva_now = p_cva;
+            if (p_cw) begin
+                if (p_cad == 12'h300)
+                    cva_now = u_dut.u_csr_file.mstatus_o;
+                else if (p_cad == 12'h100)
+                    cva_now = u_dut.u_csr_file.sstatus_view;
+                else if (p_cad == 12'h001)
+                    cva_now = {27'b0, u_dut.fflags_r};
+                else if (p_cad == 12'h002)
+                    cva_now = {29'b0, u_dut.frm_r};
+                else if (p_cad == 12'h003)
+                    cva_now = {24'b0, u_dut.frm_r, u_dut.fflags_r};
+            end
+            if (p_cw && unk32(cva_now)) o = 0;
+            if (unk2(u_dut.mstatus_fs)) o = 0;
+            if (unk1(sd_now)) o = 0;
+            if (fm && unk5(fl_head_val)) o = 0;
+            if (fm && fl_head_taint) begin
+                $display("TB_LOCKSTEP_DIAG: fflags 事件与 W 级 CSR flags 写重叠 pc=0x%08h（无法独立归属，失败）",
+                         p_pc);
+                obs_err = obs_err + 1;
+            end
+            if (!o) obs_err = obs_err + 1;
+            if (p_st) store_n = store_n + 1;
+            if (p_cw) csr_n   = csr_n + 1;
+            if (p_fw) fp_n    = fp_n + 1;
+            if (fm)   fl_n    = fl_n + 1;
+            $fwrite(trace_fd, "%0d pc=0x%08h xw=%0d xrd=%0d xval=0x%08h fw=%0d frd=%0d fval=0x%016h st=%0d ssz=%0d s0a=0x%08h s0p=0x%08h s0d=0x%08h s0b=0x%0h s1a=0x%08h s1p=0x%08h s1d=0x%08h s1b=0x%0h cw=%0d cad=0x%03h cva=0x%08h cvo=0x%08h fl=%0d ff=0x%05h fs=%0d sd=%0d obs=%0d\n",
+                    commit_n, p_pc, p_xw, p_xrd, p_xval, p_fw, p_frd, p_fval,
+                    p_stn, p_st ? p_ssz : 3'd0,
+                    p_st ? p_s0a : 32'h0, p_st ? p_s0p : 32'h0,
+                    p_st ? p_s0d : 32'h0, p_st ? p_s0b : 4'h0,
+                    (p_st && p_stn == 2) ? p_s1a : 32'h0,
+                    (p_st && p_stn == 2) ? p_s1p : 32'h0,
+                    (p_st && p_stn == 2) ? p_s1d : 32'h0,
+                    (p_st && p_stn == 2) ? p_s1b : 4'h0,
+                    p_cw, p_cw ? p_cad : 12'h0,
+                    p_cw ? cva_now : 32'h0, p_cw ? p_cvo : 32'h0,
+                    fm, fm ? fl_head_val : 5'h0,
+                    u_dut.mstatus_fs, sd_now, o);
+            commit_n = commit_n + 1;
+            pend_v <= 1'b0;
+        end
+    endtask
 
     initial begin
         aresetn          = 1'b0;
@@ -555,14 +825,15 @@ module tb_lockstep #(
         cyc              = 0;
         stopped          = 1'b0;
         ar_dbg_n         = 0;
-        magic_aw_n       = 0;
-        magic_w_n        = 0;
         trace_fd         = 0;
         trace_path_q     = DUT_TRACE;
         first_pc_chk_done= 1'b0;
         first_pc_ok      = 1'b0;
         first_pc         = 32'h0;
-        c1_ok = 1'b0; c2_ok = 1'b0; c3_ok = 1'b0; c4_ok = 1'b0; c5_ok = 1'b0; c6_ok = 1'b0;
+        pend_v           = 1'b0;
+        c1_ok = 1'b0; c2_ok = 1'b0; c3_ok = 1'b0; c4_ok = 1'b0;
+        c5_ok = 1'b0; c6_ok = 1'b0; c7_ok = 1'b0; c8_ok = 1'b0; c9_ok = 1'b0;
+        obs_err = 0; store_n = 0; csr_n = 0; fp_n = 0; fl_n = 0;
 
         $display("========================================================================");
         $display("TB_LOCKSTEP: 开始（DUT 提交 trace → %0s；终止 PC = lockstep_spin = 0x%08h）",
@@ -576,30 +847,26 @@ module tb_lockstep #(
             $display("TB_LOCKSTEP: FAIL 无法创建 DUT trace 文件 %0s", str_lj(DUT_TRACE));
             $fatal(1, "TB_LOCKSTEP FAIL trace file");
         end
-        $fwrite(trace_fd, "# DUT commit trace — RV32GC 2A Spike lockstep (sim/lockstep/tb_lockstep.sv)\n");
-        $fwrite(trace_fd, "# format: <idx> pc=0x%%08x wen=%%0d rd=%%0d wdata=0x%%08x\n");
-        $fwrite(trace_fd, "# 一行 = 一次提交（ws_valid）；rd=-1 表示该指令不写架构寄存器\n");
+        $fwrite(trace_fd, "# DUT commit trace v3 — RV32GC 2A Spike lockstep (sim/lockstep/tb_lockstep.sv)\n");
+        $fwrite(trace_fd, "# format: <idx> pc=... xw= xrd= xval= fw= frd= fval= st= ssz= s0a= s0p= s0d= s0b= s1a= s1p= s1d= s1b= cw= cad= cva= cvo= fl= ff= fs= sd= obs=\n");
+        $fwrite(trace_fd, "# x=真实 GPR 写回; f=真实 FP 64bit 写回; st=M_S_ISS 真实 store 请求; cw=显式 CSR 写; fl/ff=实际 fflags 更新; fs=实际 mstatus.FS; sd=实际 csr_mstatus_view[31]（不由 TB 推算）\n");
 
-        //----------------------------------------------------------------------
-        // 7.1 预载（#1：等 sim_mem_model 的 XIP 上电清零 initial 块跑完）
-        //----------------------------------------------------------------------
         #1;
         load_prog(PROG_HEX);
 
-        //----------------------------------------------------------------------
-        // 7.2 复位保持 RESET_CYCLES 拍，负沿释放
-        //----------------------------------------------------------------------
         repeat (RESET_CYCLES) @(posedge clk);
         @(negedge clk);
         aresetn = 1'b1;
         $display("TB_LOCKSTEP: aresetn 已释放（保持 %0d 拍）", RESET_CYCLES);
 
-        //----------------------------------------------------------------------
-        // 7.3 逐拍记录提交，直到 TERM_PC（或超时）
-        //----------------------------------------------------------------------
         while (!stopped && (cyc < TIMEOUT_CYCLES)) begin
             @(posedge clk);
             cyc = cyc + 1;
+
+            // (1) 先 flush 上一拍捕获的提交：此时 mstatus_fs 已是该提交后的实际值
+            if (pend_v) flush_pending;
+
+            // (2) 再捕获本拍提交（不写；下一拍 flush）
             if (ws_valid) begin
                 if (!first_pc_chk_done) begin
                     first_pc_chk_done = 1'b1;
@@ -609,25 +876,64 @@ module tb_lockstep #(
                 if (debug0_wb_pc == TERM_PC) begin
                     stopped = 1'b1;              // 终止点：不记录本条及以后
                 end else begin
-                    if (debug0_wb_rf_wen[0]) rd_dbg = debug0_wb_rf_wnum;
-                    else                     rd_dbg = -1;   // 不写架构寄存器
-                    $fwrite(trace_fd, "%0d pc=0x%08h wen=%0d rd=%0d wdata=0x%08h\n",
-                            commit_n, debug0_wb_pc, debug0_wb_rf_wen[0],
-                            rd_dbg, debug0_wb_rf_wdata);
-                    commit_n = commit_n + 1;
+                    pend_v <= 1'b1;
+                    p_pc   <= debug0_wb_pc;
+                    p_xw   <= u_dut.w_rf_we;
+                    p_xrd  <= u_dut.w_rf_we ? u_dut.mw_rd : -1;
+                    p_xval <= u_dut.w_rf_we ? u_dut.mw_wdata : 32'h0;
+                    p_fw   <= u_dut.mw_fp_we;
+                    p_frd  <= u_dut.mw_fp_we ? u_dut.mw_fp_rd : -1;
+                    p_fval <= u_dut.mw_fp_we ? u_dut.mw_fp_wdata : 64'h0;
+                    p_cw   <= u_dut.csr_wen_w;
+                    p_cad  <= u_dut.csr_wen_w ? u_dut.mw_csr_addr : 12'h0;
+                    p_cva  <= u_dut.csr_wen_w ? u_dut.u_csr_file.wval_final : 32'h0;
+                    p_cvo  <= (u_dut.csr_wen_w &&
+                               (u_dut.mw_csr_addr >= 12'h3B0) &&
+                               (u_dut.mw_csr_addr <= 12'h3BF))
+                              ? u_dut.u_csr_file.rd_waddr_cur : 32'h0;
+                    p_st   <= stg_v && (stg_pc == debug0_wb_pc);
+                    p_stn  <= (stg_v && (stg_pc == debug0_wb_pc))
+                              ? (stg_hi_v ? 2'd2 : 2'd1) : 2'd0;
+                    p_ssz  <= (stg_v && (stg_pc == debug0_wb_pc)) ? stg_ssz : 3'd0;
+                    p_s0a  <= (stg_v && (stg_pc == debug0_wb_pc)) ? stg_a0 : 32'h0;
+                    p_s0p  <= (stg_v && (stg_pc == debug0_wb_pc)) ? stg_p0 : 32'h0;
+                    p_s0d  <= (stg_v && (stg_pc == debug0_wb_pc)) ? stg_d0 : 32'h0;
+                    p_s0b  <= (stg_v && (stg_pc == debug0_wb_pc)) ? stg_b0 : 4'h0;
+                    p_s1a  <= (stg_v && (stg_pc == debug0_wb_pc) && stg_hi_v) ? stg_a1 : 32'h0;
+                    p_s1p  <= (stg_v && (stg_pc == debug0_wb_pc) && stg_hi_v) ? stg_p1 : 32'h0;
+                    p_s1d  <= (stg_v && (stg_pc == debug0_wb_pc) && stg_hi_v) ? stg_d1 : 32'h0;
+                    p_s1b  <= (stg_v && (stg_pc == debug0_wb_pc) && stg_hi_v) ? stg_b1 : 4'h0;
+
+                    cap_obs = 1;
+                    if (unk32(debug0_wb_pc)) cap_obs = 0;
+                    if (u_dut.w_rf_we &&
+                        (unk5(u_dut.mw_rd) || unk32(u_dut.mw_wdata))) cap_obs = 0;
+                    if (u_dut.mw_fp_we &&
+                        (unk5(u_dut.mw_fp_rd) || unk64(u_dut.mw_fp_wdata))) cap_obs = 0;
+                    if (u_dut.csr_wen_w &&
+                        (unk12(u_dut.mw_csr_addr) ||
+                         unk32(u_dut.u_csr_file.wval_final))) cap_obs = 0;
+                    if (u_dut.csr_wen_w &&
+                        (u_dut.mw_csr_addr >= 12'h3B0) &&
+                        (u_dut.mw_csr_addr <= 12'h3BF) &&
+                        unk32(u_dut.u_csr_file.rd_waddr_cur)) cap_obs = 0;
+                    if (stg_v && (stg_pc == debug0_wb_pc)) begin
+                        if (unk32(stg_a0) || unk32(stg_p0) || unk32(stg_d0) ||
+                            unk4(stg_b0) || unk3(stg_ssz)) cap_obs = 0;
+                        if (stg_hi_v && (unk32(stg_a1) || unk32(stg_p1) ||
+                                         unk32(stg_d1) || unk4(stg_b1))) cap_obs = 0;
+                    end
+                    p_obs <= cap_obs;
                 end
             end
         end
 
-        //----------------------------------------------------------------------
-        // 7.4 终止后再观察 DRAIN_CYCLES 拍：让 AXI 写（UART 结束铃）落地
-        //----------------------------------------------------------------------
+        // 超时路径也把已捕获的一拍写出去（reason 仍是 TIMEOUT，判 FAIL）
+        if (pend_v) flush_pending;
+
         for (drain = 0; drain < DRAIN_CYCLES; drain = drain + 1) @(posedge clk);
         cyc = cyc + DRAIN_CYCLES;
 
-        //----------------------------------------------------------------------
-        // 7.5 汇总证据
-        //----------------------------------------------------------------------
         $display("------------------------------------------------------------------------");
         $display("TB_LOCKSTEP_DIAG: commits=%0d cycles=%0d stopped_at_term_pc=%b",
                  commit_n, cyc, stopped);
@@ -638,24 +944,37 @@ module tb_lockstep #(
                  u_mem.first_ar_addr, u_mem.first_ar_seen, first_pc);
         $display("TB_LOCKSTEP_DIAG: UART 写次数=%0d 捕获字节=%0d（结束铃）overflow=%b",
                  u_mem.uart_write_count, u_mem.uart_tx_count, u_mem.uart_overflow);
-        $display("TB_LOCKSTEP_DIAG: 魔数写 AXI 观测（仅诊断）magic_aw=%0d magic_wdata=%0d（期望各 1）",
-                 magic_aw_n, magic_w_n);
+        $display("TB_LOCKSTEP_DIAG: 观测域条数 store=%0d csr=%0d fp64=%0d fflags=%0d obs_err=%0d",
+                 store_n, csr_n, fp_n, fl_n, obs_err);
+        $display("TB_LOCKSTEP_DIAG: DUT AXI 锚点 magic(aw=%0d,w=%0d,data=0x%08h,strb=0x%0h) doorbell(aw=%0d,w=%0d,data=0x%08h,strb=0x%0h) bus_err=%0d",
+                 magic_aw_n, magic_w_n, magic_data_q, magic_strb_q,
+                 doorbell_aw_n, doorbell_w_n, doorbell_data_q, doorbell_strb_q, bus_err);
+        if (fl_cnt != 0) begin
+            $display("TB_LOCKSTEP_DIAG: 残留 fflags 事件 fl_cnt=%0d fl_ovf=%0d fl_unf=%0d（未按提交 PC 对齐/被冲刷/溢出）",
+                     fl_cnt, fl_ovf, fl_unf);
+            obs_err = obs_err + 1;
+        end
+        if (fl_ovf != 0 || fl_unf != 0) obs_err = obs_err + 1;
 
-        // 结束证据写入 trace 末行（cmp_commit.py 必须读到）
-        $fwrite(trace_fd, "# end commits=%0d cycles=%0d reason=%0s term_pc=0x%08h uart_writes=%0d magic_aw=%0d magic_wdata=%0d\n",
+        $fwrite(trace_fd, "# end commits=%0d cycles=%0d reason=%0s term_pc=0x%08h uart_writes=%0d magic_aw=%0d magic_w=%0d magic_addr=0x%08h magic_data=0x%08h magic_strb=0x%0h doorbell_aw=%0d doorbell_w=%0d doorbell_addr=0x%08h doorbell_data=0x%08h doorbell_strb=0x%0h obs_err=%0d bus_err=%0d\n",
                 commit_n, cyc, stopped ? "TERM_PC" : "TIMEOUT", TERM_PC, u_mem.uart_write_count,
-                magic_aw_n, magic_w_n);
+                magic_aw_n, magic_w_n, MAGIC_ADDR, magic_data_q, magic_strb_q,
+                doorbell_aw_n, doorbell_w_n, DOORBELL_ADDR, doorbell_data_q, doorbell_strb_q,
+                obs_err, bus_err);
         $fclose(trace_fd);
 
-        //----------------------------------------------------------------------
-        // 7.6 判定（fail-closed：逐项列举，任一项不满足 ⇒ FAIL）
-        //----------------------------------------------------------------------
         c1_ok = (load_err == 0) && (xip_words_loaded == 2) && (ddr_words_loaded > 0);
         c2_ok = u_mem.first_ar_seen && (u_mem.first_ar_addr == `RV32GC_RESET_PC);
         c3_ok = first_pc_chk_done && first_pc_ok;
         c4_ok = stopped;
         c5_ok = (commit_n >= MIN_COMMITS);
         c6_ok = (u_mem.uart_write_count >= 1) && !u_mem.uart_overflow;
+        c7_ok = (obs_err == 0);
+        c8_ok = (magic_aw_n == 1) && (magic_w_n == 1) &&
+                (magic_data_q == MAGIC_VAL) && (magic_strb_q == MAGIC_STRB);
+        c9_ok = (doorbell_aw_n == 1) && (doorbell_w_n == 1) &&
+                (doorbell_data_q == DOORBELL_VAL) && (doorbell_strb_q == DOORBELL_STRB) &&
+                (bus_err == 0);
 
         $display("------------------------------------------------------------------------");
         if (!c1_ok) $display("TB_LOCKSTEP: FAIL C1 PROG_HEX 载入不完整（xip=%0d sim=%0d err=%0d）",
@@ -670,10 +989,18 @@ module tb_lockstep #(
                              commit_n, MIN_COMMITS);
         if (!c6_ok) $display("TB_LOCKSTEP: FAIL C6 未见 UART 结束铃（uart_write_count=%0d overflow=%b）",
                              u_mem.uart_write_count, u_mem.uart_overflow);
+        if (!c7_ok) $display("TB_LOCKSTEP: FAIL C7 观测域含 X/Z、fflags 事件无法独立归属或残留（obs_err=%0d）",
+                             obs_err);
+        if (!c8_ok) $display("TB_LOCKSTEP: FAIL C8 DUT 侧 magic 写证据不足（aw=%0d w=%0d data=0x%08h/期望 0x%08h strb=0x%0h/期望 0x%0h）",
+                             magic_aw_n, magic_w_n, magic_data_q, MAGIC_VAL, magic_strb_q, MAGIC_STRB);
+        if (!c9_ok) $display("TB_LOCKSTEP: FAIL C9 DUT 侧 UART 结束铃证据不足（aw=%0d w=%0d data=0x%08h/期望 0x%08h strb=0x%0h/期望 0x%0h bus_err=%0d）",
+                             doorbell_aw_n, doorbell_w_n, doorbell_data_q, DOORBELL_VAL,
+                             doorbell_strb_q, DOORBELL_STRB, bus_err);
 
-        if (c1_ok && c2_ok && c3_ok && c4_ok && c5_ok && c6_ok) begin
-            $display("TB_LOCKSTEP: DUT_TRACE_OK commits=%0d cycles=%0d trace=%0s uart_writes=%0d",
-                     commit_n, cyc, str_lj(DUT_TRACE), u_mem.uart_write_count);
+        if (c1_ok && c2_ok && c3_ok && c4_ok && c5_ok && c6_ok && c7_ok && c8_ok && c9_ok) begin
+            $display("TB_LOCKSTEP: DUT_TRACE_OK commits=%0d cycles=%0d trace=%0s uart_writes=%0d store=%0d csr=%0d fp64=%0d fflags=%0d",
+                     commit_n, cyc, str_lj(DUT_TRACE), u_mem.uart_write_count,
+                     store_n, csr_n, fp_n, fl_n);
             $display("========================================================================");
             $finish;
         end else begin
