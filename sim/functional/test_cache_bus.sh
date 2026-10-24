@@ -230,31 +230,42 @@ FREEZE_N=8
 FREEZE_AUX=("$SELF_PATH" "$ENV_SH")
 FREEZE_AUX_N=2
 
-#   ★ 注意 rc 传播：直接把 sha256sum 的 rc 作为函数返回值（不吞进管道）。
-freeze_sha() {
-    sha256sum -- "${FREEZE_LIST[@]}" 2>>"$RUN_LOG"
+# 原始 stdout 必须先进入本次私有 run 文件；保留原 rc，再按精确路径/顺序验证。
+validate_hash_raw() { # <raw> <expected paths...>
+    local raw="$1"; shift
+    python3 - "$raw" "$@" <<'PY'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes(); paths = sys.argv[2:]
+if not raw.endswith(b"\n") or b"\0" in raw or b"\r" in raw: raise SystemExit(1)
+lines = raw[:-1].split(b"\n")
+if len(lines) != len(paths): raise SystemExit(1)
+seen = set()
+for line, path in zip(lines, paths):
+    m = re.fullmatch(rb"([0-9a-f]{64})  (.+)", line)
+    if not m or m.group(2) != path.encode() or path in seen: raise SystemExit(1)
+    seen.add(path)
+sys.stdout.buffer.write(b"\n".join(lines) + b"\n")
+PY
 }
-freeze_aux_sha() {
-    sha256sum -- "${FREEZE_AUX[@]}" 2>>"$RUN_LOG"
+freeze_sha() { sha256sum -- "${FREEZE_LIST[@]}"; }
+freeze_aux_sha() { sha256sum -- "${FREEZE_AUX[@]}"; }
+run_freeze() { # <kind> <raw-path> ; returns command rc, stdout stays raw
+    local kind="$1" raw="$2"
+    if [ "$kind" = main ]; then freeze_sha >"$raw" 2>>"$RUN_LOG"; else freeze_aux_sha >"$raw" 2>>"$RUN_LOG"; fi
+}
+read_freeze() { # <raw> <tag> <paths...> ; validated normalized stdout
+    local raw="$1" tag="$2"; shift 2
+    validate_hash_raw "$raw" "$@" || emit_fail "${tag}_format"
 }
 
-check_freeze_lines() {  # check_freeze_lines <block> <tag> <expect_n>
-    local block="$1" tag="$2" want="$3" n_total n_hex
-    n_total="$(printf '%s\n' "$block" | wc -l)"
-    n_hex="$(printf '%s\n' "$block" | grep -c '^[0-9a-f]\{64\}  ' || true)"
-    # ★ 必须"总行数 == 期望 且 每行全为 hex"：只数合法行会让额外坏行蒙混过关。
-    [ "$n_total" = "$want" ] || emit_fail "${tag}_lines=$n_total expect=$want"
-    [ "$n_hex"   = "$want" ] || emit_fail "${tag}_hex=$n_hex expect=$want"
-}
-
-SHA_PRE="$(freeze_sha)"
-SHA_RC=$?
+SHA_PRE_RAW="$RUN_DIR/sha_pre.raw"
+run_freeze main "$SHA_PRE_RAW"; SHA_RC=$?
 [ "$SHA_RC" -eq 0 ] || emit_fail "sha256_pre_rc=$SHA_RC"
-check_freeze_lines "$SHA_PRE" "sha256_pre" "$FREEZE_N"
-AUX_PRE="$(freeze_aux_sha)"
-AUX_RC=$?
+SHA_PRE="$(read_freeze "$SHA_PRE_RAW" sha256_pre "${FREEZE_LIST[@]}")" || emit_fail "sha256_pre_format"
+AUX_PRE_RAW="$RUN_DIR/sha_aux_pre.raw"
+run_freeze aux "$AUX_PRE_RAW"; AUX_RC=$?
 [ "$AUX_RC" -eq 0 ] || emit_fail "sha256_aux_pre_rc=$AUX_RC"
-check_freeze_lines "$AUX_PRE" "sha256_aux_pre" "$FREEZE_AUX_N"
+AUX_PRE="$(read_freeze "$AUX_PRE_RAW" sha256_aux_pre "${FREEZE_AUX[@]}")" || emit_fail "sha256_aux_pre_format"
 {
     echo "-- run phase start (both phases must match; driver checks ENV/TB/PKG) --"
     echo "-- pre-run source sha256 (8 deps = 5 RTL + 2 header + TB) --"
@@ -304,14 +315,14 @@ fi
 #------------------------------------------------------------------------------
 # 9. 源冻结复核（编译/运行前后逐字节一致）
 #------------------------------------------------------------------------------
-SHA_POST="$(freeze_sha)"
-SHA_RC=$?
+SHA_POST_RAW="$RUN_DIR/sha_post.raw"
+run_freeze main "$SHA_POST_RAW"; SHA_RC=$?
 [ "$SHA_RC" -eq 0 ] || emit_fail "sha256_post_rc=$SHA_RC"
-check_freeze_lines "$SHA_POST" "sha256_post" "$FREEZE_N"
-AUX_POST="$(freeze_aux_sha)"
-AUX_RC=$?
+SHA_POST="$(read_freeze "$SHA_POST_RAW" sha256_post "${FREEZE_LIST[@]}")" || emit_fail "sha256_post_format"
+AUX_POST_RAW="$RUN_DIR/sha_aux_post.raw"
+run_freeze aux "$AUX_POST_RAW"; AUX_RC=$?
 [ "$AUX_RC" -eq 0 ] || emit_fail "sha256_aux_post_rc=$AUX_RC"
-check_freeze_lines "$AUX_POST" "sha256_aux_post" "$FREEZE_AUX_N"
+AUX_POST="$(read_freeze "$AUX_POST_RAW" sha256_aux_post "${FREEZE_AUX[@]}")" || emit_fail "sha256_aux_post_format"
 if [ "$SHA_PRE" != "$SHA_POST" ]; then
     emit_fail "source_changed_during_run"
 fi

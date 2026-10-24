@@ -55,6 +55,7 @@ module tb_ptw_top;
     // PTW 接口
     //--------------------------------------------------------------------------
     reg         req_valid = 0;
+    reg         kill = 0;
     reg  [31:0] req_va = 0;
     reg  [1:0]  req_acc = 2'b01;
     reg  [1:0]  req_priv = `RV32GC_PRIV_S;
@@ -70,6 +71,9 @@ module tb_ptw_top;
     reg         pte_req_ready = 1;
     reg         pte_resp_valid = 0;
     reg  [31:0] pte_resp_data = 0;
+    reg         pte_resp_err = 0;
+    reg  [1:0]  pte_error_mode = 2'd0; // 0=OK, 1=bus error, 2=X, 3=Z (active-valid tests)
+    reg  [31:0] pte_error_pa = 32'hFFFF_FFFF;
     wire        pmp_req_valid;
     wire [31:0] pmp_req_addr;
     wire [1:0]  pmp_req_acc, pmp_req_priv;
@@ -77,6 +81,7 @@ module tb_ptw_top;
     wire        pte_ad_update;
     wire [31:0] pte_ad_pa, pte_ad_data;
     reg         pte_ad_done = 0;
+    wire        idle_o;
     wire        fill_valid;
     wire [31:0] fill_va, fill_pa;
     wire [21:0] fill_ppn;
@@ -86,18 +91,17 @@ module tb_ptw_top;
     //     · `SVADE=0`：本 TB 的判据⑤专门覆盖"硬件更新 A/D 位"通路（pte_ad_update
     //       → pte_ad_done 握手）。核内默认口径是 **Svade=1**（A/D 缺失即 page-fault，
     //       由 arch-test 的 Svade 组覆盖）⇒ 本 TB 显式选择它要测的那条通路。
-    //     · `.kill(1'b0)`：ptw.v 新增的中止端口（核内用于"陷阱/xRET/fence.i/
-    //       sfence.vma 时把遍历拉回 IDLE"，防死锁）；单元测试无中止场景 ⇒ 接 0。
+    //     · `kill`：ptw.v 中止端口；默认 0，J6 专测 kill 与旧错误响应同拍时 kill 优先。
     ptw #(.SVADE(0)) dut (
         .clk(clk), .rst_n(rst_n),
-        .kill(1'b0),
+        .kill(kill),
         .req_valid(req_valid), .req_va(req_va), .req_acc(req_acc),
         .req_priv(req_priv), .req_sum(req_sum), .req_mxr(req_mxr), .satp(satp),
-        .req_ready(req_ready), .req_done(req_done), .pa_o(pa_o), .fault_o(fault_o),
+        .req_ready(req_ready), .idle_o(idle_o), .req_done(req_done), .pa_o(pa_o), .fault_o(fault_o),
         .fault_cause_o(fault_cause_o), .fault_tval_o(fault_tval_o),
         .pte_req_valid(pte_req_valid), .pte_req_pa(pte_req_pa),
         .pte_req_ready(pte_req_ready), .pte_resp_valid(pte_resp_valid),
-        .pte_resp_data(pte_resp_data),
+        .pte_resp_data(pte_resp_data), .pte_resp_err(pte_resp_err),
         .pmp_req_valid(pmp_req_valid), .pmp_req_addr(pmp_req_addr),
         .pmp_req_acc(pmp_req_acc), .pmp_req_priv(pmp_req_priv),
         .pmp_resp_ok(pmp_resp_ok),
@@ -157,8 +161,10 @@ module tb_ptw_top;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rd_dly <= 2'd0; pte_resp_valid <= 1'b0; pte_resp_data <= 32'h0;
+            pte_resp_err <= 1'b0;
         end else begin
             pte_resp_valid <= 1'b0;
+            pte_resp_err <= 1'b0;
             if (pte_req_valid & pte_req_ready & (rd_dly == 2'd0)) begin
                 rd_pa_q <= pte_req_pa;
                 rd_dly  <= 2'd1;
@@ -167,9 +173,17 @@ module tb_ptw_top;
                 pte_resp_data <= pte_mem[pte_index(rd_pa_q)];
                 rd_dly        <= 2'd2;
             end else if (rd_dly == 2'd2) begin
-                // 数据已稳定 ⇒ 再拉 valid（同拍数据不再变化）
+                // 数据已稳定 ⇒ 再拉 valid；错误sideband与该响应同拍。
                 rd_dly         <= 2'd0;
                 pte_resp_valid <= 1'b1;
+                if (rd_pa_q == pte_error_pa) begin
+                    case (pte_error_mode)
+                        2'd1: pte_resp_err <= 1'b1;
+                        2'd2: pte_resp_err <= 1'bx;
+                        2'd3: pte_resp_err <= 1'bz;
+                        default: pte_resp_err <= 1'b0;
+                    endcase
+                end else pte_resp_err <= 1'b0;
             end
         end
     end
@@ -695,6 +709,83 @@ module tb_ptw_top;
         do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
         expect_eq32("I2: ★ fill_perm[2] = D = 1", {31'b0, fill_perm_l[2]}, 32'h1);
         expect_eq32("I2: fill_perm[1] = A = 1", {31'b0, fill_perm_l[1]}, 32'h1);
+
+        //======================================================================
+        // J. PTE read terminal error: access-fault by original access type, no fill,
+        //    active X/Z fail closed, and a later clean walk recovers.
+        //======================================================================
+        pte_mem[pte_index(ROOT_BASE + (32'h201 << 2))] =
+            mk_pte(L1_PPN, 1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b0,1'b1);
+        pte_mem[pte_index(L1_BASE + (32'h002 << 2))] =
+            mk_pte(22'h00055, 1'b1,1'b1,1'b0,1'b0,1'b0,1'b1,1'b1,1'b1);
+
+        pte_error_pa = ROOT_BASE + (32'h201 << 2);
+        pte_error_mode = 2'd1;
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("J1: root R error terminal fault", fault_o, 1'b1);
+        expect_eq32("J1: root R error cause=5", {27'b0, fault_cause_o}, 32'd5);
+        expect_eq32("J1: root R error tval=VA", fault_tval_o, 32'h8040_2123);
+        expect_eq1("J1: root R error no TLB fill", fill_latch, 1'b0);
+        expect_eq1("J1: root R error no A/D update", saw_ad_update, 1'b0);
+
+        pte_error_mode = 2'd2; // active-valid X is not accepted as success
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("J2: active X error store cause=7", {27'b0, fault_cause_o}, 32'd7);
+        expect_eq32("J2: active X error tval=VA", fault_tval_o, 32'h8040_2123);
+        expect_eq1("J2: active X error no fill", fill_latch, 1'b0);
+        expect_eq1("J2: active X error no A/D update", saw_ad_update, 1'b0);
+
+        pte_error_mode = 2'd3; // active-valid Z is not accepted as success
+        do_translate(32'h8040_2123, 2'b00, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("J3: active Z error fetch cause=1", {27'b0, fault_cause_o}, 32'd1);
+        expect_eq32("J3: active Z error tval=VA", fault_tval_o, 32'h8040_2123);
+        expect_eq1("J3: active Z error no fill", fill_latch, 1'b0);
+        expect_eq1("J3: active Z error no A/D update", saw_ad_update, 1'b0);
+
+        pte_error_pa = L1_BASE + (32'h002 << 2);
+        pte_error_mode = 2'd1;
+        do_translate(32'h8040_2123, 2'b10, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq32("J4: leaf W error cause=7", {27'b0, fault_cause_o}, 32'd7);
+        expect_eq32("J4: leaf W error original VA", fault_tval_o, 32'h8040_2123);
+        expect_eq1("J4: leaf W error no fill", fill_latch, 1'b0);
+        expect_eq1("J4: leaf W error no A/D update", saw_ad_update, 1'b0);
+
+        pte_error_mode = 2'd0;
+        pte_error_pa = 32'hFFFF_FFFF;
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("J5: clean walk after error succeeds", fault_o, 1'b0);
+        expect_eq1("J5: clean walk fills TLB", fill_latch, 1'b1);
+
+        // J6: cancel an old walk exactly while its errored response is active.
+        // The response must not become req_done/fill; the next owner must recover.
+        pte_error_mode = 2'd1;
+        pte_error_pa = ROOT_BASE + (32'h201 << 2);
+        @(negedge clk);
+        done_latch = 1'b0;
+        fill_latch = 1'b0;
+        req_va = 32'h8040_2123; req_acc = 2'b01; req_priv = `RV32GC_PRIV_S;
+        req_sum = 1'b0; req_mxr = 1'b0; req_valid = 1'b1;
+        @(negedge clk); req_valid = 1'b0;
+        k = 0;
+        while ((pte_resp_valid !== 1'b1) && (k < 200)) begin
+            @(negedge clk); k = k + 1;
+        end
+        expect_eq1("J6: old response valid before kill", pte_resp_valid, 1'b1);
+        expect_eq1("J6: old response error asserted", pte_resp_err, 1'b1);
+        kill = 1'b1;
+        @(posedge clk); #1;
+        expect_eq1("J6: true idle survives kill mask", idle_o, 1'b1);
+        expect_eq1("J6: ready remains kill-masked", req_ready, 1'b0);
+        kill = 1'b0;
+        @(posedge clk); #1;
+        expect_eq1("J6: kill suppresses req_done", req_done, 1'b0);
+        expect_eq1("J6: kill suppresses fill", fill_valid, 1'b0);
+        expect_eq1("J6: PTW ready for next owner", req_ready, 1'b1);
+        pte_error_mode = 2'd0;
+        pte_error_pa = 32'hFFFF_FFFF;
+        do_translate(32'h8040_2123, 2'b01, `RV32GC_PRIV_S, 1'b0, 1'b0);
+        expect_eq1("J6: next owner clean walk succeeds", fault_o, 1'b0);
+        expect_eq1("J6: next owner clean walk fills", fill_latch, 1'b1);
 
         //======================================================================
         // 汇总

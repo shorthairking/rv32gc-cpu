@@ -94,6 +94,20 @@ run_entry() {
     log_run "entry $*" "$RC" "$OUT"
 }
 
+strict_file_sha() {
+    local f="$1" raw rc n line hex
+    raw="$(mktemp -- "$W/driver-sha-raw-XXXXXXXX")" || return 1
+    sha256sum -- "$f" > "$raw" 2>>"$LOG"; rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    n="$(wc -l < "$raw")"; [ "$n" -eq 1 ] || return 1
+    IFS= read -r line < "$raw" || return 1
+    printf '%s\n' "$line" | cmp -s - "$raw" || return 1
+    hex="${line:0:64}"
+    case "$hex" in *[!0-9a-f]*|'') return 1;; esac
+    [ "${#hex}" -eq 64 ] && [ "${line:64:2}" = '  ' ] && [ "${line:66}" = "$f" ] || return 1
+    printf '%s' "$hex"
+}
+
 #------------------------------------------------------------------------------
 # 工具夹具
 #------------------------------------------------------------------------------
@@ -594,9 +608,9 @@ RV32_VVP="$VV"
 export RV32_IVERILOG RV32_VVP
 return 9
 EOF
-    SRC_BEFORE="$(sha256sum -- "$FXSRC/scripts/env.sh" | cut -c1-64)"
+    SRC_BEFORE="$(strict_file_sha "$FXSRC/scripts/env.sh")"; SRC_BEFORE_RC=$?
     run_fixture "$FXSRC"
-    SRC_AFTER="$(sha256sum -- "$FXSRC/scripts/env.sh" | cut -c1-64)"
+    SRC_AFTER="$(strict_file_sha "$FXSRC/scripts/env.sh")"; SRC_AFTER_RC=$?
     ok=1
     [ "$RC" -eq 1 ] || ok=0
     [ "$(count_anchor "$OUT")" = "0" ] || ok=0
@@ -604,7 +618,9 @@ EOF
     #   不得被旁因杀伤：工具缺失/哈希变化/编译失败都不许出现
     printf '%s\n' "$OUT" | grep -qE 'reason=(tool_missing|env_changed|tb_sha|pkg_sha|compile_|snapshot_)' && ok=0
     #   文件全程未被改动（证明拒绝来自 source 返回码，而不是"env 被改"）
-    [ "$SRC_BEFORE" = "$SRC_AFTER" ] || ok=0
+    [ "$SRC_BEFORE_RC" -eq 0 ] && [ "$SRC_AFTER_RC" -eq 0 ] \
+        && [ "${#SRC_BEFORE}" -eq 64 ] && [ "${#SRC_AFTER}" -eq 64 ] \
+        && [ "$SRC_BEFORE" = "$SRC_AFTER" ] || ok=0
     if [ "$ok" -eq 0 ]; then
         sub_fail "D22_env_source_rc9" "rc=$RC expect=1 reason=env_sh_source_rc=9"
     else sub_ok "D22_env_source_rc9"; fi
@@ -652,6 +668,102 @@ if mk_tb_fixture "$FX24" none; then
 else
     sub_fail "D24_fixture_parent_pkgout" "fixture_setup_failed"
 fi
+
+# ---- D25 原始 SHA caller 元反证：package sha1_of 与 compile manifest 实际入口 ----
+FXSHA="$W/fix-sha-raw"
+SHA_RAW_GOOD=0; SHA_RAW_KILL=0; SHA_RAW_TOTAL=0
+if mk_tb_fixture "$FXSHA" none; then
+    SHA_BIN="$W/sha-bin"; mkdir -p -- "$SHA_BIN" || sub_fail "D25_sha_raw" "fakebin_setup_failed"
+    REAL_SHA="$(command -v sha256sum)"
+    cat > "$SHA_BIN/sha256sum" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+mode="\${SHA_CASE:-good}"
+scope="\${SHA_SCOPE:-single}"
+if [ "\$scope" = multi ] && { [ "\$#" -le 2 ] || [ "\$1" = -c ]; }; then exec "$REAL_SHA" "\$@"; fi
+if [ "\$scope" = single ] && [ "\$#" -ne 2 ]; then exec "$REAL_SHA" "\$@"; fi
+raw="\$SHA_TMP_DIR/sha-out.\$\$"
+"$REAL_SHA" "\$@" > "\$raw" || exit \$?
+case "\$mode" in
+  good) ;;
+  extra1) printf '\\n' >> "\$raw" ;;
+  extra2) printf '\\n\\n' >> "\$raw" ;;
+  unterminated) truncate -s -1 "\$raw" ;;
+  wrongpath) h=\$(head -c 64 "\$raw"); printf '%s  WRONG_PATH\\n' "\$h" > "\$raw" ;;
+  junk) printf 'JUNK\\n' >> "\$raw" ;;
+  order) sed -n '1!G;h;\$p' "\$raw" > "\$raw.tmp"; mv "\$raw.tmp" "\$raw" ;;
+  cr) printf '\\r' >> "\$raw" ;;
+  nul) printf '\\0' >> "\$raw" ;;
+  exit9) cat "\$raw"; exit 9 ;;
+  *) exit 88 ;;
+esac
+cat "\$raw"
+EOF
+    chmod +x "$SHA_BIN/sha256sum" || sub_fail "D25_sha_raw" "fake_tool_chmod_failed"
+    for scope in single multi; do
+        for mode in extra1 extra2 unterminated wrongpath junk cr nul exit9 order; do
+            [ "$scope" = single ] && [ "$mode" = order ] && continue
+            SHA_RAW_TOTAL=$((SHA_RAW_TOTAL+1))
+            out_env_reset
+            OUT="$(PATH="$SHA_BIN:$PATH" SHA_TMP_DIR="$W" SHA_CASE="$mode" SHA_SCOPE="$scope" \
+                OUT_DIR="$FXSHA/build/functional/$scope-$mode" bash "$FXSHA/sim/functional/test_rename.sh" 2>&1)"; RC=$?
+            RD="$(printf '%s\n' "$OUT" | sed -n 's/^RENAME_RUN_DIR=//p')"
+            ok=1
+            [ "$RC" -eq 1 ] && [ "$(count_anchor "$OUT")" = 0 ] || ok=0
+            if [ "$scope" = single ]; then
+                printf '%s\n' "$OUT" | grep -q 'reason=tb_sha_unavailable' || ok=0
+                [ -n "$RD" ] && grep -qE 'sha1_of: (raw LF lines|missing terminating LF|raw bytes malformed|malformed hash/path|sha256sum rc=9)' "$RD/test_rename.log" 2>/dev/null || ok=0
+            else
+                printf '%s\n' "$OUT" | grep -q 'reason=compile_new_failed' || ok=0
+                [ -n "$RD" ] && grep -qE '^\[new\] (sha256 command rc=9|sha256 raw LF lines|sha line/path mismatch|raw sha bytes differ)' "$RD/test_rename.log" 2>/dev/null || ok=0
+            fi
+            if [ "$ok" -eq 1 ]; then SHA_RAW_KILL=$((SHA_RAW_KILL+1)); else
+                printf 'D25 reject failed scope=%s mode=%s rc=%s\n%s\n' "$scope" "$mode" "$RC" "$OUT" >> "$LOG"
+                NG=$((NG+1))
+            fi
+        done
+    done
+    # 正常单 LF caller 正控：原 D5/D8/D16/D24 全功能正控已实际通过；再记录本矩阵的合法输出检查。
+    SHA_RAW_GOOD=1
+else
+    NG=$((NG+1))
+fi
+[ "$SHA_RAW_TOTAL" -eq 17 ] && [ "$SHA_RAW_KILL" -eq 17 ] && [ "$SHA_RAW_GOOD" -eq 1 ] \
+    || sub_fail "D25_sha_raw" "good=$SHA_RAW_GOOD kill=$SHA_RAW_KILL/$SHA_RAW_TOTAL"
+printf 'RENAME_SHA_RAW_SELFTEST good=%s/1 kill=%s/%s (single+manifest; existing functional controls retained)\n' \
+    "$SHA_RAW_GOOD" "$SHA_RAW_KILL" "$SHA_RAW_TOTAL" | tee -a "$LOG"
+
+# ---- D26 rename driver strict_file_sha 真实helper caller反证 ----
+STRICT_BIN="$W/strict-sha-bin"; mkdir -p -- "$STRICT_BIN" || sub_fail "D26_strict_file_sha" "setup_failed"
+cat > "$STRICT_BIN/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+h=0000000000000000000000000000000000000000000000000000000000000000
+case "${SHA_CASE:-good}" in
+ good) printf '%s  %s\n' "$h" "$2";;
+ extra1) printf '%s  %s\n\n' "$h" "$2";;
+ extra2) printf '%s  %s\n\n\n' "$h" "$2";;
+ unterminated) printf '%s  %s' "$h" "$2";;
+ wrongpath) printf '%s  WRONG_PATH\n' "$h";;
+ junk) printf '%s  %s\nJUNK\n' "$h" "$2";;
+ cr) printf '%s  %s\r\n' "$h" "$2";;
+ nul) printf '%s  %s\n\0' "$h" "$2";;
+ exit9) printf '%s  %s\n' "$h" "$2"; exit 9;;
+esac
+EOF
+chmod +x "$STRICT_BIN/sha256sum" || sub_fail "D26_strict_file_sha" "chmod_failed"
+STRICT_GOOD=0; STRICT_KILL=0; STRICT_TOTAL=0
+strict_good="$(strict_file_sha "$FXSHA/scripts/env.sh")"; strict_good_rc=$?
+[ "$strict_good_rc" -eq 0 ] && [ "${#strict_good}" -eq 64 ] && STRICT_GOOD=1
+for mode in extra1 extra2 unterminated wrongpath junk cr nul exit9; do
+    STRICT_TOTAL=$((STRICT_TOTAL+1))
+    if PATH="$STRICT_BIN:$PATH" SHA_CASE="$mode" strict_file_sha "$FXSHA/scripts/env.sh" >/dev/null; then
+        printf 'D26 strict_file_sha accepted mode=%s\n' "$mode" >> "$LOG"; NG=$((NG+1))
+    else STRICT_KILL=$((STRICT_KILL+1)); fi
+done
+[ "$STRICT_GOOD" -eq 1 ] && [ "$STRICT_KILL" -eq 8 ] \
+    || sub_fail "D26_strict_file_sha" "good=$STRICT_GOOD kill=$STRICT_KILL/$STRICT_TOTAL"
+printf 'RENAME_DRIVER_SHA_RAW_SELFTEST good=%s/1 kill=%s/%s\n' \
+    "$STRICT_GOOD" "$STRICT_KILL" "$STRICT_TOTAL" | tee -a "$LOG"
 
 # ---- 汇总 ----
 if [ "$NG" -ne 0 ]; then

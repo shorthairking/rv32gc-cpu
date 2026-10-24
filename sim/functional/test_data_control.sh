@@ -147,30 +147,41 @@ DUT_HDR="$DUT_ROOT/rtl/back2/back2_params.vh"
 [ -f "$DUT_HDR" ] || emit_fail "dut_header_missing file=$DUT_HDR"
 
 FREEZE_ERR=""
-freeze_sha() {
-    local out rc total line h p i
+freeze_sha() {  # 原始 stdout 文件+原 rc；验证字节及逐路径后再返回规范清单
+    local raw="$1" rc reason
     FREEZE_ERR=""
-    out="$(sha256sum -- "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" 2>>"$RUN_LOG")"
+    sha256sum -- "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" >"$raw" 2>>"$RUN_LOG"
     rc=$?
     [ "$rc" -eq 0 ] || { FREEZE_ERR="sha256sum_rc=$rc"; return 1; }
-    total="$(printf '%s\n' "$out" | wc -l)"
-    [ "$total" -eq 3 ] || { FREEZE_ERR="sha256_lines=$total"; return 1; }
-    i=0
-    for p in "$DUT_LSQ" "$DUT_HDR" "$TB_SRC"; do
-        i=$((i + 1))
-        line="$(printf '%s\n' "$out" | sed -n "${i}p")"
-        printf '%s\n' "$line" | grep -qE '^[0-9a-f]{64}  ' \
-            || { FREEZE_ERR="sha256_format line=$i"; return 1; }
-        h="$(printf '%s\n' "$line" | cut -c1-64)"
-        [ "${#h}" -eq 64 ] || { FREEZE_ERR="sha256_hexlen line=$i"; return 1; }
-        [ "$(printf '%s\n' "$line" | cut -c67-)" = "$p" ] \
-            || { FREEZE_ERR="sha256_path line=$i"; return 1; }
-    done
-    printf '%s\n' "$out"
+    reason="$(python3 - "$raw" "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" <<'PY'
+import os, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+paths = sys.argv[2:]
+if b'\0' in raw or b'\r' in raw:
+    print('sha256_bytes'); raise SystemExit(1)
+if not raw.endswith(b'\n'):
+    print('sha256_unterminated'); raise SystemExit(1)
+rows = raw.split(b'\n')[:-1]
+if len(rows) != len(paths):
+    print(f'sha256_lines={len(rows)}'); raise SystemExit(1)
+for i, (row, path) in enumerate(zip(rows, paths), 1):
+    m = re.fullmatch(rb'([0-9a-f]{64})  (.*)', row)
+    if not m:
+        print(f'sha256_format line={i}'); raise SystemExit(1)
+    if m.group(2) != os.fsencode(path):
+        print(f'sha256_path line={i}'); raise SystemExit(1)
+print('ok')
+PY
+)" || { FREEZE_ERR="${reason:-sha256_format}"; return 1; }
 }
-SHA_PRE=""
-SHA_PRE="$(freeze_sha)" || emit_fail "${FREEZE_ERR:-sha256_pre_failed}"
-{ echo "-- pre-run sha256 (DUT/header/TB) --"; printf '%s\n' "$SHA_PRE"; } >> "$RUN_LOG"
+normalize_sha_file() { awk '{print substr($0,1,64)}' "$1"; }
+SHA_PRE_RAW="$RUN_DIR/sha_pre.raw"
+SHA_POST_RAW="$RUN_DIR/sha_post.raw"
+if freeze_sha "$SHA_PRE_RAW"; then :; else
+    emit_fail "${FREEZE_ERR:-sha256_pre_failed}"
+fi
+SHA_PRE="$(normalize_sha_file "$SHA_PRE_RAW")" || emit_fail "sha256_pre_normalize_failed"
+{ echo "-- pre-run sha256 (DUT/header/TB) --"; cat -- "$SHA_PRE_RAW"; } >> "$RUN_LOG"
 
 # ---- 编译（在 DUT_ROOT 快照 cwd 内；TB 恒取本包）----
 (
@@ -200,9 +211,10 @@ fi
 [ -s "$RUN_LOG" ] || emit_fail "run_zero_output"
 
 # ---- 源冻结复核 ----
-SHA_POST=""
-SHA_POST="$(freeze_sha)" || emit_fail "${FREEZE_ERR:-sha256_post_failed}"
-[ "$SHA_PRE" = "$SHA_POST" ] || emit_fail "source_changed_during_run"
+if freeze_sha "$SHA_POST_RAW"; then :; else
+    emit_fail "${FREEZE_ERR:-sha256_post_failed}"
+fi
+cmp -s -- "$SHA_PRE_RAW" "$SHA_POST_RAW" || emit_fail "source_changed_during_run"
 
 # ---- probe 模式 ----
 if [ "$DC_EXPECT" = "probe" ]; then

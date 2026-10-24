@@ -14,14 +14,15 @@
 #           证明"同一假工具环境"下存在合法正控可过（不是所有假工具都无条件失败）；
 #        P5 私有 poison-cwd：调用者 cwd 内放冲突/非法 rtl/pkg 头（不改任何正式头），
 #           正确 DUT_ROOT 的编译必须不受影响；并先证明 poison 头"确实有毒"。
-#   ② 反证 19 例（必须全部被拒）：
-#        原 7 例（dup-pass / no-anchor / no-capture / fails-nz / vec-short /
-#        zero-vec / hang）＋ 第一轮 10 例（bad-field / log-failword / defect-repro /
-#        unknown-arg / unauthorized-out / sha-fail / fake-iverilog-noartifact /
-#        fake-vvp-empty / vec-checks-sum / one-vector-selfconsistent）
-#        ＋ TB 本体变异 2 例（mut-del-vector / mut-del-checks；在本次 run 目录里
-#        从**正式 TB** 复制变异，正式 TB 不改；并额外要求变异 TB 自己的 run 日志
-#        命中 TB 自判证据，防止只靠包装器遮盖）。
+#        P6 合法父 PKG_OUT scope：把三种父输出环境设为合法外层根，证明 mini 包日志
+#           仍落在 mini repo 私有 build/functional 下。
+#   ② 反证 33 例（必须全部被拒）：
+#        原 19 例保持（dup-pass / no-anchor / no-capture / fails-nz / vec-short /
+#        zero-vec / hang / bad-field / log-failword / defect-repro / unknown-arg /
+#        unauthorized-out / sha-fail / fake-iverilog-noartifact / fake-vvp-empty /
+#        vec-checks-sum / one-vector-selfconsistent / mut-del-vector / mut-del-checks）
+#        ＋ DUT4/TB1 sha caller 各 7 类原始字节反证（N+1 / 多空尾 / 未终止 /
+#        wrongpath / 非空垃圾 / NUL+CR / 合法 stdout exit9）。
 #
 # 依赖 : 只读仓库正式源（路径由本文件所在目录推导）：
 #          scripts/env.sh（工具真源；只读）
@@ -34,7 +35,7 @@
 #        内含各迷你仓库夹具与该夹具自己的 build/.../run-* 日志）。脚本内无 rm。
 #
 # 用法 : bash sim/functional/test_decode_driver.sh
-# 判定 : 5/5 正控 PASS、19/19 反证被拒 ⇒ 唯一整行 `FUNCTIONAL_DECODE_DRIVER: PASS`，rc=0。
+# 判定 : 6/6 正控 PASS（含父 PKG_OUT scope）、33/33 反证被拒 ⇒ 唯一整行 `FUNCTIONAL_DECODE_DRIVER: PASS`，rc=0。
 #==============================================================================
 set -u
 
@@ -192,9 +193,13 @@ newest_own_log() {  # $1=迷你仓库目录
 RUN_OUT=""
 RUN_RC=0
 CAPTURE_CWD=""
-capture() {  # $@ = 命令；若 CAPTURE_CWD 非空则先 cd 到该目录
+CAPTURE_OUT_ROOT=""
+capture() {  # mini cases must not inherit their parent's package-output roots
     if [ -n "$CAPTURE_CWD" ]; then
-        RUN_OUT="$( cd -- "$CAPTURE_CWD" && "$@" 2>&1 )"
+        RUN_OUT="$( cd -- "$CAPTURE_CWD" && (
+            unset RV32_FUNCTIONAL_OUT_DIR RV32_FUNCTIONAL_PKG_OUT_DIR
+            OUT_DIR="${CAPTURE_OUT_ROOT:-$CAPTURE_CWD}/build/functional/decode" "$@"
+        ) 2>&1 )"
     else
         RUN_OUT="$("$@" 2>&1)"
     fi
@@ -217,9 +222,11 @@ extract_fail_reason() {
 
 # 正控：必须 rc=0 + 唯一 PASS 锚点 + 无 FAIL 字样（在 $dir 为 cwd 下运行）
 run_expect_pass() {  # $1=case 名 $2=夹具目录 ; 其余=命令
-    local name="$1" dir="$2"; shift 2
+    local name="$1" dir="$2" saved_out="$CAPTURE_OUT_ROOT"; shift 2
     N_POS=$((N_POS + 1))
+    CAPTURE_OUT_ROOT="${CAPTURE_OUT_ROOT:-$dir}"
     CAPTURE_CWD="$dir"; capture "$@"; CAPTURE_CWD=""
+    CAPTURE_OUT_ROOT="$saved_out"
     if [ "$RUN_RC" -ne 0 ]; then
         echo "DRIVER-POS-FAIL($name): rc=$RUN_RC (expect 0)"
         printf '%s\n' "$RUN_OUT" | sed 's/^/    | /'
@@ -241,10 +248,12 @@ run_expect_pass() {  # $1=case 名 $2=夹具目录 ; 其余=命令
 # 反证：必须 rc==1 + 无 PASS 锚点 + 恰 1 行正式 FAIL + reason 前缀命中
 run_expect_reject() {  # $1=dir $2=reason_prefix ; 其余=命令
     local dir="$1" pat="$2"; shift 2
-    local name n_fl reason
+    local name n_fl reason saved_out="$CAPTURE_OUT_ROOT"
     name="$(basename -- "$dir")"
     N_NEG=$((N_NEG + 1))
+    CAPTURE_OUT_ROOT="${CAPTURE_OUT_ROOT:-$dir}"
     CAPTURE_CWD="$dir"; capture "$@"; CAPTURE_CWD=""
+    CAPTURE_OUT_ROOT="$saved_out"
     if [ "$RUN_RC" -ne 1 ]; then
         echo "DRIVER-NEG-FAIL($name): rc=$RUN_RC (expect exactly 1)"
         printf '%s\n' "$RUN_OUT" | sed 's/^/    | /'
@@ -275,10 +284,12 @@ run_expect_reject() {  # $1=dir $2=reason_prefix ; 其余=命令
 # TB 变异反证：同上严格判据 + 额外要求变异 TB 自己的 run 日志命中 TB 自判证据
 run_expect_reject_log() {  # $1=dir $2=reason_prefix $3=log_pat ; 其余=命令
     local dir="$1" spat="$2" lpat="$3"; shift 3
-    local name log n_fl reason
+    local name log n_fl reason saved_out="$CAPTURE_OUT_ROOT"
     name="$(basename -- "$dir")"
     N_NEG=$((N_NEG + 1))
+    CAPTURE_OUT_ROOT="${CAPTURE_OUT_ROOT:-$dir}"
     CAPTURE_CWD="$dir"; capture "$@"; CAPTURE_CWD=""
+    CAPTURE_OUT_ROOT="$saved_out"
     if [ "$RUN_RC" -ne 1 ]; then
         echo "DRIVER-NEG-FAIL($name): rc=$RUN_RC (expect exactly 1)"
         driver_fail "mutation_${name}_rc=$RUN_RC"
@@ -333,6 +344,23 @@ cp -f -- "$REAL_TB" "$d/sim/functional/tb_decode_semantics.sv"
 make_shim "$d/fakebin" sha256sum "$REAL_SHA" || driver_fail "shim_sha_failed"
 run_expect_pass "pos-path-sha-real" "$d" env -u RV32_IVERILOG -u RV32_VVP PATH="$d/fakebin:$PATH" bash "$d/sim/functional/test_decode.sh"
 
+# Parent-scope positive: a legal external PKG_OUT must not be inherited by a
+# mini repo. CAPTURE isolates it and the actual run log must land under mini root.
+d="$DRIVER_ROOT/pos-parent-pkgout-isolated"; build_repo "$d"
+cp -f -- "$REAL_TB" "$d/sim/functional/tb_decode_semantics.sv"
+PARENT_PKGOUT="$DRIVER_ROOT/parent-scope-root"
+mkdir -p -- "$PARENT_PKGOUT" || driver_fail "parent_pkgout_mkdir_failed"
+SAVED_OUT_SET="${OUT_DIR+x}"; SAVED_OUT="${OUT_DIR-}"
+SAVED_FUN_SET="${RV32_FUNCTIONAL_OUT_DIR+x}"; SAVED_FUN="${RV32_FUNCTIONAL_OUT_DIR-}"
+SAVED_PKG_SET="${RV32_FUNCTIONAL_PKG_OUT_DIR+x}"; SAVED_PKG="${RV32_FUNCTIONAL_PKG_OUT_DIR-}"
+export OUT_DIR="$PARENT_PKGOUT" RV32_FUNCTIONAL_OUT_DIR="$PARENT_PKGOUT" RV32_FUNCTIONAL_PKG_OUT_DIR="$PARENT_PKGOUT"
+run_expect_pass "pos-parent-pkgout-isolated" "$d" bash "$d/sim/functional/test_decode.sh"
+[ -n "$SAVED_OUT_SET" ] && export OUT_DIR="$SAVED_OUT" || unset OUT_DIR
+[ -n "$SAVED_FUN_SET" ] && export RV32_FUNCTIONAL_OUT_DIR="$SAVED_FUN" || unset RV32_FUNCTIONAL_OUT_DIR
+[ -n "$SAVED_PKG_SET" ] && export RV32_FUNCTIONAL_PKG_OUT_DIR="$SAVED_PKG" || unset RV32_FUNCTIONAL_PKG_OUT_DIR
+PARENT_RUNLOG="$(newest_own_log "$d")"
+case "$PARENT_RUNLOG" in "$d/build/functional/decode/run-"*/test_decode.log) : ;; *) driver_fail "parent_pkgout_log_not_mini path=${PARENT_RUNLOG:-missing}" ;; esac
+
 # P5 私有 poison-cwd 正控（不改任何正式头）：
 #   调用者 cwd 里放一份**冲突/非法**的 rtl/pkg 头；正确 DUT_ROOT 的编译必须不受影响。
 #   先证明该 poison 头"确实有毒"（在 poison cwd 下仅以 cwd 为 include 根编译必失败），
@@ -348,7 +376,9 @@ printf '%s\n' 'POISON_HEADER_MUST_NOT_BE_USED_BY_DUT_ROOT_COMPILE' \
 ( cd -- "$poison" && "$REAL_IV" -g2012 -I . -s compressed_expand \
       -o "$poison/poison_probe.vvp" "$d/rtl/decode/compressed_expand.v" ) >/dev/null 2>&1
 [ "$?" -ne 0 ] || driver_fail "poison_header_not_effective"
+CAPTURE_OUT_ROOT="$d"
 run_expect_pass "pos-poison-cwd" "$poison" env DUT_ROOT="$d" bash "$d/sim/functional/test_decode.sh"
+CAPTURE_OUT_ROOT=""
 
 #------------------------------------------------------------------------------
 # 6. 反证 19 例（夹具全部在本次 run 根内生成）
@@ -436,6 +466,49 @@ d="$DRIVER_ROOT/unauthorized-out"; build_repo "$d"
 cp -f -- "$REAL_TB" "$d/sim/functional/tb_decode_semantics.sv"
 run_expect_reject "$d" 'out_root_unauthorized' \
     env OUT_DIR="$DRIVER_ROOT/evil-out" bash "$d/sim/functional/test_decode.sh"
+
+# 15a) 原始 sha stdout 反证：DUT 多文件与 TB 单文件 caller 分别命中。
+# 有效单 LF 控由 pos-path-sha-real 覆盖；此处逐形态注入并要求精确 caller reason。
+make_sha_mutator() {
+    local d="$1"
+    mkdir -p -- "$d/fakebin"
+    cat > "$d/fakebin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+"$REAL_SHA" "$@" >"$HASH_TMP"
+real_rc=$?
+mutate=0
+if [ "$HASH_TARGET" = dut ] && [ "$#" -eq 5 ]; then mutate=1; fi
+if [ "$HASH_TARGET" = tb ] && [[ " $* " == *tb_decode_semantics.sv* ]]; then mutate=1; fi
+if [ "$mutate" -eq 0 ]; then cat -- "$HASH_TMP"; exit "$real_rc"; fi
+python3 - "$HASH_TMP" "$HASH_MODE" <<'PY'
+import pathlib,sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); m=sys.argv[2]
+if m=='extra1': b += b.split(b'\n',1)[0] + b'\n'
+elif m=='blanks': b += b'\n\n'
+elif m=='unterminated': b=b[:-1]
+elif m=='wrongpath': b=b.replace(b'  ',b'  wrong-path-',1)
+elif m=='garbage': b += b'NOT-A-HASH\n'
+elif m=='nulcr': b += b'\0\r\n'
+sys.stdout.buffer.write(b)
+PY
+if [ "$HASH_MODE" = exit9 ]; then exit 9; else exit "$real_rc"; fi
+SH
+    chmod +x "$d/fakebin/sha256sum"
+}
+for target in dut tb; do
+    for mode in extra1 blanks unterminated wrongpath garbage nulcr exit9; do
+        d="$DRIVER_ROOT/hash-${target}-${mode}"; build_repo "$d"
+        cp -f -- "$REAL_TB" "$d/sim/functional/tb_decode_semantics.sv"
+        make_sha_mutator "$d"
+        if [ "$target" = dut ]; then want="sha256_dut_format"; else want="sha256_tb_format"; fi
+        if [ "$mode" = exit9 ]; then
+            if [ "$target" = dut ]; then want="sha256_dut_rc=9"; else want="sha256_tb_rc=9"; fi
+        fi
+        run_expect_reject "$d" "$want" env -u RV32_IVERILOG -u RV32_VVP \
+            REAL_SHA="$REAL_SHA" HASH_TMP="$d/raw.sha" HASH_TARGET="$target" HASH_MODE="$mode" \
+            PATH="$d/fakebin:$PATH" bash "$d/sim/functional/test_decode.sh"
+    done
+done
 
 # 15) 头 SHA 失败（PATH 垫片 sha256sum 无条件 exit 1）
 d="$DRIVER_ROOT/sha-fail"; build_repo "$d"

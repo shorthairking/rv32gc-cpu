@@ -151,14 +151,19 @@ is_sha1() {
 }
 
 sha1_of() {
-    local f="$1" out rc n v
+    local f="$1" raw rc n line v
     [ -f "$f" ] || { echo "sha1_of: not a file: $f" >> "$RUN_LOG"; return 1; }
-    out="$(sha256sum -- "$f" 2>>"$RUN_LOG")"; rc=$?
+    raw="$(mktemp -- "$RUN_DIR/sha1-raw-XXXXXXXX")" || return 1
+    sha256sum -- "$f" > "$raw" 2>>"$RUN_LOG"; rc=$?
     [ "$rc" -eq 0 ] || { echo "sha1_of: sha256sum rc=$rc file=$f" >> "$RUN_LOG"; return 1; }
-    n="$(printf '%s\n' "$out" | grep -cE '^[0-9a-f]{64}  ' || true)"
-    [ "$n" -eq 1 ] || { echo "sha1_of: hex-line count=$n (expect 1) file=$f" >> "$RUN_LOG"; return 1; }
-    v="$(printf '%s\n' "$out" | cut -c1-64)"
-    is_sha1 "$v" || { echo "sha1_of: malformed hex '$v' file=$f" >> "$RUN_LOG"; return 1; }
+    n="$(wc -l < "$raw")"
+    [ "$n" -eq 1 ] || { echo "sha1_of: raw LF lines=$n (expect exactly 1) file=$f" >> "$RUN_LOG"; return 1; }
+    IFS= read -r line < "$raw" || { echo "sha1_of: missing terminating LF file=$f" >> "$RUN_LOG"; return 1; }
+    printf '%s\n' "$line" | cmp -s - "$raw" || { echo "sha1_of: raw bytes malformed file=$f" >> "$RUN_LOG"; return 1; }
+    case "$line" in [0-9a-f][0-9a-f]*) ;; *) echo "sha1_of: malformed line file=$f" >> "$RUN_LOG"; return 1;; esac
+    v="${line:0:64}"
+    is_sha1 "$v" && [ "${line:64:2}" = '  ' ] && [ "${line:66}" = "$f" ] \
+        || { echo "sha1_of: malformed hash/path file=$f" >> "$RUN_LOG"; return 1; }
     printf '%s\n' "$v"
     return 0
 }
@@ -340,7 +345,7 @@ snapshot_root() {
 #     同时把 sha256 清单写到 <标签>.sha，供运行结束后"前后一致"复核。
 #------------------------------------------------------------------------------
 compile_root() {
-    local root="$1" vvp="$2" tag="$3" tb="$FREEZE_TB" f rc n sha_out n_lines n_ok sha_rc n_expect
+    local root="$1" vvp="$2" tag="$3" tb="$FREEZE_TB" f rc n sha_out n_lines sha_rc n_expect sha_raw line i expected_path
     [ -d "$root" ] || { echo "[$tag] source root missing: $root" >> "$RUN_LOG"; return 1; }
     [ -f "$tb" ]      || { echo "[$tag] frozen TB missing: $tb" >> "$RUN_LOG"; return 1; }
     local files=() missing=0
@@ -362,16 +367,30 @@ compile_root() {
     fi
 
     # ---- SHA：**不得**用 `|| true` 吞失败；行数与 64-hex 行格式必须严格 ----
-    sha_out="$(sha256sum -- "$tb" "${files[@]}" "${hdrs[@]}" 2>&1)"; sha_rc=$?
+    sha_raw="$RUN_DIR/$tag.sha.raw"
+    sha256sum -- "$tb" "${files[@]}" "${hdrs[@]}" > "$sha_raw" 2>>"$RUN_LOG"; sha_rc=$?
     if [ "$sha_rc" -ne 0 ]; then echo "[$tag] sha256 command rc=$sha_rc" >> "$RUN_LOG"; return 1; fi
-    n_lines="$(printf '%s\n' "$sha_out" | grep -c . || true)"
-    n_ok="$(printf '%s\n' "$sha_out" | grep -cE '^[0-9a-f]{64}  ' || true)"
-    if [ "$n_ok" -ne "$n_expect" ] || [ "$n_lines" -ne "$n_ok" ]; then
-        echo "[$tag] sha256 line check failed lines=$n_lines hex=$n_ok expect=$n_expect" >> "$RUN_LOG"
-        printf '%s\n' "$sha_out" >> "$RUN_LOG"
+    n_lines="$(wc -l < "$sha_raw")"
+    if [ "$n_lines" -ne "$n_expect" ]; then
+        echo "[$tag] sha256 raw LF lines=$n_lines expect=$n_expect" >> "$RUN_LOG"
+        cat -- "$sha_raw" >> "$RUN_LOG"
         return 1
     fi
-    printf '%s\n' "$sha_out" > "$RUN_DIR/$tag.sha" || return 1
+    local all_paths=( "$tb" "${files[@]}" "${hdrs[@]}" )
+    : > "$RUN_DIR/$tag.sha" || return 1
+    i=0
+    while IFS= read -r line; do
+        expected_path="${all_paths[$i]:-}"
+        case "$line" in [0-9a-f][0-9a-f]*) ;; *) echo "[$tag] malformed sha line index=$i" >> "$RUN_LOG"; return 1;; esac
+        is_sha1 "${line:0:64}" && [ "${line:64:2}" = '  ' ] \
+            && [ "${line:66}" = "$expected_path" ] || {
+                echo "[$tag] sha line/path mismatch index=$i expected=$expected_path" >> "$RUN_LOG"; return 1; }
+        printf '%s\n' "$line" >> "$RUN_DIR/$tag.sha" || return 1
+        i=$((i+1))
+    done < "$sha_raw"
+    [ "$i" -eq "$n_expect" ] || { echo "[$tag] sha line count mismatch parsed=$i expect=$n_expect" >> "$RUN_LOG"; return 1; }
+    cmp -s -- "$sha_raw" "$RUN_DIR/$tag.sha" || { echo "[$tag] raw sha bytes differ from canonical manifest" >> "$RUN_LOG"; return 1; }
+    sha_out="$(<"$RUN_DIR/$tag.sha")"
     {
         echo "-- [$tag] SNAPSHOT_ROOT = $root"
         echo "-- [$tag] TB = $tb"

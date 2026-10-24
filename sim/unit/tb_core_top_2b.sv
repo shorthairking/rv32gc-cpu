@@ -28,7 +28,9 @@
 module tb_core_top_2b #(
     parameter integer CLK_HALF_NS  = 5,
     parameter integer RESET_CYCLES = 20,
-    parameter integer CYC_LIMIT    = 200000
+    parameter integer CYC_LIMIT    = 200000,
+    //   ★★ C14' 诊断开关（默认 0；-P tb_core_top_2b.DBG_C14=1 打开逐拍入队/维护冲刷现场）
+    parameter integer DBG_C14      = 0
 ) ();
 
     //==========================================================================
@@ -225,17 +227,59 @@ module tb_core_top_2b #(
     integer n_l1i_fill, n_fencei_sweep, fill_at_sweep_end;
     integer l1i_vld_left, sw_i;
     reg     fencei_busy_tb_q, fencei_done_tb_q;
-    //   ★★ (b) 硬断言计数器（报告 §B4.25）：维护冲刷拍"同组更老 store 完成 CDQ 入队"
-    //     · 判据口径（与 §B4.24.7 探针的 `[st]` 组合同源）：
-    //       该拍 `be_trp_flush=1` 且维护 lane 掩码有效（`|maint_lane_oh`，探针里即
-    //       `hold=1100` 形态）；凡 **未被维护掩码挡住**（`~cmt_hold_w`）且**已在提交
-    //       前缀链内**（`cmt_st_drain`）的 store，**必须**当拍完成入队（`dr_take`）。
-    //     · 反证（必须 FAIL）：把 `backend_top` 的入队许可临时恢复为旧式
-    //       `cmt_st_drain & cmt_ok & ~cmt_hold_w`（`cmt_ok` 在冲刷拍为 0）⇒ 本断言立即红。
+    //   ★★ C14'（2026-10-20 重构）：store 入队 / 维护次序的**不变量**。
+    //     旧判据"维护冲刷拍必须当拍入队 ≥1 次"是**时序假设**：一旦前端/ROB 让更老 store
+    //     提前一拍进入 CDQ（合法），该拍 `cmt_st_drain` 已为 0 ⇒ 旧断言毫无对象却判红。
+    //     新判据改为与同拍时序无关的不变量：
+    //       ① 入队许可 = 规格式（提交前缀 store ∧ ~维护掩码），**不含 cmt_ok/flush 门**；
+    //       ② 每笔 store **恰入队一次**（被收下的 STQ 槽此前 stq_cmt 必为 0）；
+    //       ③ 不丢：有 CDQ 余量时有效 lane 必须全部被收下；
+    //       ④ 入队落地：take 拍后 CDQ 尾指针必须恰前进 push_n（含 8 条满 CDQ 回绕）；
+    //       ⑤ 有序先于维护完成：维护**生效脉冲**拍 CDQ 必须已空（更老 store 全落地）；
+    //       ⑥ 同拍 flush+dr 角：出现时（覆盖计数）必须全部被收下；未出现不判红，
+    //          因为该角的"许可正确性"已由 ① 每拍确定性覆盖（模块级契约，不靠时序）。
     integer n_maint_flush_cyc, n_maint_st_push;
-    initial begin n_maint_flush_cyc = 0; n_maint_st_push = 0;
-                  maint_push_chk_q = 1'b0; maint_tail_chk_q = 3'h0; maint_pushn_chk_q = 3'h0; end
+    integer n_st_take_cyc, n_st_push_ent, n_st_drop, n_st_tail_bad, n_st_dup;
+    integer n_dr_perm_bad, n_maint_ord_bad, n_maint_eff_cyc;
+    integer n_st_dup_flush;         // 维护冲刷拍内的重复入队（交角；门禁项）
+    integer n_flush_store_cyc, n_flush_store_take;
+    reg        st_take_prev_q;
+    reg [2:0]  st_tail_prev_q;
+    reg [3:0]  st_pushn_prev_q;
+    reg        st_rst_prev_q;       // 复位沿屏蔽（程序间复位清 CDQ/STQ ⇒ 不作异常）
+    reg [31:0] st_last_take_t [0:3];   // 每 lane 上次 take 的拍号（诊断"重复入队"用）
+    reg [3:0]  st_last_take_idx [0:3]; // 每 lane 上次 take 的 STQ 索引
+    integer    sll;
+    wire [`BACK2_COMMIT_W-1:0] st_must_w =
+        u_dut.u_back.cmt_st_drain & ~u_dut.u_back.cmt_hold_w;
+    integer    sl;
+    initial begin
+        n_maint_flush_cyc = 0; n_maint_st_push = 0;
+        n_st_take_cyc = 0; n_st_push_ent = 0; n_st_drop = 0; n_st_tail_bad = 0; n_st_dup = 0;
+        n_dr_perm_bad = 0; n_maint_ord_bad = 0; n_maint_eff_cyc = 0; n_st_dup_flush = 0;
+        n_flush_store_cyc = 0; n_flush_store_take = 0;
+        st_take_prev_q = 1'b0; st_tail_prev_q = 3'h0; st_pushn_prev_q = 4'h0;
+        st_rst_prev_q = 1'b0;
+        for (sll = 0; sll < 4; sll = sll + 1) begin
+            st_last_take_t[sll] = 32'hFFFF_FFFF; st_last_take_idx[sll] = 4'h0;
+        end
+        maint_push_chk_q = 1'b0; maint_tail_chk_q = 3'h0; maint_pushn_chk_q = 3'h0;
+    end
     integer k1_tick; initial k1_tick = 0;
+    //   ★ C14 跟踪的复位沿处理（**必须在 if(rst_n) 之外**：程序间复位时清零，
+    //     首拍不复位后立刻用旧 tail 判"无入队却前进"）。
+    always @(posedge clk) begin
+        st_rst_prev_q <= rst_n;
+        if (!rst_n) begin
+            st_take_prev_q  <= 1'b0;
+            st_tail_prev_q  <= 3'h0;
+            st_pushn_prev_q <= 4'h0;
+            for (sll = 0; sll < 4; sll = sll + 1) begin
+                st_last_take_t[sll]   <= 32'hFFFF_FFFF;
+                st_last_take_idx[sll] <= 4'h0;
+            end
+        end
+    end
     always @(posedge clk) if (rst_n) begin
         if (u_dut.maint_cmt_w)        n_maint_cmt  <= n_maint_cmt  + 1;
         if (u_dut.maint_l1i_inval_w)  n_l1i_inval  <= n_l1i_inval  + 1;
@@ -256,37 +300,123 @@ module tb_core_top_2b #(
         //     `cache_tag_array.tagv_q[i][0]` = valid 位）。反证：断开 `inval_all`（旧接法）
         //     ⇒ 阵列里仍全是旧行 ⇒ 本项必红（这是区分"只切索引"与"真失效"的判据）。
         if (fencei_done_tb_q) l1i_vld_left <= l1i_vld_cnt();
-        //   ★★ (b) 硬断言：维护冲刷拍，同组更老 store 必须完成 CDQ 入队（见上方计数器注）
-        //     两级判定（缺一不可）：
-        //       ① **组合许可**：`dr_take` 必须覆盖"必须入队"的 lane（抓"入队许可被冲刷门抹掉"）；
-        //       ② **入队落地**：CDQ 写指针（`cdq_tail`）必须真的前进 —— 抓"许可为 1 但整机
-        //          冲刷分支把入队语句整段跳过"（本段实测的真实形态：`take=1` 而 `cnt/tail` 不动）。
-        //          用"尾指针至少前进 push_n"（模 8 比较）⇒ 容忍下拍又有新入队，不容忍被吞。
-        if (u_dut.be_trp_flush && (|u_dut.u_back.maint_lane_oh)) begin
-            maint_must_push = u_dut.u_back.cmt_st_drain & ~u_dut.u_back.cmt_hold_w;
-            n_maint_flush_cyc <= n_maint_flush_cyc + 1;
-            if (maint_must_push != 4'h0) begin
-                if ((maint_must_push & ~u_dut.u_back.u_lsu.dr_take) != 4'h0) begin
-                    $display("FAIL: [硬断言] 维护冲刷拍同组更老 store 未获 CDQ 入队许可：st_drain=%b hold=%b drv=%b take=%b",
+        //   ★ 所有 C14 不变量只在**复位释放后第二拍起**生效（首拍 DUT 内部可能仍为旧/X）；
+        //     复位沿的跟踪清零见块外独立 always（块内 `if (rst_n)` 在复位期间不执行）。
+        //   ★★ C14'-INV①：入队许可的**规格契约**（每拍确定性，与维护拍是否出现无关）。
+        //     规格 = 提交前缀内 store ∧ 未被维护 lane 掩码挡住；**不得**再乘 cmt_ok/
+        //     ~squash/flush 门（旧缺陷形态正是如此 ⇒ 已提交 store 静默丢失）。
+        if (st_rst_prev_q &&
+            (u_dut.u_back.lsu_dr_valid !== {{(4-`BACK2_COMMIT_W){1'b0}}, st_must_w})) begin
+            n_dr_perm_bad <= n_dr_perm_bad + 1;
+            if (n_dr_perm_bad < 4)
+                $display("FAIL: [C14'-1] 入队许可与规格不符：dr_valid=%b，规格=%b（drain=%b hold=%b）",
+                         u_dut.u_back.lsu_dr_valid, st_must_w,
+                         u_dut.u_back.cmt_st_drain, u_dut.u_back.cmt_hold_w);
+        end
+        //   ★★ C14'-INV②：每笔 store 恰入队一次（被收下的 STQ 槽此前不得已 stq_cmt）
+        for (sl = 0; sl < 4; sl = sl + 1) begin
+            if (st_rst_prev_q && u_dut.u_back.u_lsu.dr_take[sl] &&
+                u_dut.u_back.u_lsu.stq_cmt[u_dut.u_back.u_lsu.dr_idx[
+                    sl*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W]]) begin
+                n_st_dup <= n_st_dup + 1;
+                if (u_dut.be_trp_flush) n_st_dup_flush <= n_st_dup_flush + 1;
+                if (n_st_dup < 4)
+                    $display("FAIL: [C14'-dup] 同一 store 重复入 CDQ：t=%0d lane=%0d stq_idx=%0d 已 stq_cmt | 上次 take t=%0d idx=%0d Δ=%0d | stq_v=%b ret=%b rob=%0d av=%b | take=%b tail=%0d cdqcnt=%0d flush=%b drain=%b hold=%b cmt_pc=%08x %08x",
+                             k1_tick, sl,
+                             u_dut.u_back.u_lsu.dr_idx[sl*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W],
+                             st_last_take_t[sl], st_last_take_idx[sl],
+                             (k1_tick - st_last_take_t[sl]),
+                             u_dut.u_back.u_lsu.stq_v  [u_dut.u_back.u_lsu.dr_idx[sl*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W]],
+                             u_dut.u_back.u_lsu.stq_ret[u_dut.u_back.u_lsu.dr_idx[sl*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W]],
+                             u_dut.u_back.u_lsu.stq_rob[u_dut.u_back.u_lsu.dr_idx[sl*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W]],
+                             u_dut.u_back.u_lsu.stq_av [u_dut.u_back.u_lsu.dr_idx[sl*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W]],
+                             u_dut.u_back.u_lsu.dr_take, u_dut.u_back.u_lsu.cdq_tail,
+                             u_dut.u_back.u_lsu.cdq_cnt, u_dut.be_trp_flush,
                              u_dut.u_back.cmt_st_drain, u_dut.u_back.cmt_hold_w,
-                             u_dut.u_back.lsu_dr_valid, u_dut.u_back.u_lsu.dr_take);
-                    $fatal(1, "TB_CORE_TOP_2B 判据不满足");
-                end else begin
-                    maint_push_chk_q  <= 1'b1;
-                    maint_tail_chk_q  <= u_dut.u_back.u_lsu.cdq_tail;
-                    maint_pushn_chk_q <= u_dut.u_back.u_lsu.dr_push_n[2:0];
-                end
-            end
-        end else if (maint_push_chk_q) begin
-            maint_push_chk_q <= 1'b0;
-            if (((u_dut.u_back.u_lsu.cdq_tail - maint_tail_chk_q) & 3'h7) < maint_pushn_chk_q) begin
-                $display("FAIL: [硬断言] 维护冲刷拍同组更老 store 的 CDQ 入队**未落地**（尾指针未前进）：tail %0d→%0d，应至少 +%0d",
-                         maint_tail_chk_q, u_dut.u_back.u_lsu.cdq_tail, maint_pushn_chk_q);
-                $fatal(1, "TB_CORE_TOP_2B 判据不满足");
-            end else begin
-                n_maint_st_push <= n_maint_st_push + 1;
+                             u_dut.commit_pc[31:0], u_dut.commit_pc[63:32]);
             end
         end
+        //   ★★ C14'-INV③：有 CDQ 余量时不得丢 lane
+        if (st_rst_prev_q && u_dut.u_back.u_lsu.dr_room_ok &&
+            ((u_dut.u_back.lsu_dr_valid & ~u_dut.u_back.u_lsu.dr_take) != 4'h0)) begin
+            n_st_drop <= n_st_drop + 1;
+            if (n_st_drop < 4)
+                $display("FAIL: [C14'-2] 有 CDQ 余量但有效 store lane 未被收下：valid=%b take=%b",
+                         u_dut.u_back.lsu_dr_valid, u_dut.u_back.u_lsu.dr_take);
+        end
+        //   ★★ C14'-INV④：入队落地 —— take 拍后尾指针恰前进 push_n（模 8，容纳满 CDQ=8）
+        if (rst_n && st_rst_prev_q) begin
+            if (st_take_prev_q) begin
+                if (((u_dut.u_back.u_lsu.cdq_tail - st_tail_prev_q) & 3'h7) !=
+                    (st_pushn_prev_q[2:0])) begin
+                    n_st_tail_bad <= n_st_tail_bad + 1;
+                    if (n_st_tail_bad < 4)
+                        $display("FAIL: [C14'-4] CDQ 尾指针未按 push_n 前进：tail %0d→%0d push_n=%0d",
+                                 st_tail_prev_q, u_dut.u_back.u_lsu.cdq_tail, st_pushn_prev_q);
+                end else begin
+                    n_st_push_ent <= n_st_push_ent + st_pushn_prev_q;
+                end
+            end else if (((u_dut.u_back.u_lsu.cdq_tail - st_tail_prev_q) & 3'h7) != 3'h0) begin
+                n_st_tail_bad <= n_st_tail_bad + 1;
+                if (n_st_tail_bad < 4)
+                    $display("FAIL: [C14'-4] 无入队拍 CDQ 尾指针却前进：tail %0d→%0d",
+                             st_tail_prev_q, u_dut.u_back.u_lsu.cdq_tail);
+            end
+        end
+        for (sll = 0; sll < 4; sll = sll + 1) begin
+            if (rst_n && u_dut.u_back.u_lsu.dr_take[sll]) begin
+                st_last_take_t[sll]   <= k1_tick;
+                st_last_take_idx[sll] <= u_dut.u_back.u_lsu.dr_idx[sll*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W];
+            end
+        end
+        if (rst_n) begin
+            if (|u_dut.u_back.u_lsu.dr_take) n_st_take_cyc <= n_st_take_cyc + 1;
+            st_take_prev_q  <= |u_dut.u_back.u_lsu.dr_take;
+            st_tail_prev_q  <= u_dut.u_back.u_lsu.cdq_tail;
+            st_pushn_prev_q <= u_dut.u_back.u_lsu.dr_push_n;
+        end
+
+        //   ★★ C14'-INV⑤：有序先于维护完成 —— 维护**生效脉冲**拍 CDQ 必须已空
+        if (st_rst_prev_q &&
+            (u_dut.maint_tlb_sfence_w || u_dut.maint_l1d_inval_w || u_dut.maint_l1d_clean_w)) begin
+            n_maint_eff_cyc <= n_maint_eff_cyc + 1;
+            if (!u_dut.u_back.u_lsu.dr_empty_o) begin
+                n_maint_ord_bad <= n_maint_ord_bad + 1;
+                if (n_maint_ord_bad < 4)
+                    $display("FAIL: [C14'-5] 维护生效拍 CDQ 仍非空（更老 store 未先落地）：cnt=%0d",
+                             u_dut.u_back.u_lsu.cdq_cnt);
+            end
+        end
+
+        //   ★★ C14'-cov：同拍 flush+dr 角的**覆盖计数**（不再要求该拍必然出现）
+        if (st_rst_prev_q && u_dut.be_trp_flush && (|u_dut.u_back.maint_lane_oh)) begin
+            n_maint_flush_cyc <= n_maint_flush_cyc + 1;
+            if (|st_must_w) begin
+                n_flush_store_cyc <= n_flush_store_cyc + 1;
+                if ((st_must_w & ~u_dut.u_back.u_lsu.dr_take[`BACK2_COMMIT_W-1:0]) == 0) begin
+                    n_flush_store_take <= n_flush_store_take + 1;
+                end else begin
+                    n_st_drop <= n_st_drop + 1;
+                    $display("FAIL: [C14'-6] 维护冲刷拍同组更老 store 未全部入队：must=%b take=%b",
+                             st_must_w, u_dut.u_back.u_lsu.dr_take);
+                end
+                n_maint_st_push <= n_maint_st_push + 1;
+            end
+            if (DBG_C14)
+                $display("   [C14-dbg] t=%0d flush=1 maint=%b drain=%b hold=%b must=%b drv=%b take=%b pushn=%0d tail=%0d cdqcnt=%0d cmt_pc=%08x %08x",
+                         k1_tick, u_dut.u_back.maint_lane_oh, u_dut.u_back.cmt_st_drain,
+                         u_dut.u_back.cmt_hold_w, st_must_w, u_dut.u_back.lsu_dr_valid,
+                         u_dut.u_back.u_lsu.dr_take, u_dut.u_back.u_lsu.dr_push_n,
+                         u_dut.u_back.u_lsu.cdq_tail, u_dut.u_back.u_lsu.cdq_cnt,
+                         u_dut.commit_pc[31:0], u_dut.commit_pc[63:32]);
+        end
+        if (DBG_C14 && (|u_dut.u_back.u_lsu.dr_take) && (cur_p == 11))
+            $display("   [C14-dbg-take] t=%0d take=%b pushn=%0d tail=%0d cdqcnt=%0d flush=%b drain=%b hold=%b cmt_pc=%08x %08x",
+                     k1_tick, u_dut.u_back.u_lsu.dr_take, u_dut.u_back.u_lsu.dr_push_n,
+                     u_dut.u_back.u_lsu.cdq_tail, u_dut.u_back.u_lsu.cdq_cnt,
+                     u_dut.be_trp_flush, u_dut.u_back.cmt_st_drain,
+                     u_dut.u_back.cmt_hold_w,
+                     u_dut.commit_pc[31:0], u_dut.commit_pc[63:32]);
         k1_tick <= k1_tick + 1;
         //   ★ [诊断，默认关] p12：适配器/L1D 维护/冲刷事件逐拍（定位维护与 store 排空的交叠）
         if (DBG_P12 && (cur_p == 11) && (k1_tick > 3000) &&
@@ -824,13 +954,39 @@ module tb_core_top_2b #(
                     //   **同组提交**，提交拍 `be_trp_flush=1` ⇒ 旧实现该拍的入队被整机冲刷
                     //   分支吞掉（`take` 组合为 1 但 CDQ 计数不动）⇒ 已提交写丢失。
                     //   反证：临时恢复旧式许可（`& cmt_ok`）⇒ 本项必 FAIL（日志留证）。
-                    chk(n_maint_st_push >= 1,
-                        $sformatf("C14' p13：**维护冲刷拍同组更老 store 完成 CDQ 入队**（(b) 硬断言；实测 %0d 次 / 维护冲刷拍 %0d 拍）",
-                                  n_maint_st_push, n_maint_flush_cyc));
+                    //   ============ C14'（重构）：store 入队/维护次序不变量 ============
+                    //   旧判据（"维护冲刷拍必须当拍入队 ≥1"）已废止：它假设更老 store 与
+                    //   维护操作**同组提交**；当前前端/ROB 让该 store 提前一拍入 CDQ 是
+                    //   **合法**行为（实测维护冲刷 6 拍、同组 store=0；见 C14-dbg 日志），
+                    //   旧断言没有对象却判红。新判据见上方 INV①..⑥ 注释。
+                    $display("   [C14'] 入队不变量：take拍=%0d 条=%0d drop=%0d dup=%0d dup_flush=%0d tail_bad=%0d perm_bad=%0d | 维护生效拍=%0d 次序错=%0d | 维护冲刷拍=%0d（同组有 store 的拍=%0d，均入队=%0d）",
+                             n_st_take_cyc, n_st_push_ent, n_st_drop, n_st_dup, n_st_dup_flush,
+                             n_st_tail_bad, n_dr_perm_bad, n_maint_eff_cyc, n_maint_ord_bad,
+                             n_maint_flush_cyc, n_flush_store_cyc, n_flush_store_take);
+                    if (n_flush_store_cyc == 0)
+                        $display("   [C14'-cov] 本程序**未出现**“维护冲刷拍同组有未入队 store”的同拍角（旧断言的对象）；该角的许可正确性由 C14'-1 的**每拍规格契约**确定性覆盖，不再依赖同拍时序计数。");
+                    else
+                        $display("   [C14'-cov] 同拍 flush+dr 角覆盖 %0d 拍，其中全部入队 %0d 拍。",
+                                 n_flush_store_cyc, n_flush_store_take);
+                    chk(n_dr_perm_bad == 0,
+                        "C14'-1 p13：入队许可 = 规格式（提交前缀 store ∧ ~维护掩码；无 cmt_ok/flush 抑制）");
+                    chk(n_st_drop == 0,
+                        "C14'-2 p13：有 CDQ 余量时有效 store lane 不丢");
+                    //   ★ 母 2026-10-20 明确：C14 **强不变式保持**——"每 store 恰入队一次"
+                    //     是硬门禁，不得把真实重复改成期望/去掉检查；当前树实测违反
+                    //     ⇒ 本项必须红，待 LSQ owner（ff464）修正后复跑。
+                    //     （`[C14'-dup]` 行给出可复现 cohort：同一 lane/STQ 槽/提交 PC 3 拍内
+                    //       二次 take；不跨层读 stq_cmt 的修法由 LSQ owner 决定。）
+                    chk(n_st_dup == 0,
+                        "C14'-3 p13：每笔 store 恰入 CDQ 一次（无重复入队；强门禁）");
+                    chk(n_st_tail_bad == 0,
+                        "C14'-4 p13：take 拍 CDQ 尾指针恰前进 push_n（入队落地）");
+                    chk(n_st_take_cyc > 0,
+                        "C14'-5 p13：store 入队通路有真实流量（take 拍 > 0）");
+                    chk(n_maint_ord_bad == 0,
+                        "C14'-6 p13：维护生效拍 CDQ 已空（更老 store 先于维护完成）");
                     $display("   [C13'] Sv32：12 项全过（维护计数 maint=%0d tlb_sfence=%0d；PTE 回读 = 重映射后新 PTE 0x2000_98C7）",
                              n_maint_cmt, n_tlb_sfence);
-                    $display("   [C14'] (b) 硬断言：维护冲刷拍同组更老 store 完成 CDQ 入队 = %0d 次（维护冲刷拍 %0d 拍，`hold` 掩码有效）",
-                             n_maint_st_push, n_maint_flush_cyc);
                     $fflush();
                 end
             //   ============ C16'：S 模式完整链 + PLIC 外部中断（p15_priv，4b-3(2/2) 收口）============

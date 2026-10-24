@@ -195,16 +195,39 @@ for f in "${DUT_FILES[@]}"; do
     [ -f "$f" ] || emit_fail "dut_src_missing file=$f"
 done
 
-SHA_DUT="$(sha256sum -- "${DUT_FILES[@]}" 2>>"$RUN_LOG")"
+# sha256sum stdout is captured as bytes in this run's private directory before
+# any command substitution/normalization. Validate exact ordered paths and LF.
+validate_sha_raw() { # <raw-file> <expected paths...>
+    local raw="$1"; shift
+    python3 - "$raw" "$@" <<'PY'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+paths = sys.argv[2:]
+if not raw.endswith(b"\n") or b"\0" in raw or b"\r" in raw:
+    raise SystemExit(1)
+lines = raw[:-1].split(b"\n")
+if len(lines) != len(paths):
+    raise SystemExit(1)
+for line, path in zip(lines, paths):
+    m = re.fullmatch(rb"([0-9a-f]{64})  (.+)", line)
+    if not m or m.group(2) != path.encode():
+        raise SystemExit(1)
+if len({line.split(b"  ", 1)[1] for line in lines}) != len(paths):
+    raise SystemExit(1)
+sys.stdout.buffer.write(b"\n".join(lines) + b"\n")
+PY
+}
+SHA_DUT_RAW="$RUN_DIR/sha_dut.raw"
+sha256sum -- "${DUT_FILES[@]}" >"$SHA_DUT_RAW" 2>>"$RUN_LOG"
 SHA_RC=$?
 [ "$SHA_RC" -eq 0 ] || emit_fail "sha256_dut_rc=$SHA_RC"
-N_SHA_LINES="$(printf '%s\n' "$SHA_DUT" | grep -c '^[0-9a-f]\{64\} ' || true)"
-[ "$N_SHA_LINES" = "4" ] || emit_fail "sha256_dut_lines=$N_SHA_LINES"
+SHA_DUT="$(validate_sha_raw "$SHA_DUT_RAW" "${DUT_FILES[@]}")" || emit_fail "sha256_dut_format"
 
-SHA_TB="$(sha256sum -- "$TB_SRC" 2>>"$RUN_LOG")"
+SHA_TB_RAW="$RUN_DIR/sha_tb.raw"
+sha256sum -- "$TB_SRC" >"$SHA_TB_RAW" 2>>"$RUN_LOG"
 SHA_RC=$?
 [ "$SHA_RC" -eq 0 ] || emit_fail "sha256_tb_rc=$SHA_RC"
-printf '%s\n' "$SHA_TB" | grep -q '^[0-9a-f]\{64\} ' || emit_fail "sha256_tb_bad_line"
+SHA_TB="$(validate_sha_raw "$SHA_TB_RAW" "$TB_SRC")" || emit_fail "sha256_tb_format"
 
 {
     echo "-- DUT source sha256 --"

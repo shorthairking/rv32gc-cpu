@@ -71,12 +71,12 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 #------------------------------------------------------------------------------
 # 本包冻结规格（与 tb_privilege_semantics.sv 同步；改 TB 必须同步改这里）
 #------------------------------------------------------------------------------
-readonly SPEC_VECTORS=42
+readonly SPEC_VECTORS=44
 readonly N_HASH_EXPECTED=6        # 3 RTL + 2 vh + TB = 实际编译输入
 readonly BASE_COMMIT_SHORT="201acf61"
 readonly BASE_COMMIT_FULL="201acf61e118a3fb533e1a96768687a35efa1751"
 # 旧基线必须触发的定向缺陷标签（与 TB 头注一致）；`CTRL_` 前缀为合法控制标签
-readonly DEFECT_TAGS="PMP_OWN_L PMP_MID_OWN_L PMP_I15_OWN_L CNTR_S_DISABLED CNTR_U_SCNT_DIS CNTR_HALF_SHADOW TVM_S_ILL SIE_ALIAS_READ SIE_ALIAS_WRITE SIE_PARTIAL_DELEG SIP_ALIAS_READ SIP_UNDELEG_WRITE SIP_PARTIAL_DELEG IRQ_UNDELEG_M IRQ_SRC_S_TO_M IRQ_SSI_U_TO_M BYP_MPRV_1TO0 BYP_SSTATUS_MASK BYP_MPP_S_TO_U BYP_MIE_1TO0 IRQ_MFIRST_U IRQ_MFIRST_S SIE_PREVIEW_DELEG SIE_PREVIEW_PARTIAL SIP_PREVIEW_DELEG SIE_PREVIEW_MIDELEG_SAME MSTATUS_SD_DIRTY"
+readonly DEFECT_TAGS="PMP_OWN_L PMP_MID_OWN_L PMP_I15_OWN_L CNTR_S_DISABLED CNTR_U_SCNT_DIS CNTR_HALF_SHADOW TVM_S_ILL SIE_ALIAS_READ SIE_ALIAS_WRITE SIE_PARTIAL_DELEG SIP_ALIAS_READ SIP_UNDELEG_WRITE SIP_PARTIAL_DELEG IRQ_UNDELEG_M IRQ_SRC_S_TO_M IRQ_SSI_U_TO_M BYP_MPRV_1TO0 BYP_SSTATUS_MASK BYP_MPP_S_TO_U BYP_MIE_1TO0 IRQ_MFIRST_U IRQ_MFIRST_S SIE_PREVIEW_DELEG SIE_PREVIEW_PARTIAL SIP_PREVIEW_DELEG SIE_PREVIEW_MIDELEG_SAME MSTATUS_SD_DIRTY XRET_IRQ_MIE1 XRET_IRQ_POSTMODE"
 
 usage() {
     cat <<'EOF'
@@ -812,7 +812,7 @@ baseline_main() {
     git -C "$REPO_ROOT" archive "$full" rtl | tar -x -C "$priv" || die "git archive ${full} rtl 失败"
     printf 'privilege(baseline): baseline_src=%s commit=%s\n' "$priv" "$full"
 
-    CASE_DEFS="-DRV32_CSR_NO_CNT_PORTS"   # 旧树无 F1-B 计数器端口（仅端口兼容）
+    CASE_DEFS="-DRV32_CSR_NO_CNT_PORTS -DRV32_PRIV_NO_XRET_TGT"   # 旧树无 F1-B 计数器端口 / 新 xret 目标输出
     case_compile baseline "$priv"
     CASE_DEFS=""
     local b_err=0

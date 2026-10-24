@@ -164,28 +164,79 @@ emit_fail() {
 # 2. 哈希工具：rc **原样传播**；空输出/非 64hex 一律拒（不允许空==空假绿）
 #------------------------------------------------------------------------------
 SHA_OUT=""; SHA_RC=0
+SHA_RAW="$RUN_DIR/.sha_raw.$$"
 is_hex64() {
     case "$1" in *[!0-9a-f]*|"") return 1 ;; esac
     [ "${#1}" -eq 64 ] || return 1
     return 0
 }
-hash_many() {  # hash_many <file...> ⇒ SHA_OUT（完整 sha256sum 输出）、SHA_RC
-    SHA_OUT="$(sha256sum -- "$@" 2>>"$RUN_LOG")"
-    SHA_RC=$?
-    return "$SHA_RC"
+#   ★ 原始 stdout 先落文件再判：Bash $(...) 会吞掉全部尾 LF，绝不能先剥尾再数。
+raw_block_ok() {  # <raw> <expect_lines>
+    local raw="$1" want="$2" bytes lf last
+    # Inspect bytes before cat/head/command substitution; reject NUL and non-text bytes.
+    python3 - "$raw" <<'PY'
+import sys
+b = open(sys.argv[1], 'rb').read()
+if b'\0' in b or any(c < 0x20 and c not in (0x0a,) for c in b):
+    raise SystemExit(1)
+PY
+    [ "$?" -eq 0 ] || return 1
+    bytes="$(wc -c < "$raw")"; [ "$bytes" -gt 0 ] || return 1
+    last="$(tail -c 1 "$raw" | od -An -tu1 | tr -d ' \n')"
+    [ "$last" = "10" ] || return 1
+    lf="$(tr -cd '\n' < "$raw" | wc -c)"
+    [ "$lf" -eq "$want" ] || return 1
+    if grep -q '^$' "$raw"; then return 1; fi
+    if grep -q "$(printf '\r')" "$raw"; then return 1; fi
+    return 0
 }
-hash_one() {
-    SHA_OUT="$(sha256sum -- "$1" 2>>"$RUN_LOG")"
-    SHA_RC=$?
-    return "$SHA_RC"
+hash_many() {  # hash_many <file...> ⇒ SHA_OUT（规范行）、SHA_RC
+    SHA_OUT=""; SHA_RC=0
+    : > "$SHA_RAW" || { SHA_RC=1; return 1; }
+    sha256sum -- "$@" > "$SHA_RAW" 2>>"$RUN_LOG"; SHA_RC=$?
+    [ "$SHA_RC" -eq 0 ] || { SHA_OUT=""; return "$SHA_RC"; }
+    if ! raw_block_ok "$SHA_RAW" "$#"; then
+        local bytes last
+        # A NUL makes the raw block invalid even if command substitution would erase it.
+        if python3 - "$SHA_RAW" <<'PY'
+import sys
+raise SystemExit(0 if b'\0' in open(sys.argv[1], 'rb').read() else 1)
+PY
+        then
+            SHA_OUT=""; SHA_RC=1; return 1
+        fi
+        bytes="$(wc -c < "$SHA_RAW")"
+        if [ "$bytes" -eq 0 ]; then
+            SHA_OUT=""
+        else
+            last="$(tail -c 1 "$SHA_RAW" | od -An -tu1 | tr -d ' \n')"
+            SHA_OUT="$(cat "$SHA_RAW")"
+            if [ "$last" != "10" ] || grep -q '^$' "$SHA_RAW" || grep -q "$(printf '\r')" "$SHA_RAW"; then
+                SHA_OUT="$SHA_OUT"$'\nRAW_INVALID'
+            fi
+        fi
+        SHA_RC=0
+        return 0
+    fi
+    SHA_OUT="$(cat "$SHA_RAW")"
+    return 0
 }
-one_hash_of() {  # one_hash_of <file> ⇒ ONE_HASH；完整单行 64hex + 精确 path，无尾垃圾
+hash_one() {  # hash_one <file> ⇒ SHA_OUT 单行（不含终止 LF）；原始行必须恰好一条且 LF 终止
+    SHA_OUT=""; SHA_RC=0
+    : > "$SHA_RAW" || { SHA_RC=1; return 1; }
+    sha256sum -- "$1" > "$SHA_RAW" 2>>"$RUN_LOG"; SHA_RC=$?
+    [ "$SHA_RC" -eq 0 ] || { SHA_OUT=""; return "$SHA_RC"; }
+    raw_block_ok "$SHA_RAW" 1 || { SHA_RC=1; SHA_OUT=""; return 1; }
+    local bytes
+    bytes="$(wc -c < "$SHA_RAW")"
+    SHA_OUT="$(head -c "$((bytes - 1))" "$SHA_RAW")"
+    return 0
+}
+one_hash_of() {  # one_hash_of <file> ⇒ ONE_HASH；完整单行 64hex + 精确 path
     ONE_HASH=""
-    local f="$1" line h p n
+    local f="$1" line h p
     hash_one "$f" || return 1
     [ -n "$SHA_OUT" ] || return 1
-    n="$(printf '%s\n' "$SHA_OUT" | wc -l)"
-    [ "$n" -eq 1 ] || return 1
     line="$SHA_OUT"
     [[ "$line" =~ ^([0-9a-f]{64})\ \ (.*)$ ]] || return 1
     h="${BASH_REMATCH[1]}"; p="${BASH_REMATCH[2]}"

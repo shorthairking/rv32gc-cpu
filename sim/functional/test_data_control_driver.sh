@@ -66,20 +66,40 @@ fail() {
 #==============================================================================
 # S. SHA 收口：原 rc 捕获 + 64hex + 路径逐字 + 固定行数
 #==============================================================================
+validated_sha_output() {  # 原始 stdout 文件已捕获；仅在严格验证后输出 SHA 列
+    python3 - "$@" <<'PY'
+import os, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+paths = sys.argv[2:]
+if b'\0' in raw or b'\r' in raw:
+    print('sha_bytes', file=sys.stderr); raise SystemExit(1)
+if not raw.endswith(b'\n'):
+    print('sha_unterminated', file=sys.stderr); raise SystemExit(1)
+rows = raw.split(b'\n')[:-1]
+if len(rows) != len(paths):
+    print(f'sha_lines={len(rows)}', file=sys.stderr); raise SystemExit(1)
+hashes = []
+for i, (row, path) in enumerate(zip(rows, paths), 1):
+    m = re.fullmatch(rb'([0-9a-f]{64})  (.*)', row)
+    if not m:
+        print(f'sha_format line={i}', file=sys.stderr); raise SystemExit(1)
+    if m.group(2) != os.fsencode(path):
+        print(f'sha_path line={i}', file=sys.stderr); raise SystemExit(1)
+    hashes.append(m.group(1).decode())
+print(' '.join(hashes), end='')
+PY
+}
 file_sha() {
-    local out rc total h
-    out="$(sha256sum -- "$1")"
+    local raw rc result
+    raw="$(mktemp -- "$DRV/sha-one-XXXXXXXX")" || return 1
+    sha256sum -- "$1" >"$raw"
     rc=$?
     [ "$rc" -eq 0 ] || { printf 'sha_rc path=%s rc=%s\n' "$1" "$rc" >&3; return 1; }
-    total="$(printf '%s\n' "$out" | wc -l)"
-    [ "$total" -eq 1 ] || { printf 'sha_lines path=%s lines=%s\n' "$1" "$total" >&3; return 1; }
-    printf '%s\n' "$out" | grep -qE '^[0-9a-f]{64}  ' \
-        || { printf 'sha_fmt path=%s\n' "$1" >&3; return 1; }
-    h="$(printf '%s\n' "$out" | cut -c1-64)"
-    [ "${#h}" -eq 64 ] || { printf 'sha_len path=%s\n' "$1" >&3; return 1; }
-    [ "$(printf '%s\n' "$out" | cut -c67-)" = "$1" ] \
-        || { printf 'sha_path path=%s\n' "$1" >&3; return 1; }
-    printf '%s' "$h"
+    result="$(validated_sha_output "$raw" "$1" 2>&1)"
+    rc=$?
+    [ "$rc" -eq 0 ] || { printf 'sha_invalid path=%s reason=%s\n' "$1" "$result" >&3; return 1; }
+    [ "${#result}" -eq 64 ] || { printf 'sha_len path=%s\n' "$1" >&3; return 1; }
+    printf '%s' "$result"
 }
 sha_of() {
     local h
@@ -138,28 +158,18 @@ cmp -s -- "$TB_SH"  "$FRZ/sim/functional/tb_data_control.sv"  || fail "frozen_tb
 cmp -s -- "$ENV_SH" "$FRZ/scripts/env.sh" || fail "frozen_env_mismatch"
 
 shared_sha_of() {
-    local root="$1" out rc total line h i p
-    out="$(sha256sum -- "$root/sim/functional/test_data_control.sh" \
-                       "$root/sim/functional/tb_data_control.sv" \
-                       "$root/scripts/env.sh" 2>/dev/null)"
+    local root="$1" raw rc result
+    raw="$(mktemp -- "$DRV/sha-shared-XXXXXXXX")" || return 1
+    sha256sum -- "$root/sim/functional/test_data_control.sh" \
+                  "$root/sim/functional/tb_data_control.sv" \
+                  "$root/scripts/env.sh" >"$raw" 2>/dev/null
     rc=$?
     [ "$rc" -eq 0 ] || { printf 'shared_sha_rc=%s\n' "$rc" >&3; return 1; }
-    total="$(printf '%s\n' "$out" | wc -l)"
-    [ "$total" -eq 3 ] || { printf 'shared_sha_lines=%s\n' "$total" >&3; return 1; }
-    i=0
-    for p in "$root/sim/functional/test_data_control.sh" \
-             "$root/sim/functional/tb_data_control.sv" \
-             "$root/scripts/env.sh"; do
-        i=$((i + 1))
-        line="$(printf '%s\n' "$out" | sed -n "${i}p")"
-        printf '%s\n' "$line" | grep -qE '^[0-9a-f]{64}  ' \
-            || { printf 'shared_sha_fmt line=%s\n' "$i" >&3; return 1; }
-        h="$(printf '%s\n' "$line" | cut -c1-64)"
-        [ "${#h}" -eq 64 ] || { printf 'shared_sha_len line=%s\n' "$i" >&3; return 1; }
-        [ "$(printf '%s\n' "$line" | cut -c67-)" = "$p" ] \
-            || { printf 'shared_sha_path line=%s\n' "$i" >&3; return 1; }
-    done
-    printf '%s' "$(printf '%s\n' "$out" | cut -c1-64 | tr '\n' ' ')"
+    result="$(validated_sha_output "$raw" "$root/sim/functional/test_data_control.sh" \
+        "$root/sim/functional/tb_data_control.sv" "$root/scripts/env.sh" 2>&1)"
+    rc=$?
+    [ "$rc" -eq 0 ] || { printf 'shared_sha_invalid reason=%s\n' "$result" >&3; return 1; }
+    printf '%s ' "$result"
 }
 
 CUR_LSQ_SHA="$(sha_of "$CUR/rtl/back2/lsq_simple.v")"; need_hash "$CUR_LSQ_SHA" cur_lsq
@@ -173,10 +183,8 @@ PKG_SHA="$(sha_of "$FRZ/sim/functional/test_data_control.sh")"; need_hash "$PKG_
 TB_SHA="$(sha_of "$FRZ/sim/functional/tb_data_control.sv")"; need_hash "$TB_SHA" frozen_tb
 ENV_SHA="$(sha_of "$FRZ/scripts/env.sh")"; need_hash "$ENV_SHA" frozen_env
 SHARED_SHA_PRE="$(shared_sha_of "$FRZ")" || fail "shared_sha_pre"
-case "$SHARED_SHA_PRE" in
-    *' '* ) : ;;
-    *) fail "shared_sha_bad_value" ;;
-esac
+[[ "$SHARED_SHA_PRE" =~ ^[0-9a-f]{64}\ [0-9a-f]{64}\ [0-9a-f]{64}\ $ ]] \
+    || fail "shared_sha_bad_value"
 note "CUR_LSQ_SHA    = $CUR_LSQ_SHA"
 note "CUR_HDR_SHA    = $CUR_HDR_SHA"
 note "BASE201_COMMIT = $BASE_COMMIT"

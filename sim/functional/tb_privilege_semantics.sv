@@ -4,7 +4,7 @@
 //==============================================================================
 // 目的 : 用**同一份** TB 对两个源码根（DUT_ROOT）编译运行做对照：
 //          · 当前（已修）源码 ⇒ 全部向量通过，打印机读摘要
-//            `FUNCTIONAL_PRIVILEGE_VECTORS total=42 checks=<C> fails=0`、42 行
+//            `FUNCTIONAL_PRIVILEGE_VECTORS total=44 checks=<C> fails=0`、44 行
 //            `VEC <i> checks=<d> fails=0` 与唯一整行 `FUNCTIONAL_PRIVILEGE: PASS`；
 //          · 冻结基线 201acf61 ⇒ 定向缺陷标签必须触发 `PRIV FAIL [TAG]`（反向 oracle），
 //            摘要 fails>0，退出码非 0，且**不**打印 PASS。
@@ -13,7 +13,7 @@
 // 机读输出契约（test_privilege.sh 严格解析；同前缀必须唯一）:
 //   · `VEC <i> checks=<d> fails=<d>`：第 i 个向量结算行（i = 1..SPEC_VECTORS，恰各一次）；
 //   · `FUNCTIONAL_PRIVILEGE_VECTORS total=<d> checks=<d> fails=<d>`：总摘要
-//     （total 必须 == 42；checks == 各向量 checks 之和；fails == 0 才 PASS）；
+//     （total 必须 == 44；checks == 各向量 checks 之和；fails == 0 才 PASS）；
 //   · `FUNCTIONAL_PRIVILEGE: PASS`：仅当 total/逐向量/全局检查全过时打印（唯一 PASS 子串）。
 //   失败行统一为 `PRIV FAIL [TAG]: ...`；每个向量在 TB 内自判"至少 1 项检查"
 //   （缺检查 ⇒ `PRIV FAIL [VEC_EMPTY]` 且该向量行 fails=1）。
@@ -35,7 +35,8 @@
 //     SIP_UNDELEG_WRITE / SIP_PARTIAL_DELEG / IRQ_UNDELEG_M / IRQ_SRC_S_TO_M /
 //     IRQ_SSI_U_TO_M / BYP_MPRV_1TO0 / BYP_SSTATUS_MASK / BYP_MPP_S_TO_U / BYP_MIE_1TO0 /
 //     IRQ_MFIRST_U / IRQ_MFIRST_S / SIE_PREVIEW_DELEG / SIE_PREVIEW_PARTIAL /
-//     SIP_PREVIEW_DELEG / SIE_PREVIEW_MIDELEG_SAME / MSTATUS_SD_DIRTY；
+//     SIP_PREVIEW_DELEG / SIE_PREVIEW_MIDELEG_SAME / MSTATUS_SD_DIRTY /
+//     XRET_IRQ_MIE1 / XRET_IRQ_POSTMODE；
 //   · 合法控制标签（两实现都必须通过，前缀 `CTRL_`）：PMP_SUCC_TOR / PMP_SUCC_NONTOR /
 //     PMP_I15_PRED_FREE / CNTR_M_FREE / CNTR_S_ENABLED / CNTR_U_BOTH_EN / TVM_M_OK /
 //     TVM_CLEARED_OK / SIP_DELEG_WRITE / IRQ_M_GATED / IRQ_DELEG_S / IRQ_DELEG_M_MASK /
@@ -56,7 +57,7 @@ module tb_privilege_semantics;
     //--------------------------------------------------------------------------
     // 冻结规格：向量总数（改动 TB 必须同步 test_privilege.sh 的 SPEC_VECTORS）
     //--------------------------------------------------------------------------
-    localparam integer SPEC_VECTORS = 42;
+    localparam integer SPEC_VECTORS = 44;
 
     //--------------------------------------------------------------------------
     // 时钟 / 复位
@@ -194,6 +195,7 @@ module tb_privilege_semantics;
     reg  [11:0] p_csr_waddr = 12'h0;
     reg  [31:0] p_csr_wdata = 32'h0;
     wire [1:0]  pc_priv_o, pc_eff_priv_o, pc_priv_next_o, pc_mpp_o;
+    wire [1:0]  pc_xret_target_priv_o;
     wire        pc_mprv_o, pc_sum_o, pc_mxr_o, pc_tvm_o, pc_tw_o, pc_tsr_o;
     wire        pc_fetch_m, pc_flush_req, pc_stub_unused;
 
@@ -208,6 +210,9 @@ module tb_privilege_semantics;
         .sum_o(pc_sum_o), .mxr_o(pc_mxr_o), .mpp_o(pc_mpp_o),
         .tvm_o(pc_tvm_o), .tw_o(pc_tw_o), .tsr_o(pc_tsr_o),
         .fetch_priv_is_m_o(pc_fetch_m), .flush_req(pc_flush_req),
+`ifndef RV32_PRIV_NO_XRET_TGT
+        .xret_target_priv_o(pc_xret_target_priv_o),
+`endif
         .priv_next_o(pc_priv_next_o)
     );
 
@@ -801,6 +806,40 @@ module tb_privilege_semantics;
         @(posedge clk); #1;
         @(negedge clk); wen = 1'b0; byp_wdata = 32'h0;
         @(posedge clk); #1;
+
+        // ---- V43：MRET + M 目标 IRQ 同拍（MPIE=1）⇒ 入口 MIE=0、稳定 0x1880 ----
+        //   旧实现 OR 向量：xret_set 把 MIE 重新置 1 ⇒ 0x1888，handler 再取一次。
+        vec_begin;
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0000_1888);   // MIE1/MPIE1/MPPM
+        @(negedge clk);
+        pc_trap_valid = 1'b1; pc_trap_target = `RV32GC_PRIV_M;
+        pc_xret_valid = 1'b1; pc_xret_kind = 2'b01; #1;
+        chk1("CTRL_XRET_IRQ_TARGET_M", pc_priv_next_o == `RV32GC_PRIV_M, 1'b1);
+        @(posedge clk); #1;
+        @(negedge clk); pc_trap_valid = 1'b0; pc_xret_valid = 1'b0;
+        @(posedge clk); #1;
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("XRET_IRQ_MIE1", rdv, 32'h0000_1880);      // ★ 旧树 0x1888
+        chk1("XRET_IRQ_ENTRY_MIE0", mstatus_o[`RV32GC_MSTATUS_MIE_BIT], 1'b0);
+        chk32("CTRL_XRET_IRQ_MPIE_MPP", mstatus_o & 32'h0000_1880, 32'h0000_1880);
+
+        // ---- V44：MRET 返 U（MPP=U）+ M 目标 IRQ ⇒ trap 的 MPP←U（返回后模式）----
+        vec_begin;
+        csr_write(`RV32GC_CSR_MSTATUS, 32'h0000_0088);   // MIE1/MPIE1/MPP=U
+        @(negedge clk);
+        pc_trap_valid = 1'b1; pc_trap_target = `RV32GC_PRIV_M;
+        pc_xret_valid = 1'b1; pc_xret_kind = 2'b01; #1;
+`ifndef RV32_PRIV_NO_XRET_TGT
+        chk1("CTRL_XRET_TGT_U", pc_xret_target_priv_o == `RV32GC_PRIV_U, 1'b1);
+`endif
+        @(posedge clk); #1;
+        @(negedge clk); pc_trap_valid = 1'b0; pc_xret_valid = 1'b0;
+        @(posedge clk); #1;
+        csr_read_val(`RV32GC_CSR_MSTATUS, rdv);
+        chk32("XRET_IRQ_POSTMODE", rdv, 32'h0000_0080);  // ★ 旧树 0x1888（MPP=M）
+        chk32("XRET_IRQ_POST_MPP_U",
+              (mstatus_o >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h0);
+        chk1("XRET_IRQ_POST_MIE0", mstatus_o[`RV32GC_MSTATUS_MIE_BIT], 1'b0);
 
         //======================================================================
         // 汇总（fail-closed）

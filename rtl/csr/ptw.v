@@ -90,11 +90,12 @@ module ptw #(
     input  wire        req_mxr,        // ★ MXR 有效值（仅影响页权限，**不进 PMP**）
     input  wire [31:0] satp,           // satp.ppn 为根页表基址
 
-    output wire        req_ready,      // 本模块可接受新请求
+    output wire        req_ready,      // 本模块可接受新请求（受 kill 屏蔽）
+    output wire        idle_o,         // FSM真实处于IDLE（kill不屏蔽，用于外层排空确认）
     output wire        req_done,       // 翻译结束（成功或失败均拉高 1 拍）
     output wire [31:0] pa_o,           // 翻译后的物理地址（成功时有效）
     output wire        fault_o,        // 1 = 本次翻译失败
-    output wire [4:0]  fault_cause_o,  // 12/13/15（page-fault）或 1/5/7（PTE 访问 PMP 违反）
+    output wire [4:0]  fault_cause_o,  // 12/13/15（page-fault）或 1/5/7（PTE access-fault）
     output wire [31:0] fault_tval_o,   // 恒写**虚拟地址**（E5；norm:mtvalvaddrnot_paddr）
 
     //--------------------------------------------------------------------------
@@ -105,6 +106,7 @@ module ptw #(
     input  wire        pte_req_ready,
     input  wire        pte_resp_valid,
     input  wire [31:0] pte_resp_data,
+    input  wire        pte_resp_err,   // 有效响应的总线错误；active X/Z 也 fail-closed
 
     //--------------------------------------------------------------------------
     // ★ PTE 隐式访存的 PMP 检查端口（W1）
@@ -488,34 +490,42 @@ module ptw #(
             // 等一级 PTE 返回；★ W1：返回后先做 PMP 检查（同拍 pmp_resp_ok 有效）
             S_L1_W: begin
                 if (pte_resp_valid) begin
-                    pte_q <= pte_resp_data;
-                    pte_ppn_r <= pte_resp_data[31:10];
-                    // ★ W1 的 PMP 判定已在 S_L1 前置完成（见上），此处只做结构检查。
-                    // ★ 结构判定用 _d 系列（= pte_resp_data 的位选），不用 pte_q。
-                    if (!pte_vd) begin
-                        // V=0 ⇒ page-fault
+                    // 错误只在本状态且与 valid 同拍采样；不信任错误响应的数据位。
+                    // case inequality 明确将 active X/Z 当错误，inactive err 不参与判断。
+                    if (pte_resp_err !== 1'b0) begin
                         fault_r       <= 1'b1;
-                        fault_cause_r <= pf_cause(acc_r);
+                        fault_cause_r <= af_cause(acc_r);
                         st            <= S_DONE;
-                    end else if (pte_rsvd_d) begin
-                        // R=0 && W=1 ⇒ 保留 ⇒ page-fault
-                        fault_r       <= 1'b1;
-                        fault_cause_r <= pf_cause(acc_r);
-                        st            <= S_DONE;
-                    end else if (pte_leaf_d) begin
-                        // ---- 一级命中叶子 = 4 MiB 大页 ⇒ 检查错位超级页 ----
-                        if (ppn0_d != 10'h0) begin
+                    end else begin
+                        pte_q <= pte_resp_data;
+                        pte_ppn_r <= pte_resp_data[31:10];
+                        // ★ W1 的 PMP 判定已在 S_L1 前置完成（见上），此处只做结构检查。
+                        // ★ 结构判定用 _d 系列（= pte_resp_data 的位选），不用 pte_q。
+                        if (!pte_vd) begin
+                            // V=0 ⇒ page-fault
                             fault_r       <= 1'b1;
                             fault_cause_r <= pf_cause(acc_r);
                             st            <= S_DONE;
+                        end else if (pte_rsvd_d) begin
+                            // R=0 && W=1 ⇒ 保留 ⇒ page-fault
+                            fault_r       <= 1'b1;
+                            fault_cause_r <= pf_cause(acc_r);
+                            st            <= S_DONE;
+                        end else if (pte_leaf_d) begin
+                            // ---- 一级命中叶子 = 4 MiB 大页 ⇒ 检查错位超级页 ----
+                            if (ppn0_d != 10'h0) begin
+                                fault_r       <= 1'b1;
+                                fault_cause_r <= pf_cause(acc_r);
+                                st            <= S_DONE;
+                            end else begin
+                                leaf_from_l1 <= 1'b1;
+                                st           <= S_AD;   // 4 MiB 叶子 ⇒ 进 A/D 处理
+                            end
                         end else begin
-                            leaf_from_l1 <= 1'b1;
-                            st           <= S_AD;   // 4 MiB 叶子 ⇒ 进 A/D 处理
+                            // ---- 指针 ⇒ 下到二级 ----
+                            pte_ppn_r <= pte_resp_data[31:10];
+                            st        <= S_L0;
                         end
-                    end else begin
-                        // ---- 指针 ⇒ 下到二级 ----
-                        pte_ppn_r <= pte_resp_data[31:10];
-                        st        <= S_L0;
                     end
                 end
             end
@@ -533,7 +543,12 @@ module ptw #(
             //------------------------------------------------------------------
             S_L0_W: begin
                 if (pte_resp_valid) begin
-                    pte_q <= pte_resp_data;
+                    if (pte_resp_err !== 1'b0) begin
+                        fault_r       <= 1'b1;
+                        fault_cause_r <= af_cause(acc_r);
+                        st            <= S_DONE;
+                    end else begin
+                        pte_q <= pte_resp_data;
                     if (!pte_vd) begin
                         fault_r       <= 1'b1;
                         fault_cause_r <= pf_cause(acc_r);
@@ -550,6 +565,7 @@ module ptw #(
                     end else begin
                         leaf_from_l1 <= 1'b0;
                         st           <= S_AD;   // 叶子（4 KiB 页）⇒ A/D 处理
+                    end
                     end
                 end
             end
@@ -614,6 +630,7 @@ module ptw #(
     // 7. 输出（纯组合）
     //==========================================================================
     assign req_ready = (st == S_IDLE) & ~kill;
+    assign idle_o    = (st == S_IDLE);
 
     // ---- PTE 读请求：只在 S_L1 / S_L0 拉高，且 **PMP 未拒 且 地址在平台范围内**
     //      （W1 + 04-03 前置拦截）----

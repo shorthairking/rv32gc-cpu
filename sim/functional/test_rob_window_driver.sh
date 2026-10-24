@@ -138,17 +138,18 @@ fail() {
 #    所有 caller 都先 rc/non-empty/64hex，不做 `[ "$(sha)" = "$(sha)" ]`。
 #------------------------------------------------------------------------------
 file_sha() {  # $1=path；成功 stdout=64hex；失败 rc!=0（错误只进 DRV_LOG）
-    local out rc total h
-    out="$(sha256sum -- "$1")"; rc=$?
+    local raw rc total line h
+    raw="$(mktemp -- "$DRV/sha-raw-XXXXXXXX")" || return 1
+    sha256sum -- "$1" > "$raw" 2>>"$DRV_LOG"; rc=$?
     [ "$rc" -eq 0 ] || { printf 'sha256_failed path=%s rc=%s\n' "$1" "$rc" >> "$DRV_LOG"; return 1; }
-    total="$(printf '%s\n' "$out" | wc -l)"
+    total="$(wc -l < "$raw")"
     [ "$total" -eq 1 ] || { printf 'sha256_lines path=%s lines=%s\n' "$1" "$total" >> "$DRV_LOG"; return 1; }
-    printf '%s\n' "$out" | grep -qE '^[0-9a-f]{64}  ' \
-        || { printf 'sha256_format path=%s\n' "$1" >> "$DRV_LOG"; return 1; }
-    h="$(printf '%s\n' "$out" | cut -c1-64)"
-    [ "${#h}" -eq 64 ] || { printf 'sha256_hexlen path=%s\n' "$1" >> "$DRV_LOG"; return 1; }
-    printf '%s\n' "$out" | cut -c67- | grep -qxF -- "$1" \
-        || { printf 'sha256_path path=%s\n' "$1" >> "$DRV_LOG"; return 1; }
+    IFS= read -r line < "$raw" || { printf 'sha256_unterminated path=%s\n' "$1" >> "$DRV_LOG"; return 1; }
+    printf '%s\n' "$line" | cmp -s - "$raw" \
+        || { printf 'sha256_raw_bytes path=%s\n' "$1" >> "$DRV_LOG"; return 1; }
+    h="${line:0:64}"
+    is_sha_value "$h" && [ "${line:64:2}" = '  ' ] && [ "${line:66}" = "$1" ] \
+        || { printf 'sha256_format_or_path path=%s\n' "$1" >> "$DRV_LOG"; return 1; }
     printf '%s' "$h"
 }
 
@@ -412,19 +413,47 @@ if [ "$MODE" = "selftest" ]; then
     mk_fake sha_multi "printf '0000000000000000000000000000000000000000000000000000000000000000  %s\\n1111111111111111111111111111111111111111111111111111111111111111  %s\\n' \"\$2\" \"\$2\""
     mk_fake sha_bad "printf 'ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ  %s\\n' \"\$2\""
     mk_fake sha_out9 "printf '0000000000000000000000000000000000000000000000000000000000000000  %s\\n' \"\$2\"; exit 9"
-    mk_fake sha_wrongpath "printf '0000000000000000000000000000000000000000000000000000000000000000  /tmp/other_path\\n'"
+    mk_fake sha_wrongpath "printf '0000000000000000000000000000000000000000000000000000000000000000  WRONG_PATH\\n'"
     mk_fake sha_good "printf '0000000000000000000000000000000000000000000000000000000000000000  %s\\n' \"\$2\""
-    OLD_PATH="$PATH"
+    OLD_PATH="$PATH"; SHA_PROBE="$FIX/sha_probe_fixture"; : > "$SHA_PROBE"
     for f in sha_exit9 sha_empty sha_multi sha_bad sha_out9 sha_wrongpath; do
         PATH="$FAKE/$f:$OLD_PATH"; hash -r
-        if strict_sha H /tmp/sha_probe_fixture; then PATH="$OLD_PATH"; hash -r; fail "selftest_sha_not_rejected $f"; fi
+        if strict_sha H "$SHA_PROBE"; then PATH="$OLD_PATH"; hash -r; fail "selftest_sha_not_rejected $f"; fi
         PATH="$OLD_PATH"; hash -r
     done
     PATH="$FAKE/sha_good:$OLD_PATH"; hash -r
-    strict_sha H /tmp/sha_probe_fixture || { PATH="$OLD_PATH"; hash -r; fail "selftest_sha_good_rejected"; }
+    strict_sha H "$SHA_PROBE" || { PATH="$OLD_PATH"; hash -r; fail "selftest_sha_good_rejected"; }
     PATH="$OLD_PATH"; hash -r
     [ "$H" = "0000000000000000000000000000000000000000000000000000000000000000" ] \
         || fail "selftest_sha_good_value"
+
+    # ---- 1b1. strict_sha真实caller逐字节反证（额外LF/尾空行/未终止/路径/CR/NUL/垃圾/exit9）----
+    STRICT_BIN="$FIX/strict-raw-bin"; mkdir -p -- "$STRICT_BIN" || fail "strict_sha_raw_bin_failed"
+    cat > "$STRICT_BIN/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+h=0000000000000000000000000000000000000000000000000000000000000000
+case "${SHA_DRIVER_CASE:-good}" in
+  good) printf '%s  %s\n' "$h" "$2" ;;
+  extra1) printf '%s  %s\n\n' "$h" "$2" ;;
+  extra2) printf '%s  %s\n\n\n' "$h" "$2" ;;
+  unterminated) printf '%s  %s' "$h" "$2" ;;
+  wrongpath) printf '%s  WRONG_PATH\n' "$h" ;;
+  junk) printf '%s  %s\nJUNK\n' "$h" "$2" ;;
+  cr) printf '%s  %s\r\n' "$h" "$2" ;;
+  nul) printf '%s  %s\n\0' "$h" "$2" ;;
+  exit9) printf '%s  %s\n' "$h" "$2"; exit 9 ;;
+esac
+EOF
+    chmod +x "$STRICT_BIN/sha256sum" || fail "strict_sha_raw_chmod_failed"
+    STRICT_PROBE="$FIX/strict_sha_probe"; : > "$STRICT_PROBE"
+    STRICT_KILL=0
+    for f in extra1 extra2 unterminated wrongpath junk cr nul exit9; do
+        if PATH="$STRICT_BIN:$OLD_PATH" SHA_DRIVER_CASE="$f" strict_sha H "$STRICT_PROBE"; then
+            fail "selftest_strict_sha_raw_not_rejected $f"
+        fi
+        STRICT_KILL=$((STRICT_KILL+1))
+    done
+    printf 'ROB_DRIVER_SHA_RAW_SELFTEST good=1/1 kill=%s/8\n' "$STRICT_KILL" | tee -a "$DRV_LOG"
 
     # ---- 1c. 完整 7 输入 + driver 冻结突变矩阵 ----
     FDUT="$FIX/dut"
@@ -464,9 +493,9 @@ if [ "$MODE" = "selftest" ]; then
         return 0
     }
     cli_probe pkg_override 1 'reason=unsupported_pkg_override' \
-        ROB_WINDOW_PKG_SH=/tmp/rob_window_other_pkg || fail "selftest_cli_pkg_override"
+        ROB_WINDOW_PKG_SH="$FIX/other_pkg" || fail "selftest_cli_pkg_override"
     cli_probe cross_dut_root 1 'reason=unsupported_cross_dut_root' \
-        DUT_ROOT=/tmp/rob_window_other_root || fail "selftest_cli_cross_dut_root"
+        DUT_ROOT="$FIX/other_root" || fail "selftest_cli_cross_dut_root"
     cli_probe clean_same_root 0 '' \
         -u DUT_ROOT -u ROB_WINDOW_PKG_SH -u RV32_FUNCTIONAL_PKG_OUT_DIR || fail "selftest_cli_clean_same_root"
     cli_probe parent_pkgo 0 '' \
@@ -479,7 +508,54 @@ if [ "$MODE" = "selftest" ]; then
         || fail "selftest_cli_canonical_pkg"
     [ "$CLI_OK" -eq 5 ] || fail "selftest_cli_count=$CLI_OK expect=5"
 
-    note "SELFTEST validators=6+8 sha=6+1 freeze=$FREEZE_MUT/${#FREEZE_RELS[@]} cli=2+3"
+    # ---- 1b2. package 实际 SHA caller 元反证：单文件 sha1_of + compile manifest ----
+    RAWBIN="$FIX/rawbin"; mkdir -p -- "$RAWBIN" || fail "sha_raw_fakebin_failed"
+    REAL_SHA="$(command -v sha256sum)"
+    cat > "$RAWBIN/sha256sum" <<EOF
+#!/usr/bin/env bash
+scope="\${SHA_SCOPE:-single}"; mode="\${SHA_CASE:-good}"
+if [ "\$scope" = multi ] && { [ "\$#" -le 2 ] || [ "\$1" = -c ]; }; then exec "$REAL_SHA" "\$@"; fi
+if [ "\$scope" = single ] && [ "\$#" -ne 2 ]; then exec "$REAL_SHA" "\$@"; fi
+raw="\$SHA_TMP_DIR/raw.\$\$"
+"$REAL_SHA" "\$@" > "\$raw" || exit \$?
+case "\$mode" in
+ extra1) printf '\\n' >> "\$raw";; extra2) printf '\\n\\n' >> "\$raw";;
+ unterminated) truncate -s -1 "\$raw";; wrongpath) h=\$(head -c 64 "\$raw"); printf '%s  WRONG\\n' "\$h" > "\$raw";;
+ junk) printf 'JUNK\\n' >> "\$raw";; order) sed -n '1!G;h;\$p' "\$raw" > "\$raw.tmp"; mv "\$raw.tmp" "\$raw";; cr) printf '\\r' >> "\$raw";; nul) printf '\\0' >> "\$raw";;
+ exit9) cat "\$raw"; exit 9;; *) exit 88;; esac
+cat "\$raw"
+EOF
+    chmod +x "$RAWBIN/sha256sum" || fail "sha_raw_fake_chmod_failed"
+    RAW_KILL=0; RAW_TOTAL=0
+    for scope in single multi; do
+        for mode in extra1 extra2 unterminated wrongpath junk cr nul exit9 order; do
+            [ "$scope" = single ] && [ "$mode" = order ] && continue
+            RAW_TOTAL=$((RAW_TOTAL+1)); RAW_OUT="$FIX/pkg-$scope-$mode.out"
+            RAW_TMP="$FIX"; RAW_ROOT="$REPO_ROOT/build/functional/rob-window-sha-selftest-metadata-followup/$scope-$mode"
+            mkdir -p -- "$RAW_ROOT" || fail "sha_raw_outdir_failed"
+            ( unset RV32_FUNCTIONAL_PKG_OUT_DIR
+              PATH="$RAWBIN:$OLD_PATH" SHA_TMP_DIR="$RAW_TMP" SHA_CASE="$mode" SHA_SCOPE="$scope" \
+                OUT_DIR="$RAW_ROOT" bash "$PKG_SH" > "$RAW_OUT" 2>&1 ); RAW_RC=$?
+            RAW_RD="$(sed -n 's/^ROB_WINDOW_RUN_DIR=//p' "$RAW_OUT" | head -1)"
+            [ "$RAW_RC" -eq 1 ] || fail "sha_raw_not_rejected scope=$scope mode=$mode rc=$RAW_RC"
+            [ "$(grep -c '^FUNCTIONAL_ROB_WINDOW: PASS$' "$RAW_OUT" || true)" -eq 0 ] \
+                || fail "sha_raw_false_pass scope=$scope mode=$mode"
+            if [ "$scope" = single ]; then
+                grep -q 'reason=tb_sha_unavailable' "$RAW_OUT" || fail "sha_raw_reason scope=$scope mode=$mode"
+                grep -qE 'sha1_of: (raw LF lines|missing terminating LF|raw bytes malformed|malformed hash/path|sha256sum rc=9)' "$RAW_RD/test_rob_window.log" \
+                    || fail "sha_raw_detail scope=$scope mode=$mode"
+            else
+                grep -q 'reason=compile_new_failed' "$RAW_OUT" || fail "sha_raw_reason scope=$scope mode=$mode"
+                grep -qE '^\[new\] (sha256 command rc=9|sha256 raw LF lines|sha line/path mismatch|raw sha bytes/count differ)' "$RAW_RD/test_rob_window.log" \
+                    || fail "sha_raw_detail scope=$scope mode=$mode"
+            fi
+            RAW_KILL=$((RAW_KILL+1))
+        done
+    done
+    [ "$RAW_KILL" -eq 17 ] || fail "sha_raw_kills=$RAW_KILL/17"
+    printf 'ROB_SHA_RAW_SELFTEST good=1/1 kill=%s/%s (package single+manifest)\n' "$RAW_KILL" "$RAW_TOTAL" | tee -a "$DRV_LOG"
+
+    note "SELFTEST validators=6+8 sha=6+1 freeze=$FREEZE_MUT/${#FREEZE_RELS[@]} cli=2+3 raw=good1+kill$RAW_KILL/$RAW_TOTAL"
     printf 'ROB_WINDOW_DRIVER_SELFTEST: PASS\n'
     exit 0
 fi

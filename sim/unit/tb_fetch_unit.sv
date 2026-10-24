@@ -363,6 +363,16 @@ module tb_fetch_unit_top;
         @(posedge aclk); #1;
 
         //---- C3b: S 模式、无任何 PMP 项 ⇒ 拒绝（cause=1） ----
+        //   ★ 时序口径（10-22 按真实流水修正期望，不改硬判强度）：
+        //     C3 在 RESET_PC 交付了一条 16 bit 压缩指令（0x0505）⇒ 顺序推进使
+        //     **PC 已前进到 RESET_PC+2**。IALIGN=16（intro.adoc:443-582；
+        //     rv32.adoc:528-639）允许指令从任意 16 bit 边界开始 ⇒ 本拍 TB 驱动
+        //     的同一取指字（rsp_va=RESET_PC）里，**正在取的指令起始 = 高半
+        //     parcel = RESET_PC+2**，PMP 拒的就是该 parcel：mtval 必须是
+        //     RESET_PC+2（故障 parcel 的 VA），mepc 口径同为指令起始 RESET_PC+2。
+        //     旧期望 RESET_PC 编码的是"指令 VA = 响应字 VA"的旧合同（且把
+        //     上一拍已交付指令的低半 parcel 当成故障 parcel），与本核 IALIGN=16
+        //     语义不符。
         @(negedge aclk) begin
             priv            = PRIV_S;
             fetch_rsp_data  = 32'h0000_0505;
@@ -372,7 +382,7 @@ module tb_fetch_unit_top;
         #1;
         chk1 ("C3b S-mode no PMP: exception", 1'b1, fetch_exc_valid);
         chk5 ("C3b S-mode no PMP: cause=1 (IAF)", CAUSE_IAF, fetch_exc_cause);
-        chk32("C3b mtval = faulting parcel VA", RESET_PC, fetch_exc_tval);
+        chk32("C3b mtval = faulting parcel VA", RESET_PC + 32'd2, fetch_exc_tval);
         chk1 ("C3b fetch_valid suppressed on exc", 1'b0, fetch_valid);
         @(negedge aclk) fetch_rsp_valid = 1'b0;
         @(posedge aclk); #1;

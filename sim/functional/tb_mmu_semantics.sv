@@ -221,6 +221,7 @@ module tb_mmu_semantics;
     wire        pte_req_ready;
     wire        pte_resp_valid;
     wire [31:0] pte_resp_data;
+    wire        pte_resp_err;
     wire        pmp_req_valid;
     wire [31:0] pmp_req_addr;
     wire [1:0]  pmp_req_acc, pmp_req_priv;
@@ -254,6 +255,10 @@ module tb_mmu_semantics;
         .pte_req_ready  (pte_req_ready),
         .pte_resp_valid (pte_resp_valid),
         .pte_resp_data  (pte_resp_data),
+`ifdef PTW_PTE_RESP_ERR_PORT
+        .pte_resp_err   (pte_resp_err),
+        .idle_o         (),
+`endif
         .pmp_req_valid  (pmp_req_valid),
         .pmp_req_addr   (pmp_req_addr),
         .pmp_req_acc    (pmp_req_acc),
@@ -353,6 +358,10 @@ module tb_mmu_semantics;
     integer    pm_st = PM_IDLE;
     integer    pm_cnt = 0;
     reg [31:0] pm_addr = 0;
+    reg        pte_err_en = 1'b0;
+    reg [31:0] pte_err_pa = 32'h0;
+    reg        pte_resp_err_r = 1'b0;
+    assign pte_resp_err = pte_resp_err_r;
 
     function [15:0] pidx;
         input [31:0] pa;
@@ -365,6 +374,7 @@ module tb_mmu_semantics;
 
     // ---- 物理读计数（"不得产生低地址别名访问"的观测点）----
     integer n_pte_req = 0;
+    integer n_ptw_fill = 0;
     integer n_pmp_req = 0;
     integer n_data_req = 0;
     integer n_data_wr = 0;
@@ -375,10 +385,12 @@ module tb_mmu_semantics;
             pm_st <= PM_IDLE;
             pm_cnt <= 0;
             pte_resp_valid_r <= 1'b0;
+            pte_resp_err_r <= 1'b0;
         end else begin
             case (pm_st)
                 PM_IDLE: begin
                     pte_resp_valid_r <= 1'b0;
+                    pte_resp_err_r <= 1'b0;
                     if ((pte_req_valid === 1'b1) && (pte_req_ready === 1'b1)) begin
                         //   ★ 只在 valid===1 时采信 payload（X/Z 拍不得被当成地址）
                         pm_addr <= pte_req_pa;
@@ -397,10 +409,12 @@ module tb_mmu_semantics;
                 end
                 PM_DATA: begin
                     pte_resp_valid_r <= 1'b1;
+                    pte_resp_err_r <= pte_err_en && (pm_addr == pte_err_pa);
                     pm_st <= PM_RESP;
                 end
                 PM_RESP: begin
                     pte_resp_valid_r <= 1'b0;
+                    pte_resp_err_r <= 1'b0;
                     pm_st <= PM_IDLE;
                 end
                 default: pm_st <= PM_IDLE;
@@ -430,6 +444,7 @@ module tb_mmu_semantics;
         if (rst_n) begin
             if ((pte_req_valid === 1'b1) && (pte_req_ready === 1'b1))
                 n_pte_req <= n_pte_req + 1;
+            if (ptw_fill_valid === 1'b1) n_ptw_fill <= n_ptw_fill + 1;
             if (pmp_req_valid === 1'b1) n_pmp_req <= n_pmp_req + 1;
             if (pte_req_valid === 1'b1) saw_pte_strict <= 1'b1;
             if (pmp_req_valid === 1'b1) saw_pmp_strict <= 1'b1;
@@ -782,6 +797,7 @@ module tb_mmu_semantics;
     task clr_counters;
         begin
             n_pte_req = 0;
+            n_ptw_fill = 0;
             n_pmp_req = 0;
             n_data_req = 0;
             n_data_wr = 0;
@@ -937,6 +953,36 @@ module tb_mmu_semantics;
         chk1("CTRL_BASE_TR", h, 1'b1);
         chk32("CTRL_BASE_TR", p2, {10'b0, DATA_PPN, 12'h000});
         chk32("CTRL_BASE_TR", n_pte_req, 32'd0);          // 命中不再发物理读
+`ifdef PTW_PTE_RESP_ERR_PORT
+        // New-interface-only error cases. Old 201acf61 compiles this TB without the
+        // pin and keeps its frozen 32-vector/243-check role unchanged.
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        clr_counters;
+        setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);
+        satp_v = 32'h8000_0000 | ROOT_PPN;
+        pte_err_en = 1'b1;
+        pte_err_pa = ROOT_BASE + 32'h400; // VA_A VPN1=0x100, root PTE read error
+        walk(VA_A, ACC_LOAD, PRIV_S, 1'b0, 1'b0, f, c, p);
+        pte_err_en = 1'b0;
+        chk1("CTRL_BASE_TR PTE root load error", f, 1'b1);
+        chk32("CTRL_BASE_TR root load AF5", {27'b0,c}, C_LOAD_AF);
+        chk32("CTRL_BASE_TR root error tval", fault_tval_o, VA_A);
+        chk32("CTRL_BASE_TR root error no fill", n_ptw_fill, 32'd0);
+        chk32("CTRL_BASE_TR root error no data access", n_data_req, 32'd0);
+
+        do_sfence(32'h0, 9'h0, 1'b1, 1'b1);
+        clr_counters;
+        setup_std(VA_A, 1'b1, 1'b1, 1'b1, 1'b0, 1'b1);
+        pte_err_en = 1'b1;
+        pte_err_pa = L0_BASE; // leaf PTE response error, not the root pointer response
+        walk(VA_A, ACC_STORE, PRIV_S, 1'b0, 1'b0, f, c, p);
+        pte_err_en = 1'b0;
+        chk1("CTRL_BASE_TR PTE leaf store error", f, 1'b1);
+        chk32("CTRL_BASE_TR leaf store AF7", {27'b0,c}, C_STORE_AF);
+        chk32("CTRL_BASE_TR leaf error tval", fault_tval_o, VA_A);
+        chk32("CTRL_BASE_TR leaf error no fill", n_ptw_fill, 32'd0);
+        chk32("CTRL_BASE_TR leaf error no data access", n_data_req, 32'd0);
+`endif
 
         //======================================================================
         // V2 CTRL_BIGPAGE：4 MiB 大页（一级叶，PPN[0]=0）

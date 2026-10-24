@@ -95,7 +95,7 @@ module core_top_2b (
     output wire        rready,
 
     //--------------------------------------------------------------------------
-    // AXI4 写地址通道 AW（#20–#29）—— 本段无写主设备 ⇒ 契约电平（恒 0）
+    // AXI4 写地址通道 AW（#20–#29）—— L1D 写回/uncached store 由核内引擎发起
     //--------------------------------------------------------------------------
     output wire [3:0]  awid,
     output wire [31:0] awaddr,
@@ -109,7 +109,7 @@ module core_top_2b (
     input  wire        awready,
 
     //--------------------------------------------------------------------------
-    // AXI4 写数据通道 W（#30–#35）—— 契约电平（恒 0）
+    // 写数据通道 W（#30–#35）+ 遗留兼容 wid 输出；AXI4 本身不带 WID
     //--------------------------------------------------------------------------
     output wire [3:0]  wid,
     output wire [31:0] wdata,
@@ -212,6 +212,13 @@ module core_top_2b (
     wire        csr_we_w;
     wire [11:0] csr_waddr_w;
     wire [31:0] csr_wdata_w;
+    //   ★★ F1-B（本包接线）：Zicntr 单一 64 位本体在本层（`cycle_cnt/instret_cnt`），
+    //     csr_file 只做视图 + 半字写请求。写拍的位置信息来自后端组合输出
+    //     `csr_cmt_lane_o[1:0]`（valid 与 csr_we_o 同拍、来自真实 qualified 提交 lane）。
+    wire [1:0]  csr_cmt_lane_w;
+    wire [63:0] clint_mtime_w;
+    wire        mcycle_we_w, mcycleh_we_w, minstret_we_w, minstreth_we_w;
+    wire [31:0] cnt_wdata_w;
     //   ★★ 4c(2/3)：**2B 侧 fcsr 保持器（fflags/frm/fcsr 完整提交通路）**
     //     · 背景：2A `csr_file` 把 FFLAGS/FRM/FCSR 列入 `is_impl` 且给了 `wr_mask`
     //       （`csr_file.v:253-255/383-385`），但**不持有寄存器**——读恒回 `32'h0`
@@ -334,6 +341,17 @@ module core_top_2b (
     wire [31:0] csr_mie_o, csr_mip_o, csr_mepc_o, csr_sepc_o, csr_satp_o;
     wire [31:0] csr_mstatus_raw;
     wire [1:0]  csr_priv_2, csr_eff_priv;
+    //   ★★ F4-1：CSR 原始候选查询 / 检查反馈 7 口 + ROB 安全头 PC 资格
+    //     · 查询（backend→本层 csr_file）：E1 的 CSR 候选地址（来自 D3 派发期影子，
+    //       不是写口合成、也不是读口 csr_raddr）；**不得与读口合并**。
+    //     · 反馈（本层 csr_file→backend）：chk_illegal（未实现/特权/counteren/TVM）与
+    //       chk_ro_write（写只读地址属性）；backend 再与本条"是否真写"相与。
+    //     · priv_ctrl 的 tsr_o/tvm_o → backend：SRET/SFENCE 的动态特权检查。
+    wire        csr_chk_valid_w, csr_chk_wr_w;
+    wire [11:0] csr_chk_addr_w;
+    wire        csr_chk_illegal_w, csr_chk_ro_write_w;
+    wire        csr_tsr_w, csr_tvm_w;
+    wire        be_head_pc_valid_w;
     //   （`mstatus_set/clr` 的声明已上移到 4c(2/3) fcsr 块——本层要对它做 OR 贡献）
     wire [N_PMP*8-1:0]  pmp_cfg_flat;
     wire [N_PMP*32-1:0] pmp_addr_flat;
@@ -353,6 +371,10 @@ module core_top_2b (
     wire [31:0] tc_trap_epc_i, tc_trap_cause_i, tc_trap_tval_i;
 
     wire        rob_any_w = (dbg_rob_cnt_w != 7'd0);
+    //   ★★ F4-1/C8：安全头 PC 资格 = ROB 非空 ∧ 后端 `head_pc_valid_o`（ROB 头窗口
+    //     内容本拍安全）。trap_ctrl 的 commit_valid 与 mie 资格都用它；不安全的头
+    //     视为"无提交"（保持 pending，不读 unsafe PC）。**不跨层引用 u_back.u_rob**。
+    wire        rob_pc_ok_w = rob_any_w & be_head_pc_valid_w;
     //   ★ 裁决①：ecall 的 mtval 按 **Spike = 0**（2A 是 PC，偏差登记在册）；
     //     断点 cause 3 取 PC（Spike 实测口径）；非法指令由 trap_ctrl 用 commit_insn 覆盖；
     //     其余（取指/访存异常）沿用载荷 TVAL（= 故障 VA）。
@@ -397,6 +419,8 @@ module core_top_2b (
     wire        pte_req_ready_w;
     wire        pte_resp_valid_w;
     wire [31:0] pte_resp_data_w;
+    // PTE read miss terminal error is associated with the active AD_PTER owner.
+    wire        pte_resp_err_w;
 
     //   ★ 占位：satp = 0（Bare）、无 Sv32 ⇒ 取指直通（VA=PA）。
     //     第 4 段把 `satp` 换成 csr_file 的真值并接 `sv32_translate_*` 控制器。
@@ -415,8 +439,16 @@ module core_top_2b (
     //     **不能**用含 MPRV 语义的 `csr_eff_priv`（否则 M 模式 + MPRV=1 时取指会被误翻译，
     //     实测：p13 里取指侧抢走 PTW 并做了一笔错误的遍历）。
     wire        f_xlate_on_w = (csr_priv_2 != `RV32GC_PRIV_M);
-    wire        sv32_done    = f_tlb_hit | (ptw_req_done & ptw_owner_fetch_w);
+    //   ★★ F4-0 接口 A（母已批准）：TLB 权限错是**终态**（不能再等 PTW done）⇒
+    //     done 必须含 `f_tlb_perm_fault`，否则 fault1/done0 会让前端悬挂。
+    wire        sv32_done    = f_tlb_hit | f_tlb_perm_fault | (ptw_req_done & ptw_owner_fetch_w);
     wire        sv32_fault   = f_tlb_perm_fault | (ptw_fault & ptw_owner_fetch_w);
+    //   ★★ F4-0 接口 A：取指 fault 的 **AF/page 区分位**（1=AF cause1 / 0=page cause12）。
+    //     TLB 权限错恒为 page（12）；PTW 取指 fault 按真实 cause，**不用 !=12 吞成 AF**。
+    //     叶端口 `front4_top.sv32_translate_fault_af` 由 f2 落地后在此一行接入；
+    //     现先备好源侧信号（未引用不产生行为，待叶端口出现即连）。
+    wire        sv32_fault_af = (ptw_fault & ptw_owner_fetch_w &
+                                 (ptw_fault_cause == `RV32GC_EXC_INSN_ACCESS_FAULT));
     wire [31:0] sv32_paddr   = f_tlb_hit ? f_tlb_pa : ptw_pa_out;
 
     //==========================================================================
@@ -434,15 +466,34 @@ module core_top_2b (
     //      （取指侧 `tr_req_valid` 是电平保持 ⇒ 释放后自动重发；与 2A 同法）
     //==========================================================================
     //   ★ 4b-2b：状态码扩到 3 bit（新增 AD_XLATE/AD_TR —— 2 bit 会截断成 0/1 与 IDLE/REQ 撞车）
-    localparam [2:0] AD_IDLE = 3'd0, AD_REQ = 3'd1, AD_WAIT = 3'd2, AD_RETRY = 3'd3;
-    localparam [2:0] AD_XLATE = 3'd4, AD_TR = 3'd5;     // ★ 4b-2b：数据侧翻译两级
+    //   ★★ F4：再扩到 4 bit —— 新增 `AD_DEFER`（非 head 设备 load 无副作用释放）、
+    //     `AD_FAULT`（PMP/总线错误的带 cause 响应拍）、`AD_DRAIN`（kill 后等已 accept 的
+    //     AXI 旧响应排空）。位宽必须够，否则新码与旧码撞车（旧 3 bit 只能表示 0..7）。
+    localparam [3:0] AD_IDLE = 4'd0, AD_REQ = 4'd1, AD_WAIT = 4'd2, AD_RETRY = 4'd3;
+    localparam [3:0] AD_XLATE = 4'd4, AD_TR = 4'd5;     // ★ 4b-2b：数据侧翻译两级
     //   ★★ 4b-2c：**PTE 读经 L1D**（同一缓存层次 ⇒ 页表写在遍历中可见）
     //     · `AD_PTE`  ：借 L1D 端口读 PTE（地址是 **PA**，不再翻译）
     //     · `AD_PTER` ：该 PTE 行缺失 ⇒ 等 L1D 自填完成（`idle`）后重发
     //     · 数据侧在 `AD_TR` 等遍历、取指侧遍历时适配器空闲 ⇒ 两处都可进 `AD_PTE`
-    localparam [2:0] AD_PTE = 3'd6, AD_PTER = 3'd7;
+    localparam [3:0] AD_PTE = 4'd6, AD_PTER = 4'd7;
+    //   ★★ F4（本包新增）：
+    //     · `AD_DEFER`：**非 head 的物理设备 load**。在发出任何 L1D/AXI/CLINT/PLIC
+    //       副作用之前，以 `mem_rsp_defer=1` 回一笔（tag 不变）并释放适配器 ⇒ LSQ 清
+    //       请求、置“等 head”保持位，等它成为 ROB 头后重发。**绝不**堵住普通 cacheable
+    //       load（它们不进此态）。
+    //     · `AD_FAULT`：load 的 **PMP 拒绝**（cause 5）或 uncached R 错误（cause 5）的
+    //       响应拍。翻译页错误（cause 13）沿用既有“AD_XLATE/AD_TR 当拍响应”路径。
+    //     · `AD_DRAIN`：kill（整机冲刷 / `ld_kill_tags`）命中一笔**已 fire 到 AXI** 的
+    //       uncached load ⇒ 不得回 IDLE 接受新请求，否则迟到的旧 R 会被当成新请求的响应
+    //       （同 tag 复用污染）。在此态吞掉旧 `d_unc_done` 后才行；未 fire 的取消直接
+    //       回 IDLE（旧响应路径不存在）。
+    localparam [3:0] AD_DEFER = 4'd8, AD_FAULT = 4'd9, AD_DRAIN = 4'd10;
+    //   ★★ F4/PMP：PMP 写同步 flush 的**旧 owner 排空**态。4 拍窗口不是代际保护：
+    //     事件前已发 STX/PTW/L1D/uncached 的旧响应可能晚于窗口；离开 IDLE 前必须等到
+    //     旧 PTW 空闲 + L1D 空闲（或 uncached 的 AD_DRAIN 已收 terminal），期间不接新请求。
+    localparam [3:0] AD_STALE = 4'd11;
 
-    reg [2:0]   ad_st_q;
+    reg [3:0]   ad_st_q;
     reg         d_we_q;
     reg         d_unc_q;                 // 该笔走 uncached 直通（AXI 单 beat）
     reg         d_cp_q;                  // 该笔落 CLINT/PLIC 窗口（本段无总线事务，占位）
@@ -450,6 +501,15 @@ module core_top_2b (
     reg [31:0]  d_va_q;                  // ★ 4b-2b：翻译前的虚拟地址（异常 tval / 重发用）
     reg [3:0]   d_strb_q;
     reg [`BACK2_MEM_TAG_W-1:0] d_tag_q;
+    //   ★★ F4：**请求真实字节 + 头身份 + 有效上下文**在**接受拍锁存**。
+    //     · `d_bm4_q`：LSQ 的 `mem_req_bmask`（相对 `(addr&~3)` 的字节道集合，**不是**偏移）；
+    //       PMP 用 `(base + j)`（mask[j]=1）计算真实字节区间，禁止把 mask 当地址 OR。
+    //     · `d_head_q`：接受拍的 `mem_req_is_head`。只有“load 且设备且非 head”才 defer。
+    //     · `d_ctx_q`：{有效特权级[1:0], SUM, MXR}。数据侧翻译/PMP 若在等待期间读“当下”
+    //       CSR，会与这条 load 应得的上下文无关 ⇒ 一律用接受拍锁存值。
+    reg [3:0]   d_bm4_q;
+    reg         d_head_q;
+    reg [3:0]   d_ctx_q;
     //   ★★ (b)：**执行期 store 翻译事务**（纯翻译，不是访存）——
     //     `d_stx_q=1` 期间适配器借 `AD_XLATE/AD_TR` 做 VA→PA，完成即回 `st_xlate_done`
     //     并**不进 `AD_REQ`**（不碰 L1D/AXI 的数据通路）。
@@ -458,12 +518,58 @@ module core_top_2b (
     reg  [31:0] stx_pa_q;                // 译后 PA
     reg         stx_done_q;              // 完成单拍脉冲
     reg         stx_flt_q;               // 翻译故障单拍脉冲（与 done 同拍）
+    reg  [3:0]  stx_flt_cause_q;         // 故障 cause（0/7/15；非故障拍 = 0，不许 X/Z）
+    //   ★★ F4：**Bare/M 的 store 预检快路**（不占主适配器）——
+    //     LSQ 的 `st_xlate_*` 是单在途口；Sv32 走主适配器（要 TLB/PTW），
+    //     而 Bare/M 只需要“PA=VA + 组合 PMP 检查”，1 拍即可回 done。
+    //     若把这类 store 也塞进主适配器，会与 load 翻译争用单口，直接压低 IPC；
+    //     这里用独立 1 拍在途寄存器，主适配器仍只服务 load/PTE/Sv32 store。
+    reg         stx_fast_act_q;
+    reg  [31:0] stx_fast_pa_q;
+    reg         stx_fast_flt_q;
+    //   ★★ F4：kill/drain + 设备读 IRQ 自持 -------------------------------------------------
+    //     `d_axi_pend_q`：本笔 uncached **load** 的 AXI 读已 fire（物理副作用已发生）
+    //       ⇒ kill 只能 drain 吞响应；未 fire ⇒ 直接取消（无旧响应路径）。
+    //     `io_arm_q`：设备 load 在**进入副作用态之前的那一拍沿**置位（本设计在
+    //       AD_IDLE/AD_XLATE/AD_TR 转入 AD_WAIT 的当拍沿置位 ⇒ 第一个可能发 AR 的
+    //       周期已被保护）。`io_link_q`：已观察到 LSQ 的 `side_pending` 接力。
+    //       `io_block = io_arm | side_pending` 去屏蔽中断，直到退休释放/同步 trap。
+    reg         d_axi_pend_q;
+    //   ★★ F4-1（母转发的 UART 独立根，本包必修）：**每个 native descriptor 只允许一次
+    //     AXI accept**。`d_unc_rd/d_unc_wr` 是 AD_WAIT 的**电平**，而 AXI 控制器在末 beat
+    //     收尾的下一拍 `i_free` 已为 1、适配器却还要再等一拍 `d_unc_done`/B 才离开 AD_WAIT
+    //     ⇒ 旧 `g_dunc` 会**再次 accept 同一地址**（UART 16→20、邮箱 data31 带旧地址）。
+    //     `d_unc_issued_q`：本笔 uncached 事务已 fire；只有适配器**消费完 terminal**
+    //     （done/错误/drain 完成）才清 ⇒ accept 后立即撤 req_valid，原事务 terminal 前
+    //     绝不产生新代；字段/数据由适配器锁存保持到真实 W/B 完成，不借新请求数据。
+    reg         d_unc_issued_q;
+    reg         io_arm_q;
+    reg         io_link_q;
 
     //   LSU 的存储口（先声明，§4b 使用）
     wire        lsu_req_v, lsu_req_we;
     wire [31:0] lsu_req_a, lsu_req_d;
     wire [3:0]  lsu_req_strb;
     wire [`BACK2_MEM_TAG_W-1:0] lsu_req_tag;
+
+    //   ★★ F4：backend_top 透传的 LSQ 新契约（5f3 实现；本层不造同义替代）。
+    //     端口名以母转发的精确名为准；老 `mem_rsp_err` / `st_xlate_fault` bool 保留兼容。
+    wire [3:0]  mem_req_bytes_w, mem_req_bmask_w;
+    wire [`BACK2_ROB_IDX_W-1:0] mem_req_rob_w;
+    wire        mem_req_is_head_w;
+    wire [7:0]  st_xlate_bmask8_w;
+    wire [3:0]  st_xlate_bytes_w;
+    wire        st_xlate_xpg_w;
+    wire        side_issue_valid_w, side_pending_w;
+    wire [`BACK2_ROB_IDX_W-1:0] side_issue_rob_w, side_pending_rob_w;
+    wire [7:0]  ld_kill_tags_w;
+    wire [3:0]  mem_rsp_cause_w, st_xlate_fault_cause_w;
+    wire        mem_rsp_defer_w, mem_rsp_side_w;
+    wire        d_unc_err_w;             // uncached load 的 R 错误（§5 赋值，响应用）
+    //   ★★ F4/PMP：backend 导出的“**合法 PMP CSR 写已退休**”事件 + 真 next PC（CSR+4）。
+    //     本层只在**寄存后**用它发起 flush/redirect，绝不组合回抑本条已退休 CSR。
+    wire        pmp_cmt_w;
+    wire [31:0] pmp_cmt_next_pc_w;
 
     //   ★ 4b-2b：数据侧访问类型 / 有效特权级（MPRV=1 ⇒ 按 mstatus.MPP 判权限，2A 同口径）
     wire        d_mprv_w      = csr_mstatus_raw[`RV32GC_MSTATUS_MPRV_BIT];
@@ -492,13 +598,30 @@ module core_top_2b (
     //   ---- ★★ (b) 执行期 store 翻译口（LSQ ↔ 本适配器；§B4.24.9 简化 ③）----
     //   `st_xlate_en_w`：E1 拍"本笔 store 需要翻译"（与上面同式，不含 `~lsu_req_we`）
     //     ⇒ LSQ 在 E1 拍据此决定 `stq_pv`，**无需新增"何时翻译"的判据**。
-    wire        st_xlate_en_w = sv32_en & d_xlate_on_w;
+    //   ★★ F4 修正：**恒为 1** —— PMP 与翻译无关，Bare/M 的 store 也必须**退休前**
+    //     用真实 PA/真实字节做 PMP/PMA 预检（AF7）。Bare 时 PA=VA，由 §2c 的 1 拍快路
+    //     直接回 done（不占主适配器）；只有“确实需要翻译”的 store 才进 AD_XLATE/AD_TR。
+    //     绝不因 `sv32_en=0` 跳过检查，也绝不把“无错”当默认（fail-closed 由快路保证）。
+    wire        st_xlate_en_w = 1'b1;
+    //   ★★ F4：本笔 store **是否真的需要 VA→PA 翻译**（仅 Sv32 且有效特权级 ≠ M）。
+    //     其余（Bare / M 模式）走快路：PA=VA + PMP 组合检查，1 拍 done。
+    //     上下文取 LSQ 随请求携带的**原指令上下文**，不取“当下”CSR。
+    wire        st_xlate_trans_w = sv32_en &
+                                  (st_xlate_ctx_in_w[3:2] != `RV32GC_PRIV_M);
     //   ★★ 翻译上下文 {有效特权级[1:0], SUM, MXR} —— **必须随请求携带**：适配器/PTW 若用
     //     "当下"的 CSR 值做 TLB 查询与遍历，得到的 PA 与该项应得的翻译无关（实测根因：
     //     p13 的 PTE 更新 store 被按 MPRV=1+MPP=U 翻译 ⇒ U=0 页 ⇒ 页错误 ⇒ 已提交写丢失）。
     wire [3:0]  st_xlate_ctx_w = {d_eff_priv_w,
                                   csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT],
                                   csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]};
+    //   ★★ F4：store 翻译的**已完成提交上下文**（用于“上下文追随”：请求锁存的 ctx 若已
+    //     过时，结果的 PA/故障对该 store 不是程序序语义 ⇒ 用本值重译，绝不交付陈旧结果）。
+    wire [3:0]  stx_ctx_live_w = {d_eff_priv_w,
+                                  csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT],
+                                  csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]};
+    //   已完成提交上下文下是否还需要翻译（上下文追随到 M/Bare 时 PA=VA + PMP）
+    wire        stx_need_trans_live_w = sv32_en &
+                                        (stx_ctx_live_w[3:2] != `RV32GC_PRIV_M);
     wire        st_xlate_valid_w;
     wire [31:0] st_xlate_va_w;
     wire [`BACK2_STQ_IDX_W-1:0] st_xlate_idx_w;
@@ -510,12 +633,18 @@ module core_top_2b (
 
     //   PTW 请求仲裁（数据优先；取指在途被抢占时 `kill`）
     wire        ptw_req_ready_w;
+    wire        ptw_idle_w; // PTW FSM 空闲，不被当前 kill 组合门控掩蔽
     //   ★★ 4b-2c：PTE 读的"宿主" = 数据适配器（借 L1D 端口）；见 §2c 说明
     reg  [31:0] d_pte_pa_q;                 // 本笔 PTE 的物理地址
     reg         d_pte_ret_q;                // 读完回哪：1 = 回 AD_TR（数据侧遍历）
+    wire        fetch_pte_adapter_owner_w = ((ad_st_q == AD_PTE) | (ad_st_q == AD_PTER)) &
+                                            ~d_pte_ret_q;
     wire        d_ptw_want_w = (ad_st_q == AD_TR);
-    wire        f_ptw_want_w = sv32_en & f_xlate_on_w & tr_req_valid & ~f_tlb_hit;
-    wire        ptw_free_w   = ptw_req_ready_w;              // PTW 空闲（可接受新请求）
+    //   AD_STALE 持有被取消数据 walk 的旧 PTE/L1D epoch；在其排空前不准新取指 walk
+    //   抢占该单 PTW/L1D 资源，避免新 walk 等 PTE 响应而旧 adapter 又等 L1D idle。
+    wire        f_ptw_want_w = sv32_en & f_xlate_on_w & tr_req_valid & ~f_tlb_hit &
+                                (ad_st_q != AD_STALE);
+    wire        ptw_free_w   = ptw_req_ready_w;              // handshake ready；kill时低于真实 ptw_idle_w
     //   ★★ 4b-2c：`kill` 还需覆盖**整机冲刷**（陷阱/xRET/维护）—— 否则适配器被 kill 后
     //     不再回 PTE 响应，PTW 会永远停在 S_L1_W/S_L0_W（`req_ready` 恒 0 ⇒ 全网挂死）。
     //     2A `m_kill_fsm = trap_valid | xret_redirect | fencei_hold | sfence_sync_pending`
@@ -529,8 +658,16 @@ module core_top_2b (
     //   ★ 实测（本段）：把整机冲刷的 kill 限定为"仅取指侧"反而使 p13 的
     //     `nop` 形态从绿转红（数据侧在途遍历跨过 flush 完成 ⇒ 旧翻译被回填）
     //     ⇒ **撤回**该尝试，保持与已验收提交一致的 `| be_trp_flush` 口径。
-    wire        ptw_kill_w   = (d_ptw_want_w & ~ptw_free_w & ptw_owner_fetch_w) |
-                               be_trp_flush;
+    // Tag-squash of the active load cancels only its own data PTW walk, including while
+    // its PTE response is being serviced (AD_PTE/PTER, where d_ptw_want_w is low).
+    wire        d_tag_cancel_live_load_w = (ad_st_q != AD_IDLE) &
+                                           (ad_st_q != AD_DRAIN) & (ad_st_q != AD_STALE) &
+                                           ~d_we_q & ~d_stx_q & ld_kill_tags_w[d_tag_q[2:0]];
+    wire        d_tag_data_ptw_kill_w = d_tag_cancel_live_load_w &
+                                       ~ptw_free_w & ~ptw_owner_fetch_w;
+    wire        d_ptw_accept_w = d_ptw_want_w & ~d_tag_cancel_live_load_w;
+    wire        ptw_kill_w   = (d_ptw_accept_w & ~ptw_free_w & ptw_owner_fetch_w) |
+                               d_tag_data_ptw_kill_w | be_trp_flush;
     //   ★★ 4b-2c 定案（一步判定实验结论）：**冲刷前启动的遍历不得回填 TLB**。
     //     实测（`[tlbflush]` 打点）：flush 拍 `fill_valid=0` ⇒ **不是"同拍 fill 覆盖 flush"**；
     //     真相是"walk 的 PTE 读发生在 flush **之前**、其回填（`fill_valid`）落在 flush **之后**"
@@ -544,8 +681,10 @@ module core_top_2b (
         else if (ptw_req_v_w & ptw_free_w) ptw_flushed_q <= 1'b0;
     end
     wire        ptw_fill_ok_w = ~ptw_flushed_q;
-    wire        ptw_req_v_w  = d_ptw_want_w | (f_ptw_want_w & ~d_ptw_want_w);
-    wire [31:0] ptw_req_va_w = d_ptw_want_w ? d_va_q : tr_req_va;
+    // A tag-killed AD_TR load is no longer eligible for this cycle's PTW handshake.
+    // This prevents PTW accepting it on the same edge AD enters AD_STALE.
+    wire        ptw_req_v_w  = d_ptw_accept_w | (f_ptw_want_w & ~d_ptw_accept_w);
+    wire [31:0] ptw_req_va_w = d_ptw_accept_w ? d_va_q : tr_req_va;
 
     //   路由（MMIO/uncached 判定，2A `mmio_route`）必须吃**物理地址**：
     //   翻译两级用各自的 PA；其余（Bare/空闲）用本拍请求 VA（= 旧行为，逐拍不变）
@@ -558,9 +697,11 @@ module core_top_2b (
         .lookup_valid(ad_st_q == AD_XLATE), .lookup_va(d_va_q), .lookup_asid(9'h0),
         .lookup_acc(d_acc_w),
         //   ★★ (b)：翻译事务用**随请求携带**的上下文（否则"当下"CSR 值会把 PA 判错）
-        .lookup_priv(d_stx_q ? d_stx_ctx_q[3:2] : d_eff_priv_w),
-        .lookup_sum (d_stx_q ? d_stx_ctx_q[1]   : csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT]),
-        .lookup_mxr (d_stx_q ? d_stx_ctx_q[0]   : csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]),
+        //   ★★ F4：load 也用**接受拍锁存**的 `d_ctx_q`（翻译/PMP 等待期间 CSR 变化不得
+        //     改变本条应得的权限上下文；等待期间读“当下”CSR 是无关状态）。
+        .lookup_priv(d_stx_q ? d_stx_ctx_q[3:2] : d_ctx_q[3:2]),
+        .lookup_sum (d_stx_q ? d_stx_ctx_q[1]   : d_ctx_q[1]),
+        .lookup_mxr (d_stx_q ? d_stx_ctx_q[0]   : d_ctx_q[0]),
         .hit_o(d_tlb_hit), .perm_fault_o(d_tlb_perm_fault), .pa_o(d_tlb_pa),
         // ---- 第二查询口 = 取指（2A §5.2.2/§9.4.1 同法）----
         .lookup2_valid(tr_req_valid), .lookup2_va(tr_req_va), .lookup2_asid(9'h0),
@@ -589,20 +730,20 @@ module core_top_2b (
         //   ★★ 4b-2b：I/D **串行复用**同一请求口（2A `m_tr_src_q` 同构）——
         //     数据侧在 `AD_TR` 期间占用；否则取指侧（且仅 S/U 模式）使用
         .req_valid(ptw_req_v_w),
-        .req_va(ptw_req_va_w), .req_acc(d_ptw_want_w ? d_acc_w : 2'b00),
+        .req_va(ptw_req_va_w), .req_acc(d_ptw_accept_w ? d_acc_w : 2'b00),
         //   ★★ (b)：数据侧遍历用**随请求携带**的上下文（store 翻译事务取 `d_stx_ctx_q`，
-        //     load 取"当下"有效特权级 —— load 的翻译发生在执行期，语义即"当下"）
-        .req_priv(d_stx_q ? d_stx_ctx_q[3:2] : d_eff_priv_w),
-        .req_sum(d_ptw_want_w ? (d_stx_q ? d_stx_ctx_q[1]
-                                          : csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT]) : 1'b0),
-        .req_mxr(d_ptw_want_w ? (d_stx_q ? d_stx_ctx_q[0]
-                                          : csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]) : 1'b0),
+        //     load 取**接受拍锁存**的 `d_ctx_q` —— 等待期间 CSR 变化不得改判）
+        .req_priv(d_stx_q ? d_stx_ctx_q[3:2] : d_ctx_q[3:2]),
+        .req_sum(d_ptw_accept_w ? (d_stx_q ? d_stx_ctx_q[1] : d_ctx_q[1]) : 1'b0),
+        .req_mxr(d_ptw_accept_w ? (d_stx_q ? d_stx_ctx_q[0] : d_ctx_q[0]) : 1'b0),
         .satp(csr_satp_o),
-        .req_ready(ptw_req_ready_w), .req_done(ptw_req_done), .pa_o(ptw_pa_out),
+        .req_ready(ptw_req_ready_w), .idle_o(ptw_idle_w),
+        .req_done(ptw_req_done), .pa_o(ptw_pa_out),
         .fault_o(ptw_fault), .fault_cause_o(ptw_fault_cause), .fault_tval_o(ptw_fault_tval),
         .pte_req_valid(ptw_pte_req_valid), .pte_req_pa(ptw_pte_req_pa),
         .pte_req_ready(pte_req_ready_w),
         .pte_resp_valid(pte_resp_valid_w), .pte_resp_data(pte_resp_data_w),
+        .pte_resp_err(pte_resp_err_w),
         .pmp_req_valid(ptw_pmp_req_valid), .pmp_req_addr(ptw_pmp_req_addr),
         .pmp_req_acc(ptw_pmp_req_acc), .pmp_req_priv(ptw_pmp_req_priv),
         .pmp_resp_ok(ptw_pmp_ok),
@@ -640,6 +781,112 @@ module core_top_2b (
         .acc_type_i(pmp_acc_xlat(ptw_pmp_req_acc)),
         .allow_o(ptw_pmp_ok), .fault_cause_o(), .hit_o(), .hit_idx_o(), .denied_by_full_o()
     );
+
+    //==========================================================================
+    // 2c. ★★ F4：**数据侧 PMP 检查 + store 退休前预检**
+    //--------------------------------------------------------------------------
+    //  规范/任务口径（逐条落地，不复制 `pmp_check` 算法）：
+    //    · 必须用**真实访问字节**（`mem_req_bmask` / `st_xlate_bmask8` 的字节道集合，
+    //      不是 size 编码、不是把 mask 当地址 OR）。实际字节地址 = `base + j`，
+    //      base = PA & ~3，mask[j]=1；连续集合可化简为 first/len，本层用
+    //      `[first,last]` 的区间长度（LSQ 真 store 的字节集合恒连续；不连续时该区间
+    //      只会**更保守**地要求同一 PMP 项覆盖，不会放过未覆盖的字节）。
+    //    · load：翻译得到最终 PA 后、**任何 L1D/AXI/CLINT/PLIC 副作用之前**检查；
+    //      拒绝 ⇒ cause 5（access fault）。页错误（TLB 权限/PTW）另走 cause 13。
+    //    · store：**退休前**（E1 预翻译或提交窗扫描）按真实 PA/字节检查；拒绝 ⇒
+    //      cause 7。Sv32 的 store 走主适配器（TLB/PTW），Bare/M 走 1 拍快路。
+    //      **已退休**的 CDQ store 排空绝不再按“当下”priv/PMP 重判（见 §4b.2）。
+    //    · 并发纪律：PTE 自己的 `u_pmp_pte` 与本实例**不混用**（PTE 遍历有自己的
+    //      访问类型/上下文/时序）；本实例按 owner 组合复用（Store 优先于 Load）。
+    //      额外面积未综合，如实登记。
+    //==========================================================================
+    //   ---- 字节道集合 → 首/末字节 + 实际字节数（真实字节区间）----
+    function [3:0] bm_first8;
+        input [7:0] m;
+        integer i;
+        begin
+            bm_first8 = 4'd0;
+            for (i = 7; i >= 0; i = i - 1)
+                if (m[i]) bm_first8 = i[3:0];
+        end
+    endfunction
+
+    function [3:0] bm_last8;
+        input [7:0] m;
+        integer i;
+        begin
+            bm_last8 = 4'd0;
+            for (i = 0; i < 8; i = i + 1)
+                if (m[i]) bm_last8 = i[3:0];
+        end
+    endfunction
+
+    //   ---- load 的真实字节（接受拍锁存的 `mem_req_bmask`；1..4 B）----
+    wire [7:0]  d_bm8_w       = {4'h0, d_bm4_q};
+    wire [3:0]  d_bm_first_w  = bm_first8(d_bm8_w);
+    wire [3:0]  d_bm_last_w   = bm_last8(d_bm8_w);
+    wire [31:0] d_pmp_pa_w    = (d_a_q & 32'hFFFF_FFFC) + {28'h0, d_bm_first_w};
+    wire [4:0]  d_pmp_bytes_w = {1'b0, d_bm_last_w} - {1'b0, d_bm_first_w} + 5'd1;
+    //   ---- store 的真实字节（`st_xlate_bmask8`；相对 `(va&~3)` 的 8B 窗）----
+    wire [3:0]  stx_bm_first_w  = bm_first8(st_xlate_bmask8_w);
+    wire [3:0]  stx_bm_last_w   = bm_last8(st_xlate_bmask8_w);
+    wire [4:0]  stx_bm_bytes_w  = {1'b0, stx_bm_last_w} - {1'b0, stx_bm_first_w} + 5'd1;
+    //   Sv32 store 的 PA 候选：AD_XLATE 拍 = TLB 组合输出；AD_TR 拍 = PTW 输出。
+    //   （Bare/M 快路直接用 VA=PA，不经过这里。）
+    wire [31:0] stx_pa_cand_w   = (ad_st_q == AD_XLATE) ? d_tlb_pa : ptw_pa_out;
+    wire [31:0] stx_pmp_pa_w    = (stx_pa_cand_w & 32'hFFFF_FFFC) + {28'h0, stx_bm_first_w};
+    wire [31:0] stx_fast_pmp_pa_w = (st_xlate_va_w & 32'hFFFF_FFFC) + {28'h0, stx_bm_first_w};
+
+    //   ---- Bare/M store 快路（不占主适配器）----
+    //     检查器同一拍也被主适配器的 load/store 用；快路在 load 检查窗
+    //     （AD_REQ/AD_WAIT 的 load）与在途 Sv32 store 时让行，避免“一个实例两种 owner
+    //     同拍混用”。让行只增加最多少个位数拍延迟，不改变语义。
+    wire        pmp_load_busy_w = ((ad_st_q == AD_REQ) | (ad_st_q == AD_WAIT)) &
+                                  ~d_we_q & ~d_stx_q;
+    wire        stx_fast_go_w   = st_xlate_valid_w & ~st_xlate_trans_w &
+                                  ~stx_fast_act_q & ~pmp_load_busy_w &
+                                  ~d_stx_q & ~stx_done_q & ~be_trp_flush;
+    wire        stx_fast_done_w = stx_fast_act_q;
+    wire        pmp_use_fast_store_w = stx_fast_go_w |
+                                       (d_stx_q & ~stx_need_trans_live_w);
+    wire        pmp_use_store_w = pmp_use_fast_store_w |
+                                  (d_stx_q & ((ad_st_q == AD_XLATE) | (ad_st_q == AD_TR)));
+    wire [31:0] pmp_acc_pa_w    = pmp_use_fast_store_w ? stx_fast_pmp_pa_w :
+                                  d_stx_q              ? stx_pmp_pa_w  : d_pmp_pa_w;
+    wire [4:0]  pmp_acc_bytes_w = (pmp_use_fast_store_w | d_stx_q) ? stx_bm_bytes_w
+                                                                   : d_pmp_bytes_w;
+    wire [1:0]  pmp_acc_priv_w  = pmp_use_fast_store_w ? stx_ctx_live_w[3:2] :
+                                  d_stx_q              ? d_stx_ctx_q[3:2] : d_ctx_q[3:2];
+    wire [1:0]  pmp_acc_type_w  = pmp_use_store_w ? 2'd1 : 2'd0;   // 1=store / 0=load
+    wire        pmp_allow_w;
+
+    pmp_check #(.PMP_ENTRIES(N_PMP)) u_pmp_data (
+        .clk(aclk), .rst_n(aresetn),
+        .cfg_i(pmp_cfg_flat), .addr_i(pmp_addr_flat),
+        .acc_pa_i(pmp_acc_pa_w), .acc_bytes_i(pmp_acc_bytes_w),
+        .acc_priv_i(pmp_acc_priv_w), .acc_type_i(pmp_acc_type_w),
+        .allow_o(pmp_allow_w), .fault_cause_o(), .hit_o(), .hit_idx_o(),
+        .denied_by_full_o(), .allow_rw_o()
+    );
+    //   load 的拒绝（只在 load 的最终 PA 拍有效）；store 的拒绝由各路径各自取用。
+    wire        load_pmp_deny_w = ~d_we_q & ~d_stx_q & ~pmp_allow_w;
+
+    //   ★★ F4：Bare/M store 预检结果（1 拍后回 done；PA=VA；cause 7）
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            stx_fast_act_q <= 1'b0;
+            stx_fast_pa_q  <= 32'h0;
+            stx_fast_flt_q <= 1'b0;
+        end else begin
+            stx_fast_act_q <= 1'b0;         // 单拍在途
+            stx_fast_flt_q <= 1'b0;         // 故障值仅随本笔 fast done 保持
+            if (stx_fast_go_w) begin
+                stx_fast_act_q <= 1'b1;
+                stx_fast_pa_q  <= st_xlate_va_w;        // Bare/M ⇒ PA = VA
+                stx_fast_flt_q <= ~pmp_allow_w;         // PMP 拒绝 ⇒ cause 7
+            end
+        end
+    end
 
     //==========================================================================
     // 3. front4_top（4 宽取指 + 预测器 + 检查点 + RAS）
@@ -700,7 +947,10 @@ module core_top_2b (
         //   ★★ 4b-2b：**取指翻译只在 S/U 模式启用**（M 模式取指恒不翻译；
         //     MPRV 只影响取数侧 ⇒ 数据侧另由 `d_xlat_need_w` 判）
         .sv32_translate_en(sv32_en & f_xlate_on_w), .sv32_translate_done(sv32_done),
-        .sv32_translate_fault(sv32_fault), .sv32_translate_paddr(sv32_paddr),
+        .sv32_translate_fault(sv32_fault), .sv32_translate_fault_af(sv32_fault_af),
+        .sv32_translate_paddr(sv32_paddr),
+        .l1i_rsp_err(l1i_cs_err), .l1i_rsp_err_pa(l1i_cs_err_pa),
+        .unc_rsp_err(unc_rsp_err_w),
         .tr_req_valid(tr_req_valid), .tr_req_va(tr_req_va),
         .priv(`RV32GC_PRIV_M), .pmpcfg_i({N_PMP*8{1'b0}}), .pmpaddr_i({N_PMP*32{1'b0}}),
         // ---- L1I / XIP ----
@@ -753,6 +1003,13 @@ module core_top_2b (
     wire [1:0]  l1d_fill_owner;
     wire [4:0]  l1d_fill_beats;
     wire        l1d_fill_accepted, l1d_fill_valid, l1d_fill_done;
+    //   ★★ F4-0：逐 beat R 错误 / 事务级错误 / cache 错误消费网（2B 适配器侧）
+    wire        axi_rdata_error_w, axi_done_error_w;
+    wire        l1i_cs_err, l1i_fill_err, l1i_fill_fail, l1i_err_sticky;
+    wire [31:0] l1i_cs_err_pa;
+    wire        l1d_cs_err, l1d_fill_err, l1d_fill_fail, l1d_wb_err;
+    wire        l1d_wb_fail, l1d_maint_err, l1d_err_sticky;
+    wire        unc_rsp_err_w;
     wire [31:0] l1d_fill_data;
     wire [4:0]  l1d_fill_word_idx;
     wire        l1d_wb_req, l1d_wb_accepted, l1d_wb_done, l1d_wb_ready;
@@ -799,6 +1056,9 @@ module core_top_2b (
         .fill_accepted(l1i_fill_accepted),
         .fill_valid(l1i_fill_valid), .fill_data(l1i_fill_data),
         .fill_word_idx(l1i_fill_word_idx), .fill_done(l1i_fill_done),
+        //   ★★ F4-0：逐 beat R 错误 + 事务级失败/粘滞（与 fill_valid 同拍）
+        .fill_err(l1i_fill_err), .fill_fail(l1i_fill_fail),
+        .cs_err(l1i_cs_err), .cs_err_paddr(l1i_cs_err_pa), .err_sticky(l1i_err_sticky),
         //   ★★ 4b-2c 收尾：**fence.i 的 L1I 失效口接通**。
         //     本核的 fence.i = "冻结 256 拍 + 每拍一组、该组索引由 `l1i_cs_vaddr` 给出"的扫掠
         //     （见 §4a 的 `fencei_busy/fencei_idx_q`），而 L1I 的失效写口判据正是
@@ -870,26 +1130,67 @@ module core_top_2b (
     //     正停在 `AD_WAIT` 等一个不会到来的 `l1d_cs_ready` ⇒ `d_ready_w` 永久为 0
     //     ⇒ 之后所有访存全部挂住。2A 对应 `m_kill_fsm`（core_top.v:3749-3752 的
     //     "异常 / fence.i 同步：放弃在途访存"）⇒ 本核给适配器补同样的 kill。
-    //   ★★ p12 收口修正：**kill 不能杀"已提交的 store 排空"**。
-    //     本核的 store 是在**提交点**才被排空（CDQ）⇒ 一旦被适配器接管（`d_start`），
-    //     它就是**已提交**的写，杀掉即丢数据（实测 p12：`cbo.clean/flush` 前后 4 次 load
-    //     只有 1 次读到 0x55667788 —— 被杀的 store 从未落进 L1D/内存）。
-    //     load 则相反：其请求者会被冲刷并重新执行 ⇒ kill 安全。
-    //   ★★ p12 定案后的精确修法：kill **不得抢占"正在被接管的请求"**。
-    //     根因链：CDQ（已提交 store 排空 FIFO）在 `flush_all` 下**不会**被清 ✓（设计正确），
-    //     但当冲刷拍恰好与适配器"接管该 store"同拍时：LSQ 看到 `mem_req_valid & mem_req_ready`
-    //     成立 ⇒ **CDQ 已弹出该项**，而适配器被 kill ⇒ 该笔已提交写**从未落到 L1D**
-    //     ⇒ 后续同地址 load 读到内存旧值 0（实测 p12 idx10/12/13）。
-    //     `d_we_q` 在接管当拍尚未锁存 ⇒ 仅 `& ~d_we_q` 挡不住 ⇒ 必须再排除接管拍（`~d_start`）。
-    wire        d_kill_w = be_trp_flush & ~d_we_q & ~d_start & ~d_stx_q;
+    //   ★★ F4 kill / drain 口径（替换旧的 `d_kill_w`）：
+    //     · **store 已提交**（CDQ 排空）⇒ 绝不因 flush 取消（旧注释 p12 的教训继续成立）。
+    //     · load：
+    //         – 未 fire 到 AXI（缓存/翻译/等待中）⇒ 直接取消（无旧响应路径）；
+    //         – 已 fire 到 AXI（`d_axi_pend_q=1`，物理读已发生）⇒ 只能进 `AD_DRAIN`
+    //           吞掉迟到 R，排空前不得回 IDLE 接受新请求（防旧响应被当新 tag 的响应）。
+    //     · 同拍“flush 与首次 AXI/CLINT/PLIC 请求”：由 §5 的 `g_dunc`/`clint_req_vld`/
+    //       PLIC `req_valid` 用 `~be_trp_flush` 门控 ⇒ **flush 优先**，不会出现
+    //       “已有副作用但未记账”。
     wire        d_idle     = (ad_st_q == AD_IDLE);
-    //   ★★ p12 收口加固（实测波形抓出）：维护动作脉冲那一拍**不得再接管新请求**。
-    //     若维护脉冲与"适配器接管一笔新访问"同拍，则该访问会在下一拍与 L1D 维护扫描
-    //     的第 0 组写入重叠（tag 写口/dirty 清口同组竞争）⇒ 落进 L1D 的 store 可能被
-    //     维护扫描的 dirty 清零吃掉（数据在、dirty 丢 ⇒ 后续逐出丢数据）。实测：三次
-    //      维护脉冲里两次都有 `st=AD_REQ/csreq=1`（load）同拍 ⇒ 必须挡。
-    assign      d_ready_w  = d_idle & ~l1d_busy_w & ~maint_act_q;
+    wire        d_req_is_load_w = d_start ? ~lsu_req_we : (~d_we_q & ~d_stx_q);
+    //   ★★ F4：`ld_kill_tags` 命中**在途 load 的 tag**（store 排空 tag=全 1，不参与）。
+    //     LQ=8 ⇒ 槽号 3 bit；load 的 tag 恒 0..7。
+    wire        d_tag_kill_w = (ad_st_q != AD_IDLE) & ~d_we_q & ~d_stx_q &
+                               ld_kill_tags_w[d_tag_q[2:0]];
+    //   接受拍：被 squash 的年轻 load tag 不得再被接受（它已经在死项上）。
+    wire        d_start_block_w = lsu_req_v & ~lsu_req_we &
+                                  ld_kill_tags_w[lsu_req_tag[2:0]];
+    wire        d_abort_w = ((be_trp_flush & d_req_is_load_w) | d_tag_kill_w) &
+                            ~d_stx_q;
+    //   ★★ p12 收口加固（沿旧口径）：维护动作脉冲那一拍**不得再接管新请求**。
+    //     flush 拍也不再接受 load（LSQ 侧 `ld_fire` 已用 `~fl_flush` 门控；这里双保险）。
+    assign      d_ready_w  = d_idle & ~l1d_busy_w & ~maint_act_q &
+                             ~d_start_block_w &
+                             ~(be_trp_flush & lsu_req_v & ~lsu_req_we);
     wire        d_start    = d_ready_w & lsu_req_v;
+    //   ★★ F4：设备 load 的 IRQ 自持置位点 —— 与下面 FSM 的“转入 AD_WAIT”逐条件同源
+    //     （实际副作用第一拍之前的那一拍沿置位；同拍 IRQ 由 flush 门控让设备请求不发出）。
+    wire        io_set_w =
+        ((ad_st_q == AD_IDLE) & d_start & ~lsu_req_we & ~d_xlat_need_w &
+         (d_unc_w | d_clint_plic) & mem_req_is_head_w) |
+        ((ad_st_q == AD_XLATE) & ~d_stx_q & d_tlb_hit &
+         (d_unc_w | d_clint_plic) & d_head_q) |
+        ((ad_st_q == AD_TR) & ~d_stx_q & ptw_req_done &
+         ~ptw_owner_fetch_w & ~ptw_fault & (d_unc_w | d_clint_plic) & d_head_q);
+    //   IRQ 自持：arm（副作用窗）→ LSQ `side_pending` 接力（响应→退休）→ 释放。
+    //   全程只吃寄存器/组合的 LSQ 状态，不吃 trap 结果 ⇒ 无 IRQ↔start 组合环。
+    wire        io_block_w = io_arm_q | side_pending_w;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            io_arm_q <= 1'b0; io_link_q <= 1'b0;
+        end else if (be_trp_flush) begin
+            io_arm_q <= 1'b0; io_link_q <= 1'b0;        // 同步 trap 终止保护
+        end else begin
+            if (io_set_w)       io_arm_q  <= 1'b1;
+            if (side_pending_w) io_link_q <= 1'b1;      // 接力建立
+            // 退休释放（token 落 0）/ 被杀且未 fire AXI / drain 完成 / 错误响应
+            if (io_link_q & ~side_pending_w) begin
+                io_arm_q <= 1'b0; io_link_q <= 1'b0;
+            end
+            if (d_abort_w & ~d_axi_pend_q) begin
+                io_arm_q <= 1'b0; io_link_q <= 1'b0;
+            end
+            if ((ad_st_q == AD_DRAIN) & d_unc_done_w) begin
+                io_arm_q <= 1'b0; io_link_q <= 1'b0;
+            end
+            if (d_unc_err_w) begin
+                io_arm_q <= 1'b0; io_link_q <= 1'b0;
+            end
+        end
+    end
 
     //--------------------------------------------------------------------------
     // 4b.1 ★★ 核内 CLINT（2B-4 第 4a 段第 4 步）：MMIO 截获，**绝不发 AXI**
@@ -908,7 +1209,11 @@ module core_top_2b (
     //   ★★ 4b-3：核内 MMIO 现在有**两个**从设备（CLINT / PLIC）⇒ 按锁存地址 `d_a_q` 选
     //     （`mmio_route` 的 `plic_hit_o` 反映的是**当拍端口地址**，不能用于已接管的访问）
     wire        plic_sel_w      = (d_a_q >= `RV32GC_PLIC_HIT_LO) && (d_a_q < `RV32GC_PLIC_HIT_HI);
-    wire        clint_req_vld   = (ad_st_q == AD_WAIT) & d_cp_q & ~plic_sel_w;
+    //   ★★ F4：**PMP 必须早于物理副作用** ⇒ 核内 MMIO 请求也被 `load_pmp_deny` 门控
+    //     （被拒的 load 不进 CLINT/PLIC，不会误清 claim/pending）；同拍 flush 亦优先。
+    wire        d_cp_load_w    = (ad_st_q == AD_WAIT) & d_cp_q & ~d_we_q;
+    wire        d_cp_blk_w     = d_cp_load_w & (load_pmp_deny_w | be_trp_flush);
+    wire        clint_req_vld   = (ad_st_q == AD_WAIT) & d_cp_q & ~plic_sel_w & ~d_cp_blk_w;
     wire        clint_req_wr    = d_we_q;
     wire [31:0] clint_req_wdata = d_d_q;
     wire [3:0]  clint_req_strb  = d_strb_q;
@@ -926,7 +1231,9 @@ module core_top_2b (
         .resp_rdata(clint_rdata_w),
         .resp_hit  (clint_hit_w),
         .msip_o    (clint_msip_w),
-        .mtip_o    (clint_mtip_w)
+        .mtip_o    (clint_mtip_w),
+        //   ★★ F1-B：mtime 实时值（time/timeh 的只读影子源）
+        .mtime_o   (clint_mtime_w)
     );
 
     //==========================================================================
@@ -957,7 +1264,7 @@ module core_top_2b (
         .aresetn       (aresetn),
         .src           (intrpt),
         .intrpt_src_map(plic_src_map_w),
-        .req_valid     ((ad_st_q == AD_WAIT) & d_cp_q & plic_sel_w),
+        .req_valid     ((ad_st_q == AD_WAIT) & d_cp_q & plic_sel_w & ~d_cp_blk_w),
         .req_write     (d_we_q),
         .req_addr      (d_a_q - `RV32GC_PLIC_BASE),
         .req_wdata     (d_d_q),
@@ -983,7 +1290,9 @@ module core_top_2b (
     // 请求发射：AD_REQ 拍恰好一次（重试时等 L1D 回到 IDLE）
     //   ★★ 4b-2c：`AD_PTE` 也用同一端口做 PTE 读（地址=PA：paddr/vaddr 都给 PA，
     //     index 段即物理索引 ⇒ 与数据侧"物理 tag + 虚拟 index"的口径一致）
-    wire        l1d_cs_req_w = (ad_st_q == AD_REQ) | (ad_st_q == AD_PTE);
+    //   ★★ F4：PMP 拒绝时**不得发 L1D 请求**（真实字节检查先于缓存副作用）。
+    wire        l1d_cs_req_w = ((ad_st_q == AD_REQ) & ~load_pmp_deny_w) |
+                               (ad_st_q == AD_PTE);
     wire [31:0] l1d_cs_a_w   = (ad_st_q == AD_PTE) ? d_pte_pa_q : d_a_q;
     //   PTE 读接受判据：适配器空闲（或正等遍历）且 L1D 空闲
     wire        pte_rd_go_w  = ((ad_st_q == AD_IDLE) | (ad_st_q == AD_TR)) &
@@ -991,28 +1300,57 @@ module core_top_2b (
                                ~((ad_st_q == AD_IDLE) & d_start);
     //   ★★ (b)：**执行期 store 翻译请求的接受拍** —— 适配器空闲、且本拍没有更高优先的
     //     工作（PTE 读服务在途遍历 > 访存请求（含排空）> 纯翻译）。
-    //     注意：不需要 `~d_stx_need_w` 之类分支 —— LSQ 只在"该 store 在 E1 拍被判定为
-    //     需要翻译"时才把项留在 `stq_pv=0` 并发出请求 ⇒ 收到请求就**必须真翻译**
-    //     （否则 MPRV/satp 中途变化会让 PA 退化成 VA）。
-    //     `~stx_done_q`：完成脉冲那一拍不再接受（避免同一请求被二次接受）。
+    //   ★★ F4：只有 `st_xlate_trans_w`（Sv32 且有效特权级 ≠ M）才走主适配器；
+    //     Bare/M 由 §2c 的 1 拍快路接受。`~be_trp_flush`：flush 拍不接受（LSQ 会清在途）。
     wire        st_xlate_go_w = (ad_st_q == AD_IDLE) & st_xlate_valid_w &
-                                ~d_start & ~pte_rd_go_w & ~stx_done_q;
-    assign      st_xlate_ready_w = st_xlate_go_w;      // 接受拍（LSQ 据此锁存在途项）
-    assign      st_xlate_done_w  = stx_done_q;         // 完成脉冲（1 拍）
-    assign      st_xlate_pa_w    = stx_pa_q;           // 译后 PA
-    assign      st_xlate_fault_w = stx_flt_q;          // 翻译故障（本步兜底：作废不写）
+                                st_xlate_trans_w &
+                                ~d_start & ~pte_rd_go_w & ~stx_done_q & ~be_trp_flush;
+    //   接受/完成/结果三路：快路（Bare/M）与主适配器（Sv32）互斥（LSQ 单在途）。
+    assign      st_xlate_ready_w = st_xlate_trans_w ? st_xlate_go_w : stx_fast_go_w;
+    assign      st_xlate_done_w  = stx_done_q | stx_fast_done_w;
+    assign      st_xlate_pa_w    = stx_fast_done_w ? stx_fast_pa_q : stx_pa_q;
+    // 故障必须与有效 owner 的 done 同拍；旧 fast 结果不得污染后续 slow store。
+    assign      st_xlate_fault_w = (stx_done_q & stx_flt_q) |
+                                   (stx_fast_done_w & stx_fast_flt_q);
+    //   ★★ F4：`st_xlate_fault_cause` 是**有效 done 拍上的 active 字段**：
+    //     故障 = 7（PMP access fault）或 15（翻译 page fault）；无错/非 done 拍**明确 0**，
+    //     绝不输出 X/Z（LSQ 对未知 fail-closed，会把合法 store 误判成故障）。
+    assign      st_xlate_fault_cause_w =
+                    stx_fast_done_w ? (stx_fast_flt_q ? 4'd7 : 4'd0) :
+                    (stx_done_q & stx_flt_q) ? stx_flt_cause_q : 4'd0;
     wire [31:0] d_rdata_w    = d_unc_q ? d_unc_rdata_w : l1d_cs_rdata;
-    //   ★★ 4b-2b：**数据侧翻译故障**（TLB 权限错 / PTW 故障）⇒ 以"正常响应 + err=1"
-    //     回一笔（tag 仍是该 load 的标签）⇒ LSQ 标 done+异常 ⇒ ROB 精确抛页错误。
-    //     · 只在 load 上精确（store 的翻译发生在提交后排空 ⇒ 见 §B4.19 登记）
-    wire        d_tlb_fault_cyc_w = (ad_st_q == AD_XLATE) & d_tlb_perm_fault;
-    wire        d_ptw_fault_cyc_w = (ad_st_q == AD_TR) & ptw_req_done &
+    //   ★★ 4b-2b/F4：响应分类（严格四态）：
+    //     页错误 = TLB 权限错 / PTW 故障 ⇒ cause 13；PMP 拒绝 / uncached R 错误 ⇒ cause 5；
+    //     defer（非 head 设备 load，无副作用）⇒ 不 done；正常 ⇒ done。
+    //     这些信号都在**响应拍**组合有效，`mem_rsp_cause/defer/side` 与 `mem_rsp_valid`
+    //     同拍（LSQ 契约）。
+    wire        d_tlb_fault_cyc_w = (ad_st_q == AD_XLATE) & ~d_stx_q & d_tlb_perm_fault;
+    wire        d_ptw_fault_cyc_w = (ad_st_q == AD_TR) & ~d_stx_q & ptw_req_done &
                                     ~ptw_owner_fetch_w & ptw_fault;
-    wire        d_rsp_err_w   = ~d_we_q & ~d_stx_q & (d_tlb_fault_cyc_w | d_ptw_fault_cyc_w);
-    assign      d_rsp_v_w    = d_rsp_err_w |
-                               ((ad_st_q == AD_WAIT) & ~d_we_q &
-                                (d_cp_q ? 1'b1 :
-                                 d_unc_q ? d_unc_done_w : l1d_cs_ready));
+    wire        d_rsp_page_w    = d_tlb_fault_cyc_w | d_ptw_fault_cyc_w;
+    wire        d_rsp_fault_w   = (ad_st_q == AD_FAULT);
+    wire        d_rsp_defer_w   = (ad_st_q == AD_DEFER);
+    wire        d_rsp_unc_err_w = (ad_st_q == AD_WAIT) & d_unc_q & ~d_we_q & d_unc_err_w;
+    wire        d_rsp_norm_w    = (ad_st_q == AD_WAIT) & ~d_we_q & ~load_pmp_deny_w &
+                                  (d_cp_q ? 1'b1 :
+                                   d_unc_q ? d_unc_done_w : l1d_cs_ready);
+    assign      d_rsp_v_w     = d_rsp_page_w | d_rsp_fault_w | d_rsp_defer_w |
+                                d_rsp_norm_w | d_rsp_unc_err_w;
+    // PTW 保留 PTE PMP/PA-range access-fault cause；TLB 权限错及普通非法 PTE 仍为 page fault。
+    assign      mem_rsp_cause_w  = d_ptw_fault_cyc_w ? ptw_fault_cause[3:0] :
+                                   d_tlb_fault_cyc_w ? 4'd13 :
+                                   (d_rsp_fault_w | d_rsp_unc_err_w) ? 4'd5 : 4'd0;
+    assign      mem_rsp_defer_w  = d_rsp_defer_w;
+    //   设备读的“不可重复副作用已发生”只在**真发起副作用的拍**有效：
+    //     · CLINT/PLIC：AD_WAIT 拍发起即完成；
+    //     · uncached：AXI R 完成拍；
+    //     被 PMP 拒/被 flush 挡/错误响应 ⇒ side=0（LSQ 不建 token）。
+    assign      mem_rsp_side_w   = (ad_st_q == AD_WAIT) & ~d_we_q &
+                                   ~load_pmp_deny_w &
+                                   (d_cp_q | (d_unc_q & d_unc_done_w)) &
+                                   ~d_rsp_unc_err_w;
+    //   旧 bool 兼容口：与 cause 同源（错误拍=1），不再单独造第二套判据。
+    wire        d_rsp_err_w   = (mem_rsp_cause_w != 4'd0);
     //   CLINT 命中取 CLINT 读数据；窗口内未接部分（PLIC）仍回 0（占位，fail-safe）
     //   ★ 4b-3：核内 MMIO 读数据 mux（窗口互斥 ⇒ 顺序无歧义；PLIC 未命中回 0 的既有口径不变）
     wire [31:0] d_cp_rdata_w = plic_sel_w ? (plic_hit_w ? plic_rdata_w : 32'h0)
@@ -1045,13 +1383,28 @@ module core_top_2b (
         .fill_beats(l1d_fill_beats), .fill_accepted(l1d_fill_accepted),
         .fill_valid(l1d_fill_valid), .fill_data(l1d_fill_data),
         .fill_word_idx(l1d_fill_word_idx), .fill_done(l1d_fill_done),
+        //   ★★ F4-0：逐 beat R 错误 + 事务级失败/粘滞（与 fill_valid 同拍）
+        .fill_err(l1d_fill_err), .fill_fail(l1d_fill_fail), .cs_err(l1d_cs_err),
         .wb_req(l1d_wb_req), .wb_paddr(l1d_wb_paddr), .wb_way(l1d_wb_way),
         .wb_owner(l1d_wb_owner), .wb_beats(l1d_wb_beats), .wb_accepted(l1d_wb_accepted),
         .wb_word_idx(l1d_wb_word_idx), .wb_data(l1d_wb_data), .wb_done(l1d_wb_done),
+        .wb_err(l1d_wb_err),
         .wb_ready(l1d_wb_ready),
         //   ★ 占位：L1D 维护（fence.i / cbo.inval / clean）本段无 CSR 提交源 ⇒ 恒 0
+        .maint_err(l1d_maint_err), .err_sticky(l1d_err_sticky),
         .inval_all(maint_l1d_inval_w), .clean_all(maint_l1d_clean_w), .idle(l1d_idle)
     );
+
+    //   ★★ F4/DRAIN：flush 的 load/STX 取消判据（**不含已提交 store**）
+    wire        d_stale_need_w = (d_stx_q |
+                                  (ad_st_q == AD_XLATE) | (ad_st_q == AD_TR) |
+                                  (ad_st_q == AD_PTE)  | (ad_st_q == AD_PTER) |
+                                  l1d_busy_w | ~ptw_req_ready_w);
+    wire        d_flush_load_w = be_trp_flush & ~d_we_q &
+                                 (ad_st_q != AD_IDLE) &
+                                 (ad_st_q != AD_DRAIN) & (ad_st_q != AD_STALE);
+    wire        d_tag_load_w   = d_tag_kill_w & ~d_we_q & (ad_st_q != AD_IDLE) &
+                                 (ad_st_q != AD_DRAIN) & (ad_st_q != AD_STALE);
 
     // ---- 适配器时序 ----
     always @(posedge aclk or negedge aresetn) begin
@@ -1060,29 +1413,46 @@ module core_top_2b (
             d_we_q <= 1'b0; d_unc_q <= 1'b0; d_cp_q <= 1'b0;
             d_a_q <= 32'h0; d_va_q <= 32'h0; d_d_q <= 32'h0; d_strb_q <= 4'h0;
             d_tag_q <= {`BACK2_MEM_TAG_W{1'b0}};
+            d_bm4_q <= 4'h0; d_head_q <= 1'b0; d_ctx_q <= 4'h0;
+            d_axi_pend_q <= 1'b0;
             m_tr_src_q <= 1'b1;             // 复位后 PTW 归取指侧（与旧行为一致）
             //   ★★ (b)：翻译事务状态/结果寄存器**必须显式复位** —— 原先靠"每拍默认清零"
             //     兜底，改用"贯穿事务的状态标志"后该兜底消失 ⇒ 不复位会一直是 **x**
-            //     （实测：p12 的 C12' 因 `d_kill_w`/`d_acc_w` 含 x 而红）。
+            //     （实测：p12 的 C12' 因 kill/`d_acc_w` 含 x 而红）。
             d_stx_q <= 1'b0; d_stx_ctx_q <= 4'h0;
             stx_pa_q <= 32'h0; stx_done_q <= 1'b0; stx_flt_q <= 1'b0;
+            stx_flt_cause_q <= 4'h0;
         end else begin
             //   ★★ (b)：完成/故障是**单拍脉冲**（默认清零，各分支置位）。
             //     ★ `d_stx_q` **不能**在这里默认清零 —— 它是**贯穿整个翻译事务**的状态标志
             //       （AD_IDLE 接受 → AD_XLATE →（缺失）AD_TR → AD_PTE/AD_PTER → … → 完成），
-            //       只在"接受"拍置位、在各条出口分支清零（见 AD_XLATE/AD_TR）。
-            //       实测教训：若按"单拍"默认清零，则进 AD_TR 后 `d_stx_q=0` ⇒
-            //       ① `d_acc_w` 退化成 **load**（TLB/PTW 按读权限判 ⇒ 权限结论错）；
-            //       ② `AD_TR` 的**故障**分支走"普通访存"路径 ⇒ 不回 `stx_done/fault`
-            //          ⇒ LSQ 永远等不到结果、提交门永久阻塞（p14 实测：PTW 遍历
-            //          `st=6 done=1 flt=1` 而适配器 `ad=5 d_stx=0` ⇒ 反复重译死循环）。
-            stx_done_q <= 1'b0;
-            stx_flt_q  <= 1'b0;
+            //       只在"接受"拍置位、在各条出口分支清零。
+            stx_done_q      <= 1'b0;
+            stx_flt_q       <= 1'b0;
+            stx_flt_cause_q <= 4'h0;        // 非故障拍明确 0（LSQ 对未知 fail-closed）
             //   ★ 4b-2b：PTW 归属 —— 请求被**接受**的那一拍记录归属（2A `m_tr_src_q` 同法）
-            if (ptw_req_v_w & ptw_free_w) m_tr_src_q <= d_ptw_want_w ? 1'b0 : 1'b1;
-            //   ★ 4b-2a：维护/陷阱/xRET 冲刷 ⇒ 放弃在途访问（看上面 `d_kill_w` 的说明）
-            if (d_kill_w) begin
-                ad_st_q <= AD_IDLE;
+            if (ptw_req_v_w & ptw_free_w) m_tr_src_q <= d_ptw_accept_w ? 1'b0 : 1'b1;
+            //   ★★ F4：flush 只取消**真正可取消的 active load/STX**；**已提交 store 的排空
+            //     必须继续走 case 直到 terminal**（ready 宣告接管 = 本拍锁存，不得在 flush 拍
+            //     跳过 FSM，否则：① cbo/sfence 等 CDQ 空的维护会永久等待；② trap 同拍 CDQ
+            //     接管的新 store 被 pop 后丢失）。IDLE 时不得用上一笔的 d_stx/load 标记误杀
+            //     本拍新接管的 store —— 只看 estate(ad_st_q) 下真实 active owner。
+            if (be_trp_flush) d_stx_q <= 1'b0;
+            if (be_trp_flush & d_stx_q) begin
+                // 在途 store 翻译事务被冲刷（LSQ 同拍清 act；迟到 done 忽略）⇒ 等资源 terminal
+                ad_st_q <= (((ad_st_q == AD_XLATE) | (ad_st_q == AD_TR) |
+                             (ad_st_q == AD_PTE)  | (ad_st_q == AD_PTER)) |
+                            l1d_busy_w | ~ptw_req_ready_w) ? AD_STALE : AD_IDLE;
+            end else if (d_flush_load_w & ~fetch_pte_adapter_owner_w) begin
+                // active load：未 fire AXI ⇒ stale/取消；已 fire ⇒ drain 吞旧 R。
+                // A PTE read already owned by fetch is not this load's resource; leave its
+                // AD_PTE/PTER state intact so the existing walker receives its terminal response.
+                ad_st_q <= d_axi_pend_q ? AD_DRAIN :
+                           (d_stale_need_w ? AD_STALE : AD_IDLE);
+            end else if (d_tag_load_w & ~fetch_pte_adapter_owner_w) begin
+                // partial squash kills only this load owner; do not orphan a fetch PTE response.
+                ad_st_q <= d_axi_pend_q ? AD_DRAIN :
+                           (d_stale_need_w ? AD_STALE : AD_IDLE);
             end else case (ad_st_q)
                 AD_IDLE: begin
                     if (pte_rd_go_w) begin
@@ -1095,24 +1465,41 @@ module core_top_2b (
                         d_d_q    <= lsu_req_d;
                         d_strb_q <= lsu_req_strb;
                         d_tag_q  <= lsu_req_tag;
-                        if (d_xlat_need_w) begin
-                            //   ★ 4b-2b：先做 VA→PA 翻译（`AD_XLATE` 拍 TLB 组合查询）
-                            //   ★★ (b)：此分支现在**只服务 load**（store 排空带 PA ⇒
-                            //     `d_xlat_need_w` 被 `~lsu_req_we` 关掉）
-                            d_va_q  <= lsu_req_a;
-                            ad_st_q <= AD_XLATE;
-                        end else begin
-                            //   Bare，或 ★(b) **已提交 store 的排空**（`lsu_req_a` 已是 PA）
+                        //   ★★ F4：请求元数据在**接受拍锁存**（真实字节/头身份/上下文）
+                        d_bm4_q  <= mem_req_bmask_w;
+                        d_head_q <= mem_req_is_head_w;
+                        d_ctx_q  <= {d_eff_priv_w,
+                                     csr_mstatus_raw[`RV32GC_MSTATUS_SUM_BIT],
+                                     csr_mstatus_raw[`RV32GC_MSTATUS_MXR_BIT]};
+                        if (lsu_req_we) begin
+                            //   ★★ **已提交 store 的排空**：`lsu_req_a` 已是 PA，绝不重译、
+                            //     绝不按“当下”priv/PMP 重新判故障（退休前预检已在 §2c/§3.4
+                            //     完成；这里只搬写）。RAS 口径：committed store 不因 flush 取消。
                             d_a_q   <= lsu_req_a;
-                            d_va_q  <= lsu_req_a;   // Bare：VA==PA（cs_vaddr 的 index 段用）
+                            d_va_q  <= lsu_req_a;
                             d_unc_q <= d_unc_w;
                             d_cp_q  <= d_clint_plic;
                             ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                        end else if (d_xlat_need_w) begin
+                            //   先做 VA→PA 翻译（`AD_XLATE` 拍 TLB 组合查询）
+                            d_va_q  <= lsu_req_a;
+                            ad_st_q <= AD_XLATE;
+                        end else begin
+                            //   Bare：VA==PA；先判设备/头身份（defer 必须在任何副作用之前）
+                            d_a_q   <= lsu_req_a;
+                            d_va_q  <= lsu_req_a;
+                            d_unc_q <= d_unc_w;
+                            d_cp_q  <= d_clint_plic;
+                            if ((d_unc_w | d_clint_plic) & ~mem_req_is_head_w) begin
+                                //   ★★ 非 head 设备 load：**零副作用**回 defer，释放适配器
+                                ad_st_q <= AD_DEFER;
+                            end else begin
+                                ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                            end
                         end
                     end else if (st_xlate_go_w) begin
-                        //   ★★ (b)：**执行期 store 翻译事务**（纯翻译，不进 AD_REQ）——
-                        //     复用 `AD_XLATE/AD_TR` 两级 + 现有 PTW 串行复用/PTE 读通路，
-                        //     完成即回 `st_xlate_pa/done`（PA 由 LSQ 写回 STQ/CDQ）。
+                        //   ★★ F4：**Sv32 store 翻译事务**（纯翻译，不进 AD_REQ）——
+                        //     复用 `AD_XLATE/AD_TR` 两级 + PTW 串行复用/PTE 读通路。
                         d_va_q      <= st_xlate_va_w;
                         d_stx_ctx_q <= st_xlate_ctx_in_w;
                         d_stx_q     <= 1'b1;
@@ -1121,28 +1508,59 @@ module core_top_2b (
                 end
                 AD_XLATE: begin
                     //   TLB 口 1 当拍出结果（纯组合）
-                    if (d_tlb_hit) begin
-                        //   ★★ (b)：纯翻译事务 ⇒ 只回 PA，不进访存级（事务在本拍结束）
-                        d_stx_q <= 1'b0;
-                        if (d_stx_q) begin
-                            stx_pa_q   <= d_tlb_pa;
+                    if (d_stx_q) begin
+                        //   ★★ F4 **上下文追随**：store 预检/翻译的请求上下文可能取自
+                        //     “更老 CSR 尚未提交”的瞬间（LSQ 的 `st_xlate_ctx` 是当下已提交
+                        //     值）。若完成时已提交上下文已变化，则本结果对该 store 不是
+                        //     程序序语义（可能伪页错误/错 PA）⇒ **不交付**，按新上下文重译。
+                        //     该 store 还在提交窗内（LSQ 会因 ctx 不一致再请求），故安全；
+                        //     上下文只在更老指令提交时变化 ⇒ 有限次收敛。
+                        if (d_stx_ctx_q != stx_ctx_live_w) begin
+                            d_stx_ctx_q <= stx_ctx_live_w;
+                            ad_st_q     <= AD_XLATE;        // 用新上下文重查
+                        end else if (!stx_need_trans_live_w) begin
+                            //   追随后的上下文不再需要翻译（M/Bare）⇒ PA=VA + PMP(原指令 ctx)
+                            d_stx_q    <= 1'b0;
                             stx_done_q <= 1'b1;
-                            ad_st_q    <= AD_IDLE;
-                        end else begin
-                            d_a_q   <= d_tlb_pa;
-                            d_unc_q <= d_unc_w;             // 路由按 **PA** 重算
-                            d_cp_q  <= d_clint_plic;
-                            ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
-                        end
-                    end else if (d_tlb_perm_fault) begin
-                        //   ★★ (b)：store 翻译权限错 ⇒ 回"故障"（事务在本拍结束；
-                        //     LSQ 据此按 cause 15 精确上报 / 作废该项，见 `lsq_simple` §3.4）
-                        d_stx_q <= 1'b0;
-                        if (d_stx_q) begin
+                            if (pmp_allow_w) stx_pa_q <= d_va_q;
+                            else begin
+                                stx_flt_q       <= 1'b1;
+                                stx_flt_cause_q <= 4'd7;
+                            end
+                            ad_st_q <= AD_IDLE;
+                        end else
+                        //   ---- Sv32 store：TLB 命中 ⇒ 真实字节 PMP 检查后回 done ----
+                        if (d_tlb_hit) begin
+                            d_stx_q <= 1'b0;
+                            stx_done_q <= 1'b1;
+                            if (pmp_allow_w) begin
+                                stx_pa_q <= d_tlb_pa;
+                            end else begin
+                                //   PMP 拒绝 ⇒ cause 7（store/AMO access fault）
+                                stx_flt_q       <= 1'b1;
+                                stx_flt_cause_q <= 4'd7;
+                            end
+                            ad_st_q <= AD_IDLE;
+                        end else if (d_tlb_perm_fault) begin
+                            //   翻译权限错 ⇒ cause 15（store page fault）
+                            d_stx_q <= 1'b0;
+                            stx_done_q <= 1'b1;
                             stx_flt_q  <= 1'b1;
-                            stx_done_q <= 1'b1;
+                            stx_flt_cause_q <= 4'd15;
+                            ad_st_q <= AD_IDLE;
+                        end else begin
+                            ad_st_q <= AD_TR;           // 缺失 ⇒ 向 PTW 发请求
                         end
-                        ad_st_q <= AD_IDLE;             // load：本拍已回"带错响应"（见 `d_rsp_err_w`）
+                    end else if (d_tlb_hit) begin
+                        d_a_q   <= d_tlb_pa;
+                        d_unc_q <= d_unc_w;             // 路由按 **PA** 重算
+                        d_cp_q  <= d_clint_plic;
+                        if ((d_unc_w | d_clint_plic) & ~d_head_q)
+                            ad_st_q <= AD_DEFER;        // 非 head 设备 load：无副作用 defer
+                        else
+                            ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                    end else if (d_tlb_perm_fault) begin
+                        ad_st_q <= AD_IDLE;             // load：本拍回 cause 13（d_rsp_page_w）
                     end else begin
                         ad_st_q <= AD_TR;               // 缺失 ⇒ 向 PTW 发请求
                     end
@@ -1156,7 +1574,11 @@ module core_top_2b (
                     end
                 end
                 AD_PTER: begin
-                    if (l1d_idle) ad_st_q <= AD_PTE;
+                    // L1D fill_fail is the terminal for this active PTE read. Feed PTW
+                    // the same-cycle err response and return to the owning data walk (or
+                    // release the adapter for fetch); never retry the failed PTE as data.
+                    if (l1d_fill_fail) ad_st_q <= d_pte_ret_q ? AD_TR : AD_IDLE;
+                    else if (l1d_idle) ad_st_q <= AD_PTE;
                 end
                 AD_TR: begin
                     //   等本笔遍历结束（归属必须是数据侧 —— 取指侧的 done 不算）
@@ -1166,40 +1588,77 @@ module core_top_2b (
                         d_pte_ret_q <= 1'b1;
                         ad_st_q     <= AD_PTE;
                     end else if (ptw_req_done & ~ptw_owner_fetch_w) begin
-                        d_stx_q <= 1'b0;        // 遍历有结果 ⇒ 纯翻译事务本拍结束
-                        if (ptw_fault) begin
-                            //   ★★ (b)：store 翻译遍历故障 ⇒ 回"故障"（作废不写；见 AD_XLATE）
-                            if (d_stx_q) begin
-                                stx_flt_q  <= 1'b1;
-                                stx_done_q <= 1'b1;
-                            end
-                            ad_st_q <= AD_IDLE;         // load：本拍已回"带错响应"
+                        if (d_stx_q && (d_stx_ctx_q != stx_ctx_live_w)) begin
+                            //   ★★ F4 上下文追随（同 AD_XLATE）：遍历按旧上下文完成的结果
+                            //     不得交付 ⇒ 按新上下文重新翻译（有限收敛，见 AD_XLATE 注释）
+                            d_stx_ctx_q <= stx_ctx_live_w;
+                            ad_st_q     <= AD_XLATE;
                         end else if (d_stx_q) begin
-                            //   ★★ (b)：纯翻译事务完成 ⇒ 只回 PA，不进访存级
-                            stx_pa_q   <= ptw_pa_out;
+                            //   ---- Sv32 store：遍历结果 + 真实字节 PMP ⇒ done/fault ----
+                            d_stx_q    <= 1'b0;
                             stx_done_q <= 1'b1;
-                            ad_st_q    <= AD_IDLE;
+                            if (ptw_fault) begin
+                                stx_flt_q       <= 1'b1;
+                                stx_flt_cause_q <= ptw_fault_cause[3:0]; // 原样保留 7/15 等 PTW cause
+                            end else if (!pmp_allow_w) begin
+                                stx_flt_q       <= 1'b1;
+                                stx_flt_cause_q <= 4'd7;    // store access fault
+                            end else begin
+                                stx_pa_q <= ptw_pa_out;     // 独立翻译出的 PA（绝不 PA+4）
+                            end
+                            ad_st_q <= AD_IDLE;
+                        end else if (ptw_fault) begin
+                            ad_st_q <= AD_IDLE;         // load：本拍回 cause 13
                         end else begin
                             d_a_q   <= ptw_pa_out;
                             d_unc_q <= d_unc_w;
                             d_cp_q  <= d_clint_plic;
-                            ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
+                            if ((d_unc_w | d_clint_plic) & ~d_head_q)
+                                ad_st_q <= AD_DEFER;
+                            else
+                                ad_st_q <= (d_unc_w | d_clint_plic) ? AD_WAIT : AD_REQ;
                         end
                     end
                 end
                 AD_REQ: begin
+                    //   ★★ F4：PMP 拒绝 ⇒ 不发 L1D 请求，下一拍带 cause 5 响应
+                    if (load_pmp_deny_w)    ad_st_q <= AD_FAULT;
                     // 请求已呈现一拍：写命中当拍完成（st_hit 组合），否则进 AD_WAIT
-                    ad_st_q <= l1d_cs_wr_done ? AD_IDLE : AD_WAIT;
+                    else                    ad_st_q <= l1d_cs_wr_done ? AD_IDLE : AD_WAIT;
                 end
                 AD_WAIT: begin
-                    if (d_cp_q)                                          ad_st_q <= AD_IDLE;
-                    else if (d_unc_q) begin if (d_unc_done_w)            ad_st_q <= AD_IDLE; end
+                    if (load_pmp_deny_w)                                 ad_st_q <= AD_FAULT;
+                    else if (d_cp_q)                                     ad_st_q <= AD_IDLE;
+                    else if (d_unc_q) begin
+                        if (d_unc_done_w | d_unc_err_w)                  ad_st_q <= AD_IDLE;
+                    end
                     else if (d_we_q ? l1d_cs_wr_done : l1d_cs_ready)     ad_st_q <= AD_IDLE;
                     else if (l1d_cs_miss)                                ad_st_q <= AD_RETRY;
                 end
                 AD_RETRY: begin
-                    // 缺失/写回由 L1D 自理（请求已由 §5 引擎服务）；回到 IDLE 后重发访问
-                    if (l1d_idle) ad_st_q <= AD_REQ;
+                    // Cacheable live load fill failure is terminal for this owner (AF5).
+                    // A committed store remains owned and retries; do not drop its write.
+                    if (l1d_fill_fail && ~d_we_q) ad_st_q <= AD_FAULT;
+                    else if (l1d_idle) ad_st_q <= AD_REQ;
+                end
+                AD_DEFER: begin
+                    //   defer 响应已在本拍给出（`mem_rsp_defer`），释放适配器
+                    ad_st_q <= AD_IDLE;
+                end
+                AD_FAULT: begin
+                    //   cause 5 响应已在本拍给出（`mem_rsp_cause`），释放适配器
+                    ad_st_q <= AD_IDLE;
+                end
+                AD_DRAIN: begin
+                    //   等已 fire 的 AXI 旧读收尾；吞掉 `d_unc_done`，绝不回成新请求的响应
+                    if (d_unc_done_w) ad_st_q <= AD_IDLE;
+                end
+                AD_STALE: begin
+                    // Old data walk must be idle before release, but an unrelated in-flight
+                    // fetch owner may use this adapter to finish its PTE reads. req_ready is
+                    // kill-masked, so distinguish true PTW idle from that ready handshake.
+                    // Late completion is never consumed as data; only owner/resource drain gates.
+                    if ((ptw_idle_w | ptw_owner_fetch_w) & l1d_idle) ad_st_q <= AD_IDLE;
                 end
                 default: ad_st_q <= AD_IDLE;
             endcase
@@ -1233,14 +1692,17 @@ module core_top_2b (
     reg [1:0]  i_wdly_q;         // 写回数据建立等待（行缓冲读延迟；2 拍保险）
 
     wire        i_free   = (ist_q == IST_IDLE);
-    wire        d_unc_rd = (ad_st_q == AD_WAIT) & d_unc_q & ~d_we_q;
+    //   ★★ F4：PMP 拒绝的 load 不得发 AXI；同拍 flush 优先于**未发生**的 load 副作用
+    //     （已 fire 的由 AD_DRAIN 收尾；store 是已提交写，不受 flush/PMT 影响）。
+    wire        d_unc_rd = (ad_st_q == AD_WAIT) & d_unc_q & ~d_we_q &
+                           ~load_pmp_deny_w & ~be_trp_flush;
     wire        d_unc_wr = (ad_st_q == AD_WAIT) & d_unc_q &  d_we_q;
 
     // ---- 仲裁（2A §11.1 优先序）----
     wire        g_wrbk = i_free &  l1d_wb_req;
     wire        g_dfil = i_free & ~l1d_wb_req &  l1d_fill_req;
-    wire        g_dunc = i_free & ~l1d_wb_req & ~l1d_fill_req & (d_unc_rd | d_unc_wr);
-    //   ★★ 4b-2c：**PTE 读不再走 AXI**（改经 L1D）⇒ 本引擎删去该源（`g_pte` 恒 0），
+    wire        g_dunc = i_free & ~l1d_wb_req & ~l1d_fill_req & ~d_unc_issued_q &
+                         (d_unc_rd | d_unc_wr);    //   ★★ 4b-2c：**PTE 读不再走 AXI**（改经 L1D）⇒ 本引擎删去该源（`g_pte` 恒 0），
     //     且 XIP/L1I 填充**不再**被 PTE 读抑制（原先的 `~ptw_pte_req_valid` 项一并删掉）。
     wire        g_pte  = 1'b0;
     wire        g_xipf = i_free & ~l1d_wb_req & ~l1d_fill_req & ~(d_unc_rd | d_unc_wr) &
@@ -1333,13 +1795,43 @@ module core_top_2b (
     assign l1i_fill_data     = rdata;
     assign l1i_fill_word_idx = i_cnt_q;
     assign l1i_fill_done     = r_fire_w & (i_own_q == IOWN_IFIL) & (i_cnt_q == i_last_q);
+    //   ★★ F4-0：逐 beat R 错误（与对应 fill_valid **同拍**；owner 已在 fill_valid 内限定）
+    //   ★★ F4-0b：uncached/XIP 直连响应错误 = 真实 R 拍 + 该笔 owner（不借翻译 fault）
+    assign unc_rsp_err_w = r_fire_w & axi_rdata_error_w &
+                           ((i_own_q == IOWN_DUNC) | (i_own_q == IOWN_XIPF));
+    //   ★★ F4：uncached **load** 的 R 错误（最后 beat，与响应同拍）⇒ load access fault 5。
+    //     只在 load（~d_we_q）成立；store 的 B/R 错误属用户保留的“外部错误”边界，不改。
+    assign d_unc_err_w   = (ad_st_q == AD_WAIT) & d_unc_q & ~d_we_q &
+                           r_fire_w & (i_own_q == IOWN_DUNC) &
+                           (i_cnt_q == i_last_q) & axi_rdata_error_w;
+    assign l1d_fill_err      = l1d_fill_valid & axi_rdata_error_w;
+    assign l1i_fill_err      = l1i_fill_valid & axi_rdata_error_w;
     //   ★★ 4b-2c：PTE 读响应来自 L1D（不再是 AXI 读数据）
-    assign pte_resp_valid_w  = (ad_st_q == AD_PTE) & l1d_cs_ready;
+    // A cache hit responds normally. A PTE miss that ends in L1D fill_fail also
+    // generates one terminal PTW response; that exact AD_PTER owner receives the error.
+    assign pte_resp_valid_w  = ((ad_st_q == AD_PTE) & l1d_cs_ready) |
+                               ((ad_st_q == AD_PTER) & l1d_fill_fail);
     assign pte_resp_data_w   = l1d_cs_rdata;
+    assign pte_resp_err_w    = (ad_st_q == AD_PTER) & l1d_fill_fail;
 
     // ---- 写拍分发（L1D 写回：逐字取行缓冲；uncached store：单 beat）----
     assign l1d_wb_word_idx = i_cnt_q;
-    assign l1d_wb_done     = (ist_q == IST_WR) & w_is_wrbk & w_fire & (i_cnt_q == i_last_q);
+    //   ★★ F4-0：wb_done = **B 响应收到**（不是最后一拍 W）；wb_err 与 wb_done 同拍。
+    //     仅 (wb_done & ~wb_err) 才允许 l1d 清 dirty / 腾路。
+    assign l1d_wb_done     = bvalid & bready;
+    assign l1d_wb_err      = l1d_wb_done & (bresp != 2'b00);
+
+    //   ★★ F4-0：cache 逐请求错误脉冲的诊断粘滞位。活动 AD_RETRY load 将 fill_fail
+    //     终结为 AF5；AD_PTER owner 将同拍 fill_fail 交 PTW 的 pte_resp_err。B 错误
+    //     仍由 L1D 保留脏行处理，不借此取消或改写已接受/已提交 store。
+    reg cache_err_sticky_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) cache_err_sticky_q <= 1'b0;
+        else if (l1i_cs_err | l1i_fill_fail | l1i_err_sticky |
+                 l1d_cs_err | l1d_fill_fail | l1d_wb_fail | l1d_maint_err |
+                 l1d_err_sticky | axi_done_error_w)
+            cache_err_sticky_q <= 1'b1;
+    end
 
     // XIP 字锁存 + 在途跟踪
     always @(posedge aclk or negedge aresetn) begin
@@ -1379,6 +1871,34 @@ module core_top_2b (
     assign d_unc_done_w  = d_unc_done_r;
     assign d_unc_rdata_w = d_unc_rdata_r;
 
+    //   ★★ F4：uncached load 的 AXI 读是否已 fire（用于 kill 的“取消 vs drain”区分）。
+    //     只记**读**（写是已提交 store，flush 不取消）。最后 beat R 握手清 0。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) d_axi_pend_q <= 1'b0;
+        else begin
+            if (i_fire & (i_own_new == IOWN_DUNC) & ~i_req_wr)
+                d_axi_pend_q <= 1'b1;
+            if (r_fire_w & (i_own_q == IOWN_DUNC) & (i_cnt_q == i_last_q))
+                d_axi_pend_q <= 1'b0;
+        end
+    end
+
+    //   ★★ F4-1：**native uncached 事务单次 accept** 记账（根因见声明处）。
+    //     set：本笔 AXI accept；clear：适配器消费 terminal（read R done / write B done /
+    //     错误响应 / drain 完成 / kill 且未 fire）。清后适配器已/即将回 IDLE，下一代
+    //     请求才会重新 accept。绝不会在 AD_WAIT 的 done 等待拍重复 accept。
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) d_unc_issued_q <= 1'b0;
+        else begin
+            if (i_fire & (i_own_new == IOWN_DUNC))
+                d_unc_issued_q <= 1'b1;
+            else if ((((ad_st_q == AD_WAIT) | (ad_st_q == AD_DRAIN)) & d_unc_done_w) |
+                     d_unc_err_w |
+                     (d_abort_w & ~d_axi_pend_q))
+                d_unc_issued_q <= 1'b0;
+        end
+    end
+
     axi_master_ctrl #(
         .ADDR_W(32), .DATA_W(32), .STRB_W(4), .ID_W(4), .LEN_W(4),
         .SIZE_W(3), .BURST_W(2), .CACHE_W(4), .PROT_W(3), .OWNER_W(3),
@@ -1402,6 +1922,8 @@ module core_top_2b (
         .rdata_valid(), .rdata_data(), .rdata_hold(), .rdata_id(), .rdata_last(),
         .rdata_ready(1'b1),
         .done(axi_done_w), .done_owner(), .done_addr(), .resp_error(), .resp_code(),
+        // ★★ F4-0：逐 beat R 错误（同拍同 beat）与事务级累计错误
+        .rdata_error(axi_rdata_error_w), .done_error(axi_done_error_w),
         .m_awid(awid), .m_awaddr(awaddr), .m_awlen(awlen), .m_awsize(awsize),
         .m_awburst(awburst), .m_awlock(awlock_raw), .m_awcache(awcache), .m_awprot(awprot),
         .m_awvalid(awvalid), .m_awready(awready),
@@ -1418,6 +1940,9 @@ module core_top_2b (
     //   `arlock/awlock` 只驱动 [0]（契约注释口径）
     assign arlock = {1'b0, arlock_raw[0]};
     assign awlock = {1'b0, awlock_raw[0]};
+    // Legacy compatibility pin only: mirror the AW ID held by axi_master_ctrl's
+    // single in-flight descriptor; AXI4 data association remains ordered, no WID state.
+    assign wid = awid;
 
     //==========================================================================
     // 6. backend_top（ROB 128 + 重命名 + 发射队列 + PRF + LSQ + 过渡 CSR 栈）
@@ -1460,6 +1985,26 @@ module core_top_2b (
         .mem_req_ready_i(d_ready_w),
         .mem_rsp_valid_i(d_rsp_v_w), .mem_rsp_rdata_i(d_rsp_d_w),
         .mem_rsp_tag_i(d_rsp_tag_w),
+        //   ★★ F4：LSQ 新契约透传（端口名由母 Agent 转发 backend5f3 的精确名字；
+        //     后端落地前本层保持同一组具名连接，不造同义替代）。
+        //     请求：真实字节集合（不是 size 编码）、load 的 ROB 头身份；
+        //     响应：显式 cause（5/13）、defer（非 head 设备 load 无副作用重试）、
+        //           side（不可重复设备读，LSQ 建 token 到退休）。
+        .mem_req_bytes_o(mem_req_bytes_w), .mem_req_bmask_o(mem_req_bmask_w),
+        .mem_req_rob_o(mem_req_rob_w), .mem_req_is_head_o(mem_req_is_head_w),
+        .mem_rsp_cause_i(mem_rsp_cause_w), .mem_rsp_defer_i(mem_rsp_defer_w),
+        .mem_rsp_side_i(mem_rsp_side_w),
+        //     store 退休前预检：真实字节、跨 4K 拆笔、故障 cause（0/7/15）
+        .st_xlate_bmask8_o(st_xlate_bmask8_w), .st_xlate_bytes_o(st_xlate_bytes_w),
+        .st_xlate_xpg_o(st_xlate_xpg_w),
+        .st_xlate_fault_cause_i(st_xlate_fault_cause_w),
+        //     side token 透传 + partial-squash 在途 tag 释放
+        .side_issue_valid_o(side_issue_valid_w), .side_issue_rob_o(side_issue_rob_w),
+        .side_pending_o(side_pending_w), .side_pending_rob_o(side_pending_rob_w),
+        .ld_kill_tags_o(ld_kill_tags_w),
+        //   ★★ F4/PMP：合法 PMP CSR 写退休事件（5f3 实现；本层寄存后 flush+redirect）
+        .pmp_cmt_o(pmp_cmt_w),
+        .pmp_cmt_next_pc_o(pmp_cmt_next_pc_w),
         //   ★★ (b) 执行期 store 翻译口（LSQ ↔ 本层数据适配器；§B4.24.9）
         .st_xlate_en_i(st_xlate_en_w), .st_xlate_ctx_i(st_xlate_ctx_w),
         .st_xlate_valid_o(st_xlate_valid_w), .st_xlate_va_o(st_xlate_va_w),
@@ -1482,6 +2027,19 @@ module core_top_2b (
         //   ★ 4b-3(2/2)：当前特权级 ⇒ `backend_top` 按它生成 ecall 的 cause（8/9/11）
         .priv_i(csr_priv_2),
         .csr_we_o(csr_we_w), .csr_waddr_o(csr_waddr_w), .csr_wdata_o(csr_wdata_w),
+        //   ★★ F1-B：CSR 在**本拍 qualified 提交组**中的真实 lane（供 minstret 的
+        //      older → 半字覆盖 → younger 顺序；与 csr_we_o 同拍有效）
+        .csr_cmt_lane_o(csr_cmt_lane_w),
+        //   ★★ F4-1：CSR 权限检查 7 口（查询出 / 反馈入 / TSR.TVM 入）
+        .csr_chk_valid_o(csr_chk_valid_w),
+        .csr_chk_addr_o(csr_chk_addr_w),
+        .csr_chk_wr_o(csr_chk_wr_w),
+        .csr_chk_illegal_i(csr_chk_illegal_w),
+        .csr_chk_ro_write_i(csr_chk_ro_write_w),
+        .csr_tsr_i(csr_tsr_w),
+        .csr_tvm_i(csr_tvm_w),
+        //   ★★ F4-1/C8：ROB 头 PC 安全指示（同名直连 rob.head_pc_valid_o，不跨层）
+        .head_pc_valid_o(be_head_pc_valid_w),
         .xret_kind_o(xret_kind_w),
         .cbo_perm_i(cbo_perm_w), .maint_kind_o(maint_kind_w), .maint_cmt_o(maint_cmt_w),
         .maint_pc_o(maint_pc_w), .maint_rdy_i(l1d_idle),
@@ -1507,7 +2065,10 @@ module core_top_2b (
         .raddr(csr_raddr_w), .rdata(csr_rdata_cf_w), .wen(csr_cf_we_w),
         .waddr(csr_waddr_w), .wdata(csr_wdata_w), .w_illegal(1'b0),
         .rdata_w(), .byp_wdata(32'h0), .byp_rdata(),
-        .priv(csr_priv_2), .chk_addr(12'h0), .chk_illegal(), .chk_ro_write(),
+        //   ★ 查询地址与读口 csr_raddr 不同：chk_addr 取 backend 的 E1 原始候选地址；
+        //     反馈两线回 backend（不再 tie 0/悬空 ⇒ 非法 CSR 走精确 cause 2 而不悬挂）。
+        .priv(csr_priv_2), .chk_addr(csr_chk_addr_w),
+        .chk_illegal(csr_chk_illegal_w), .chk_ro_write(csr_chk_ro_write_w),
         .mstatus_o(csr_mstatus_raw), .mstatus_set(mstatus_set), .mstatus_clr(mstatus_clr),
         //   ★★ G2：4 bit 分组使能**原样透传**（`trap_ctrl` 已按 `trap_target` 分组 —— 见声明处）
         .trap_we(tc_trap_we), .trap_epc_i(tc_trap_epc_i), .trap_cause_i(tc_trap_cause_i),
@@ -1515,6 +2076,11 @@ module core_top_2b (
         .irq_msip(clint_msip_w), .irq_mtip(clint_mtip_w), .irq_meip(plic_meip_w),
         .irq_stip(1'b0), .irq_seip(plic_seip_w),
         .cycle_i(cycle_cnt), .instret_i(instret_cnt),
+        //   ★★ F1-B：time/timeh 接 CLINT 真实 mtime；写请求回到本层 64 位本体
+        .mtime_i(clint_mtime_w),
+        .mcycle_we_o(mcycle_we_w), .mcycleh_we_o(mcycleh_we_w),
+        .minstret_we_o(minstret_we_w), .minstreth_we_o(minstreth_we_w),
+        .cnt_wdata_o(cnt_wdata_w),
         .pmp_cfg_o(pmp_cfg_flat), .pmp_addr_o(pmp_addr_flat), .satp_o(csr_satp_o),
         .menvcfg_o(csr_menvcfg_w), .senvcfg_o(), .mcounteren_o(), .scounteren_o(),
         .mtvec_o(csr_mtvec_o), .stvec_o(csr_stvec_o),
@@ -1531,7 +2097,8 @@ module core_top_2b (
         .mstatus_set(priv_mset_w), .mstatus_clr(priv_mclr_w),
         .priv_o(csr_priv_2), .eff_priv_o(csr_eff_priv),
         .mprv_o(), .sum_o(), .mxr_o(), .mpp_o(),
-        .tvm_o(), .tw_o(), .tsr_o(), .fetch_priv_is_m_o(),
+        //   ★★ F4-1：实际当前 priv 的 mstatus.TVM/TSR 信号交 backend 做动态特权检查
+        .tvm_o(csr_tvm_w), .tw_o(), .tsr_o(csr_tsr_w), .fetch_priv_is_m_o(),
         .flush_req(), .priv_next_o()
     );
 
@@ -1544,7 +2111,10 @@ module core_top_2b (
     //     · exc_tval 按裁决① 适配（ecall→0 / 断点→PC / 其余→载荷 TVAL）
     //     · mie 按 ROB 非空掩码 ⇒ ROB 空时不取中断（无"下一条未执行指令"）
     trap_ctrl u_trap_ctrl (
-        .commit_valid (rob_any_w),
+        //   ★★ F4-1/C8：commit_valid 用**安全头 PC 资格**（rob_any & head_pc_valid）；
+        //     头窗口内容不安全时视为无提交 ⇒ 保持 pending，不用 unsafe PC 取中断/异常。
+        //     `trap_pc` 来源（trap_pc_w）不变。
+        .commit_valid (rob_pc_ok_w),
         .commit_pc    (trap_pc_w),
         .commit_pc_next(trap_pc_w),
         .commit_insn  (trap_tval_w),
@@ -1556,7 +2126,10 @@ module core_top_2b (
         .medeleg      (csr_medeleg_o),
         .mideleg      (csr_mideleg_o),
         .mip          (csr_mip_o),
-        .mie          (csr_mie_o & {32{rob_any_w}}),
+        //   ★★ F4：**设备读不可重复** ⇒ 从物理副作用发起前到真实退休/同步 trap，
+        //     用 `io_block` 屏蔽中断取点（异常不受影响）。`io_block` 只由寄存器
+        //     `io_arm_q` 与 LSQ 的 `side_pending` 组成，不依赖 trap 结果 ⇒ 无组合环。
+        .mie          (csr_mie_o & {32{rob_pc_ok_w & ~io_block_w}}),
         .mstatus_i    (csr_mstatus_raw),
         .mtvec        (csr_mtvec_o),
         .stvec        (csr_stvec_o),
@@ -1579,14 +2152,50 @@ module core_top_2b (
     //   ★ 4b-1c：`irq_mti_w` 保留为**观测口**（= 本拍真的在交付中断）；判定本体在 `trap_ctrl`
     assign irq_mti_w = tc_trap_valid & tc_trap_is_int;
 
-    //   ★ mcycle/minstret（Zicntr；4b-1c 的读回单调性判据用）
+    //   ★★ F1-B：mcycle/minstret（Zicntr）—— 64 位本体 + 软件半字写的**同沿**语义
+    //     与 2A `core_top.v` 同口径，差别仅在"提交宽度"：
+    //     · mcycle（clock 计数）：先整 64 位 +1，再覆盖被写半字；未写半保留本拍增量/进位。
+    //     · minstret（指令退休副效应）：写**代替本条自身**的隐式 +1 ⇒
+    //         pre   = 本体 + N_older            （同提交组中比 CSR 更老的 lane 先退休）
+    //         mid   = 半字覆盖(pre, 写值)        （本条自己的 +1 被替代）
+    //         next  = mid + N_young             （更年轻的 lane 在写之后退休）
+    //       非写拍：next = 本体 + N_commit（本拍全部 qualified 提交）。
+    //     N_older/N_young 由**真实 qualified 提交掩码 + CSR 提交 lane**（backend 的组合
+    //     输出 `csr_cmt_lane_o`）给出；本核 COMMIT_W=2。
+    //     · lane0=CSR,lane1=ALU（older=0,young=1）：**实测可达**（TB 计数 >0）。
+    //     · lane0=ALU,lane1=CSR（older=1,young=0）：要求 CSR 不在 ROB 头提交；当前后端
+    //       "CSR 指令只在 ROB 头执行"（`csr_pend` 串行化）⇒ **实测不可达**；本式仍按
+    //       通用位次计算（一旦后端放开即可生效），但不得宣称该组合已动态覆盖。
+    wire [2:0] cmt_older_w =
+        ({2'b00, commit_valid[0]} & {2'b00, (csr_cmt_lane_w > 2'd0)}) +
+        ({2'b00, commit_valid[1]} & {2'b00, (csr_cmt_lane_w > 2'd1)}) +
+        ({2'b00, commit_valid[2]} & {2'b00, (csr_cmt_lane_w > 2'd2)}) +
+        ({2'b00, commit_valid[3]} & {2'b00, (csr_cmt_lane_w > 2'd3)});
+    wire [2:0] cmt_younger_w =
+        ({2'b00, commit_valid[0]} & {2'b00, (csr_cmt_lane_w < 2'd0)}) +
+        ({2'b00, commit_valid[1]} & {2'b00, (csr_cmt_lane_w < 2'd1)}) +
+        ({2'b00, commit_valid[2]} & {2'b00, (csr_cmt_lane_w < 2'd2)}) +
+        ({2'b00, commit_valid[3]} & {2'b00, (csr_cmt_lane_w < 2'd3)});
+    wire        minstret_wr_w = minstret_we_w | minstreth_we_w;
+    wire [63:0] cycle_inc_w   = cycle_cnt + 64'd1;
+    wire [63:0] cycle_next_w  = mcycle_we_w  ? {cycle_inc_w[63:32], cnt_wdata_w} :
+                                mcycleh_we_w ? {cnt_wdata_w, cycle_inc_w[31:0]} :
+                                               cycle_inc_w;
+    wire [63:0] instret_pre_w  = instret_cnt +
+                                 {61'b0, (minstret_wr_w ? cmt_older_w : cmt_num_w)};
+    wire [63:0] instret_mid_w  = minstret_we_w  ? {instret_pre_w[63:32], cnt_wdata_w} :
+                                 minstreth_we_w ? {cnt_wdata_w, instret_pre_w[31:0]} :
+                                                  instret_pre_w;
+    wire [63:0] instret_next_w = instret_mid_w +
+                                 {61'b0, (minstret_wr_w ? cmt_younger_w : 3'd0)};
+
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             cycle_cnt   <= 64'h0;
             instret_cnt <= 64'h0;
         end else begin
-            cycle_cnt   <= cycle_cnt + 64'd1;
-            instret_cnt <= instret_cnt + {61'b0, cmt_num_w};
+            cycle_cnt   <= cycle_next_w;
+            instret_cnt <= instret_next_w;
         end
     end
 
@@ -1684,9 +2293,60 @@ module core_top_2b (
         end
     end
 
-    assign be_trp_flush       = trp_take_w | fencei_pend_w | maint_pend_w | maint_hold_w;
-    assign be_trp_redirect_v  = trp_take_w | maint_redir_w | (fencei_busy_q & ~fencei_busy);
+    //==========================================================================
+    // 6b-pmp. ★★ F4/PMP：合法 PMP CSR 写“同步重取”
+    //--------------------------------------------------------------------------
+    //  证据（私有合法程序）：更老 PMP CSR 提交新 deny 后，已完成预检的年轻 store 仍落写；
+    //  且 CSR lane0 + store lane1 同组提交（commit_valid=0011）也落写。5f3 在 backend
+    //  做 candidate 级 lane>PMP lane 的 commit/CDQ 限制；本层负责“已退休事件”后的
+    //  flush + 重取（新 PMP 下重新预检）。
+    //  纪律：
+    //    · `pmp_cmt` 是**实际退休沿**脉冲；先寄存，下一拍起 flush，绝不同拍组合抑本条 CSR。
+    //    · 只对合法**写**事件触发；CSR 读不触发（5f3 只在 csr_we 上导出）。
+    //    · trap/xRET 的同拍/窗口内 flush+redirect 已覆盖“新 PMP 后重取” ⇒ 清本地挂起。
+    //    · fence.i/sfence/cbo 维护窗口优先：PMP 窗口等维护 redirect 完成后再 flush+redirect。
+    //    · 只延迟中断（flush 期间不提交、mip 不清）；不清 pending、不新增 cause/IRQ。
+    //    · 已退休 CDQ store 不在本机制内（照常排空，不 retroactive PMP fault）。
+    //==========================================================================
+    reg         pmp_pend_q;
+    reg  [1:0]  pmp_wait_q;
+    reg  [31:0] pmp_next_pc_q;
+    wire        pmp_evt_w   = pmp_cmt_w & ~trp_take_w & ~xret_cmt_w;
+    wire        pmp_busy_w  = fencei_pend_w | maint_pend_w | maint_hold_w;
+    // Four quiet cycles are not an epoch barrier: preserve committed CDQ stores and
+    // wait for the adapter, L1D, and old PTW owner to drain before refetch.
+    wire        pmp_owner_drain_w = cdq_empty_w & (ad_st_q == AD_IDLE) &
+                                    l1d_idle & ptw_idle_w;
+    wire        pmp_redir_w = pmp_pend_q & (pmp_wait_q == 2'd0) & ~pmp_busy_w & pmp_owner_drain_w &
+                              ~trp_take_w & ~xret_cmt_w;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) begin
+            pmp_pend_q <= 1'b0; pmp_wait_q <= 2'd0; pmp_next_pc_q <= 32'h0;
+        end else if (trp_take_w | xret_cmt_w) begin
+            // 同步 trap / xRET 自带 flush+redirect（重取在用新 PMP），本地事件作废
+            pmp_pend_q <= 1'b0; pmp_wait_q <= 2'd0;
+        end else if (pmp_evt_w & ~pmp_pend_q) begin
+            //   ★ 只在窗口外接受新事件：窗口内不得被第二个/重复 pulse 改 next_pc/重启窗口
+            //     （PMP 写同步 flush 期间不会提交新指令 ⇒ 真实第二个 PMP 写不可能在窗口内）。
+            pmp_pend_q   <= 1'b1;
+            pmp_wait_q   <= 2'd3;               // 4 拍 flush 窗口
+            pmp_next_pc_q<= pmp_cmt_next_pc_w;  // backend 给真 CSR PC+4
+        end else if (pmp_pend_q) begin
+            if (!pmp_busy_w && pmp_owner_drain_w) begin
+                if (pmp_wait_q == 2'd0) pmp_pend_q <= 1'b0;
+                else                    pmp_wait_q <= pmp_wait_q - 2'd1;
+            end
+        end
+    end
+    //   ★★ 绝不在事件拍组合回灌 flush（会经 cmt_ok 反抑本条已退休 CSR）⇒ 只用寄存版。
+    wire        pmp_flush_w = pmp_pend_q;
+
+    assign be_trp_flush       = trp_take_w | fencei_pend_w | maint_pend_w | maint_hold_w |
+                                pmp_flush_w;
+    assign be_trp_redirect_v  = trp_take_w | pmp_redir_w | maint_redir_w |
+                                (fencei_busy_q & ~fencei_busy);
     assign be_trp_redirect_pc = trp_take_w          ? trp_target_w :
+                                pmp_redir_w         ? pmp_next_pc_q :
                                 maint_redir_w       ? maint_pc_save_q :
                                 (fencei_busy_q & ~fencei_busy) ? fencei_pc_q :
                                                       trp_target_w;

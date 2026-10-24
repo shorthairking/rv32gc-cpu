@@ -96,6 +96,8 @@ module tb_trap_ctrl_top;
     reg         p_xret_valid = 0;
     reg  [1:0]  p_xret_kind = 2'b01;
     wire [31:0] p_mstatus_set, p_mstatus_clr;
+    wire [1:0]  p_xret_target_priv;
+    reg  [31:0] k_land;
     wire [1:0]  p_priv_o, p_eff_priv_o, p_priv_next_o;
     wire        p_mprv_o, p_sum_o, p_mxr_o, p_tvm_o, p_tw_o, p_tsr_o;
     wire [1:0]  p_mpp_o;
@@ -108,6 +110,7 @@ module tb_trap_ctrl_top;
         .mstatus_i(p_mstatus_i), .csr_wen(p_csr_wen),
         .csr_waddr(p_csr_waddr), .csr_wdata(p_csr_wdata),
         .mstatus_set(p_mstatus_set), .mstatus_clr(p_mstatus_clr),
+        .xret_target_priv_o(p_xret_target_priv),
         .priv_o(p_priv_o), .eff_priv_o(p_eff_priv_o),
         .mprv_o(p_mprv_o), .sum_o(p_sum_o), .mxr_o(p_mxr_o),
         .mpp_o(p_mpp_o), .tvm_o(p_tvm_o), .tw_o(p_tw_o), .tsr_o(p_tsr_o),
@@ -155,6 +158,16 @@ module tb_trap_ctrl_top;
                          ({31'b0, sum_b}  << `RV32GC_MSTATUS_SUM_BIT)  |
                          ({31'b0, mxr_b}  << `RV32GC_MSTATUS_MXR_BIT)  |
                          ({30'b0, mpp}    << `RV32GC_MSTATUS_MPP_LSB);
+        end
+    endfunction
+
+    // ★ 落盘值 = csr_file 的 `(stored & ~clr) | set`（同拍 xret/trap 的独立 gold）
+    function [31:0] land_mstat;
+        input [31:0] pre;
+        input [31:0] set;
+        input [31:0] clr;
+        begin
+            land_mstat = (pre & ~clr) | set;
         end
     endfunction
 
@@ -813,6 +826,65 @@ module tb_trap_ctrl_top;
         mstatus_i = mk_mstatus(1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, 1'b0, `RV32GC_PRIV_S);
         #1;
         expect_eq1("CTRL J18b S 已委托 + SIE=0 ⇒ 不取", trap_valid, 1'b0);
+
+        //==========================================================================
+        // K. 【同拍 xRET + trap】有序落地：先返回（MIE←MPIE/MPIE←1/MPP←U/按需清 MPRV），
+        //    合法 trap 再按"返回后的状态/模式"落地。旧实现 OR 向量会让 MPIE=1 的 MRET
+        //    把 MIE 重新置 1（入口 MIE=1，handler 再取一次），本段为独立 gold。
+        //==========================================================================
+        //   ---- K1：M + MIE=1/MPIE=1/MPP=M，MRET + M 目标 IRQ ⇒ 入口 MIE=0 ----
+        p_mstatus_i = 32'h0000_1888;
+        p_trap_target = `RV32GC_PRIV_M; p_xret_kind = 2'b01;
+        @(negedge clk); p_trap_valid = 1'b1; p_xret_valid = 1'b1; #1;
+        k_land = land_mstat(p_mstatus_i, p_mstatus_set, p_mstatus_clr);
+        expect_eq32("★ K1 xret+trap 落盘 = 0x1880（MIE0/MPIE1/MPPM）", k_land, 32'h0000_1880);
+        expect_eq1("★ K1 入口 MIE=0", k_land[`RV32GC_MSTATUS_MIE_BIT], 1'b0);
+        expect_eq1("K1 入口 MPIE=1", k_land[`RV32GC_MSTATUS_MPIE_BIT], 1'b1);
+        expect_eq32("K1 入口 MPP=M",
+                    (k_land >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h3);
+        expect_eq1("K1 priv_next=M", p_priv_next_o == `RV32GC_PRIV_M, 1'b1);
+        expect_eq1("K1 xret_target_priv=M（纯组合，与 trap 无关）",
+                   p_xret_target_priv == `RV32GC_PRIV_M, 1'b1);
+        @(posedge clk); #1;
+        @(negedge clk); p_trap_valid = 1'b0; p_xret_valid = 1'b0; #1;
+        //   ---- K2：MPIE=0 的 MRET + IRQ ⇒ MPIE←MIE(after)=0，入口 MIE=0 ----
+        p_mstatus_i = 32'h0000_1808;   // MIE=1, MPIE=0, MPP=M
+        p_trap_target = `RV32GC_PRIV_M; p_xret_kind = 2'b01;
+        @(negedge clk); p_trap_valid = 1'b1; p_xret_valid = 1'b1; #1;
+        k_land = land_mstat(p_mstatus_i, p_mstatus_set, p_mstatus_clr);
+        expect_eq32("★ K2 MPIE=0 时落盘 = 0x1800（MPIE←0/MPPM/MIE0）", k_land, 32'h0000_1800);
+        expect_eq1("K2 入口 MPIE=0", k_land[`RV32GC_MSTATUS_MPIE_BIT], 1'b0);
+        @(posedge clk); #1;
+        @(negedge clk); p_trap_valid = 1'b0; p_xret_valid = 1'b0; #1;
+        //   ---- K3：MRET 返 U（MPP=U）+ M 目标 IRQ ⇒ trap 的 MPP←U（返回后的模式）----
+        p_mstatus_i = 32'h0000_0088;   // MIE=1, MPIE=1, MPP=U
+        p_trap_target = `RV32GC_PRIV_M; p_xret_kind = 2'b01;
+        @(negedge clk); p_trap_valid = 1'b1; p_xret_valid = 1'b1; #1;
+        k_land = land_mstat(p_mstatus_i, p_mstatus_set, p_mstatus_clr);
+        expect_eq32("★ K3 MRET→U + M trap：落盘 = 0x0080（MPP←U，非旧 M）", k_land, 32'h0000_0080);
+        expect_eq32("★ K3 MPP=U（返回后的 y）",
+                    (k_land >> `RV32GC_MSTATUS_MPP_LSB) & 32'h3, 32'h0);
+        expect_eq1("K3 priv_next=M（trap 目标优先）",
+                   p_priv_next_o == `RV32GC_PRIV_M, 1'b1);
+        expect_eq1("K3 xret_target_priv=U（返回目标，与 trap 无关）",
+                   p_xret_target_priv == `RV32GC_PRIV_U, 1'b1);
+        @(posedge clk); #1;
+        @(negedge clk); p_trap_valid = 1'b0; p_xret_valid = 1'b0; #1;
+        //   ---- K4：SRET（SPP=U）+ S 目标 trap ⇒ SPP←U/SIE0/SPIE1 ----
+        p_mstatus_i = 32'h0000_0022;   // SIE=1, SPIE=1, SPP=U
+        p_trap_target = `RV32GC_PRIV_S; p_xret_kind = 2'b00;
+        @(negedge clk); p_trap_valid = 1'b1; p_xret_valid = 1'b1; #1;
+        k_land = land_mstat(p_mstatus_i, p_mstatus_set, p_mstatus_clr);
+        expect_eq32("★ K4 SRET+trap 落盘 = 0x0020（SPIE1/SIE0/SPP←U）", k_land, 32'h0000_0020);
+        expect_eq1("K4 入口 SIE=0", k_land[`RV32GC_MSTATUS_SIE_BIT], 1'b0);
+        expect_eq1("K4 入口 SPIE=1", k_land[`RV32GC_MSTATUS_SPIE_BIT], 1'b1);
+        expect_eq1("K4 priv_next=S（trap 目标优先）",
+                   p_priv_next_o == `RV32GC_PRIV_S, 1'b1);
+        expect_eq1("K4 xret_target_priv=U（SRET 返回目标）",
+                   p_xret_target_priv == `RV32GC_PRIV_U, 1'b1);
+        @(posedge clk); #1;
+        @(negedge clk); p_trap_valid = 1'b0; p_xret_valid = 1'b0; #1;
+        p_mstatus_i = 32'h0; #1;
 
         //   ---- 收尾：清中断请求，避免影响后续/收尾判定 ----
         mip = 32'h0; mideleg = 32'h0; #1;

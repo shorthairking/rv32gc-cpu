@@ -273,6 +273,16 @@ module tb_back2_ipc;
         .csr_raddr_o(tb_csr_raddr), .csr_rdata_i(tb_csr_rdata),
         .csr_frm_i(tb_csr_frm), .csr_fflags_i(tb_csr_fflags),
         .csr_we_o(tb_csr_we), .csr_waddr_o(tb_csr_waddr), .csr_wdata_o(tb_csr_wdata),
+        //   ★★ F4-1：本 bench 为纯后端直驱（无 csr_file / priv_ctrl）⇒ 检查反馈
+        //     按**环境模型**接常量（M 态裸机、无 CSR 检查源）；候选查询口悬空观测。
+        //     程序序权限检查本身由 sim/functional/tb_backend_permission.sv 用真实
+        //     csr_file 覆盖，本 bench 不冒充该验证。
+        .csr_chk_valid_o(), .csr_chk_addr_o(), .csr_chk_wr_o(),
+        .csr_chk_illegal_i(1'b0), .csr_chk_ro_write_i(1'b0),
+        .csr_tsr_i(1'b0), .csr_tvm_i(1'b0),
+        //   ★★ F4-1 LSQ 透传：本纯直驱 bench 无 Top 访存适配器 ⇒ 显式 0（不靠 Z）。
+        .mem_rsp_cause_i(4'h0), .mem_rsp_defer_i(1'b0), .mem_rsp_side_i(1'b0),
+        .st_xlate_fault_cause_i(4'h0),
         .xret_kind_o(),
         .trap_valid_o(trap_valid), .trap_pc_o(trap_pc),
         .trap_cause_o(trap_cause), .trap_tval_o(trap_tval),

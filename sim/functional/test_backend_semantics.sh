@@ -156,24 +156,46 @@ snapshot_root() {
         [ -f "$root/$rel" ] || { echo "snapshot: REQUIRED INPUT MISSING: $root/$rel" >> "$RUN_LOG"; return 1; }
         mkdir -p -- "$snap/$(dirname -- "$rel")" || return 1
         cp -p -- "$root/$rel" "$snap/$rel" || return 1
+        cmp -s -- "$root/$rel" "$snap/$rel" || { echo "snapshot: source-copy mismatch: $rel" >> "$RUN_LOG"; return 1; }
     done
     [ -f "$TB_SRC" ] || { echo "snapshot: TB missing $TB_SRC" >> "$RUN_LOG"; return 1; }
     cp -p -- "$TB_SRC" "$snap/$TB_IN_SNAP" || return 1
+    cmp -s -- "$TB_SRC" "$snap/$TB_IN_SNAP" || { echo "snapshot: source-copy mismatch: $TB_IN_SNAP" >> "$RUN_LOG"; return 1; }
     return 0
 }
 
-# 固定顺序 sha256 清单（26 行）。**先捕获 sha256sum 输出与其 rc，再 sort**：
-# sha256sum 非零即返回非零（即使它打印了看似完整正确的 26 行）⇒ 调用方硬拒。
-snapshot_manifest() {
-    local out rc
-    out="$( cd -- "$1" || exit 1
-           sha256sum -- "${DEP_FILES[@]}" "${HDR_FILES[@]}" "$TB_IN_SNAP" )"
+# Capture raw bytes to a private file, check original rc and exact ordered path list,
+# only then normalize/sort. Never infer row count from command-substitution text.
+MANIFEST_SEQ=0
+snapshot_manifest() { # <snap> <raw-file> -> validated sorted manifest on stdout
+    local snap="$1" raw="$2" rc
+    ( cd -- "$snap" || exit 1
+      sha256sum -- "${DEP_FILES[@]}" "${HDR_FILES[@]}" "$TB_IN_SNAP" ) >"$raw"
     rc=$?
     [ "$rc" -eq 0 ] || return "$rc"
-    printf '%s\n' "$out" | LC_ALL=C sort
+    python3 - "$raw" "${DEP_FILES[@]}" "${HDR_FILES[@]}" "$TB_IN_SNAP" <<'PY' || return 1
+import pathlib,re,sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); paths=sys.argv[2:]
+if not b.endswith(b"\n") or b"\0" in b or b"\r" in b: raise SystemExit(1)
+ls=b[:-1].split(b"\n")
+if len(ls)!=len(paths): raise SystemExit(1)
+seen=set()
+for line,path in zip(ls,paths):
+ m=re.fullmatch(rb"([0-9a-f]{64})  (.+)",line)
+ if not m or m.group(2)!=path.encode() or path in seen: raise SystemExit(1)
+ seen.add(path)
+PY
+    LC_ALL=C sort -- "$raw"
 }
-manifest_write() {   # $1=snap $2=outfile ; 返回 sha256sum 的 rc（不吞非零）
-    snapshot_manifest "$1" > "$2"
+manifest_write() { # <snap> <outfile>; raw bytes retained next to output
+    MANIFEST_SEQ=$((MANIFEST_SEQ + 1))
+    snapshot_manifest "$1" "$RUN_DIR/manifest-$MANIFEST_SEQ.raw" >"$2"
+}
+manifest_matches() { # <snap> <reference> <tag>
+    MANIFEST_SEQ=$((MANIFEST_SEQ + 1))
+    local out="$RUN_DIR/manifest-check-$MANIFEST_SEQ.txt"
+    snapshot_manifest "$1" "$RUN_DIR/manifest-check-$MANIFEST_SEQ.raw" >"$out" || return 1
+    cmp -s "$2" "$out"
 }
 
 #------------------------------------------------------------------------------
@@ -188,13 +210,14 @@ compile_root() {
     [ -f "$snap/$TB_IN_SNAP" ] || { echo "[$tag] MISSING snapshot TB: $snap/$TB_IN_SNAP" >> "$RUN_LOG"; missing=1; }
     [ "$missing" -eq 0 ] || return 1
 
-    sha_out="$(snapshot_manifest "$snap")"; rc=$?
-    [ "$rc" -eq 0 ] || { echo "[$tag] snapshot_manifest rc=$rc (硬拒)" >> "$RUN_LOG"; return 1; }
-    n_lines="$(printf '%s\n' "$sha_out" | grep -c . || true)"
-    n_ok="$(printf '%s\n' "$sha_out" | grep -cE '^[0-9a-f]{64}  ' || true)"
-    if [ "$n_ok" -ne "$INPUT_N" ] || [ "$n_lines" -ne "$n_ok" ]; then
-        echo "[$tag] sha256 line check failed lines=$n_lines hex=$n_ok expect=$INPUT_N" >> "$RUN_LOG"
-        printf '%s\n' "$sha_out" >> "$RUN_LOG"; return 1
+    MANIFEST_SEQ=$((MANIFEST_SEQ + 1))
+    local raw="$RUN_DIR/manifest-compile-$MANIFEST_SEQ.raw"
+    sha_out="$(snapshot_manifest "$snap" "$raw")"; rc=$?
+    [ "$rc" -eq 0 ] || { echo "[$tag] snapshot_manifest rc=$rc (硬拒; raw=$raw)" >> "$RUN_LOG"; return 1; }
+    n_lines="$(wc -l < "$raw")"
+    if [ "$n_lines" -ne "$INPUT_N" ]; then
+        echo "[$tag] sha256 raw line check failed lines=$n_lines expect=$INPUT_N" >> "$RUN_LOG"
+        return 1
     fi
     {
         echo "-- [$tag] SNAPSHOT_ROOT = $snap"
@@ -203,8 +226,12 @@ compile_root() {
     } >> "$RUN_LOG"
 
     # 关键：cwd = 快照 root；相对 `-I` 与相对源路径 ⇒ 工作树头/cwd 不可能被借入
+    #   ★ F4-1 接口宏：只有**新树**定义 `BACKEND_HAS_CSR_CHK`（新增 CSR 检查端口）；
+    #     201 旧树不定义 ⇒ 同一 TB 用纯接口适配分支编译，**不改变黄金/不伪造执行**。
+    local defs=""
+    [ "$tag" = "old" ] || defs="-DBACKEND_HAS_CSR_CHK -DBACKEND_HAS_LSQ_F4"
     ( cd -- "$snap" && \
-      timeout "$TIMEOUT_COMPILE_S" "$IV" -g2012 -I rtl/pkg -I . \
+      timeout "$TIMEOUT_COMPILE_S" "$IV" -g2012 $defs -I rtl/pkg -I . \
               -s tb_backend_semantics -o "$vvp" "$TB_IN_SNAP" "${DEP_FILES[@]}" ) \
         > "$RUN_LOG.compile.$tag" 2>&1
     rc=$?
@@ -432,7 +459,7 @@ fi
 # (2b) 完整快照从**任意 cwd**（/=）编译（正控）
 CP_C_N=$((CP_C_N+1))
 if ( cd / && compile_root "$SNAP_NEW" "$RUN_DIR/cp_foreign.vvp" "cp-foreign" ) \
-   && cmp -s "$RUN_DIR/man_new_before.txt" <(snapshot_manifest "$SNAP_NEW"); then
+   && manifest_matches "$SNAP_NEW" "$RUN_DIR/man_new_before.txt" cp_foreign; then
     CP_C_OK=$((CP_C_OK+1)); printf 'CP closure foreign-cwd got=accept want=accept pass\n' >> "$RUN_LOG"
 else
     printf 'CP closure foreign-cwd got=reject want=accept REJECTED\n' >> "$RUN_LOG"
@@ -444,12 +471,10 @@ CP_C_N=$((CP_C_N+1))
 if snapshot_root "$DUT_ROOT" "$FIX_SRC" && snapshot_root "$FIX_SRC" "$FIX_SNAP" \
    && manifest_write "$FIX_SNAP" "$RUN_DIR/man_mut_before.txt"; then
     printf '\n// FIXTURE-ONLY mutation (private fixture; NOT a repo header)\n' >> "$FIX_SRC/rtl/pkg/rv32_defs.vh"
-    MUT_SRC_AFTER="$(sha256sum "$FIX_SRC/rtl/pkg/rv32_defs.vh" | awk '{print $1}')"
-    SNAP_HDR="$(sha256sum "$FIX_SNAP/rtl/pkg/rv32_defs.vh" | awk '{print $1}')"
     if ( cd / && compile_root "$FIX_SNAP" "$RUN_DIR/cp_mut.vvp" "cp-mut" ) \
        && manifest_write "$FIX_SNAP" "$RUN_DIR/man_mut_after.txt" \
        && cmp -s "$RUN_DIR/man_mut_before.txt" "$RUN_DIR/man_mut_after.txt" \
-       && [ "$MUT_SRC_AFTER" != "$SNAP_HDR" ]; then
+       && ! cmp -s -- "$FIX_SRC/rtl/pkg/rv32_defs.vh" "$FIX_SNAP/rtl/pkg/rv32_defs.vh"; then
         CP_C_OK=$((CP_C_OK+1)); printf 'CP closure mutation-isolated(comment) got=isolated want=isolated pass\n' >> "$RUN_LOG"
     else
         printf 'CP closure mutation-isolated(comment) got=leaked want=isolated REJECTED\n' >> "$RUN_LOG"
@@ -535,7 +560,7 @@ CP_C_N=$((CP_C_N+1))
 rc_cdremoved2=$?
 if [ "$rc_cdremoved2" -ne 0 ] \
    && ( cd -- "$POISON" && compile_root "$SNAP_NEW" "$RUN_DIR/cp_poison.vvp" "cp-poison" ) \
-   && cmp -s "$RUN_DIR/man_new_before.txt" <(snapshot_manifest "$SNAP_NEW"); then
+   && manifest_matches "$SNAP_NEW" "$RUN_DIR/man_new_before.txt" cp_foreign; then
     CP_C_OK=$((CP_C_OK+1))
     printf 'CP closure poison-rearmed(cd-removed fails & snapshot ok) got=fail+accept want=fail+accept pass (poison=re-armed)\n' >> "$RUN_LOG"
 else
@@ -556,7 +581,7 @@ CP_S_N=$((CP_S_N+1))
 fake_rc=$?
 fake_lines="$(grep -cE '^[0-9a-f]{64}  ' "$RUN_DIR/fake_sha.raw" || true)"
 if [ "$fake_rc" -eq 9 ] && [ "$fake_lines" -eq "$INPUT_N" ]; then
-    if ( cd -- "$SNAP_NEW" && PATH="$FAKEBIN:$PATH" snapshot_manifest "$SNAP_NEW" ) \
+    if PATH="$FAKEBIN:$PATH" snapshot_manifest "$SNAP_NEW" "$RUN_DIR/fake_sha.selftest.raw" \
         > "$RUN_DIR/fake_sha.manifest" 2>&1; then
         printf 'CP sha nonzero-full-output got=accept want=reject REJECTED\n' >> "$RUN_LOG"
     else
@@ -566,6 +591,46 @@ if [ "$fake_rc" -eq 9 ] && [ "$fake_lines" -eq "$INPUT_N" ]; then
 else
     printf 'CP sha nonzero-full-output precondition_failed raw_rc=%s raw_lines=%s REJECTED\n' "$fake_rc" "$fake_lines" >> "$RUN_LOG"
 fi
+
+# Exercise the actual default-package manifest_write caller (26 fixed inputs).
+# Each fake tool passes through real output, mutates only the 26-input invocation,
+# and the child must fail specifically at manifest_new_before before compile/vvp.
+SHA_MATRIX_BIN="$RUN_DIR/sha-matrix-bin"; mkdir -p -- "$SHA_MATRIX_BIN"
+cat > "$SHA_MATRIX_BIN/sha256sum" <<'SH'
+#!/usr/bin/env bash
+"$REAL_SHA_ORIG" "$@" >"$SHA_MATRIX_RAW"; rc=$?
+if [ "$#" -ne 27 ]; then cat -- "$SHA_MATRIX_RAW"; exit "$rc"; fi
+python3 - "$SHA_MATRIX_RAW" "$SHA_MATRIX_MODE" <<'PY'
+import pathlib,sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); m=sys.argv[2]
+if m=='extra1': b+=b.split(b'\n',1)[0]+b'\n'
+elif m=='blanks': b+=b'\n\n'
+elif m=='unterminated': b=b[:-1]
+elif m=='wrongpath': b=b.replace(b'  ',b'  wrong-path-',1)
+elif m=='garbage': b+=b'NOT-A-HASH\n'
+elif m=='nulcr': b+=b'\0\r\n'
+sys.stdout.buffer.write(b)
+PY
+if [ "$SHA_MATRIX_MODE" = exit9 ]; then exit 9; else exit "$rc"; fi
+SH
+chmod +x "$SHA_MATRIX_BIN/sha256sum"
+for hm in extra1 blanks unterminated wrongpath garbage nulcr exit9; do
+    CP_S_N=$((CP_S_N+1))
+    out="$RUN_DIR/sha-matrix-$hm.out"
+    env PATH="$SHA_MATRIX_BIN:$PATH" REAL_SHA_ORIG="$REAL_SHA" \
+        SHA_MATRIX_RAW="$RUN_DIR/sha-matrix-$hm.raw" SHA_MATRIX_MODE="$hm" \
+        RV32_BACKEND_SEMANTICS_MODE=spec OUT_DIR="$RUN_DIR/sha-matrix-$hm-out" \
+        bash "$SELF_ABS" >"$out" 2>&1
+    hm_rc=$?
+    if [ "$hm_rc" -eq 1 ] && grep -q 'reason=manifest_new_before_failed' "$out" \
+       && ! grep -qxF 'FUNCTIONAL_BACKEND_SEMANTICS: PASS' "$out"; then
+        CP_S_OK=$((CP_S_OK+1))
+        printf 'CP sha actual-manifest caller mode=%s rc=%s reason=manifest_new_before_failed pass\\n' "$hm" "$hm_rc" >> "$RUN_LOG"
+    else
+        printf 'CP sha actual-manifest caller mode=%s rc=%s REJECTED\\n' "$hm" "$hm_rc" >> "$RUN_LOG"
+        cat -- "$out" >> "$RUN_LOG"
+    fi
+done
 
 # (4) X 敏感：csr_we/commit_valid/fprf_we 注 X ⇒ XZ；XINJ=0 正控 ⇒ OK
 for spec in "1:XZ" "2:XZ" "3:XZ" "0:OK"; do

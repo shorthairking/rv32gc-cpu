@@ -76,26 +76,27 @@ fail() {
     exit 1
 }
 
-HASH_ERR=""     # 失败原因（**全局**：绝不放在 command substitution 子壳里，否则会丢）
-HASH_OUT=""     # 成功时的 64 hex（同样走全局，避免 `$(...)` 吞 rc/丢状态）
-
-#   ★ 用法约定：**不要**写 `h=$(hash_one f)` —— 那会开子壳，既丢 rc 又丢 HASH_ERR。
-#     一律 `hash_one f || fail "..."`，随后读 $HASH_OUT。
-hash_one() {  # hash_one <file> -> 成功: HASH_OUT=64hex, rc=0；失败: HASH_ERR, rc=1
-    local f="$1" out rc one nlines
-    HASH_ERR=""; HASH_OUT=""
-    out="$(sha256sum -- "$f" 2>>"$DRV_LOG")"
-    rc=$?
+HASH_ERR=""; HASH_OUT=""; HASH_SEQ=0
+# Capture raw bytes first; preserve sha256sum's rc and verify exactly one LF line
+# with the exact caller path (not just a digest-shaped prefix).
+hash_one() {
+    local f="$1" raw rc parsed
+    HASH_ERR=""; HASH_OUT=""; HASH_SEQ=$((HASH_SEQ + 1))
+    raw="$DRV/hash-one-$HASH_SEQ.raw"
+    sha256sum -- "$f" >"$raw" 2>>"$DRV_LOG"; rc=$?
     if [ "$rc" -ne 0 ]; then HASH_ERR="hash_rc=$rc file=$f"; return 1; fi
-    if [ -z "$out" ]; then HASH_ERR="hash_empty file=$f"; return 1; fi
-    nlines="$(printf '%s\n' "$out" | wc -l)"
-    if [ "$nlines" -ne 1 ]; then HASH_ERR="hash_lines=$nlines file=$f"; return 1; fi
-    one="${out%%[[:space:]]*}"
-    if [ "${#one}" -ne 64 ]; then HASH_ERR="hash_len=${#one} file=$f"; return 1; fi
-    case "$one" in
-        *[!0-9a-f]*) HASH_ERR="hash_badhex file=$f"; return 1 ;;
-    esac
-    HASH_OUT="$one"
+    parsed="$(python3 - "$raw" "$f" <<'PY'
+import pathlib, re, sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); p=sys.argv[2].encode()
+if not b.endswith(b"\n") or b"\0" in b or b"\r" in b: raise SystemExit(1)
+ls=b[:-1].split(b"\n")
+if len(ls)!=1: raise SystemExit(1)
+m=re.fullmatch(rb"([0-9a-f]{64})  (.+)",ls[0])
+if not m or m.group(2)!=p: raise SystemExit(1)
+sys.stdout.write(m.group(1).decode())
+PY
+)" || { HASH_ERR="hash_format file=$f"; return 1; }
+    HASH_OUT="$parsed"
     return 0
 }
 
@@ -120,10 +121,24 @@ is_hex64() {
     return 0
 }
 
-# ★ rc 传播：sha256sum 的 rc 由函数返回，调用方用 `rc=$?` 取；不经管道吞掉。
-snapshot_sha() {  # snapshot_sha <root>  -> 7 行 sha256sum 输出，rc=sha256sum 的 rc
-    local r="$1"
-    ( cd -- "$r" && sha256sum -- $BASE_FILES 2>>"$DRV_LOG" )
+# Raw stdout is retained in the private driver run; preserve the command rc.
+snapshot_sha() { # <root> <raw>; stdout bytes go to raw, return original sha rc
+    local r="$1" raw="$2"
+    ( cd -- "$r" && sha256sum -- $BASE_FILES ) >"$raw" 2>>"$DRV_LOG"
+}
+snapshot_sha_validate() { # <raw>
+    python3 - "$1" $BASE_FILES <<'PY'
+import pathlib,re,sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); paths=sys.argv[2:]
+if not b.endswith(b"\n") or b"\0" in b or b"\r" in b: raise SystemExit(1)
+ls=b[:-1].split(b"\n")
+if len(ls)!=len(paths): raise SystemExit(1)
+seen=set()
+for line,path in zip(ls,paths):
+ m=re.fullmatch(rb"[0-9a-f]{64}  (.+)",line)
+ if not m or m.group(1)!=path.encode() or path in seen: raise SystemExit(1)
+ seen.add(path)
+PY
 }
 
 note "==== test_cache_bus_driver.sh ===="
@@ -178,12 +193,9 @@ CUR="$DRV/deps_cur"
 #     (b) 拒绝空输出与非法 hex；
 #     (c) 比较前先各自校验非空 —— 否则"两边都失败 ⇒ 空==空 ⇒ 通过"是最隐蔽的假绿。
 # ★ 块校验：恰好 SNAP_N 行、且 SNAP_N 行全为 64 位 hex（不允许额外坏行）
-snapshot_sha_check() {  # snapshot_sha_check <block> <tag>
-    local block="$1" tag="$2" n_total n_hex
-    n_total="$(printf '%s\n' "$block" | wc -l)"
-    n_hex="$(printf '%s\n' "$block" | grep -c '^[0-9a-f]\{64\}  ' || true)"
-    [ "$n_total" = "$SNAP_N" ] || fail "${tag}_lines=$n_total expect=$SNAP_N"
-    [ "$n_hex"   = "$SNAP_N" ] || fail "${tag}_hex=$n_hex expect=$SNAP_N"
+snapshot_sha_check() {  # raw file + tag; fail closed on exact list/bytes
+    local raw="$1" tag="$2"
+    snapshot_sha_validate "$raw" || fail "${tag}_format_or_path"
 }
 
 if [ "$MODE" = "full" ]; then
@@ -197,10 +209,11 @@ if [ "$MODE" = "full" ]; then
         verify_copy_equal "$REPO_ROOT/$f" "$CUR/$f" "cur f=$f" \
             || fail "cur_snapshot_copy_check f=$f ${HASH_ERR}"
     done
-    CUR_SHA_PRE="$(snapshot_sha "$CUR")"
-    rc=$?
+    CUR_SHA_PRE_RAW="$DRV/cur_sha_pre.raw"
+    snapshot_sha "$CUR" "$CUR_SHA_PRE_RAW"; rc=$?
     [ "$rc" -eq 0 ] || fail "cur_snapshot_sha_rc=$rc"
-    snapshot_sha_check "$CUR_SHA_PRE" "cur_snapshot_sha"
+    snapshot_sha_check "$CUR_SHA_PRE_RAW" "cur_snapshot_sha"
+    CUR_SHA_PRE="$(cat -- "$CUR_SHA_PRE_RAW")"
     note "CUR        = $CUR"
     note "CUR_SHA    = $CUR_SHA_PRE"
     #   ---- 旧树基线快照（git show 提取；不递归 build、不碰工作树）----
@@ -211,14 +224,31 @@ if [ "$MODE" = "full" ]; then
         [ -s "$SNAP/$f" ] || fail "snapshot_empty f=$f"
         chmod 444 -- "$SNAP/$f" || fail "snapshot_chmod_failed f=$f"
     done
-    SNAP_SHA_PRE="$(snapshot_sha "$SNAP")"
-    rc=$?
+    SNAP_SHA_PRE_RAW="$DRV/snapshot_sha_pre.raw"
+    snapshot_sha "$SNAP" "$SNAP_SHA_PRE_RAW"; rc=$?
     [ "$rc" -eq 0 ] || fail "snapshot_sha_rc=$rc"
-    snapshot_sha_check "$SNAP_SHA_PRE" "snapshot_sha"
+    snapshot_sha_check "$SNAP_SHA_PRE_RAW" "snapshot_sha"
+    SNAP_SHA_PRE="$(cat -- "$SNAP_SHA_PRE_RAW")"
     note "SNAP       = $SNAP"
     note "SNAP_COMMIT= $BASE_COMMIT"
     note "SNAP_SHA   = $SNAP_SHA_PRE"
     [ "$SNAP_SHA_PRE" != "$CUR_SHA_PRE" ] || fail "snapshot_identical_to_cur (nothing to prove)"
+fi
+
+# --self-test is a supported standalone mode: prepare its required current-tree
+# DUT snapshot explicitly (without creating/reading the old baseline snapshot).
+if [ "$MODE" = "selftest" ]; then
+    for f in $BASE_FILES; do
+        mkdir -p -- "$CUR/$(dirname -- "$f")" || fail "selftest_cur_mkdir_failed"
+        cp -- "$REPO_ROOT/$f" "$CUR/$f" || fail "selftest_cur_copy f=$f"
+        chmod 444 -- "$CUR/$f" || fail "selftest_cur_chmod f=$f"
+        verify_copy_equal "$REPO_ROOT/$f" "$CUR/$f" "selftest_cur f=$f" \
+            || fail "selftest_cur_copy_check f=$f ${HASH_ERR}"
+    done
+    CUR_SHA_RAW="$DRV/selftest_cur_sha.raw"
+    snapshot_sha "$CUR" "$CUR_SHA_RAW"; rc=$?
+    [ "$rc" -eq 0 ] || fail "selftest_cur_sha_rc=$rc"
+    snapshot_sha_check "$CUR_SHA_RAW" "selftest_cur_sha"
 fi
 
 #------------------------------------------------------------------------------
@@ -344,13 +374,17 @@ if [ "$MODE" = "full" ]; then
     done
 
     #   ---- 快照不可变复核（rc 原样检查）----
-    SNAP_SHA_POST="$(snapshot_sha "$SNAP")"; rc=$?
+    SNAP_SHA_POST_RAW="$DRV/snapshot_sha_post.raw"
+    snapshot_sha "$SNAP" "$SNAP_SHA_POST_RAW"; rc=$?
     [ "$rc" -eq 0 ] || fail "snapshot_post_sha_rc=$rc"
-    snapshot_sha_check "$SNAP_SHA_POST" "snapshot_post_sha"
+    snapshot_sha_check "$SNAP_SHA_POST_RAW" "snapshot_post_sha"
+    SNAP_SHA_POST="$(cat -- "$SNAP_SHA_POST_RAW")"
     [ "$SNAP_SHA_PRE" = "$SNAP_SHA_POST" ] || fail "snapshot_modified"
-    CUR_SHA_POST="$(snapshot_sha "$CUR")"; rc=$?
+    CUR_SHA_POST_RAW="$DRV/cur_sha_post.raw"
+    snapshot_sha "$CUR" "$CUR_SHA_POST_RAW"; rc=$?
     [ "$rc" -eq 0 ] || fail "cur_post_sha_rc=$rc"
-    snapshot_sha_check "$CUR_SHA_POST" "cur_post_sha"
+    snapshot_sha_check "$CUR_SHA_POST_RAW" "cur_post_sha"
+    CUR_SHA_POST="$(cat -- "$CUR_SHA_POST_RAW")"
     [ "$CUR_SHA_PRE" = "$CUR_SHA_POST" ] || fail "cur_snapshot_modified"
 fi
 
@@ -578,7 +612,7 @@ echo "this-is-not-a-hash-line"
 exit 0
 EOF
 chmod 755 "$FAKEBIN/sha256sum"
-selftest_start hash_extra_line sha256_pre_lines=9
+selftest_start hash_extra_line sha256_pre_format
 run_pkg "$ST_LOG" "PATH=$FAKEBIN:$PATH" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st16"
 selftest_check $?
 
@@ -592,7 +626,46 @@ chmod 755 "$FAKEBIN/sha256sum"
 selftest_start hash_exit9 sha256_pre_rc=9
 run_pkg "$ST_LOG" "PATH=$FAKEBIN:$PATH" "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_st17"
 selftest_check $?
-#   还原 fakebin（后续不再使用）
+#   还原 fakebin（后续矩阵自建）
+rm -f "$FAKEBIN/sha256sum"
+
+# 精确攻击包入口的 A(8 行)/B(2 行) 实际 caller；合法输出/原rc先由工具真源控绿，
+# 下列各形态必须在对应 pre-run caller 被拒，不能由工具/参数检查抢先拒绝。
+make_freeze_mutator() {
+    cat > "$FAKEBIN/sha256sum" <<'SH'
+#!/usr/bin/env bash
+"$REAL_SHA" "$@" >"$HASH_TMP"; rc=$?
+mutate=0
+if [ "$HASH_TARGET" = main ] && [ "$#" -eq 9 ]; then mutate=1; fi
+if [ "$HASH_TARGET" = aux ] && [ "$#" -eq 3 ]; then mutate=1; fi
+if [ "$mutate" -eq 0 ]; then cat -- "$HASH_TMP"; exit "$rc"; fi
+python3 - "$HASH_TMP" "$HASH_MODE" <<'PY'
+import pathlib,sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); m=sys.argv[2]
+if m=='extra1': b+=b.split(b'\n',1)[0]+b'\n'
+elif m=='blanks': b+=b'\n\n'
+elif m=='unterminated': b=b[:-1]
+elif m=='wrongpath': b=b.replace(b'  ',b'  wrong-path-',1)
+elif m=='garbage': b+=b'NOT-A-HASH\n'
+elif m=='nulcr': b+=b'\0\r\n'
+sys.stdout.buffer.write(b)
+PY
+if [ "$HASH_MODE" = exit9 ]; then exit 9; else exit "$rc"; fi
+SH
+    chmod +x "$FAKEBIN/sha256sum"
+}
+for ht in main aux; do
+    for hm in extra1 blanks unterminated wrongpath garbage nulcr exit9; do
+        make_freeze_mutator
+        if [ "$ht" = main ]; then prefix=sha256_pre; else prefix=sha256_aux_pre; fi
+        if [ "$hm" = exit9 ]; then want="${prefix}_rc=9"; else want="${prefix}_format"; fi
+        selftest_start "raw_${ht}_${hm}" "$want"
+        run_pkg "$ST_LOG" "PATH=$FAKEBIN:$PATH" "REAL_SHA=$REAL_SHA" \
+            "HASH_TMP=$DRV/hash_${ht}_${hm}.raw" "HASH_TARGET=$ht" "HASH_MODE=$hm" \
+            "DUT_ROOT=$CUR" "RV32_FUNCTIONAL_PKG_OUT_DIR=$DRV/pkg_raw_${ht}_${hm}"
+        selftest_check $?
+    done
+done
 rm -f "$FAKEBIN/sha256sum"
 
 #   18) **单文件**哈希：真实完整输出后 exit 9（多文件/共享调用仍正常）⇒
@@ -633,7 +706,7 @@ PATH="$FAKEBIN:$PATH"
 hash_one "$HS_A"; HO_RC=$?; HO_ERR="$HASH_ERR"; HO_EMPTY="$HASH_OUT"
 PATH="$OLD_PATH"
 ST_N=$((ST_N + 1))
-if [ "$HO_RC" -eq 0 ] || [ -n "$HO_EMPTY" ] || [[ "$HO_ERR" != *"hash_empty"* ]]; then
+if [ "$HO_RC" -eq 0 ] || [ -n "$HO_EMPTY" ] || [[ "$HO_ERR" != *"hash_format"* ]]; then
     printf 'CACHE_BUS_SELFTEST case=hash_empty rc=%s out=%s err=%s ok=0\n' "$HO_RC" "$HO_EMPTY" "$HO_ERR"
     ST_FAIL=1
 else
@@ -651,7 +724,7 @@ PATH="$FAKEBIN:$PATH"
 hash_one "$HS_A"; HO_RC=$?; HO_ERR="$HASH_ERR"; HO_BAD="$HASH_OUT"
 PATH="$OLD_PATH"
 ST_N=$((ST_N + 1))
-if [ "$HO_RC" -eq 0 ] || [ -n "$HO_BAD" ] || [[ "$HO_ERR" != *"hash_badhex"* ]]; then
+if [ "$HO_RC" -eq 0 ] || [ -n "$HO_BAD" ] || [[ "$HO_ERR" != *"hash_format"* ]]; then
     printf 'CACHE_BUS_SELFTEST case=hash_badhex rc=%s out=%s err=%s ok=0\n' "$HO_RC" "$HO_BAD" "$HO_ERR"
     ST_FAIL=1
 else
@@ -673,17 +746,66 @@ exit 9
 EOF
 chmod 755 "$FAKEBIN/sha256sum"
 PATH="$FAKEBIN:$PATH"
-SNAP_SELF_OUT="$(snapshot_sha "$SNAP_SELF")"; SNAP_SELF_RC=$?
+SNAP_SELF_RAW="$DRV/snapshot_self.raw"
+snapshot_sha "$SNAP_SELF" "$SNAP_SELF_RAW"; SNAP_SELF_RC=$?
 PATH="$OLD_PATH"
-SNAP_SELF_LINES="$(printf '%s\n' "$SNAP_SELF_OUT" | wc -l)"
+SNAP_SELF_LINES="$(wc -l < "$SNAP_SELF_RAW")"
 ST_N=$((ST_N + 1))
-if [ "$SNAP_SELF_RC" -ne 9 ] || [ "$SNAP_SELF_LINES" -ne "$SNAP_N" ]; then
+if [ "$SNAP_SELF_RC" -ne 9 ] || [ "$SNAP_SELF_LINES" -ne "$SNAP_N" ] || ! snapshot_sha_validate "$SNAP_SELF_RAW"; then
     printf 'CACHE_BUS_SELFTEST case=snapshot_hash_exit9 rc=%s lines=%s ok=0\n' "$SNAP_SELF_RC" "$SNAP_SELF_LINES"
     ST_FAIL=1
 else
     printf 'CACHE_BUS_SELFTEST case=snapshot_hash_exit9 rc=%s lines=%s ok=1\n' "$SNAP_SELF_RC" "$SNAP_SELF_LINES"
 fi
 note "SELFTEST snapshot_hash_exit9 rc=$SNAP_SELF_RC lines=$SNAP_SELF_LINES"
+
+# Exact byte/path mutations for the actual single-file hash_one and 7-file
+# snapshot_sha helpers. Each mutation starts from the real, LF-terminated output.
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '"%s" "$@" >"$HASH_TMP"; rc=$?\n' "$REAL_SHA"
+    cat <<'SH'
+mutate=0
+if [ "$HASH_KIND" = single ] && [ "$#" -eq 2 ]; then mutate=1; fi
+if [ "$HASH_KIND" = snapshot ] && [ "$#" -eq 8 ]; then mutate=1; fi
+if [ "$mutate" -eq 0 ]; then cat -- "$HASH_TMP"; exit "$rc"; fi
+python3 - "$HASH_TMP" "$HASH_MODE" <<'PY'
+import pathlib,sys
+b=pathlib.Path(sys.argv[1]).read_bytes(); m=sys.argv[2]
+if m=='extra1': b+=b.split(b'\n',1)[0]+b'\n'
+elif m=='blanks': b+=b'\n\n'
+elif m=='unterminated': b=b[:-1]
+elif m=='wrongpath': b=b.replace(b'  ',b'  wrong-path-',1)
+elif m=='garbage': b+=b'NOT-A-HASH\n'
+elif m=='nulcr': b+=b'\0\r\n'
+sys.stdout.buffer.write(b)
+PY
+if [ "$HASH_MODE" = exit9 ]; then exit 9; else exit "$rc"; fi
+SH
+} > "$FAKEBIN/sha256sum"
+chmod 755 "$FAKEBIN/sha256sum"
+for hm in extra1 blanks unterminated wrongpath garbage nulcr; do
+    OLD_PATH="$PATH"; PATH="$FAKEBIN:$PATH"
+    HASH_KIND=single HASH_MODE="$hm" HASH_TMP="$DRV/hash_one_${hm}.raw" \
+        hash_one "$HS_A"; HO_RC=$?; HO_ERR="$HASH_ERR"
+    PATH="$OLD_PATH"
+    ST_N=$((ST_N+1))
+    if [ "$HO_RC" -eq 0 ] || [[ "$HO_ERR" != *hash_format* ]]; then
+        printf 'CACHE_BUS_SELFTEST case=hash_one_%s rc=%s err=%s ok=0\n' "$hm" "$HO_RC" "$HO_ERR"; ST_FAIL=1
+    else
+        printf 'CACHE_BUS_SELFTEST case=hash_one_%s rc=%s err=%s ok=1\n' "$hm" "$HO_RC" "$HO_ERR"
+    fi
+    OLD_PATH="$PATH"; PATH="$FAKEBIN:$PATH"
+    HASH_KIND=snapshot HASH_MODE="$hm" HASH_TMP="$DRV/snapshot_${hm}.raw" \
+        snapshot_sha "$SNAP_SELF" "$DRV/snapshot_${hm}.captured.raw"; SH_RC=$?
+    PATH="$OLD_PATH"
+    ST_N=$((ST_N+1))
+    if [ "$SH_RC" -ne 0 ] || snapshot_sha_validate "$DRV/snapshot_${hm}.captured.raw"; then
+        printf 'CACHE_BUS_SELFTEST case=snapshot_%s rc=%s ok=0\n' "$hm" "$SH_RC"; ST_FAIL=1
+    else
+        printf 'CACHE_BUS_SELFTEST case=snapshot_%s rc=%s validation=reject ok=1\n' "$hm" "$SH_RC"
+    fi
+done
 rm -f "$FAKEBIN/sha256sum"
 
 #   22) **跨相 env 敏感反证**：两相 env SHA 与起始值不同 ⇒ 必须按精确原因拒绝

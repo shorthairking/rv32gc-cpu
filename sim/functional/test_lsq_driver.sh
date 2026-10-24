@@ -80,20 +80,40 @@ fail() {
 #    路径逐字匹配；调用端一律“先 capture 并 ||fail、非空 64hex 再比较/打印”，
 #    绝不在 `[ "$(hash a)" = "$(hash b)" ]` / `note "$(hash)"` 里直接调用。
 #==============================================================================
-file_sha() {  # 成功：stdout = 64hex；失败：返回非零
-    local out rc total h
-    out="$(sha256sum -- "$1")"
+validated_sha_output() {  # 原始字节文件已捕获；仅在严格验证后输出 SHA 列
+    python3 - "$@" <<'PY'
+import os, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+paths = sys.argv[2:]
+if b'\0' in raw or b'\r' in raw:
+    print('sha256_bytes', file=sys.stderr); raise SystemExit(1)
+if not raw.endswith(b'\n'):
+    print('sha256_unterminated', file=sys.stderr); raise SystemExit(1)
+rows = raw.split(b'\n')[:-1]
+if len(rows) != len(paths):
+    print(f'sha256_lines={len(rows)}', file=sys.stderr); raise SystemExit(1)
+hashes = []
+for i, (row, path) in enumerate(zip(rows, paths), 1):
+    m = re.fullmatch(rb'([0-9a-f]{64})  (.*)', row)
+    if not m:
+        print(f'sha256_format line={i}', file=sys.stderr); raise SystemExit(1)
+    if m.group(2) != os.fsencode(path):
+        print(f'sha256_path line={i}', file=sys.stderr); raise SystemExit(1)
+    hashes.append(m.group(1).decode())
+print(' '.join(hashes), end='')
+PY
+}
+file_sha() {  # capture raw stdout and rc first, validate exact one-row record
+    local raw rc result
+    raw="$(mktemp -- "$DRV/sha-one-XXXXXXXX")" || return 1
+    sha256sum -- "$1" >"$raw"
     rc=$?
     [ "$rc" -eq 0 ] || { printf 'sha256_failed path=%s rc=%s\n' "$1" "$rc" >&2; return 1; }
-    total="$(printf '%s\n' "$out" | wc -l)"
-    [ "$total" -eq 1 ] || { printf 'sha256_lines path=%s lines=%s\n' "$1" "$total" >&2; return 1; }
-    printf '%s\n' "$out" | grep -qE '^[0-9a-f]{64}  ' \
-        || { printf 'sha256_format path=%s\n' "$1" >&2; return 1; }
-    h="$(printf '%s\n' "$out" | cut -c1-64)"
-    [ "${#h}" -eq 64 ] || { printf 'sha256_hexlen path=%s\n' "$1" >&2; return 1; }
-    [ "$(printf '%s\n' "$out" | cut -c67-)" = "$1" ] \
-        || { printf 'sha256_path path=%s\n' "$1" >&2; return 1; }
-    printf '%s' "$h"
+    result="$(validated_sha_output "$raw" "$1" 2>&1)"
+    rc=$?
+    [ "$rc" -eq 0 ] || { printf 'sha256_invalid path=%s reason=%s\n' "$1" "$result" >&2; return 1; }
+    [ "${#result}" -eq 64 ] || { printf 'sha256_hexlen path=%s\n' "$1" >&2; return 1; }
+    printf '%s' "$result"
 }
 
 sha_of() {  # 取哈希并传播失败（绝不让空值参与比较）
@@ -174,28 +194,18 @@ cmp -s -- "$REPO_ROOT/scripts/env.sh" "$FRZ/scripts/env.sh" || fail "frozen_env_
 #   共享输入清单（3 条固定路径）—— 同样直接捕 rc、固定 3 行、每行 64hex、路径逐条匹配；
 #   任何一项不符都返回非零（“少一条共享 hash”不得被当成正常）。
 shared_sha_of() {
-    local root="$1" out rc total line h i p
-    out="$(sha256sum -- "$root/sim/functional/test_lsq.sh" \
-                       "$root/sim/functional/tb_lsq_semantics.sv" \
-                       "$root/scripts/env.sh" 2>/dev/null)"
+    local root="$1" raw rc result
+    raw="$(mktemp -- "$DRV/sha-shared-XXXXXXXX")" || return 1
+    sha256sum -- "$root/sim/functional/test_lsq.sh" \
+                  "$root/sim/functional/tb_lsq_semantics.sv" \
+                  "$root/scripts/env.sh" >"$raw" 2>/dev/null
     rc=$?
     [ "$rc" -eq 0 ] || { printf 'shared_sha_rc=%s\n' "$rc" >&3; return 1; }
-    total="$(printf '%s\n' "$out" | wc -l)"
-    [ "$total" -eq 3 ] || { printf 'shared_sha_lines=%s\n' "$total" >&3; return 1; }
-    i=0
-    for p in "$root/sim/functional/test_lsq.sh" \
-             "$root/sim/functional/tb_lsq_semantics.sv" \
-             "$root/scripts/env.sh"; do
-        i=$((i + 1))
-        line="$(printf '%s\n' "$out" | sed -n "${i}p")"
-        printf '%s\n' "$line" | grep -qE '^[0-9a-f]{64}  ' \
-            || { printf 'shared_sha_format line=%s\n' "$i" >&3; return 1; }
-        h="$(printf '%s\n' "$line" | cut -c1-64)"
-        [ "${#h}" -eq 64 ] || { printf 'shared_sha_hexlen line=%s\n' "$i" >&3; return 1; }
-        [ "$(printf '%s\n' "$line" | cut -c67-)" = "$p" ] \
-            || { printf 'shared_sha_path line=%s\n' "$i" >&3; return 1; }
-    done
-    printf '%s' "$(printf '%s\n' "$out" | cut -c1-64 | tr '\n' ' ')"
+    result="$(validated_sha_output "$raw" "$root/sim/functional/test_lsq.sh" \
+        "$root/sim/functional/tb_lsq_semantics.sv" "$root/scripts/env.sh" 2>&1)"
+    rc=$?
+    [ "$rc" -eq 0 ] || { printf 'shared_sha_invalid reason=%s\n' "$result" >&3; return 1; }
+    printf '%s ' "$result"
 }
 
 #   ★ REAL 相用活源：其前后必须与冻结时的同一集合逐字一致（否则结果与日志 SHA 错配）。

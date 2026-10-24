@@ -177,15 +177,35 @@ PROD_N=$(( ${#PROD_REL[@]} + 1 ))              # + TB = 16
 PKG_N=3                                        # wrapper + driver + env
 
 HASH_OUT=""; HASH_ERR=""
+SHA_RAW="$W/.sha_raw.$$"
+raw_block_ok() {  # <raw> <expect_lines>
+    local raw="$1" want="$2" bytes lf last
+    # Validate bytes before cat/head/command substitution can normalize them.
+    python3 - "$raw" <<'PY'
+import sys
+b = open(sys.argv[1], 'rb').read()
+if b'\0' in b or any(c < 0x20 and c not in (0x0a,) for c in b):
+    raise SystemExit(1)
+PY
+    [ "$?" -eq 0 ] || return 1
+    bytes="$(wc -c < "$raw")"; [ "$bytes" -gt 0 ] || return 1
+    last="$(tail -c 1 "$raw" | od -An -tu1 | tr -d ' \n')"
+    [ "$last" = "10" ] || return 1
+    lf="$(tr -cd '\n' < "$raw" | wc -c)"
+    [ "$lf" -eq "$want" ] || return 1
+    if grep -q '^$' "$raw"; then return 1; fi
+    if grep -q "$(printf '\r')" "$raw"; then return 1; fi
+    return 0
+}
 hash_one() {
-    local f="$1" out rc one n line p h
-    HASH_ERR=""; HASH_OUT=""
-    out="$(sha256sum -- "$f" 2>>"$LOG")"; rc=$?
+    local f="$1" raw rc bytes line p h
+    HASH_ERR=""; HASH_OUT=""; raw="$SHA_RAW"
+    : > "$raw" || { HASH_ERR="hash_tmp file=$f"; return 1; }
+    sha256sum -- "$f" > "$raw" 2>>"$LOG"; rc=$?
     [ "$rc" -eq 0 ] || { HASH_ERR="hash_rc=$rc file=$f"; return 1; }
-    [ -n "$out" ] || { HASH_ERR="hash_empty file=$f"; return 1; }
-    n="$(printf '%s\n' "$out" | wc -l)"
-    [ "$n" -eq 1 ] || { HASH_ERR="hash_lines=$n file=$f"; return 1; }
-    line="$out"
+    raw_block_ok "$raw" 1 || { HASH_ERR="hash_rawline file=$f"; return 1; }
+    bytes="$(wc -c < "$raw")"
+    line="$(head -c "$((bytes - 1))" "$raw")"
     if [[ ! "$line" =~ ^([0-9a-f]{64})\ \ (.*)$ ]]; then
         HASH_ERR="hash_format file=$f"; return 1
     fi
@@ -222,8 +242,14 @@ validate_block() {  # <output> <tag>
         [ "$p" = "${EXPECT_PATHS[$i]}" ] || fail "${tag}_path=$((i + 1)) got=$p expect=${EXPECT_PATHS[$i]}"
     done
 }
-sha_list() {  # <file...> ⇒ SHA_LIST_OUT / SHA_LIST_RC
-    SHA_LIST_OUT="$(sha256sum -- "$@" 2>>"$LOG")"; SHA_LIST_RC=$?
+sha_list() {  # <file...> ⇒ SHA_LIST_OUT（规范行）/ SHA_LIST_RC；原始行先验
+    SHA_LIST_OUT=""; SHA_LIST_RC=0
+    : > "$SHA_RAW" || { SHA_LIST_RC=1; return 1; }
+    sha256sum -- "$@" > "$SHA_RAW" 2>>"$LOG"; SHA_LIST_RC=$?
+    [ "$SHA_LIST_RC" -eq 0 ] || { SHA_LIST_OUT=""; return "$SHA_LIST_RC"; }
+    raw_block_ok "$SHA_RAW" "$#" || { SHA_LIST_RC=1; SHA_LIST_OUT=""; return 1; }
+    SHA_LIST_OUT="$(cat "$SHA_RAW")"
+    return 0
 }
 
 #------------------------------------------------------------------------------
@@ -1054,10 +1080,16 @@ tmp="$W/sha_tmp.\$\$"
 "$REAL_SHA" "\$@" > "\$tmp"
 rc=\$?
 case "$mode" in
+    multi_nul) python3 - "\$tmp" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); b = p.read_bytes(); i = b.index(b'  ') + 2
+sys.stdout.buffer.write(b[:i] + b'\\0' + b[i:])
+PY
+        exit 0 ;;
     multi_exit9) cat "\$tmp"; exit 9 ;;
     multi_extra) cat "\$tmp"; echo "this-is-not-a-hash-line"; exit 0 ;;
     multi_badline) sed '1s/^./z/' "\$tmp"; exit 0 ;;
-    multi_ok) exit \$rc ;;
+    multi_ok) cat "\$tmp"; exit \$rc ;;
 esac
 exit \$rc
 EOF
@@ -1082,6 +1114,10 @@ run_fake_sha "$W/h5.log" multi_readfail; RC=$?
 assert_case H5_sha_readfail "$RC" "$W/h5.log" 1 "sha256_pre_rc=1" 0
 run_fake_sha "$W/h6.log" env_exit9; RC=$?
 assert_case H6_env_sha_exit9 "$RC" "$W/h6.log" 1 "env_sha_pre_rc=9" 0
+run_fake_sha "$W/h7.log" multi_nul; RC=$?
+assert_case H7_sha_bulk_nul "$RC" "$W/h7.log" 1 "sha256_pre_rc=1" 0
+run_fake_sha "$W/h8.log" multi_ok; RC=$?
+assert_case H8_sha_bulk_valid "$RC" "$W/h8.log" 0 "" 1
 rm -f "$FBIN/sha256sum"
 
 #------------------------------------------------------------------------------
@@ -1101,39 +1137,102 @@ if [ "\$n" -le 1 ]; then
     esac
     case "$mode" in
         exit9)
-            "$REAL_SHA" "\$@" > "$W/single_tmp.\$\$" 2>/dev/null
-            cat "$W/single_tmp.\$\$"; exit 9 ;;
+            tmp="\$(mktemp "$W/single_tmp.XXXXXX")" || exit 1
+            "$REAL_SHA" "\$@" > "\$tmp" 2>/dev/null
+            cat "\$tmp"; rm -f "\$tmp"; exit 9 ;;
         empty) exit 0 ;;
         wrongpath)
             printf '%064d  /definitely/wrong/path\n' 0; exit 0 ;;
         garbage)
             printf 'this is not a sha256sum line\n'; exit 0 ;;
+        trail)
+            tmp="\$(mktemp "$W/single_tmp.XXXXXX")" || exit 1
+            "$REAL_SHA" "\$@" > "\$tmp" 2>/dev/null
+            cat "\$tmp"; rm -f "\$tmp"; printf '\n'; exit 0 ;;
+        nul)
+            tmp="\$(mktemp "$W/single_tmp.XXXXXX")" || exit 1
+            "$REAL_SHA" "\$@" > "\$tmp" 2>/dev/null
+            python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); b=p.read_bytes(); sys.stdout.buffer.write(b.replace(b"  ", b"\\0 ", 1))' "\$tmp"
+            rm -f "\$tmp"; exit 0 ;;
+        unterminated)
+            tmp="\$(mktemp "$W/single_tmp.XXXXXX")" || exit 1
+            "$REAL_SHA" "\$@" > "\$tmp" 2>/dev/null
+            head -c "\$(( \$(wc -c < "\$tmp") - 1 ))" "\$tmp"; rm -f "\$tmp"; exit 0 ;;
+        valid)
+            exec "$REAL_SHA" "\$@" ;;
     esac
 fi
 exec "$REAL_SHA" "\$@"
 EOF
     chmod 755 "$FBIN2/sha256sum"
 }
-for mode in exit9 empty wrongpath garbage; do
+for mode in exit9 empty wrongpath garbage trail nul unterminated valid; do
     mk_single_fake "$mode" "tb_frontend_faults.sv"
     ( cd "$P1" && env -u RV32_FUNCTIONAL_PKG_OUT_DIR -u RV32_FUNCTIONAL_OUT_DIR -u OUT_DIR \
         -u FRONTEND_FAULTS_SRC_ROOT -u FRONTEND_FAULTS_FIXTURES_ROOT \
         PATH="$FBIN2:$PATH" RV32_FUNCTIONAL_PKG_OUT_DIR="$P1/build/functional" DUT_ROOT="$P1" \
         bash "$P1/sim/functional/test_frontend_faults.sh" ) > "$W/h_tb_$mode.log" 2>&1
-    RC=$?; assert_case "H_tb_$mode" "$RC" "$W/h_tb_$mode.log" 1 "tb_sha_unavailable" 0
+    RC=$?
+    if [ "$mode" = valid ]; then
+        assert_case "H_tb_$mode" "$RC" "$W/h_tb_$mode.log" 0 "" 1
+    else
+        assert_case "H_tb_$mode" "$RC" "$W/h_tb_$mode.log" 1 "tb_sha_unavailable" 0
+    fi
 
     mk_single_fake "$mode" "rtl/front4/ifetch4.v"
     ( cd "$P1" && env -u RV32_FUNCTIONAL_PKG_OUT_DIR -u RV32_FUNCTIONAL_OUT_DIR -u OUT_DIR \
         PATH="$FBIN2:$PATH" RV32_FUNCTIONAL_PKG_OUT_DIR="$P1/build/functional" DUT_ROOT="$P1" \
         bash "$P1/sim/functional/test_frontend_faults.sh" ) > "$W/h_rtl_$mode.log" 2>&1
-    RC=$?; assert_case "H_rtl_$mode" "$RC" "$W/h_rtl_$mode.log" 1 "snapshot_src_hash_failed" 0
+    RC=$?
+    if [ "$mode" = valid ]; then
+        assert_case "H_rtl_$mode" "$RC" "$W/h_rtl_$mode.log" 0 "" 1
+    else
+        assert_case "H_rtl_$mode" "$RC" "$W/h_rtl_$mode.log" 1 "snapshot_src_hash_failed" 0
+    fi
 
     mk_single_fake "$mode" "frontend_hist_183/tb_frontend_faults.sv"
     run_child_driver explicit "$P1" "$W/h_fix_$mode.log" \
         PATH="$FBIN2:$PATH" RV32_FUNCTIONAL_PKG_OUT_DIR="$P1/build/functional"
-    RC=$?; assert_case "H_fix_$mode" "$RC" "$W/h_fix_$mode.log" 1 "fixture_hash_failed" 0
+    RC=$?
+    if [ "$mode" = valid ]; then
+        [ "$RC" -eq 0 ] && grep -qxF 'FUNCTIONAL_FRONTEND_FAULTS_DRIVER: PASS' "$W/h_fix_$mode.log" \
+            && sub_ok "H_fix_$mode" || sub_fail "H_fix_$mode" "child_rc=$RC want driver PASS"
+    else
+        assert_case "H_fix_$mode" "$RC" "$W/h_fix_$mode.log" 1 "fixture_hash_failed" 0
+    fi
 done
 rm -f "$FBIN2/sha256sum"
+
+# 12c. Bulk sha_list caller：argc>1 NUL 必须拒；同工具有效 bulk 输出必须通过。
+FBIN3="$W/fakebin_bulk"; mkdir -p "$FBIN3"
+cat > "$FBIN3/sha256sum" <<EOF
+#!/usr/bin/env bash
+n=\$#
+[ "\${1:-}" = "--" ] && n=\$((n - 1))
+if [ "\$n" -gt 1 ] && [ "\${FRONTEND_TEST_SHA_MODE:-valid}" = nul ]; then
+    tmp="\$(mktemp "$W/bulk_tmp.XXXXXX")" || exit 1
+    "$REAL_SHA" "\$@" > "\$tmp" || exit \$?
+    python3 - "\$tmp" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]); b = p.read_bytes(); i = b.index(b'  ') + 2
+sys.stdout.buffer.write(b[:i] + b'\\0' + b[i:])
+PY
+    rc=\$?; rm -f "\$tmp"; exit \$rc
+fi
+exec "$REAL_SHA" "\$@"
+EOF
+chmod 755 "$FBIN3/sha256sum"
+run_child_driver explicit "$P1" "$W/h_bulk_nul.log" \
+    PATH="$FBIN3:$PATH" FRONTEND_TEST_SHA_MODE=nul \
+    RV32_FUNCTIONAL_PKG_OUT_DIR="$P1/build/functional"
+RC=$?
+assert_case H_driver_bulk_nul "$RC" "$W/h_bulk_nul.log" 1 "src_manifest_sha_rc=1" 0
+run_child_driver explicit "$P1" "$W/h_bulk_valid.log" \
+    PATH="$FBIN3:$PATH" FRONTEND_TEST_SHA_MODE=valid \
+    RV32_FUNCTIONAL_PKG_OUT_DIR="$P1/build/functional"
+RC=$?
+[ "$RC" -eq 0 ] && grep -qxF 'FUNCTIONAL_FRONTEND_FAULTS_DRIVER: PASS' "$W/h_bulk_valid.log" \
+    && sub_ok H_driver_bulk_valid || sub_fail H_driver_bulk_valid "child_rc=$RC"
 
 #------------------------------------------------------------------------------
 # 13. M* 跨相漂移（运行中改文件；每类精确 reason）

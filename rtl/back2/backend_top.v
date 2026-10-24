@@ -109,6 +109,11 @@ module backend_top #(
     output wire [31:0] mem_req_wdata_o,
     output wire [3:0]  mem_req_wstrb_o,
     output wire [`BACK2_MEM_TAG_W-1:0] mem_req_tag_o,   // ★ 2B-3 扩 3→6 bit；2B-5 L5 LQ 16 ⇒ 5 bit；EXP-R3 LQ 8 ⇒ 4 bit
+    //   ★★ F4-1：LSQ 数据侧最小契约的**请求侧**（纯透传；Top 在接收拍锁存）。
+    output wire [3:0]  mem_req_bytes_o,      // 真实访问字节数 1..8（非 size 编码）
+    output wire [3:0]  mem_req_bmask_o,      // 本笔在 (addr & ~3) 4B 字内的字节道
+    output wire [`BACK2_ROB_IDX_W-1:0] mem_req_rob_o,   // load 的 ROB 索引（store 排空=0）
+    output wire        mem_req_is_head_o,    // load 的 ld_rob == rob_head（store=0）
     input  wire        mem_req_ready_i,
     input  wire        mem_rsp_valid_i,
     input  wire [31:0] mem_rsp_rdata_i,
@@ -123,6 +128,10 @@ module backend_top #(
     output wire [31:0] st_xlate_va_o,        // 该 store 的 VA
     output wire [`BACK2_STQ_IDX_W-1:0] st_xlate_idx_o,   // 目标下标（STQ 槽 / CDQ 项）
     output wire [3:0]  st_xlate_ctx_o,       // 该请求的翻译上下文（随请求携带）
+    //   ★★ F4-1：store 提交前翻译的**真实字节信息**（纯透传；Top 做最终 PMP/PMA）
+    output wire [7:0]  st_xlate_bmask8_o,    // 相对 (VA & ~3) 的 8B 窗字节道
+    output wire [3:0]  st_xlate_bytes_o,     // popcount(bmask8)，1..8（非 size 编码）
+    output wire        st_xlate_xpg_o,       // 跨 4K 拆笔（低/高请求都为 1）
     input  wire        st_xlate_ready_i,     // 适配器接受拍
     input  wire        st_xlate_done_i,      // 完成脉冲
     input  wire [31:0] st_xlate_pa_i,        // 译后 PA
@@ -165,7 +174,33 @@ module backend_top #(
     input  wire [1:0]  priv_i,
     output wire        csr_we_o,
     output wire [11:0] csr_waddr_o,
+    // ★★ F4-0b（母批准的最小新增）：CSR 提交 lane 位次（仅组合输出，无新 input）。
+    //   有效性与 csr_we_o 同拍同条件；值 = 该 CSR 在**本拍 qualified `commit_valid_o`**
+    //   中的真实位置（同拍有多条 CSR 时取程序序最老者，与提交级 CSR 合成一致）；
+    //   无效时恒 0。**不是** raw drain 掩码。
+    output wire [1:0]  csr_cmt_lane_o,
     output wire [31:0] csr_wdata_o,
+    //--------------------------------------------------------------------------
+    //   ★★ F4-1：**CSR 原始候选查询 / CSRFile 检查反馈**（程序序提交点权限检查）
+    //--------------------------------------------------------------------------
+    //   时序（组合，全部与 E1 同拍；**不依赖**最终 `csr_we_o`/提交允许，故无组合环）：
+    //     · `csr_chk_valid_o = 1` 表示本拍 E1 有一条 CSR 候选；候选身份/字段来自
+    //       **D3 派发期 CSR 影子**（按该指令自己的 ROB 索引/块内 lane 回读），**不读
+    //       ROB 窗口** ⇒ 窗口未命中/旧内容不会把旧 PC/旧 CSR 冒充成它；
+    //     · `csr_chk_addr_o` = 该候选的**原始 CSR 地址**（D3 的 uop CSRADDR，不是写口
+    //       合成结果，也不依赖 `csr_we_o`）；
+    //     · `csr_chk_wr_o` = 该指令**是否真的写** CSR：CSRRW/CSRRWI 恒 1；
+    //       CSRRS/CSRRC/CSRRSI/CSRRCI 仅当编码里的 rs1/zimm 域非 0 才为 1
+    //       （rs1=x0 的 CSRRS/RC 是"无写"，即便源值恰为 0 也不算写）。
+    //   ★ 消费者（顶层 `csr_file`）须用**实际当前特权级 `priv_i`** 做 `chk_illegal`
+    //     判定（不是数据访问的 MPRV 有效特权级）；反馈与本输出同拍组合返回。
+    output wire        csr_chk_valid_o,
+    output wire [11:0] csr_chk_addr_o,
+    output wire        csr_chk_wr_o,
+    input  wire        csr_chk_illegal_i,     // ← csr_file.chk_illegal（未实现/特权/counteren/TVM）
+    input  wire        csr_chk_ro_write_i,    // ← csr_file.chk_ro_write（写只读地址属性）
+    input  wire        csr_tsr_i,             // ← 实际当前 priv 的 mstatus.TSR（如 priv_ctrl.tsr_o）
+    input  wire        csr_tvm_i,             // ← 实际当前 priv 的 mstatus.TVM（如 priv_ctrl.tvm_o）
     output wire [1:0]  xret_kind_o,
     //--------------------------------------------------------------------------
     //   ★★ 2B-4 第 4b-2a 段：**维护操作（fence.i / sfence.vma / cbo.\*）**
@@ -192,6 +227,15 @@ module backend_top #(
     output wire [31:0] trap_pc_o,
     output wire [3:0]  trap_cause_o,
     output wire [31:0] trap_tval_o,
+    //   ★★ F4-1/C8：ROB 头部 PC 安全指示（组合 1bit，**同名直连** `u_rob.head_pc_valid_o`）。
+    //     语义 = `cnt_q != 0` 且头部窗口内容本拍安全（内部 `win_lane_ok[0]`/e_ok/e_bad
+    //     守卫；不含 done/exc）。Top 用 `rob_any & head_pc_valid` 门控 trap_ctrl 的
+    //     commit_valid/mie；`trap_pc_o` 已透传同一 PC ⇒ 不再新造 32bit 重复别名。
+    output wire        head_pc_valid_o,
+    //   ★★ F4-1 PMP-Sync：仅在**实际合法 PMP CSR 写**退休拍 pulse；Top 寄存后
+    //     复用 flush/redirect 到本 CSR 的 PC+4（不组合回杀本条 CSR）。
+    output wire        pmp_cmt_o,
+    output wire [31:0] pmp_cmt_next_pc_o,
     output wire [31:0] cnt_commit_o,
     output wire [31:0] cnt_squash_o,
     output wire [31:0] cnt_commit4_o,
@@ -203,7 +247,21 @@ module backend_top #(
     output wire        cdq_empty_o,
     //   ★★ 2B-4 第 4b-2b 段：数据侧访存响应**带错**（TLB 权限错 / PTW 故障）——
     //     顶层适配器以"正常响应 + err=1"回一笔 ⇒ LSQ 标 done+异常 ⇒ ROB `upd_exc`
-    input  wire        mem_rsp_err_i
+    input  wire        mem_rsp_err_i,
+    //   ★★ F4-1：LSQ 数据侧最小契约的**响应侧/翻译字节侧**（纯透传）。
+    //     · cause 与旧 err 并行：cause!=0 即错误；err=1&cause=0 由 LSQ 兼容为 13。
+    //     · defer/side 由 Top 判定，LSQ 消费；本层不实现算法、不改变旧 err 语义。
+    input  wire [3:0]  mem_rsp_cause_i,
+    input  wire        mem_rsp_defer_i,
+    input  wire        mem_rsp_side_i,
+    input  wire [3:0]  st_xlate_fault_cause_i,
+    //   ★ LSQ side token 透传（Top 做 IRQ 优先级/锁；本层只连线）
+    output wire        side_issue_valid_o,
+    output wire [`BACK2_ROB_IDX_W-1:0] side_issue_rob_o,
+    output wire        side_pending_o,
+    output wire [`BACK2_ROB_IDX_W-1:0] side_pending_rob_o,
+    //   ★ squash 在途 load 的 tag 释放（Top kill/drain；宽度=LQ 深度，不改容量）
+    output wire [`BACK2_MEM_OUT_N-1:0] ld_kill_tags_o
 );
 
     //==========================================================================
@@ -263,6 +321,24 @@ module backend_top #(
     function [PW_F-1:0] u_pdfo; input [UOPW-1:0] u; begin u_pdfo = u[`BACK2_U_PDFOLD_MSB:`BACK2_U_PDFOLD_LSB]; end endfunction
     function [31:0] u_predtgt; input [UOPW-1:0] u; begin u_predtgt = u[`BACK2_U_PREDTGT_MSB:`BACK2_U_PREDTGT_LSB]; end endfunction
     function [31:0] u_tval;    input [UOPW-1:0] u; begin u_tval = u[`BACK2_U_TVAL_MSB:`BACK2_U_TVAL_LSB]; end endfunction
+    //   ★★ F4-1 PMP-Sync：PMP CFG0..3 / ADDR0..15（RV32 地址 0x3A0..0x3A3 / 0x3B0..0x3BF）
+    function is_pmp_csr; input [11:0] a; begin
+        is_pmp_csr = ((a >= 12'h3A0) && (a <= 12'h3A3)) ||
+                     ((a >= 12'h3B0) && (a <= 12'h3BF));
+    end endfunction
+    //   ★★ F4-1 P1：sfence 的 rs1/rs2 **显式 5bit** 取字段（先落 32bit 临时再位选）。
+    //     不能写成 `((u_tval(u)>>20)&5'h1F)`：移位/与结果是 32bit，进 12bit concat 会被
+    //     截断，rs2 整段丢失 ⇒ `sfence.vma x0,x2` 的 cause2 tval 错成 0x12000073。
+    function [4:0] u_tval_rs2;
+        input [UOPW-1:0] u;
+        reg [31:0] t32;
+        begin t32 = u_tval(u); u_tval_rs2 = t32[24:20]; end
+    endfunction
+    function [4:0] u_tval_rs1;
+        input [UOPW-1:0] u;
+        reg [31:0] t32;
+        begin t32 = u_tval(u); u_tval_rs1 = t32[19:15]; end
+    endfunction
     function [3:0]  u_exc;     input [UOPW-1:0] u; begin u_exc  = u[`BACK2_U_EXC_MSB:`BACK2_U_EXC_LSB]; end endfunction
     function u_ckv;            input [UOPW-1:0] u; begin u_ckv  = u[`BACK2_UB_CKPT_VALID]; end endfunction
     function [3:0]  u_ckid;    input [UOPW-1:0] u; begin u_ckid = u[`BACK2_U_CKPT_MSB:`BACK2_U_CKPT_LSB]; end endfunction
@@ -475,12 +551,31 @@ module backend_top #(
     //   ★ 2B-4 第二步：LQ 槽在 **D3 派发期**分配（load 项、程序序）⇒ 需要"ROB 项 → LQ 槽"
     //     登记表供 E1 取用（与 store 的 `stq_of_rob` 同构）。
     reg  [`BACK2_LQ_IDX_W-1:0]  lq_of_rob  [0:ROB_N-1];
+    //   ★★ F4-1：ROB 项 → 「含动态特权检查的 SRET/SFENCE」**派发期影子**（12 bit/项）。
+    //     [0]   = sret；[1] = sfence.vma；
+    //     [6:2] = insn[19:15]（sfence 的 rs1 / sret 恒 0，供 mtval 原样恢复）；
+    //     [11:7]= insn[24:20]（sfence 的 rs2）。
+    //     这两类指令必须**等到成为 ROB 头**才发射，才能用"全部更老已提交"的 CSR 状态
+    //     做程序序正确的 TSR/TVM 检查；它们极稀少，不改变常规 4 发射/2 提交峰。
+    //     用派发期影子（而不是 ROB 窗口 `cmt_pay`）恢复指令位/tval：即使窗口未命中/
+    //     含旧内容，本表按该指令自己的 ROB 索引写入，不会把旧 PC/旧指令当成它。
+    //     （MRET 无动态位：其"仅 M"检查在 D1 静态完成。）
+    reg  [11:0] sys_of_rob [0:ROB_N-1];
+    //   ★★ F4-1：CSR 候选**派发期影子**（每块 ≤4 条；块内 lane 号即条目号）。
+    //     与 `sys_of_rob` 同理：候选地址/“是否真写”/原始指令位都在 D3 从该条 uop 取出，
+    //     按 ROB 索引/块内 lane 回读，不依赖 ROB 窗口是否命中；检查反馈（真实 csr_file）
+    //     在 E1 同拍组合返回。`csr_pend_mask_q` 的 lane 位保证条目属于在飞 CSR 块。
+    reg  [11:0] csr_sh_addr_q [0:DISP_W-1];
+    reg  [31:0] csr_sh_insn_q [0:DISP_W-1];
+    reg         csr_sh_wr_q   [0:DISP_W-1];
     wire [`BACK2_LQ_IDX_W-1:0]  lq_of_rob_r;
     wire [11:0] csr_raddr_w;
     assign csr_raddr_o = csr_raddr_w;
     //   ★ 4b-1a：写口与陷阱写口引出（`csr_we_w/csr_waddr_w/csr_wdata_w` 见 §7 提交级合成）
     assign csr_we_o    = csr_we_w;
     assign csr_waddr_o = csr_waddr_w;
+    // ★★ F4-0b：CSR 提交 lane 位次（有效与 csr_we_o 同拍同条件；无效置 0）。
+    assign csr_cmt_lane_o = csr_cmt_we ? csr_cmt_lane : 2'd0;
     assign csr_wdata_o = csr_wdata_w;
 
 
@@ -640,6 +735,20 @@ module backend_top #(
     //      —— 它原本就硬接 `1'b0`（动态实测恒 0），CSR 提交期源改从载荷 `uop.PS1I` 取
     //      （见下方 `csr_cmt_ps1i` ← rob 的 `csr_pay`，其 `csrw` 段现由 rob 从载荷 PS1I 给出）。
     wire        upd_tr_v, upd_ff_v, upd_exc_v;
+    //   ★★ F4-1：CSR/特权动态检查的**单写口合并**（复用 ROB 既有 `upd_exc`，不改 ROB）。
+    //     CSR 与 SRET/SFENCE 都只在**安全头部**（全部更老指令已提交）被判非法，故它们
+    //     比任何年轻 LSU 异常更老 ⇒ 同拍冲突时 CSR/特权路径优先；年轻 LSU 异常所属项会
+    //     被本次 trap 的 flush_all 冲掉并在处理程序返回后重放，不会漏报。
+    wire        csr_v_w;                 // E1 有 CSR 项（源：`x_i2_v[] & is_csr`）
+    wire [2:0]  csr_lane;
+    wire [IWW-1:0] csr_uop;
+    wire        csr_chk_ill;             // 提交点 CSR 非法（含 RO 写按“真写”过滤）
+    wire        sys_cand_v;              // E1 有 SRET/SFENCE 候选（来自派发期影子）
+    wire        sys_ill;                 // SRET.TSR / SFENCE.TVM 动态非法
+    wire        rob_upd_exc_valid;
+    wire [ROBW-1:0] rob_upd_exc_idx;
+    wire [3:0]  rob_upd_exc_code;
+    wire [31:0] rob_upd_exc_tval;
 
     // 提交
     wire [6:0]  cmt_i2;
@@ -1037,12 +1146,38 @@ module backend_top #(
     //     ⇒ 自检跳 fail）。修法：**含 CSR 的块在"有未提交 CSR"期间不得派发** ⇒ 不变式
     //     "至多一条未提交 CSR"成立，`csr_pend_q` 的年龄窗（load/FP 门）才可靠。
     //     （死锁性：在飞的 CSR 一定比 D1 里的块**更老**，其发射不受本门影响 ⇒ 它提交后门即开。）
-    reg        csr_pend_q;      // 有"最老未提交 CSR 指令"
-    reg  [ROBW-1:0] csr_pend_rob_q;  // 它的 ROB 索引（年龄窗原点；L3：模 ROB_N）
-    wire       blk_has_csr_w = (d1_v_q[0] & u_is_csr(d1_uop_q[0])) |
-                               (d1_v_q[1] & u_is_csr(d1_uop_q[1])) |
-                               (d1_v_q[2] & u_is_csr(d1_uop_q[2])) |
-                               (d1_v_q[3] & u_is_csr(d1_uop_q[3]));
+    //   ★★ F4-1 修正（原实现缺陷）：**用块内 CSR 位图跟踪，不再只记"一条最年轻 CSR"**。
+    //     ① 原 `csr_pend_q` 在任何 CSR 提交时**无条件清**（注释声称按 idx，代码没有比较）
+    //        ⇒ 一个块内 `{fsrmi,frrm,frcsr}` 的**更老** CSR 提交会把更年轻在飞 CSR 的
+    //        可见性窗一起抹掉 ⇒ 更年轻 FP/load 用旧 frm/旧翻译上下文执行；
+    //     ② 原 squash 只按"唯一跟踪项"判杀，若同块更年轻 CSR 被冲掉，更老的存活 CSR
+    //        也失去窗（或者反过来把存活项误清）。
+    //     现语义：`csr_pend_mask_q` = 单个已派发 CSR 块内**尚未提交/未被冲掉**的 CSR lane
+    //     位图；`csr_blk_base_q` = 该块 lane0 的 ROB 索引；锚点 = **最老存活 CSR**
+    //     （保守：所有比它年轻的 load/FP 都等它提交；不会放行任何依赖）。
+    //     不变式仍由 `csr_serial_w` 保证（有 pending 时含 CSR 的块不派发）⇒ 位图只对应
+    //     一个块；块内多条 CSR 也逐 lane 记。
+    reg        csr_pend_q;
+    reg  [ROBW-1:0]   csr_blk_base_q;
+    reg  [DISP_W-1:0] csr_pend_mask_q;
+    wire [DISP_W-1:0] blk_csr_mask_w = {
+        d1_v_q[3] & u_is_csr(d1_uop_q[3]),
+        d1_v_q[2] & u_is_csr(d1_uop_q[2]),
+        d1_v_q[1] & u_is_csr(d1_uop_q[1]),
+        d1_v_q[0] & u_is_csr(d1_uop_q[0]) };
+    //   锚点 = 最低有效 lane（最老）的绝对 ROB 索引（ROBW 位模 ROB_N）。
+    function [ROBW-1:0] csr_anchor_f;
+        input [ROBW-1:0]   base;
+        input [DISP_W-1:0] mask;
+        integer            ca;
+        begin
+            csr_anchor_f = base;
+            for (ca = DISP_W-1; ca >= 0; ca = ca - 1)
+                if (mask[ca]) csr_anchor_f = base + ca[ROBW-1:0];
+        end
+    endfunction
+    wire [ROBW-1:0] csr_pend_rob_q = csr_anchor_f(csr_blk_base_q, csr_pend_mask_q);
+    wire       blk_has_csr_w = |blk_csr_mask_w;
     wire       csr_serial_w  = blk_has_csr_w & csr_pend_q;
     wire        disp_ok = (d1_v_q != {DISP_W{1'b0}}) & ~rn_i_busy & ~rn_f_busy &
                           ~squash_v_w & ~flush_all_w &
@@ -1234,8 +1369,19 @@ module backend_top #(
     wire [6*PW_F-1:0] wk_f_tag_w;
     // CSR 只在 ALU0、且必须已到 ROB 头（§8.3：读写都按提交序可见）
     wire al0_csr_blk = i0_sel_v & iq_sel_nq[0][`BACK2_IQN_IS_CSR] & (i0_sel_rob != rob_head_w);
+    //   ★★ F4-1：SRET/SFENCE 的**动态特权检查**（TSR/TVM）必须在"全部更老已提交"的点做。
+    //     它们也属 ALU0 类；此处用 D3 写入的 `sys_of_rob` 预译码位把它们限制为"ROB 头才发射"。
+    //     理由：若允许提前发射，E1 时读到的 mstatus.TSR/TVM 可能是更老 CSR 写之前的旧值；
+    //     等到头部再发射 ⇒ 更老指令已全部提交 ⇒ 检查用的是程序序最终值（不是投机预检测）。
+    //     代价：SRET/SFENCE 每条约多等 1 拍，属极稀少指令；4 发射/2 提交的常规峰不变。
+    //     （已知时序交互：p13 的"store 与 sfence 同组"场景会变成 store 先单独提交；
+    //       store 仍在自己的提交拍入 CDQ，不丢数据；C14' 的“同组”计数是时序 oracle，
+    //       需母/top owner 决定是否按正确行为更新该计数。）
+    wire [11:0] i0_sys_of_rob = sys_of_rob[i0_sel_rob];
+    wire al0_sys_blk = i0_sel_v & (|i0_sys_of_rob[1:0]) & (i0_sel_rob != rob_head_w);
+    wire al0_head_blk = al0_csr_blk | al0_sys_blk;
 
-    wire [2:0] q0_ready = ~al0_csr_blk;
+    wire [2:0] q0_ready = ~al0_head_blk;
     wire [2:0] q1_ready = 3'd1;
     wire [2:0] q2_ready = 3'd1;
     wire [2:0] q3_ready = mdu_free_w ? 3'd1 : 3'd0;
@@ -1294,7 +1440,7 @@ module backend_top #(
     //   ★★ C1：各队列的**基础**发射许可（= C1 之前 `iss_ready` 的全部判据，逐位不变）。
     //     最终 `iss_ready` = 基础许可 ∧ **读口获准**（`iwm_gnt`）⇒ 拿不到读口的队列本拍
     //     不出队、下一拍重试（宽载荷要到手才能进 E1）。顺序：{q5,q4,q3,q2,q1,q0}
-    assign iq_base_rdy = { fpu_iss_ok_w, ~lsu_ld_block, mdu_free_w, 1'b1, 1'b1, ~al0_csr_blk };
+    assign iq_base_rdy = { fpu_iss_ok_w, ~lsu_ld_block, mdu_free_w, 1'b1, 1'b1, ~al0_head_blk };
 
     iq #(.DEPTH(`BACK2_IQ_ALU0_D), .DBG(DBG_IQ)) u_iq0 (
         .clk(clk), .rst_n(rst_n), .flush_all(flush_all_w), .squash(squash_v_w), .squash_idx(squash_idx_w), .squash_age(squash_age_w),
@@ -1719,15 +1865,25 @@ module backend_top #(
         .mem_req_valid(mem_req_valid_o), .mem_req_wen(mem_req_wen_o),
         .mem_req_addr(mem_req_addr_o), .mem_req_wdata(mem_req_wdata_o),
         .mem_req_wstrb(mem_req_wstrb_o), .mem_req_tag(mem_req_tag_o),
+        .mem_req_bytes(mem_req_bytes_o), .mem_req_bmask(mem_req_bmask_o),
+        .mem_req_rob(mem_req_rob_o), .mem_req_is_head(mem_req_is_head_o),
         .mem_req_ready(mem_req_ready_i),
         .mem_rsp_valid(mem_rsp_valid_i), .mem_rsp_rdata(mem_rsp_rdata_i),
         .mem_rsp_tag(mem_rsp_tag_i), .mem_rsp_err(mem_rsp_err_i),
+        .mem_rsp_cause(mem_rsp_cause_i), .mem_rsp_defer(mem_rsp_defer_i),
+        .mem_rsp_side(mem_rsp_side_i),
+        .side_issue_valid(side_issue_valid_o), .side_issue_rob(side_issue_rob_o),
+        .side_pending(side_pending_o), .side_pending_rob(side_pending_rob_o),
+        .ld_kill_tags(ld_kill_tags_o),
         //   ★★ (b)：执行期 store 翻译口（透传到 `core_top_2b` 的数据适配器）
         .st_xlate_en(st_xlate_en_i), .st_xlate_ctx(st_xlate_ctx_i),
         .st_xlate_valid(st_xlate_valid_o), .st_xlate_va(st_xlate_va_o),
         .st_xlate_idx(st_xlate_idx_o), .st_xlate_ctx_o(st_xlate_ctx_o),
         .st_xlate_ready(st_xlate_ready_i), .st_xlate_done(st_xlate_done_i),
         .st_xlate_pa(st_xlate_pa_i), .st_xlate_fault(st_xlate_fault_i),
+        .st_xlate_fault_cause(st_xlate_fault_cause_i),
+        .st_xlate_bmask8(st_xlate_bmask8_o), .st_xlate_bytes(st_xlate_bytes_o),
+        .st_xlate_xpg(st_xlate_xpg_o),
         .exc_valid_o(lsu_exc_v), .exc_rob_o(lsu_exc_rob),
         .exc_cause_o(lsu_exc_cause), .exc_tval_o(lsu_exc_tval),
         .wb_valid(lsu_wb_v), .wb_rob(lsu_wb_rob), .wb_epoch(lsu_wb_ep),
@@ -1760,7 +1916,11 @@ module backend_top #(
     //         队列会取到 Q=ALU0 的 uop），新式给出 `a0_res`（不把 CSR 数据错塞进 lane 0）。
     //       · 发射宽载荷（IW）因此不必再存 3 bit 的 Q 字段（其唯一消费点就是本判据）。
     wire [31:0] a0_wb_data = (csr_v_w & (csr_lane == 3'd0)) ? csr_rdata_w : a0_res;
-    wire        a0_wb_i    = w_di(x_i2_uop[0]);
+    //   ★★ F4-1：非法的 CSR 候选**不得产生 PRF 写副作用**（架构上它会在提交点 cause 2）。
+    //     ROB 的 done 仍由 `wb_v[WBP_ALU0]`（= x_i2_v[0]）照常置位，故它会到达提交点并被
+    //     精确陷阱弹出；这里只关掉"体系结构目的寄存器"的物理写/唤醒。被分配的物理号随
+    //     trap 的 flush_all 由 rename 全量重建 free-list 回收，不会泄漏。
+    wire        a0_wb_i    = w_di(x_i2_uop[0]) & ~csr_chk_ill;
     wire [31:0] a1_wb_data = a1_res;
     wire        a1_wb_i    = w_di(x_i2_uop[1]);
     wire [31:0] bru_wb_data = (w_wbsel(x_i2_uop[2]) == WB_PC4) ? bru_link : bru_target;
@@ -1923,6 +2083,11 @@ module backend_top #(
             if (cmt_raw[cnp]) cmt_n_c = cmt_n_c + 3'd1;
     end
     assign cmt_n_w = cmt_ok ? cmt_n_c : 3'd0;
+
+    //   ★★ F4-1 PMP-Sync：raw 候选先夹年轻 lane，再生成实际 csr_we/事件。
+    //     `pmp_hold_w` 只掩“该 PMP CSR 之后”的 lane（不含本条），故本条与更老 prefix 正常退休。
+    wire                    pmp_cmt_v;
+    wire [COMMIT_W-1:0]     pmp_hold_w;
     assign cmt_i2 = x_i2_rob[2];
 
     genvar cc;
@@ -1942,7 +2107,9 @@ module backend_top #(
         //     **不带**本 lane 门（见 `commit_valid_o` 的注释：下游一律以 `commit_valid_o`
         //     为准取用），故与"窗口未命中时输出什么"无关（改前此处也已是 `cmt_pay` 位域）。
         //     `cmt_narrow` 余下 13 bit（pre/trtaken/exc/epoch/done）仍在下面按 `nq` 读。
-        assign commit_valid_o[cc] = cmt_raw_m[cc] & cmt_ok;
+        //   ★ PMP-Sync：PMP 写之后的更年轻 lane 本拍不上报提交（由 Top 冲刷后重取）。
+        assign commit_valid_o[cc] = cmt_raw[cc] & ~cmt_hold_w[cc] &
+                                    ~pmp_hold_w[cc] & cmt_ok;
         assign commit_pc_o[cc*32 +: 32] = p_pc(p);
         assign commit_arch_rd_o[cc*5 +: 5] = p_arn(p);
         assign commit_arch_we_o[cc] = p_di(p) | p_df(p);
@@ -1976,7 +2143,8 @@ module backend_top #(
         //     修法：**排空入队只看"前缀链里的 store"与"不被维护 lane 掩码挡住"**——
         //     `cmt_st_drain` 天然只含已提交前缀项，冲刷不可能让更老项变成未提交 ⇒ 安全。
         //     覆盖面：维护 / 陷阱 / xRET 触发的整机冲刷拍全部包含在内。
-        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & ~cmt_hold_w[cc];
+        //   ★ PMP-Sync：年轻 store 不得在本拍入 CDQ（否则 flush 后仍保留非法写）。
+        assign lsu_dr_valid[cc] = cmt_st_drain[cc] & ~cmt_hold_w[cc] & ~pmp_hold_w[cc];
         assign lsu_dr_idx[cc*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W] = p_stq(p);
     end
     endgenerate
@@ -2001,7 +2169,12 @@ module backend_top #(
     endgenerate
 
     // 提交点 CSR 写（同拍至多 1 条：CSR 指令只在 ROB 头执行 ⇒ 至多一条在飞）
-    reg        csr_cmt_we;  reg [11:0] csr_cmt_addr; reg [31:0] csr_cmt_data;
+    reg        csr_raw_we;   // raw 前缀候选（可未退休，用于 pmp_hold/夹取）
+    reg [11:0] csr_raw_addr; // raw 候选地址（取提交载荷，不等 csr_pay_w 动态口）
+    reg [2:0]  csr_raw_op;
+    reg [31:0] csr_raw_insn; // 原始 raw 候选指令：同一 cmt_pay lane，不依赖滞后 csr_pay_w
+    wire       csr_cmt_we;   // final qualified：候选 lane 必须真在 commit_valid_o 里
+    reg [11:0] csr_cmt_addr; reg [31:0] csr_cmt_data;
     reg [2:0]  csr_cmt_op;   // ★ B29：提交级 CSR 操作码
     reg        ff_cmt_any;  reg [4:0]  ff_cmt_val;
     reg [ROBW-1:0] csr_cmt_idx;              // ★ 4c(2/3)：本拍提交的 CSR 的 ROB 索引（L3：模 ROB_N）
@@ -2011,23 +2184,31 @@ module backend_top #(
     reg [1:0]  csr_cmt_lane;
     integer    cw;
     always @(*) begin
-        csr_cmt_we   = 1'b0;
+        csr_raw_we   = 1'b0;
+        csr_raw_addr = 12'h0;
+        csr_raw_op   = 3'd0;
+        csr_raw_insn = 32'h0;
         csr_cmt_addr = 12'h0;
         csr_cmt_data = 32'h0; csr_cmt_op = 3'd0; csr_cmt_insn = 32'h0;
         csr_cmt_ps1i = {PW_I{1'b0}};
-        ff_cmt_any   = 1'b0;
-        ff_cmt_val   = 5'h0;
         csr_cmt_idx  = {ROBW{1'b0}};
         csr_cmt_lane = 2'd0;
         for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
-            if (commit_valid_o[cw]) begin
+            //   ★ raw 候选：前缀/无维护掩码/无 squash 即选，**不读**最终 commit_valid，
+            //     避免“最终 csr_we 反推 commit mask”的组合环。
+            //   ★ raw 夹取不看 cmt_ok：cmt_ok=0 的“窗口未 final”拍，年轻 store 仍不能
+            //     抢在 PMP CSR 前入 CDQ；actual 写/event 仍由 csr_cmt_we（含 final）门控。
+            if (cmt_raw[cw] & ~cmt_hold_w[cw]) begin
                 //   ★ ②：判定改吃 `cmt_narrow` 的 `is_csr`（FF 组合读）；
                 //     宽字段（tval/csrw/csra/csrop）改由 rob.v 的**单 lane 动态读口** `csr_pay_w` 提供
                 //   ★★ EXP-N35B：`is_csr` 已从 `nq` 删除 ⇒ 改吃载荷访问函数（`commit_valid_o[cw]`
                 //     门控下窗口必已命中，逐位等价，见 §9 `g_cmt` 的门控说明）。
                 if (p_csr(cmt_pay[cw*RB_W +: RB_W])) begin
-                    csr_cmt_we   = 1'b1;
+                    csr_raw_we   = 1'b1;
                     csr_cmt_lane = cw[1:0];
+                    csr_raw_addr = p_csra(cmt_pay[cw*RB_W +: RB_W]);
+                    csr_raw_op   = p_csrop(cmt_pay[cw*RB_W +: RB_W]);
+                    csr_raw_insn = p_tval(cmt_pay[cw*RB_W +: RB_W]);
                     csr_cmt_addr = csr_pay_w[14:3];
                     csr_cmt_data = csr_pay_w[46:15];
                     csr_cmt_op   = csr_pay_w[2:0];
@@ -2035,6 +2216,15 @@ module backend_top #(
                     csr_cmt_ps1i = csr_pay_w[15 +: PW_I];   // ★ EXP-B：该字段现由 rob 从**载荷 uop.PS1I** 拼出（原为 updq.CSRW 低 PW_I 位，逐位等价）
                     csr_cmt_idx  = rob_head_w[ROBW-1:0] + cw[1:0];      // ★ L3：模 ROB_N（cw ≤ 3）
                 end
+            end
+        end
+    end
+    //   FF 累积只取**夹后**的提交 lane（年轻于 PMP 的 FF 不落盘）
+    always @(*) begin
+        ff_cmt_any = 1'b0;
+        ff_cmt_val = 5'h0;
+        for (cw = COMMIT_W-1; cw >= 0; cw = cw - 1) begin
+            if (commit_valid_o[cw]) begin
                 if (p_ff(cmt_pay[cw*RB_W +: RB_W]) != 5'h0) begin
                     ff_cmt_any = 1'b1;
                     ff_cmt_val = ff_cmt_val | p_ff(cmt_pay[cw*RB_W +: RB_W]);
@@ -2044,61 +2234,101 @@ module backend_top #(
     end
     //   ★ ②：单 lane 动态读口索引 = 提交组内 CSR lane 的**绝对 ROB 索引**
     assign csr_dyn_idx_w = rob_head_w[ROBW-1:0] + csr_cmt_lane;   // ★ L3：模 ROB_N
+    //   ★★ F4-1 P1 根修：raw 候选只用于“先定 lane/夹取”；真实 CSR 写/pending 清/事件
+    //     必须等该 lane 进入 final qualified commit。否则慢 load 后未退休的 CSR 会提前
+    //     csr_we_w / 拿旧候选去配新 commit PC。
+    assign csr_cmt_we = csr_raw_we & commit_valid_o[csr_cmt_lane];
+
+    //   ★★ F4-1 PMP-Sync：raw 候选（地址/真写意图）⇒ 年轻 lane clamp。
+    //     必须从同一原始 cmt_pay 指令位判定：CSRRW 恒写；CSRRS/RC 仅 rs1/zimm != 0。
+    //     编码非零寄存器即使值为 0 仍是真写；CSRRSI/RCI 的 zimm=0 则无写。
+    wire pmp_cand_write_w = (csr_cmt_op == 3'd1) |
+                            (((csr_cmt_op == 3'd2) | (csr_cmt_op == 3'd3)) &
+                             (csr_cmt_insn[19:15] != 5'd0));
+    wire pmp_raw_write_w = (csr_raw_op == 3'd1) |
+                           (((csr_raw_op == 3'd2) | (csr_raw_op == 3'd3)) &
+                            (csr_raw_insn[19:15] != 5'd0));
+    wire pmp_raw_v = csr_raw_we & is_pmp_csr(csr_raw_addr) & pmp_raw_write_w;
+    assign pmp_cmt_v = csr_raw_we & is_pmp_csr(csr_cmt_addr) & pmp_cand_write_w;
+    assign pmp_hold_w = pmp_raw_v ? ({COMMIT_W{1'b1}} << (csr_cmt_lane + 3'd1))
+                                  : {COMMIT_W{1'b0}};
 
     // fflags 累积写入（FPU 结果提交时），与 CSR 写并路：地址 0x001 用"读改写"
     //   ★★ CSR 可见性互锁的**跟踪**（见 §9 发射门处的声明/说明）
     //     · 派发（`disp_ok` 块内 lane 0 最老）：本块有 CSR 且当前无在途 ⇒ 记下它的 ROB 索引；
     //     · 清除：整机冲刷 / 该 CSR 被 squash / 它**已提交**（CSR 状态已更新 ⇒ 年轻访存可放行）；
     //     · 同一拍"清 + 派发"：后面的派发赋值覆盖 ⇒ 取新的那条（块内最老）✓
+    //   ★★ F4-1：按**块内 CSR 位图**跟踪（见 §5 声明处说明）。
+    //     · commit：只清"提交级算出的、且确在跟踪位图里的那个 idx"对应的 lane
+    //       （`csr_cmt_idx` 与 `csr_blk_base_q + lane` 匹配；不再无条件 clear）；
+    //     · squash：逐 lane 只杀"更年轻于冲刷点"的位，**保留未杀的更老 pending**；
+    //     · flush_all：整机清空（ROB 已空，全部项消失）。
+    //   squash 辅助：只杀 age > squash_age 的位（与 ROB/iq 的口径逐位同式）。
+    function [DISP_W-1:0] csr_mask_sq_f;
+        input [ROBW-1:0]   base;
+        input [ROBW-1:0]   head;
+        input [ROBW-1:0]   age;
+        input [DISP_W-1:0] mask;
+        integer            q;
+        reg   [ROBW-1:0]   ix;
+        begin
+            csr_mask_sq_f = mask;
+            for (q = 0; q < DISP_W; q = q + 1) begin
+                ix = base + q[ROBW-1:0];
+                if (mask[q] && ((ix - head) > age)) csr_mask_sq_f[q] = 1'b0;
+            end
+        end
+    endfunction
+    wire [ROBW-1:0]   csr_cmt_off_w    = csr_cmt_idx - csr_blk_base_q;
+    wire              csr_cmt_off_ok_w = ({1'b0, csr_cmt_off_w} < 4);
+    wire [DISP_W-1:0] csr_cmt_onehot_w = (csr_cmt_we & csr_pend_q & csr_cmt_off_ok_w) ?
+                                         ({{(DISP_W-1){1'b0}}, 1'b1} << csr_cmt_off_w[1:0]) :
+                                         {DISP_W{1'b0}};
+    wire [DISP_W-1:0] csr_mask_cmt_w  = csr_pend_mask_q & ~csr_cmt_onehot_w;
+    wire [DISP_W-1:0] csr_mask_sq_w   = csr_mask_sq_f(csr_blk_base_q,
+                                                      rob_head_w[ROBW-1:0], squash_age_w,
+                                                      csr_pend_mask_q);
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            csr_pend_q     <= 1'b0;
-            csr_pend_rob_q <= {ROBW{1'b0}};
+            csr_pend_q      <= 1'b0;
+            csr_blk_base_q  <= {ROBW{1'b0}};
+            csr_pend_mask_q <= {DISP_W{1'b0}};
         end else begin
             if (flush_all_w) begin
-                csr_pend_q <= 1'b0;
-            end else if (squash_v_w && csr_pend_q &&
-                         ((csr_pend_rob_q[ROBW-1:0] - rob_head_w[ROBW-1:0]) >
-                          squash_age_w)) begin
-                csr_pend_q <= 1'b0;                     // 该 CSR 在冲刷点之后 ⇒ 已不存在
-            end else if (csr_cmt_we) begin
-                //   ★★ 4c(2/3)：**只有"被跟踪的那条 CSR"提交才清** —— 一个派发块可含**多条**
-                //     CSR（实测 p16 的 `{fsrmi,frrm,frcsr}` 三连同块），更老的 CSR 提交时
-                //     若无条件清，会把"更年轻的在飞 CSR"的窗一起抹掉（实测：`frcsr` 在
-                //     c=210 提交 ⇒ 把 c=208 登记的 `fsrm` 窗清掉 ⇒ 紧随的 `fcvt.w.s` 用旧
-                //     frm 执行）。索引比较用提交级算出的 `csr_cmt_idx`（CSR 可在提交组任意 lane）。
-                csr_pend_q <= 1'b0;                     // 该 CSR 已提交 ⇒ CSR 状态已更新
+                csr_pend_q      <= 1'b0;
+                csr_pend_mask_q <= {DISP_W{1'b0}};
+            end else if (squash_v_w) begin
+                csr_pend_mask_q <= csr_mask_sq_w;
+                csr_pend_q      <= |csr_mask_sq_w;
+            end else if (csr_cmt_we && csr_pend_q && csr_cmt_off_ok_w &&
+                         csr_pend_mask_q[csr_cmt_off_w[1:0]]) begin
+                csr_pend_mask_q <= csr_mask_cmt_w;
+                csr_pend_q      <= |csr_mask_cmt_w;
             end
-            if (disp_ok) begin
-                //   ★★ 4c(2/3) 缺陷修复（p16 实测抓出）：**登记条件不得含 `~csr_pend_q`** ——
-                //     它读的是"本拍之前"的寄存器值 ⇒ 在"**同一拍：老 CSR 提交（清）+ 新 CSR 块派发**"
-                //     的边界上，新 CSR **不会被登记**（旧值仍为 1）⇒ 紧随其后的 FP/load 可见性窗
-                //     完全失守（实测 p16：`fsrm frm,0` 与更老的 `frcsr` 提交同拍派发 ⇒ 未登记 ⇒
-                //     紧随的 `fcvt.w.s` 用**旧 frm=RTZ** 执行 ⇒ 得 3 而非 4 ⇒ 自检跳 fail）。
-                //     现在改为**无条件登记**（块内 lane 0 最老优先；后面的赋值天然覆盖前面的
-                //     ⇒ "清 + 派发"同拍取新登记的那条 ✓）。配合上面的 `csr_serial_w`
-                //     不变式（含 CSR 的块在有未提交 CSR 时不派发 ⇒ 至多一条未提交 CSR），
-                //     登记值不会被更年轻的 CSR 覆盖 ⇒ 年龄窗可靠。
-                //   ★ 4c(2/3)：**取块内"最年轻"的 CSR**（lane 3→0 扫描；lane 0 最老）——
-                //     一个块可含多条 CSR，只登记最老的那条会让块内更年轻的 CSR 完全不被
-                //     覆盖（实测 p16 的 `{fsrmi,frrm,frcsr}` 块）。登记最年轻者 + "只有它提交
-                //     才清" ⇒ 在其提交前，所有更年轻的 FP 项都被挡在发射口外 ✓（保守但正确：
-                //     块内更老的 CSR 也一定更早提交）。
-                if (d1_v_q[0] & u_is_csr(d1_uop_q[0])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[0];
-                end else if (d1_v_q[1] & u_is_csr(d1_uop_q[1])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[1];
-                end else if (d1_v_q[2] & u_is_csr(d1_uop_q[2])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[2];
-                end else if (d1_v_q[3] & u_is_csr(d1_uop_q[3])) begin
-                    csr_pend_q <= 1'b1; csr_pend_rob_q <= rb_ix_w[3];
-                end
+            //   派发登记（`disp_ok` 已含 `~csr_serial_w` ⇒ 当前无 pending；块内可多条 CSR）。
+            if (disp_ok && blk_has_csr_w) begin
+                csr_blk_base_q  <= rb_ix_w[0];
+                csr_pend_mask_q <= blk_csr_mask_w;
+                csr_pend_q      <= 1'b1;
             end
         end
     end
 
-    wire        csr_we_w    = csr_cmt_we | ff_cmt_any;
-    wire [11:0] csr_waddr_w = csr_cmt_we ? csr_cmt_addr : 12'h001;
+    //   ★★ F4-1：**CSRRS/CSRRC 且 rs1=x0（或立即数形式 zimm=0）是"无写"** ——
+    //     它仍然要读 CSR / 写回 rd，但**不得**置 csr_file.wen。旧实现把 `csr_cmt_we`
+    //     直接当写使能 ⇒ `csrr x1,cycle` 也会写同一个值（功能上同值，但违反"无写"语义，
+    //     也会在只读 CSR 上产生一次虚假 wen）。这里用提交级原始指令位/操作码判"真写"。
+    wire        csr_cmt_write_w = csr_cmt_we &
+                                  ((csr_cmt_op == 3'd1) |
+                                   (((csr_cmt_op == 3'd2) | (csr_cmt_op == 3'd3)) &
+                                    (csr_cmt_insn[19:15] != 5'd0)));
+    //   ★ event 只在本条实际写且已上报提交时 pulse；nextPC=真实提交 PC+4（CSR 恒 32bit）。
+    assign pmp_cmt_o = pmp_cmt_v & csr_cmt_write_w &
+                       commit_valid_o[csr_cmt_lane] & cmt_ok;
+    assign pmp_cmt_next_pc_o = pmp_cmt_o ?
+        (commit_pc_o[csr_cmt_lane*32 +: 32] + 32'd4) : 32'h0;
+    wire        csr_we_w    = csr_cmt_write_w | ff_cmt_any;
+    wire [11:0] csr_waddr_w = csr_cmt_write_w ? csr_cmt_addr : 12'h001;
     //   ★★ 2B-4 第 4a 段缺陷修复：**CSR 立即数形式（csrrwi/csrsi/csrrci）的源**。
     //     载荷 `p_csrw` 存的是"被当成 rs1 重命名"的物理号，而立即数形式的 insn[19:15]
     //     是 **zimm**（5 位立即数，不是寄存器号）⇒ 提交点从 PRF 读回的是**无关寄存器**
@@ -2118,22 +2348,56 @@ module backend_top #(
     wire [31:0] csr_cmt_new = (csr_cmt_op == 3'd1) ? csr_cmt_src_e :
                               (csr_cmt_op == 3'd2) ? (csr_rdata_w | csr_cmt_src_e) :
                                                      (csr_rdata_w & ~csr_cmt_src_e);
-    wire [31:0] csr_wdata_w = csr_cmt_we ? (csr_cmt_addr == 12'h001 ?
+    wire [31:0] csr_wdata_w = csr_cmt_write_w ? (csr_cmt_addr == 12'h001 ?
                               (csr_cmt_new | ff_cmt_val) : csr_cmt_new)
                                          : (csr_ff_w | ff_cmt_val);
     //   ★★ B29 修复：CSR 指令可能落在 I2 的**任意槽**（此前四处硬编码槽 0 ⇒ 取到别的指令的
     //     `x_i2_rob[0]`/读口数据 ⇒ `csrrw` 写入了错误值，实测 mscratch 被写成 1 而非 3）。
     //     CSR 属 ALU0 类（D1 的 oq 分配：CSR 的 opt ⇒ Q_ALU0）⇒ 源操作数取 ALU0 的 rs1 读口。
-    wire [2:0] csr_lane = (x_i2_v[0] & w_is_csr(x_i2_uop[0])) ? 3'd0 :
+    assign csr_lane = (x_i2_v[0] & w_is_csr(x_i2_uop[0])) ? 3'd0 :
                           (x_i2_v[1] & w_is_csr(x_i2_uop[1])) ? 3'd1 :
                           (x_i2_v[2] & w_is_csr(x_i2_uop[2])) ? 3'd2 :
                           (x_i2_v[3] & w_is_csr(x_i2_uop[3])) ? 3'd3 :
                           (x_i2_v[4] & w_is_csr(x_i2_uop[4])) ? 3'd4 :
                           (x_i2_v[5] & w_is_csr(x_i2_uop[5])) ? 3'd5 : 3'd0;
-    wire       csr_v_w  = (x_i2_v[0] & w_is_csr(x_i2_uop[0])) | (x_i2_v[1] & w_is_csr(x_i2_uop[1])) |
+    assign csr_v_w  = (x_i2_v[0] & w_is_csr(x_i2_uop[0])) | (x_i2_v[1] & w_is_csr(x_i2_uop[1])) |
                           (x_i2_v[2] & w_is_csr(x_i2_uop[2])) | (x_i2_v[3] & w_is_csr(x_i2_uop[3])) |
                           (x_i2_v[4] & w_is_csr(x_i2_uop[4])) | (x_i2_v[5] & w_is_csr(x_i2_uop[5]));
-    wire [IWW-1:0] csr_uop = x_i2_uop[csr_lane];   // ★ C9：发射载荷宽 = IWW
+    assign csr_uop = x_i2_uop[csr_lane];   // ★ C9：发射载荷宽 = IWW
+
+    //--------------------------------------------------------------------------
+    //   ★★ F4-1：**CSR 原始候选查询**（E1，组合；真源 = D3 派发期 CSR 影子）
+    //--------------------------------------------------------------------------
+    //   为什么不用最终 `csr_we_o`/`cmt_ok` 反推：那会与提交级 CSR 合成形成组合环，且
+    //   "非法后仅关 we 仍退休"正是要禁止的行为。这里只读：
+    //     · `csr_sh_*_q` = 该 CSR 指令在 **D3 派发期**从 uop 固化的地址/真写/原始指令位；
+    //     · `x_i2_uop[csr_lane]` = 本拍 E1 实际执行的 CSR 指令（IQ 宽载荷）。
+    //   ★ 候选字段全部来自**派发期 CSR 影子**（`csr_sh_*_q`，按该指令自己的 ROB 索引
+    //     与块内 lane 回读）：地址/“是否真写”/原始指令位都在 D3 从该条 uop 固化，
+    //     **不读 ROB 窗口** ⇒ 即使窗口未命中/含旧内容，也不会把旧 PC/旧 CSR 当成它。
+    //     这条 CSR 若在 E1，它必是 `csr_pend_mask_q` 里尚未提交的 lane（mask 位命中），
+    //     且已被 `al0_csr_blk` 限制为 ROB 头 ⇒ 全部更老指令已提交。
+    wire [ROBW-1:0] csr_exec_off_w    = x_i2_rob[csr_lane] - csr_blk_base_q;
+    wire            csr_exec_off_ok_w = ({1'b0, csr_exec_off_w} < 4);
+    wire            csr_sh_hit_w      = csr_pend_q & csr_exec_off_ok_w &
+                                        csr_pend_mask_q[csr_exec_off_w[1:0]];
+    wire [11:0]     csr_cand_addr_w   = csr_sh_addr_q[csr_exec_off_w[1:0]];
+    wire [31:0]     csr_cand_insn_w   = csr_sh_insn_q[csr_exec_off_w[1:0]];
+    //   ★ "是否真写"同影子里的 D3 结论：CSRRW/CSRRWI 恒写；CSRRS/RC/RSI/RCI 仅当
+    //     `insn[19:15]`（寄存器形式的 rs1 / 立即数形式的 zimm）非 0 才写。
+    //     故 rs1=x0 的 CSRRS/RC **无写**（即使是写只读 CSR 也合法），而 rs1≠x0 但值 0
+    //     仍然**会写**（值 0 的 RMW 也必须按写只读 CSR 判非法）。
+    wire            csr_cand_wr_w     = csr_sh_wr_q[csr_exec_off_w[1:0]];
+    wire            csr_cand_v_w      = csr_v_w & csr_sh_hit_w;
+    assign csr_chk_valid_o = csr_cand_v_w;
+    //   无效拍输出确定 0（避免 x_i2_rob/影子数组未初始化时把 x 送给 csr_file.chk_addr）；
+    //   消费者只在 valid=1 取用。
+    assign csr_chk_addr_o  = csr_cand_v_w ? csr_cand_addr_w : 12'h000;
+    assign csr_chk_wr_o    = csr_cand_v_w ? csr_cand_wr_w   : 1'b0;
+    //   `csr_file.chk_illegal` 已含"未实现/特权不足/counteren/TVM(satp)"；
+    //   `chk_ro_write` 是地址属性，必须再与"本条真的写"相与。
+    assign csr_chk_ill = csr_cand_v_w &
+                         (csr_chk_illegal_i | (csr_chk_ro_write_i & csr_cand_wr_w));
     //   ★★ B29 修法（第 34 轮，按母代理更正）：提交点现算 CSR 写数据 —— 源操作数取
     //   **该 CSR 指令自己的 rs1 物理号（PS1I）**，提交拍直接 `PRF[ps1i]` 取值；不再从
     //   `p_imm[19:15]` 反推（那是 CSR 地址 0x340，[19:15]=6 ⇒ ARAT[6] 恰为值 1 的寄存器，
@@ -2197,8 +2461,10 @@ module backend_top #(
         .upd_tr_valid(upd_tr_v), .upd_tr_idx(x_i2_rob[2]),
         .upd_tr_taken(bru_act_tk), .upd_tr_target(bru_target),
         .upd_ff_valid(upd_ff_v), .upd_ff_idx(fpu_if_rob), .upd_ff_flags(fpu_ff),
-        .upd_exc_valid(lsu_exc_v), .upd_exc_idx(lsu_exc_rob),
-        .upd_exc_code(lsu_exc_cause), .upd_exc_tval(lsu_exc_tval),
+        //   ★★ F4-1：复用既有 `upd_exc` 单写口（不改 ROB）：CSR/特权动态非法与 LSU
+        //     精确异常在这里合流；前者更老（头部）⇒ 冲突时优先。
+        .upd_exc_valid(rob_upd_exc_valid), .upd_exc_idx(rob_upd_exc_idx),
+        .upd_exc_code(rob_upd_exc_code), .upd_exc_tval(rob_upd_exc_tval),
         //   ★ 2B-4：store 提交门 = LSQ 的 CDQ 余量（不再是"排空口空闲"）——
         //     同拍多 store 提交组全部入队、逐拍顺序排空；`mem_req_ready_i` 仍作为排空口
         //     本身的握手（在 lsq_simple 内使用）。
@@ -2207,6 +2473,7 @@ module backend_top #(
         .cmt_st_drain(cmt_st_drain), .cmt_st_ckpt(cmt_st_ckpt), .cmt_st_branch(cmt_st_branch),
         .trap_valid(trap_v_rob), .trap_pc(trap_pc_o), .trap_cause(trap_cause_o),
         .trap_tval(trap_tval_o),
+        .head_pc_valid_o(head_pc_valid_o),
         .squash_valid(squash_v_w), .squash_idx(squash_idx_w), .flush_all(flush_all_w),
         .trap_retire(trap_v_rob & trp_flush_v_i),
         .head_o(rob_head_w), .cnt_o(rob_cnt_w), .empty_o(), .head_done_o(), .head_exc_o(),
@@ -2402,6 +2669,45 @@ module backend_top #(
                     ? 3'd5 : 3'd0;                         // cbo.flush（imm12=2）
         end
     endfunction
+
+    //==========================================================================
+    // 11b. ★★ F4-1：SRET/SFENCE 的**动态特权检查**（TSR/TVM）+ `upd_exc` 单口合流
+    //==========================================================================
+    //   ISA 口径（M/S/U）：
+    //     · MRET：仅 M 合法（D1 静态 `xret_priv_ill` 已判；无动态位）；
+    //     · SRET：U 非法（D1 静态）；S 在 mstatus.TSR=1 时**非法**；M 恒合法；
+    //     · SFENCE.VMA：U 非法（D1 静态）；S 在 mstatus.TVM=1 时**非法**；M 恒合法。
+    //   程序序正确性：`sys_cand_v` 只可能在该项为 ROB 头时成立（`al0_sys_blk` 把 SRET/
+    //   SFENCE 限制为头部发射），故更老指令（含任何 mstatus/satp 写）都已提交 ⇒ 这里
+    //   读到的 `priv_i`/TSR/TVM 就是该项程序序点的最终值；**不是**派发期预检测。
+    //   与 CSR 同法：候选身份/指令位取自**派发期影子 `sys_of_rob`**（按该指令自己的
+    //   ROB 索引写/读），**不读 ROB 窗口**；因此不会把窗口里的旧 PC/旧指令当成它。
+    //   非法项再下一拍由 ROB 的提交点精确抛 cause 2/tval=原始指令位（sfence 的
+    //   rs1/rs2 也按影子恢复，mtval 与真实编码一致）。
+    wire [11:0] sys_pre_w       = sys_of_rob[x_i2_rob[0]];
+    wire        sys_is_sret_w   = sys_pre_w[0];
+    wire        sys_is_sfence_w = sys_pre_w[1];
+    wire [31:0] sys_head_insn_w = sys_is_sret_w ? `RV32GC_INSN_SRET :
+                                  sys_is_sfence_w ?
+                                    {7'b0001001, sys_pre_w[11:7], sys_pre_w[6:2],
+                                     3'b000, 5'd0, 7'b1110011} : 32'h0;
+    assign sys_cand_v = x_i2_v[0] & (sys_is_sret_w | sys_is_sfence_w);
+    assign sys_ill = sys_cand_v & ~flush_all_w &
+                     ((sys_is_sret_w   & (priv_i == `RV32GC_PRIV_S) & csr_tsr_i) |
+                      (sys_is_sfence_w & (priv_i == `RV32GC_PRIV_S) & csr_tvm_i));
+    //   单写口仲裁：CSR/特权非法项在 ROB 头（更老）；LSU 异常项只可能更年轻 ⇒ 冲突时
+    //   让 CSR/特权路径赢。被丢弃的年轻 LSU 异常随本次 trap 的 flush_all 作废，处理程序
+    //   返回后会重新执行并再次上报，不会静默丢失。
+    wire csr_or_sys_ill_w = (csr_chk_ill | sys_ill) & ~flush_all_w;
+    assign rob_upd_exc_valid = lsu_exc_v | csr_or_sys_ill_w;
+    assign rob_upd_exc_idx   = csr_chk_ill ? x_i2_rob[csr_lane] :
+                               sys_ill     ? x_i2_rob[0] :
+                                             lsu_exc_rob;
+    assign rob_upd_exc_code  = (csr_chk_ill | sys_ill) ? `BACK2_EXC_ILLEGAL : lsu_exc_cause;
+    assign rob_upd_exc_tval  = (csr_chk_ill | sys_ill) ?
+                               (csr_chk_ill ? csr_cand_insn_w : sys_head_insn_w) :
+                               lsu_exc_tval;
+
     //   ★★ EXP-N1：本扫描是**提交侧** ⇒ 位向量宽度 = COMMIT_W（=2）。
     reg  [COMMIT_W-1:0] xret_lane_oh, maint_lane_oh;
     reg  [1:0]  xret_lane_idx, maint_lane_idx;
@@ -2465,7 +2771,7 @@ module backend_top #(
     wire [COMMIT_W-1:0] cmt_hold_w = (|maint_lane_oh) ? (4'hF << maint_hold_sh) :
                                      (|xret_lane_oh)  ? (4'hF << xret_hold_sh)  :
                                                         {COMMIT_W{1'b0}};
-    wire [COMMIT_W-1:0] cmt_raw_m  = cmt_raw & ~cmt_hold_w;
+    wire [COMMIT_W-1:0] cmt_raw_m  = cmt_raw & ~cmt_hold_w & ~pmp_hold_w;
 
     //==========================================================================
     // 12. 提交训练 / 检查点释放 / RAS（前端衔接）
@@ -2534,7 +2840,7 @@ module backend_top #(
     reg  [TRQW-1:0]  stg [0:TRQ_SD-1];
     reg  [TRQ_SD-1:0] stg_v;                 // 各槽有效位
     //   提交侧训练申请（唯一真源）：本拍哪些 lane 是"可上报的控制转移"
-    wire [COMMIT_W-1:0] trq_ok = cmt_st_branch & {COMMIT_W{cmt_ok}} & ~cmt_hold_w;
+    wire [COMMIT_W-1:0] trq_ok = cmt_st_branch & {COMMIT_W{cmt_ok}} & ~cmt_hold_w & ~pmp_hold_w;
 
     //   排空槽 = 最低有效槽；`trq_room` 保证不覆盖 FIFO 中未出队项
     //   （优先级编码：由高到低扫描、命中即覆盖 ⇒ 留下**最低**置位槽；规模 = COMMIT_W ≤ 2）
@@ -2681,7 +2987,7 @@ module backend_top #(
         ras_cmt_pv  = 1'b0;
         ras_cmt_pov = 1'b0;
         for (rq2 = 0; rq2 < COMMIT_W; rq2 = rq2 + 1) begin
-            if (cmt_st_branch[rq2] & cmt_ok) begin
+            if (cmt_st_branch[rq2] & commit_valid_o[rq2]) begin
                 if (t_call(p_cls(cmt_pay[rq2*RB_W +: RB_W]))) ras_cmt_pv  = 1'b1;
                 if (t_ret (p_cls(cmt_pay[rq2*RB_W +: RB_W]))) ras_cmt_pov = 1'b1;
             end
@@ -2716,6 +3022,12 @@ module backend_top #(
             for (si2 = 0; si2 < 4; si2 = si2 + 1) iwm_own_q[si2] <= 3'd6;
             for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) stq_of_rob[si2] <= {`BACK2_STQ_IDX_W{1'b0}};
             for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) lq_of_rob[si2]  <= {`BACK2_LQ_IDX_W{1'b0}};
+            for (si2 = 0; si2 < ROB_N; si2 = si2 + 1) sys_of_rob[si2] <= 12'h000;
+            for (si2 = 0; si2 < DISP_W; si2 = si2 + 1) begin
+                csr_sh_addr_q[si2] <= 12'h000;
+                csr_sh_insn_q[si2] <= 32'h0;
+                csr_sh_wr_q[si2]   <= 1'b0;
+            end
             for (si2 = 0; si2 < TRQ_D; si2 = si2 + 1) trq[si2] <= {TRQW{1'b0}};
         end else begin
             busy_i_q <= busy_i_nx;
@@ -2777,12 +3089,29 @@ module backend_top #(
             end
 
             // ---- STQ 归属表（store 的 ROB 项 → STQ 索引）----
+            //   ★★ F4-1：同拍登记「SRET/SFENCE 头部发射门」预译码位（2 bit/项）。
             if (disp_fire_w) begin
                 for (si2 = 0; si2 < DISP_W; si2 = si2 + 1) begin
                     if (st_alloc_v[si2])
                         stq_of_rob[rb_ix_w[si2]] <= st_alloc_idx[si2*`BACK2_STQ_IDX_W +: `BACK2_STQ_IDX_W];
                     if (ld_alloc_v[si2])
                         lq_of_rob[rb_ix_w[si2]]  <= ld_alloc_idx[si2*LDW +: LDW];
+                    if (d1_v_q[si2]) begin
+                        sys_of_rob[rb_ix_w[si2]] <= {
+                            u_tval_rs2(d1_uop_q[si2]),                       // [11:7] sfence rs2（5bit）
+                            u_tval_rs1(d1_uop_q[si2]),                       // [6:2]  sfence rs1（5bit）
+                            (lane_pre[si2][2:0] == 3'd2),                    // [1]    sfence.vma
+                            lane_pre[si2][3] };                              // [0]    sret
+                    end
+                    // CSR 候选影子（地址/真写/原始指令位；块内 lane 号即条目号）
+                    if (d1_v_q[si2] & u_is_csr(d1_uop_q[si2])) begin
+                        csr_sh_addr_q[si2] <= u_csra(d1_uop_q[si2]);
+                        csr_sh_insn_q[si2] <= u_tval(d1_uop_q[si2]);
+                        csr_sh_wr_q[si2]   <= (u_csrop(d1_uop_q[si2]) == 3'd1) |
+                                              (((u_csrop(d1_uop_q[si2]) == 3'd2) |
+                                                (u_csrop(d1_uop_q[si2]) == 3'd3)) &
+                                               (((u_tval(d1_uop_q[si2]) >> 15) & 5'h1F) != 5'd0));
+                    end
                 end
             end
 
@@ -2801,9 +3130,9 @@ module backend_top #(
                     end
                 end
             end
-            if (cmt_ok) begin
+            begin
                 for (si2 = 0; si2 < COMMIT_W; si2 = si2 + 1) begin
-                    if (cmt_st_ckpt[si2]) begin
+                    if (cmt_st_ckpt[si2] && commit_valid_o[si2]) begin
                         ck_pend_q[p_ckid(cmt_pay[si2*RB_W +: RB_W])] <= 1'b1;
                         ck_busy_q[p_ckid(cmt_pay[si2*RB_W +: RB_W])] <= 1'b0;
                     end

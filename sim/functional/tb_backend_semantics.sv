@@ -128,6 +128,18 @@ module tb_backend_semantics ();
         .priv_i(priv), .csr_we_o(csr_we_o),
         .maint_rdy_i(maint_rdy), .cbo_perm_i(cbo_perm), .maint_cmt_o(maint_cmt_o),
         .xret_cmt_o(xret_cmt_o),
+`ifdef BACKEND_HAS_CSR_CHK
+        // F4-1 新增接口：本 18 向量包只做旧行为回归 ⇒ 检查输入固定 0（不启用新 gate）。
+        // 新权限 TB 用自身实例化覆盖；旧 201 源码编译不定义本宏（纯接口适配）。
+        .csr_chk_valid_o(), .csr_chk_addr_o(), .csr_chk_wr_o(),
+        .csr_chk_illegal_i(1'b0), .csr_chk_ro_write_i(1'b0),
+        .csr_tsr_i(1'b0), .csr_tvm_i(1'b0),
+`endif
+`ifdef BACKEND_HAS_LSQ_F4
+        // F4-1 LSQ 透传：旧 basic bench 无 Top 适配器 ⇒ 显式接 0（不靠 Z 净化）。
+        .mem_rsp_cause_i(4'h0), .mem_rsp_defer_i(1'b0), .mem_rsp_side_i(1'b0),
+        .st_xlate_fault_cause_i(4'h0),
+`endif
         .trap_valid_o(trap_valid_o), .trap_cause_o(trap_cause_o),
         .commit_valid_o(commit_valid_o), .commit_pc_o(commit_pc_o),
         .commit_arch_rd_o(commit_arch_rd_o), .commit_arch_rd_wdata_o(commit_arch_rd_wdata_o),

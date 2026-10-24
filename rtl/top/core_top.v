@@ -318,7 +318,15 @@ module core_top (
     wire [31:0] axi_fill_data;
     wire [4:0]  axi_fill_word_idx;
     wire        axi_fill_accept_ifil, axi_fill_accept_dfil;
-    wire        axi_wb_accept, axi_wb_done;
+    wire        axi_wb_accept, axi_wb_done, axi_wb_err;
+    //   ★★ F4-0 基础收线：AXI 逐 beat R 错误 / 事务级错误 / cache 错误消费网
+    //      · axi_rdata_error：与 axi_rdata_valid 同拍同 beat（axi_master_ctrl 契约）
+    //      · axi_done_error ：与 axi_ctrl_done 同拍的事务级累计错
+    wire        axi_rdata_error, axi_done_error;
+    wire        l1i_cs_err, l1i_fill_err, l1i_fill_fail, l1i_err_sticky;
+    wire [31:0] l1i_cs_err_pa;
+    wire        l1d_cs_err, l1d_fill_err, l1d_fill_fail, l1d_wb_err;
+    wire        l1d_wb_fail, l1d_maint_err, l1d_err_sticky;
     wire [4:0]  axi_wb_word_idx;
     wire        axi_rdata_valid;
     wire [31:0] axi_rdata_data;
@@ -638,6 +646,13 @@ module core_top (
     reg         em_valid;
     reg  [31:0] em_pc;
     reg  [31:0] em_pc_next;
+    //   ★★ 08-05 修复：`em_pc_next` 只作 **link**（jal/jalr 写回 rd 的 pc+ilen），
+    //     架构意义上的"本条之后要执行的下一条 PC"另设 `em_archnext_q`：
+    //       · 控制转移 taken ⇒ BRU 目标；否则 link；
+    //       · W 级另把 mret/sret 覆盖成 *epc（见 `mw_archnext_w`）。
+    //     二者不可混用：把 link 改成目标会毁掉 jal 的链接写回（旧候选实测），
+    //     只用 link 当 arch-next 则把"taken 转移退休拍的中断 EPC"写成 fall-through。
+    reg  [31:0] em_archnext_q;
     reg  [31:0] em_insn_raw;
     reg  [4:0]  em_rd;
     reg  [2:0]  em_wb_sel;
@@ -785,6 +800,7 @@ module core_top (
     wire        fu_fetch_req_uncached;
     wire        fu_fetch_req_cacheable;
     wire [31:0] fu_fetch_pc;
+    wire [31:0] fu_fetch_fault_pc;   // 取指请求正在等待的 parcel VA（总线错误 tval 口径）
     wire [31:0] fu_fetch_data;
     wire        fu_fetch_valid;
     wire        fu_fetch_ilen32;
@@ -834,6 +850,7 @@ module core_top (
     .fetch_valid          (fu_fetch_valid),
     .fetch_ilen32         (fu_fetch_ilen32),
     .fetch_insn_va        (fu_fetch_insn_va),
+        .fetch_fault_pc       (fu_fetch_fault_pc),
     .fetch_insn_pa        (fu_fetch_insn_pa),
     .uncached(obs_uncached),
     .fetch_uncached_pa    (fu_fetch_uncached_pa),
@@ -875,8 +892,16 @@ module core_top (
     assign fetch_exc_cause = fu_exc_gated ?
                              (f_tr_fault_is_af ? `RV32GC_EXC_INSN_ACCESS_FAULT : fu_exc_cause) :
                              `RV32GC_EXC_INSN_ACCESS_FAULT;
-    assign fetch_exc_tval  = fu_exc_gated ? fu_exc_tval  : fu_fetch_pc;
-    assign fetch_exc_pc    = fu_exc_gated ? fu_exc_pc    : fu_fetch_pc;
+    //   ★★ 08-06/10-22 修正（高半 32 bit 第二字总线错误）：旧实现两者都取 live
+    //     `fu_fetch_pc` —— 第二 parcel 的填充在**第二字地址**上出错时，那个地址是
+    //     故障 parcel（tval 正确），但**不是指令起始**（mepc 错成第二字）。
+    //     现口径：mepc = `fu_fetch_insn_va`（指令起始 VA；低半起始=当前字，
+    //     高半 16 bit=PC，高半 32 bit 等第二字时=锁存的 hi32_va_q），
+    //     tval = `fu_fetch_fault_pc`（正在等待的 parcel VA：首 parcel=fetch_pc_w，
+    //     第二 parcel=hi32_va_q+2）。两者均为 VA；Bare 下与事务 PA 同值。
+    //     粘滞判据（request_pa == 出错事务地址）不变 ⇒ 重定向后旧错误不会再上报。
+    assign fetch_exc_tval  = fu_exc_gated ? fu_exc_tval  : fu_fetch_fault_pc;
+    assign fetch_exc_pc    = fu_exc_gated ? fu_exc_pc    : fu_fetch_insn_va;
 
     // ---- 5.3 L1I（16 KB / 2 路 / 32 B 行）----
     //   ★ fence.i 的**全阵列失效**：l1i 的 inval_all 只清"当前 cs_vaddr 索引所在组"
@@ -946,6 +971,12 @@ module core_top (
     .fill_data      (axi_fill_data),
     .fill_word_idx  (axi_fill_word_idx),
     .fill_done      (axi_fill_done),
+    // ★★ F4-0：逐 beat R 错误（与 fill_valid 同拍）+ 事务级失败/粘滞
+    .fill_err       (l1i_fill_err),
+    .fill_fail      (l1i_fill_fail),
+    .cs_err         (l1i_cs_err),
+    .cs_err_paddr   (l1i_cs_err_pa),
+    .err_sticky     (l1i_err_sticky),
     .inval_all      (l1i_maint_inval),
     .idle           (l1i_idle)
     );
@@ -1026,6 +1057,13 @@ module core_top (
 
     wire        csr_chk_illegal, csr_chk_ro_write;
     wire [31:0] csr_rdata_raw, csr_rdata_w, csr_byp_mval, csr_mstatus_raw;
+    //   ★ F1-B 跨半 carry 旁路需要 64 位 cycle 本体（真声明在后文 §13，这里前移供 §7.8 使用）
+    wire [63:0]  cycle_cnt;
+    //   ★★ 08-05/10-22：计数器读的**程序序投影**（older W → M → 本拍读）在 §7.8.2
+    //     使用 64 位 instret 本体与 W 级半字写请求 ⇒ 声明前移（真值在 §13 顶部赋）。
+    wire [63:0]  instret_cnt;
+    wire         mcycle_we_w, mcycleh_we_w, minstret_we_w, minstreth_we_w;
+    wire [31:0]  cnt_wdata_w;
     reg  [4:0]  fflags_r;
     reg  [2:0]  frm_r;
     wire [31:0] menvcfg_cbie_w, senvcfg_cbie_w;
@@ -1180,7 +1218,10 @@ module core_top (
 
     wire e_is_ctl_xfer = (de_op_type == OPT_BRU) | (de_op_type == OPT_JAL) |
                          (de_op_type == OPT_JALR);
-    assign bru_redirect = de_valid & e_is_ctl_xfer & e_bru_taken &
+    // A taken transfer is architecturally irreversible only when its E-stage
+    // instruction can advance. While older M work or an operand hazard stalls
+    // the pipe, keep the branch resident and suppress redirect/younger flush.
+    assign bru_redirect = de_valid & e_is_ctl_xfer & e_bru_taken & pipe_adv &
                           ~de_ill & ~de_exc_valid & ~kill_young;
     assign bru_target   = e_bru_target;
 
@@ -1360,14 +1401,59 @@ module core_top (
                             (de_csr_addr == `RV32GC_CSR_FCSR);
 
     // ---- 7.8.1 CSR 写 → E 级读 同拍旁路（两级；同拍双命中时 younger 优先 = M > W）----
+    //   ★★ F1-B 别名扩展：Zicntr 的 mcycle/minstret 与只读影子 cycle/instret 是
+    //     **同一 64 位本体**的 CSR 视图 ⇒ "写 mcycle 后紧邻读 cycle"（及高半对应）
+    //     必须级联旁路，否则命名空间不同名会把新值漏掉。
+    //   ★ 命中口径 = **同计数器且同半字**：
+    //       mcycle↔cycle、mcycleh↔cycleh、minstret↔instret、minstreth↔instreth；
+    //     **写低半不得命中读高半**（M 级预览 byp_rdata 对计数器返回的是"被写半字的
+    //     写值"，跨半命中会把低半写值当高半读回）。time/timeh 无写入口，不参与别名。
+    //     其余 CSR 仍按原"地址相等"命中（不扩大语义）。
+    function automatic csr_wr_rd_alias;
+        input [11:0] wa;   // 写者地址（M 或 W 槽）
+        input [11:0] ra;   // 读者地址（E 槽）
+        begin
+            csr_wr_rd_alias =
+                (wa == ra) |
+                ((wa == `RV32GC_CSR_MCYCLE)    & (ra == `RV32GC_CSR_CYCLE))    |
+                ((wa == `RV32GC_CSR_MCYCLEH)   & (ra == `RV32GC_CSR_CYCLEH))   |
+                ((wa == `RV32GC_CSR_MINSTRET)  & (ra == `RV32GC_CSR_INSTRET))  |
+                ((wa == `RV32GC_CSR_MINSTRETH) & (ra == `RV32GC_CSR_INSTRETH));
+        end
+    endfunction
     wire        csr_em_hit = em_valid & em_csr_we & ~em_exc_valid &
-                             (em_csr_addr == de_csr_addr);
-    wire        csr_mw_hit = csr_wen_w & (mw_csr_addr == de_csr_addr);
+                             csr_wr_rd_alias(em_csr_addr, de_csr_addr);
+    wire        csr_mw_hit = csr_wen_w & csr_wr_rd_alias(mw_csr_addr, de_csr_addr);
     wire        csr_byp_hit = csr_em_hit | csr_mw_hit;
     //   ★ 优先级 **M > W**：两条写指令同拍命中同一地址时，M 槽那条**更年轻**
     //     （W 槽比 M 槽老一拍）⇒ E 级读必须看到更年轻那条的新值（程序序在后的写在后）。
     //     两个候选值都是 csr_file 的 post-WARL 落盘值（见 §7.8 注释）。
     wire [31:0] csr_byp_val = csr_em_hit ? csr_byp_mval : csr_rdata_w;
+
+    //   ★★ 10-22 收口：计数器（mcycle/cycle 家族、minstret/instret 家族）的读
+    //     不再用"单写者 + 当前 body.low==0xFFFF_FFFF/0xFFFF_FFFE"特判，而统一走
+    //     §7.8.2 的**程序序投影**（older W → M（若存在）→ 本拍读）。旧特判在
+    //       · W/M 两槽**同时**有写者（后写的 carry 输入被前写改掉），或
+    //       · 更早一次写已改写 low、使随后 tick 的进位与 body.low 不同
+    //     时给出错的高半；且"读低半 + 写高半"的交叉组合完全无旁路。
+    //     ⇒ 这里只声明读选择；投影本体（含 tick/半字覆盖的通用式）在 §13 顶部赋值。
+    //       非计数器 CSR 仍保留上面的同址 alias 旁路（M > W），语义不变。
+    wire        csr_cnt_family =
+        (de_csr_addr == `RV32GC_CSR_MCYCLE)    | (de_csr_addr == `RV32GC_CSR_MCYCLEH) |
+        (de_csr_addr == `RV32GC_CSR_CYCLE)     | (de_csr_addr == `RV32GC_CSR_CYCLEH)  |
+        (de_csr_addr == `RV32GC_CSR_MINSTRET)  | (de_csr_addr == `RV32GC_CSR_MINSTRETH)|
+        (de_csr_addr == `RV32GC_CSR_INSTRET)   | (de_csr_addr == `RV32GC_CSR_INSTRETH);
+    wire [63:0] cnt_proj_mc_w;   // mcycle/cycle 家族：older W → M 投影（§13 顶部赋值）
+    wire [63:0] cnt_proj_in_w;   // minstret/instret 家族：older W → M 投影（同上）
+    wire [31:0] csr_cnt_rd =
+        ((de_csr_addr == `RV32GC_CSR_MCYCLE)    | (de_csr_addr == `RV32GC_CSR_CYCLE))
+            ? cnt_proj_mc_w[31:0] :
+        ((de_csr_addr == `RV32GC_CSR_MCYCLEH)   | (de_csr_addr == `RV32GC_CSR_CYCLEH))
+            ? cnt_proj_mc_w[63:32] :
+        ((de_csr_addr == `RV32GC_CSR_MINSTRET)  | (de_csr_addr == `RV32GC_CSR_INSTRET))
+            ? cnt_proj_in_w[31:0] :
+        ((de_csr_addr == `RV32GC_CSR_MINSTRETH) | (de_csr_addr == `RV32GC_CSR_INSTRETH))
+            ? cnt_proj_in_w[63:32] : 32'h0;
     wire [31:0] csr_base_rd = csr_byp_hit ? csr_byp_val : csr_rdata_raw;
 
     //   mstatus/sstatus 的 FS/SD 位由 core_top 持有 ⇒ 读路径覆盖（csr_file 内那份同步被遮盖）。
@@ -1403,7 +1489,10 @@ module core_top (
         (de_csr_addr == `RV32GC_CSR_FRM)    ? {29'b0, csr_frm_rd}    :
         (de_csr_addr == `RV32GC_CSR_FCSR)   ? {24'b0, csr_frm_rd, csr_fflags_rd} :
                                               csr_fp_view;
-    wire [31:0] csr_rdata  = csr_is_fp ? csr_fp_byp : csr_base_rd_fs;
+    //   ★★ 10-22：计数器地址一律取 §7.8.2 的程序序投影值（覆盖旧的 alias 旁路）；
+    //     FP CSR 与其余 CSR 走各自原通路（互不重叠）。
+    wire [31:0] csr_rdata  = csr_is_fp  ? csr_fp_byp :
+                             csr_cnt_family ? csr_cnt_rd : csr_base_rd_fs;
 
     wire [31:0] csr_src_e = de_csr_zimm ? {27'b0, de_rs1} : e_rs1_byp;
     wire [31:0] csr_new_e = (de_csr_op == CSRN_W) ? csr_src_e :
@@ -1454,7 +1543,9 @@ module core_top (
     .resp_rdata(clint_rdata),
     .resp_hit  (clint_hit),
     .msip_o    (clint_msip),
-    .mtip_o    (clint_mtip)
+    .mtip_o    (clint_mtip),
+    //   ★★ F1-B：mtime 实时值（time/timeh 的只读影子源；同一 mtime_r）
+    .mtime_o   (clint_mtime_w)
     );
 
     plic #(
@@ -1634,9 +1725,13 @@ module core_top (
     //              ⇒ 权限 = R、cause = 15（页故障）/ 7（access fault）。
     //     ⇒ 本核：翻译口径用 2'b01（load，见本 wire），cause 用 `cbo_cause_fix()` 折算。
     wire        m_is_cbo  = (em_mem_op == MEM_CBO);
+    //   ★★ F4-0：CBO 以 **ACC_CBM=2'b11** 送 PTW/TLB（不再折算成 2'b01）。
+    //     ptw.v/tlb.v 的 ACC_CBM 分支权限 = `r_bit | (mxr & x_bit)`（与 load 同），
+    //     且 **不查 D**（CBM 只读缓存行、不写内存）；异常类型仍由 `cbo_cause_fix()`
+    //     折算成 store 类（见上注）。A/D 口径按 acc==2'b10 才判，11 不猜位序。
     wire [1:0]  m_tlb_acc = (em_mem_op == MEM_STORE) | (em_mem_op == MEM_AMO) |
                             (em_mem_op == MEM_SC) ? 2'b10 :
-                            m_is_cbo ? 2'b01 : 2'b01;
+                            m_is_cbo ? 2'b11 : 2'b01;
     wire [31:0] m_pa_eff = m_pa_q + (m_hi_q ? 32'd4 : 32'd0);   // ★ 物理地址唯一赋值点派生
 
     // -------------------------------------------------------------------------
@@ -1708,6 +1803,17 @@ module core_top (
     wire [31:0] csr_mepc_o, csr_sepc_o;
     wire [31:0] xret_epc_pc   = (mw_xret_kind == 2'b01) ? csr_mepc_o : csr_sepc_o;
     wire [11:0] csr_raddr_mux = xret_redirect ? xret_epc_addr : de_csr_addr;
+
+    //   ★★ 08-05 修复：W 槽的"架构下一条 PC"（= trap_ctrl 的中断 EPC 口径）。
+    //     · 普通指令 / taken 控制转移：随流水携带的 arch-next（`mw_pc_next`，
+    //       由 E 级按 taken?目标:link 锁存）；
+    //     · mret/sret：本条提交后执行流回到 *epc ⇒ 取 W 拍 csr_file 的专用
+    //       *epc 出口（与 xret_redirect 同源同拍同值）。
+    //     为什么不在 E 级把 xret 目标一起锁进 em_archnext_q：`csrw mepc; mret`
+    //     这类程序序里，E 拍看到的 *epc 可能还没被更老那条写落地；W 拍取值与
+    //     实际 xret 重定向逐位一致，避免"EPC 与真正返回目标不同源"。
+    //     `mw_xret_valid` 在捕获时已与 ~mw_n_excv 相与 ⇒ 有异常的 xret 不会进入。
+    wire [31:0] mw_archnext_w = mw_xret_valid ? xret_epc_pc : mw_pc_next;
 
     //   ★ sfence.vma（2026-09 新增）：它在 W 提交，比它**更年轻**的 M/E/D 槽指令是
     //     用**旧翻译**取来的（页表可能刚被软件改写）⇒ 必须与陷阱/fence.i 同口径冲刷；
@@ -1814,6 +1920,7 @@ module core_top (
     .req_mxr        (csr_mxr),
     .satp           (csr_satp),
     .req_ready(obs_req_ready),
+    .idle_o(),
     .req_done       (ptw_req_done),
     .pa_o           (ptw_pa_out),
     .fault_o        (ptw_fault),
@@ -1824,6 +1931,8 @@ module core_top (
     .pte_req_ready  (m_ptw_pte_ready_q),
     .pte_resp_valid (m_ptw_pte_resp_v_q),
     .pte_resp_data  (m_ptw_pte_resp_d_q),
+    // poison 与本次 pte_resp_valid 同拍锁存；仅 valid 时 PTW 采样此错误 sideband。
+    .pte_resp_err   (m_ptw_poison_q),
     .pmp_req_valid  (ptw_pmp_req_valid),
     .pmp_req_addr   (ptw_pmp_req_addr),
     .pmp_req_acc    (ptw_pmp_req_acc),
@@ -2366,6 +2475,10 @@ module core_top (
     .fill_data      (axi_fill_data),
     .fill_word_idx  (axi_fill_word_idx),
     .fill_done      (axi_fill_done),
+    // ★★ F4-0：逐 beat R 错误（与 fill_valid 同拍）+ 事务级失败/粘滞
+    .fill_err       (l1d_fill_err),
+    .fill_fail      (l1d_fill_fail),
+    .cs_err         (l1d_cs_err),
     .wb_req         (l1d_wb_req),
     .wb_paddr       (l1d_wb_paddr),
     .wb_way         (l1d_wb_way),
@@ -2374,10 +2487,14 @@ module core_top (
     .wb_accepted    (axi_wb_accept),
     .wb_word_idx    (axi_wb_word_idx),
     .wb_data        (l1d_wb_data),
+    // ★★ F4-0：wb_done = **B 响应收到**（成功/失败），wb_err 与之同拍
     .wb_done        (axi_wb_done),
+    .wb_err         (axi_wb_err),
     .wb_ready       (l1d_wb_ready),
     .inval_all      (l1d_maint_inval),
     .clean_all      (l1d_maint_clean),
+    .maint_err      (l1d_maint_err),
+    .err_sticky     (l1d_err_sticky),
     .idle           (l1d_idle)
     );
 
@@ -2442,7 +2559,15 @@ module core_top (
     wire         priv_flush_req;
     wire [1:0]   priv_next;
     wire         csr_fetch_is_m;
-    wire [31:0]  cycle_cnt, instret_cnt;
+    //   ★★ F1-B（本包接线）：Zicntr 的**单一 64 位本体在本层**。
+    //     csr_file 只做 CSR 视图（cycle/instret 只读影子）与半字写请求；
+    //     本层持 `cycle_cnt_r/instret_cnt_r` 真 64 位本体并施加写语义
+    //     （mcycle：先整 64 位 +1，再覆盖被写的半字；minstret：older→半字覆盖→younger）。
+    //     ★ 旧写法 `wire [31:0] cycle_cnt` 会在 `{32'h0, cycle_cnt}` 处把 64 位本体
+    //       截成 32 位（高半恒 0、无进位）⇒ 读 mcycleh/mcycle 溢出即错。
+    //     ★ 10-22：`instret_cnt` 与 4 个半字 we + cnt_wdata 的**声明已前移**到 §6.1
+    //       之前（§7.8.2 计数器读投影在 E 级消费它们，避免隐式 1-bit 网截断）。
+    wire [63:0]  clint_mtime_w;          // CLINT 的 64 位 mtime（time/timeh 影子源）
 
     assign csr_wen_w = mw_valid & mw_csr_we & ~mw_exc_valid & ~trap_exc;
     assign satp_wr_pulse = csr_wen_w & (mw_csr_addr == `RV32GC_CSR_SATP);
@@ -2496,8 +2621,15 @@ module core_top (
     .irq_meip    (plic_meip_sync_q),
     .irq_stip    (1'b0),      // 核内无 S 级定时器源（08 §6.6）
     .irq_seip    (plic_seip_sync_q),
-    .cycle_i     ({32'h0, cycle_cnt}),
-    .instret_i   ({32'h0, instret_cnt}),
+    .cycle_i     (cycle_cnt),
+    .instret_i   (instret_cnt),
+    //   ★★ F1-B：time/timeh 读 CLINT 的**真实 mtime**（不是 cycle）；写请求回本层本体
+    .mtime_i     (clint_mtime_w),
+    .mcycle_we_o (mcycle_we_w),
+    .mcycleh_we_o(mcycleh_we_w),
+    .minstret_we_o(minstret_we_w),
+    .minstreth_we_o(minstreth_we_w),
+    .cnt_wdata_o (cnt_wdata_w),
     .pmp_cfg_o   (pmp_cfg_o),
     .pmp_addr_o  (pmp_addr_o),
     .satp_o      (csr_satp),
@@ -2565,10 +2697,51 @@ module core_top (
     //     的声明已前置到 §10 的 csr_file 例化之前（隐式声明修复），此处不再重复。
     wire [31:0] trap_cause, trap_tval, trap_epc, trap_pc, trap_redirect_pc;
 
+    //==========================================================================
+    // ★★ 08-06 同拍 XRET→IRQ：给 trap_ctrl 的**有效资格上下文**（最小 Top 旁路）
+    //--------------------------------------------------------------------------
+    //   背景：中断陷阱不会压制 `xret_valid`（trap_exc 只含同步异常）⇒ mret/sret
+    //   退休拍可同拍取中断。此时 trap_ctrl 的资格判定必须用 **xret 之后**的
+    //   MIE/SIE 与特权级，否则：
+    //     · MPIE=0 的 mret：xret 后 MIE=0，本边界**不应**取中断（旧实现用旧 MIE=1 取）；
+    //     · 返 U/S 后同拍陷阱：委托/目标特权级应按 xret 目标算（旧实现按 xret 前模式）。
+    //
+    //   三条硬约束（母 2026-10-22 复审口径）：
+    //     ① **MRET 只把 MIE 换成 MPIE，SRET 只把 SIE 换成 SPIE**；无关 XIE 位保持
+    //        （不得任意 xret 同时替换 MIE/SIE）。
+    //     ② 候选只由「**合法、可退休的 XRET**」+ mstatus 原值构成：
+    //        `mw_xret_valid & mw_valid & ~mw_exc_valid`（**不含** trap_exc/trap_valid）
+    //        ⇒ 不依赖将要输出的 trap_valid/irq_valid，不会形成组合环。
+    //     ③ xret 目标特权级用 **MPP（经 priv_ctrl 合法化的 mpp_o）/SPP 原值**专用
+    //        表达式，绝不取已 trap 优先的 `priv_next`（否则环）。
+    //   作用域：**只**接 trap_ctrl 的 mstatus_i/priv（中断判定 + 委托 + 目标选择）；
+    //   `cur_priv` 的其它消费者、priv_ctrl 的状态落地一律不变（状态有序修在叶）。
+    //==========================================================================
+    wire        xret_retire_pre = mw_xret_valid & mw_valid & ~mw_exc_valid;
+    wire [1:0]  xret_tgt_priv_pre = (mw_xret_kind == 2'b01) ? csr_mpp :
+                                    (mw_xret_kind == 2'b00) ?
+                                        (mstatus_merged[`RV32GC_MSTATUS_SPP_BIT] ? 2'b01 : 2'b00) :
+                                    2'b00;   // uret：本设计不实现（译码报非法）
+    wire [1:0]  trap_priv_eff = xret_retire_pre ? xret_tgt_priv_pre : csr_priv_2;
+    //   MIE：mret ⇒ MPIE；SIE：sret ⇒ SPIE；其余情况保持原值
+    wire        trap_mie_eff = (xret_retire_pre && (mw_xret_kind == 2'b01))
+                               ? mstatus_merged[`RV32GC_MSTATUS_MPIE_BIT]
+                               : mstatus_merged[`RV32GC_MSTATUS_MIE_BIT];
+    wire        trap_sie_eff = (xret_retire_pre && (mw_xret_kind == 2'b00))
+                               ? mstatus_merged[`RV32GC_MSTATUS_SPIE_BIT]
+                               : mstatus_merged[`RV32GC_MSTATUS_SIE_BIT];
+    wire [31:0] trap_mstatus_eff =
+        (mstatus_merged & ~((32'h1 << `RV32GC_MSTATUS_MIE_BIT) |
+                            (32'h1 << `RV32GC_MSTATUS_SIE_BIT))) |
+        ({31'b0, trap_mie_eff} << `RV32GC_MSTATUS_MIE_BIT) |
+        ({31'b0, trap_sie_eff} << `RV32GC_MSTATUS_SIE_BIT);
+
     trap_ctrl u_trap_ctrl (
     .commit_valid  (mw_valid),
     .commit_pc     (mw_pc),
-    .commit_pc_next(mw_pc_next),
+    //   ★★ 08-05：中断 EPC = 架构下一条 PC（taken 目标 / *epc / 否则 link），
+    //     不是固定 link（旧式对 taken 转移与 mret 都写成 fall-through）。
+    .commit_pc_next(mw_archnext_w),
     .commit_insn   (mw_insn_raw),
     //   ★ 异常标记必须与 `mw_valid` 相与（2026-09-15 修复）：`mw_exc_valid` 是随流水
     //     携带的**电平**载荷，W 槽被清空（mw_valid=0）后仍会保持上一拍的值 ⇒ 若直接把
@@ -2580,12 +2753,13 @@ module core_top (
     .exc_cause     (mw_exc_cause),
     .exc_tval      (mw_exc_tval),
     .exc_is_fetch  (mw_exc_is_fetch),
-    .priv          (csr_priv_2),
+    //   ★ 08-06：同拍 XRET 时用有效上下文（只影响中断资格/委托/目标；见上）
+    .priv          (trap_priv_eff),
     .medeleg       (csr_medeleg),
     .mideleg       (csr_mideleg),
     .mip           (csr_mip),
     .mie           (csr_mie),
-    .mstatus_i     (mstatus_merged),
+    .mstatus_i     (trap_mstatus_eff),
     .mtvec         (csr_mtvec),
     .stvec         (csr_stvec),
     .trap_valid    (trap_valid),
@@ -2884,6 +3058,9 @@ module core_top (
     .done_addr   (axi_ctrl_done_addr),
     .resp_error  (axi_resp_error),
     .resp_code   (axi_resp_code),
+    // ★★ F4-0：逐 beat R 错误（同拍同 beat）与事务级累计错误
+    .rdata_error (axi_rdata_error),
+    .done_error  (axi_done_error),
     .m_awid      (awid),
     .m_awaddr    (awaddr),
     .m_awlen     (awlen),
@@ -2944,7 +3121,13 @@ module core_top (
 
     wire axi_wb_fire = wvalid & wready;
     assign axi_wb_word_idx = axi_beat_q;
-    assign axi_wb_done     = axi_wb_fire & (axi_beat_q == (axi_beats_q - 5'd1));
+    //   ★★ F4-0：写回完成 = **B 响应收到**（不是最后一拍 W）；wb_err 与 wb_done 同拍。
+    //     `bresp != OKAY` ⇒ l1d 中止（脏数据保留、不腾路、不进填充）。
+    assign axi_wb_done = bvalid & bready;
+    assign axi_wb_err  = axi_wb_done & (bresp != 2'b00);
+    //   ★★ F4-0：行填充错误逐 beat 送达对应 cache，owner 用**持续 owner**（请求锁存值）。
+    assign l1i_fill_err = axi_rdata_valid & axi_rdata_error & (axi_owner_sel == AXO_IFIL);
+    assign l1d_fill_err = axi_rdata_valid & axi_rdata_error & (axi_owner_sel == AXO_DFIL);
 
     // ---- 11.5 mshr_simple：2A 简化 MSHR（每侧 1 项在途）----
     //   用途：作为**缓存行事务**的在途跟踪（busy/owner/paddr + done 归属），
@@ -3132,6 +3315,18 @@ module core_top (
     //   本拍 PTE 读地址是否落在"填充失败"的行上（行粒度 = L1D 32 B）
     wire ptw_pte_line_err = l1d_fill_err_q &
                             (m_ptw_pte_pa_q[31:5] == l1d_fill_err_line_q[31:5]);
+    //   ★★ F4-0：cache 逐请求错误脉冲的**粘滞捕获**（只捕获、不改退休协议）。
+    //     fill_err/wb_err 已直接送入 l1i/l1d（坏行不装 valid、B 错误保留脏数据）；
+    //     cs_err/fill_fail 的**精确 cause 注入**需要 fetch_unit/lsu 的错误输入端口，
+    //     那两个模块不在本包写范围 ⇒ 保留本粘滞作观测/后续消费锚点，未闭项见交付。
+    reg cache_err_sticky_q;
+    always @(posedge aclk or negedge aresetn) begin
+        if (!aresetn) cache_err_sticky_q <= 1'b0;
+        else if (l1i_cs_err | l1i_fill_fail | l1i_err_sticky |
+                 l1d_cs_err | l1d_fill_fail | l1d_wb_fail | l1d_maint_err |
+                 l1d_err_sticky | axi_done_error)
+            cache_err_sticky_q <= 1'b1;
+    end
     //   隐式读（PTE 读）报 access fault 时的 cause = **原访问类型**
     //     （数据侧：load/fld/lr ⇒ 5；store/AMO/SC/cbo ⇒ 7。取指侧恒 1，见 §9.4.1）
     wire [4:0] m_implicit_af_cause =
@@ -3175,7 +3370,17 @@ module core_top (
                                     e_fpu_val;
 
     wire em_n_valid   = de_valid;
-    wire [31:0] em_n_pcnext = e_link;             // 分支/跳转目标由 BRU 另行重定向
+    wire [31:0] em_n_pcnext = e_link;             // 只作 link（WB_PC4 写回 / fence.i 后继）
+    //   ★★ 08-05 修复：架构下一条 PC（中断 EPC 口径）与 link 分开。
+    //     · taken 控制转移（BRU 判 taken，且本条不带异常/非法）⇒ 目标；
+    //     · 其余（含 not-taken 分支、普通指令、压缩指令）⇒ link（pc+ilen，半字对齐可达）。
+    //     · mret/sret 不在此处展开：W 级用 *epc 覆盖（见 `mw_archnext_w`），
+    //       这样 EPC 与 xret 实际重定向同源（同一拍同值），不会拿到 pc+4。
+    //     与 `bru_redirect` 的判据逐字一致（de_ill / de_exc_valid 门控），避免
+    //     "会派发陷阱的指令"把 arch-next 记成目标。
+    wire [31:0] em_n_archnext =
+        (e_is_ctl_xfer & e_bru_taken & ~de_ill & ~de_exc_valid) ? e_bru_target
+                                                                : e_link;
     wire [2:0]  em_n_wbsel  = de_wb_sel;
     wire [31:0] em_n_result = e_result_sel;
     wire [3:0]  em_n_memop  = de_mem_op;
@@ -3349,6 +3554,84 @@ module core_top (
     reg [63:0] cycle_cnt_r;
     reg [63:0] instret_cnt_r;
 
+    // ---- Zicntr 本体下一拍值（组合，供 §13 单点时序块落盘）----
+    //   ★ 口径（KB：zicsr.adoc norm:csrw_order / norm:csraccessorder）：
+    //     · mcycle：tick 是**时钟副效应**，与本条写无关 ⇒ 先 +1 再覆盖选中半字；
+    //     · minstret：写**代替本条自身的隐式 +1**（不是"先加再覆盖"）⇒ 被写拍只
+    //       累加 older 退休（2A = 0，本条自己的 +1 被替代），半字覆盖后加 younger（=0）。
+    //     · 同拍至多一个 we（csr_file 保证）；写值 = cnt_wdata_w（post-WARL 写数据）。
+    wire        inst_retire_w = mw_valid & ~trap_exc;   // 2A：W 级本拍确实退休 1 条
+    //   ★ 只有 **minstret 自己的显式写**才替代本条隐式 +1；
+    //     mcycle 的写**不抑制** minstret（两者是不同计数器，不得混用抑制条件）。
+    wire        inst_suppress_w = minstret_we_w | minstreth_we_w;
+    wire [63:0] cycle_inc_w   = cycle_cnt_r + 64'd1;
+    wire [63:0] cycle_next_w  = mcycle_we_w  ? {cycle_inc_w[63:32], cnt_wdata_w} :
+                                mcycleh_we_w ? {cnt_wdata_w, cycle_inc_w[31:0]} :
+                                               cycle_inc_w;
+    //   2A 单退休：older = 0；写拍下"本条 +1"被显式写替代，未写拍照常 +1。
+    wire [63:0] instret_pre_w  = instret_cnt_r + ((~inst_suppress_w & inst_retire_w) ? 64'd1 : 64'd0);
+    wire [63:0] instret_next_w = minstret_we_w  ? {instret_pre_w[63:32], cnt_wdata_w} :
+                                 minstreth_we_w ? {cnt_wdata_w, instret_pre_w[31:0]} :
+                                                  instret_pre_w;
+
+    //==========================================================================
+    // 12.6 ★★ 计数器 CSR 读的**程序序投影**（older W → M（若存在）→ 本拍读）
+    //--------------------------------------------------------------------------
+    //   读指令在 E；程序序更老的指令可能仍在 W/M 槽（尚未退休）。规范要求
+    //   "显式 CSR 读返回本条执行前的值"，且更老写的值必须被后条读到
+    //   （zicsr.adoc:166-184 norm:csr_order/csrw_order；"a value written to instret
+    //   by one instruction will be the value read by the following instruction"）。
+    //   2A 每拍最多退休 1 条且 W/M 槽各至多 1 条 ⇒ 投影恰好覆盖两槽，按程序序：
+    //     W 槽（更老）→ M 槽（更年轻）。
+    //   · mcycle/cycle 家族（时钟计数）：
+    //       每槽在**其落盘沿**先 tick(+1)，再覆盖被写半字（写高时低半仍 +1）。
+    //       只对"确有在途写"的槽投影 tick：无在途写 ⇒ 读本体（采样时钟计数的
+    //       既有口径，不无端加拍）；有 W 写 ⇒ 1 个 tick 后覆盖；有 M 写 ⇒ 再 1 个
+    //       tick（M 的落盘沿在下一拍末）后覆盖。⇒ 单写者结果与旧 C15 特判一致
+    //       （W:high+carry(low+1)；M:high+carry(low+1)+carry(low+2)），但
+    //       "W+M 双写者"时第二个写者的 carry 输入是**第一个写者覆盖后的 low**，
+    //       而不是 body.low；不再假设 low==0xFFFF_FFFF/0xFFFF_FFFE。
+    //   · minstret/instret 家族（指令退休计数）：
+    //       每槽若显式写该计数器的半字 ⇒ 以写值覆盖，**替代自身隐式 +1**；
+    //       否则该条退休 ⇒ +1（W 槽用 inst_retire_w；M 槽用 em_valid & ~m_exc_any，
+    //       陷阱拍 M 槽会被 kill_young 作废、E 槽读者也不落架构状态）。
+    //       ⇒ 相邻两读的差值恒 = 之间的退休条数（与本条自身 +1 无关）。
+    //   这是"实际 older W 效果 → M 若存在 → 当前 CSR 读"的通用式：填掉旧实现
+    //   "单写者公式"与"跨半无旁路"的洞，且不依赖任何 force/层次探针。
+    //==========================================================================
+    // ---- 在途写识别（W 槽 = csr_file 的 post-WARL 半字写请求；M 槽 = 更年轻的写）----
+    wire m_mc_lo = em_valid & em_csr_we & ~m_exc_any &
+                   (em_csr_addr == `RV32GC_CSR_MCYCLE);
+    wire m_mc_hi = em_valid & em_csr_we & ~m_exc_any &
+                   (em_csr_addr == `RV32GC_CSR_MCYCLEH);
+    wire m_in_lo = em_valid & em_csr_we & ~m_exc_any &
+                   (em_csr_addr == `RV32GC_CSR_MINSTRET);
+    wire m_in_hi = em_valid & em_csr_we & ~m_exc_any &
+                   (em_csr_addr == `RV32GC_CSR_MINSTRETH);
+    wire w_mc_lo = mcycle_we_w,  w_mc_hi = mcycleh_we_w;
+    wire w_in_lo = minstret_we_w, w_in_hi = minstreth_we_w;
+    wire w_mc_any = w_mc_lo | w_mc_hi;
+    wire m_mc_any = m_mc_lo | m_mc_hi;
+    wire m_retire = em_valid & ~m_exc_any;
+
+    // ---- mcycle 家族：W 落盘沿（tick → 覆盖）再 M 落盘沿（tick → 覆盖）----
+    wire [63:0] mc_e1 = cycle_cnt + 64'd1;                       // 本拍末 tick
+    wire [63:0] mc_e2 = w_mc_lo ? {mc_e1[63:32], cnt_wdata_w} :
+                        w_mc_hi ? {cnt_wdata_w, mc_e1[31:0]} : mc_e1;
+    wire [63:0] mc_e3 = mc_e2 + 64'd1;                           // 下一拍末 tick
+    wire [63:0] mc_e4 = m_mc_lo ? {mc_e3[63:32], em_csr_wdata} :
+                        m_mc_hi ? {em_csr_wdata, mc_e3[31:0]} : mc_e3;
+    assign cnt_proj_mc_w = m_mc_any ? mc_e4 : (w_mc_any ? mc_e2 : cycle_cnt);
+
+    // ---- minstret 家族：W 退休/替代写 → M 退休/替代写 ----
+    wire [63:0] in_e1 = w_in_lo ? {instret_cnt[63:32], cnt_wdata_w} :
+                        w_in_hi ? {cnt_wdata_w, instret_cnt[31:0]} :
+                        (inst_retire_w ? instret_cnt + 64'd1 : instret_cnt);
+    wire [63:0] in_e2 = m_in_lo ? {in_e1[63:32], em_csr_wdata} :
+                        m_in_hi ? {em_csr_wdata, in_e1[31:0]} :
+                        (m_retire ? in_e1 + 64'd1 : in_e1);
+    assign cnt_proj_in_w = in_e2;
+
     always @(posedge aclk or negedge aresetn) begin
         if (!aresetn) begin
             //------------------------ FD ------------------------
@@ -3372,6 +3655,7 @@ module core_top (
             de_exc_cause <= 5'd0; de_exc_pc <= 32'h0; de_exc_is_fetch <= 1'b0;
             //------------------------ EM ------------------------
             em_valid <= 1'b0; em_pc <= 32'h0; em_pc_next <= 32'h0;
+            em_archnext_q <= 32'h0;
             em_insn_raw <= 32'h0000_0013; em_rd <= 5'd0; em_wb_sel <= WB_NONE;
             em_result <= 32'h0; em_mem_op <= MEM_NONE; em_mem_size <= 3'd0;
             em_mem_unsign <= 1'b0; em_rs1_val <= 32'h0; em_imm_val <= 32'h0;
@@ -3447,7 +3731,9 @@ module core_top (
                 // ★ mepc 口径：取指总线错误时 fu_fetch_insn_va 由 parcel_align 从
                 //   取指数据推得（错误行的填充数据无意义，且错误可能在回填前就锁存）
                 //   ⇒ 该情形改用**故障取指地址** fu_fetch_pc（与 fetch_exc_pc 同源）。
-                fd_pc        <= fetch_bus_err ? fu_fetch_pc : fu_fetch_insn_va;
+                // ★ 08-06/10-22：总线错误时 D 级 PC 也取**指令起始**（旧取 live
+                //   fu_fetch_pc 会把高半 32 bit 指令的 PC 记成第二字地址）。
+                fd_pc        <= fu_fetch_insn_va;
                 fd_pc_pa     <= obs_fetch_pc_pa;
                 fd_insn      <= fu_fetch_data;
                 fd_ilen32    <= fu_fetch_ilen32;
@@ -3551,10 +3837,15 @@ module core_top (
             //       · E 槽 fpu_fflags（与本次 CSR 写同拍落盘 ⇒ 被同块后赋值覆盖）
             //     sticky-OR 幂等 ⇒ 重复并入不会多置位（见下面 (7) 段的 e_flags_younger）。
 
-            // 计数器（Zicntr；csr_file 侧合成软件可写视图）
-            cycle_cnt_r   <= cycle_cnt_r + 64'd1;
-            instret_cnt_r <= instret_cnt_r +
-                             ((mw_valid & ~trap_exc) ? 64'd1 : 64'd0);
+            // 计数器（Zicntr）—— ★★ F1-B：64 位本体 + 软件半字写的**同沿**语义
+            //   · mcycle：clock 计数（非指令副效应）⇒ 每拍**先整 64 位 +1**，再只覆盖
+            //     被写的半字；未写半保留本拍增量/进位（写低 ⇒ 高半含低位进位；
+            //     写高 ⇒ 低半本拍照常 +1）。**不得**整拍抑制 tick。
+            //   · minstret：写代替**本条**自己的隐式 +1；2A 单退休 ⇒ older/younger 恒 0
+            //     ⇒ next = (本体 + 0) 覆盖半字 + 0。
+            //   · 无写拍：instret 加本拍实际退休量（2A = W 级真的提交 1 条）。
+            cycle_cnt_r   <= cycle_next_w;
+            instret_cnt_r <= instret_next_w;
 
             // ================= (4) EM（E→M）=================
             //   ★ 冲刷优先（2026-09-15 修复）：kill_young（陷阱拍 / fence.i 同步窗口）
@@ -3569,6 +3860,7 @@ module core_top (
                 em_valid        <= em_n_valid;
                 em_pc           <= de_pc;
                 em_pc_next      <= em_n_pcnext;
+                em_archnext_q   <= em_n_archnext;
                 em_insn_raw     <= de_insn_raw;
                 em_rd           <= de_rd;
                 em_wb_sel       <= em_n_wbsel;
@@ -3633,7 +3925,9 @@ module core_top (
             if (mw_cap) begin
                 mw_valid        <= mw_n_valid & pipe_adv;
                 mw_pc           <= em_pc;
-                mw_pc_next      <= em_pc_next;
+                //   ★ 08-05：W 槽"后继 PC" = 架构下一条（taken 目标/否则 link），
+                //     不再固定取 link；link 仍由 em_pc_next 供 WB_PC4 写回。
+                mw_pc_next      <= em_archnext_q;
                 mw_insn_raw     <= em_insn_raw;
                 mw_wb_sel       <= mw_n_wbsel;
                 mw_rd           <= em_rd;

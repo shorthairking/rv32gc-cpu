@@ -62,6 +62,8 @@ ENV_SH="${REPO_ROOT}/scripts/env.sh"   # 强绑定 actual 路径；无外部覆�
 TB="${REPO_ROOT}/sim/functional/tb_counter_time.sv"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+mkdir -p -- "${REPO_ROOT}/build/functional" || die "无法创建 SHA 私有区"
+SHA_TMP_ROOT="$(mktemp -d -- "${REPO_ROOT}/build/functional/.counter-sha-XXXXXXXX")" || die "无法创建 SHA 私有区"
 
 readonly SPEC_VECTORS=12
 readonly SPEC_CHECKS=50
@@ -93,12 +95,23 @@ esac
 #------------------------------------------------------------------------------
 # ---- aux 身份：严格单行 64-hex；每 caller 显式 || die/fail（不吞错）----
 aux_sha() {
-    local f="$1" out n
-    out="$(sha256sum -- "$f" 2>/dev/null)" || return $?
-    n="$(printf '%s\n' "$out" | wc -l)"
-    [ "$n" -eq 1 ] || return 90
-    printf '%s\n' "$out" | grep -qE '^[0-9a-f]{64}  ' || return 91
-    printf '%s' "${out:0:64}"
+    local LC_ALL=C
+    local f="$1" raw line rc=0 nlines nbytes expected_bytes last
+    [ -f "$f" ] || return 1
+    raw="$(mktemp -- "$SHA_TMP_ROOT/aux-raw.XXXXXXXX")" || return 1
+    sha256sum -- "$f" >"$raw" 2>/dev/null || rc=$?
+    [ "$rc" -eq 0 ] || { rm -f -- "$raw"; return "$rc"; }
+    nlines="$(wc -l <"$raw")" || { rm -f -- "$raw"; return 1; }
+    nbytes="$(wc -c <"$raw")" || { rm -f -- "$raw"; return 1; }
+    [ "$nlines" -eq 1 ] || { rm -f -- "$raw"; return 90; }
+    IFS= read -r line <"$raw" || { rm -f -- "$raw"; return 90; }
+    expected_bytes=$((${#line} + 1))
+    last="$(tail -c 1 -- "$raw" | od -An -tx1 | tr -d ' \\n')"
+    [ "$nbytes" -eq "$expected_bytes" ] && [ "$last" = 0a ] || { rm -f -- "$raw"; return 90; }
+    [[ "${line:0:64}" =~ ^[0-9a-f]{64}$ ]] && [ "${line:64:2}" = '  ' ] \
+        && [ "${line:66}" = "$f" ] || { rm -f -- "$raw"; return 91; }
+    rm -f -- "$raw"
+    printf '%s' "${line:0:64}"
 }
 aux_start_recheck() {   # <where>：三者必须仍等于 source 前起始
     local where="$1" a b c
@@ -179,15 +192,28 @@ abs_cmd() {
 DUT_REL_LIST=( rtl/csr/csr_file.v rtl/csr/priv_ctrl.v rtl/clint/clint.v )
 DUT_HDR_REL_LIST=( rtl/pkg/rv32_defs.vh rtl/pkg/core_params.vh )
 
-hash_inputs() {   # <out> <files...> → HASH_RC/HASH_LINES/HASH_BADHEX
+hash_inputs() {   # <out> <files...> → HASH_RC/HASH_LINES/HASH_BADHEX; raw bytes retained
+    local LC_ALL=C
     local out="$1"; shift
+    local rc=0 nbytes expected line path bad=0 idx=0 last
     HASH_RC=0; HASH_LINES=0; HASH_BADHEX=0
-    sha256sum -- "$@" > "$out" 2>>"${CASE_CLOG:-/dev/null}" || HASH_RC=$?
-    [ "$HASH_RC" -eq 0 ] || return 0
+    sha256sum -- "$@" > "$out" 2>>"${CASE_CLOG:-/dev/null}" || rc=$?
+    HASH_RC=$rc
+    [ "$rc" -eq 0 ] || return 0
     HASH_LINES="$(wc -l < "$out" 2>/dev/null || printf 0)"
-    [ "$HASH_LINES" -eq "$N_HASH_EXPECTED" ] || HASH_RC=97
-    HASH_BADHEX="$(grep -cvE '^[0-9a-f]{64} ' "$out" 2>/dev/null || true)"; HASH_BADHEX="${HASH_BADHEX:-0}"
-    [ "$HASH_BADHEX" -eq 0 ] || HASH_RC=96
+    nbytes="$(wc -c < "$out" 2>/dev/null || printf 0)"
+    last="$(tail -c 1 -- "$out" | od -An -tx1 | tr -d ' \\n')"
+    [ "$HASH_LINES" -eq "$N_HASH_EXPECTED" ] && [ "$last" = 0a ] || { HASH_RC=97; return 0; }
+    expected=0
+    for path in "$@"; do expected=$((expected + 66 + ${#path} + 1)); done
+    [ "$nbytes" -eq "$expected" ] || { HASH_RC=97; return 0; }
+    while IFS= read -r line; do
+        path="$1"; shift; idx=$((idx + 1))
+        if [[ ! "${line:0:64}" =~ ^[0-9a-f]{64}$ ]] || [ "${line:64:2}" != '  ' ] || [ "${line:66}" != "$path" ]; then bad=$((bad + 1)); fi
+    done < "$out"
+    HASH_BADHEX=$bad
+    [ "$idx" -eq "$N_HASH_EXPECTED" ] || HASH_RC=97
+    [ "$bad" -eq 0 ] || HASH_RC=96
     return 0
 }
 
@@ -494,8 +520,88 @@ EOS
 case "\$*" in *csr_file.v*) exit 9 ;; esac
 exec ${REAL_SHA} "\$@"
 EOS
+    cat > "$fb/sha256sum" <<'EOS'
+#!/bin/sh
+case "$FAKE_SHA_MODE" in
+  valid) exec "$FAKE_REAL_SHA" "$@" ;;
+  extra_lf) "$FAKE_REAL_SHA" "$@"; printf '\n' ;;
+  multi_blank) "$FAKE_REAL_SHA" "$@"; printf '\n\n' ;;
+  unterminated) "$FAKE_REAL_SHA" "$@" | tr -d '\n' ;;
+  wrongpath) "$FAKE_REAL_SHA" "$@" | while IFS= read -r line; do p="${line#*  }"; printf '%s  X%s\n' "${line%%  *}" "${p#?}"; done ;;
+  garbage) "$FAKE_REAL_SHA" "$@"; printf 'JUNK\n' ;;
+  nul) "$FAKE_REAL_SHA" "$@"; printf '\0' ;;
+  stdout_rc9) "$FAKE_REAL_SHA" "$@"; exit 9 ;;
+esac
+EOS
     chmod +x "$fb"/* || die "selftest: chmod 假工具失败"
     mkdir -p "$e2e/p_rc"; cp -f "$fb/sha_fail" "$e2e/p_rc/sha256sum"; chmod +x "$e2e/p_rc/sha256sum"
+
+    # ---- SHA元反证：每个case直接走实际aux_sha/hash_inputs caller，且reason精确 ----
+    local SHA_META_TOTAL=0 SHA_META_OK=0 saved_path="$PATH" aux_got main_got
+    local -a meta_files=( "$REPO_ROOT/rtl/csr/csr_file.v" "$REPO_ROOT/rtl/csr/priv_ctrl.v"
+        "$REPO_ROOT/rtl/clint/clint.v" "$REPO_ROOT/rtl/pkg/rv32_defs.vh"
+        "$REPO_ROOT/rtl/pkg/core_params.vh" "$TB" "$ENV_SH" "$SCRIPT_PATH" )
+    export FAKE_REAL_SHA="$REAL_SHA"
+    PATH="$fb:$PATH"; export PATH
+    for meta_mode in valid extra_lf multi_blank unterminated wrongpath garbage nul stdout_rc9; do
+        export FAKE_SHA_MODE="$meta_mode"
+        if aux_sha "$AUX_SCRIPT" >/dev/null 2>&1; then aux_got=0; else aux_got=$?; fi
+        case "$meta_mode" in
+          valid) aux_expect=0 ;;
+          wrongpath) aux_expect=91 ;;
+          stdout_rc9) aux_expect=9 ;;
+          *) aux_expect=90 ;;
+        esac
+        SHA_META_TOTAL=$((SHA_META_TOTAL + 1))
+        if [ "$aux_got" -eq "$aux_expect" ]; then SHA_META_OK=$((SHA_META_OK + 1)); printf 'SHA_META counter_aux mode=%s reason=rc_%s OK\n' "$meta_mode" "$aux_got"
+        else printf 'SHA_META counter_aux mode=%s expected=rc_%s got=rc_%s MISMATCH\n' "$meta_mode" "$aux_expect" "$aux_got"; fi
+
+        hash_inputs "$st_dir/meta_${meta_mode}.sha" "${meta_files[@]}"
+        main_got="$HASH_RC"
+        case "$meta_mode" in
+          valid) main_expect=0 ;;
+          wrongpath) main_expect=96 ;;
+          stdout_rc9) main_expect=9 ;;
+          *) main_expect=97 ;;
+        esac
+        SHA_META_TOTAL=$((SHA_META_TOTAL + 1))
+        if [ "$main_got" -eq "$main_expect" ]; then SHA_META_OK=$((SHA_META_OK + 1)); printf 'SHA_META counter_inputs mode=%s reason=hash_rc_%s OK\n' "$meta_mode" "$main_got"
+        else printf 'SHA_META counter_inputs mode=%s expected=hash_rc_%s got=hash_rc_%s MISMATCH\n' "$meta_mode" "$main_expect" "$main_got"; fi
+    done
+    PATH="$saved_path"; export PATH
+    printf 'SHA_META_SUMMARY: total=%s ok=%s bad=%s\n' "$SHA_META_TOTAL" "$SHA_META_OK" "$((SHA_META_TOTAL-SHA_META_OK))"
+    [ "$SHA_META_OK" -eq "$SHA_META_TOTAL" ] || die "SHA meta counter caller failed"
+
+    # ---- C.UTF-8 Unicode path control: invoke both real callers on byte-identical copies ----
+    local unicode_root="$st_dir/计数器 fixture" unicode_aux aux_expected aux_got aux_rc=0 unicode_ok=1
+    local -a unicode_files=()
+    mkdir -p -- "$unicode_root"
+    sha256sum -- "${meta_files[@]}" > "$st_dir/unicode_source_before.sha256" || die "unicode: source before snapshot failed"
+    for idx in "${!meta_files[@]}"; do
+        local source_file="${meta_files[$idx]}" copy_file="$unicode_root/input_${idx}_$(basename -- "${meta_files[$idx]}")"
+        cp -- "$source_file" "$copy_file" || die "unicode: copy input failed"
+        cmp -s -- "$source_file" "$copy_file" || unicode_ok=0
+        unicode_files+=( "$copy_file" )
+    done
+    unicode_aux="$unicode_root/测试脚本.sh"
+    cp -- "$SCRIPT_PATH" "$unicode_aux" || die "unicode: copy aux input failed"
+    cmp -s -- "$SCRIPT_PATH" "$unicode_aux" || unicode_ok=0
+    aux_expected="$(sha256sum -- "$unicode_aux" | { IFS=' ' read -r digest _; printf '%s' "$digest"; })"
+    aux_got="$(aux_sha "$unicode_aux")" || { aux_rc=$?; unicode_ok=0; }
+    [ "$aux_got" = "$aux_expected" ] || unicode_ok=0
+    hash_inputs "$st_dir/unicode_inputs.sha256" "${unicode_files[@]}"
+    [ "$HASH_RC" -eq 0 ] && [ "$HASH_LINES" -eq "$N_HASH_EXPECTED" ] \
+        && [ "$HASH_BADHEX" -eq 0 ] || unicode_ok=0
+    sha256sum -- "${meta_files[@]}" > "$st_dir/unicode_source_after.sha256" || die "unicode: source after snapshot failed"
+    cmp -s -- "$st_dir/unicode_source_before.sha256" "$st_dir/unicode_source_after.sha256" || unicode_ok=0
+    total=$((total + 1))
+    if [ "$unicode_ok" -eq 1 ]; then
+        pass=$((pass + 1)); printf 'SHA_UNICODE_CALLERS: aux_sha=rc0 hash_inputs=rc0 lines=%s badhex=%s copies=byte-equal source=stable root=%s OK\n' \
+            "$HASH_LINES" "$HASH_BADHEX" "$unicode_root"
+    else
+        printf 'SHA_UNICODE_CALLERS: aux_rc=%s hash_rc=%s lines=%s badhex=%s copies/source verification failed root=%s MISMATCH\n' \
+            "$aux_rc" "$HASH_RC" "$HASH_LINES" "$HASH_BADHEX" "$unicode_root"
+    fi
 
     priv_root() {  # <dir>：私有 aux 根（脚本/TB/env 均为副本，绝不动正式源）
         local d="$1"

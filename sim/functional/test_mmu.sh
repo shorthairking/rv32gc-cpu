@@ -71,9 +71,9 @@ readonly BASE_COMMIT_FULL="201acf61e118a3fb533e1a96768687a35efa1751"
 #     故分别冻结、分别校验总数，绝不用一个总数硬压另一棵树。
 #   · 任何 TB 改动都必须同步本表（否则门控拒）。
 readonly VEC_NAMES="CTRL_XZ_DETECT CTRL_BASE_TR CTRL_BIGPAGE MMU_SVADE_D_TLB_HIT CTRL_SVADE_D1 CTRL_SVADE_A0 MMU_SFENCE_GLOBAL_VA CTRL_SFENCE_ASID_KEEP_G CTRL_SFENCE_VA_ASID_KEEP_G CTRL_SFENCE_ALL MMU_PA34_ROOT MMU_PA34_L0 MMU_PA34_LEAF4K MMU_PA34_LEAF4M CTRL_PA34_PRIO_PERM MMU_PA34_AF_LEGAL CTRL_PA34_SVADE CTRL_PA_LOW MMU_CBM_RO_PTW MMU_CBM_RO_TLB MMU_CBM_D_CHECK CTRL_CBM_A0 CTRL_CBM_RESERVED CTRL_STORE_RO MMU_LSU_CBM_RO CTRL_LSU_CBM_WO MMU_LSU_NEED_PERM CTRL_LSU_CBM_DENY CTRL_LSU_STORE_RO CTRL_LOOKUP2_FETCH MMU_LOOKUP2_D0 CTRL_LSU_LOAD_WO"
-readonly NEW_CHECKS="5 11 7 9 9 6 16 9 9 9 11 6 6 5 7 8 6 8 6 9 7 4 5 7 4 3 2 3 3 13 9 3"
+readonly NEW_CHECKS="5 21 7 9 9 6 16 9 9 9 11 6 6 5 7 8 6 8 6 9 7 4 5 7 4 3 2 3 3 13 9 3"
 readonly OLD_CHECKS="5 11 7 9 9 6 16 9 9 9 17 9 9 8 7 17 6 8 3 9 4 4 5 7 4 3 2 3 3 13 9 3"
-readonly CHECKS_TOTAL_NEW=225
+readonly CHECKS_TOTAL_NEW=235
 readonly CHECKS_TOTAL_OLD=243
 # 旧基线必须触发的定向缺陷标签（与 TB 头注一致）；`CTRL_` 前缀为合法控制标签
 readonly DEFECT_TAGS="MMU_SVADE_D_TLB_HIT MMU_SFENCE_GLOBAL_VA MMU_PA34_ROOT MMU_PA34_L0 MMU_PA34_LEAF4K MMU_PA34_LEAF4M MMU_PA34_AF_LEGAL MMU_CBM_RO_PTW MMU_CBM_RO_TLB MMU_CBM_D_CHECK MMU_LSU_CBM_RO MMU_LSU_NEED_PERM MMU_LOOKUP2_D0"
@@ -191,6 +191,11 @@ hash_inputs() {
 case_compile() {   # <name> <root> [iv] [vv] [extra_iverilog_args] [tb_file]
     local name="$1" root="$2" iv="${3:-$IV}" vv="${4:-$VVP}"
     local extra="${5:-}" tb_file="${6:-$TB}"
+    # Select the new TB named-port branch only for source roots that actually expose
+    # the input. Frozen 201acf61 intentionally compiles the legacy port map unchanged.
+    if grep -Eq 'input[[:space:]]+wire[[:space:]]+pte_resp_err' "$root/rtl/csr/ptw.v"; then
+        extra="${extra} -DPTW_PTE_RESP_ERR_PORT"
+    fi
     CASE_DIR="${RUN_DIR}/${name}"
     mkdir -p -- "$CASE_DIR"
     CASE_CLOG="${CASE_DIR}/compile.log"
@@ -498,13 +503,13 @@ selftest_main() {
     cp "${st_dir}/good.log" "${st_dir}/dup_anchor.log"; printf 'FUNCTIONAL_MMU: PASS\n' >> "${st_dir}/dup_anchor.log"
     grep -v '^FUNCTIONAL_MMU_VECTORS ' "${st_dir}/good.log" > "${st_dir}/no_summary.log" || true
     cp "${st_dir}/good.log" "${st_dir}/dup_summary.log"; printf 'FUNCTIONAL_MMU_VECTORS total=%d checks=%d fails=0\n' "$SPEC_VECTORS" "$CHECKS_TOTAL_NEW" >> "${st_dir}/dup_summary.log"
-    sed 's/^FUNCTIONAL_MMU_VECTORS total=32 checks=225 fails=0$/FUNCTIONAL_MMU_VECTORS total=32 checks=225/' \
+    sed 's/^FUNCTIONAL_MMU_VECTORS total=32 checks=235 fails=0$/FUNCTIONAL_MMU_VECTORS total=32 checks=235/' \
         "${st_dir}/good.log" > "${st_dir}/bad_summary_fmt.log"
     sed 's/^FUNCTIONAL_MMU_VECTORS total=32 /FUNCTIONAL_MMU_VECTORS total=31 /' \
         "${st_dir}/good.log" > "${st_dir}/bad_total.log"
-    sed "s/^FUNCTIONAL_MMU_VECTORS total=32 checks=225 fails=0$/FUNCTIONAL_MMU_VECTORS total=32 checks=0 fails=0/" \
+    sed "s/^FUNCTIONAL_MMU_VECTORS total=32 checks=235 fails=0$/FUNCTIONAL_MMU_VECTORS total=32 checks=0 fails=0/" \
         "${st_dir}/good.log" > "${st_dir}/zero_checks.log"
-    sed 's/^FUNCTIONAL_MMU_VECTORS total=32 checks=225 fails=0$/FUNCTIONAL_MMU_VECTORS total=32 checks=225 fails=1/' \
+    sed 's/^FUNCTIONAL_MMU_VECTORS total=32 checks=235 fails=0$/FUNCTIONAL_MMU_VECTORS total=32 checks=235 fails=1/' \
         "${st_dir}/good.log" > "${st_dir}/summary_fails.log"
     grep -v "^VEC ${SPEC_VECTORS} " "${st_dir}/good.log" > "${st_dir}/vec_missing_line.log" || true
     sed "s/^VEC ${SPEC_VECTORS} /VEC $((SPEC_VECTORS - 1)) /" "${st_dir}/good.log" > "${st_dir}/vec_dup_idx.log"

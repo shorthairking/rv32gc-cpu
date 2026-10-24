@@ -216,37 +216,42 @@ DUT_HDR="$DUT_ROOT/rtl/back2/back2_params.vh"
 #   ★ 窄复审 P1：哈希清单**直接捕原始 rc + 固定 3 条/每行 64hex/路径逐条匹配**。
 #     旧实现只数“3 条合法行”⇒ 额外坏行被放过；且 `sha256sum | awk` 会吞掉工具 rc。
 FREEZE_ERR=""
-freeze_sha() {  # 成功：stdout = 3 行完整清单；失败：FREEZE_ERR 给精确原因
-    local out rc total line h p i
+freeze_sha() {  # 原始 stdout 先落盘并捕原 rc；验证原始字节后才输出规范清单
+    local raw="$1" rc reason
     FREEZE_ERR=""
-    out="$(sha256sum -- "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" 2>>"$RUN_LOG")"
+    sha256sum -- "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" >"$raw" 2>>"$RUN_LOG"
     rc=$?
     if [ "$rc" -ne 0 ]; then FREEZE_ERR="sha256sum_rc=$rc"; return 1; fi
-    total="$(printf '%s\n' "$out" | wc -l)"
-    if [ "$total" -ne 3 ]; then FREEZE_ERR="sha256_lines=$total"; return 1; fi
-    i=0
-    for p in "$DUT_LSQ" "$DUT_HDR" "$TB_SRC"; do
-        i=$((i + 1))
-        line="$(printf '%s\n' "$out" | sed -n "${i}p")"
-        if ! printf '%s\n' "$line" | grep -qE '^[0-9a-f]{64}  '; then
-            FREEZE_ERR="sha256_format line=$i"; return 1
-        fi
-        h="$(printf '%s\n' "$line" | cut -c1-64)"
-        if [ "${#h}" -ne 64 ]; then FREEZE_ERR="sha256_hexlen line=$i"; return 1; fi
-        if [ "$(printf '%s\n' "$line" | cut -c67-)" != "$p" ]; then
-            FREEZE_ERR="sha256_path line=$i"; return 1
-        fi
-    done
-    printf '%s\n' "$out"
+    reason="$(python3 - "$raw" "$DUT_LSQ" "$DUT_HDR" "$TB_SRC" <<'PY'
+import os, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+paths = sys.argv[2:]
+if b'\0' in raw or b'\r' in raw:
+    print('sha256_bytes'); raise SystemExit(1)
+if not raw.endswith(b'\n'):
+    print('sha256_unterminated'); raise SystemExit(1)
+rows = raw.split(b'\n')[:-1]
+if len(rows) != len(paths):
+    print(f'sha256_lines={len(rows)}'); raise SystemExit(1)
+for i, (row, path) in enumerate(zip(rows, paths), 1):
+    m = re.fullmatch(rb'([0-9a-f]{64})  (.*)', row)
+    if not m:
+        print(f'sha256_format line={i}'); raise SystemExit(1)
+    if m.group(2) != os.fsencode(path):
+        print(f'sha256_path line={i}'); raise SystemExit(1)
+print('ok')
+PY
+)" || { FREEZE_ERR="${reason:-sha256_format}"; return 1; }
 }
+normalize_sha_file() { awk '{print substr($0,1,64)}' "$1"; }
 FREEZE_PRE_OUT="$RUN_DIR/sha_pre.txt"
-if freeze_sha > "$FREEZE_PRE_OUT"; then :; else
+if freeze_sha "$FREEZE_PRE_OUT"; then :; else
     emit_fail "${FREEZE_ERR:-sha256_pre_failed}"
 fi
-SHA_PRE="$(cat -- "$FREEZE_PRE_OUT")" || emit_fail "sha256_pre_read_failed"
+SHA_PRE="$(normalize_sha_file "$FREEZE_PRE_OUT")" || emit_fail "sha256_pre_normalize_failed"
 {
     echo "-- pre-run source sha256 (DUT / header / TB) --"
-    printf '%s\n' "$SHA_PRE"
+    cat -- "$FREEZE_PRE_OUT"
 } >> "$RUN_LOG" || emit_fail "run_log_sha_pre_append_failed"
 
 #------------------------------------------------------------------------------
@@ -304,11 +309,10 @@ fi
 # 8. 源冻结复核（编译/运行前后逐字节一致）
 #------------------------------------------------------------------------------
 FREEZE_POST_OUT="$RUN_DIR/sha_post.txt"
-if freeze_sha > "$FREEZE_POST_OUT"; then :; else
+if freeze_sha "$FREEZE_POST_OUT"; then :; else
     emit_fail "${FREEZE_ERR:-sha256_post_failed}"
 fi
-SHA_POST="$(cat -- "$FREEZE_POST_OUT")" || emit_fail "sha256_post_read_failed"
-if [ "$SHA_PRE" != "$SHA_POST" ]; then
+if ! cmp -s -- "$FREEZE_PRE_OUT" "$FREEZE_POST_OUT"; then
     emit_fail "source_changed_during_run"
 fi
 
